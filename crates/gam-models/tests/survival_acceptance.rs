@@ -22,6 +22,8 @@ mod latent_loaded_vs_unloaded_chart_2714;
 mod location_scale_heteroscedastic_globalization_1569;
 #[path = "survival_acceptance/margslope_face_criterion_fd_2894.rs"]
 mod margslope_face_criterion_fd_2894;
+#[path = "survival_acceptance/moving_law_certificate_2926.rs"]
+mod moving_law_certificate_2926;
 
 fn initialize_cpu_fitting() {
     static INIT: std::sync::Once = std::sync::Once::new();

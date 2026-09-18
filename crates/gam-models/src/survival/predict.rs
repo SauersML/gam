@@ -3695,6 +3695,9 @@ struct MarginalSlopePredictContext {
     /// Per-row noise offset, mirroring the `pred_input.offset_noise` slice
     /// used by the CLI.
     noise_offset: Array1<f64>,
+    /// Per-row scaled context covariates a local latent law is replayed from
+    /// (gam#2926); `None` for every other law.
+    local_law_conditioning: Option<Array2<f64>>,
 }
 
 fn design_row_owned(
@@ -3762,6 +3765,13 @@ fn build_marginal_slope_predict_context(
     };
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let local_law_conditioning =
+        crate::inference::predict_input::build_marginal_slope_local_auxiliary_matrix(
+            model, data, col_map,
+        )
+        .map_err(|error| SurvivalPredictError::InvalidInput {
+            reason: error.to_string(),
+        })?;
     let (predictor, _pred_input, _predictor_fit) = build_saved_survival_marginal_slope_predictor(
         model,
         &fit_saved,
@@ -3775,6 +3785,7 @@ fn build_marginal_slope_predict_context(
         derivative_offset_exit,
         primary_offset,
         &effective_noise_offset,
+        local_law_conditioning.clone(),
     )?;
 
     let blocks = &fit_saved.blocks;
@@ -3809,6 +3820,7 @@ fn build_marginal_slope_predict_context(
         cov_eta,
         z_raw,
         noise_offset: effective_noise_offset,
+        local_law_conditioning,
     })
 }
 
@@ -4216,7 +4228,12 @@ fn marginal_slope_cell(
         )),
         offset_noise: Some(Array1::from_elem(1, ctx.noise_offset[row_index])),
         auxiliary_scalar: Some(Array1::from_elem(1, ctx.z_raw[row_index])),
-        auxiliary_matrix: None,
+        // gam#2926: the row's context covariates, so a local latent law is
+        // replayed for this cell exactly as for the whole table.
+        auxiliary_matrix: ctx
+            .local_law_conditioning
+            .as_ref()
+            .map(|conditioning| conditioning.slice(s![row_index..row_index + 1, ..]).to_owned()),
     };
     Ok(MarginalSlopeCell {
         input: pred_input,
@@ -5657,6 +5674,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
     derivative_offset_exit: &Array1<f64>,
     primary_offset: &Array1<f64>,
     noise_offset: &Array1<f64>,
+    local_law_conditioning: Option<Array2<f64>>,
 ) -> Result<
     (
         BernoulliMarginalSlopePredictor,
@@ -5917,7 +5935,9 @@ pub fn build_saved_survival_marginal_slope_predictor(
         design_noise: Some(slope_design.clone()),
         offset_noise: Some(noise_offset.clone()),
         auxiliary_scalar: Some(z.clone()),
-        auxiliary_matrix: None,
+        // gam#2926: a local latent law is replayed from the context covariates
+        // of the prediction rows, exactly as the Bernoulli predictor replays it.
+        auxiliary_matrix: local_law_conditioning,
     };
 
     Ok((predictor, pred_input, predictor_fit))

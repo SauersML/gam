@@ -1943,6 +1943,20 @@ fn inner_fit_from_certified_outer(
     .map_err(FitFailure::from)
 }
 
+/// What a converged fit whose certificate prefers another law hands the re-solve
+/// on that law (gam#2926): the law and the label the re-solved fit records, which
+/// carries the certificate that chose it, and the coefficients it starts from.
+struct ClosedFormFallback {
+    decision: LatentMeasureDecision,
+    hints: ThetaHints,
+}
+
+/// One fit's outcome under its latent-law certificate.
+enum CertifiedFit {
+    Fitted(Box<BernoulliMarginalSlopeFitResult>),
+    ReSolve(ClosedFormFallback),
+}
+
 pub(crate) fn fit_bernoulli_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: BernoulliMarginalSlopeTermSpec,
@@ -1950,6 +1964,47 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, FitFailure> {
+    // gam#2926: a closed form the adequacy screen chose, and the arm a moving law
+    // was fitted on, are certified at the converged fit. When the certificate
+    // prefers another law, the same spec is re-solved on it from the converged
+    // coefficients; the re-solve carries that certificate and takes no other.
+    match fit_bernoulli_marginal_slope_terms_under(
+        data,
+        spec.clone(),
+        options,
+        kappa_options,
+        policy,
+        None,
+    )? {
+        CertifiedFit::Fitted(result) => Ok(*result),
+        CertifiedFit::ReSolve(fallback) => {
+            match fit_bernoulli_marginal_slope_terms_under(
+                data,
+                spec,
+                options,
+                kappa_options,
+                policy,
+                Some(fallback),
+            )? {
+                CertifiedFit::Fitted(result) => Ok(*result),
+                CertifiedFit::ReSolve(_) => Err(FitFailure::raised(
+                    gam_problem::FailureCategory::Invariant,
+                    "bernoulli marginal-slope: a re-solve on the law its certificate chose \
+                     asked to be re-solved again, but it carries that certificate",
+                )),
+            }
+        }
+    }
+}
+
+fn fit_bernoulli_marginal_slope_terms_under(
+    data: ArrayView2<'_, f64>,
+    spec: BernoulliMarginalSlopeTermSpec,
+    options: &BlockwiseFitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    policy: &gam_runtime::resource::ResourcePolicy,
+    fallback: Option<ClosedFormFallback>,
+) -> Result<CertifiedFit, FitFailure> {
     use gam_problem::FailureCategory;
     let mut spec = spec;
     let data_view = data;
@@ -2141,12 +2196,12 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     spec.slope_offset = slope_design
         .compose_offset(spec.slope_offset.view(), "BMS slope block")
         .map_err(FitFailure::from)?;
-    // #905: the conditional `E[z|C]`/`Var(z|C)` Rao gate conditions on the
-    // marginal-index span a(C) (= the marginal design columns), which is
-    // exactly where the `b(C)·m(C)` leakage lives. It is engaged only on the
-    // raw-z path (no CTN Stage-1 influence absorber); when an absorber is
-    // active the conditional leakage is already absorbed (#461) and the
-    // widened-marginal predict seam must not be perturbed by replacing z.
+    // #905/gam#2926: the conditional-law structure test conditions on the
+    // marginal-index span a(C) (= the marginal design columns), which is exactly
+    // where the `b(C)·m(C)` leakage lives, and a local law is estimated by
+    // context over the covariates that span is built from. Neither is engaged
+    // behind a CTN Stage-1 influence absorber (#461): the conditional leakage is
+    // then already absorbed and the widened-marginal predict seam must not move.
     let absorber_active = spec
         .score_influence_jacobian
         .as_ref()
@@ -2161,33 +2216,96 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
                 .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?,
         )
     };
-    let (latent_measure, latent_z_calibration, latent_measure_build) =
-        build_latent_measure_with_geometry(
+    let context_cols = estimated_latent_law::marginal_formula_context_columns(
+        &marginalspec_boot,
+        data_view.ncols(),
+    )
+    .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+    let context_features = data_view.select(ndarray::Axis(1), &context_cols);
+    let local_context = (!absorber_active && !context_cols.is_empty()).then(|| {
+        estimated_latent_law::LocalLawContext {
+            features: context_features.view(),
+            feature_cols: context_cols.clone(),
+        }
+    });
+    // A learnable frailty sigma is differentiated only under the closed-form
+    // Gaussian lowering, so that is this kernel's latent-law capability here.
+    let (support, gate_context) = if sigma_learnable {
+        (
+            EmpiricalLatentMeasureSupport::StandardNormalOnly,
+            "bernoulli marginal-slope with a learnable Gaussian-shift frailty sigma",
+        )
+    } else {
+        (
+            EmpiricalLatentMeasureSupport::Available,
+            "bernoulli marginal-slope",
+        )
+    };
+    // gam#2926: the re-solve of a fit whose certificate preferred another law
+    // anchors on that law, and records why.
+    let (fallback_hints, fallback_decision) = match fallback {
+        Some(ClosedFormFallback { decision, hints }) => (Some(hints), Some(decision)),
+        None => (None, None),
+    };
+    let decision = match (fallback_decision, spec.declared_latent_law.as_ref()) {
+        (Some(decision), _) => decision,
+        (None, Some(grid)) => {
+            if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
+                return Err(FitFailure::raised(
+                    gam_problem::FailureCategory::Input,
+                    LatentLawRefusal::EmpiricalKernelUnavailable {
+                        context: gate_context.to_string(),
+                        requested: "declared_latent_law".to_string(),
+                    }
+                    .to_string(),
+                ));
+            }
+            // A declared law is the caller's statement about the score AS GIVEN:
+            // nothing is estimated or checked, and the law is what the fit
+            // anchors on and persists.
+            let kind = LatentMeasureKind::GlobalEmpirical { grid: grid.clone() };
+            kind.validate("bernoulli marginal-slope declared latent law")
+                .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+            LatentMeasureDecision {
+                kind,
+                calibration: LatentMeasureCalibration::None,
+                empirical_build: None,
+                certificate_law: None,
+                moving_law: None,
+                consumed: LatentLawConsumed::DeclaredFiniteLaw {
+                    nodes: grid.nodes.len(),
+                },
+            }
+        }
+        (None, None) => build_latent_measure_decision(
             &spec.z,
             &spec.weights,
             &spec.latent_z_policy,
             conditioning_dense.as_ref().map(|d| d.view()),
+            local_context.as_ref(),
+            support,
+            gate_context,
         )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-    if latent_measure.is_empirical() && sigma_learnable {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Input,
-            "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure",
-        ));
-    }
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?,
+    };
+    let LatentMeasureDecision {
+        kind: latent_measure,
+        calibration: latent_z_calibration,
+        empirical_build: latent_measure_build,
+        certificate_law: latent_certificate_law,
+        consumed: mut latent_law_consumed,
+        moving_law: latent_moving_law,
+    } = decision;
 
     let y = Arc::new(spec.y.clone());
     let weights = Arc::new(spec.weights.clone());
-    // Apply rank-INT calibration to training z before any downstream
-    // consumer (pooled probit baseline, term-collection designs, the
-    // family's PIRLS loops) sees it. The calibration is persisted on the
-    // fit result so prediction applies the identical monotone map.
+    // Only the declared conditional location-scale law replaces the training
+    // score before a downstream consumer (pooled probit baseline,
+    // term-collection designs, the family's PIRLS loops) sees it; every other
+    // law is anchored on the score as given. The calibration is persisted on the
+    // fit result so prediction applies the identical map.
     let z = match &latent_z_calibration {
         LatentMeasureCalibration::None => Arc::new(spec.z.clone()),
-        LatentMeasureCalibration::RankInverseNormal(cal) => Arc::new(
-            cal.apply_to_training(&spec.z)
-                .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?,
-        ),
         LatentMeasureCalibration::ConditionalLocationScale(cal) => {
             // ζ = (z − m(C))/√v(C) on the marginal-index span. The conditioning
             // block was built above (raw-z path only), so it is present here.
@@ -2621,7 +2739,8 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     // closures promote it into the deterministic coefficient-mode branch on
     // their first invocation.
     let pending_beta_seed = RefCell::new(None::<Array1<f64>>);
-    let hints = RefCell::new(ThetaHints::default());
+    // A re-solve on the estimated law starts from the closed-form coefficients.
+    let hints = RefCell::new(fallback_hints.unwrap_or_default());
     let score_warp_runtime = score_warp_prepared.as_ref().map(|p| p.runtime.clone());
     let link_dev_runtime = link_dev_prepared.as_ref().map(|p| p.runtime.clone());
 
@@ -2696,7 +2815,8 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
         Ok(blocks)
     };
 
-    let intercept_warm_starts = new_intercept_warm_start_cache(y.len());
+    let intercept_warm_starts = new_intercept_warm_start_cache_on_law(&latent_measure, y.len())
+        .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     let cell_moment_lru = new_cell_moment_lru_cache(policy);
     let cell_moment_cache_stats = new_cell_moment_cache_stats();
     let make_family = |marginal_design: &TermCollectionDesign,
@@ -3134,6 +3254,315 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
     let mut solved_fit = solved.fit;
+    if let Some(law) = intercept_warm_starts.anchor_law.as_ref() {
+        log::info!(
+            "[bernoulli marginal-slope anchor] root slots over the fit: {} (gam#2943 part 3(iii))",
+            law.counts()
+        );
+    }
+    // gam#2926 with a gam#2924 residual repair block: the fit anchors on the joint
+    // (z, r) law, and both certificates below read a row's anchor through the
+    // score alone, so neither can be taken. The fit is what the gate chose — the
+    // closed form, the provisional arm of a moving law, a declared Gaussian — and
+    // the record names why it carries no certificate.
+    let latent_moving_law = if residual_runtime.is_some() {
+        let reason = RESIDUAL_REPAIR_UNCERTIFIED.to_string();
+        latent_law_consumed = match latent_law_consumed {
+            LatentLawConsumed::EstimatedGaussianAdequate {
+                evidence,
+                adequacy,
+                residual: None,
+            } => LatentLawConsumed::GaussianUncertified {
+                evidence,
+                adequacy: Some(adequacy),
+                certificate: None,
+                missing: reason.clone(),
+            },
+            LatentLawConsumed::DeclaredGaussian {
+                evidence,
+                adequacy: Some(adequacy),
+                residual: None,
+                uncertified: None,
+            } => LatentLawConsumed::DeclaredGaussian {
+                evidence,
+                adequacy: Some(adequacy),
+                residual: None,
+                uncertified: Some(reason.clone()),
+            },
+            LatentLawConsumed::EstimatedMovingLaw {
+                evidence,
+                arm,
+                contexts,
+                certificate: None,
+                uncertified: None,
+            } => LatentLawConsumed::EstimatedMovingLaw {
+                evidence,
+                arm,
+                contexts,
+                certificate: None,
+                uncertified: Some(reason.clone()),
+            },
+            other => other,
+        };
+        if let Some(reason) = latent_law_consumed.uncertified_reason() {
+            log::warn!(
+                "[{gate_context} latent-z] the {} law is fitted uncertified: {reason} (gam#2926)",
+                latent_law_consumed.label()
+            );
+        }
+        None
+    } else {
+        latent_moving_law
+    };
+    // gam#2926: certify a closed form the adequacy screen chose, by the error it
+    // controls. One pass over the rows of the converged fit: each row's
+    // intercept under the closed form, and its anchoring residual
+    // `Σ_k w_k Φ(η_k) − π` under the estimated law, and its sampling error. When
+    // their excess-KL estimate prefers that law, the fit is re-solved on it from
+    // these coefficients. A declared Gaussian law whose score failed the screen
+    // is measured the same way and kept, with the measurement warned about.
+    let mut uncertified: Option<LatentLawConsumed> = None;
+    let certificate_pending = matches!(
+        &latent_law_consumed,
+        LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
+            | LatentLawConsumed::DeclaredGaussian {
+                adequacy: Some(_),
+                residual: None,
+                uncertified: None,
+                ..
+            }
+    );
+    if certificate_pending {
+        let law = latent_certificate_law.as_ref().ok_or_else(|| {
+            FitFailure::raised(
+                FailureCategory::Invariant,
+                "bernoulli marginal-slope: a provisional closed form carried no estimated law to \
+                 certify it against",
+            )
+        })?;
+        let certificate_family = make_family(&designs[0], &designs[1], final_sigma_cell.get());
+        let block_states = &solved_fit.block_states;
+        let beta_h = certificate_family
+            .score_beta(block_states)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+        let beta_w = certificate_family
+            .link_beta(block_states)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+        // The estimated law was compressed from these weighted scores, so its
+        // sampling error scales with their Kish effective size.
+        let weight_sum = weights.iter().sum::<f64>();
+        let weight_sq_sum = weights.iter().map(|w| w * w).sum::<f64>();
+        let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
+        let rows = (0..y.len())
+            .into_par_iter()
+            .map(|row| -> Result<(f64, f64, f64, f64), String> {
+                let marginal_eta = block_states[0].eta[row];
+                let slope = block_states[1].eta[row];
+                let (intercept, _, _) = certificate_family.solve_row_intercept_base(
+                    row,
+                    marginal_eta,
+                    slope,
+                    beta_h,
+                    beta_w,
+                    None,
+                )?;
+                let (anchoring_residual, law_sd, mu) = certificate_family
+                    .evaluate_empirical_grid_anchoring_residual(
+                        intercept,
+                        marginal_eta,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        law,
+                    )?;
+                Ok((
+                    anchoring_residual,
+                    law_sd / sqrt_effective_n,
+                    mu * (1.0 - mu),
+                    weights[row],
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+        let certificate = ClosedFormAnchorResidual::from_rows(
+            &rows,
+            law.nodes.len(),
+            sqrt_effective_n * sqrt_effective_n,
+        )
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+        if let LatentLawConsumed::DeclaredGaussian {
+            adequacy: Some(adequacy),
+            residual,
+            ..
+        } = &mut latent_law_consumed
+        {
+            log::warn!(
+                "[{gate_context} latent-z] the declared Gaussian law is fitted although the score \
+                 fails the standard-normal adequacy screen (adequacy ledger, x = statistic / \
+                 bound, x<=1 passed: {}); the declaration's estimated excess anchoring loss at \
+                 the converged fit: {} (gam#2926)",
+                adequacy.ledger(),
+                certificate.summary()
+            );
+            *residual = Some(certificate);
+        } else if let LatentLawConsumed::EstimatedGaussianAdequate {
+            evidence,
+            adequacy,
+            residual,
+        } = &mut latent_law_consumed
+        {
+            if certificate.closed_form_chosen {
+                log::info!(
+                    "[{gate_context} latent-z] the closed form is certified at the converged fit: {} \
+                     (gam#2926)",
+                    certificate.summary()
+                );
+                *residual = Some(certificate);
+            } else if support == EmpiricalLatentMeasureSupport::StandardNormalOnly {
+                let missing = format!(
+                    "at the converged closed-form fit the estimated law is expected to be the more \
+                     accurate anchor ({}), and a learnable Gaussian-shift frailty sigma is \
+                     differentiated only under the closed form, so nothing can re-solve on it",
+                    certificate.summary()
+                );
+                log::warn!(
+                    "[{gate_context} latent-z] the closed form stays uncertified: {missing} (gam#2926)"
+                );
+                uncertified = Some(LatentLawConsumed::GaussianUncertified {
+                    evidence: evidence.clone(),
+                    adequacy: Some(adequacy.clone()),
+                    certificate: Some(certificate),
+                    missing,
+                });
+            } else {
+                log::info!(
+                    "[{gate_context} latent-z] at the converged closed-form fit the estimated law is \
+                     expected to be the more accurate anchor ({}); re-solving on it from the \
+                     closed-form coefficients (gam#2926)",
+                    certificate.summary()
+                );
+                return Ok(CertifiedFit::ReSolve(ClosedFormFallback {
+                    decision: LatentMeasureDecision {
+                        kind: LatentMeasureKind::GlobalEmpirical { grid: law.clone() },
+                        calibration: LatentMeasureCalibration::None,
+                        empirical_build: None,
+                        certificate_law: None,
+                        consumed: LatentLawConsumed::EstimatedGlobalByResidual {
+                            evidence: evidence.clone(),
+                            adequacy: adequacy.clone(),
+                            residual: certificate,
+                        },
+                        moving_law: None,
+                    },
+                    hints: ThetaHints {
+                        marginal_beta: Some(block_states[0].beta.clone()),
+                        slope_beta: Some(block_states[1].beta.clone()),
+                        residual_beta: None,
+                        score_warp_beta: beta_h.cloned(),
+                        link_dev_beta: beta_w.cloned(),
+                    },
+                }));
+            }
+        }
+    }
+    if let Some(next) = uncertified {
+        latent_law_consumed = next;
+    }
+    // gam#2926: certify the arm a moving law was fitted on against the other arms,
+    // by their cross-fitted cross-entropy at the converged fit. Each row is anchored
+    // at its fitted intercept; each arm's held-out law and the row's own score give
+    // the anchor's event probabilities. When the rule prefers another arm, the fit is
+    // re-solved on it from these coefficients.
+    if let Some(candidates) = latent_moving_law.as_ref() {
+        let certificate_family = make_family(&designs[0], &designs[1], final_sigma_cell.get());
+        let block_states = &solved_fit.block_states;
+        let beta_h = certificate_family
+            .score_beta(block_states)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+        let beta_w = certificate_family
+            .link_beta(block_states)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
+        let losses = (0..y.len())
+            .into_par_iter()
+            .map(|row| -> Result<Option<Vec<f64>>, moving_law_rule::MovingLawError> {
+                if !(weights[row] > 0.0) {
+                    return Ok(None);
+                }
+                let marginal_eta = block_states[0].eta[row];
+                let slope = block_states[1].eta[row];
+                let (intercept, _, _) = certificate_family
+                    .solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, None)
+                    .map_err(|reason| moving_law_rule::MovingLawError::AnchorProgram { reason })?;
+                let anchor = |law: &EmpiricalZGrid| {
+                    certificate_family.empirical_grid_anchor_log_probabilities(
+                        intercept,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        law,
+                    )
+                };
+                // The row's own score as a one-point law: the observed row's event
+                // probability, which each arm's is scored against.
+                let own = anchor(&EmpiricalZGrid {
+                    nodes: vec![candidates.own_score(row)],
+                    weights: vec![1.0],
+                })?;
+                let arms = candidates
+                    .row_laws(row)?
+                    .iter()
+                    .map(anchor)
+                    .collect::<Result<Vec<_>, _>>()?;
+                moving_law_rule::moving_law_row_losses(&[moving_law_rule::MovingLawAnchor {
+                    arms,
+                    own,
+                }])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let certificate = candidates.certify(weights.as_ref(), &losses)?;
+        if certificate.chosen == certificate.fitted {
+            log::info!(
+                "[{gate_context} latent-z] the {} law is certified at the converged fit: {} \
+                 (gam#2926)",
+                certificate.fitted.label(),
+                certificate.summary()
+            );
+            if let LatentLawConsumed::EstimatedMovingLaw {
+                certificate: slot, ..
+            } = &mut latent_law_consumed
+            {
+                *slot = Some(certificate);
+            }
+        } else {
+            log::info!(
+                "[{gate_context} latent-z] at the converged {} fit the moving-law certificate \
+                 chooses the {} law ({}); re-solving on it from these coefficients (gam#2926)",
+                certificate.fitted.label(),
+                certificate.chosen.label(),
+                certificate.summary()
+            );
+            // The slope and the flex deviations live on the latent axis: they carry
+            // over only when the chosen arm reads the same axis as the fitted one.
+            let calibrated_axis = |arm: MovingLawArm| {
+                matches!(
+                    arm,
+                    MovingLawArm::LocationScaleGaussian | MovingLawArm::LocationScaleEmpirical
+                )
+            };
+            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let chosen = certificate.chosen;
+            return Ok(CertifiedFit::ReSolve(ClosedFormFallback {
+                decision: candidates.decision_for(chosen, Some(certificate))?,
+                hints: ThetaHints {
+                    marginal_beta: Some(block_states[0].beta.clone()),
+                    slope_beta: same_axis.then(|| block_states[1].beta.clone()),
+                    residual_beta: None,
+                    score_warp_beta: if same_axis { beta_h.cloned() } else { None },
+                    link_dev_beta: if same_axis { beta_w.cloned() } else { None },
+                },
+            }));
+        }
+    }
     // #905 GENERATED-REGRESSOR (Murphy–Topel) SEAM. When the conditional
     // location-scale gate fired, the slope fit above treated the calibrated
     // score `ζ = (z − m̂(C))/√v̂(C)` as KNOWN, so `solved_fit.beta_covariance()`
@@ -3169,12 +3598,10 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     // kernels, the span-local cubic row calculus differentiates its observed-z
     // coefficient jets and scatters every active primary into the same reduced
     // full-beta frame as `covariance_conditional` (#2303).
-    let (latent_z_rank_int_calibration, latent_z_conditional_calibration) =
-        match latent_z_calibration {
-            LatentMeasureCalibration::None => (None, None),
-            LatentMeasureCalibration::RankInverseNormal(cal) => (Some(cal), None),
-            LatentMeasureCalibration::ConditionalLocationScale(cal) => (None, Some(cal)),
-        };
+    let latent_z_conditional_calibration = match latent_z_calibration {
+        LatentMeasureCalibration::None => None,
+        LatentMeasureCalibration::ConditionalLocationScale(cal) => Some(cal),
+    };
     // #905/#1028/#2303: apply the Murphy–Topel correction while every block is
     // still in the exact reduced covariance frame. The rigid kernel uses its
     // three-axis tower; flex fits use the observed-z derivative channel from
@@ -3183,7 +3610,7 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     // may be padded with zero sensitivity or skipped.
     // gam#2718. This pair — a fired conditional location-scale calibration and a
     // non-StandardNormal second-stage measure — is a legitimate POINT-ESTIMATION
-    // state, and the site that mints it (`build_latent_measure_with_geometry`)
+    // state, and the site that mints it (`build_latent_measure_decision`)
     // says so in as many words. It used to be minted there and destroyed HERE by
     // a `return Err` that took the point estimates down with the covariance.
     //
@@ -3466,7 +3893,7 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
     // builder (src/main.rs run_fit_bernoulli_marginal_slope → inference) owns
     // that truncation; it must record p_m (= marginal_design.design.ncols())
     // and slice the persisted marginal β to it. Survival mirrors this seam.
-    Ok(BernoulliMarginalSlopeFitResult {
+    Ok(CertifiedFit::Fitted(Box::new(BernoulliMarginalSlopeFitResult {
         fit: solved_fit,
         marginalspec_resolved: resolved_specs.remove(0),
         slopespec_resolved: resolved_specs.remove(0),
@@ -3480,10 +3907,10 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
         link_dev_runtime,
         gaussian_frailty_sd: final_sigma_cell.get(),
         cross_block_warnings,
-        latent_z_rank_int_calibration,
+        latent_law_consumed,
         latent_z_conditional_calibration,
         residual_repair: residual_runtime
             .as_ref()
             .map(|runtime| runtime.geometry.clone()),
-    })
+    })))
 }

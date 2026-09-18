@@ -66,6 +66,11 @@ pub(crate) fn fit_survival_marginal_slope_terms(
     // clipping a fit by elapsed time is non-deterministic and machine-dependent,
     // so a slow-to-converge fit is fixed or bounded by work, never by a timer.
     //
+    // gam#2926: a closed form the adequacy screen chose, and the arm a moving law
+    // was fitted on, are certified at the converged fit; where the certificate
+    // prefers another law, the same spec is re-solved on it from the converged
+    // coefficients, and the re-solve carries that certificate.
+    //
     // A declared law with many atoms is fit on its certified compression
     // (gam#2928), designed first over the default operating range. Where a
     // converged row's anchor misses the target, the compression is refined at
@@ -74,14 +79,50 @@ pub(crate) fn fit_survival_marginal_slope_terms(
     // Only a declared law can be compressed; whether it is, is the certified
     // compression's own decision (`CompressedLaw::compress`).
     if spec.declared_latent_law.is_none() {
-        return fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options, &[])
-            .map(|(result, _)| result);
+        let (outcome, _) =
+            fit_survival_marginal_slope_terms_impl(data, spec.clone(), options, kappa_options, &[], None)?;
+        return match outcome {
+            SurvivalCertifiedFit::Fitted(result) => Ok(*result),
+            SurvivalCertifiedFit::ReSolve(fallback) => {
+                match fit_survival_marginal_slope_terms_impl(
+                    data,
+                    spec,
+                    options,
+                    kappa_options,
+                    &[],
+                    Some(fallback),
+                )?
+                .0
+                {
+                    SurvivalCertifiedFit::Fitted(result) => Ok(*result),
+                    SurvivalCertifiedFit::ReSolve(_) => Err(FitFailure::invariant(
+                        "survival marginal-slope: a re-solve on the law its certificate chose \
+                         asked to be re-solved again, but it carries that certificate",
+                    )),
+                }
+            }
+        };
     }
     let mut design = default_design();
     let mut refinements = 0usize;
     loop {
-        let (result, missed) =
-            fit_survival_marginal_slope_terms_impl(data, spec.clone(), options, kappa_options, &design)?;
+        let (outcome, missed) = fit_survival_marginal_slope_terms_impl(
+            data,
+            spec.clone(),
+            options,
+            kappa_options,
+            &design,
+            None,
+        )?;
+        // A declared law is the caller's statement about the score: nothing is
+        // estimated, so no certificate asks for a re-solve.
+        let SurvivalCertifiedFit::Fitted(result) = outcome else {
+            return Err(FitFailure::invariant(
+                "survival marginal-slope: a fit on a declared latent law asked to be re-solved \
+                 on another law, but a declared law carries no certificate",
+            ));
+        };
+        let result = *result;
         if missed.is_empty() {
             return Ok(result);
         }
@@ -119,6 +160,23 @@ pub(crate) fn fit_survival_marginal_slope_terms(
     }
 }
 
+/// What a converged survival fit whose certificate prefers another law hands the
+/// re-solve on that law (gam#2926): each score's calibration and law, the label the
+/// re-solved fit records, which carries the certificate that chose it, and the
+/// coefficients it starts from.
+pub(crate) struct SurvivalClosedFormFallback {
+    calibrations: Vec<crate::bms::LatentMeasureCalibration>,
+    measures: Vec<crate::bms::LatentMeasureKind>,
+    consumed: crate::bms::LatentLawConsumed,
+    hints: ThetaHints,
+}
+
+/// One survival fit's outcome under its latent-law certificate.
+pub(crate) enum SurvivalCertifiedFit {
+    Fitted(Box<SurvivalMarginalSlopeFitResult>),
+    ReSolve(SurvivalClosedFormFallback),
+}
+
 /// Refinements of a declared law's compression a fit may run before it
 /// refuses (gam#2928).
 const DECLARED_LAW_COMPRESSION_REFINEMENTS: usize = 3;
@@ -132,8 +190,18 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     compression_design: &[DesignPoint],
-) -> Result<(SurvivalMarginalSlopeFitResult, Vec<DesignPoint>), FitFailure> {
+    fallback: Option<SurvivalClosedFormFallback>,
+) -> Result<(SurvivalCertifiedFit, Vec<DesignPoint>), FitFailure> {
     let fit_started = std::time::Instant::now();
+    let (fallback_law, fallback_hints) = match fallback {
+        Some(SurvivalClosedFormFallback {
+            calibrations,
+            measures,
+            consumed,
+            hints,
+        }) => (Some((calibrations, measures, consumed)), Some(hints)),
+        None => (None, None),
+    };
     let mut spec = spec;
     // The spec validator checks only what the caller supplied (#2937).
     validate_spec(&spec).map_err(FitFailure::input)?;
@@ -417,9 +485,68 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .map_err(FitFailure::invariant)?,
         );
     }
-    // The latent-measure gate reads the caller's scores and declared law.
-    let latent_calibration =
-        resolve_survival_latent_score_calibration(&mut spec, &marginal_design).map_err(FitFailure::input)?;
+    let latent_calibration = match fallback_law {
+        // gam#2926: the re-solve of a closed form whose certificate preferred the
+        // estimated law anchors on that law, and records why.
+        // With several scores it anchors on their joint law, transported on the
+        // same conditioning span the gate used, and persists each score's own law.
+        Some((calibrations, measures, consumed)) => {
+            let k = spec.z.ncols();
+            if measures.len() != k || calibrations.len() != k {
+                return Err(FitFailure::invariant(format!(
+                    "survival marginal-slope re-solve carried {} laws and {} calibrations for \
+                     K={k} scores",
+                    measures.len(),
+                    calibrations.len()
+                )));
+            }
+            let absorber_active = spec
+                .score_influence_jacobian
+                .as_ref()
+                .is_some_and(|jacobian| jacobian.ncols() > 0);
+            let conditioning = if absorber_active {
+                None
+            } else {
+                Some(
+                    marginal_design
+                        .design
+                        .try_to_dense_arc("survival marginal-slope re-solve conditioning span")
+                        .map_err(FitFailure::input)?,
+                )
+            };
+            let raw_scores = spec.z.clone();
+            // A location-scale law the certificate chose replaces the score before
+            // any consumer sees it, as the gate's own decision would have.
+            for (col, calibration) in calibrations.iter().enumerate() {
+                if let crate::bms::LatentMeasureCalibration::ConditionalLocationScale(cal) =
+                    calibration
+                {
+                    let a_block = conditioning.as_ref().ok_or_else(|| {
+                        FitFailure::invariant(
+                            "survival marginal-slope re-solve on a location-scale law requires \
+                             the marginal conditioning block",
+                        )
+                    })?;
+                    let calibrated = cal
+                        .apply(raw_scores.column(col), a_block.view())
+                        .map_err(FitFailure::invariant)?;
+                    spec.z.column_mut(col).assign(&calibrated);
+                }
+            }
+            SurvivalLatentScoreCalibration {
+                per_score: calibrations,
+                per_score_measure: measures,
+                consumed,
+                certificate_laws: vec![None; k],
+                moving_law: None,
+                raw_scores,
+                conditioning,
+            }
+        }
+        // The latent-measure gate reads the caller's scores and declared law.
+        None => resolve_survival_latent_score_calibration(&mut spec, &marginal_design, data)
+            .map_err(FitFailure::input)?,
+    };
     // gam#2766: `Σ` in this family's defining identity is `Var(z | a)`, so the
     // pooled matrix above is only the right object when that conditional
     // covariance does not move. One robust Rao score test per score PAIR, on the
@@ -450,7 +577,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if latent_calibration
             .per_score_measure
             .iter()
-            .any(|measure| measure.is_empirical())
+            .any(|measure| !matches!(measure, crate::bms::LatentMeasureKind::StandardNormal))
         {
             if let Some(reason) = joint_latent_law_measure_refusal(
                 spec.z.ncols(),
@@ -945,7 +1072,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         kappa_options,
     )?;
 
-    let hints = RefCell::new(ThetaHints::default());
+    // A re-solve on the estimated law starts from the closed-form coefficients.
+    let hints = RefCell::new(fallback_hints.unwrap_or_default());
     // #808 operating-point warm start for the slope block. The inner
     // joint-Newton seeds each block at `spec.initial_beta` (→ `hints.slope_beta`
     // via `build_slope_blockspec`). At the default `g = 0` seed the slope
@@ -2211,6 +2339,305 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )
     };
 
+    // gam#2926: certify a closed form the adequacy screen chose, by the error it
+    // controls: at every training row's exit, and at its entry where the entry
+    // survival probability is below one, the anchoring residual under the
+    // estimated law at the closed-form anchor of the converged fit, and its
+    // sampling error. When their excess-KL estimate prefers that law, the fit is
+    // re-solved on it from these coefficients.
+    //
+    // With several scores the law is their joint law, transported to each row's
+    // context by the covariance field the closed form lowered on (gam#2929), and
+    // the residual is the closed form's under it.
+    //
+    // A declared Gaussian law whose score failed the screen is measured the same
+    // way and kept, with the measurement warned about.
+    let mut latent_law_consumed = latent_calibration.consumed.clone();
+    let certificate_pending = matches!(
+        &latent_law_consumed,
+        crate::bms::LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
+            | crate::bms::LatentLawConsumed::DeclaredGaussian {
+                adequacy: Some(_),
+                residual: None,
+                ..
+            }
+    );
+    if certificate_pending {
+        let laws = latent_calibration
+            .certificate_laws
+            .iter()
+            .cloned()
+            .collect::<Option<Vec<_>>>();
+        let frame_unavailable = anchored_kernel_unavailable_reason(&spec);
+        let certificate_family = make_family(
+            &solved.designs[0],
+            &solved.designs[1],
+            &certified_theta,
+            FlexActivation::On,
+        )
+        .map_err(FitFailure::invariant)?;
+        let block_states = &solved.fit.block_states;
+        // The estimated law was compressed from these weighted scores, so its
+        // sampling error scales with their Kish effective size.
+        let weight_sum = spec.weights.iter().sum::<f64>();
+        let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
+        let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
+        let to_rows = |per_anchor: [(f64, f64, f64); 2], weight: f64| {
+            per_anchor.map(|(anchoring_residual, law_sd, scale)| {
+                (anchoring_residual, law_sd / sqrt_effective_n, scale, weight)
+            })
+        };
+        let (anchors, nodes) = if spec.z.ncols() == 1 {
+            let law = laws
+                .as_ref()
+                .and_then(|laws| laws.first())
+                .ok_or_else(|| {
+                    FitFailure::invariant(
+                        "survival marginal-slope: a provisional closed form carried no \
+                         estimated law to certify it against",
+                    )
+                })?;
+            let anchors = (0..n)
+                .into_par_iter()
+                .map(|row| -> Result<[(f64, f64, f64, f64); 2], String> {
+                    Ok(to_rows(
+                        certificate_family.closed_form_certificate_anchors(
+                            row,
+                            block_states,
+                            law,
+                        )?,
+                        spec.weights[row],
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(FitFailure::numerical)?;
+            (anchors, law.nodes.len())
+        } else {
+            let (_, joint_law) = build_joint_latent_law(
+                spec.z.view(),
+                spec.weights.view(),
+                &score_covariance,
+                latent_calibration
+                    .conditioning
+                    .as_ref()
+                    .map(|design| design.view()),
+                DEFAULT_JOINT_LATENT_NODES,
+            )
+            .map_err(FitFailure::unclassified)?;
+            let anchors = (0..n)
+                .into_par_iter()
+                .map_init(
+                    || super::calibration::JointCertificateWorkspace::new(
+                        &certificate_family,
+                        &joint_law,
+                    ),
+                    |workspace, row| -> Result<[(f64, f64, f64, f64); 2], String> {
+                        let workspace = workspace.as_mut().map_err(|error| error.clone())?;
+                        Ok(to_rows(
+                            certificate_family.closed_form_joint_certificate_anchors(
+                                row,
+                                block_states,
+                                &joint_law,
+                                workspace,
+                            )?,
+                            spec.weights[row],
+                        ))
+                    },
+                )
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(FitFailure::numerical)?;
+            (anchors, joint_law.node_count())
+        };
+        let rows: Vec<(f64, f64, f64, f64)> = anchors.into_iter().flatten().collect();
+        let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
+            &rows,
+            nodes,
+            sqrt_effective_n * sqrt_effective_n,
+        )
+        .map_err(FitFailure::numerical)?;
+        if let crate::bms::LatentLawConsumed::DeclaredGaussian {
+            adequacy: Some(adequacy),
+            residual,
+            ..
+        } = &mut latent_law_consumed
+        {
+            log::warn!(
+                "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
+                 the score fails the standard-normal adequacy screen (adequacy ledger, x = \
+                 statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
+                 anchoring loss at the converged fit: {} (gam#2926)",
+                adequacy.ledger(),
+                certificate.summary()
+            );
+            *residual = Some(certificate);
+        } else if let crate::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            evidence,
+            adequacy,
+            residual,
+        } = &mut latent_law_consumed
+        {
+            if certificate.closed_form_chosen {
+                log::info!(
+                    "[survival-marginal-slope latent-z] the closed form is certified at the \
+                     converged fit: {} (gam#2926)",
+                    certificate.summary()
+                );
+                *residual = Some(certificate);
+            } else if let Some(reason) = frame_unavailable {
+                return Err(FitFailure::input(
+                    crate::bms::LatentLawRefusal::EstimatedLawCannotReSolve {
+                        context: "survival-marginal-slope".to_string(),
+                        certificate: certificate.summary(),
+                        reason: reason.to_string(),
+                    }
+                    .to_string(),
+                ));
+            } else {
+                log::info!(
+                    "[survival-marginal-slope latent-z] at the converged closed-form fit the \
+                     estimated law is expected to be the more accurate anchor ({}); re-solving on \
+                     it from the closed-form coefficients (gam#2926)",
+                    certificate.summary()
+                );
+                let laws = laws.ok_or_else(|| {
+                    FitFailure::invariant(
+                        "survival marginal-slope: a re-solve on the estimated law needs every \
+                         score's own law, and a provisional closed form carried none for some \
+                         score",
+                    )
+                })?;
+                return Ok((
+                    SurvivalCertifiedFit::ReSolve(SurvivalClosedFormFallback {
+                        calibrations: vec![
+                            crate::bms::LatentMeasureCalibration::None;
+                            laws.len()
+                        ],
+                        measures: laws
+                            .into_iter()
+                            .map(|grid| crate::bms::LatentMeasureKind::GlobalEmpirical { grid })
+                            .collect(),
+                        consumed: crate::bms::LatentLawConsumed::EstimatedGlobalByResidual {
+                            evidence: evidence.clone(),
+                            adequacy: adequacy.clone(),
+                            residual: certificate,
+                        },
+                        hints: ThetaHints {
+                            time_beta: Some(block_states[0].beta.clone()),
+                            marginal_beta: Some(block_states[1].beta.clone()),
+                            slope_beta: Some(block_states[2].beta.clone()),
+                            score_warp_beta: None,
+                            link_dev_beta: None,
+                            influence_beta: None,
+                        },
+                    }),
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+    // gam#2926: certify the arm a moving law was fitted on against the other arms,
+    // by their cross-fitted cross-entropy at the converged fit, over each row's exit
+    // and entry anchors, both read at its partner's times (the row's own times are an
+    // outcome of its score). An entry anchor whose survival is one to rounding
+    // weighs its arms' tails by the row's own vanishing event probability, so it
+    // costs nothing it does not observe. When the rule prefers another arm, the fit
+    // is re-solved on it from these coefficients.
+    if let Some(candidates) = latent_calibration.moving_law.as_ref() {
+        let certificate_family = make_family(
+            &solved.designs[0],
+            &solved.designs[1],
+            &certified_theta,
+            FlexActivation::On,
+        )
+        .map_err(FitFailure::invariant)?;
+        let block_states = &solved.fit.block_states;
+        let losses = (0..n)
+            .into_par_iter()
+            .map(|row| -> Result<Option<Vec<f64>>, crate::bms::moving_law_rule::MovingLawError> {
+                if !(spec.weights[row] > 0.0) {
+                    return Ok(None);
+                }
+                let partner = candidates.partner(row);
+                // The row's own score as a one-point law: its survival
+                // probabilities at the anchors are what each arm's are scored on.
+                let own = certificate_family.moving_law_certificate_anchors(
+                    row,
+                    partner,
+                    block_states,
+                    &crate::bms::EmpiricalZGrid {
+                        nodes: vec![candidates.own_score(row)],
+                        weights: vec![1.0],
+                    },
+                )?;
+                let arms = candidates
+                    .row_laws(row)?
+                    .iter()
+                    .map(|law| {
+                        certificate_family.moving_law_certificate_anchors(row, partner, block_states, law)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let anchors: Vec<crate::bms::moving_law_rule::MovingLawAnchor> = (0..2)
+                    .map(|anchor| crate::bms::moving_law_rule::MovingLawAnchor {
+                        arms: arms.iter().map(|arm| arm[anchor]).collect(),
+                        own: own[anchor],
+                    })
+                    .collect();
+                crate::bms::moving_law_rule::moving_law_row_losses(&anchors)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let certificate = candidates.certify(&spec.weights, &losses)?;
+        if certificate.chosen == certificate.fitted {
+            log::info!(
+                "[survival-marginal-slope latent-z] the {} law is certified at the converged fit: \
+                 {} (gam#2926)",
+                certificate.fitted.label(),
+                certificate.summary()
+            );
+            if let crate::bms::LatentLawConsumed::EstimatedMovingLaw {
+                certificate: slot, ..
+            } = &mut latent_law_consumed
+            {
+                *slot = Some(certificate);
+            }
+        } else {
+            log::info!(
+                "[survival-marginal-slope latent-z] at the converged {} fit the moving-law \
+                 certificate chooses the {} law ({}); re-solving on it from these coefficients \
+                 (gam#2926)",
+                certificate.fitted.label(),
+                certificate.chosen.label(),
+                certificate.summary()
+            );
+            // The slope lives on the latent axis: it carries over only when the
+            // chosen arm reads the same axis as the fitted one.
+            let calibrated_axis = |arm: crate::bms::MovingLawArm| {
+                matches!(
+                    arm,
+                    crate::bms::MovingLawArm::LocationScaleGaussian
+                        | crate::bms::MovingLawArm::LocationScaleEmpirical
+                )
+            };
+            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let chosen = certificate.chosen;
+            let decision = candidates.decision_for(chosen, Some(certificate))?;
+            return Ok((
+                SurvivalCertifiedFit::ReSolve(SurvivalClosedFormFallback {
+                calibrations: vec![decision.calibration],
+                measures: vec![decision.kind],
+                consumed: decision.consumed,
+                hints: ThetaHints {
+                    time_beta: Some(block_states[0].beta.clone()),
+                    marginal_beta: Some(block_states[1].beta.clone()),
+                    slope_beta: same_axis.then(|| block_states[2].beta.clone()),
+                    score_warp_beta: None,
+                    link_dev_beta: None,
+                    influence_beta: None,
+                },
+                }),
+                Vec::new(),
+            ));
+        }
+    }
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
     let mut solved_fit = solved.fit;
@@ -2279,7 +2706,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         Some((record, missed)) => (Some(record), missed),
         None => (None, Vec::new()),
     };
-    Ok((SurvivalMarginalSlopeFitResult {
+    Ok((SurvivalCertifiedFit::Fitted(Box::new(SurvivalMarginalSlopeFitResult {
         fit: solved_fit,
         marginalspec_resolved: resolved_specs.remove(0),
         slopespec_resolved: resolved_specs.remove(0),
@@ -2304,6 +2731,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         latent_measure: latent_calibration.primary_measure().clone(),
         latent_law_compression,
         declared_latent_law,
+        latent_law_consumed,
         latent_z_calibrations: latent_calibration.per_score,
         latent_conditioning_reproducible,
         score_covariance: score_covariance.pooled_covariance().to_dense(),
@@ -2322,5 +2750,5 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .as_ref()
             .map(|z_tilde| z_tilde.ncols()),
         influence_absorber_design: influence_absorber_residualized,
-    }, missed_anchors))
+    })), missed_anchors))
 }

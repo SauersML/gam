@@ -602,6 +602,7 @@ impl BernoulliMarginalSlopePredictor {
                 grids,
                 top_k,
                 bandwidth,
+                mixture,
                 ..
             } => {
                 let conditioning = self.local_conditioning_view(input).ok_or_else(|| {
@@ -623,7 +624,9 @@ impl BernoulliMarginalSlopePredictor {
                     .into_iter()
                     .map(|row| {
                         let point = row.iter().copied().collect::<Vec<_>>();
-                        Self::local_empirical_mixture_for_point(&point, centers, *top_k, *bandwidth)
+                        Self::local_empirical_mixture_for_point(
+                            &point, centers, *top_k, *bandwidth, *mixture,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(LatentMeasureKind::LocalEmpirical {
@@ -633,6 +636,7 @@ impl BernoulliMarginalSlopePredictor {
                     grids: grids.clone(),
                     top_k: *top_k,
                     bandwidth: *bandwidth,
+                    mixture: *mixture,
                     train_row_mixtures: Arc::new(mixtures),
                 })
             }
@@ -783,132 +787,23 @@ impl BernoulliMarginalSlopePredictor {
         centers: &[Vec<f64>],
         top_k: usize,
         bandwidth: f64,
+        mixture: crate::bms::LocalLawMixture,
     ) -> Result<Vec<(usize, f64)>, EstimationError> {
-        if centers.is_empty() {
-            return Err(EstimationError::InvalidInput(
-                "local empirical latent prediction has no centers".to_string(),
-            ));
-        }
-        if top_k == 0 {
-            return Err(EstimationError::InvalidInput(
-                "local empirical latent prediction top_k must be positive".to_string(),
-            ));
-        }
-        if !(bandwidth.is_finite() && bandwidth > 0.0) {
-            return Err(EstimationError::InvalidInput(format!(
-                "local empirical latent prediction bandwidth must be finite and positive, got {bandwidth}"
-            )));
-        }
-        let bw2 = bandwidth * bandwidth;
-        let mut distances = Vec::<(usize, f64)>::with_capacity(centers.len());
-        for (idx, center) in centers.iter().enumerate() {
-            if center.len() != point.len() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "local empirical latent prediction center {idx} dimension mismatch: center={}, point={}",
-                    center.len(),
-                    point.len()
-                )));
-            }
-            let d2 = center
-                .iter()
-                .zip(point.iter())
-                .map(|(&c, &x)| {
-                    let delta = x - c;
-                    delta * delta
-                })
-                .sum::<f64>();
-            if !d2.is_finite() {
-                return Err(EstimationError::InvalidInput(
-                    "local empirical latent prediction distance is non-finite".to_string(),
-                ));
-            }
-            distances.push((idx, d2));
-        }
-        distances.sort_by(|left, right| {
-            left.1
-                .partial_cmp(&right.1)
-                .expect("validated local empirical distances are finite")
-        });
-        let k = top_k.min(distances.len());
-        let mut mixture = Vec::with_capacity(k);
-        let mut total = 0.0;
-        // Kernel weights relative to the nearest center (`distances` is sorted
-        // ascending): the nearest weight is exactly 1, so the mixture never
-        // underflows as a whole, and a center far enough to underflow relative
-        // to it honestly contributes nothing — the log-sum-exp shift, not a
-        // `1e-300` floor that would turn an all-underflow mixture into a
-        // uniform one.
-        let d2_nearest = distances.first().map_or(0.0, |&(_, d2)| d2);
-        for &(idx, d2) in distances.iter().take(k) {
-            let weight = (-0.5 * (d2 - d2_nearest) / bw2).exp();
-            mixture.push((idx, weight));
-            total += weight;
-        }
-        if !(total.is_finite() && total > 0.0) {
-            return Err(EstimationError::InvalidInput(
-                "local empirical latent prediction mixture has non-positive total weight"
-                    .to_string(),
-            ));
-        }
-        for (_, weight) in &mut mixture {
-            *weight /= total;
-        }
-        Ok(mixture)
+        // The fit computes every training row's mixture with the same function
+        // (gam#2926), so a row's fitted law and its predicted law are one object.
+        crate::bms::estimated_latent_law::local_empirical_mixture_for_point(
+            point, centers, top_k, bandwidth, mixture,
+        )
+        .map_err(EstimationError::InvalidInput)
     }
 
     fn combine_empirical_grids(
         grids: &[EmpiricalZGrid],
         mixture: &[(usize, f64)],
     ) -> Result<EmpiricalZGrid, EstimationError> {
-        let total_len = mixture
-            .iter()
-            .map(|&(idx, _)| grids.get(idx).map_or(0, |grid| grid.nodes.len()))
-            .sum::<usize>();
-        let mut nodes = Vec::with_capacity(total_len);
-        let mut weights = Vec::with_capacity(total_len);
-        let mut total_weight = 0.0;
-        for &(grid_idx, grid_weight) in mixture {
-            if !(grid_weight.is_finite() && grid_weight >= 0.0) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "local empirical latent prediction mixture weight must be finite and non-negative, got {grid_weight}"
-                )));
-            }
-            let grid = grids.get(grid_idx).ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "local empirical latent prediction grid index {grid_idx} is out of bounds for {} grids",
-                    grids.len()
-                ))
-            })?;
-            if grid.nodes.len() != grid.weights.len() || grid.nodes.is_empty() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "local empirical latent prediction grid {grid_idx} is invalid: nodes={}, weights={}",
-                    grid.nodes.len(),
-                    grid.weights.len()
-                )));
-            }
-            for (node, weight) in grid.pairs() {
-                let combined_weight = grid_weight * weight;
-                if !(node.is_finite() && combined_weight.is_finite() && combined_weight >= 0.0) {
-                    return Err(EstimationError::InvalidInput(
-                        "local empirical latent prediction grid contains invalid node/weight"
-                            .to_string(),
-                    ));
-                }
-                nodes.push(node);
-                weights.push(combined_weight);
-                total_weight += combined_weight;
-            }
-        }
-        if !(total_weight.is_finite() && total_weight > 0.0) {
-            return Err(EstimationError::InvalidInput(
-                "local empirical latent prediction combined grid has non-positive total weight"
-                    .to_string(),
-            ));
-        }
-        for weight in &mut weights {
-            *weight /= total_weight;
-        }
-        Ok(EmpiricalZGrid { nodes, weights })
+        // The fit combines every training row's grids with the same function
+        // (gam#2926): sorted once, equal nodes coalesced, validated.
+        crate::bms::combine_empirical_grids(grids, mixture).map_err(EstimationError::InvalidInput)
     }
 
     fn empirical_grid_for_prediction_row(
@@ -924,6 +819,7 @@ impl BernoulliMarginalSlopePredictor {
                 grids,
                 top_k,
                 bandwidth,
+                mixture,
                 ..
             } => {
                 let conditioning = self.local_conditioning_view(input).ok_or_else(|| {
@@ -947,7 +843,9 @@ impl BernoulliMarginalSlopePredictor {
                 }
                 let point = conditioning.row(row).to_vec();
                 let mixture =
-                    Self::local_empirical_mixture_for_point(&point, centers, *top_k, *bandwidth)?;
+                    Self::local_empirical_mixture_for_point(
+                        &point, centers, *top_k, *bandwidth, *mixture,
+                    )?;
                 Self::combine_empirical_grids(grids, &mixture).map(Some)
             }
         }
@@ -1900,48 +1798,40 @@ impl BernoulliMarginalSlopePredictor {
                     }));
                     (final_eta_internal, marginal_scales, slope_scales)
                 }
-                LatentMeasureKind::GlobalEmpirical { grid } => {
-                    let mut final_eta = Array1::<f64>::zeros(n);
-                    let mut marginal_scales = Array1::<f64>::zeros(n);
-                    let mut slope_scales = Array1::<f64>::zeros(n);
-                    for i in 0..n {
-                        let (intercept, a_marginal, a_slope) = self
-                            .empirical_rigid_intercept_and_gradient(
+                LatentMeasureKind::GlobalEmpirical { .. } | LatentMeasureKind::LocalEmpirical { .. } => {
+                    // Each row takes its own law and solves its own anchor with no
+                    // warm start shared across rows, so the rows run in parallel and
+                    // every value is the one the serial loop computed.
+                    let rows = (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            let grid = self
+                                .empirical_grid_for_prediction_row(input, i)?
+                                .ok_or_else(|| {
+                                    EstimationError::InvalidInput(
+                                        "empirical latent prediction did not produce a row grid"
+                                            .to_string(),
+                                    )
+                                })?;
+                            self.empirical_rigid_intercept_and_gradient(
                                 marginal_eta[i],
                                 slope_eta[i],
                                 &grid.nodes,
                                 &grid.weights,
-                            )?;
-                        final_eta[i] = intercept + scale * slope_eta[i] * z[i];
-                        marginal_scales[i] = a_marginal;
-                        slope_scales[i] = a_slope + scale * z[i];
-                    }
-                    (final_eta, marginal_scales, slope_scales)
-                }
-                LatentMeasureKind::LocalEmpirical { .. } => {
-                    let mut final_eta = Array1::<f64>::zeros(n);
-                    let mut marginal_scales = Array1::<f64>::zeros(n);
-                    let mut slope_scales = Array1::<f64>::zeros(n);
-                    for i in 0..n {
-                        let grid = self
-                            .empirical_grid_for_prediction_row(input, i)?
-                            .ok_or_else(|| {
-                                EstimationError::InvalidInput(
-                                    "local empirical latent prediction did not produce a row grid"
-                                        .to_string(),
-                                )
-                            })?;
-                        let (intercept, a_marginal, a_slope) = self
-                            .empirical_rigid_intercept_and_gradient(
-                                marginal_eta[i],
-                                slope_eta[i],
-                                &grid.nodes,
-                                &grid.weights,
-                            )?;
-                        final_eta[i] = intercept + scale * slope_eta[i] * z[i];
-                        marginal_scales[i] = a_marginal;
-                        slope_scales[i] = a_slope + scale * z[i];
-                    }
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let final_eta = Array1::from_iter(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, &(intercept, _, _))| intercept + scale * slope_eta[i] * z[i]),
+                    );
+                    let marginal_scales = Array1::from_iter(rows.iter().map(|&(_, a_marginal, _)| a_marginal));
+                    let slope_scales = Array1::from_iter(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, &(_, _, a_slope))| a_slope + scale * z[i]),
+                    );
                     (final_eta, marginal_scales, slope_scales)
                 }
             };
@@ -2711,28 +2601,38 @@ impl BernoulliMarginalSlopePredictor {
                     return Ok((eta, eta_t));
                 }
                 _ => {
-                    let mut eta = Array1::<f64>::zeros(n);
-                    let mut eta_t = Array1::<f64>::zeros(n);
-                    for i in 0..n {
-                        let grid = self
-                            .empirical_grid_for_prediction_row(input, i)?
-                            .ok_or_else(|| {
-                                EstimationError::InvalidInput(
-                                    "empirical latent prediction did not produce a row grid"
-                                        .to_string(),
-                                )
-                            })?;
-                        let (intercept, eta_q, a_slope) = self
-                            .empirical_rigid_intercept_and_gradient(
+                    // Rows are independent, as in `final_eta_and_gradient_from_theta`:
+                    // each takes its own law and solves its own anchor.
+                    let rows = (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            let grid = self
+                                .empirical_grid_for_prediction_row(input, i)?
+                                .ok_or_else(|| {
+                                    EstimationError::InvalidInput(
+                                        "empirical latent prediction did not produce a row grid"
+                                            .to_string(),
+                                    )
+                                })?;
+                            self.empirical_rigid_intercept_and_gradient(
                                 marginal_eta[i],
                                 slope_eta[i],
                                 &grid.nodes,
                                 &grid.weights,
-                            )?;
-                        eta[i] = intercept + scale * slope_eta[i] * z[i];
-                        let eta_b = a_slope + scale * z[i];
-                        eta_t[i] = eta_q * q_t[i] + eta_b * b_t[i];
-                    }
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let eta = Array1::from_iter(
+                        rows.iter()
+                            .enumerate()
+                            .map(|(i, &(intercept, _, _))| intercept + scale * slope_eta[i] * z[i]),
+                    );
+                    let eta_t = Array1::from_iter(rows.iter().enumerate().map(
+                        |(i, &(_, eta_q, a_slope))| {
+                            let eta_b = a_slope + scale * z[i];
+                            eta_q * q_t[i] + eta_b * b_t[i]
+                        },
+                    ));
                     return Ok((eta, eta_t));
                 }
             }

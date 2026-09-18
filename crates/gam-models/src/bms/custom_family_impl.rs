@@ -588,7 +588,7 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
             intercept_warm_starts: self
                 .intercept_warm_starts
                 .as_ref()
-                .map(|_| new_intercept_warm_start_cache(self.y.len())),
+                .map(|cache| cache.empty_like()),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
             // Its same-β exact-cache and rigid-tensor stores are its own too.
@@ -3026,7 +3026,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_third_contracted_many(
                 row, primary, q, b, beta_h, beta_w, row_ctx, row_dirs, &grid,
             );

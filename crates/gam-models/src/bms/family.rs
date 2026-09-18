@@ -1,6 +1,9 @@
 use super::*;
 
 use crate::fnv1a::Fnv1a;
+use crate::latent_anchor::{
+    AnchorGrid, AnchorGridOwned, AnchorRootCache, AnchorRowContext, AnchorSolveCounts,
+};
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
@@ -146,12 +149,25 @@ pub(super) struct BernoulliInterceptWarmStartCache {
     pub(super) intercept_value: Vec<AtomicU64>,
     pub(super) intercept_tag: Vec<AtomicU64>,
     pub(super) predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
+    /// The law the rigid empirical intercept anchors on, with the root slots it
+    /// is solved in; `None` for a cache built without one, whose rows solve cold.
+    pub(super) anchor_law: Option<BernoulliAnchorLaw>,
 }
 
 impl BernoulliInterceptWarmStartCache {
     #[inline]
     pub(super) fn len(&self) -> usize {
         self.intercept_value.len()
+    }
+
+    /// A cache of the same rows on the same law holding nothing. Each multistart
+    /// search starts from one, as a freshly built family does (gnomon#2359), so no
+    /// search reads another's warm starts or root slots.
+    pub(super) fn empty_like(&self) -> Arc<Self> {
+        Arc::new(warm_start_cache(
+            self.len(),
+            self.anchor_law.as_ref().map(BernoulliAnchorLaw::empty_like),
+        ))
     }
 
     /// Return the cached intercept iff the slot's stored `beta_tag` matches
@@ -258,28 +274,193 @@ impl BernoulliInterceptWarmStartCache {
     }
 }
 
-pub(super) fn new_intercept_warm_start_cache(n: usize) -> Arc<BernoulliInterceptWarmStartCache> {
-    Arc::new(BernoulliInterceptWarmStartCache {
+/// The per-row intercept warm-start cache, carrying the fit's latent law and the
+/// root slots its rigid empirical intercepts are solved in (gam#2926).
+pub(super) fn new_intercept_warm_start_cache_on_law(
+    latent_measure: &LatentMeasureKind,
+    n: usize,
+) -> Result<Arc<BernoulliInterceptWarmStartCache>, String> {
+    let anchor_law = BernoulliAnchorLaw::from_kind(latent_measure, n)?;
+    Ok(Arc::new(warm_start_cache(n, anchor_law)))
+}
+
+fn warm_start_cache(
+    n: usize,
+    anchor_law: Option<BernoulliAnchorLaw>,
+) -> BernoulliInterceptWarmStartCache {
+    BernoulliInterceptWarmStartCache {
         intercept_value: (0..n).map(|_| AtomicU64::new(f64::NAN.to_bits())).collect(),
         intercept_tag: (0..n).map(|_| AtomicU64::new(0)).collect(),
         predictors: (0..n).map(|_| Mutex::new(None)).collect(),
-    })
+        anchor_law,
+    }
 }
 
-/// FNV-1a 64-bit hash of per-row state determining the empirical-grid rigid
-/// intercept root. The root depends only on `(marginal.q, slope)` (the grid
-/// nodes/weights are immutable per `latent_measure`), so hashing these two
-/// scalars is sufficient to distinguish trust-region trials at different β.
-/// Returned tag is guaranteed non-zero (zero is remapped to one) so the
-/// cache's "never written" sentinel cannot collide with a real key.
-#[inline]
-pub(super) fn hash_intercept_warm_start_key_rigid(marginal_q: f64, slope: f64) -> u64 {
-    let mut hash = Fnv1a::new();
-    // Domain separator for the rigid (empirical-grid) cache stream.
-    hash.mix_byte(0xb1);
-    hash.mix_f64(marginal_q);
-    hash.mix_f64(slope);
-    hash.finish_nonzero()
+/// The latent law the rigid empirical intercept anchors on, materialised once
+/// per fit — one grid for a global law, one per training row for a local
+/// mixture — with the roots solved on it (gam#2926, gam#2943 part 3(iii)).
+///
+/// The calibration `Σ_k w_k Φ(a + b·u_k) = Φ(q)` at the OBSERVED slope `b` is
+/// the anchoring equation of [`crate::latent_anchor`]: with `Φ(−x) = 1 − Φ(x)` and
+/// weights summing to one it reads `Σ_k w_k Φ(−(a + b·u_k)) = Φ(−q)`. So `a(q, b)`
+/// is that equation's root, and one slot per row keeps it across the outer
+/// search: a bitwise repeat of a row's equation is answered from the slot, and
+/// any other equation is solved from the closed form (gam#2983), so every root
+/// is the one its equation defines.
+pub(super) struct BernoulliAnchorLaw {
+    /// Immutable once built, so a search member shares it (gnomon#2359).
+    grids: Arc<BernoulliAnchorGrids>,
+    roots: AnchorRootCache,
+}
+
+enum BernoulliAnchorGrids {
+    Global(AnchorGridOwned),
+    PerRow(Vec<LocalRowLaw>),
+}
+
+/// One training row's local mixture, combined once: the grid every consumer of
+/// the row reads, its log-weights for the anchor, and the mixture it was combined
+/// from, which a lookup must name to be served.
+struct LocalRowLaw {
+    grid: EmpiricalZGrid,
+    log_weights: Vec<f64>,
+    mixture: Vec<(usize, f64)>,
+}
+
+impl BernoulliMarginalSlopeFamily {
+    /// Row `row`'s empirical latent grid. A local mixture is served from the grid
+    /// the fit's anchor law combined once, instead of being combined again on
+    /// every call; any other measure, or a row whose mixture is not the one the
+    /// law combined, is read from the measure itself.
+    pub(super) fn training_row_grid(
+        &self,
+        row: usize,
+    ) -> Result<Option<std::borrow::Cow<'_, EmpiricalZGrid>>, String> {
+        if let LatentMeasureKind::LocalEmpirical {
+            train_row_mixtures, ..
+        } = &self.latent_measure
+            && let Some(law) = self
+                .intercept_warm_starts
+                .as_ref()
+                .and_then(|cache| cache.anchor_law.as_ref())
+            && let Some(mixture) = train_row_mixtures.get(row)
+            && let Some(grid) = law.local_row_grid(row, mixture)
+        {
+            return Ok(Some(std::borrow::Cow::Borrowed(grid)));
+        }
+        self.latent_measure.empirical_grid_for_training_row(row)
+    }
+}
+
+impl BernoulliAnchorLaw {
+    /// Materialise `kind` for `n` training rows; `None` for the standard-normal
+    /// law, whose anchor is the closed form.
+    pub(super) fn from_kind(kind: &LatentMeasureKind, n: usize) -> Result<Option<Self>, String> {
+        let grids = match kind {
+            LatentMeasureKind::StandardNormal => return Ok(None),
+            LatentMeasureKind::GlobalEmpirical { grid } => {
+                BernoulliAnchorGrids::Global(AnchorGridOwned::from_grid(grid))
+            }
+            LatentMeasureKind::LocalEmpirical {
+                train_row_mixtures, ..
+            } => BernoulliAnchorGrids::PerRow(
+                (0..n)
+                    .into_par_iter()
+                    .map(|row| {
+                        let missing = || {
+                            format!(
+                                "bernoulli marginal-slope local latent law produced no grid for \
+                                 row {row}"
+                            )
+                        };
+                        let grid = kind
+                            .empirical_grid_for_training_row(row)?
+                            .ok_or_else(missing)?
+                            .into_owned();
+                        let mixture = train_row_mixtures.get(row).ok_or_else(missing)?;
+                        Ok(LocalRowLaw {
+                            log_weights: grid.weights.iter().map(|w| w.ln()).collect(),
+                            grid,
+                            mixture: mixture.iter().copied().collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
+        };
+        let shared_across_rows = matches!(grids, BernoulliAnchorGrids::Global(_));
+        Ok(Some(Self {
+            grids: Arc::new(grids),
+            roots: AnchorRootCache::new(n, 1, shared_across_rows),
+        }))
+    }
+
+    /// The same law with empty root slots, for a search that must not read
+    /// another search's roots (gnomon#2359).
+    fn empty_like(&self) -> Self {
+        Self {
+            grids: Arc::clone(&self.grids),
+            roots: self.roots.empty_like(),
+        }
+    }
+
+    /// Row `row`'s law with the roots solved on it. `nodes` is the grid the
+    /// caller read for the row; a grid that is not this law's is refused, so no
+    /// row is ever answered with another law's roots.
+    pub(super) fn row_context(
+        &self,
+        row: usize,
+        nodes: &[f64],
+    ) -> Result<AnchorRowContext<'_>, String> {
+        let grid = match self.grids.as_ref() {
+            BernoulliAnchorGrids::Global(grid) => grid.view(),
+            BernoulliAnchorGrids::PerRow(rows) => {
+                let law = rows.get(row).ok_or_else(|| {
+                    format!("bernoulli marginal-slope anchor law has no grid for row {row}")
+                })?;
+                AnchorGrid {
+                    nodes: &law.grid.nodes,
+                    weights: &law.grid.weights,
+                    log_weights: &law.log_weights,
+                }
+            }
+        };
+        let bits = |values: &[f64]| {
+            (
+                values.len(),
+                values.first().map(|value| value.to_bits()),
+                values.last().map(|value| value.to_bits()),
+            )
+        };
+        if bits(grid.nodes) != bits(nodes) {
+            return Err(format!(
+                "bernoulli marginal-slope anchor: row {row} read a grid of {} nodes that is not \
+                 the law of {} nodes its root slots were built on",
+                nodes.len(),
+                grid.nodes.len()
+            ));
+        }
+        Ok(AnchorRowContext {
+            grid,
+            roots: Some(&self.roots),
+        })
+    }
+
+    /// Row `row`'s combined local grid, when this law combined it from exactly
+    /// `mixture`.
+    fn local_row_grid(&self, row: usize, mixture: &[(usize, f64)]) -> Option<&EmpiricalZGrid> {
+        match self.grids.as_ref() {
+            BernoulliAnchorGrids::PerRow(rows) => rows
+                .get(row)
+                .filter(|law| law.mixture.as_slice() == mixture)
+                .map(|law| &law.grid),
+            BernoulliAnchorGrids::Global(_) => None,
+        }
+    }
+
+    /// What the root slots have answered with so far.
+    pub(super) fn counts(&self) -> AnchorSolveCounts {
+        self.roots.counts()
+    }
 }
 
 /// FNV-1a 64-bit hash of per-row state determining the FLEX intercept root.

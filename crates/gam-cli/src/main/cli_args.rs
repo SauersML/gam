@@ -321,8 +321,9 @@ pub(crate) struct FitArgs {
     #[arg(long = "slope-formula")]
     pub(crate) slope_formula: Option<String>,
     /// Column containing the latent score z for the Bernoulli marginal-slope
-    /// family. The fit auto-detects whether to use the standard-normal or
-    /// empirical latent measure for marginal calibration.
+    /// family. By default the fit anchors the marginal index on the estimated
+    /// law of the score; the Gaussian closed form is used only when declared
+    /// (`latent_measure = "gaussian"`), and is refused when the score contradicts it.
     #[arg(long = "z-column")]
     pub(crate) z_column: Option<String>,
     /// Residual genetic repair column (gam#2924, Bernoulli marginal-slope):

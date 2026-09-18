@@ -173,6 +173,13 @@ slow-timeout = { period = "600s", terminate-after = 4 }
 filter = 'test(/bms_residual_repair_2924::residual_block_anchors_on_a_declared_skewed_score_law/)'
 slow-timeout = { period = "600s", terminate-after = 4 }
 
+# The gam#2926 survival moving-law acceptance probes each fit the survival default on a
+# moving conditional law and certify it (10 held-out laws per arm), and the shape-moving
+# probe re-solves on the local law and fits the declared location-scale law beside it.
+[[profile.default.overrides]]
+filter = 'test(/moving_law_certificate_2926::/)'
+slow-timeout = { period = "600s", terminate-after = 4 }
+
 # The gam#2927 survival marginal-slope posterior-mean measurement fits the
 # #2765 follow-up-varying-slope fixture once (n = 800, a quadratic time margin
 # on the slope) and then runs 2 × 20,000 full plug-in survival predictions as

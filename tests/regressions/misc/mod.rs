@@ -54,6 +54,8 @@ mod zero_weight_rows_not_equivalent_to_absent_rows;
 mod bms_conditional_latent_estimand_2768;
 mod bms_covariance_declined_2718;
 mod bms_residual_repair_2924;
+mod bms_estimated_latent_law_2926;
+mod bms_moving_law_certificate_2926;
 mod bug_hunt_1680_near_collinear_additive_recovery;
 mod bug_hunt_2623_sampled_marginal_outer_gradient_frame;
 mod corrected_covariance_sigma_node_calibration_2728;

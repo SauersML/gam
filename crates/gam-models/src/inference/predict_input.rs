@@ -190,7 +190,10 @@ fn build_residual_repair_feature_matrix(
     Ok(out)
 }
 
-fn build_marginal_slope_local_auxiliary_matrix(
+/// The scaled context covariates a saved marginal-slope model's local latent
+/// law is replayed from, one row per prediction row; `None` for every other law.
+/// Shared by both marginal-slope families' predictors (gam#2926).
+pub fn build_marginal_slope_local_auxiliary_matrix(
     model: &FittedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,

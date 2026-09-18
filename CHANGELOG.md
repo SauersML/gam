@@ -91,6 +91,44 @@
   `inference::rho_posterior::k_hat_standard_error` give the grade's resolution.
   **Saved models:** new payloads write only the new tokens. A payload written earlier still
   reads, because the old tokens are accepted as read-only aliases.
+- **Marginal-slope fits anchor on the estimated law of the score by default**
+  (#2926). Both families test the score's conditional law on the
+  marginal-index span. Where that law does not move and the score passes the
+  standard-normal adequacy screen, the fit uses the closed form, kept at the
+  converged fit only when the rows' anchoring residuals under the estimated
+  law say it is expected to be at least as accurate as that law's own anchor
+  (`D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0`), and records it as
+  `estimated-gaussian-adequate`; otherwise the fit is re-solved on the
+  estimated law (`estimated-global-by-residual`). Otherwise it anchors the index on
+  one estimated finite law, or on local laws by context where the law moves,
+  with the score on its own axis. The rank inverse-normal and automatic
+  conditional standardisation are gone from the default.
+- `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain declare
+  the Gaussian closed form. A declaration is refused when the score's
+  conditional law moves on the span; when the pooled score fails the
+  adequacy screen it is fitted with a warning, and the model records the
+  ledger and the declaration's excess anchoring loss `D̂`.
+  `latent_measure="conditional-location-scale"`
+  keeps the location-scale law on the span as an explicit choice, and
+  `declared_latent_law` now serves the Bernoulli family too.
+- Saved models record which law the fit consumed in `latent_law_consumed`.
+  Models saved earlier replay their old calibration unchanged.
+- Fits that anchor on an estimated law are slower than the closed form until
+  the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
+  score took 199 s where the closed form took 4.6 s, and on a moving law
+  1 031 s where the previous default refused. A closed form the certificate
+  keeps costs what it did (5.1 s against 5.3 s on a Gaussian score).
+- Survival configurations whose kernel is closed-form only (flex blocks, an
+  influence absorber, time-wiggle, follow-up-varying slope) keep the closed
+  form, certify it by `D̂`, and are refused naming `D̂` where it prefers the
+  estimated law, which nothing there can re-solve on yet (#2948). A fit on
+  any of them whose law departs or moves records `gaussian-uncertified` with
+  a warning naming what is missing.
+- Several survival scores anchor on their joint law where some score departs
+  from the standard normal. Where a score's law moves, every score keeps the
+  closed form as `gaussian-uncertified`, naming that score (#2949). A closed
+  form the screen chose for several scores is certified by `D̂` on their joint
+  law, and re-solved on it or refused naming `D̂` where `D̂ > 0`.
 
 ## gamfit 0.1.268 (2026-09-11)
 

@@ -4399,5 +4399,16 @@
     },
     "reason": "#2822 commit A: closed_form_beta_gauge_directions emitted a harmonic atom's chart generators as structural nulls of the penalized objective only when the atom's ARD block was empty (atom_step_gauge_is_structural_null). Commit A makes the coordinate ARD prior mandatory and refuses an empty block at criterion entry. A centered coordinate prior moves under every generator on its axes, so no chart phase direction is a null of the penalized objective (#2720), the declaration is unreachable, and its producer, its one install site (fit_drivers.rs run_joint_fit_arrow_schur) and its pin tests_chart_gauge_structural_null_2267 are deleted.",
     "evidence": "Gate job 1245170 (base f58b6715be, tree 292c4eec): public_api_census.py refuses exactly this removal before this entry. git grep -n -w closed_form_beta_gauge_directions at eead230646b20751308a3a660796cd440f70e6bd finds it only in chart_gauges.rs (declaration and a doc link), the fit_drivers.rs install branch and the deleted test."
+  },
+  {
+    "base": "0672d284b2db09ef27c3f7ec5da26b9740ae1b9d",
+    "removed": {
+      "crates/gam-models/src/bms/family.rs::hash_intercept_warm_start_key_rigid": 1,
+      "crates/gam-models/src/bms/family.rs::new_intercept_warm_start_cache": 1,
+      "crates/gam-models/src/bms/mod.rs::build_latent_measure_with_geometry": 1,
+      "crates/gam-models/src/bms/mod.rs::is_empirical": 1
+    },
+    "reason": "gam#2926: the marginal-slope latent-law gate returns a typed LatentMeasureDecision that carries which law the fit consumed, and the Bernoulli empirical intercept is solved in root slots on the fit's anchor law. build_latent_measure_with_geometry (the tuple-returning gate) and LatentMeasureKind::is_empirical are replaced by build_latent_measure_decision and exhaustive matches on the kind; new_intercept_warm_start_cache and hash_intercept_warm_start_key_rigid (the per-row rigid intercept key cache) are replaced by new_intercept_warm_start_cache_on_law, whose root slots are keyed on the law itself.",
+    "evidence": "scripts/public_api_census.py --base bf8bcd492c --head the landing commit on MSI acl42 measured exactly these four removals. Every caller at the base (bms/block_specs.rs build_latent_measure_with_geometry, is_empirical and new_intercept_warm_start_cache; bms/cell_moment_assembly.rs hash_intercept_warm_start_key_rigid; survival/marginal_slope/fit_entry.rs is_empirical and new_intercept_warm_start_cache) moved to the successors. Successor tests: bms::anchor_law_2926_tests::rigid_intercept_slots_answer_repeats_and_seed_moved_iterates_2926 and rigid_intercept_slots_refuse_a_grid_that_is_not_the_law_2926 (root slots), bms::tests::a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declaration (the gate), bms::moving_law_rule::tests (the moving-law certificate), and the root bms_estimated_latent_law_2926 and bms_moving_law_certificate_2926 regressions."
   }
 ]

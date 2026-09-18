@@ -130,6 +130,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
         residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }

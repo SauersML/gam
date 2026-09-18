@@ -56,7 +56,10 @@ fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
-        intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
+        intercept_warm_starts: Some(
+            new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
+                .expect("an intercept cache on the standard-normal law"),
+        ),
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };
@@ -194,7 +197,10 @@ fn flex_fixture() -> (BernoulliMarginalSlopeFamily, Array2<f64>, Array2<f64>, us
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
-        intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
+        intercept_warm_starts: Some(
+            new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
+                .expect("an intercept cache on the standard-normal law"),
+        ),
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(Mutex::new(None)),
     };

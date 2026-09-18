@@ -1,4 +1,6 @@
-use crate::bms::{LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration};
+use crate::bms::{
+    LatentLawConsumed, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
+};
 use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
@@ -89,10 +91,19 @@ use std::path::Path;
 // (`RailedCoordinateFact::face`, `NewtonPolishRail::face`) inside the fit artifacts. Both carry
 // serde defaults, so an older payload loads with no polish and every face `Unrecorded`: no
 // record is ever read as a face kind it did not record.
-pub const MODEL_PAYLOAD_VERSION: u32 = 22;
+// v23 records which latent law a marginal-slope fit consumed (`latent_law_consumed`,
+// gam#2926): an estimate with its certificate, a declaration, or the Gaussian closed form.
+// The field carries a serde default, so a v22, v21, v20, v19 or v18 payload, which predates it,
+// loads with no record, which reads as the law the pre-gam#2926 automatic gate chose; a v22
+// binary refuses a v23 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 23;
+
+/// The schema before the latent-law record (gam#2926), whose only difference is that
+/// field's absence.
+const LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 22;
 
 /// The schema before the certificate's Newton polish and face kinds (#2954), whose only
-/// difference is those fields' absence.
+/// difference from [`LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION`] is those fields' absence.
 const NEWTON_POLISH_ABSENT_PAYLOAD_VERSION: u32 = 21;
 
 /// The schema before the rho-posterior adequacy tokens (#2946 T2), whose only
@@ -113,8 +124,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 5] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 6] = [
     MODEL_PAYLOAD_VERSION,
+    LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
     NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
     RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
     EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
@@ -630,6 +642,12 @@ pub struct FittedModelPayload {
     /// models saved before the block existed load as "no residual block".
     #[serde(default)]
     pub residual_repair: Option<crate::bms::ResidualRepairGeometry>,
+    /// Which latent law the marginal-slope fit consumed (gam#2926): an estimate,
+    /// a declaration, or the Gaussian closed form. The law itself is
+    /// `latent_measure`. `None` for other families and for models saved before
+    /// the field existed, whose law the pre-gam#2926 automatic gate chose.
+    #[serde(default)]
+    pub latent_law_consumed: Option<LatentLawConsumed>,
     #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
@@ -1008,6 +1026,7 @@ impl FittedModelPayload {
             latent_z_rank_int_calibration: None,
             latent_z_conditional_calibration: None,
             residual_repair: None,
+            latent_law_consumed: None,
             marginal_baseline: None,
             baseline_slope: None,
             baseline_slopes: None,
@@ -7372,6 +7391,8 @@ mod tests {
     /// `FitInference::edf_rank_bound`, carries `#[serde(default)]`, so it reads as empty.
     /// The v20 schema before the rho-posterior adequacy tokens (#2946 T2) passes too;
     /// its old tokens read as aliases.
+    /// The v22 schema before the latent-law record (gam#2926) passes too; the field it lacks
+    /// carries `#[serde(default)]`.
     #[test]
     fn the_payload_before_the_edf_rank_bound_status_is_readable_2901() {
         let blocks = || {
@@ -7384,6 +7405,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
             NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
             RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
             EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
@@ -7394,7 +7416,8 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
         assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
@@ -7486,6 +7509,61 @@ mod tests {
                 MODEL_PAYLOAD_VERSION + 1
             )),
             "{err}"
+        );
+    }
+
+    /// gam#2926: a v22 payload, written before `latent_law_consumed` existed, is read
+    /// by this binary and records no latent law; a current payload with no record
+    /// round-trips; and a payload claiming a schema above this binary's is refused by
+    /// its version, not by a field it cannot parse.
+    #[test]
+    fn a_payload_before_the_latent_law_record_is_read_and_a_newer_one_is_refused_2926() {
+        let blocks = || {
+            vec![FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            }]
+        };
+        let payload =
+            marginal_slope_payload(LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION, saved_fit(blocks()));
+        let mut value = serde_json::to_value(&payload).expect("serialize a v22 payload");
+        value
+            .as_object_mut()
+            .expect("a payload is a JSON object")
+            .remove("latent_law_consumed")
+            .expect("the record is written, as null when there is none");
+        let older: FittedModelPayload =
+            serde_json::from_value(value).expect("a v22 payload without the record deserializes");
+        assert!(older.latent_law_consumed.is_none());
+        FittedModel::from_payload(older)
+            .payload()
+            .validate_payload_version()
+            .expect("a v22 payload is readable");
+
+        let current = marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks()));
+        assert!(current.latent_law_consumed.is_none());
+        let text = serde_json::to_string(&current).expect("serialize a current payload");
+        let reloaded: FittedModelPayload =
+            serde_json::from_str(&text).expect("a current payload round-trips");
+        assert!(reloaded.latent_law_consumed.is_none());
+        FittedModel::from_payload(reloaded)
+            .payload()
+            .validate_payload_version()
+            .expect("a current payload is readable");
+
+        let newer = MODEL_PAYLOAD_VERSION + 1;
+        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
+            .payload()
+            .validate_payload_version()
+            .expect_err("a payload from a newer schema is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("payload schema mismatch")
+                && message.contains(&format!("file has version={newer}"))
+                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+            "a newer payload must be refused by its version: {message}"
         );
     }
 

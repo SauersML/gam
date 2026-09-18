@@ -35,13 +35,13 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
 // gate ran this binary. A bump that adds no payload key changes what a field
 // means, and `inference/model.rs` documents that beside the constant.
 //
-// Enumerated at schema version 20 (i2939's enumeration at 19, re-counted by
-// i2955): `FittedModelPayload` declares 103 `pub` fields and has no
-// `#[serde(skip)]` and no `#[serde(flatten)]`. Four carry `skip_serializing_if`,
-// and these fixtures leave all four at their skipped value:
+// Enumerated at schema version 22 (i2939's enumeration at 19, re-counted by
+// i2955 at 20 and by gam#2926 at 22): `FittedModelPayload` declares 104 `pub`
+// fields and has no `#[serde(skip)]` and no `#[serde(flatten)]`. Four carry
+// `skip_serializing_if`, and these fixtures leave all four at their skipped value:
 // `declared_latent_law=None`, `declared_latent_law_compression=None`,
 // `group_metadata=None` and `deployment_extensions=[]`. So the JSON payload
-// carries 103 - 4 = 99 keys. The version 12 fitted-estimator tag is one of them:
+// carries 104 - 4 = 100 keys. The version 12 fitted-estimator tag is one of them:
 // it keeps an expectile target from decoding as a Gaussian observation law.
 //
 // Stateful-sync audit for the fields added since the last correct pin (96 keys,
@@ -68,7 +68,11 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
 // payload key or a stateful-link slot.
 // Schema 22 records the #2954 certificate's Newton polish and each railed coordinate's
 // face kind inside the fit artifacts: neither is a payload key or a stateful-link slot.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 99;
+// Schema 23 adds `latent_law_consumed`, which records the latent law a marginal-slope
+// fit consumed and its certificate (gam#2926, `#[serde(default)]` only, so it always
+// serializes); it is a fit record, not a fitted link state, so no stateful-link slot
+// changes.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 100;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {

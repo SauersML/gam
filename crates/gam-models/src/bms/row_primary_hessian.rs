@@ -566,7 +566,7 @@ impl BernoulliMarginalSlopeFamily {
         let (intercept, m_a, intercept_fast_path) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, stats)?
         } else {
-            let intercept = match self.latent_measure.empirical_grid_for_training_row(row)? {
+            let intercept = match self.training_row_grid(row)? {
                 None => {
                     rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale())
                 }
@@ -3044,7 +3044,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let r = primary.total;
         scratch.reset(need_hessian);
-        let empirical_grid = self.latent_measure.empirical_grid_for_training_row(row)?;
+        let empirical_grid = self.training_row_grid(row)?;
         if empirical_grid.is_some() {
             if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
                 return Err("non-finite empirical flexible row context in VGH evaluation".into());
@@ -3739,7 +3739,7 @@ impl BernoulliMarginalSlopeFamily {
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
                     let [t3_q, t3_g] = if let Some(grid) =
-                        self.latent_measure.empirical_grid_for_training_row(row)?
+                        self.training_row_grid(row)?
                     {
                         let point = self.primary_point_from_block_states(
                             row,
@@ -3815,7 +3815,7 @@ impl BernoulliMarginalSlopeFamily {
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
                     let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] = if let Some(grid) =
-                        self.latent_measure.empirical_grid_for_training_row(row)?
+                        self.training_row_grid(row)?
                     {
                         let point = self.primary_point_from_block_states(
                             row,
@@ -3964,7 +3964,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_third_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
             );
@@ -4549,7 +4549,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_third_trace_gradient(
                 row, primary, q, b, beta_h, beta_w, row_ctx, gram, &grid,
             );
@@ -5847,7 +5847,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_fourth_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir_u, dir_v, &grid,
             );
@@ -7294,7 +7294,7 @@ impl BernoulliMarginalSlopeFamily {
                 direction_v.len()
             ));
         }
-        let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? else {
+        let Some(grid) = self.training_row_grid(row)? else {
             return direction_pairs
                 .iter()
                 .map(|(direction_u, direction_v)| {

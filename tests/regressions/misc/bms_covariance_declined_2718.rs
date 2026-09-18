@@ -351,10 +351,14 @@ fn fit_bms(
     marginal: &str,
     slope: &str,
     label: &str,
+    latent_measure: Option<&str>,
 ) -> gam::families::bms::BernoulliMarginalSlopeFitResult {
+    // A declared latent law names the marginal-slope family it is declared for.
     let cfg = FitConfig {
+        family: latent_measure.map(|_| "bernoulli-marginal-slope".to_string()),
         slope_formula: Some(slope.to_string()),
         z_column: Some("prs_z".to_string()),
+        latent_measure: latent_measure.map(str::to_string),
         ..FitConfig::default()
     };
     match fit_from_formula(marginal, data, &cfg) {
@@ -372,11 +376,14 @@ fn fit_bms(
 fn bms_publishes_the_corrected_covariance_on_a_global_empirical_measure_2484() {
     gam::init_parallelism();
     let data = prs_pc_confounded_dataset();
+    // gam#2926: the calibrated pair this correction is about is minted only by
+    // the declared conditional location-scale law.
     let out = fit_bms(
         &data,
         MARGINAL_FORMULA_CENTERS6,
         SLOPE_FORMULA_CENTERS6,
         "prs/pc-confounded BMS fit",
+        Some("conditional-location-scale"),
     );
 
     // 1. The point estimates are published. This never stopped being true, and
@@ -485,6 +492,7 @@ fn bms_standard_normal_latent_measure_declares_nothing_2718() {
         MARGINAL_FORMULA_CENTERS60,
         SLOPE_FORMULA_CENTERS60,
         "rank-reduced centers=60 BMS fit",
+        None,
     );
 
     assert!(
@@ -602,6 +610,7 @@ fn a_published_fit_ships_the_curvature_a_declination_would_be_about_2718() {
         MARGINAL_FORMULA_CENTERS6,
         SLOPE_FORMULA_CENTERS6,
         "prs/pc-confounded BMS fit (persistence arm)",
+        Some("conditional-location-scale"),
     );
 
     assert!(

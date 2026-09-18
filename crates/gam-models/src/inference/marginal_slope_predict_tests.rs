@@ -284,6 +284,7 @@ fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
             grids: grids.clone(),
             top_k: 1,
             bandwidth: 0.25,
+            mixture: crate::bms::LocalLawMixture::default(),
             train_row_mixtures: std::sync::Arc::new(Vec::new()),
         },
         baseline_marginal: 0.0,

@@ -263,6 +263,51 @@ impl RootSlot {
     }
 }
 
+/// What a law's root slots answered with (gam#2943 part 3(iii)). A hit answers
+/// from a stored root of bitwise the same equation; every other equation is
+/// solved from the closed form (gam#2983). Evaluations are residual
+/// evaluations, one per Halley or bisection step.
+#[derive(Debug, Default)]
+struct AnchorSolveCounters {
+    hits: AtomicU64,
+    cold_solves: AtomicU64,
+    cold_evaluations: AtomicU64,
+}
+
+/// A snapshot of a law's [`AnchorSolveCounters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnchorSolveCounts {
+    pub(crate) hits: u64,
+    pub(crate) cold_solves: u64,
+    pub(crate) cold_evaluations: u64,
+}
+
+impl AnchorSolveCounters {
+    fn snapshot(&self) -> AnchorSolveCounts {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        AnchorSolveCounts {
+            hits: load(&self.hits),
+            cold_solves: load(&self.cold_solves),
+            cold_evaluations: load(&self.cold_evaluations),
+        }
+    }
+}
+
+impl std::fmt::Display for AnchorSolveCounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let per_solve = if self.cold_solves == 0 {
+            0.0
+        } else {
+            self.cold_evaluations as f64 / self.cold_solves as f64
+        };
+        write!(
+            f,
+            "{} hits, {} solves from the closed form ({per_solve:.2} residual evaluations each)",
+            self.hits, self.cold_solves,
+        )
+    }
+}
+
 /// The roots already solved on one law (gam#2928): `slots_per_row` slots per
 /// training row — one per location channel the family anchors, two for
 /// survival's entry and exit — and, for a global law, a cross-row table.
@@ -290,6 +335,7 @@ pub(crate) struct AnchorRootCache {
     /// Slot kind `s`'s entries at `s·SHARED_ROOT_SLOTS + hash`.
     shared: Option<Vec<RootSlot>>,
     shared_index: fn(u64, u64) -> u64,
+    counters: AnchorSolveCounters,
 }
 
 impl AnchorRootCache {
@@ -312,7 +358,24 @@ impl AnchorRootCache {
             slots_per_row,
             shared: shared_across_rows.then(|| slots(slots_per_row * SHARED_ROOT_SLOTS)),
             shared_index,
+            counters: AnchorSolveCounters::default(),
         }
+    }
+
+    /// A cache of the same shape holding nothing: what a search that must not
+    /// read another search's roots starts from (gnomon#2359).
+    pub(crate) fn empty_like(&self) -> Self {
+        Self::with_shared_index(
+            self.slots.len() / self.slots_per_row.max(1),
+            self.slots_per_row,
+            self.shared.is_some(),
+            self.shared_index,
+        )
+    }
+
+    /// What the slots have answered with so far.
+    pub(crate) fn counts(&self) -> AnchorSolveCounts {
+        self.counters.snapshot()
     }
 
     /// Row `row`'s slot `slot`; `None` for a slot the cache does not keep.
@@ -439,9 +502,20 @@ fn anchor_in_slot(
             shared.write(anchor);
         }
     };
+    let counters = &cache.counters;
+    let cold = || -> Result<f64, String> {
+        let (root, evaluations) =
+            solve_anchor_counted(q, observed_slope, context.grid, gaussian_anchor(q, observed_slope))?;
+        counters.cold_solves.fetch_add(1, Ordering::Relaxed);
+        counters
+            .cold_evaluations
+            .fetch_add(evaluations as u64, Ordering::Relaxed);
+        Ok(root)
+    };
     if let (Some(own), Some(stored)) = (own, own_root)
         && (stored.q, stored.slope) == inputs
     {
+        counters.hits.fetch_add(1, Ordering::Relaxed);
         let taylor = if differentiate { own.read_table(&stored) } else { None };
         if taylor.is_some() || !differentiate {
             return Ok(StoredAnchor {
@@ -466,13 +540,17 @@ fn anchor_in_slot(
         .filter(|stored| stored.root.is_finite() && (stored.q, stored.slope) == inputs);
     let root = match shared_match {
         Some(stored) if stored.taylor.is_some() || !differentiate => {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
             if let Some(own) = own {
                 own.write(&stored);
             }
             return Ok(stored);
         }
-        Some(stored) => stored.root,
-        None => solve_anchor(q, observed_slope, context.grid)?,
+        Some(stored) => {
+            counters.hits.fetch_add(1, Ordering::Relaxed);
+            stored.root
+        }
+        None => cold()?,
     };
     let anchor = StoredAnchor {
         q: inputs.0,
@@ -514,6 +592,16 @@ pub(crate) fn solve_anchor_from(
     grid: AnchorGrid<'_>,
     seed: f64,
 ) -> Result<f64, String> {
+    solve_anchor_counted(q, observed_slope, grid, seed).map(|(root, _)| root)
+}
+
+/// [`solve_anchor_from`], with the residual evaluations the solve spent.
+fn solve_anchor_counted(
+    q: f64,
+    observed_slope: f64,
+    grid: AnchorGrid<'_>,
+    seed: f64,
+) -> Result<(f64, usize), String> {
     solve_anchor_with(q, observed_slope, grid, seed, anchor_log_residual)
 }
 
@@ -529,7 +617,7 @@ fn solve_anchor_with(
     grid: AnchorGrid<'_>,
     seed: f64,
     residual: AnchorResidual,
-) -> Result<f64, String> {
+) -> Result<(f64, usize), String> {
     if !(q.is_finite() && observed_slope.is_finite() && seed.is_finite()) {
         return Err(format!(
             "survival marginal-slope anchor requires finite q, slope and seed, got q={q}, b={observed_slope}, seed={seed}"
@@ -551,7 +639,7 @@ fn solve_anchor_with(
     let mut step_cap = (0.25 * (1.0 + seed.abs())).max(1.0);
     let mut last_step = f64::INFINITY;
     let rounding = anchor_residual_rounding(log_target, grid.len());
-    for _ in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
+    for evaluation in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
         let (value, first, second) = residual(alpha, observed_slope, grid, survival_side, log_target)?;
         if value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
             // The accepted `α` still carries a residual up to the tolerance,
@@ -565,13 +653,14 @@ fn solve_anchor_with(
             // bracket, else the accepted point stands.
             let polished = alpha - value / first;
             let in_model = (value * second).abs() <= first * first;
-            return Ok(
+            return Ok((
                 if in_model && polished.is_finite() && polished > below && polished < above {
                     polished
                 } else {
                     alpha
                 },
-            );
+                evaluation + 1,
+            ));
         }
         let root_is_above = if increasing { value < 0.0 } else { value > 0.0 };
         if root_is_above {
@@ -2179,9 +2268,9 @@ mod anchor_tests {
                 let noise = (grid.view().len() as f64 + 4.0) * f64::EPSILON * (1.0 + log_target.abs());
                 for &b in &[-4.0, -1.6, -0.5, 0.0, 0.5, 1.6, 4.0] {
                     let seed = gaussian_anchor(q, b);
-                    let linear = solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual)
+                    let (linear, _) = solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual)
                         .unwrap_or_else(|e| panic!("{label} q={q} b={b}: linear solve: {e}"));
-                    let logged =
+                    let (logged, _) =
                         solve_anchor_with(q, b, grid.view(), seed, anchor_log_residual_in_log_space)
                             .unwrap_or_else(|e| panic!("{label} q={q} b={b}: log solve: {e}"));
                     let reference = |alpha: f64| {

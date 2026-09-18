@@ -2625,6 +2625,10 @@ pub(crate) fn run_predict_survival(
             &derivative_offset_exit,
             &effective_primary_offset,
             &effective_noise_offset,
+            gam::predict::input::build_marginal_slope_local_auxiliary_matrix(
+                model, data, col_map,
+            )
+            .map_err(|error| error.to_string())?,
         )?;
 
         let (eta, mean, eta_se_opt, mean_lo, mean_hi): (

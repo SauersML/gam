@@ -8991,3 +8991,102 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
          (relative) at row {worst_row}, device_selected={selected}"
     );
 }
+
+/// An equal-mass law at `m` standard-normal quantiles: the midpoint rule on the
+/// probability scale, whose error on a smooth integrand is O(1/m²).
+fn normal_quantile_law(m: usize) -> crate::bms::EmpiricalZGrid {
+    let nodes: Vec<f64> = (0..m)
+        .map(|k| {
+            gam_math::probability::standard_normal_quantile((k as f64 + 0.5) / m as f64)
+                .expect("standard-normal quantile")
+        })
+        .collect();
+    crate::bms::EmpiricalZGrid::new(nodes, vec![1.0 / m as f64; m], "normal quantiles")
+        .expect("equal-mass normal law")
+}
+
+/// gam#2926: the flex program's anchoring residual under a law that is its own
+/// `N(0, 1)` vanishes, because the row's intercept anchors exactly that integral,
+/// and without flex coefficients the program's residual is the rigid closed form's.
+#[test]
+fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2926() {
+    let family = make_flex_no_wiggle_test_family(8);
+    let block_states = flex_no_wiggle_test_block_states(&family);
+    let beta_h = family
+        .flex_score_beta(&block_states)
+        .expect("score-warp coefficients");
+    assert!(
+        beta_h.is_some(),
+        "the fixture must carry score-warp coefficients, or this test measures the rigid form twice"
+    );
+    let law = normal_quantile_law(4001);
+    for &(q, slope) in &[(-1.5, 0.4), (0.3, 0.8), (2.0, -0.6)] {
+        let (flex_residual, _, _) = family
+            .flex_survival_anchoring_residual(q, slope, beta_h, None, &law)
+            .expect("flex anchoring residual");
+        assert!(
+            flex_residual.abs() < 1e-5,
+            "under the program's own N(0, 1) the flex residual must vanish: q={q} slope={slope} \
+             residual={flex_residual:e}"
+        );
+        let (through_flex, sd_through_flex, scale_through_flex) = family
+            .flex_survival_anchoring_residual(q, slope, None, None, &law)
+            .expect("rigid anchoring residual through the flex program");
+        let (rigid, sd_rigid, scale_rigid) =
+            crate::bms::estimated_latent_law::closed_form_survival_anchoring_residual(
+                q,
+                family.probit_frailty_scale() * slope,
+                &law,
+            );
+        assert!(
+            (through_flex - rigid).abs() <= 1e-10
+                && (sd_through_flex - sd_rigid).abs() <= 1e-10
+                && scale_through_flex == scale_rigid,
+            "without flex coefficients the program's residual must be the rigid form's: q={q} \
+             slope={slope} flex=({through_flex:e}, {sd_through_flex:e}) rigid=({rigid:e}, \
+             {sd_rigid:e})"
+        );
+    }
+}
+
+/// gam#2926: the closed-form certificate scores each anchor's defining equation,
+/// which is offset-free. With a CTN Stage-1 influence absorber installed and a
+/// nonzero offset `o_infl` on every row, the certificate's anchors are exactly the
+/// ones the same rows have with no absorber.
+#[test]
+fn closed_form_certificate_anchors_exclude_the_influence_offset_2926() {
+    let n = 8;
+    let family = make_flex_no_wiggle_test_family(n);
+    let block_states = flex_no_wiggle_test_block_states(&family);
+    let law = normal_quantile_law(401);
+
+    let mut absorbed = make_flex_no_wiggle_test_family(n);
+    absorbed.influence_absorber = Some(Array2::from_shape_fn((n, 1), |(row, _)| {
+        0.3 + 0.1 * row as f64
+    }));
+    // The absorber is the trailing block, after the score-warp block.
+    let mut absorbed_states = block_states.clone();
+    let mut influence = block_states[3].clone();
+    influence.beta = array![0.7];
+    absorbed_states.push(influence);
+
+    for row in 0..n {
+        let offset = absorbed
+            .influence_index_offset(row, &absorbed_states)
+            .expect("absorber offset");
+        assert!(
+            offset.abs() > 0.1,
+            "fixture invariant: row {row} must carry a nonzero absorber offset, got {offset}"
+        );
+        let plain = family
+            .closed_form_certificate_anchors(row, &block_states, &law)
+            .expect("certificate anchors without an absorber");
+        let with_absorber = absorbed
+            .closed_form_certificate_anchors(row, &absorbed_states, &law)
+            .expect("certificate anchors with an absorber");
+        assert_eq!(
+            plain, with_absorber,
+            "row {row}: the certificate must score the offset-free anchor, whatever o_infl = {offset}"
+        );
+    }
+}

@@ -80,14 +80,14 @@ pub fn validate_survival_baseline_config(
     Ok(())
 }
 
-/// The `latent_measure` spellings a request may carry. `None` is the automatic
-/// gate (the default policy), so the caller need not construct one.
+/// The `latent_measure` spellings a request may carry. `None` is the default
+/// estimated law (the default policy), so the caller need not construct one.
 pub(crate) fn parse_latent_measure_spec(
     value: &str,
 ) -> Result<Option<crate::bms::LatentMeasureSpec>, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "auto" => Ok(None),
-        "standard-normal" | "standard_normal" | "gaussian" => {
+        "gaussian" | "standard-normal" | "standard_normal" => {
             Ok(Some(crate::bms::LatentMeasureSpec::StandardNormal))
         }
         "global-empirical" | "global_empirical" | "empirical" => {
@@ -95,8 +95,14 @@ pub(crate) fn parse_latent_measure_spec(
                 grid_size: crate::bms::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
             }))
         }
+        "conditional-location-scale" | "conditional_location_scale" => {
+            Ok(Some(crate::bms::LatentMeasureSpec::ConditionalLocationScale {
+                grid_size: crate::bms::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+            }))
+        }
         other => Err(format!(
-            "unsupported latent_measure '{other}'; use auto, standard-normal, or global-empirical"
+            "unsupported latent_measure '{other}'; use auto (the estimated law of the score, the \
+             default), gaussian, global-empirical, or conditional-location-scale"
         )),
     }
 }
@@ -225,10 +231,8 @@ impl FitConfig {
             .map(|value| value.trim().to_ascii_lowercase())
             .filter(|value| !value.is_empty());
         if self.declared_latent_law.is_some() {
-            if self.survival_likelihood.as_deref() != Some("marginal-slope") {
-                return Err(
-                    "declared_latent_law applies to survival marginal-slope fits only".to_string(),
-                );
+            if !self.requests_marginal_slope() {
+                return Err("declared_latent_law applies to marginal-slope fits only".to_string());
             }
             if self.z_column.is_none() || self.ctn_stage1.is_some() {
                 return Err(
@@ -247,13 +251,15 @@ impl FitConfig {
             self.declared_latent_law_grid()?;
         }
         if let Some(measure) = self.latent_measure.as_deref() {
-            parse_latent_measure_spec(measure)?;
+            let spec = parse_latent_measure_spec(measure)?;
             if !self.requests_marginal_slope() {
                 return Err("latent_measure applies to marginal-slope fits only".to_string());
             }
-            if self.frozen_score && measure != "standard-normal" {
+            // Compared by the law it names, so every spelling of the Gaussian
+            // declaration agrees with frozen_score.
+            if self.frozen_score && spec != Some(crate::bms::LatentMeasureSpec::StandardNormal) {
                 return Err(format!(
-                    "frozen_score pins the standard-normal latent measure; it cannot be combined with latent_measure = '{measure}'"
+                    "frozen_score declares the Gaussian latent law; it cannot be combined with latent_measure = '{measure}'"
                 ));
             }
         }

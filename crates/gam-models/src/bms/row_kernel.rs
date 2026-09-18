@@ -309,11 +309,7 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
             .family
             .marginal_link_map(self.block_states[0].eta[row])?;
         let slope = self.block_states[1].eta[row];
-        match self
-            .family
-            .latent_measure
-            .empirical_grid_for_training_row(row)?
-        {
+        match self.family.training_row_grid(row)? {
             None => rigid_standard_normal_row_nll_generic(
                 p,
                 marginal,

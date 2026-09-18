@@ -15,6 +15,7 @@ use super::row_kernel::*;
 use super::*;
 
 use crate::fnv1a::Fnv1a;
+use crate::latent_anchor::{AnchorGridOwned, anchor_derivatives_in_slot, solve_anchor};
 use gam_math::jet_scalar::{
     DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch,
     FixedRuntimeJet, OneSeed, TwoSeed,
@@ -287,31 +288,30 @@ impl BernoulliMarginalSlopeFamily {
         nodes: &[f64],
         measure_weights: &[f64],
     ) -> Result<f64, String> {
-        // Cache slot is keyed by `(marginal.q, slope)`: a rejected TR trial
-        // at one β and an accepted trial at another produce different
-        // `(marginal_eta_row, slope_row)` for the same row, so without the
-        // tag the slot can read back a value from a different trial and
-        // poison the new root solve. The empirical-grid root depends only
-        // on `(marginal.q, slope)` (the grid is immutable per latent measure),
-        // so this two-scalar tag is sufficient.
-        let beta_tag = hash_intercept_warm_start_key_rigid(marginal.q, slope);
-        let cached = self
+        // The intercept is the anchoring equation's root at the OBSERVED slope
+        // (gam#2926). On the fit's law it is solved in the row's root slot and
+        // differentiated once, so the next iterate of the row starts from this
+        // root carried along its first derivatives instead of from the closed
+        // form (gam#2943 part 3(iii)).
+        let observed_slope = rigid_observed_slope(slope, self.probit_frailty_scale());
+        match self
             .intercept_warm_starts
             .as_ref()
-            .and_then(|cache| cache.load_tagged(row, beta_tag));
-        let root = empirical_intercept_from_marginal(
-            marginal.mu,
-            marginal.q,
-            slope,
-            self.probit_frailty_scale(),
-            nodes,
-            measure_weights,
-            cached,
-        )?;
-        if let Some(cache) = self.intercept_warm_starts.as_ref() {
-            cache.store_tagged(row, root, beta_tag);
+            .and_then(|cache| cache.anchor_law.as_ref())
+        {
+            Some(law) => anchor_derivatives_in_slot(
+                marginal.q,
+                observed_slope,
+                law.row_context(row, nodes)?,
+                row,
+                0,
+            )
+            .map(|derivatives| derivatives.alpha),
+            None => {
+                let grid = AnchorGridOwned::new(nodes.to_vec(), measure_weights.to_vec());
+                solve_anchor(marginal.q, observed_slope, grid.view())
+            }
         }
-        Ok(root)
     }
 
     /// Objective-only fast path for the empirical-grid rigid kernel: returns
@@ -353,7 +353,7 @@ impl BernoulliMarginalSlopeFamily {
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<f64, String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => rigid_standard_normal_neglog_only(
                 marginal.q,
                 slope,
@@ -1664,7 +1664,7 @@ impl BernoulliMarginalSlopeFamily {
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => rigid_standard_normal_row_kernel(
                 marginal,
                 slope,
@@ -1691,7 +1691,7 @@ impl BernoulliMarginalSlopeFamily {
         dir_q: f64,
         dir_g: f64,
     ) -> Result<[[f64; 2]; 2], String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => rigid_standard_normal_third_contracted_generated(
                 marginal,
                 slope,
@@ -2106,7 +2106,7 @@ impl BernoulliMarginalSlopeFamily {
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<[[[f64; 2]; 2]; 2], String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => rigid_standard_normal_third_full(
                 marginal,
                 slope,
@@ -2140,7 +2140,7 @@ impl BernoulliMarginalSlopeFamily {
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => rigid_standard_normal_fourth_full(
                 marginal,
                 slope,
@@ -3043,6 +3043,63 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a, f_aa))
     }
 
+    /// The moving-law certificate's `(ln P, ln(1 − P))` of the row's anchor at
+    /// intercept `a` under the finite law `grid` (gam#2926): `P = Σ_k w_k Φ(η(u_k))`
+    /// for `η` the de-nested index, through
+    /// [`super::moving_law_rule::log_grid_anchor_probabilities`].
+    pub(super) fn empirical_grid_anchor_log_probabilities(
+        &self,
+        a: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        grid: &EmpiricalZGrid,
+    ) -> Result<(f64, f64), super::moving_law_rule::MovingLawError> {
+        use super::moving_law_rule::MovingLawError;
+        super::moving_law_rule::log_grid_anchor_probabilities(grid, |node| {
+            let obs = self
+                .observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)
+                .map_err(|reason| MovingLawError::AnchorProgram { reason })?;
+            Ok(eval_coeff4_at(&obs.coeff, node))
+        })
+    }
+
+    /// The anchoring residual `Σ_k w_k Φ(η_k) − μ` at intercept `a` under the
+    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, and
+    /// `μ` (gam#2926: the closed-form certificate reads all three).
+    pub(super) fn evaluate_empirical_grid_anchoring_residual(
+        &self,
+        a: f64,
+        marginal_eta: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        grid: &EmpiricalZGrid,
+    ) -> Result<(f64, f64, f64), String> {
+        let marginal = self.marginal_link_map(marginal_eta)?;
+        let mut probabilities = Vec::with_capacity(grid.nodes.len());
+        let mut mean = 0.0;
+        for (node, weight) in grid.pairs() {
+            let obs = self.observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)?;
+            let probability = normal_cdf(eval_coeff4_at(&obs.coeff, node));
+            mean += weight * probability;
+            probabilities.push(probability);
+        }
+        let variance = grid
+            .weights
+            .iter()
+            .zip(probabilities.iter())
+            .map(|(&weight, &probability)| weight * (probability - mean) * (probability - mean))
+            .sum::<f64>();
+        if !(mean.is_finite() && variance.is_finite()) {
+            return Err(format!(
+                "empirical latent anchoring residual is not finite: mean={mean}, variance={variance} \
+                 at intercept={a}"
+            ));
+        }
+        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu))
+    }
+
     pub(super) fn evaluate_calibration_newton(
         &self,
         row: usize,
@@ -3052,7 +3109,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64, f64), String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
+        match self.training_row_grid(row)? {
             None => {
                 self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
             }

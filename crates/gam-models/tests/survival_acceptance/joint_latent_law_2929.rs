@@ -165,6 +165,7 @@ struct Fitted {
     pooled_covariance: Array2<f64>,
     marginal_design: Array2<f64>,
     joint_law_present: bool,
+    latent_law_consumed: gam_models::bms::LatentLawConsumed,
 }
 
 fn fit(data: &gam_data::EncodedDataset, formula: &str, config: &FitConfig) -> Fitted {
@@ -188,6 +189,7 @@ fn fit(data: &gam_data::EncodedDataset, formula: &str, config: &FitConfig) -> Fi
         pooled_covariance: fit.score_covariance.clone(),
         marginal_design: fit.marginal_design.design.to_dense(),
         joint_law_present: fit.joint_latent_law.is_some(),
+        latent_law_consumed: fit.latent_law_consumed.clone(),
     }
 }
 
@@ -236,6 +238,28 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     // pair gate has no span to condition on and one `Σ̄` serves every row.
     let pooled = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
     assert!(!pooled.joint_law_present);
+    // gam#2926: one of these exact-Gaussian scores has a point beyond 4σ, which
+    // fails the fixed shape screen at n = 3 000. The declaration is fitted with a
+    // warning, and records its excess anchoring loss on the joint law, which on
+    // Gaussian scores stays at the level of its sampling noise.
+    let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
+        adequacy: Some(_),
+        residual: Some(certificate),
+        ..
+    } = &pooled.latent_law_consumed
+    else {
+        panic!(
+            "a Gaussian declaration whose score fails the shape screen must be fitted and record \
+             its excess anchoring loss; got {:?}",
+            pooled.latent_law_consumed
+        )
+    };
+    eprintln!("[2926 declared K=2] shape screen failed; recorded {certificate:?}");
+    assert!(
+        certificate.excess_kl <= certificate.noise_energy,
+        "on exact Gaussian scores the declaration's excess anchoring loss must stay at noise \
+         level: {certificate:?}"
+    );
     // The anchored fit: the marginal-index span carries `x`, and the joint law
     // is transported by the conditional covariance fitted on it.
     let anchored_config = config("global-empirical");
@@ -429,6 +453,75 @@ fn joint_law_is_persisted_and_replayed_at_prediction_2929() {
     assert_eq!(
         worst_roundtrip, 0.0,
         "a JSON round trip of the payload must predict bit for bit what the payload did"
+    );
+}
+
+/// gam#2926: the default on the same two conditionally standard-normal scores.
+/// Each score passes the adequacy screen, so the fit lowers the identity in
+/// closed form at the conditional `Σ(x)` provisionally, and the converged fit
+/// certifies it on the joint law of the score vector. Either branch is a result:
+/// `D̂ ≤ 0` keeps the closed form with its certificate, `D̂ > 0` re-solves on the
+/// joint law. Both must be calibrated on the marginal index under the true law.
+#[test]
+fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
+    install();
+    let fixture = build_fixture(0x2929_0000_0004);
+    let result = fit_from_formula("Surv(time, event) ~ x + x2", &fixture.data, &config("auto"))
+        .expect("the default K=2 fit");
+    let FitResult::SurvivalMarginalSlope(fit) = result else {
+        panic!("expected a SurvivalMarginalSlope fit result");
+    };
+    let marginal_error = fit
+        .fitted_exit_index
+        .iter()
+        .zip(fixture.times.iter())
+        .map(|(&q_hat, &time)| (normal_cdf(-q_hat) - normal_cdf(-planted_index(time))).abs())
+        .sum::<f64>()
+        / N as f64;
+    match &fit.latent_law_consumed {
+        gam_models::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            residual: Some(certificate),
+            ..
+        } => {
+            eprintln!(
+                "[2926 K=2 default] n={N} kept the closed form: {certificate:?} | mean \
+                 |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
+                "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
+            );
+            assert!(
+                fit.joint_latent_law.is_none(),
+                "a kept closed form must not persist a joint latent law"
+            );
+        }
+        gam_models::bms::LatentLawConsumed::EstimatedGlobalByResidual {
+            residual: certificate,
+            ..
+        } => {
+            eprintln!(
+                "[2926 K=2 default] n={N} re-solved on the joint law: {certificate:?} | mean \
+                 |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
+            );
+            assert!(
+                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
+                "a re-solve's recorded decision must be the sign of its D̂: {certificate:?}"
+            );
+            assert!(
+                fit.joint_latent_law.is_some(),
+                "a re-solve on the estimated law must anchor on the joint latent law"
+            );
+        }
+        other => panic!(
+            "the default on two scores that pass the screen must record a certified decision; \
+             got {other:?}"
+        ),
+    }
+    assert!(
+        marginal_error < 0.02,
+        "the default K=2 fit must be calibrated on the marginal index under the true law; mean \
+         |Φ(−q̂)−Φ(−q)| = {marginal_error:.4}"
     );
 }
 

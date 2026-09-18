@@ -176,6 +176,7 @@ fn build_problem(
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
         residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }

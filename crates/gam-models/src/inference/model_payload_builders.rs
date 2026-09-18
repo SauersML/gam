@@ -17,7 +17,7 @@
 
 use crate::bms::deviation_runtime::AnchorComponentTag;
 use crate::bms::{
-    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
+    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentLawConsumed, LatentMeasureKind, LatentZConditionalCalibration,
 };
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
@@ -476,7 +476,7 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub baseline_slope: f64,
     pub latent_z_normalization: SavedLatentZNormalization,
     pub latent_measure: LatentMeasureKind,
-    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    pub latent_law_consumed: LatentLawConsumed,
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
@@ -735,7 +735,7 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         baseline_slope,
         latent_z_normalization,
         latent_measure,
-        latent_z_rank_int_calibration,
+        latent_law_consumed,
         latent_z_conditional_calibration,
         score_warp_runtime,
         link_dev_runtime,
@@ -772,7 +772,8 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.z_columns = Some(vec![z_column]);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
-    payload.latent_z_rank_int_calibration = latent_z_rank_int_calibration;
+    latent_law_consumed.require_recorded("bernoulli marginal-slope payload")?;
+    payload.latent_law_consumed = Some(latent_law_consumed);
     payload.latent_z_conditional_calibration = latent_z_conditional_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.baseline_slope = Some(baseline_slope);
@@ -1078,9 +1079,11 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     /// The automatic latent-measure gate's decision for the persisted score
     /// surface (gam#2768), split by
     /// [`SurvivalMarginalSlopeFitResult::persisted_latent_z_calibrations`].
-    /// Mutually exclusive; both `None` when the gate did not fire.
-    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// `None` unless the declared conditional location-scale law calibrated the
+    /// score.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// Which latent law the fit consumed (gam#2926).
+    pub latent_law_consumed: LatentLawConsumed,
     /// The latent measure the fit's row program integrated against
     /// (gam#2923): the standard-normal law of the closed form, or the declared
     /// finite law the index was anchored on. Replayed by the shared
@@ -1199,7 +1202,10 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.latent_measure = Some(inputs.latent_measure);
     payload.declared_latent_law = inputs.declared_latent_law;
     payload.declared_latent_law_compression = inputs.declared_latent_law_compression;
-    payload.latent_z_rank_int_calibration = inputs.latent_z_rank_int_calibration;
+    inputs
+        .latent_law_consumed
+        .require_recorded("survival marginal-slope payload")?;
+    payload.latent_law_consumed = Some(inputs.latent_law_consumed);
     payload.latent_z_conditional_calibration = inputs.latent_z_conditional_calibration;
     payload.baseline_slope = Some(inputs.baseline_slope);
     payload.baseline_slopes = Some(vec![inputs.baseline_slope]);
@@ -1958,7 +1964,7 @@ fn payload_for_bernoulli_marginal_slope(
                 sd: ms_result.z_normalization.sd,
             },
             latent_measure: ms_result.latent_measure.clone(),
-            latent_z_rank_int_calibration: ms_result.latent_z_rank_int_calibration.clone(),
+            latent_law_consumed: ms_result.latent_law_consumed.clone(),
             latent_z_conditional_calibration: ms_result.latent_z_conditional_calibration.clone(),
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
@@ -2120,8 +2126,7 @@ fn payload_for_survival_marginal_slope(
             );
         }
     };
-    let (persisted_rank_int, persisted_conditional) =
-        ms_result.persisted_latent_z_calibrations()?;
+    let persisted_conditional = ms_result.persisted_latent_z_calibrations()?;
     // gam#2929: a K ≥ 2 per-score fit anchored on the joint law of its score
     // vector persists that law, one score column and one slope surface per
     // coordinate. What the single-score contract cannot carry is refused here.
@@ -2147,10 +2152,9 @@ fn payload_for_survival_marginal_slope(
                         .to_string(),
                 );
             }
-            if let Some(reason) = joint_latent_law_calibration_save_refusal(
-                persisted_rank_int.as_ref(),
-                persisted_conditional.as_ref(),
-            ) {
+            if let Some(reason) =
+                joint_latent_law_calibration_save_refusal(persisted_conditional.as_ref())
+            {
                 return Err(reason.to_string());
             }
             if law.conditional.is_some() && !ms_result.latent_conditioning_reproducible {
@@ -2216,7 +2220,7 @@ fn payload_for_survival_marginal_slope(
                 mean: ms_result.z_normalization.mean,
                 sd: ms_result.z_normalization.sd,
             },
-            latent_z_rank_int_calibration: persisted_rank_int,
+            latent_law_consumed: ms_result.latent_law_consumed.clone(),
             latent_z_conditional_calibration: persisted_conditional,
             latent_measure: ms_result.latent_measure.clone(),
             declared_latent_law: ms_result.declared_latent_law.clone(),
@@ -2255,10 +2259,9 @@ fn payload_for_survival_marginal_slope(
 /// columns, so a model whose scores were calibrated before the fit would predict
 /// on scores other than the ones it was fitted on.
 fn joint_latent_law_calibration_save_refusal(
-    rank_int: Option<&crate::bms::LatentZRankIntCalibration>,
     conditional: Option<&crate::bms::LatentZConditionalCalibration>,
 ) -> Option<&'static str> {
-    (rank_int.is_some() || conditional.is_some()).then_some(
+    conditional.is_some().then_some(
         "survival marginal-slope K ≥ 2 model calibrated its scores before the fit, and the joint \
          latent law's saved contract replays the anchor on the raw score columns: saving is \
          refused rather than writing a model whose prediction evaluates different scores",
@@ -2835,18 +2838,14 @@ mod joint_latent_law_save_tests {
     use super::*;
 
     /// A joint-law model refuses to save by name when its score column carries a
-    /// persisted rank-INT or conditional location-scale calibration, and saves
-    /// when it carries neither.
+    /// persisted conditional location-scale calibration, and saves when it does
+    /// not. Fits no longer persist a rank-INT calibration (gam#2926).
     #[test]
     fn joint_law_model_with_a_calibrated_score_refuses_to_save_2929() {
         assert!(
-            joint_latent_law_calibration_save_refusal(None, None).is_none(),
+            joint_latent_law_calibration_save_refusal(None).is_none(),
             "an uncalibrated joint-law model must save"
         );
-        let z = ndarray::Array1::from_vec(vec![-1.3, -0.4, 0.2, 0.9, 1.7, 2.8]);
-        let weights = ndarray::Array1::from_elem(z.len(), 1.0);
-        let rank_int = crate::bms::LatentZRankIntCalibration::fit(&z, &weights)
-            .expect("rank-INT calibration");
         let conditional = crate::bms::LatentZConditionalCalibration {
             mean_coeffs: vec![0.1, 0.4],
             var_coeffs: Vec::new(),
@@ -2857,25 +2856,13 @@ mod joint_latent_law_save_tests {
             post_sd: 1.0,
             theta1_cov: ndarray::Array2::zeros((0, 0)),
         };
-        for (label, reason) in [
-            (
-                "rank-INT",
-                joint_latent_law_calibration_save_refusal(Some(&rank_int), None),
-            ),
-            (
-                "conditional location-scale",
-                joint_latent_law_calibration_save_refusal(None, Some(&conditional)),
-            ),
-        ] {
-            let reason = reason.unwrap_or_else(|| {
-                panic!("a {label} calibration must refuse the joint-law save")
-            });
-            assert!(
-                reason.contains("model calibrated its scores before the fit")
-                    && reason.contains("saving is refused"),
-                "{label}: unexpected refusal {reason}"
-            );
-        }
+        let reason = joint_latent_law_calibration_save_refusal(Some(&conditional))
+            .expect("a conditional location-scale calibration must refuse the joint-law save");
+        assert!(
+            reason.contains("model calibrated its scores before the fit")
+                && reason.contains("saving is refused"),
+            "unexpected refusal {reason}"
+        );
     }
 }
 

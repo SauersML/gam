@@ -269,6 +269,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         latent_z_policy: config.marginal_slope_latent_policy(),
         score_influence_jacobian,
         residual,
+        declared_latent_law: config.declared_latent_law_grid()?,
     };
 
     Ok(MaterializedModel {

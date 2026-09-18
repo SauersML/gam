@@ -208,12 +208,15 @@ pub struct FitRequestConfigDocument {
     /// The supplied z column is already transformed by a frozen external model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frozen_score: Option<bool>,
-    /// The latent measure a marginal-slope kernel integrates against:
-    /// `"auto"`, `"standard-normal"`, or `"global-empirical"` (gam#2923).
+    /// The latent law a marginal-slope fit anchors on (gam#2926): `"auto"` (the
+    /// default: the law of the score estimated on the marginal-index span, global
+    /// or local by context), `"gaussian"` (the closed form, refused when the
+    /// score fails the adequacy check), `"global-empirical"`, or
+    /// `"conditional-location-scale"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latent_measure: Option<String>,
-    /// A declared finite law of the latent score for a survival marginal-slope
-    /// fit (gam#2923): `{"nodes": [...], "weights": [...]}`.
+    /// A declared finite law of the latent score for a marginal-slope fit
+    /// (gam#2923, gam#2926): `{"nodes": [...], "weights": [...]}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_latent_law: Option<DeclaredLatentLawDocument>,
 }
