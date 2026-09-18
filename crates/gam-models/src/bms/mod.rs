@@ -666,13 +666,6 @@ pub enum LatentLawRefusal {
     /// The requested law needs the empirical anchoring kernel, and this
     /// configuration's kernel is the closed-form Gaussian lowering only.
     EmpiricalKernelUnavailable { context: String, requested: String },
-    /// At the converged closed-form fit the default's certificate prefers the
-    /// estimated law, and nothing on this configuration can re-solve on it.
-    EstimatedLawCannotReSolve {
-        context: String,
-        certificate: String,
-        reason: String,
-    },
     /// The conditional law moves on the span, so the default law is local by
     /// context, and this caller supplied no context to estimate it on.
     LocalLawContextUnavailable {
@@ -711,17 +704,6 @@ impl std::fmt::Display for LatentLawRefusal {
                  configuration's row kernel evaluates only the closed-form Gaussian lowering. \
                  Declare latent_measure=\"gaussian\" to fit the Gaussian law (the score must pass \
                  the adequacy check), or remove what confines the kernel to the closed form"
-            ),
-            Self::EstimatedLawCannotReSolve {
-                context,
-                certificate,
-                reason,
-            } => write!(
-                f,
-                "{context}: at the converged closed-form fit the estimated law of the score is \
-                 expected to be the more accurate anchor ({certificate}), and the anchored frame \
-                 that would re-solve on it is unavailable because {reason}. Refused; gam#2948 \
-                 tracks that frame for flex blocks"
             ),
             Self::LocalLawContextUnavailable { context, evidence } => write!(
                 f,

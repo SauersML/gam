@@ -455,7 +455,9 @@ de-nested index at each node of the estimated law, a follow-up-varying slope on
 each anchor's own slope, and an influence absorber on the offset-free anchor
 the fit solves, because the absorber's offset is added only after the anchor.
 Where the certificate prefers the estimated law, which nothing there can
-re-solve on yet, the fit is refused naming `D̂` (gam#2948). A fit on any of
+re-solve on yet (gam#2948), the fit keeps the closed form, recorded
+`gaussian-uncertified` with that certificate and why nothing re-solves on it,
+which `require_certified` refuses by name. A fit on any of
 them whose law departs or moves records `gaussian-uncertified` with a warning
 naming what is missing. The Jeffreys/Firth arming's closed-form fifth
 and sixth derivatives are the Gaussian lowering's and are not served on a
@@ -548,7 +550,7 @@ Two limits are worth stating plainly:
   law, each row's residual `Σ_m w_m Φ(−(q·√(1 + rᵀΣ(a)r) + rᵀu_m)) − Φ(−q)`
   on the row's transported nodes. `D̂ > 0` re-solves on the joint law; where
   nothing can re-solve on it, as with a slope shared across the scores, the
-  fit is refused naming `D̂`.
+  fit keeps the closed form, recorded `gaussian-uncertified` with `D̂`.
 
 ## Residual genetic repair: reading what the score discarded
 

@@ -120,15 +120,17 @@
   keeps costs what it did (5.1 s against 5.3 s on a Gaussian score).
 - Survival configurations whose kernel is closed-form only (flex blocks, an
   influence absorber, time-wiggle, follow-up-varying slope) keep the closed
-  form, certify it by `D̂`, and are refused naming `D̂` where it prefers the
-  estimated law, which nothing there can re-solve on yet (#2948). A fit on
+  form and certify it by `D̂`. Where it prefers the estimated law, which
+  nothing there can re-solve on yet (#2948), the fit keeps the closed form,
+  recorded `gaussian-uncertified` with that certificate. A fit on
   any of them whose law departs or moves records `gaussian-uncertified` with
   a warning naming what is missing.
 - Several survival scores anchor on their joint law where some score departs
   from the standard normal. Where a score's law moves, every score keeps the
   closed form as `gaussian-uncertified`, naming that score (#2949). A closed
   form the screen chose for several scores is certified by `D̂` on their joint
-  law, and re-solved on it or refused naming `D̂` where `D̂ > 0`.
+  law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
+  with `D̂` where nothing can re-solve on it.
 
 ## gamfit 0.1.268 (2026-09-11)
 

@@ -2455,6 +2455,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             sqrt_effective_n * sqrt_effective_n,
         )
         .map_err(FitFailure::numerical)?;
+        let mut uncertified = None;
         if let crate::bms::LatentLawConsumed::DeclaredGaussian {
             adequacy: Some(adequacy),
             residual,
@@ -2484,14 +2485,25 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 );
                 *residual = Some(certificate);
             } else if let Some(reason) = frame_unavailable {
-                return Err(FitFailure::input(
-                    crate::bms::LatentLawRefusal::EstimatedLawCannotReSolve {
-                        context: "survival-marginal-slope".to_string(),
-                        certificate: certificate.summary(),
-                        reason: reason.to_string(),
-                    }
-                    .to_string(),
-                ));
+                // The fit the closed form converged to is kept, as the Bernoulli
+                // frailty σ keeps its own, with the certificate that prefers the
+                // estimated law recorded beside why nothing here re-solves on it.
+                let missing = format!(
+                    "at the converged closed-form fit the estimated law is expected to be the more \
+                     accurate anchor ({}), and nothing on this configuration can re-solve on it: \
+                     {reason}",
+                    certificate.summary()
+                );
+                log::warn!(
+                    "[survival-marginal-slope latent-z] the closed form stays uncertified: {missing} \
+                     (gam#2926)"
+                );
+                uncertified = Some(crate::bms::LatentLawConsumed::GaussianUncertified {
+                    evidence: evidence.clone(),
+                    adequacy: Some(adequacy.clone()),
+                    certificate: Some(certificate),
+                    missing,
+                });
             } else {
                 log::info!(
                     "[survival-marginal-slope latent-z] at the converged closed-form fit the \
@@ -2533,6 +2545,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     Vec::new(),
                 ));
             }
+        }
+        if let Some(record) = uncertified {
+            latent_law_consumed = record;
         }
     }
     // gam#2926: certify the arm a moving law was fitted on against the other arms,

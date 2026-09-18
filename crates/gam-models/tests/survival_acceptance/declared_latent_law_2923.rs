@@ -860,9 +860,10 @@ fn many_atom_declared_law_is_compressed_persisted_and_replayed_bitwise_2928() {
 /// gam#2926 follow-up: a survival fit whose slope varies along follow-up, on a
 /// standard-normal score, certifies its closed form with each anchor's own slope:
 /// the entry slope at entry and the exit slope at exit. The record follows the sign
-/// of `D̂`: `D̂ ≤ 0` keeps a certified closed form, and `D̂ > 0` is refused by name,
-/// because the anchored frame does not carry a follow-up-varying slope. A kept fit
-/// is calibrated under the TRUE law on the marginal index.
+/// of `D̂`: `D̂ ≤ 0` keeps a certified closed form, and `D̂ > 0` keeps the same fit
+/// recorded `gaussian-uncertified` with its certificate, because the anchored frame
+/// does not carry a follow-up-varying slope. A certified fit is calibrated under the
+/// TRUE law on the marginal index.
 #[test]
 fn follow_up_varying_slope_default_records_its_certificate_decision_2926() {
     super::initialize_cpu_fitting();
@@ -890,38 +891,38 @@ fn follow_up_varying_slope_default_records_its_certificate_decision_2926() {
 }
 
 /// The certificate decision of a default fit on a configuration the anchored frame
-/// does not serve, in either branch: a kept fit carries a certified closed form
-/// whose decision is the sign of its `D̂` and is calibrated on the marginal index
-/// under the TRUE law; a refused one names its `D̂` and why nothing can re-solve.
+/// does not serve, in either branch, and a fitted model in both: a certified
+/// closed form whose decision is the sign of its `D̂` and which is calibrated on the
+/// marginal index under the TRUE law, or, where `D̂` prefers the estimated law, the
+/// same closed-form fit recorded `gaussian-uncertified` with that certificate and
+/// why nothing here re-solves on it, which `require_certified` refuses by name.
 fn records_certificate_decision<E: std::fmt::Display>(
     label: &str,
     result: Result<FitResult, E>,
     truth: &[f64],
-    refusal_names: &str,
+    unavailable_names: &str,
 ) {
-    match result {
-        Ok(FitResult::SurvivalMarginalSlope(fit)) => {
-            let gam_models::bms::LatentLawConsumed::EstimatedGaussianAdequate {
-                residual: Some(certificate),
-                ..
-            } = &fit.latent_law_consumed
-            else {
-                panic!(
-                    "a kept {label} fit must carry a certified closed form; got {:?}",
-                    fit.latent_law_consumed
-                )
-            };
+    let fit = match result {
+        Ok(FitResult::SurvivalMarginalSlope(fit)) => fit,
+        Ok(_) => panic!("expected a SurvivalMarginalSlope fit result"),
+        Err(error) => panic!("a default {label} fit must return a model; got {error}"),
+    };
+    let marginal_error = fit
+        .fitted_exit_index
+        .iter()
+        .zip(truth)
+        .map(|(&q_hat, &q)| (normal_cdf(-q_hat) - normal_cdf(-q)).abs())
+        .sum::<f64>()
+        / truth.len() as f64;
+    match &fit.latent_law_consumed {
+        gam_models::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            residual: Some(certificate),
+            ..
+        } => {
             assert!(
                 certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
                 "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
             );
-            let marginal_error = fit
-                .fitted_exit_index
-                .iter()
-                .zip(truth)
-                .map(|(&q_hat, &q)| (normal_cdf(-q_hat) - normal_cdf(-q)).abs())
-                .sum::<f64>()
-                / truth.len() as f64;
             eprintln!(
                 "[2926 {label}] n={N} planted b={SLOPE} | kept the closed form: {certificate:?} | \
                  mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
@@ -932,16 +933,36 @@ fn records_certificate_decision<E: std::fmt::Display>(
                  mean |Φ(−q̂)−Φ(−q)| = {marginal_error:.4}"
             );
         }
-        Ok(_) => panic!("expected a SurvivalMarginalSlope fit result"),
-        Err(error) => {
-            let message = error.to_string();
-            eprintln!("[2926 {label}] n={N} planted b={SLOPE} | refused: {message}");
-            assert!(
-                message.contains("expected to be the more accurate anchor")
-                    && message.contains("D̂ =")
-                    && message.contains(refusal_names),
-                "a refused {label} fit must name its D̂ and why nothing can re-solve; got {message}"
+        gam_models::bms::LatentLawConsumed::GaussianUncertified {
+            certificate: Some(certificate),
+            missing,
+            ..
+        } => {
+            eprintln!(
+                "[2926 {label}] n={N} planted b={SLOPE} | uncertified: {missing} | \
+                 mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
             );
+            assert!(
+                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
+                "an uncertified closed form must carry the D̂ that preferred the estimated law: \
+                 {certificate:?}"
+            );
+            assert!(
+                missing.contains("expected to be the more accurate anchor")
+                    && missing.contains("D̂ =")
+                    && missing.contains(unavailable_names),
+                "an uncertified {label} fit must name its D̂ and why nothing can re-solve; got \
+                 {missing}"
+            );
+            let refusal = fit
+                .latent_law_consumed
+                .require_certified(label)
+                .expect_err("an uncertified closed form is not a certified fit");
+            assert!(refusal.contains(missing.as_str()), "{refusal}");
         }
+        other => panic!(
+            "a default {label} fit must record a certified or an uncertified closed form; got \
+             {other:?}"
+        ),
     }
 }
