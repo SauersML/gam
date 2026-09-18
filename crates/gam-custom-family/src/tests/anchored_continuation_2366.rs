@@ -765,3 +765,40 @@ fn anchored_continuation_selects_the_anchor_branch_2366() {
         objective(shallow)
     );
 }
+
+/// gam#2928: the ladder keeps the anchor's corrected mode for its later sweeps,
+/// and the kept mode answers only the anchor it was solved at. A different
+/// anchor, one rounding step away, a different width, or a zero of the other
+/// sign, is solved rather than read.
+#[test]
+fn the_kept_anchor_mode_answers_only_its_own_anchor_2928() {
+    let anchor = array![8.0, 3.5];
+    let kept = crate::fit::AnchorWaypointMode::new(
+        &anchor,
+        crate::assembly::ConstrainedWarmStart {
+            rho: anchor.clone(),
+            block_beta: vec![array![-0.25]],
+            active_sets: vec![None],
+            cached_inner: None,
+        },
+    );
+    let read = kept.at(&anchor).expect("the anchor it was solved at");
+    assert_eq!(read.block_beta[0][0].to_bits(), (-0.25_f64).to_bits());
+    for other in [
+        array![8.0, f64::from_bits(3.5_f64.to_bits() + 1)],
+        array![8.0],
+        array![8.0, 3.5, 0.0],
+        array![8.0, -3.5],
+    ] {
+        assert!(
+            kept.at(&other).is_none(),
+            "anchor {other} read the mode kept for {anchor}"
+        );
+    }
+    assert!(
+        crate::fit::AnchorWaypointMode::new(&array![0.0], kept.at(&anchor).expect("kept").clone())
+            .at(&array![-0.0])
+            .is_none(),
+        "a zero of the other sign is a different anchor"
+    );
+}

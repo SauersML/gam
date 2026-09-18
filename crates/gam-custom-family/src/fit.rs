@@ -1297,6 +1297,7 @@ pub(crate) fn anchored_continuation_seed<F: CustomFamily + Clone + Send + Sync +
         rho_prior,
         rho_anchor,
         rho_target,
+        anchor_mode: std::cell::OnceCell::new(),
     };
     certify_refined_continuation(&path, options, false)
 }
@@ -1562,6 +1563,84 @@ struct ContinuationPath<'a, F> {
     rho_prior: &'a gam_problem::RhoPrior,
     rho_anchor: &'a Array1<f64>,
     rho_target: &'a Array1<f64>,
+    /// The anchor waypoint's corrected mode, once a sweep has solved it.
+    anchor_mode: std::cell::OnceCell<AnchorWaypointMode>,
+}
+
+/// The corrected mode at the continuation's anchor, kept for the ladder's
+/// later sweeps (gam#2928).
+///
+/// Every sweep's first corrector solves the inner problem at `ρ_A` from the
+/// caller's coefficients, and the mode there is unique by construction (see
+/// [`ContinuationPath::sweep`]). Each refinement therefore repeated one
+/// deterministic computation on the same inputs: 3 of a 4-step ladder's 13
+/// inner solves, 21 s of a 125 s fit at n = 300,000. The ladder now solves it
+/// once. Every later waypoint is still corrected afresh in each refinement, so
+/// the refinements stay independent wherever a branch can be chosen.
+///
+/// The solve reads the family, the options, the layout, `ρ_A` and the specs,
+/// whose `initial_beta` are the caller's coefficients it starts from (a cold
+/// start, `buildblock_states`). Every one of them is a shared borrow of the
+/// path and cannot change under it. The mode is still keyed by `ρ_A`'s bits,
+/// so an anchor that does not match them is solved, never read.
+pub(crate) struct AnchorWaypointMode {
+    rho_bits: Vec<u64>,
+    mode: ConstrainedWarmStart,
+}
+
+impl AnchorWaypointMode {
+    pub(crate) fn new(rho: &Array1<f64>, mode: ConstrainedWarmStart) -> Self {
+        Self {
+            rho_bits: rho.iter().map(|value| value.to_bits()).collect(),
+            mode,
+        }
+    }
+
+    /// The kept mode, only for the anchor it was solved at.
+    pub(crate) fn at(&self, rho: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
+        (self.rho_bits.len() == rho.len()
+            && self
+                .rho_bits
+                .iter()
+                .zip(rho.iter())
+                .all(|(&bits, value)| bits == value.to_bits()))
+        .then_some(&self.mode)
+    }
+}
+
+impl<F: CustomFamily + Clone + Send + Sync + 'static> ContinuationPath<'_, F> {
+    /// The corrected mode at `ρ_A` from the caller's coefficients: solved by
+    /// the first sweep, read by the rest.
+    fn anchor_waypoint_mode(
+        &self,
+        steps: usize,
+    ) -> Result<ConstrainedWarmStart, AnchoredContinuationRefusal> {
+        if let Some(mode) = self
+            .anchor_mode
+            .get()
+            .and_then(|kept| kept.at(self.rho_anchor))
+        {
+            return Ok(mode.clone());
+        }
+        let (_, warm_start) = correct_labeled_coefficient_mode(
+            self.family,
+            self.specs,
+            self.options,
+            self.layout,
+            self.rho_anchor,
+            None,
+        )
+        .map_err(
+            |error| AnchoredContinuationRefusal::WaypointEvaluationFailed {
+                steps,
+                waypoint_index: 0,
+                reason: error.to_string(),
+            },
+        )?;
+        self.anchor_mode
+            .get_or_init(|| AnchorWaypointMode::new(self.rho_anchor, warm_start.clone()));
+        Ok(warm_start)
+    }
 }
 
 impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
@@ -1576,7 +1655,9 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
     /// penalized term sits on its penalty nullspace, so the surviving problem
     /// has a single mode and the caller's seed cannot select anything. Every
     /// later waypoint is warm-started from the previous one, so the branch is
-    /// carried forward rather than rediscovered.
+    /// carried forward rather than rediscovered. Because that first solve is the
+    /// same computation in every sweep, it runs once per ladder
+    /// ([`AnchorWaypointMode`]).
     ///
     /// The final waypoint uses `rho_target` verbatim rather than the
     /// reconstructed `ρ_A + 1·(ρ − ρ_A)`: the endpoint must be the mode *at the
@@ -1585,10 +1666,12 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
     fn sweep(&self, steps: usize) -> Result<SweptEndpoint, AnchoredContinuationRefusal> {
         let mut carried: Option<ConstrainedWarmStart> = None;
         for step in 0..=steps {
+            if step == 0 && step < steps {
+                carried = Some(self.anchor_waypoint_mode(steps)?);
+                continue;
+            }
             let waypoint = if step == steps {
                 self.rho_target.clone()
-            } else if step == 0 {
-                self.rho_anchor.clone()
             } else {
                 let t = step as f64 / steps as f64;
                 Array1::from_shape_fn(self.rho_target.len(), |j| {
