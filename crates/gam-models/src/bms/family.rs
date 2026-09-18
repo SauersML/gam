@@ -77,11 +77,34 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// `Some` routes every rigid-path consumer through the residual row kernel
     /// (`RowKernel<2+K>`); `None` is the two-primary family unchanged.
     pub(super) residual: Option<Arc<super::residual_repair::ResidualBlockRuntime>>,
-    /// The memory lane of this member's search in a parallel multistart
-    /// (gnomon#2359): its row-primary cache decision reads the lane's
-    /// pre-launch availability and pins, and charges its pins to the lane.
+    /// This member's own search state in a parallel multistart (gnomon#2359).
     /// `None` outside a multistart.
-    pub(super) search_lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
+    pub(super) search: Option<Arc<BmsSearchMember>>,
+}
+
+/// One outer search's own state in a parallel multistart (gnomon#2359).
+///
+/// The lane's memory reading drives its row-primary cache decision, and its pins
+/// are charged to the lane. The same-β stores hold this search's builds only,
+/// where a fit on its own keeps them process-wide. An exact cache carries the
+/// row intercept roots its builder's warm starts converged to, and a hit skips
+/// the root solves that seed a search's next warm start, so a shared store let a
+/// search read other searches' roots and lose its own builds to their evictions,
+/// and its result depended on which searches ran beside it.
+pub(super) struct BmsSearchMember {
+    pub(super) lane: Arc<gam_runtime::resource::SearchLaneBudget>,
+    pub(super) exact_caches: Mutex<super::cell_moment_assembly::SharedExactCacheStore>,
+    pub(super) rigid_tensors: Mutex<super::row_kernel::SharedRigidTensorStore>,
+}
+
+impl BmsSearchMember {
+    pub(super) fn new(lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> Self {
+        Self {
+            lane,
+            exact_caches: Mutex::new(super::cell_moment_assembly::SharedExactCacheStore::empty()),
+            rigid_tensors: Mutex::new(super::row_kernel::SharedRigidTensorStore::empty()),
+        }
+    }
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule

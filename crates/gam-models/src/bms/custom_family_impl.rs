@@ -591,7 +591,8 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
                 .map(|_| new_intercept_warm_start_cache(self.y.len())),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            search_lane: Some(lane),
+            // Its same-β exact-cache and rigid-tensor stores are its own too.
+            search: Some(Arc::new(BmsSearchMember::new(lane))),
             ..self.clone()
         }
     }

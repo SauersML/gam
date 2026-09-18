@@ -291,10 +291,11 @@ impl OuterProblem {
                 joined.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             match &outcome {
                 Ok(certified) => log::info!(
-                    "[OUTER] {context}: multistart seed {index} rho={:?} certified value={:.9e} \
-                     after {} iterations in {seconds:.3}s",
+                    "[OUTER] {context}: multistart seed {index} rho={:?} certified value={:?} at \
+                     rho={:?} after {} iterations in {seconds:.3}s",
                     seeds[index].to_vec(),
                     certified.final_value(),
+                    certified.rho().to_vec(),
                     certified.iterations(),
                 ),
                 Err(error) => log::info!(

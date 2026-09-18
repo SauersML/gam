@@ -26,13 +26,20 @@ use std::sync::{Mutex, OnceLock};
 type RigidThirdFull = Vec<[[[f64; 2]; 2]; 2]>;
 type RigidFourthFull = Vec<[[[[f64; 2]; 2]; 2]; 2]>;
 
-struct SharedRigidTensorStore {
+pub(super) struct SharedRigidTensorStore {
     third: Vec<(u64, Arc<RigidThirdFull>)>,
     fourth: Vec<(u64, Arc<RigidFourthFull>)>,
 }
 
 impl SharedRigidTensorStore {
     const CAPACITY: usize = 2;
+
+    pub(super) fn empty() -> Self {
+        Self {
+            third: Vec::with_capacity(Self::CAPACITY),
+            fourth: Vec::with_capacity(Self::CAPACITY),
+        }
+    }
 
     fn get_third(&self, fp: u64) -> Option<Arc<RigidThirdFull>> {
         self.third
@@ -71,12 +78,16 @@ impl SharedRigidTensorStore {
 
 fn shared_rigid_tensor_store() -> &'static Mutex<SharedRigidTensorStore> {
     static STORE: OnceLock<Mutex<SharedRigidTensorStore>> = OnceLock::new();
-    STORE.get_or_init(|| {
-        Mutex::new(SharedRigidTensorStore {
-            third: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
-            fourth: Vec::with_capacity(SharedRigidTensorStore::CAPACITY),
-        })
-    })
+    STORE.get_or_init(|| Mutex::new(SharedRigidTensorStore::empty()))
+}
+
+/// The rigid-tensor store `family` reuses from: its own search's in a parallel
+/// multistart (gnomon#2359), else the process-wide one.
+fn rigid_tensor_store(family: &BernoulliMarginalSlopeFamily) -> &Mutex<SharedRigidTensorStore> {
+    match family.search.as_deref() {
+        Some(member) => &member.rigid_tensors,
+        None => shared_rigid_tensor_store(),
+    }
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -194,7 +205,7 @@ impl BernoulliRigidRowKernel {
         self.third_full_cache
             .get_or_compute(|| {
                 let fp = self.rigid_tensor_fingerprint(0xa3);
-                if let Some(hit) = shared_rigid_tensor_store()
+                if let Some(hit) = rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on third read")
                     .get_third(fp)
@@ -220,7 +231,7 @@ impl BernoulliRigidRowKernel {
                          per-row jet should not error at the converged β snapshot",
                     );
                 let shared = Arc::new(built);
-                shared_rigid_tensor_store()
+                rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on third write")
                     .insert_third(fp, Arc::clone(&shared));
@@ -241,7 +252,7 @@ impl BernoulliRigidRowKernel {
         self.fourth_full_cache
             .get_or_compute(|| {
                 let fp = self.rigid_tensor_fingerprint(0xa4);
-                if let Some(hit) = shared_rigid_tensor_store()
+                if let Some(hit) = rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on fourth read")
                     .get_fourth(fp)
@@ -263,7 +274,7 @@ impl BernoulliRigidRowKernel {
                          per-row jet should not error at the converged β snapshot",
                     );
                 let shared = Arc::new(built);
-                shared_rigid_tensor_store()
+                rigid_tensor_store(&self.family)
                     .lock()
                     .expect("BMS rigid tensor store mutex poisoned on fourth write")
                     .insert_fourth(fp, Arc::clone(&shared));

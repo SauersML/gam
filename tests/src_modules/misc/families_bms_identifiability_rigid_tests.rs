@@ -107,7 +107,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
     BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
         residual: None,
-        search_lane: None,
+        search: None,
         y: Arc::new(Array1::zeros(0)),
         weights: Arc::new(Array1::zeros(0)),
         z: Arc::new(Array1::zeros(0)),

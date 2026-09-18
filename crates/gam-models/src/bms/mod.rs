@@ -2885,6 +2885,10 @@ mod latent_measure_2768_tests;
 // tensors. Bare `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod psi_axis_contractions_979_tests;
+// gnomon#2359: a multistart member reuses only its own same-β stores. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod multistart_member_2359_tests;
 pub(crate) mod row_primary_hessian;
 
 pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;

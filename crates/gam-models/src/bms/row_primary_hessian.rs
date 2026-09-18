@@ -1815,7 +1815,7 @@ impl BernoulliMarginalSlopeFamily {
         // multistart lane both are the availability read before launch and the
         // pins are the search's own (`row_primary_cache_memory_readings`).
         let (runtime_available, stable_capacity, workspace_pinned) =
-            row_primary_cache_memory_readings(self.search_lane.as_deref());
+            row_primary_cache_memory_readings(self.search.as_deref().map(|member| &*member.lane));
         let plan = decide_row_primary_hessian_cache(
             n,
             r,
@@ -2034,7 +2034,7 @@ impl BernoulliMarginalSlopeFamily {
                 packed_grad,
                 packed_hess,
                 plan.bytes,
-                self.search_lane.clone(),
+                self.search.as_ref().map(|member| Arc::clone(&member.lane)),
             )));
         }
         let completed_rows = AtomicUsize::new(0);
@@ -2180,7 +2180,7 @@ impl BernoulliMarginalSlopeFamily {
             packed_grad,
             packed_hess,
             bytes,
-            self.search_lane.clone(),
+            self.search.as_ref().map(|member| Arc::clone(&member.lane)),
         ))
     }
 

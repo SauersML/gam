@@ -180,11 +180,13 @@ pub(super) fn decide_row_primary_hessian_cache(
 /// - the row-primary cache (`neglog`, `grad`, `hess`: `n·(r²+r+1)` f64) at the
 ///   size `decide_row_primary_hessian_cache` gives it on that availability with
 ///   nothing else pinned: materialized or tiled, or nothing when streamed;
-/// - two exact-evaluation caches, the one a search evaluates on and the one the
-///   shared store keeps, each with its per-row contexts, its degree-9 and
+/// - three exact-evaluation caches, the two its own store retains and the one it
+///   builds on a miss (`BmsSearchMember`), each with its per-row contexts, its degree-9 and
 ///   degree-15 cell-moment bundles at `RowCellMomentsBundle::estimated_resident_bytes`
 ///   over the partition's most cells per row, and its per-row flex third
 ///   tensors (two `r×r` f64 per row);
+/// - on the rigid path, three of each of its own store's per-row third and
+///   fourth rigid tensors (8 and 16 f64 per row);
 /// - the row-intercept warm starts: two `u64` and a predictor slot per row,
 ///   each predictor two `r`-vectors of f64;
 /// - the block states' linear predictors, `n` f64 per block;
@@ -228,7 +230,12 @@ pub(super) fn outer_search_working_set_bytes(
     } else {
         0
     };
-    let exact_eval_caches = 2 * (row_contexts + cell_bundles + flex_third);
+    let exact_eval_caches = 3 * (row_contexts + cell_bundles + flex_third);
+    let rigid_tensors = if flex_active {
+        0
+    } else {
+        3 * n.saturating_mul((8 + 16) * f64_bytes)
+    };
     let predictor_slot = std::mem::size_of::<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>()
         as u64
         + 2 * r * f64_bytes;
@@ -238,6 +245,7 @@ pub(super) fn outer_search_working_set_bytes(
     let joint_hessian = 2 * p.saturating_mul(p).saturating_mul(f64_bytes);
     row_primary_cache
         .saturating_add(exact_eval_caches)
+        .saturating_add(rigid_tensors)
         .saturating_add(intercept_warm_starts)
         .saturating_add(block_predictors)
         .saturating_add(joint_hessian)

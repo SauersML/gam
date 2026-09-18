@@ -107,13 +107,19 @@ pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJ
 /// distinct β̂ exact-caches (each O(n·cells); at biobank scale ≈ a few hundred
 /// MB, well within the box's headroom, and the FIFO-2 cap is the same bound the
 /// assembled-operator cache uses one layer up).
-struct SharedExactCacheStore {
+pub(super) struct SharedExactCacheStore {
     /// `(fingerprint, exact-cache)` for at most the last two distinct β̂ builds.
     entries: Vec<(u64, Arc<BernoulliMarginalSlopeExactEvalCache>)>,
 }
 
 impl SharedExactCacheStore {
     const CAPACITY: usize = 2;
+
+    pub(super) fn empty() -> Self {
+        Self {
+            entries: Vec::with_capacity(Self::CAPACITY),
+        }
+    }
 
     fn get(&self, fingerprint: u64) -> Option<Arc<BernoulliMarginalSlopeExactEvalCache>> {
         self.entries
@@ -137,11 +143,16 @@ impl SharedExactCacheStore {
 
 fn shared_exact_cache_store() -> &'static Mutex<SharedExactCacheStore> {
     static STORE: OnceLock<Mutex<SharedExactCacheStore>> = OnceLock::new();
-    STORE.get_or_init(|| {
-        Mutex::new(SharedExactCacheStore {
-            entries: Vec::with_capacity(SharedExactCacheStore::CAPACITY),
-        })
-    })
+    STORE.get_or_init(|| Mutex::new(SharedExactCacheStore::empty()))
+}
+
+/// The exact-cache store `family` reuses from: its own search's in a parallel
+/// multistart (gnomon#2359), else the process-wide one.
+fn exact_cache_store(family: &BernoulliMarginalSlopeFamily) -> &Mutex<SharedExactCacheStore> {
+    match family.search.as_deref() {
+        Some(member) => &member.exact_caches,
+        None => shared_exact_cache_store(),
+    }
 }
 
 /// Fill one deviation-basis column of the *score-warp* coefficient jet.
@@ -1839,7 +1850,7 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Arc<BernoulliMarginalSlopeExactEvalCache>, String> {
         let fingerprint =
             self.shared_exact_cache_fingerprint(block_states, options, want_primary_hessians);
-        if let Some(cache) = shared_exact_cache_store()
+        if let Some(cache) = exact_cache_store(self)
             .lock()
             .map_err(|e| format!("BMS exact-cache store mutex poisoned on read: {e}"))?
             .get(fingerprint)
@@ -1852,7 +1863,7 @@ impl BernoulliMarginalSlopeFamily {
                 self.build_row_primary_hessian_cache(block_states, &cache)?;
         }
         let cache = Arc::new(cache);
-        shared_exact_cache_store()
+        exact_cache_store(self)
             .lock()
             .map_err(|e| format!("BMS exact-cache store mutex poisoned on write: {e}"))?
             .insert(fingerprint, Arc::clone(&cache));
@@ -3659,7 +3670,7 @@ mod empirical_rigid_jet_oracle_tests {
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
             residual: None,
-            search_lane: None,
+            search: None,
             y: Arc::new(Array1::from_vec(y)),
             weights: Arc::new(Array1::from_vec(weights)),
             z: Arc::new(Array1::from_vec(z)),
@@ -4318,7 +4329,7 @@ mod empirical_flex_jet_oracle_tests {
         let family = BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
             residual: None,
-            search_lane: None,
+            search: None,
             y: Arc::new(Array1::from_vec(vec![1.0])),
             weights: Arc::new(Array1::from_vec(vec![1.0])),
             z: Arc::new(Array1::from_vec(vec![0.45])),
