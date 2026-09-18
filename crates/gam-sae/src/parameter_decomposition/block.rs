@@ -704,6 +704,26 @@ pub struct NativeGatedBlock {
 }
 
 impl NativeGatedBlock {
+    /// The source's attention normalization (`input_layernorm`).
+    pub fn attention_norm(&self) -> &NativeNorm {
+        &self.attention_norm
+    }
+
+    /// The source's attention sublayer on its own tensors.
+    pub fn attention(&self) -> &NativeAttention {
+        &self.attention
+    }
+
+    /// The source's MLP normalization (`post_attention_layernorm`).
+    pub fn mlp_norm(&self) -> &NativeNorm {
+        &self.mlp_norm
+    }
+
+    /// The source's gated MLP on its own tensors.
+    pub fn mlp(&self) -> &NativeSwiglu {
+        &self.mlp
+    }
+
     /// A block of the source's sublayers. Each width is refused where its owner
     /// reads it.
     pub fn new(

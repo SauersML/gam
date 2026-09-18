@@ -1,4 +1,5 @@
-//! Mechanism programs over [`super::block`]'s attention-only layers (#2951).
+//! Mechanism programs over [`super::block`]'s attention-only layers and gated decoder blocks
+//! (#2951).
 //!
 //! [`attention_layer_program`] writes a norm-free, MLP-free decoder layer
 //! `h' = h + concat_h(z_h) W_Oᵀ` as one [`Program`]: the residual input, the query,
@@ -24,6 +25,18 @@
 //! [`NativeAttentionLayer::execute`] with native reads, and a masked program to
 //! [`ComponentAttentionLayer::execute`] with component reads, at every stage.
 //!
+//! # A whole gated block
+//!
+//! [`GatedBlockProgram`] writes a gated (SwiGLU) decoder block, the A12 block shape, as one program:
+//! norm, the query, key and value projections with their biases, `CausalSelfAttention`, the output
+//! projection, the residual `Sum`, norm, the gate and up projections, `SwiGlu`, the down projection
+//! and the residual `Sum`, in the block's layout, with a slot per stage. Its formal parameters
+//! are named after the source's tensors, so a registry binding can read them, and
+//! [`GatedBlockSource`] binds a [`NativeGatedBlock`]'s own tensors, borrowed. Its projections run
+//! through apply.rs, where the native block runs its owners' kernels, so the two agree stage by
+//! stage within the sum of their rounding bands, and the norm stages bit for bit. A block that
+//! normalizes each head's queries and keys (Qwen3) is refused: no program primitive expresses it.
+//!
 //! # Validity domain
 //!
 //! A program reads each projection globally. A read at declared positions
@@ -31,7 +44,10 @@
 //! by invocation, not by sequence position.
 
 use super::apply::{ApplyError, FactorView, apply_anchored_linear, native_linear};
-use super::block::{AttentionProjection, BlockError, ComponentAttentionLayer, NativeAttentionLayer};
+use super::block::{
+    AttentionProjection, BlockError, ComponentAttentionLayer, NativeAttentionLayer, NativeGatedBlock, NativeNorm,
+};
+use super::gated_rewrite::ResidualLayout;
 use super::lift::TieOrientation;
 use super::program::{
     Body, BodyId, ControlDecl, ControlId, MaskAssignment, MaskGroup, MaskGroupId, NativePrimitive, Node,
@@ -407,10 +423,500 @@ impl ParameterSource for ComponentAttentionLayer {
     }
 }
 
+/// A formal parameter of a gated block's program. A block whose norms are RMSNorms
+/// declares no norm bias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatedBlockParameter {
+    AttentionNormGain,
+    AttentionNormBias,
+    QueryWeight,
+    QueryBias,
+    KeyWeight,
+    KeyBias,
+    ValueWeight,
+    ValueBias,
+    OutputWeight,
+    OutputBias,
+    MlpNormGain,
+    MlpNormBias,
+    Gate,
+    Up,
+    Down,
+}
+
+impl fmt::Display for GatedBlockParameter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AttentionNormGain => "input_layernorm.weight",
+            Self::AttentionNormBias => "input_layernorm.bias",
+            Self::QueryWeight => "self_attn.q_proj.weight",
+            Self::QueryBias => "self_attn.q_proj.bias",
+            Self::KeyWeight => "self_attn.k_proj.weight",
+            Self::KeyBias => "self_attn.k_proj.bias",
+            Self::ValueWeight => "self_attn.v_proj.weight",
+            Self::ValueBias => "self_attn.v_proj.bias",
+            Self::OutputWeight => "self_attn.o_proj.weight",
+            Self::OutputBias => "self_attn.o_proj.bias",
+            Self::MlpNormGain => "post_attention_layernorm.weight",
+            Self::MlpNormBias => "post_attention_layernorm.bias",
+            Self::Gate => "mlp.gate_proj.weight",
+            Self::Up => "mlp.up_proj.weight",
+            Self::Down => "mlp.down_proj.weight",
+        })
+    }
+}
+
+/// A stage a gated block's program keeps in a `Write` slot, in slot order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatedBlockStage {
+    /// `N₁(h)`.
+    AttentionInput,
+    /// `x W_Qᵀ + b_Q` on the attention input.
+    Queries,
+    Keys,
+    Values,
+    /// The head-mixed rows before the output projection.
+    Mixed,
+    /// `concat_h(z_h) W_Oᵀ + b_O`, the attention write with no residual.
+    AttentionWrite,
+    /// `N₂` of the stream the MLP reads: `h + A` sequential, `h` parallel.
+    MlpInput,
+    /// `gate_proj` of the MLP input.
+    Gate,
+    /// `up_proj` of the MLP input.
+    Up,
+    /// `s(gate) ⊙ up`, the `down_proj` input.
+    Hidden,
+    /// `down_proj`, the MLP write with no residual.
+    MlpWrite,
+}
+
+impl GatedBlockStage {
+    pub const ALL: [Self; 11] = [
+        Self::AttentionInput,
+        Self::Queries,
+        Self::Keys,
+        Self::Values,
+        Self::Mixed,
+        Self::AttentionWrite,
+        Self::MlpInput,
+        Self::Gate,
+        Self::Up,
+        Self::Hidden,
+        Self::MlpWrite,
+    ];
+
+    /// The stage's slot in a gated block's program.
+    pub fn slot(self) -> SlotId {
+        SlotId(match self {
+            Self::AttentionInput => 0,
+            Self::Queries => 1,
+            Self::Keys => 2,
+            Self::Values => 3,
+            Self::Mixed => 4,
+            Self::AttentionWrite => 5,
+            Self::MlpInput => 6,
+            Self::Gate => 7,
+            Self::Up => 8,
+            Self::Hidden => 9,
+            Self::MlpWrite => 10,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::AttentionInput => "attention input",
+            Self::Queries => "queries",
+            Self::Keys => "keys",
+            Self::Values => "values",
+            Self::Mixed => "mixed",
+            Self::AttentionWrite => "attention write",
+            Self::MlpInput => "MLP input",
+            Self::Gate => "gate",
+            Self::Up => "up",
+            Self::Hidden => "hidden",
+            Self::MlpWrite => "MLP write",
+        }
+    }
+}
+
+/// A refused gated-block program or binding.
+#[derive(Debug)]
+pub enum GatedBlockProgramError {
+    /// The program graph was refused.
+    Program(ProgramError),
+    /// The block normalizes each head's queries and keys (Qwen3 `q_norm`/`k_norm`), which
+    /// no program primitive expresses.
+    QueryKeyNorm,
+    /// A formal parameter the program does not declare.
+    Unbound { parameter: ParameterSlot },
+    /// A vector parameter read as a matrix.
+    NotAMatrix { parameter: GatedBlockParameter },
+    /// A matrix parameter read as a vector.
+    NotAVector { parameter: GatedBlockParameter },
+    /// A native block has no component anchor for controls to act on.
+    Controlled { parameter: GatedBlockParameter },
+    /// apply.rs refused a read.
+    Apply {
+        parameter: GatedBlockParameter,
+        error: ApplyError,
+    },
+}
+
+impl From<ProgramError> for GatedBlockProgramError {
+    fn from(error: ProgramError) -> Self {
+        Self::Program(error)
+    }
+}
+
+impl fmt::Display for GatedBlockProgramError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Program(error) => write!(formatter, "the gated block program was refused: {error}"),
+            Self::QueryKeyNorm => formatter.write_str(
+                "the block normalizes each head's queries and keys, which no program primitive expresses",
+            ),
+            Self::Unbound { parameter } => {
+                write!(formatter, "formal parameter {} is not one of the block program's", parameter.0)
+            }
+            Self::NotAMatrix { parameter } => write!(formatter, "{parameter} is a vector, not a matrix"),
+            Self::NotAVector { parameter } => write!(formatter, "{parameter} is a matrix, not a vector"),
+            Self::Controlled { parameter } => {
+                write!(formatter, "{parameter} is a native tensor with no component anchor for controls")
+            }
+            Self::Apply { parameter, error } => write!(formatter, "the {parameter} read was refused: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GatedBlockProgramError {}
+
+/// A body's nodes, pushed in topological order.
+struct BodyNodes(Vec<Node>);
+
+impl BodyNodes {
+    fn push(&mut self, node: Node) -> NodeId {
+        self.0.push(node);
+        NodeId(self.0.len() as u32 - 1)
+    }
+
+    fn write(&mut self, stage: GatedBlockStage, value: NodeId) -> NodeId {
+        self.push(Node::Write {
+            slot: stage.slot(),
+            value,
+        })
+    }
+
+    fn native(&mut self, primitive: NativePrimitive, arguments: Vec<NodeId>) -> NodeId {
+        self.push(Node::Native { primitive, arguments })
+    }
+
+    fn sum(&mut self, values: &[NodeId]) -> NodeId {
+        self.push(Node::Sum {
+            terms: values
+                .iter()
+                .map(|&value| SumTerm { value, control: None })
+                .collect(),
+        })
+    }
+
+    fn linear(&mut self, weight: ParameterSlot, input: NodeId) -> NodeId {
+        self.native(
+            NativePrimitive::Linear {
+                weight,
+                orientation: TieOrientation::Identity,
+            },
+            vec![input],
+        )
+    }
+
+    /// `x Wᵀ + b`: a `Linear` node, then an `AddBias` node.
+    fn affine(&mut self, (weight, bias): (ParameterSlot, ParameterSlot), input: NodeId) -> NodeId {
+        let product = self.linear(weight, input);
+        self.native(NativePrimitive::AddBias { bias }, vec![product])
+    }
+}
+
+/// Declares the next formal parameter.
+fn declare(parameters: &mut Vec<GatedBlockParameter>, parameter: GatedBlockParameter) -> ParameterSlot {
+    parameters.push(parameter);
+    ParameterSlot(parameters.len() as u32 - 1)
+}
+
+/// The norm primitive of `norm`, declaring its gain and, for a LayerNorm, its bias.
+fn norm_primitive(
+    parameters: &mut Vec<GatedBlockParameter>,
+    norm: &NativeNorm,
+    gain: GatedBlockParameter,
+    bias: GatedBlockParameter,
+) -> NativePrimitive {
+    match norm {
+        NativeNorm::Rms { epsilon, .. } => NativePrimitive::RmsNorm {
+            epsilon: *epsilon,
+            gain: declare(parameters, gain),
+        },
+        NativeNorm::Layer { epsilon, .. } => {
+            let gain = declare(parameters, gain);
+            NativePrimitive::LayerNorm {
+                epsilon: *epsilon,
+                gain,
+                bias: declare(parameters, bias),
+            }
+        }
+    }
+}
+
+/// A gated (SwiGLU) decoder block written as one mechanism program: norm, the query, key
+/// and value `Linear` and `AddBias` nodes, `CausalSelfAttention`, the output projection,
+/// the residual `Sum`, norm, the gate and up `Linear` nodes, `SwiGlu`, the down `Linear`
+/// node and the residual `Sum`, in the block's residual layout. Each stage is kept in its
+/// [`GatedBlockStage`] slot, and the formal parameters are named after the source's
+/// tensors ([`GatedBlockParameter`]), in the order [`Self::parameters`] lists them.
+///
+/// The residual sums run in the source's order: `(h + a) + m` sequential and
+/// `(m + a) + h` parallel, as [`super::gated_rewrite::decoder_layer`] adds them.
+#[derive(Clone, Debug)]
+pub struct GatedBlockProgram {
+    program: Program,
+    parameters: Vec<GatedBlockParameter>,
+}
+
+impl GatedBlockProgram {
+    /// The program of `block`'s structure: its norms, attention geometry and layout. Its
+    /// tensors are bound at execution ([`Self::source`]).
+    pub fn new(block: &NativeGatedBlock) -> Result<Self, GatedBlockProgramError> {
+        let attention = block.attention();
+        if attention.has_query_key_norm() {
+            return Err(GatedBlockProgramError::QueryKeyNorm);
+        }
+        let mut parameters = Vec::new();
+        let attention_norm = norm_primitive(
+            &mut parameters,
+            block.attention_norm(),
+            GatedBlockParameter::AttentionNormGain,
+            GatedBlockParameter::AttentionNormBias,
+        );
+        let query = (
+            declare(&mut parameters, GatedBlockParameter::QueryWeight),
+            declare(&mut parameters, GatedBlockParameter::QueryBias),
+        );
+        let key = (
+            declare(&mut parameters, GatedBlockParameter::KeyWeight),
+            declare(&mut parameters, GatedBlockParameter::KeyBias),
+        );
+        let value = (
+            declare(&mut parameters, GatedBlockParameter::ValueWeight),
+            declare(&mut parameters, GatedBlockParameter::ValueBias),
+        );
+        let output = (
+            declare(&mut parameters, GatedBlockParameter::OutputWeight),
+            declare(&mut parameters, GatedBlockParameter::OutputBias),
+        );
+        let mlp_norm = norm_primitive(
+            &mut parameters,
+            block.mlp_norm(),
+            GatedBlockParameter::MlpNormGain,
+            GatedBlockParameter::MlpNormBias,
+        );
+        let gate = declare(&mut parameters, GatedBlockParameter::Gate);
+        let up = declare(&mut parameters, GatedBlockParameter::Up);
+        let down = declare(&mut parameters, GatedBlockParameter::Down);
+
+        let mut nodes = BodyNodes(Vec::new());
+        let residual = nodes.push(Node::Input { port: 0 });
+        let normalized = nodes.native(attention_norm, vec![residual]);
+        let attention_input = nodes.write(GatedBlockStage::AttentionInput, normalized);
+        let queries = nodes.affine(query, attention_input);
+        let queries = nodes.write(GatedBlockStage::Queries, queries);
+        let keys = nodes.affine(key, attention_input);
+        let keys = nodes.write(GatedBlockStage::Keys, keys);
+        let values = nodes.affine(value, attention_input);
+        let values = nodes.write(GatedBlockStage::Values, values);
+        let mixed = nodes.native(
+            NativePrimitive::CausalSelfAttention {
+                geometry: attention.geometry(),
+                rotary: attention.rotary().clone(),
+                score_scale: attention.score_scale(),
+            },
+            vec![queries, keys, values],
+        );
+        let mixed = nodes.write(GatedBlockStage::Mixed, mixed);
+        let attention_write = nodes.affine(output, mixed);
+        let attention_write = nodes.write(GatedBlockStage::AttentionWrite, attention_write);
+        let stream = match block.layout() {
+            ResidualLayout::Sequential => nodes.sum(&[residual, attention_write]),
+            ResidualLayout::Parallel => residual,
+        };
+        let normalized = nodes.native(mlp_norm, vec![stream]);
+        let mlp_input = nodes.write(GatedBlockStage::MlpInput, normalized);
+        let gated = nodes.linear(gate, mlp_input);
+        let gated = nodes.write(GatedBlockStage::Gate, gated);
+        let lifted = nodes.linear(up, mlp_input);
+        let lifted = nodes.write(GatedBlockStage::Up, lifted);
+        let hidden = nodes.native(NativePrimitive::SwiGlu, vec![gated, lifted]);
+        let hidden = nodes.write(GatedBlockStage::Hidden, hidden);
+        let mlp_write = nodes.linear(down, hidden);
+        let mlp_write = nodes.write(GatedBlockStage::MlpWrite, mlp_write);
+        let block_output = match block.layout() {
+            ResidualLayout::Sequential => nodes.sum(&[stream, mlp_write]),
+            ResidualLayout::Parallel => nodes.sum(&[mlp_write, attention_write, residual]),
+        };
+        let parts = ProgramParts {
+            parameters: parameters
+                .iter()
+                .map(|parameter| ParameterDecl {
+                    name: parameter.to_string(),
+                    controls: Vec::new(),
+                })
+                .collect(),
+            slots: GatedBlockStage::ALL
+                .iter()
+                .map(|stage| SlotDecl {
+                    name: stage.name().to_string(),
+                })
+                .collect(),
+            controls: Vec::new(),
+            mask_groups: Vec::new(),
+            bodies: vec![Body {
+                name: "gated decoder block".to_string(),
+                inputs: 1,
+                nodes: nodes.0,
+                output: block_output,
+            }],
+            entry: BodyId(0),
+        };
+        Ok(Self {
+            program: Program::new(parts)?,
+            parameters,
+        })
+    }
+
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    /// The source tensor each formal parameter reads, in slot order.
+    pub fn parameters(&self) -> &[GatedBlockParameter] {
+        &self.parameters
+    }
+
+    /// `block`'s tensors bound to this program's formal parameters, borrowed, not copied.
+    pub fn source<'a>(&'a self, block: &'a NativeGatedBlock) -> GatedBlockSource<'a> {
+        GatedBlockSource {
+            block,
+            parameters: &self.parameters,
+        }
+    }
+}
+
+/// A native gated block's tensors as a [`GatedBlockProgram`]'s dense
+/// [`ParameterSource`]: it refuses anchor controls and reads a Transpose use through
+/// the stored tensor's transposed view.
+#[derive(Clone, Copy, Debug)]
+pub struct GatedBlockSource<'a> {
+    block: &'a NativeGatedBlock,
+    parameters: &'a [GatedBlockParameter],
+}
+
+impl GatedBlockSource<'_> {
+    fn parameter(&self, parameter: ParameterUse<'_>) -> Result<GatedBlockParameter, GatedBlockProgramError> {
+        let declared = self
+            .parameters
+            .get(parameter.parameter.index())
+            .copied()
+            .ok_or(GatedBlockProgramError::Unbound {
+                parameter: parameter.parameter,
+            })?;
+        if parameter.controls.is_empty() {
+            Ok(declared)
+        } else {
+            Err(GatedBlockProgramError::Controlled { parameter: declared })
+        }
+    }
+}
+
+impl ParameterSource for GatedBlockSource<'_> {
+    type Error = GatedBlockProgramError;
+
+    fn apply_linear(
+        &self,
+        parameter: ParameterUse<'_>,
+        orientation: TieOrientation,
+        rows: ArrayView2<'_, f64>,
+    ) -> Result<Governed<Array2<f64>>, GatedBlockProgramError> {
+        let declared = self.parameter(parameter)?;
+        let attention = self.block.attention();
+        let weight = match declared {
+            GatedBlockParameter::QueryWeight => attention.query().weight.view(),
+            GatedBlockParameter::KeyWeight => attention.key().weight.view(),
+            GatedBlockParameter::ValueWeight => attention.value().weight.view(),
+            GatedBlockParameter::OutputWeight => attention.output().weight.view(),
+            GatedBlockParameter::Gate => self.block.mlp().gate(),
+            GatedBlockParameter::Up => self.block.mlp().up(),
+            GatedBlockParameter::Down => self.block.mlp().down(),
+            GatedBlockParameter::AttentionNormGain
+            | GatedBlockParameter::AttentionNormBias
+            | GatedBlockParameter::QueryBias
+            | GatedBlockParameter::KeyBias
+            | GatedBlockParameter::ValueBias
+            | GatedBlockParameter::OutputBias
+            | GatedBlockParameter::MlpNormGain
+            | GatedBlockParameter::MlpNormBias => {
+                return Err(GatedBlockProgramError::NotAMatrix { parameter: declared });
+            }
+        };
+        native_linear(oriented(weight, orientation), rows)
+            .map_err(|error| GatedBlockProgramError::Apply { parameter: declared, error })
+    }
+
+    fn vector(&self, parameter: ParameterUse<'_>) -> Result<Array1<f64>, GatedBlockProgramError> {
+        let declared = self.parameter(parameter)?;
+        let attention = self.block.attention();
+        let not_a_vector = GatedBlockProgramError::NotAVector { parameter: declared };
+        match declared {
+            GatedBlockParameter::AttentionNormGain => Ok(norm_gain(self.block.attention_norm())),
+            GatedBlockParameter::AttentionNormBias => norm_bias(self.block.attention_norm()).ok_or(not_a_vector),
+            GatedBlockParameter::QueryBias => Ok(attention.query().bias.clone()),
+            GatedBlockParameter::KeyBias => Ok(attention.key().bias.clone()),
+            GatedBlockParameter::ValueBias => Ok(attention.value().bias.clone()),
+            GatedBlockParameter::OutputBias => Ok(attention.output().bias.clone()),
+            GatedBlockParameter::MlpNormGain => Ok(norm_gain(self.block.mlp_norm())),
+            GatedBlockParameter::MlpNormBias => norm_bias(self.block.mlp_norm()).ok_or(not_a_vector),
+            GatedBlockParameter::QueryWeight
+            | GatedBlockParameter::KeyWeight
+            | GatedBlockParameter::ValueWeight
+            | GatedBlockParameter::OutputWeight
+            | GatedBlockParameter::Gate
+            | GatedBlockParameter::Up
+            | GatedBlockParameter::Down => Err(not_a_vector),
+        }
+    }
+}
+
+fn norm_gain(norm: &NativeNorm) -> Array1<f64> {
+    match norm {
+        NativeNorm::Rms { gain, .. } | NativeNorm::Layer { gain, .. } => gain.clone(),
+    }
+}
+
+fn norm_bias(norm: &NativeNorm) -> Option<Array1<f64>> {
+    match norm {
+        NativeNorm::Rms { .. } => None,
+        NativeNorm::Layer { bias, .. } => Some(bias.clone()),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parameter_decomposition::attention::{AttentionGeometry, RotaryEmbedding, RotaryPairing};
+    use crate::parameter_decomposition::attention::{
+        AffineProjection, AttentionGeometry, NativeAttention, ProjectedRows, RotaryCausalAttention, RotaryEmbedding,
+        RotaryPairing,
+    };
+    use crate::parameter_decomposition::gated_rewrite::{NativeSwiglu, swiglu_hidden};
+    use crate::parameter_decomposition::receipts::affine_stage_band;
+    use gam_linalg::roundoff::accumulation_growth;
     use crate::parameter_decomposition::block::{AttentionLayerExecution, AttentionLayerReads, ProjectionRead};
     use crate::parameter_decomposition::program::{Execution, ExecutionError};
     use crate::parameter_decomposition::rewrite::ComponentRead;
@@ -723,6 +1229,341 @@ mod tests {
         assert!(
             matches!(program.masks(views(&infinite)), Err(LayerProgramError::Program(_))),
             "a non-finite mask must be refused by the program's assignment"
+        );
+    }
+
+    const HIDDEN: usize = 12;
+
+    /// A gated block on eighths weights with biases, over a residual in thirds of eighths:
+    /// Llama-style (RMSNorm, sequential) or parallel with LayerNorm. `shift` moves the query
+    /// weight's and the gate weight's first entries, for the positive controls.
+    fn gated_block(layout: ResidualLayout, seed: u64, shift: f64) -> (NativeGatedBlock, Array2<f64>, Vec<i64>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut matrix = |rows: usize, cols: usize| eighths(&mut rng, rows, cols);
+        let (mut query, key, value, output) =
+            (matrix(WIDTH, WIDTH), matrix(WIDTH, WIDTH), matrix(WIDTH, WIDTH), matrix(WIDTH, WIDTH));
+        let (mut gate, up, down) = (matrix(HIDDEN, WIDTH), matrix(HIDDEN, WIDTH), matrix(WIDTH, HIDDEN));
+        let mut vector = |len: usize| Array1::from_shape_simple_fn(len, || rng.random_range(-8..=8) as f64 / 8.0);
+        let (query_bias, key_bias, value_bias, output_bias) = (vector(WIDTH), vector(WIDTH), vector(WIDTH), vector(WIDTH));
+        let (attention_gain, attention_bias, mlp_gain, mlp_bias) =
+            (vector(WIDTH), vector(WIDTH), vector(WIDTH), vector(WIDTH));
+        query[[0, 0]] += shift;
+        gate[[0, 0]] += shift;
+        let attention = NativeAttention::new(
+            geometry(),
+            rotary(),
+            0.5,
+            AffineProjection {
+                weight: query,
+                bias: query_bias,
+            },
+            AffineProjection {
+                weight: key,
+                bias: key_bias,
+            },
+            AffineProjection {
+                weight: value,
+                bias: value_bias,
+            },
+            AffineProjection {
+                weight: output,
+                bias: output_bias,
+            },
+        )
+        .expect("fixture attention tensors match the geometry");
+        let norm = |gain: Array1<f64>, bias: Array1<f64>| match layout {
+            ResidualLayout::Sequential => NativeNorm::Rms { epsilon: 1.0e-6, gain },
+            ResidualLayout::Parallel => NativeNorm::Layer {
+                epsilon: 1.0e-5,
+                gain,
+                bias,
+            },
+        };
+        let block = NativeGatedBlock::new(
+            layout,
+            norm(attention_gain, attention_bias),
+            attention,
+            norm(mlp_gain, mlp_bias),
+            NativeSwiglu::new(gate, up, down).expect("fixture SwiGLU shapes compose"),
+        );
+        let residual = Array2::from_shape_simple_fn((TOKENS, WIDTH), || rng.random_range(-48..=48) as f64 / 24.0);
+        (block, residual, (3..3 + TOKENS as i64).collect())
+    }
+
+    fn violations(left: &Array2<f64>, right: &Array2<f64>, band: &Array2<f64>) -> usize {
+        left.iter()
+            .zip(right.iter())
+            .zip(band.iter())
+            .filter(|((a, b), bound)| (*a - *b).abs() > **bound)
+            .count()
+    }
+
+    fn gated_slot(execution: &Execution, stage: GatedBlockStage) -> &Array2<f64> {
+        execution.slots[stage.slot().index()]
+            .as_ref()
+            .expect("every stage slot is written")
+    }
+
+    fn run_gated(
+        program: &GatedBlockProgram,
+        block: &NativeGatedBlock,
+        residual: &Array2<f64>,
+        positions: &[i64],
+    ) -> Execution {
+        program
+            .program()
+            .execute(
+                &program.source(block),
+                &MaskAssignment::all_on(),
+                vec![residual.clone()],
+                vec![None; GatedBlockStage::ALL.len()],
+                positions,
+            )
+            .expect("gated block program")
+    }
+
+    /// The program route's radius at its attention write, against the exact sublayer at the
+    /// program's attention input: each projection's band `affine_stage_band` (`Linear` then
+    /// `AddBias`, `d + 1` roundings) enters the attention core as its input radius, and the
+    /// output projection adds its own band plus `|W_O|` times the mixed radius.
+    fn program_attention_radius(block: &NativeGatedBlock, execution: &Execution, positions: &[i64]) -> Array2<f64> {
+        let attention = block.attention();
+        let input = gated_slot(execution, GatedBlockStage::AttentionInput);
+        let band = |projection: &AffineProjection, rows: &Array2<f64>| {
+            affine_stage_band(projection.weight.view(), Some(projection.bias.view()), rows.view())
+                .expect("fixture shapes")
+        };
+        let (query_radius, key_radius, value_radius) =
+            (band(attention.query(), input), band(attention.key(), input), band(attention.value(), input));
+        let core = RotaryCausalAttention::new(attention.geometry(), attention.rotary().clone(), attention.score_scale())
+            .expect("the fixture attention core");
+        let with_radius = core
+            .attend_projected(
+                ProjectedRows {
+                    values: gated_slot(execution, GatedBlockStage::Queries).view(),
+                    radius: query_radius.view(),
+                },
+                ProjectedRows {
+                    values: gated_slot(execution, GatedBlockStage::Keys).view(),
+                    radius: key_radius.view(),
+                },
+                ProjectedRows {
+                    values: gated_slot(execution, GatedBlockStage::Values).view(),
+                    radius: value_radius.view(),
+                },
+                positions,
+            )
+            .expect("finite projected rows");
+        let mixed = gated_slot(execution, GatedBlockStage::Mixed);
+        assert!(
+            bits(&with_radius.mixed) == bits(mixed),
+            "the radius arithmetic must leave the program's mixed rows' bits alone"
+        );
+        let carried = with_radius.mixed_radius.dot(&attention.output().weight.mapv(f64::abs).t())
+            / (1.0 - accumulation_growth(mixed.ncols() + 1));
+        band(attention.output(), mixed) + &carried
+    }
+
+    /// A gated block's program is a receipt-grade executor of the block. Fed the program's own
+    /// previous stage, the native block's owners agree with every program stage: the norm stages
+    /// bit for bit (the same `MaskedNorm`); the attention write within the sum of the native
+    /// attention's radius and the program route's radius; the gate, up and down projections
+    /// within the two routes' affine bands (apply.rs on one side, the native SwiGLU's products on
+    /// the other); the SwiGLU hidden rows and the residual sums bit for bit. Both layouts.
+    /// Positive controls: a query weight entry and a gate weight entry moved by 1e-9 each leave
+    /// their stage's band.
+    #[test]
+    fn a_gated_block_program_agrees_with_the_native_block_stage_by_stage() {
+        for (layout, seed) in [(ResidualLayout::Sequential, 3001), (ResidualLayout::Parallel, 3002)] {
+            let (block, residual, positions) = gated_block(layout, seed, 0.0);
+            let program = GatedBlockProgram::new(&block).expect("the block program is valid");
+            let executed = run_gated(&program, &block, &residual, &positions);
+            let native = block.execute(residual.view(), &positions).expect("native block");
+            let slot = |stage| gated_slot(&executed, stage);
+            assert!(
+                bits(slot(GatedBlockStage::AttentionInput)) == bits(&native.attention_input),
+                "{layout:?}: the attention norm is the same MaskedNorm on the same rows"
+            );
+            let attention_band =
+                program_attention_radius(&block, &executed, &positions) + &native.attention.output_radius;
+            assert_eq!(
+                violations(slot(GatedBlockStage::AttentionWrite), &native.attention.output, &attention_band),
+                0,
+                "{layout:?}: the program's attention write left the two routes' summed radii"
+            );
+            let stream = match layout {
+                ResidualLayout::Sequential => &residual + slot(GatedBlockStage::AttentionWrite),
+                ResidualLayout::Parallel => residual.clone(),
+            };
+            let mlp_input = block.mlp_norm().as_masked_norm().apply(stream.view()).expect("finite stream");
+            assert!(
+                bits(slot(GatedBlockStage::MlpInput)) == bits(&mlp_input),
+                "{layout:?}: the MLP norm is the same MaskedNorm on the program's stream"
+            );
+            let native_mlp = block
+                .mlp()
+                .execute_stages(slot(GatedBlockStage::MlpInput).view())
+                .expect("native SwiGLU stages");
+            for (stage, weight, native_rows) in [
+                (GatedBlockStage::Gate, block.mlp().gate(), &native_mlp.gate),
+                (GatedBlockStage::Up, block.mlp().up(), &native_mlp.up),
+            ] {
+                let band =
+                    affine_stage_band(weight, None, slot(GatedBlockStage::MlpInput).view()).expect("fixture shapes");
+                assert_eq!(
+                    violations(slot(stage), native_rows, &(&band * 2.0)),
+                    0,
+                    "{layout:?}: the program's {stage:?} left the two routes' affine bands"
+                );
+            }
+            let hidden = swiglu_hidden(slot(GatedBlockStage::Gate).view(), slot(GatedBlockStage::Up).view())
+                .expect("finite gate and up rows");
+            assert!(
+                bits(slot(GatedBlockStage::Hidden)) == bits(&hidden),
+                "{layout:?}: the SwiGLU node is the owner's swiglu_hidden on the program's rows"
+            );
+            let native_write = slot(GatedBlockStage::Hidden).dot(&block.mlp().down().t());
+            let band = affine_stage_band(block.mlp().down(), None, slot(GatedBlockStage::Hidden).view())
+                .expect("fixture shapes");
+            assert_eq!(
+                violations(slot(GatedBlockStage::MlpWrite), &native_write, &(&band * 2.0)),
+                0,
+                "{layout:?}: the program's MLP write left the two routes' affine bands"
+            );
+            let composed = match layout {
+                ResidualLayout::Sequential => &stream + slot(GatedBlockStage::MlpWrite),
+                ResidualLayout::Parallel => {
+                    &(slot(GatedBlockStage::MlpWrite) + slot(GatedBlockStage::AttentionWrite)) + &residual
+                }
+            };
+            assert!(
+                bits(&executed.output) == bits(&composed),
+                "{layout:?}: the residual sums run in the source's order"
+            );
+
+            // Positive controls: the program of a block whose query and gate weights moved by 1e-9.
+            let (moved, residual, positions) = gated_block(layout, seed, 1.0e-9);
+            let shifted = run_gated(&program, &moved, &residual, &positions);
+            assert!(
+                violations(
+                    gated_slot(&shifted, GatedBlockStage::AttentionWrite),
+                    &native.attention.output,
+                    &attention_band
+                ) > 0,
+                "{layout:?}: the attention band must resolve a 1e-9 query weight move"
+            );
+            let shifted_input = gated_slot(&shifted, GatedBlockStage::MlpInput);
+            let unmoved_gate = block
+                .mlp()
+                .execute_stages(shifted_input.view())
+                .expect("native SwiGLU stages")
+                .gate;
+            let band = affine_stage_band(block.mlp().gate(), None, shifted_input.view()).expect("fixture shapes");
+            assert!(
+                violations(gated_slot(&shifted, GatedBlockStage::Gate), &unmoved_gate, &(&band * 2.0)) > 0,
+                "{layout:?}: the gate band must resolve a 1e-9 gate weight move"
+            );
+        }
+    }
+
+    /// Typed refusals beside the accepted binding: a block with a per-head query/key norm has no
+    /// program, and the source refuses an undeclared parameter, a vector read as a matrix, a
+    /// matrix read as a vector, and anchor controls.
+    #[test]
+    fn a_gated_block_program_refuses_what_it_cannot_express_or_bind() {
+        let (block, residual, positions) = gated_block(ResidualLayout::Sequential, 3003, 0.0);
+        let program = GatedBlockProgram::new(&block).expect("the block program is valid");
+        assert!(
+            program
+                .program()
+                .execute(
+                    &program.source(&block),
+                    &MaskAssignment::all_on(),
+                    vec![residual.clone()],
+                    vec![None; GatedBlockStage::ALL.len()],
+                    &positions,
+                )
+                .is_ok(),
+            "control: the block binds its own program"
+        );
+        let normed = NativeGatedBlock::new(
+            ResidualLayout::Sequential,
+            block.attention_norm().clone(),
+            block
+                .attention()
+                .clone()
+                .with_query_key_norm(1.0e-6, Array1::ones(4), Array1::ones(4))
+                .expect("head-width gains"),
+            block.mlp_norm().clone(),
+            block.mlp().clone(),
+        );
+        assert!(
+            matches!(GatedBlockProgram::new(&normed), Err(GatedBlockProgramError::QueryKeyNorm)),
+            "a per-head query/key norm has no program primitive and must be refused"
+        );
+
+        let source = program.source(&block);
+        let slot_of = |parameter: GatedBlockParameter| {
+            ParameterSlot(
+                program
+                    .parameters()
+                    .iter()
+                    .position(|declared| *declared == parameter)
+                    .expect("declared parameter") as u32,
+            )
+        };
+        let rows = Array2::<f64>::ones((1, WIDTH));
+        let at = |parameter: ParameterSlot, controls: &'static [f64]| ParameterUse {
+            parameter,
+            body: BodyId(0),
+            node: NodeId(0),
+            invocation: &[],
+            controls,
+        };
+        let gate = slot_of(GatedBlockParameter::Gate);
+        assert!(
+            matches!(
+                source.apply_linear(at(ParameterSlot(99), &[]), TieOrientation::Identity, rows.view()),
+                Err(GatedBlockProgramError::Unbound {
+                    parameter: ParameterSlot(99)
+                })
+            ),
+            "an undeclared parameter must be refused"
+        );
+        assert!(
+            matches!(
+                source.apply_linear(
+                    at(slot_of(GatedBlockParameter::AttentionNormGain), &[]),
+                    TieOrientation::Identity,
+                    rows.view()
+                ),
+                Err(GatedBlockProgramError::NotAMatrix {
+                    parameter: GatedBlockParameter::AttentionNormGain
+                })
+            ),
+            "a gain read as a matrix must be refused"
+        );
+        assert!(
+            matches!(
+                source.vector(at(gate, &[])),
+                Err(GatedBlockProgramError::NotAVector {
+                    parameter: GatedBlockParameter::Gate
+                })
+            ),
+            "a weight read as a vector must be refused"
+        );
+        assert!(
+            matches!(
+                source.apply_linear(at(gate, &[0.5]), TieOrientation::Identity, rows.view()),
+                Err(GatedBlockProgramError::Controlled {
+                    parameter: GatedBlockParameter::Gate
+                })
+            ),
+            "anchor controls on a native tensor must be refused"
+        );
+        assert!(
+            source.apply_linear(at(gate, &[]), TieOrientation::Identity, rows.view()).is_ok(),
+            "control: the gate weight reads the rows"
         );
     }
 }

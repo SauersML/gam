@@ -302,6 +302,21 @@ impl NativeSwiglu {
         self.gate.ncols()
     }
 
+    /// The source's `gate_proj` weight, `H x d`.
+    pub fn gate(&self) -> ArrayView2<'_, f64> {
+        self.gate.view()
+    }
+
+    /// The source's `up_proj` weight, `H x d`.
+    pub fn up(&self) -> ArrayView2<'_, f64> {
+        self.up.view()
+    }
+
+    /// The source's `down_proj` weight, `d x H`.
+    pub fn down(&self) -> ArrayView2<'_, f64> {
+        self.down.view()
+    }
+
     /// Every stage of the layer on the original tensors.
     pub fn execute_stages(&self, inputs: ArrayView2<'_, f64>) -> Result<SwigluStages, GatedRewriteError> {
         require_shape("SwiGLU input rows", (inputs.nrows(), self.width()), inputs.dim())?;
