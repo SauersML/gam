@@ -570,8 +570,10 @@ fn a_withheld_covariance_names_the_missing_channel_and_survives_the_wire_2718() 
     // And an OLD payload — written before gam#2484 split the reason from the
     // channel — must still load, with the channel simply empty. A hard
     // deserialization failure there would lock consumers out of models they
-    // could previously read.
-    let legacy = r#"{"covariance_declined":{"reason":"bms-generated-regressor-latent-measure-not-standard-normal","latent_measure":"global-empirical"}}"#;
+    // could previously read. The artifacts carry `rho_posterior`, as every
+    // readable payload's do: it persists with no default since payload v18,
+    // and an older payload is refused by version before artifacts are parsed.
+    let legacy = r#"{"rho_posterior":{"NotComputed":"NotFormedOnThisRoute"},"covariance_declined":{"reason":"bms-generated-regressor-latent-measure-not-standard-normal","latent_measure":"global-empirical"}}"#;
     let loaded: gam::estimate::FitArtifacts = serde_json::from_str(legacy)
         .expect("gam#2484: a pre-channel payload must still deserialize");
     match loaded.covariance_declined {
