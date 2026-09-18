@@ -933,6 +933,9 @@ pub(crate) fn joint_outer_evaluate(
                 + Sync,
         >,
     >,
+    // The outer Hessian's second-order correction traces from the workspace's
+    // row kernels (gam#2922), paired with the owned closures above.
+    owned_second_correction_traces: Option<Arc<DriftSecondCorrectionTracesFn>>,
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
     batched_outer_hessian_operator: Option<Arc<dyn gam_problem::HessianOperator>>,
@@ -1169,6 +1172,7 @@ pub(crate) fn joint_outer_evaluate(
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 compute_d2h_many: owned_compute_d2h_many,
+                second_correction_traces: owned_second_correction_traces,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
@@ -1727,6 +1731,7 @@ pub(crate) fn joint_outer_evaluate_efs(
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 compute_d2h_many: owned_compute_d2h_many,
+                second_correction_traces: None,
                 family_outer_hessian_operator: None,
             })
         } else {
@@ -1956,6 +1961,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                 owned_compute_dh_many,
                 owned_compute_d2h,
                 owned_compute_d2h_many,
+                owned_second_correction_traces: _,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;

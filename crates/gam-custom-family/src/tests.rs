@@ -699,6 +699,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         None,
         None,
         None,
+        None,
     )
     .expect("projected outer evaluation succeeds");
 
@@ -724,6 +725,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         &no_dh,
         None,
         &no_d2h,
+        None,
         None,
         None,
         None,
@@ -877,6 +879,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
         None,
         None,
         None,
+        None,
     )
     .expect("projected outer evaluation succeeds on a singular joint Hessian");
 
@@ -1019,6 +1022,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             None,
             None,
             None,
+            None,
         )
         .expect("projected eval ok");
 
@@ -1045,6 +1049,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             &no_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
@@ -1385,6 +1390,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
         &compute_dh,
         None,
         &no_d2h,
+        None,
         None,
         None,
         None,

@@ -488,6 +488,60 @@ pub(crate) fn compute_outer_hessian(
     } else {
         None
     };
+    // gam#2922: a provider whose row kernel contracts the logdet factor itself
+    // answers every pair's correction trace in one pass, so the K(K+1)/2 drifts
+    // are never formed. Taken only where the per-pair path below would trace the
+    // materialised correction as `tr(Fᵀ·C·F)` with this dense spectral kernel's
+    // own factor `F`: the full-space logdet, and no scalar-GLM adjoint shortcut.
+    let batched_rho_pair_corrections =
+        match (batched_rho_pair_corrections, hop.as_exact_dense_spectral()) {
+            (None, Some(spectral))
+                if incl_logdet_h
+                    && subspace.is_none()
+                    && adjoint_z_c.is_none()
+                    && effective_deriv.has_corrections()
+                    && effective_deriv.has_hessian_second_derivative_correction_traces() =>
+            {
+                let traced_start = std::time::Instant::now();
+                let mut rhs_matrix = Array2::<f64>::zeros((hop.dim(), rho_pair_count));
+                for pair_idx in 0..rho_pair_count {
+                    let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
+                    rhs_matrix
+                        .column_mut(pair_idx)
+                        .assign(&build_rho_pair_rhs(kk, ll)?);
+                }
+                let solved = second_mode_kernel.respond_stack(&rhs_matrix);
+                let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = (0..rho_pair_count)
+                    .map(|pair_idx| {
+                        let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
+                        (
+                            v_ks[kk].clone(),
+                            v_ks[ll].clone(),
+                            solved.column(pair_idx).to_owned(),
+                        )
+                    })
+                    .collect();
+                let traced = effective_deriv.hessian_second_derivative_correction_traces(
+                    spectral.logdet_gradient_factor(),
+                    &triples,
+                )?;
+                if let Some(values) = traced.as_ref() {
+                    if values.len() != rho_pair_count {
+                        return Err(format!(
+                            "outer Hessian correction traces: {} for {rho_pair_count} pairs",
+                            values.len()
+                        ));
+                    }
+                    log::info!(
+                        "[compute_outer_hessian rho-rho] {rho_pair_count} pair correction \
+                         trace(s) from the family row kernel in {:.3}s",
+                        traced_start.elapsed().as_secs_f64(),
+                    );
+                }
+                traced
+            }
+            (batched, _) => batched,
+        };
 
     let rho_pair_values: Vec<(usize, usize, f64)> = {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};

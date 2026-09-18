@@ -144,6 +144,38 @@ pub trait HessianDerivativeProvider: Send + Sync {
         false
     }
 
+    /// The second-order corrections' logdet traces, contracted in the family's
+    /// own row space (gam#2922).
+    ///
+    /// Entry `i` is `tr(Fᵀ·C_i·F)`, where `C_i` is the drift
+    /// [`Self::hessian_second_derivative_correction_result`] returns for
+    /// `triples[i]` and `F` is a factor with `tr(G·A) = tr(Fᵀ·A·F)` for the
+    /// logdet kernel `G`. The outer Hessian reads each correction only through
+    /// that trace, so a family whose row kernel contracts `F` itself never forms
+    /// the K(K+1)/2 drifts: per row it contracts the fourth derivative with
+    /// `F·Fᵀ` once and reads every pair off that one matrix. `None` means the
+    /// provider has no such kernel, and the caller forms and traces the drifts.
+    fn hessian_second_derivative_correction_traces(
+        &self,
+        factor: &Array2<f64>,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Option<Vec<f64>>, String> {
+        assert_eq!(
+            factor.nrows(),
+            triples
+                .first()
+                .map_or(factor.nrows(), |(v_k, _, _)| v_k.len()),
+            "correction traces need the factor in coefficient space"
+        );
+        Ok(None)
+    }
+
+    /// Whether [`Self::hessian_second_derivative_correction_traces`] has a row
+    /// kernel, so the caller solves the pair stack for it only when it answers.
+    fn has_hessian_second_derivative_correction_traces(&self) -> bool {
+        false
+    }
+
     /// Whether this provider has non-trivial corrections.
     /// False for Gaussian, true for GLMs and coupled families.
     fn has_corrections(&self) -> bool;

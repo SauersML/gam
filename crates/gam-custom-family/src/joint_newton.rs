@@ -136,6 +136,10 @@ pub(crate) struct JointHessianBundle<'a> {
                 + Sync,
         >,
     >,
+    /// The outer Hessian's second-order correction traces from the workspace's
+    /// own row kernels (gam#2922), when it has them. Threaded through to
+    /// `OwnedJointDerivProvider`.
+    pub(crate) owned_second_correction_traces: Option<Arc<DriftSecondCorrectionTracesFn>>,
     pub(crate) rho_curvature_scale: f64,
     pub(crate) hessian_logdet_correction: f64,
 }
@@ -155,6 +159,15 @@ pub(crate) type DriftSecondDerivManyFn<'a> = dyn Fn(&[(Array1<f64>, Array1<f64>)
     + Send
     + Sync
     + 'a;
+
+/// `tr(Fᵀ·C·F)` of each `(v_k, v_l, u_kl)` triple's second-order correction
+/// `C` against the logdet factor `F` (gam#2922); `None` when unavailable.
+pub(crate) type DriftSecondCorrectionTracesFn = dyn Fn(
+        &Array2<f64>,
+        &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Option<Vec<f64>>, CustomFamilyError>
+    + Send
+    + Sync;
 
 /// Cheap, deterministic non-finite-curvature probe for the joint Hessian
 /// source (gam#1088). A `NaN`/`Inf` in the penalized Hessian `H_pen = H +
@@ -609,6 +622,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many: None,
+            owned_second_correction_traces: None,
             rho_curvature_scale: curvature.rho_curvature_scale,
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
@@ -677,6 +691,8 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
         let compute_d2h_many = exact_newton_d2h_many_closure(1.0, hessian_workspace.clone());
         let owned_compute_d2h_many =
             exact_newton_d2h_many_closure_owned(1.0, hessian_workspace.clone());
+        let owned_second_correction_traces =
+            exact_newton_second_correction_traces_closure_owned(1.0, hessian_workspace.clone());
         return Ok(Some(JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
@@ -688,6 +704,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many,
+            owned_second_correction_traces,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -801,6 +818,7 @@ pub(crate) fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + 
             owned_compute_dh_many: None,
             owned_compute_d2h: Some(owned_compute_d2h),
             owned_compute_d2h_many: None,
+            owned_second_correction_traces: None,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -1143,6 +1161,74 @@ pub(crate) fn exact_newton_d2h_many_closure_owned(
             })
             .collect()
     }))
+}
+
+/// The second-order correction traces from the workspace's row kernels
+/// (gam#2922), for the drifts the `scale`d workspace closures above form.
+///
+/// The correction for `(v_k, v_l, u_kl)` is `D_β H[u_kl] + D²_β H[−v_l, −v_k]`
+/// (`joint_second_derivative_correction_result`), so its trace against `F` is
+/// the workspace's trace with mode `u_kl` at the direction pair `(v_l, v_k)`:
+/// the two sign flips cancel in the bilinear term. The distinct `v` directions
+/// are passed once each, so the kernel reads all K(K+1)/2 pairs off one
+/// contraction per row. The closure answers `None` when the workspace has no
+/// such kernel.
+pub(crate) fn exact_newton_second_correction_traces_closure_owned(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<Arc<DriftSecondCorrectionTracesFn>> {
+    let workspace = workspace?;
+    Some(Arc::new(
+        move |factor: &Array2<f64>, triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)]| {
+            let total = factor.nrows();
+            let mut second_modes = Array2::<f64>::zeros((total, triples.len()));
+            let mut distinct: Vec<&Array1<f64>> = Vec::new();
+            let mut pairs = Vec::with_capacity(triples.len());
+            for (column, (v_k, v_l, u_kl)) in triples.iter().enumerate() {
+                second_modes.column_mut(column).assign(u_kl);
+                let l = distinct_direction_index(&mut distinct, v_l);
+                let k = distinct_direction_index(&mut distinct, v_k);
+                pairs.push((l, k));
+            }
+            let mut directions = Array2::<f64>::zeros((total, distinct.len()));
+            for (column, direction) in distinct.iter().enumerate() {
+                directions.column_mut(column).assign(*direction);
+            }
+            let Some(traces) = workspace.projected_second_correction_traces(
+                factor,
+                &second_modes,
+                &directions,
+                &pairs,
+            )?
+            else {
+                return Ok(None);
+            };
+            if traces.len() != triples.len() {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "second-order correction traces: {} traces for {} triples",
+                        traces.len(),
+                        triples.len()
+                    ),
+                });
+            }
+            Ok(Some(traces.iter().map(|trace| scale * trace).collect()))
+        },
+    ))
+}
+
+/// The index of `direction` among `distinct`, appending it the first time it
+/// is seen. Equality is exact, so a direction repeated across triples is one
+/// column of the second-order kernel's direction matrix.
+fn distinct_direction_index<'d>(
+    distinct: &mut Vec<&'d Array1<f64>>,
+    direction: &'d Array1<f64>,
+) -> usize {
+    if let Some(index) = distinct.iter().position(|seen| *seen == direction) {
+        return index;
+    }
+    distinct.push(direction);
+    distinct.len() - 1
 }
 
 pub(crate) fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(

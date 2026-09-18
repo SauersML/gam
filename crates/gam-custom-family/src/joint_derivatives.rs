@@ -205,6 +205,9 @@ pub(crate) struct OwnedJointDerivProvider {
                 + Sync,
         >,
     >,
+    /// The second-order corrections' logdet traces from the workspace's row
+    /// kernels (gam#2922), for the drifts `compute_dh` and `compute_d2h` form.
+    pub(crate) second_correction_traces: Option<Arc<DriftSecondCorrectionTracesFn>>,
     pub(crate) family_outer_hessian_operator: Option<Arc<dyn gam_problem::HessianOperator>>,
 }
 
@@ -314,6 +317,22 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         self.compute_d2h_many.is_some()
+    }
+
+    fn hessian_second_derivative_correction_traces(
+        &self,
+        factor: &Array2<f64>,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Option<Vec<f64>>, String> {
+        // Display boundary: `HessianDerivativeProvider` is `String`-erroring (gam#2689).
+        match self.second_correction_traces.as_ref() {
+            Some(traces) => traces(factor, triples).map_err(|error| error.to_string()),
+            None => Ok(None),
+        }
+    }
+
+    fn has_hessian_second_derivative_correction_traces(&self) -> bool {
+        self.second_correction_traces.is_some()
     }
 
     fn has_corrections(&self) -> bool {

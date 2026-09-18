@@ -3534,6 +3534,7 @@ mod psi_axis_contractions_979_tests;
 #[cfg(test)]
 mod multistart_member_2359_tests;
 pub(crate) mod row_primary_hessian;
+mod second_correction_traces;
 
 pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{

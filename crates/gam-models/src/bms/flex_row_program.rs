@@ -852,7 +852,7 @@ impl BmsFlexRowProgram {
         index: &BmsFlexIndexProgram,
         workspace: &'arena S::Workspace,
     ) -> S {
-        let dimension = self.primary.total;
+        let dimension = a.dimension();
         let b = &vars[self.primary.slope];
         // Every step below is one fused jet operation: the runtime jets
         // allocate and stream a fresh `(1 + lanes)·(d + d²)` block per
@@ -892,13 +892,17 @@ impl BmsFlexRowProgram {
         lift_iters: usize,
         workspace: &'arena S::Workspace,
     ) -> Result<S, String> {
-        let dimension = self.primary.total;
-        if vars.len() != dimension {
+        let primaries = self.primary.total;
+        if vars.len() != primaries {
             return Err(format!(
-                "BMS FLEX row program received {} primaries, expected {dimension}",
+                "BMS FLEX row program received {} primaries, expected {primaries}",
                 vars.len()
             ));
         }
+        // The jets' free axes are the primaries themselves, or a fixed set of
+        // directions of the primary space for a projected contraction (gam#2922).
+        // Every primary must carry the same ones.
+        let dimension = vars.first().map_or(primaries, |var| var.dimension());
         if vars.iter().any(|var| var.dimension() != dimension) {
             return Err("BMS FLEX row program received a mismatched jet dimension".to_string());
         }

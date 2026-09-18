@@ -3041,6 +3041,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         None,
                         None,
                         None,
+                        None,
                         robust_jeffreys_hphi.clone(),
                         None,
                     )?;
@@ -3310,6 +3311,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         } else {
             exact_newton_d2h_many_closure_owned(rho_curvature_scale, hessian_workspace.clone())
         };
+        let owned_second_correction_traces = if use_outer_curvature_derivatives {
+            None
+        } else {
+            exact_newton_second_correction_traces_closure_owned(
+                rho_curvature_scale,
+                hessian_workspace.clone(),
+            )
+        };
 
         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
         let mut eval_result = joint_outer_evaluate(
@@ -3348,6 +3357,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             owned_compute_dh_many,
             Some(owned_compute_d2h),
             owned_compute_d2h_many,
+            owned_second_correction_traces,
             ext_bundle,
             None,
             custom_family_batched_outer_hessian_operator(
@@ -3480,6 +3490,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         owned_compute_dh_many: _,
                         owned_compute_d2h: _,
                         owned_compute_d2h_many: _,
+                        owned_second_correction_traces: _,
                         rho_curvature_scale,
                         hessian_logdet_correction,
                     } = joint_bundle_value_only;
@@ -3519,6 +3530,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         compute_dh_many.as_deref(),
                         compute_d2h.as_ref(),
                         compute_d2h_many.as_deref(),
+                        None,
                         None,
                         None,
                         None,
@@ -3576,6 +3588,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             owned_compute_dh_many,
             owned_compute_d2h,
             owned_compute_d2h_many,
+            owned_second_correction_traces,
             rho_curvature_scale,
             hessian_logdet_correction,
         } = joint_bundle;
@@ -3618,6 +3631,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             owned_compute_dh_many,
             owned_compute_d2h,
             owned_compute_d2h_many,
+            owned_second_correction_traces,
             None, // no ext_coords when psi_dim == 0
             None,
             custom_family_batched_outer_hessian_operator(
@@ -3943,6 +3957,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         &compute_dh,
         None,
         &compute_d2h,
+        None,
         None,
         None,
         None,

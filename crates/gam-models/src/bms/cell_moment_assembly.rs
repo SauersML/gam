@@ -58,7 +58,7 @@ const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
 const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
 #[inline]
-fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
+pub(super) fn empirical_bms_runtime_batch_lanes(r: usize) -> usize {
     let tape_work_per_lane = r.saturating_mul(r).saturating_mul(r).max(1);
     (EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET / tape_work_per_lane)
         .max(1)

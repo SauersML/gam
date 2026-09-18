@@ -348,4 +348,33 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .map(|(u, v)| self.second_directional_derivative_operator(u, v))
             .collect()
     }
+
+    /// Exact row-local contractions for the outer Hessian's second-order
+    /// corrections, `trace(F^T · (D_beta H[u_i] + D²_beta H[d_a, d_b]) · F)` with
+    /// `u_i` the `i`-th column of `second_modes` and `(a, b) = pairs[i]` (gam#2922).
+    ///
+    /// `directions` holds each distinct direction as a column and `pairs` indexes
+    /// them, so a row kernel can contract the third and fourth derivatives with
+    /// `F·F^T` once per row and read every pair off those, instead of forming one
+    /// drift per pair. `Ok(None)` means the workspace has no such kernel.
+    fn projected_second_correction_traces(
+        &self,
+        factor: &Array2<f64>,
+        second_modes: &Array2<f64>,
+        directions: &Array2<f64>,
+        pairs: &[(usize, usize)],
+    ) -> Result<Option<Array1<f64>>, String> {
+        assert!(
+            factor.nrows() == second_modes.nrows() && factor.nrows() == directions.nrows(),
+            "projected second correction traces require shared coefficient dimension"
+        );
+        assert!(
+            second_modes.ncols() == pairs.len()
+                && pairs
+                    .iter()
+                    .all(|&(a, b)| a < directions.ncols() && b < directions.ncols()),
+            "projected second correction traces take one mode per pair, indexing the directions"
+        );
+        Ok(None)
+    }
 }

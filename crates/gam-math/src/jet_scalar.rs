@@ -2904,6 +2904,54 @@ impl<'arena> DynamicTwoSeedBatch<'arena> {
         }
     }
 
+    /// Seed one primary that moves by `gradient[a]` along the `a`-th free axis,
+    /// across every direction-pair lane (gam#2922).
+    ///
+    /// [`Self::seed_direction_pairs`] takes the free axes to be the primaries
+    /// themselves. Here they are directions `d_1..d_m` of the primary space, with
+    /// `gradient[a]` this primary's component of `d_a`. Each lane's
+    /// [`Self::contracted_fourth`] is then the fourth contraction projected onto
+    /// those directions, `T4[u, v, d_a, d_b]`, carried at `m²` order-two
+    /// coefficients per node instead of one per pair of primaries.
+    #[inline(always)]
+    #[must_use]
+    pub fn seed_direction_pairs_along(
+        x: f64,
+        gradient: &[f64],
+        workspace: &'arena DynamicJetBatchWorkspace,
+        mut direction_pair_at: impl FnMut(usize) -> (f64, f64),
+    ) -> Self {
+        let dimension = gradient.len();
+        let directions = workspace
+            .arena
+            .alloc_slice_fill_with(workspace.lanes, |lane| direction_pair_at(lane));
+        let eps = workspace
+            .arena
+            .alloc_slice_fill_with(workspace.lanes, |lane| {
+                DynamicOrder2::constant(directions[lane].0, dimension, &workspace.arena)
+            });
+        let del = workspace
+            .arena
+            .alloc_slice_fill_with(workspace.lanes, |lane| {
+                DynamicOrder2::constant(directions[lane].1, dimension, &workspace.arena)
+            });
+        let eps_del = workspace.arena.alloc_slice_fill_with(workspace.lanes, |_| {
+            DynamicOrder2::constant(0.0, dimension, &workspace.arena)
+        });
+        Self {
+            base: DynamicOrder2::from_channel_functions(
+                x,
+                dimension,
+                &workspace.arena,
+                |axis| gradient[axis],
+                |_, _| 0.0,
+            ),
+            eps,
+            del,
+            eps_del,
+        }
+    }
+
     /// Number of simultaneous contraction pairs.
     #[inline(always)]
     #[must_use]

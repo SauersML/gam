@@ -2669,6 +2669,26 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         Ok(Some(traces))
     }
 
+    fn projected_second_correction_traces(
+        &self,
+        factor: &Array2<f64>,
+        second_modes: &Array2<f64>,
+        directions: &Array2<f64>,
+        pairs: &[(usize, usize)],
+    ) -> Result<Option<Array1<f64>>, String> {
+        self.family
+            .batched_second_correction_logdet_traces(
+                &self.block_states,
+                &self.cache,
+                &self.options,
+                factor,
+                second_modes,
+                directions,
+                pairs,
+            )
+            .map(Some)
+    }
+
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
