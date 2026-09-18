@@ -172,9 +172,10 @@ fn add_symmetric_outer(target: &mut Array2<f64>, residual: &Range<usize>, mu_d: 
     if scale == 0.0 {
         return;
     }
-    for (j, (&dj, &ej)) in mu_d.iter().zip(mu_e).enumerate() {
-        for (l, (&dl, &el)) in mu_d.iter().zip(mu_e).enumerate() {
-            target[[residual.start + j, residual.start + l]] += scale * (dj * el + ej * dl);
+    let mut block = target.slice_mut(s![residual.clone(), residual.clone()]);
+    for (mut row, (&dj, &ej)) in block.rows_mut().into_iter().zip(mu_d.iter().zip(mu_e)) {
+        for (entry, (&dl, &el)) in row.iter_mut().zip(mu_d.iter().zip(mu_e)) {
+            *entry += scale * (dj * el + ej * dl);
         }
     }
 }
@@ -248,11 +249,11 @@ fn pullback_residual_block(
             }
         }
     }
-    for j in 0..k {
+    let [p0, p1, p2] = &projected;
+    for (j, mut row) in target_rr.rows_mut().into_iter().take(k).enumerate() {
         let (r0, r1, r2) = (rho[0][j], rho[1][j], rho[2][j]);
-        let mut row = target_rr.row_mut(j);
-        for l in 0..k {
-            row[l] += r0 * projected[0][l] + r1 * projected[1][l] + r2 * projected[2][l];
+        for (entry, ((&x0, &x1), &x2)) in row.iter_mut().zip(p0.iter().zip(p1).zip(p2)) {
+            *entry += r0 * x0 + r1 * x1 + r2 * x2;
         }
     }
     let surface = |primary: usize| -> Vec<f64> {
@@ -264,16 +265,26 @@ fn pullback_residual_block(
 }
 
 /// `acc[res+j, c] += w·μ_j·g_c` and `acc[c, res+j] += w·g_c·μ_j`.
+///
+/// Through row and column views, not `acc[[i, j]]`: on a row-varying `Σ(a)` this
+/// runs `2·K·p` updates per row per direction, and the owned array's per-element
+/// `IndexMut` is a call whose inlining moves with unrelated edits (out of line,
+/// it made the K = 26 gradient corrections 1.75× slower). Every entry receives
+/// the same products in the same order as a per-element loop: `[res+a, res+b]`
+/// takes `j = a` in the row pass and `j = b` in the column pass, so its updates
+/// still come in ascending `j`.
 fn add_rank_two(acc: &mut Array2<f64>, residual_start: usize, mu: &[f64], g: &[f64], w: f64) {
     for (j, &m) in mu.iter().enumerate() {
         let scale = w * m;
         if scale == 0.0 {
             continue;
         }
-        for (c, &gc) in g.iter().enumerate() {
-            let value = scale * gc;
-            acc[[residual_start + j, c]] += value;
-            acc[[c, residual_start + j]] += value;
+        let target = residual_start + j;
+        for (entry, &gc) in acc.row_mut(target).iter_mut().zip(g) {
+            *entry += scale * gc;
+        }
+        for (entry, &gc) in acc.column_mut(target).iter_mut().zip(g) {
+            *entry += scale * gc;
         }
     }
 }
