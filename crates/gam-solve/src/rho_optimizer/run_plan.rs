@@ -1844,6 +1844,7 @@ pub(crate) fn run_outer_with_plan(
                         value: seed_eval.cost,
                         gradient: seed_eval.gradient,
                         hessian: seed_hessian,
+                        decrement_bands: None,
                     };
 
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)

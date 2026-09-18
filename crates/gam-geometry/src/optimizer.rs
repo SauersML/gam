@@ -141,6 +141,7 @@ impl RiemannianTrustRegion {
             max_radius: self.max_radius,
             max_iter: self.max_iter,
             grad_tol: self.grad_tol,
+            stationarity_reference: None,
         };
         let termination = solver
             .minimize(
@@ -235,6 +236,9 @@ fn geometry_error(error: opt::RiemannianTrustRegionError<GeometryError>) -> Geom
         }
         Refusal::InvalidGradientTolerance => GeometryError::InvalidPoint(
             "trust-region gradient tolerance must be finite and non-negative",
+        ),
+        Refusal::InvalidStationarityReference => GeometryError::InvalidPoint(
+            "trust-region stationarity reference must be finite and non-negative",
         ),
         Refusal::NonFiniteValue => {
             GeometryError::InvalidPoint("trust-region objective returned a non-finite value")

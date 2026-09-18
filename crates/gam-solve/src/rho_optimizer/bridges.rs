@@ -3212,6 +3212,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             value: eval.cost,
             gradient: eval.gradient,
             hessian,
+            decrement_bands: None,
         })
     }
 }
