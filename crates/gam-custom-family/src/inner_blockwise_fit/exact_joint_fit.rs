@@ -7562,6 +7562,56 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             objective_state,
         });
     }
+    let exit_unprojected_kkt_inf = cached_joint_gradient
+        .as_ref()
+        .and_then(|joint_grad| {
+            exact_newton_joint_stationarity_vector_from_gradient(
+                joint_grad,
+                &states,
+                specs,
+                &s_lambdas,
+            )
+            .ok()
+        })
+        .map(|residual| {
+            residual
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max)
+        })
+        .unwrap_or(f64::NAN);
+    // Every non-converged exit names the block carrying its residual from a
+    // refusal report, and the refusal that leaves this solve reads it
+    // (gam#2943). The residual-stall and structured-refusal exits record theirs
+    // at the iterate they refuse; every other exit, the budget included, gets
+    // one here at the state it returns, so no exit leaves unnamed (#2977).
+    let exit_report = match last_kkt_refusal_report.take() {
+        Some(report) => report,
+        None => {
+            let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+            compute_kkt_refusal_report(
+                cycles_done,
+                &states,
+                specs,
+                &s_lambdas,
+                &ranges,
+                cached_joint_gradient.as_ref(),
+                &cached_active_sets,
+                &block_constraints,
+                None,
+                total_p,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                last_residual_tol,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                exit_unprojected_kkt_inf,
+                last_joint_math.as_ref(),
+            )
+        }
+    };
     if cycles_done >= inner_max_cycles {
         if !converged {
             // Engine-level diagnostic. Emit measured quantities only:
@@ -7608,24 +7658,6 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .fold(0.0_f64, f64::max);
             let block_diag_default =
                 !family.exact_newton_joint_hessian_beta_dependent() && specs.len() >= 2;
-            let exit_unprojected_kkt_inf = cached_joint_gradient
-                .as_ref()
-                .and_then(|joint_grad| {
-                    exact_newton_joint_stationarity_vector_from_gradient(
-                        joint_grad,
-                        &states,
-                        specs,
-                        &s_lambdas,
-                    )
-                    .ok()
-                })
-                .map(|residual| {
-                    residual
-                        .iter()
-                        .map(|x: &f64| x.abs())
-                        .fold(0.0_f64, f64::max)
-                })
-                .unwrap_or(f64::NAN);
             let last_math_summary = last_joint_math
                 .as_ref()
                 .map(|math| {
@@ -7679,38 +7711,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // non-certifying, but neighbouring rho values are perfectly
                 // fit-able, so aborting the whole fit prevents the optimizer
                 // from ever leaving the valley.
-                // The report is kept, not only rendered: the refusal that leaves
-                // this solve names its carrying block from it (gam#2943).
-                if last_kkt_refusal_report.is_none() {
-                    let block_constraints =
-                        collect_block_linear_constraints(family, &states, specs)?;
-                    let report = compute_kkt_refusal_report(
-                        cycles_done,
-                        &states,
-                        specs,
-                        &s_lambdas,
-                        &ranges,
-                        cached_joint_gradient.as_ref(),
-                        &cached_active_sets,
-                        &block_constraints,
-                        None,
-                        total_p,
-                        f64::NAN,
-                        f64::NAN,
-                        f64::NAN,
-                        last_residual_tol,
-                        f64::NAN,
-                        f64::NAN,
-                        f64::NAN,
-                        exit_unprojected_kkt_inf,
-                        last_joint_math.as_ref(),
-                    );
-                    last_kkt_refusal_report = Some(report);
-                }
-                let block_diag = last_kkt_refusal_report
-                    .as_ref()
-                    .map(KktRefusalReport::format_bubbled_error)
-                    .unwrap_or_default();
+                let block_diag = exit_report.format_bubbled_error();
                 log::log!(
                     exhaustion_level,
                     "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
@@ -7790,9 +7791,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             terminal_carrying_block: if converged {
                 None
             } else {
-                last_kkt_refusal_report
-                    .as_ref()
-                    .and_then(KktRefusalReport::carrying_block_name)
+                exit_report.carrying_block_name()
             },
             kkt_residual: None,
             active_constraints,
@@ -7810,13 +7809,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // routed to blockwise before this joint path starts. Return the
         // current finite iterate with `converged=false` so the outer
         // optimizer can reject this rho and continue.
-        let block_diag = last_kkt_refusal_report
-            .as_ref()
-            .map(KktRefusalReport::format_bubbled_error)
-            .unwrap_or_else(|| {
-                "structured KKT refusal report unavailable: no joint Newton math snapshot"
-                    .to_string()
-            });
+        let block_diag = exit_report.format_bubbled_error();
         log::warn!(
             "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
         );
@@ -7874,9 +7867,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             block_logdet_s: None,
             s_lambdas,
             joint_workspace: cached_joint_workspace.clone(),
-            terminal_carrying_block: last_kkt_refusal_report
-                .as_ref()
-                .and_then(KktRefusalReport::carrying_block_name),
+            terminal_carrying_block: exit_report.carrying_block_name(),
             kkt_residual: None,
             active_constraints,
             objective_state,

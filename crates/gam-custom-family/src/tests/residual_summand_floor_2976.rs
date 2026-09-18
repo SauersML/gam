@@ -312,3 +312,39 @@ fn a_mode_parked_above_its_target_refuses_by_name_before_the_cycle_budget_2977()
         result.cycles
     );
 }
+
+/// #2977 — an early exit that records no refusal report of its own still names
+/// the block carrying its residual (gam#2943).
+///
+/// Pin (c)'s stalled mode leaves on the flat-residual stall, one of the early
+/// exits that recorded no `KktRefusalReport` at the iterate it refused. The exit
+/// then logged "structured KKT refusal report unavailable" and returned no
+/// `terminal_carrying_block`, so the refusal that left the solve named no block.
+#[test]
+fn an_early_exit_without_its_own_report_still_names_its_carrying_block_2977() {
+    let family = CancellingRowSumFamily::new(1.0, false);
+    let budget = BlockwiseFitOptions::default().inner_max_cycles;
+    let result = fit_result(&family, family.mode() + 0.5, budget);
+    let reason = match result.terminal_convergence_state.as_ref() {
+        Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+            termination_reason, ..
+        }) => termination_reason.clone(),
+        other => panic!("the joint-Newton solve must record its terminal state, got {other:?}"),
+    };
+    println!(
+        "[2977] early exit: converged={} cycles={}/{budget} reason={reason:?} \
+         carrying_block={:?}",
+        result.converged, result.cycles, result.terminal_carrying_block
+    );
+    assert!(!result.converged, "a mode above its target must not settle");
+    assert!(
+        matches!(reason, gam_problem::JointNewtonTerminalReason::FlatResidualStall { .. }),
+        "the fixture must leave on the flat-residual stall, an exit that records no report \
+         of its own: reason {reason:?}"
+    );
+    assert_eq!(
+        result.terminal_carrying_block.as_deref(),
+        Some("location"),
+        "an early exit must name the block carrying its residual"
+    );
+}
