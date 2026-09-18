@@ -424,6 +424,96 @@ fn generalized_trust_region_reduced_step(
     })
 }
 
+/// Passes of [`restore_rounding_level_violations`]. Pass `k` steps each row
+/// still outside its wall back onto it and past it by `2^(k + 1 − PASSES)` of
+/// the row's rounding band: the first pass by well under a unit in the last
+/// place of the row's value, the last by the whole band.
+const ROUNDING_RESTORATION_PASSES: i32 = 9;
+
+/// Move a face step's candidate back inside every wall it is outside of only by
+/// the rounding of evaluating that wall, along the wall's normal (gnomon#2359).
+///
+/// The equality face's step satisfies `A_F δ = b_F − A_F β` in real arithmetic,
+/// so `β + δ` as evaluated can sit one rounding step outside a wall the face
+/// holds as an equality, or outside a zero-slack wall the step is tangent to.
+/// The feasible chord from a base ON that wall has no feasible positive step, so
+/// its clip returned the base itself: a zero step at a residual above target,
+/// cycle after cycle. On the gnomon#2359 calibration fit, 88 chord clips were of
+/// equality-held score-warp rows violated by 1.0e-16 to 2.7e-16, and each one
+/// from a base on its wall clipped to `t = 0`, leaving slope_surface, which is
+/// unconstrained, at 8.3e-10 against 3.9e-11.
+///
+/// A row's rounding band is `γ_{p+1}·(Σ|a_j x_j| + |b|)`, the error of
+/// evaluating `a·x − b`; a larger shortfall is a real crossing, and the feasible
+/// chord owns it. The move past the wall is only what the evaluation needs,
+/// escalating from under one unit in the last place, because the face's
+/// multipliers price every unit of slack: a point parked a whole band inside
+/// its walls costs `ν·band` of objective, and near convergence that outweighs
+/// the Newton step's own predicted gain. On the same fit, moving by the
+/// shortfall plus the band made the trust-region model test refuse a 7.1e-9
+/// face step 24 times, which collapsed the radius to 1e-12 and held the
+/// residual at 8.6e-8 for 40 cycles.
+///
+/// `None` when some row is outside its wall by more than its band, or the
+/// passes leave the point infeasible.
+fn restore_rounding_level_violations(
+    constraints: &ConstraintSet,
+    candidate: &Array1<f64>,
+) -> Result<Option<Array1<f64>>, CustomFamilyError> {
+    let growth = gam_linalg::roundoff::accumulation_growth(candidate.len() + 1);
+    let mut restored = candidate.clone();
+    for pass in 0..ROUNDING_RESTORATION_PASSES {
+        let values = constraints.values(restored.view()).map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "rounding-level restoration could not evaluate the constraints: {error}"
+            ))
+        })?;
+        let overshoot_fraction = 2.0_f64.powi(pass + 1 - ROUNDING_RESTORATION_PASSES);
+        let mut moved = false;
+        for (row, value) in values.iter().enumerate() {
+            let bound = constraints.bound(row).map_err(|error| {
+                CustomFamilyError::trial_point(format!(
+                    "rounding-level restoration could not read row {row}'s bound: {error}"
+                ))
+            })?;
+            let shortfall = bound - value;
+            if !(shortfall > 0.0) {
+                continue;
+            }
+            let gathered = constraints.gather_rows(&[row]).map_err(|error| {
+                CustomFamilyError::trial_point(format!(
+                    "rounding-level restoration could not gather row {row}: {error}"
+                ))
+            })?;
+            let normal = gathered.a.row(0);
+            let magnitude = normal
+                .iter()
+                .zip(restored.iter())
+                .map(|(entry, coordinate)| (entry * coordinate).abs())
+                .sum::<f64>()
+                + bound.abs();
+            let band = growth * magnitude;
+            let norm_sq = normal.dot(&normal);
+            if !(shortfall <= band && norm_sq.is_finite() && norm_sq > 0.0) {
+                return Ok(None);
+            }
+            restored.scaled_add((shortfall + overshoot_fraction * band) / norm_sq, &normal);
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    let (violation, _) = constraints
+        .max_scaled_violation(restored.view())
+        .map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "rounding-level restoration could not classify its result: {error}"
+            ))
+        })?;
+    Ok((violation.is_finite() && violation <= 0.0).then_some(restored))
+}
+
 /// Upgrade a tolerance-feasible active-set result to a mathematically feasible
 /// point without changing either the quadratic objective or its feasible
 /// reference.
@@ -1204,6 +1294,13 @@ fn certified_reduced_face_candidate(
                 ));
                 continue;
             }
+            if let Some(restored) = restore_rounding_level_violations(constraints, &raw_candidate)?
+            {
+                let restored_delta = &restored - beta;
+                let restored_gain = model_gain(&restored_delta);
+                feasible_candidates.push((restored, restored_delta, restored_gain, 0.0));
+                continue;
+            }
             let (clipped, blocker, step) = clip_infeasible_candidate_to_certified_feasible_chord(
                 constraints,
                 &feasible_base,
@@ -1462,6 +1559,90 @@ fn canonical_accepted_active_rows(
 mod exact_face_newton_tests {
     use super::*;
     use ndarray::array;
+
+    /// One half-space `a·x ≥ b` whose bound is `offset` units in the last place
+    /// above `a·point` as the constraint set evaluates it, so `point` is outside
+    /// it by that many.
+    fn wall_above(point: &Array1<f64>, normal: Array2<f64>, offset: usize) -> ConstraintSet {
+        let probe = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(normal.clone(), array![0.0]).expect("one half-space"),
+        );
+        let mut bound = probe.values(point.view()).expect("evaluate the wall")[0];
+        for _ in 0..offset {
+            bound = bound.next_up();
+        }
+        ConstraintSet::Dense(
+            LinearInequalityConstraints::new(normal, array![bound]).expect("one half-space"),
+        )
+    }
+
+    /// gnomon#2359: a candidate outside a wall by one rounding step of that wall
+    /// is moved back inside along its normal, by rounding, not clipped away.
+    #[test]
+    fn a_rounding_level_violation_is_restored_along_its_normal_2359() {
+        let point = array![0.3_f64, 0.1, 0.2];
+        let constraints = wall_above(&point, array![[0.0_f64, 1.0, 1.0]], 1);
+        let (violation, _) = constraints
+            .max_scaled_violation(point.view())
+            .expect("classify the candidate");
+        assert!(violation > 0.0, "fixture premise: one ulp outside the wall");
+        let restored = restore_rounding_level_violations(&constraints, &point)
+            .expect("the restoration evaluates")
+            .expect("a one-ulp violation is rounding");
+        let (restored_violation, _) = constraints
+            .max_scaled_violation(restored.view())
+            .expect("classify the restored point");
+        assert!(
+            restored_violation <= 0.0,
+            "the restored point is feasible as evaluated"
+        );
+        let moved = (&restored - &point)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            moved > 0.0 && moved <= 8.0 * f64::EPSILON,
+            "moved by rounding: {moved:.3e}"
+        );
+    }
+
+    /// gnomon#2359: the restored point sits within a few units in the last place
+    /// of its wall, not a rounding band inside it. The face's multipliers price
+    /// that slack, and a band's worth outweighed the predicted gain of a
+    /// converging face step, so the trust-region model test refused it. Here the
+    /// band is 35 units in the last place of the wall's value.
+    #[test]
+    fn a_restored_row_stays_on_its_wall_2359() {
+        let point = Array1::from_iter((0..20).map(|j| 1.0 + 0.037 * j as f64));
+        let constraints = wall_above(&point, Array2::ones((1, 20)), 1);
+        let (violation, _) = constraints
+            .max_scaled_violation(point.view())
+            .expect("classify the candidate");
+        assert!(violation > 0.0, "fixture premise: one ulp outside the wall");
+        let restored = restore_rounding_level_violations(&constraints, &point)
+            .expect("the restoration evaluates")
+            .expect("a one-ulp violation is rounding");
+        let value = constraints.values(restored.view()).expect("evaluate")[0];
+        let bound = constraints.bound(0).expect("read the bound");
+        let unit = bound.next_up() - bound;
+        assert!(
+            value >= bound && value - bound <= 4.0 * unit,
+            "restored {:.1} units in the last place inside the wall",
+            (value - bound) / unit
+        );
+    }
+
+    /// A crossing larger than the wall's rounding is a real one, and stays the
+    /// feasible chord's to repair.
+    #[test]
+    fn a_real_crossing_is_left_to_the_feasible_chord_2359() {
+        let point = array![0.3_f64, 0.1, 0.2];
+        let constraints = wall_above(&point, array![[0.0_f64, 1.0, 1.0]], 1 << 20);
+        assert!(
+            restore_rounding_level_violations(&constraints, &point)
+                .expect("the restoration evaluates")
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_face_the_trust_metric_makes_singular_is_still_solved_2600() {

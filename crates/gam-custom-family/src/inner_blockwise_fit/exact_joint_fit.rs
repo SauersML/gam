@@ -336,13 +336,66 @@ mod constrained_newton_candidate_tests {
             .into_iter()
             .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
             .fold(0.0_f64, f64::max);
-        let delta_norm = delta.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let delta_norm = delta
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
         let bound = 4.0 * 3.0 * f64::EPSILON * hessian_norm * delta_norm;
         assert!(
             face_residual <= bound,
             "face stationarity {face_residual:.3e} exceeds the step's rounding {bound:.3e}; \
              the new-iterate form carries eps*|H|*|beta| = {:.3e}",
             f64::EPSILON * hessian_norm * 1.45
+        );
+    }
+
+    /// gnomon#2359: the simple-lower-bound branch keeps the new-iterate form
+    /// (`H·β + rhs`), but it solves for the increment internally from the
+    /// gradient `H·β − (H·β + rhs)`, so its error is the rounding of `H·β` row by
+    /// row, `ε·Σ_l|H_jl β_l|`, not the `ε·‖H‖·‖β‖` of the general QP. On the same
+    /// stiff Hessian, iterate and residual, its free-coordinate stationarity must
+    /// stay within that componentwise band.
+    #[test]
+    fn simple_lower_bound_step_error_is_componentwise_2359() {
+        let hessian = array![[3.27e9, 5.0, 2.0], [5.0, 50.0, 3.0], [2.0, 3.0, 20.0]];
+        let beta = array![8.9e-10, 1.45, -0.8];
+        let constraints = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(array![[0.0, 0.0, 1.0]], array![-0.8])
+                .expect("one coordinate bound"),
+        );
+        let bounds = crate::blockwise_solve::extract_simple_lower_bounds(&constraints, 3)
+            .expect("the bound classifies")
+            .expect("a coordinate row is a simple lower bound");
+        let rhs = array![2.0e-4, -3.0e-4, -1.0e-4];
+        let rhs_beta = &hessian.dot(&beta) + &rhs;
+        let (candidate, active) = crate::blockwise_solve::solve_quadratic_with_simple_lower_bounds(
+            &hessian, &rhs_beta, &beta, &bounds, None,
+        )
+        .expect("the bounded Newton QP solves");
+        assert_eq!(
+            active,
+            vec![0],
+            "the pushed-into bound is active at the candidate"
+        );
+        let delta = &candidate - &beta;
+        let after = &rhs - &hessian.dot(&delta);
+        let free_residual = after
+            .iter()
+            .take(2)
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let componentwise = hessian
+            .rows()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .zip(beta.iter())
+                    .map(|(h, b)| (h * b).abs())
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max);
+        let bound = 64.0 * 3.0 * f64::EPSILON * componentwise;
+        assert!(
+            free_residual <= bound,
+            "free stationarity {free_residual:.3e} exceeds the componentwise band {bound:.3e}"
         );
     }
 }
