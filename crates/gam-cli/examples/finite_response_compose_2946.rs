@@ -20,8 +20,9 @@
 //!   `x̄ = mean(x_first)`, so `LN(x) = β + γ ⊙ C x / s₀` with `C` the centring and `s₀ = √(‖C x̄‖²/D + ε)`, an affine
 //!   map, and `F₂'(y) = MLP_{l+1}(β + γ ⊙ C (r̄ + y) / s₀)` is one known block reading `y`. At retained points `P z` of
 //!   each frame (`top:q`, the leading `q` coordinates of `Z`, which with `L = V Λ^{1/2}` are the top-`q` principal
-//!   directions of the declared law; or `readers:q`, the top `q` right singular vectors of the first block's readers
-//!   `W L`) it reports, against the executed layer-by-layer Monte Carlo
+//!   directions of the declared law; `bottom:q`, the `q` least-variance coordinates the law resolves from zero; or
+//!   `readers:q`, the top `q` right singular vectors of the first block's readers `W L`) it reports, against the
+//!   executed layer-by-layer Monte Carlo
 //!   `z → h → y → x → LN → MLP_{l+1}` under the same law:
 //!   - the second stage's pre-activation conditional means and variances, which `gaussian_closure_response` gives
 //!     EXACTLY (the mean composition `F₂'(E[y | P z])` gets the means right and every variance wrong, as zero);
@@ -47,6 +48,12 @@
 //!   retained response `F̄_P(P z)` against each retained point's executed conditional mean. `top:k` retains
 //!   everything, so `Z' = Z` exactly: its executed `E` is the row-alignment control. A float64 forward pass of this file
 //!   on the leading drawn rows checks that the executed rows are this block's function.
+//! * `a7`       acceptance A7 on the same real block: each frame's best retained response compiled into a compact GAM
+//!   `g` (`response::compile`: Duchon smooth, multi-penalty REML), which reports R2's two terms separately, the exact
+//!   `E(P)` and the held-out function error `Â`. Both are then read off the A3 draw's rows EXECUTED by torch: the
+//!   executed total `‖F(Z) − g(Qᵀ Z)‖²_M` against `E(P) + Â`, and two estimates of the function error against `Â`,
+//!   one free of the operator and one with the discarded part cancelled row by row. The negative control reads the
+//!   same `g` through a perturbed frame and must miss; `bottom:q` is the blind frame.
 //!
 //! ```text
 //! cargo run --profile test -p gam-cli --example finite_response_compose_2946 -- check --pair PAIR --rows R --out OUT
@@ -58,13 +65,20 @@
 //! python export_block.py execute --model M --revision R --layer L --inputs DRAW/h.npy --batch B --out DRAW/executed.npy
 //! cargo run --profile test -p gam-cli --example finite_response_compose_2946 -- a3 --pair PAIR --law LAW --draw DRAW \
 //!     --executed DRAW/executed.npy --out OUT
+//! cargo run --profile test -p gam-cli --example finite_response_compose_2946 -- a7 --pair PAIR --law LAW --draw DRAW \
+//!     --executed DRAW/executed.npy --frames top:2,top:4,bottom:2 --training-draws 4000 --holdout-draws 4000 --seed S \
+//!     --out OUT
 //! ```
 
 use clap::{Parser, Subcommand};
 use gam::faer_ndarray::{FaerSvd, fast_ab, fast_abt};
+use gam::linalg::roundoff::factor_singular_band;
 use gam::utils::splitmix64;
 use gam_math::gaussian_activation::{GaussianActivation, gaussian_smoothing_derivatives};
 use gam_math::probability::{standard_normal_from_uniform_bits, standard_normal_quantile};
+use gam_sae::response::compile::{
+    CompileDesign, CompiledResponse, FunctionRepresentation, compile_retained_response,
+};
 use gam_sae::response::compose::{compose_affine_stage, gaussian_closure_response};
 use gam_sae::response::raw_block::UnabsorbedBlock;
 use gam_sae::response::state_blocks::StateBlocks;
@@ -112,8 +126,9 @@ enum Stage {
         /// `finite_response_teacher_2946 declare` output on the pair's `h_first` rows.
         #[arg(long)]
         law: PathBuf,
-        /// Retained frames, comma separated: `top:q` (the leading `q` coordinates of `Z`) or `readers:q` (the top `q`
-        /// right singular vectors of the first block's readers `W L`).
+        /// Retained frames, comma separated: `top:q` (the leading `q` coordinates of `Z`), `bottom:q` (the `q`
+        /// least-variance coordinates the law resolves from zero) or `readers:q` (the top `q` right singular vectors
+        /// of the first block's readers `W L`).
         #[arg(long, value_delimiter = ',')]
         frames: Vec<String>,
         /// Retained points per frame.
@@ -170,6 +185,31 @@ enum Stage {
         draw_dir: PathBuf,
         #[arg(long)]
         executed: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// A7: compile each frame's best retained response into a compact GAM and set its reported split against the
+    /// executed block on an A3 draw.
+    A7 {
+        #[arg(long)]
+        pair: PathBuf,
+        #[arg(long)]
+        law: PathBuf,
+        #[arg(long = "draw")]
+        draw_dir: PathBuf,
+        #[arg(long)]
+        executed: PathBuf,
+        /// Frames to compile; each must be one of the A3 draw's frames, whose coupled rows it reads.
+        #[arg(long, value_delimiter = ',')]
+        frames: Vec<String>,
+        /// Draws the compact GAM is fitted on.
+        #[arg(long)]
+        training_draws: usize,
+        /// Independent draws its function error is estimated on.
+        #[arg(long)]
+        holdout_draws: usize,
+        #[arg(long)]
+        seed: u64,
         #[arg(long)]
         out: PathBuf,
     },
@@ -243,6 +283,29 @@ fn main() -> ExitCode {
             executed,
             out,
         } => a3(&pair, &law, &draw_dir, &executed, &out),
+        Stage::A7 {
+            pair,
+            law,
+            draw_dir,
+            executed,
+            frames,
+            training_draws,
+            holdout_draws,
+            seed,
+            out,
+        } => a7(
+            &pair,
+            &law,
+            &draw_dir,
+            &executed,
+            &frames,
+            CompileRun {
+                training_draws,
+                holdout_draws,
+                seed,
+            },
+            &out,
+        ),
         Stage::Blocks {
             pair,
             maps,
@@ -675,6 +738,53 @@ fn mean_with_se(samples: &[f64]) -> (f64, f64) {
     (mean, (variance / n).sqrt())
 }
 
+/// The declared law's principal variances `λ_j = ‖L e_j‖²`, in the declared (descending) order of the columns of `L`,
+/// and the band on `√λ_j` below which a coordinate is not resolved from zero.
+///
+/// `finite_response_teacher_2946 declare` takes `L` from the thin SVD of the centred rows scaled by `1/√(n − 1)`, so
+/// `√λ_j` is a singular value of that factor. Two errors sit in it. The harvested rows are torch's float32 outputs,
+/// each entry within `u₃₂` of its value, which moves every singular value by at most `u₃₂‖X‖_F/√(n − 1)` (Weyl, the
+/// centring being a projector), with `‖X‖_F² = n‖h₀‖² + (n − 1)·tr Σ̂` over the stored rows. That is the final rounding
+/// alone, so the float32 forward's accumulated error can only widen it. The SVD adds its backward error,
+/// `factor_singular_band`. A post-norm law has one exactly null direction, since the norm centres every row, and its
+/// float32 rows leave it at roundoff variance, inside this band.
+struct DeclaredSpectrum {
+    variances: Vec<f64>,
+    root_band: f64,
+}
+
+impl DeclaredSpectrum {
+    fn read(law: &Path) -> Result<Self, String> {
+        let meta = read_json(&law.join("law.json"))?;
+        let rows = meta
+            .get("rows")
+            .and_then(Value::as_u64)
+            .ok_or("law.json names no row count")? as usize;
+        let total_variance = meta
+            .get("total_variance")
+            .and_then(Value::as_f64)
+            .ok_or("law.json names no total variance")?;
+        if rows < 2 {
+            return Err(format!("law.json declares {rows} rows, which carry no covariance"));
+        }
+        let baseline = read_vector(&law.join("h0.npy"))?;
+        let loading = read_rows::<f64>(&law.join("L.npy"), None)?;
+        let variances: Vec<f64> = loading.columns().into_iter().map(|column| column.dot(&column)).collect();
+        let largest = variances.iter().copied().fold(0.0_f64, f64::max);
+        let scaled_row_norm = (rows as f64 * baseline.dot(&baseline) / (rows - 1) as f64 + total_variance).sqrt();
+        let root_band =
+            FLOAT32_UNIT_ROUNDOFF * scaled_row_norm + factor_singular_band(rows, loading.nrows(), largest.sqrt());
+        Ok(Self { variances, root_band })
+    }
+
+    /// The latent coordinates resolved from zero, in declared order.
+    fn resolved(&self) -> Vec<usize> {
+        (0..self.variances.len())
+            .filter(|&coordinate| self.variances[coordinate].sqrt() > self.root_band)
+            .collect()
+    }
+}
+
 /// A retained frame `Q` (`k × q`, orthonormal) of the latent `Z ~ N(0, I_k)`.
 struct LatentFrame {
     name: String,
@@ -683,9 +793,10 @@ struct LatentFrame {
 
 impl LatentFrame {
     /// `top:q`, the leading `q` coordinates of `Z` (with `L = V Λ^{1/2}` from the post-norm covariance, the top-`q`
-    /// principal directions of the declared law); or `readers:q`, the top `q` right singular vectors of the block's
-    /// readers `W L`.
-    fn parse(spec: &str, block: &KnownBlock) -> Result<Self, String> {
+    /// principal directions of the declared law); `bottom:q`, the `q` least-variance coordinates `spectrum` resolves
+    /// from zero (the blind frame; the post-norm null direction is not among them); or `readers:q`, the top `q` right
+    /// singular vectors of the block's readers `W L`.
+    fn parse(spec: &str, block: &KnownBlock, spectrum: &DeclaredSpectrum) -> Result<Self, String> {
         let (kind, count) = spec
             .split_once(':')
             .ok_or(format!("frame {spec:?} is not KIND:COUNT"))?;
@@ -699,6 +810,26 @@ impl LatentFrame {
                 let mut basis = Array2::<f64>::zeros((latent_dim, retained));
                 for coordinate in 0..retained {
                     basis[[coordinate, coordinate]] = 1.0;
+                }
+                basis
+            }
+            "bottom" => {
+                if spectrum.variances.len() != latent_dim {
+                    return Err(format!(
+                        "the law declares {} coordinates but the block reads {latent_dim}",
+                        spectrum.variances.len()
+                    ));
+                }
+                let resolved = spectrum.resolved();
+                if resolved.len() < retained {
+                    return Err(format!(
+                        "frame {spec:?} asks for {retained} coordinates but the law resolves {} from zero",
+                        resolved.len()
+                    ));
+                }
+                let mut basis = Array2::<f64>::zeros((latent_dim, retained));
+                for (column, &coordinate) in resolved[resolved.len() - retained..].iter().enumerate() {
+                    basis[[coordinate, column]] = 1.0;
                 }
                 basis
             }
@@ -717,7 +848,7 @@ impl LatentFrame {
                 }
                 basis
             }
-            other => return Err(format!("frame kind {other:?} is neither top nor readers")),
+            other => return Err(format!("frame kind {other:?} is none of top, bottom and readers")),
         };
         Ok(Self {
             name: spec.to_string(),
@@ -842,10 +973,11 @@ fn compose(
     let latent_dim = declared.first.input_dim();
     let units = declared.second.width();
     let outputs = declared.second.output_dim();
+    let spectrum = DeclaredSpectrum::read(law)?;
     let mut state = seed;
     let mut frame_reports = Vec::new();
     for spec in frames {
-        let frame = LatentFrame::parse(spec, &declared.first)?;
+        let frame = LatentFrame::parse(spec, &declared.first, &spectrum)?;
         if frame.retained() == latent_dim {
             return Err(format!("frame {spec:?} retains everything: nothing is composed through a discarded law"));
         }
@@ -1090,9 +1222,10 @@ fn a3_draw(
     let baseline = read_vector(&law.join("h0.npy"))?;
     let loading = read_rows::<f64>(&law.join("L.npy"), None)?;
     let latent_dim = known.input_dim();
+    let spectrum = DeclaredSpectrum::read(law)?;
     let frames = frames
         .iter()
-        .map(|spec| LatentFrame::parse(spec, &known))
+        .map(|spec| LatentFrame::parse(spec, &known, &spectrum))
         .collect::<Result<Vec<_>, String>>()?;
     let points_frame = frames.first().ok_or("--frames names no frame")?;
     let mut state = seed;
@@ -1181,9 +1314,10 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
     let comparisons = 1 + 4 * frame_specs.len();
     let multiple = comparison_multiple(comparisons)?;
     let latent = read_rows::<f64>(&draw_dir.join("z.npy"), None)?;
+    let spectrum = DeclaredSpectrum::read(law)?;
     let mut frame_reports = Vec::new();
     for spec in &frame_specs {
-        let frame = LatentFrame::parse(spec, &known)?;
+        let frame = LatentFrame::parse(spec, &known, &spectrum)?;
         let coupled = block_rows(&format!("coupled:{spec}"))?;
         let discarded_samples = half_squared_distances(z, coupled);
         let explained_samples: Vec<f64> = total_samples
@@ -1255,6 +1389,7 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
             .and_then(Value::as_str)
             .ok_or("draw.json names no points frame")?,
         &known,
+        &spectrum,
     )?;
     let points = read_rows::<f64>(&draw_dir.join("points.npy"), None)?;
     let response_started = Instant::now();
@@ -1311,6 +1446,258 @@ fn a3(pair_dir: &Path, law: &Path, draw_dir: &Path, executed_path: &Path, out: &
         "[a3] V(I) analytic {:.6e} mc {total_mc:.6e} +- {total_se:.2e}",
         known.total_variance()
     );
+    Ok(())
+}
+
+/// The compile's declared experiment: draws the compact GAM is fitted on, independent draws for its function error,
+/// and the seed of the stream both come from.
+struct CompileRun {
+    training_draws: usize,
+    holdout_draws: usize,
+    seed: u64,
+}
+
+/// `‖r_i‖²_M` for each row `r_i` of `rows`.
+fn metric_squared_norms(rows: &Array2<f64>, metric: ArrayView2<'_, f64>) -> Vec<f64> {
+    let weighted = fast_ab(rows, &metric);
+    rows.rows()
+        .into_iter()
+        .zip(weighted.rows())
+        .map(|(row, weighted_row)| row.dot(&weighted_row))
+        .collect()
+}
+
+/// `frame` with its last direction replaced by the unit residual of the latent axis farthest from its span (the first
+/// such axis on a tie): orthonormal, and a different retained frame. Some axis is at squared distance at least
+/// `1 − q/d` from a rank-`q` span, since the axes' squared projections onto it sum to `q`.
+fn perturbed_frame(frame: &LatentFrame) -> Result<Array2<f64>, String> {
+    let (latent_dim, retained) = frame.basis.dim();
+    if retained >= latent_dim {
+        return Err(format!("frame {} spans every latent axis; no axis lies outside it", frame.name));
+    }
+    let (axis, _) = frame
+        .basis
+        .rows()
+        .into_iter()
+        .map(|row| 1.0 - row.dot(&row))
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |best, (axis, distance)| {
+            if distance > best.1 { (axis, distance) } else { best }
+        });
+    // `e_a − Q Qᵀ e_a = e_a − Q (row a of Q)ᵀ`.
+    let mut residual = frame.basis.dot(&frame.basis.row(axis)).mapv(|value| -value);
+    residual[axis] += 1.0;
+    let norm = euclidean(residual.view());
+    let mut basis = frame.basis.clone();
+    basis.column_mut(retained - 1).assign(&(residual / norm));
+    Ok(basis)
+}
+
+/// One estimate of the function error `A` against the compile's held-out `Â`: its Bonferroni `z` and whether it is
+/// resolved from zero at the same multiple (an agreement of two unresolved zeros carries no information).
+fn function_error_report(samples: &[f64], compiled: &CompiledResponse, multiple: f64) -> Value {
+    let split = compiled.split();
+    let (mean, se) = mean_with_se(samples);
+    let z = (mean - split.function_error).abs() / se.hypot(split.function_error_standard_error);
+    json!({
+        "mean": mean,
+        "se": se,
+        "z_against_holdout": z,
+        "agrees": z <= multiple,
+        "resolved_from_zero": mean > multiple * se,
+    })
+}
+
+/// A7: the teacher receipt of the compact GAM on the executed block.
+///
+/// For each frame, `compile_retained_response` fits `g` to the analytic best retained response `F̄_P` and reports R2's
+/// split `E‖F − g(PZ)‖²_M = E(P) + A`: `E(P)` exact from the operator, `Â` the held-out mean of `‖F̄_P − g‖²_M` on the
+/// compile's own draws. The A3 draw's rows were executed by torch, so on them the split is measured from executed
+/// outputs: `T = ‖F(Z) − g(Qᵀ Z)‖²_M` has `E T = E(P) + A`; `F(Z)` and `F(Z')` are two draws of one conditional law, so
+/// `E‖F(Z) − F(Z')‖²_M = 2 E(P)` and the paired `D = T − ‖F(Z) − F(Z')‖²_M / 2` has `E D = A` with no operator in it.
+/// `D' = T − ‖F(Z) − F̄_P(P Z)‖²_M = ‖F̄_P − g‖²_M + 2⟨F − F̄_P, F̄_P − g⟩_M` cancels the discarded part row by row,
+/// so its standard error does not carry `Var ‖F − F̄_P‖²`; `E D' = A` holds when `F̄_P` is the executed conditional
+/// mean, which A3 tests on the same rows. The negative control reads the same `g` through a deliberately wrong frame,
+/// the frame's last direction swapped for the first latent axis outside its span ([`perturbed_frame`]): a wrong
+/// retained response, whose executed total must miss `E(P) + Â` at the same multiple. The blind control is the frame
+/// kind `bottom:q`, run beside the others: the least-variance coordinates the law resolves carry almost none of the
+/// response, so its split is nearly all `E(P)`.
+fn a7(
+    pair_dir: &Path,
+    law: &Path,
+    draw_dir: &Path,
+    executed_path: &Path,
+    frames: &[String],
+    run: CompileRun,
+    out: &Path,
+) -> Result<(), String> {
+    let layout = read_json(&draw_dir.join("draw.json"))?;
+    let block_name = layout
+        .get("block")
+        .and_then(Value::as_str)
+        .ok_or("draw.json names no block")?
+        .to_string();
+    let drawn_frames: Vec<&str> = layout
+        .get("frames")
+        .and_then(Value::as_array)
+        .ok_or("draw.json names no frames")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let pair = Pair::load(pair_dir)?;
+    let known = declared_block(pair_block(&pair, &block_name)?, law)?;
+    let spectrum = DeclaredSpectrum::read(law)?;
+    let executed = read_rows::<f64>(executed_path, None)?;
+    let block_rows = |name: &str| layout_rows(&layout, &executed, name);
+    let latent = read_rows::<f64>(&draw_dir.join("z.npy"), None)?;
+    let at_draw = block_rows("z")?.to_owned();
+    if latent.nrows() != at_draw.nrows() {
+        return Err(format!(
+            "z.npy has {} rows but the executed z block has {}",
+            latent.nrows(),
+            at_draw.nrows()
+        ));
+    }
+    let metric = known.metric();
+    // Per frame: T against E(P) + Â, D and D' against Â, and the control's T and D'.
+    let comparisons = 5 * frames.len();
+    let multiple = comparison_multiple(comparisons)?;
+    let mut frame_reports = Vec::new();
+    for spec in frames {
+        if !drawn_frames.contains(&spec.as_str()) {
+            return Err(format!("frame {spec} is not one of the A3 draw's frames {drawn_frames:?}"));
+        }
+        let frame = LatentFrame::parse(spec, &known, &spectrum)?;
+        let coupled = block_rows(&format!("coupled:{spec}"))?;
+        let design = CompileDesign::pilot(run.training_draws, run.holdout_draws, frame.retained());
+        let compile_started = Instant::now();
+        let compiled = compile_retained_response(&known, frame.basis.view(), design, run.seed)
+            .map_err(|error| format!("compile at {spec}: {error}"))?;
+        let compile_seconds = compile_started.elapsed().as_secs_f64();
+        let split = compiled.split();
+
+        let compiled_at = compiled
+            .evaluate_coordinates(fast_ab(&latent, &frame.basis).view())
+            .map_err(|error| format!("compiled response at {spec}: {error}"))?;
+        let perturbed = perturbed_frame(&frame)?;
+        let perturbed_at = compiled
+            .evaluate_coordinates(fast_ab(&latent, &perturbed).view())
+            .map_err(|error| format!("compiled response through the perturbed frame at {spec}: {error}"))?;
+        let best = known
+            .retained_response(frame.basis.view(), frame.project(&latent).view())
+            .map_err(|error| format!("retained response at {spec}: {error}"))?;
+
+        let discarded: Vec<f64> = metric_squared_norms(&(&at_draw - &coupled), metric)
+            .into_iter()
+            .map(|value| 0.5 * value)
+            .collect();
+        let residual_to_best = metric_squared_norms(&(&at_draw - &best), metric);
+        let executed_split = |fitted: &Array2<f64>| -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+            let total = metric_squared_norms(&(&at_draw - fitted), metric);
+            let paired = total.iter().zip(&discarded).map(|(t, d)| t - d).collect();
+            let cancelled = total.iter().zip(&residual_to_best).map(|(t, r)| t - r).collect();
+            (total, paired, cancelled)
+        };
+        let (total, paired, cancelled) = executed_split(&compiled_at);
+        let (control_total, _, control_cancelled) = executed_split(&perturbed_at);
+        let (total_mc, total_se) = mean_with_se(&total);
+        let (control_total_mc, control_total_se) = mean_with_se(&control_total);
+        let (discarded_mc, discarded_se) = mean_with_se(&discarded);
+        let total_z = (total_mc - split.total()).abs() / total_se.hypot(split.function_error_standard_error);
+        let control_total_z =
+            (control_total_mc - split.total()).abs() / control_total_se.hypot(split.function_error_standard_error);
+
+        let dominance = compiled.dominance_call();
+        let price = compiled.price();
+        let representation = match compiled.representation() {
+            FunctionRepresentation::Constant => json!({"kind": "Constant"}),
+            FunctionRepresentation::Reml {
+                smoothing_parameters,
+                placement,
+                smoother_edf,
+            } => json!({
+                "kind": "Reml",
+                "smoothing_parameters": smoothing_parameters,
+                "placement": placement.iter().map(|place| format!("{place:?}")).collect::<Vec<_>>(),
+                "smoother_edf": smoother_edf,
+            }),
+        };
+        frame_reports.push(json!({
+            "frame": spec,
+            "retained": frame.retained(),
+            "design": {
+                "training_draws": design.training_draws,
+                "holdout_draws": design.holdout_draws,
+                "centers": design.centers,
+            },
+            "compile_seconds": compile_seconds,
+            "representation": representation,
+            "fitted_directions": compiled.fitted_directions(),
+            "split": {
+                "discarded_error_exact": split.discarded_error,
+                "function_error_holdout": split.function_error,
+                "function_error_holdout_se": split.function_error_standard_error,
+                "function_error_resolved_from_zero": split.function_error > multiple * split.function_error_standard_error,
+                "total": split.total(),
+                "discarded_fraction": split.discarded_error / split.total(),
+            },
+            "dominance_call": {
+                "action": format!("{:?}", dominance.action),
+                "reversal_probability": dominance.reversal_probability,
+            },
+            "frame_step": compiled.frame_step().map(|step| json!({
+                "discarded_error_after": step.discarded_error_after,
+                "gain": step.gain,
+            })),
+            "price": {
+                "reader_frame": price.reader_frame,
+                "writer_frame": price.writer_frame,
+                "output_mean": price.output_mean,
+                "function_coefficients": price.function_coefficients,
+                "function_edf": price.function_edf,
+                "connections": price.connections,
+                "unexplained_error": price.residual.unexplained_error,
+                "executed_parameters": price.residual.executed_parameters,
+            },
+            "executed": {
+                "rows": total.len(),
+                "discarded_error": discarded_mc,
+                "discarded_error_se": discarded_se,
+                "total": total_mc,
+                "total_se": total_se,
+                "total_z_against_split": total_z,
+                "total_agrees": total_z <= multiple,
+                "function_error_paired": function_error_report(&paired, &compiled, multiple),
+                "function_error_cancelled": function_error_report(&cancelled, &compiled, multiple),
+            },
+            "control_perturbed_frame": {
+                "total": control_total_mc,
+                "total_se": control_total_se,
+                "total_z_against_split": control_total_z,
+                "total_rejected": control_total_z > multiple,
+                "function_error_cancelled": function_error_report(&control_cancelled, &compiled, multiple),
+            },
+        }));
+        println!(
+            "[a7] {spec}: E(P) {:.6e}; A-hat {:.6e} +- {:.2e}; executed total {total_mc:.6e} +- {total_se:.2e} (z {total_z:.2}); perturbed-frame control z {control_total_z:.2}; compile {compile_seconds:.1}s",
+            split.discarded_error, split.function_error, split.function_error_standard_error
+        );
+    }
+    write_json(
+        out,
+        &json!({
+            "stage": "a7",
+            "provenance": pair.provenance(),
+            "law": read_json(&law.join("law.json"))?,
+            "law_root_band": spectrum.root_band,
+            "draw": layout,
+            "block": block_name,
+            "seed": run.seed,
+            "gate_multiple": multiple,
+            "comparisons": comparisons,
+            "frames": frame_reports,
+        }),
+    )?;
     Ok(())
 }
 
