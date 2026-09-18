@@ -141,11 +141,10 @@ class SourceRemovalGuard(unittest.TestCase):
                                  "crates/b/src/lib.rs": "pub fn shared() {}\n"})
             head = commit(root, {"crates/a/src/lib.rs": "fn kept() {}\nfn user() { shared(); kept(); }\n",
                                  "crates/b/src/lib.rs": "\n"})
-            with mock.patch.object(guard.subprocess, "run", wraps=subprocess.run) as spy:
+            with mock.patch.object(guard, "source_words", wraps=guard.source_words) as spy:
                 before, after, words = guard.changed_inventory(root, base, head)
-            queries = [call.args[0] for call in spy.call_args_list if "grep" in call.args[0]]
-            self.assertEqual(len(queries), 1, "one pass counts every removed private name")
-            self.assertEqual(queries[0][queries[0].index("-F") + 1:], ["-e", "shared", base, "--", "*.rs"],
+            self.assertEqual(spy.call_count, 1, "one pass counts every removed private name")
+            self.assertEqual(spy.call_args.args[1:], (base, ["shared"]),
                              "only the private name that lost a declaration is queried")
             blocked = {f"{x['path']}:{x['kind']}:{x['name']}" for x in guard.removals(before, after, words)}
             self.assertEqual(blocked, {"crates/a/src/lib.rs:fn:shared", "crates/b/src/lib.rs:fn:shared"})
