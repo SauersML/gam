@@ -112,6 +112,7 @@ mod tests {
             threshold: 0.0,
             top_k: None,
             random_state: 0,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         })
@@ -293,6 +294,7 @@ mod tests {
             threshold: 0.0,
             top_k: None,
             random_state: 0,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         })

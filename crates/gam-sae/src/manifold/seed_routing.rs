@@ -1,15 +1,15 @@
 //! Cold-start seed routing for the SAE-manifold fit (issues #174, #629, #630).
 //!
 //! These are the closed-form seeding-policy primitives the fit entry uses
-//! before the joint Arrow-Schur solve: the joint ridge-LSQ decoder seed, the
+//! before the joint Arrow-Schur solve: the joint smoothness-MAP decoder seed, the
 //! mean-centred residual-logit routing seed, the output-energy clustering that
 //! separates periodic seed coordinates, and the deterministic alternating initialization that
 //! refines all three together. Moved here from `gam-pyffi` (issue #2236) so the
 //! CLI, Rust library users, and the Python binding seed identically; the
 //! binding is marshalling only.
 
-use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
+use gam_linalg::faer_ndarray::{FaerSvd, fast_atb};
+use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3, Axis};
 
 use crate::assignment::{ordered_beta_bernoulli_row, threshold_gate_row, topk_row};
@@ -614,9 +614,10 @@ pub(crate) fn sae_refine_mobius_seed_coords_by_cluster(
     Ok(())
 }
 
-/// Seed each atom's decoder coefficient block via a joint ridge-regularized
-/// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
-/// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton
+/// Seed each atom's decoder coefficient block via the joint MAP projection of
+/// `Z` onto the atom design `[a_init * Phi_1, ..., a_init * Phi_K]` under the
+/// fit's decoder smoothness prior `½ λ Σ_k tr(B_kᵀ S_k B_k)` (`S_k` the per-atom
+/// block of `smooth_penalties`, `λ = smoothness`), where `a_init` is the assignment map that the inner Newton
 /// driver will produce at iteration 0 from the supplied `initial_logits`.
 /// Ordered Beta--Bernoulli uses the base `alpha` because learnable-alpha fits start with
 /// `rho0 = 0`, and the smooth threshold gate uses its configured center.
@@ -638,6 +639,8 @@ pub(crate) fn sae_refine_mobius_seed_coords_by_cluster(
 pub fn sae_decoder_lsq_init(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
+    smooth_penalties: ArrayView3<'_, f64>,
+    smoothness: f64,
     z: ArrayView2<'_, f64>,
     initial_logits: ArrayView2<'_, f64>,
     assignment_kind: &str,
@@ -668,6 +671,20 @@ pub fn sae_decoder_lsq_init(
     if !tau.is_finite() || tau <= 0.0 {
         return Err(format!(
             "sae_decoder_lsq_init: tau must be finite and positive; got {tau}"
+        ));
+    }
+    if !smoothness.is_finite() || smoothness <= 0.0 {
+        return Err(format!(
+            "sae_decoder_lsq_init: smoothness must be finite and positive; got {smoothness}"
+        ));
+    }
+    let penalty_shape = smooth_penalties.shape();
+    if penalty_shape[0] != k_atoms
+        || penalty_shape[1] != penalty_shape[2]
+        || basis_sizes.iter().any(|&m| m > penalty_shape[1])
+    {
+        return Err(format!(
+            "sae_decoder_lsq_init: smooth_penalties must be (K={k_atoms}, M, M) with M >= every basis size; got {penalty_shape:?}"
         ));
     }
     if assignment_kind != "topk" && top_k.is_some() {
@@ -765,7 +782,7 @@ pub fn sae_decoder_lsq_init(
     // with column count M_total = sum_k basis_sizes[k]. If every atom has zero
     // weight on a row, that row contributes nothing — but with all the
     // supported initial logits we use, a_init has at least one non-zero
-    // column per row. Solve (X^T X + ridge I) B = X^T Z, then split.
+    // column per row. Solve the smoothness-penalized LSQ below, then split.
     let offsets: Vec<usize> = {
         let mut acc = 0usize;
         let mut v = Vec::with_capacity(k_atoms + 1);
@@ -794,49 +811,44 @@ pub fn sae_decoder_lsq_init(
             }
         }
     }
-    // Symmetric normal-equations matrix and rhs.
-    let mut xtx = fast_ata(&x);
-    // Diagonal Tikhonov ridge for the seed projection (issue #671 multi-atom
-    // conditioning). The cold multi-atom seed places near-identical coordinates
-    // on every atom (the periodic seed shares the leading principal component
-    // across atoms), so the joint design's per-atom column blocks are nearly
-    // collinear and `X^T X` is severely ill-conditioned. A tiny mean-relative
-    // ridge (the historical `mean_diag * 1e-8`) leaves the near-null directions
-    // unregularized, producing decoder coefficients of order 1e5; the
-    // DecoderIncoherence penalty's gradient is cubic in `B`, so those seeds blow
-    // the joint solver up by ~1e15. We instead anchor the ridge to the SPECTRAL
-    // scale (the maximum diagonal, an upper bound on the largest eigenvalue)
-    // with a larger relative floor. This bounds the seed solution norm by
-    // roughly `||X^T Z|| / ridge` while leaving well-conditioned designs
-    // essentially unchanged (the ridge stays negligible against the signal
-    // eigenvalues there). Conditioning the seed is correct here: the inner
-    // data-fit Newton step refines `B` from a sane, bounded starting point
-    // rather than a pathological one.
-    let mut trace = 0.0_f64;
-    let mut max_diag = 0.0_f64;
-    for i in 0..m_total {
-        let d = xtx[[i, i]];
-        trace += d;
-        if d > max_diag {
-            max_diag = d;
+    // MAP decoder under the fit's own smoothness prior (#3090). The fit's
+    // objective is `½‖Z − XB‖² + ½ Σ_k λ tr(B_kᵀ S_k B_k)`, so its conditional
+    // decoder optimum at the seed assignments is the penalized least-squares
+    // solution of the augmented system `[X; √λ·blockdiag(R_k)] B ≈ [Z; 0]`
+    // with `S_k = R_kᵀ R_k`. Near-collinear per-atom column blocks (the #671
+    // multi-atom seed, where every atom shares the leading principal
+    // component) are bounded by the same prior the fit applies, instead of by
+    // a spectral-scale ridge that biased every seed; directions the prior
+    // leaves free and the data do not identify get the minimum-norm solution
+    // from the rank-certified SVD solve.
+    let mut roots = Vec::with_capacity(k_atoms);
+    let mut root_rows = 0usize;
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let penalty = smooth_penalties
+            .slice(ndarray::s![atom_idx, 0..m_k, 0..m_k])
+            .to_owned();
+        let root = penalty_matrix_root(&penalty)
+            .map_err(|err| format!("sae_decoder_lsq_init: atom {atom_idx} penalty root: {err}"))?;
+        root_rows += root.nrows();
+        roots.push(root);
+    }
+    let sqrt_lambda = smoothness.sqrt();
+    let mut augmented = Array2::<f64>::zeros((n_obs + root_rows, m_total));
+    augmented.slice_mut(ndarray::s![0..n_obs, ..]).assign(&x);
+    let mut row = n_obs;
+    for (atom_idx, root) in roots.iter().enumerate() {
+        let off = offsets[atom_idx];
+        for root_row in root.rows() {
+            for (basis_col, &value) in root_row.iter().enumerate() {
+                augmented[[row, off + basis_col]] = sqrt_lambda * value;
+            }
+            row += 1;
         }
     }
-    let mean_diag = (trace / m_total as f64).max(0.0);
-    // Spectral-scale ridge: tie the floor to the largest diagonal so collinear
-    // column blocks (small eigenvalues) are damped relative to the design's
-    // dominant scale, not its average. `1e-4` is large enough to keep the seed
-    // coefficient norm bounded under near-duplicate atoms yet small enough that
-    // a well-conditioned design recovers essentially the unregularized LSQ fit.
-    let spectral_scale = max_diag.max(mean_diag).max(1.0e-12);
-    let jitter = spectral_scale * 1.0e-4;
-    for i in 0..m_total {
-        xtx[[i, i]] += jitter;
-    }
-    let xtz = fast_atb(&x, &z.to_owned());
-    let factor = xtx
-        .cholesky(Side::Lower)
-        .map_err(|err| format!("sae_decoder_lsq_init: Cholesky failed: {err:?}"))?;
-    let b_joint = factor.solve_mat(&xtz);
+    let mut rhs = Array2::<f64>::zeros((n_obs + root_rows, p_out));
+    rhs.slice_mut(ndarray::s![0..n_obs, ..]).assign(&z);
+    let b_joint = super::solve_design_least_squares(augmented.view(), rhs.view())?;
     if !b_joint.iter().all(|v| v.is_finite()) {
         return Err("sae_decoder_lsq_init: non-finite LSQ solution".to_string());
     }
@@ -877,7 +889,7 @@ pub fn sae_decoder_lsq_init(
 ///    where atom `k` reconstructs it well, while the off-atoms move to wherever
 ///    their current decoder is least wrong on that row.
 /// 2. **Decoder refit** — refit every atom's decoder by the same weighted joint
-///    LSQ used for the cold init ([`sae_decoder_lsq_init`]), now at the
+///    smoothness-MAP LSQ used for the cold init ([`sae_decoder_lsq_init`]), now at the
 ///    *separated* coordinates, so each atom's block specializes toward the rows
 ///    it actually explains.
 /// 3. **Routing seed** — recompute the mean-centred residual logits
@@ -904,6 +916,7 @@ pub(crate) fn sae_refine_routing_seed(
     alpha: f64,
     tau: f64,
     threshold_gate_threshold: f64,
+    smoothness: f64,
     random_state: u64,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
@@ -923,6 +936,22 @@ pub(crate) fn sae_refine_routing_seed(
     let m_max = basis_sizes.iter().copied().max().unwrap_or(0);
     if m_max == 0 {
         return Ok(());
+    }
+    // The decoder refit is the MAP under the fit's smoothness prior, so it
+    // reads the same per-atom penalties the joint objective charges.
+    let mut smooth_penalties = Array3::<f64>::zeros((k_atoms, m_max, m_max));
+    for atom_idx in 0..k_atoms {
+        let penalty = term.atoms[atom_idx].smooth_penalty();
+        let m_k = basis_sizes[atom_idx];
+        if penalty.dim() != (m_k, m_k) {
+            return Err(format!(
+                "sae_refine_routing_seed: atom {atom_idx} smooth penalty is {:?}, expected ({m_k}, {m_k})",
+                penalty.dim()
+            ));
+        }
+        smooth_penalties
+            .slice_mut(ndarray::s![atom_idx, 0..m_k, 0..m_k])
+            .assign(penalty);
     }
     for _ in 0..SAE_SEED_REFINE_ROUNDS {
         // 1. Coordinate update: project each row onto the current decoder.
@@ -950,6 +979,8 @@ pub(crate) fn sae_refine_routing_seed(
         let decoder = sae_decoder_lsq_init(
             basis3.view(),
             basis_sizes,
+            smooth_penalties.view(),
+            smoothness,
             z,
             term.assignment.logits.view(),
             assignment_kind,
@@ -995,6 +1026,8 @@ pub(crate) fn sae_refine_routing_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faer::Side;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata};
 
     #[test]
     fn mobius_double_cover_seed_reconstructs_planted_band() {
@@ -1341,6 +1374,7 @@ mod tests {
             threshold: 0.0,
             top_k: None,
             random_state: 0,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         }) {
@@ -1443,9 +1477,13 @@ mod tests {
         }
         let basis_sizes = vec![m; k];
         let logits = Array2::<f64>::zeros((n, k));
+        // No smoothness penalty: the seed is the plain joint LSQ projection.
+        let penalties = Array3::<f64>::zeros((k, m, m));
         let decoder = sae_decoder_lsq_init(
             basis.view(),
             &basis_sizes,
+            penalties.view(),
+            1.0,
             z.view(),
             logits.view(),
             "ordered_beta_bernoulli",
@@ -1528,9 +1566,13 @@ mod tests {
         // Top-1 routing decouples the positive and negative rows.
         let logits = array![[0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, 0.5]];
 
+        // A constant column is in every smoothness penalty's null space.
+        let penalties = Array3::<f64>::zeros((k_atoms, 1, 1));
         let decoder = sae_decoder_lsq_init(
             basis.view(),
             &[1, 1],
+            penalties.view(),
+            1.0,
             z.view(),
             logits.view(),
             "topk",
@@ -1554,6 +1596,8 @@ mod tests {
         let decoder_dense = sae_decoder_lsq_init(
             basis.view(),
             &[1, 1],
+            penalties.view(),
+            1.0,
             z.view(),
             logits.view(),
             "softmax",
@@ -1567,6 +1611,118 @@ mod tests {
             (decoder_dense[[0, 0, 0]] - 1.0).abs() > 0.5,
             "uncapped softmax must remain coupled; got {}",
             decoder_dense[[0, 0, 0]]
+        );
+    }
+
+    /// #3090 — the decoder seed is the MAP of the fit's own penalized objective
+    /// `½‖Z − XB‖² + ½ λ Σ_k tr(B_kᵀ S_k B_k)` at the seed assignments, not a
+    /// spectral-ridge perturbation of it. Checked through the objective's
+    /// stationarity `Xᵀ(Z − XB) = λ·blockdiag(S_k)·B`, on a well-conditioned
+    /// two-atom design and on exactly duplicated atoms (the #671 collinear
+    /// seed), where the prior-free constant directions must split symmetrically
+    /// (minimum norm) instead of blowing up. The retired `1e-4·max diag(XᵀX)`
+    /// ridge leaves a stationarity residual of that relative size.
+    #[test]
+    fn sae_decoder_lsq_seed_is_the_smoothness_map_3090() {
+        let n = 60usize;
+        let p = 3usize;
+        let m = 3usize;
+        let k = 2usize;
+        let lambda = 0.3_f64;
+        let two_pi = std::f64::consts::TAU;
+        let case = |harmonic: [f64; 2]| {
+            let mut basis = Array3::<f64>::zeros((k, n, m));
+            let mut penalties = Array3::<f64>::zeros((k, m, m));
+            for atom in 0..k {
+                for row in 0..n {
+                    let t = two_pi * harmonic[atom] * (row as f64) / (n as f64);
+                    basis[[atom, row, 0]] = 1.0;
+                    basis[[atom, row, 1]] = t.sin();
+                    basis[[atom, row, 2]] = t.cos();
+                }
+                let roughness = harmonic[atom].powi(4);
+                penalties[[atom, 1, 1]] = roughness;
+                penalties[[atom, 2, 2]] = roughness;
+            }
+            let z = Array2::from_shape_fn((n, p), |(row, col)| {
+                let t = two_pi * (row as f64) / (n as f64);
+                0.4 * (col as f64) + (t + 0.3 * col as f64).sin() + 0.2 * (2.0 * t).cos()
+            });
+            let logits = Array2::from_shape_fn((n, k), |(row, atom)| {
+                if harmonic[0] == harmonic[1] {
+                    0.0
+                } else {
+                    0.8 * ((row * (atom + 2)) as f64 * 0.37).sin()
+                }
+            });
+            let decoder = sae_decoder_lsq_init(
+                basis.view(),
+                &[m, m],
+                penalties.view(),
+                lambda,
+                z.view(),
+                logits.view(),
+                "softmax",
+                1.0,
+                1.0,
+                0.0,
+                None,
+            )
+            .expect("the MAP decoder seed solves");
+            // Rebuild the joint design at the softmax seed assignments.
+            let mut x = Array2::<f64>::zeros((n, k * m));
+            for row in 0..n {
+                let max = logits.row(row).iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = logits.row(row).iter().map(|v| (v - max).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for atom in 0..k {
+                    for col in 0..m {
+                        x[[row, atom * m + col]] =
+                            weights[atom] / total * basis[[atom, row, col]];
+                    }
+                }
+            }
+            let mut b = Array2::<f64>::zeros((k * m, p));
+            let mut penalty_b = Array2::<f64>::zeros((k * m, p));
+            for atom in 0..k {
+                for col in 0..m {
+                    for out in 0..p {
+                        b[[atom * m + col, out]] = decoder[[atom, col, out]];
+                        penalty_b[[atom * m + col, out]] =
+                            lambda * penalties[[atom, col, col]] * decoder[[atom, col, out]];
+                    }
+                }
+            }
+            let data_pull = x.t().dot(&(&z - &x.dot(&b)));
+            let scale = x.t().dot(&z).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let stationarity = (&data_pull - &penalty_b)
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            (decoder, stationarity / scale)
+        };
+
+        let (_, distinct_residual) = case([1.0, 2.0]);
+        assert!(
+            distinct_residual < 1.0e-10,
+            "the seed must be the exact smoothness-MAP decoder on a well-conditioned design; \
+             relative stationarity residual {distinct_residual:.3e}"
+        );
+
+        let (duplicate, duplicate_residual) = case([1.0, 1.0]);
+        assert!(
+            duplicate_residual < 1.0e-10,
+            "the seed must be the exact smoothness-MAP decoder on duplicated atoms; \
+             relative stationarity residual {duplicate_residual:.3e}"
+        );
+        let asymmetry = (0..m)
+            .flat_map(|col| (0..p).map(move |out| (col, out)))
+            .map(|(col, out)| (duplicate[[0, col, out]] - duplicate[[1, col, out]]).abs())
+            .fold(0.0_f64, f64::max);
+        let magnitude = duplicate.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            asymmetry < 1.0e-10 * magnitude.max(1.0) && magnitude < 10.0,
+            "duplicated atoms must share the minimum-norm MAP decoder: asymmetry \
+             {asymmetry:.3e}, max |B| {magnitude:.3e}"
         );
     }
 

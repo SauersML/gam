@@ -45,6 +45,7 @@ fn linear_circle() -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>) {
         threshold: 0.0,
         top_k: None,
         random_state: 45,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

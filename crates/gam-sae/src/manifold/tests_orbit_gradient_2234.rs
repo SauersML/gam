@@ -50,6 +50,7 @@ fn planted_fixture(basis: &str) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
         threshold: 0.0,
         top_k: None,
         random_state: 45,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })
@@ -372,6 +373,7 @@ pub(super) fn topk_two_circle_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeMan
         threshold: 0.0,
         top_k: Some(1),
         random_state: 45,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

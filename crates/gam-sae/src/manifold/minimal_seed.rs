@@ -17,6 +17,9 @@ pub struct SaeMinimalSeedRequest<'a> {
     pub threshold: f64,
     pub top_k: Option<usize>,
     pub random_state: u64,
+    /// Decoder smoothness strength `λ` the fit starts from; the LSQ decoder
+    /// seed is the MAP under the same `½ λ tr(BᵀSB)` prior.
+    pub smoothness: f64,
     pub initial_logits: Option<ArrayView2<'a, f64>>,
     pub initial_coords: Option<ArrayView3<'a, f64>>,
 }
@@ -289,6 +292,8 @@ pub fn build_sae_minimal_seed(
     let decoder_coefficients = sae_decoder_lsq_init(
         basis_values.view(),
         &basis_sizes,
+        smooth_penalties.view(),
+        request.smoothness,
         request.target,
         initial_logits.view(),
         request.assignment_kind.tag(),
@@ -328,6 +333,7 @@ mod tests {
             threshold: 0.0,
             top_k: None,
             random_state: 0,
+            smoothness: 1.0,
             initial_logits: None,
             initial_coords: None,
         })

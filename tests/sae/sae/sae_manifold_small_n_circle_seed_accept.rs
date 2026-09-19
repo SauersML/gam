@@ -99,6 +99,7 @@ fn build_production_seed(z: &Array2<f64>) -> (SaeManifoldTerm, SaeManifoldRho) {
         threshold: 0.0,
         top_k: None,
         random_state: 0,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

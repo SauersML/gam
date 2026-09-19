@@ -172,6 +172,7 @@ fn seeded_term_of_kind(
         threshold: 0.0,
         top_k: None,
         random_state: 45,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })

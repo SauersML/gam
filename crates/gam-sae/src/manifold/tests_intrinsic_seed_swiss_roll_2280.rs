@@ -154,6 +154,7 @@ fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
         threshold: 0.0,
         top_k: None,
         random_state: 0,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })
@@ -377,6 +378,7 @@ fn planted_swiss_roll_is_a_sheet_with_unrolled_coordinates_2280() {
         threshold: 0.0,
         top_k: None,
         random_state: 0,
+        smoothness: 1.0,
         initial_logits: None,
         initial_coords: None,
     })
