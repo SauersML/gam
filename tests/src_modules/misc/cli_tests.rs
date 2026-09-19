@@ -1122,7 +1122,6 @@ fn location_scale_fit_args(
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(out),
     }
 }
@@ -1197,7 +1196,6 @@ fn cli_fit_request_replaces_formula_and_scientific_flags() {
         vec!["y ~ x"],
         vec!["--family", "auto"],
         vec!["--transformation-normal"],
-        vec!["--precompute-conformal", "false"],
     ] {
         let mut argv = vec![
             "gam",
@@ -1528,7 +1526,6 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1657,7 +1654,6 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -1744,7 +1740,6 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2254,7 +2249,6 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2310,6 +2304,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -2500,7 +2495,6 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     })
     .unwrap_or_else(|e| {
@@ -2534,6 +2528,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -2603,7 +2598,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("main formula should reject z-column reuse")
@@ -2649,7 +2643,6 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(td.path().join("model.json")),
     })
     .expect_err("slope formula should reject z-column reuse")
@@ -3125,7 +3118,6 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit should succeed", e));
@@ -3153,6 +3145,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -3194,6 +3187,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -3261,7 +3255,6 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(out),
     }
 }
@@ -3408,7 +3401,6 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         sigma_time_k: None,
         slope_time_k: None,
         scale_dimensions: false,
-        precompute_conformal: true,
         out: Some(model_path.clone()),
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "Firth fit should succeed", e));
@@ -3436,6 +3428,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(predict_args).unwrap_or_else(|e| {
         panic!(
@@ -3477,6 +3470,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(band_args).unwrap_or_else(|e| {
         panic!(
@@ -3651,6 +3645,7 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     run_predict(args)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
@@ -5046,6 +5041,7 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         covariance_mode: Some(InferenceCovarianceMode::SmoothingCorrected),
         conformal: false,
         calibration: None,
+        training_data: None,
     })
     .unwrap_or_else(|e| {
         panic!(
@@ -6678,6 +6674,7 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         covariance_mode: None,
         conformal: false,
         calibration: None,
+        training_data: None,
     };
     super::run_predict_survival(
         &args,
@@ -6841,6 +6838,7 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         covariance_mode: None,
         conformal: false,
         calibration: None,
+        training_data: None,
     };
 
     super::run_predict_survival(

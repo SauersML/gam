@@ -24,7 +24,9 @@ mod low_rank;
 mod newton_solve;
 mod penalty;
 mod pls_solver;
+mod residuals;
 mod reweight;
+mod row_pass;
 mod sparse_system;
 mod state;
 mod student_t;
@@ -35,6 +37,8 @@ mod workspace;
 mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
+#[cfg(test)]
+mod residuals_tests;
 #[cfg(test)]
 mod sas_saturated_row_2733_tests;
 #[cfg(test)]
@@ -62,9 +66,11 @@ pub use family_state::{
     valid_count_response,
 };
 pub(crate) use gam_working_model::*;
+pub(crate) use row_pass::*;
 pub use glm_update::*;
 pub use low_rank::*;
 pub use newton_solve::*;
+pub use residuals::*;
 pub(crate) use sparse_system::*;
 pub(crate) use student_t::*;
 pub(crate) use working_model_trait::*;
@@ -127,5 +133,3 @@ pub use loop_driver::{
     nfree_skip_row_element_touches,
 };
 
-/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history.
-pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;
