@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed absence (unsupported platform, no driver, no device, or a CUDA runtime library such as cuBLAS with no candidate on the host, which is where a CPU-only install lands on a driver-only GPU machine) selects CPU; a present-but-broken driver or runtime library, or an initialization fault, remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
