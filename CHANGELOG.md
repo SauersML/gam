@@ -28,8 +28,8 @@
   (pyGAM audit, lane pv-model-comparison). The χ²_r reference for the score at the
   penalized fit is only first order, and at small n it was miscalibrated in both
   directions: at n = 200 with a default `s(x)` it was conservative (binomial size 0.032 at
-  0.05; with success probabilities 0.05–0.27 size 0.024 at 0.05, KS p ≈ 0), and with
-  Poisson means 0.14–1.0 its p-values failed a KS test against U(0, 1) (p ≈ 0). The score
+  0.05; with success probabilities 0.05–0.27 size 0.024 at 0.05, KS p = 1e-9), and with
+  Poisson means 0.14–1.0 its p-values failed a KS test against U(0, 1) (p = 3e-5). The score
   is now taken at the unpenalized null MLE and referred to its law conditional on the
   sufficient statistic `Xᵀ(w∘y)`, with its mean, covariance and fourth cumulant corrected
   to O(1/n) (`c·χ²_{r/c}`, `c = 1 + K₄/(2r)`). Binomial and Poisson `basis_checks` p-values
