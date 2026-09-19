@@ -6,9 +6,12 @@
 //! across chunk boundaries differently, so it must NOT be bit-equal to the chunked
 //! fold on this fixture, which shows the equality below can fail.
 //!
-//! #2822 — the partials take a dense store (value array, touched marker, key list)
-//! where the memory governor admits it, and the keyed store otherwise. The two fold
-//! the same words, signed zeros included.
+//! #2822 — every partial is a dense store (value array and a touched column set per
+//! left index), and the memory governor sets only how many are alive at once, down
+//! to the serial in-place reduction when it admits none. The partial count does not
+//! move a word, signed zeros included. A declined footprint used to fall back to a
+//! keyed store that hashed every product (24.5 s against 1.2 s dense per
+//! `inner_fit_core_scaling` solve, sw4i 1255679).
 
 #![cfg(test)]
 
@@ -17,12 +20,12 @@ use crate::arrow_schur::newton_step::{
     SchurReductionKind, factor_blocks_for_system, subtract_row_schur_contribution,
 };
 use crate::arrow_schur::reduced_solve::{
-    SCHUR_MATVEC_PARALLEL_ROW_MIN, TouchedPairStoreKind, fold_row_chunk_partials,
-    fold_touched_pair_chunk_partials, reduce_row_schur_contributions,
-    reserve_dense_touched_pair_partials,
+    SCHUR_MATVEC_PARALLEL_ROW_MIN, TouchedPairFold, fold_row_chunk_partials,
+    fold_touched_pair_chunk_partials, plan_touched_pair_fold, reduce_row_schur_contributions,
 };
 use crate::arrow_schur::solve_options::{ArrowEvidencePolicy, CpuBatchedBlockSolver};
 use ndarray::{Array1, Array2, ArrayView1};
+use std::cell::Cell;
 use std::sync::Arc;
 
 /// Rows with `active` of `k` border columns each, `H_tt = 4·I`, and fixed couplings
@@ -194,9 +197,28 @@ fn raw_words_equal(left: &Array2<f64>, right: &Array2<f64>) -> bool {
             .all(|(p, q)| p.to_bits() == q.to_bits())
 }
 
+/// The production fold at the governor-admitted width, and at one and two live
+/// partials, against an independent touched-pairs-only reference: zero-seeded dense
+/// `k×k` chunk partials under the CPU `block_gemm_subtract`, folded in chunk order
+/// at every entry whose word is not `+0.0`.
+///
+/// That reference folds exactly the touched pairs' words. A pair no row touches is
+/// `+0.0` in its partial and skipped. A touched pair whose sum is `+0.0` is skipped
+/// too, where the production fold adds it, but the Schur seed `20·I` holds `+0.0`
+/// off its diagonal and a sum of `±0.0` terms onto `+0.0` stays `+0.0`, so neither
+/// choice moves a word on this fixture.
+///
+/// `k = 48` holds each touched set in one word; `k = 130` spans three, the last one
+/// partial.
 #[test]
-fn dense_and_keyed_touched_pair_stores_fold_the_same_words_2822() {
-    let (n, active, k) = (1024usize, 6usize, 48usize);
+fn the_touched_pair_fold_folds_the_same_words_at_every_partial_count_2822() {
+    for k in [48usize, 130] {
+        assert_touched_pair_fold_words(k);
+    }
+}
+
+fn assert_touched_pair_fold_words(k: usize) {
+    let (n, active) = (1024usize, 6usize);
     let sys = sparse_row_system(n, active, k);
     let backend = CpuBatchedBlockSolver;
     let factors = factor_blocks_for_system(
@@ -208,16 +230,54 @@ fn dense_and_keyed_touched_pair_stores_fold_the_same_words_2822() {
     )
     .expect("row factors")
     .factors;
+    assert!(
+        n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none(),
+        "the parallel chunk fold must be the route under test"
+    );
 
     for kind in [SchurReductionKind::Direct, SchurReductionKind::SqrtBa] {
-        let fold = |store| {
+        let mut admitted = Array2::<f64>::eye(k) * 20.0;
+        reduce_row_schur_contributions(
+            &sys,
+            &factors,
+            &backend,
+            kind,
+            &mut admitted,
+            gam_gpu::GpuPolicy::Off,
+        )
+        .expect("touched-pair chunk fold at the admitted width");
+        let at_width = |partials: usize| {
             let mut schur = Array2::<f64>::eye(k) * 20.0;
-            fold_touched_pair_chunk_partials(&sys, &factors, &backend, kind, &mut schur, store)
+            fold_touched_pair_chunk_partials(&sys, &factors, &backend, kind, &mut schur, partials)
                 .expect("touched-pair chunk fold");
             schur
         };
-        let dense = fold(TouchedPairStoreKind::Dense);
-        let keyed = fold(TouchedPairStoreKind::Keyed);
+
+        let mut reference = Array2::<f64>::eye(k) * 20.0;
+        fold_row_chunk_partials(
+            n,
+            || Array2::<f64>::zeros((k, k)),
+            |partial| partial.fill(0.0),
+            |i, partial| {
+                subtract_row_schur_contribution(
+                    &sys,
+                    i,
+                    &sys.rows[i],
+                    factors.factor(i),
+                    &backend,
+                    kind,
+                    partial,
+                )
+            },
+            |partial| {
+                for ((a, b), value) in partial.indexed_iter() {
+                    if value.to_bits() != 0 {
+                        reference[[a, b]] += *value;
+                    }
+                }
+            },
+        )
+        .expect("reference chunk fold");
 
         let mut serial = Array2::<f64>::eye(k) * 20.0;
         rayon::ThreadPoolBuilder::new()
@@ -237,32 +297,98 @@ fn dense_and_keyed_touched_pair_stores_fold_the_same_words_2822() {
             .expect("serial in-place reduction");
 
         assert!(
-            raw_words_equal(&dense, &keyed),
-            "{kind:?}: the dense and keyed touched-pair stores fold different words"
+            raw_words_equal(&admitted, &reference),
+            "{kind:?} at k = {k}: the touched-pair fold at the admitted width folds different \
+             words from the touched-pairs-only reference"
         );
+        for partials in [1, 2] {
+            assert!(
+                raw_words_equal(&at_width(partials), &admitted),
+                "{kind:?} at k = {k}: the touched-pair fold at {partials} live partials folds \
+                 different words from the fold at the admitted width"
+            );
+        }
         assert!(
-            !raw_words_equal(&serial, &keyed),
-            "{kind:?}: control failed: the serial reduction's words equal the chunked fold's, \
-             so word equality cannot tell two reductions apart on this fixture"
+            !raw_words_equal(&serial, &admitted),
+            "{kind:?} at k = {k}: control failed: the serial reduction's words equal the chunked \
+             fold's, so word equality cannot tell two reductions apart on this fixture"
         );
     }
 }
 
+/// One dense partial's charge at border `k`: `k²` values, `k·⌈k/64⌉` touched words
+/// and a list slot and flag per left index.
+fn dense_partial_bytes(k: usize) -> usize {
+    k * k * 8 + k * k.div_ceil(64) * 8 + k * (8 + 1)
+}
+
+/// A declined footprint costs the fold its parallelism, never its per-product work.
+/// The plan admits as many dense partials as the ledger takes, down to the serial
+/// in-place reduction. Any other fallback fails the exact `Chunked { partials: 2 }`
+/// below, whether it is a hashed store, the in-place loop taken too early or a width
+/// the ledger did not admit. The ledger here is a budget the test sets: `remaining`
+/// reports it and `reserve` charges it.
 #[test]
-fn a_dense_touched_pair_footprint_the_governor_declines_folds_keyed_2822() {
-    // 48² pairs at 9 bytes, for 4 partials: 82,944 bytes.
-    assert!(
-        reserve_dense_touched_pair_partials(48, 4).is_some(),
-        "a 48-wide border's dense partials must be admitted, or the decline below is not \
-         specific to the footprint"
+fn a_declined_footprint_folds_with_fewer_dense_partials_never_a_hashed_store_2822() {
+    let k = 48usize;
+    let per_partial = dense_partial_bytes(k);
+
+    // The budget holds two of the four partials the pool wants.
+    let budget = 2 * per_partial + per_partial / 2;
+    let reserved = Cell::new(0usize);
+    let (plan, charge) = plan_touched_pair_fold(
+        k,
+        4,
+        || budget - reserved.get(),
+        |bytes| {
+            (reserved.get() + bytes <= budget).then(|| {
+                reserved.set(reserved.get() + bytes);
+                bytes
+            })
+        },
     );
-    // 2⁴⁰ pairs at 9 bytes: 9 TiB, past any host's governor budget.
-    assert!(
-        reserve_dense_touched_pair_partials(1 << 20, 1).is_none(),
-        "a 9 TiB dense partial must be declined"
+    assert_eq!(
+        plan,
+        TouchedPairFold::Chunked { partials: 2 },
+        "a budget of {budget} bytes admits two {per_partial}-byte dense partials"
     );
-    assert!(
-        reserve_dense_touched_pair_partials(usize::MAX, 1).is_none(),
-        "a dense partial whose byte count overflows must be declined"
+    assert_eq!(
+        charge,
+        Some(2 * per_partial),
+        "the admitted partials are charged as dense stores"
     );
+
+    // The whole want fits: every partial is admitted.
+    let (plan, _) = plan_touched_pair_fold(k, 4, || 4 * per_partial, Some);
+    assert_eq!(plan, TouchedPairFold::Chunked { partials: 4 });
+
+    // A peer reserves between the price and the charge: the count that remains is taken.
+    let peer_took = Cell::new(false);
+    let (plan, charge) = plan_touched_pair_fold(
+        k,
+        4,
+        || {
+            if peer_took.get() {
+                per_partial
+            } else {
+                3 * per_partial
+            }
+        },
+        |bytes| {
+            if peer_took.get() {
+                Some(bytes)
+            } else {
+                peer_took.set(true);
+                None
+            }
+        },
+    );
+    assert_eq!(plan, TouchedPairFold::Chunked { partials: 1 });
+    assert_eq!(charge, Some(per_partial));
+
+    // Less than one partial, or a byte count that overflows: the rows reduce in place.
+    let (plan, charge) = plan_touched_pair_fold(k, 4, || per_partial - 1, Some);
+    assert_eq!((plan, charge), (TouchedPairFold::InPlace, None));
+    let (plan, charge) = plan_touched_pair_fold(usize::MAX, 4, || usize::MAX, Some);
+    assert_eq!((plan, charge), (TouchedPairFold::InPlace, None));
 }

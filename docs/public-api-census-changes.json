@@ -4421,5 +4421,13 @@
     },
     "reason": "#2333/#2933 F03: the outer-gradient assembler's pairing refusal left no route to the bundle-free arm that called logdet_theta_adjoint, the last non-test caller of the Trace-seam majorizer theta-adjoint. The adjoint, its consumer contracted_trace_adjoint, the Trace planner plan_softmax_row_jets_trace and the output-base projection project_output_bases that only the consumer used are deleted.",
     "evidence": "Gate job 1197886 (gx8, 5023324b3c + patch d72e32519a06a71d81fb8c0a79207eec): public_api_census.py reported exactly these four identities as removed without an acknowledgement (12200 public function declarations before, 12196 after). The three selected-inverse helpers this change also deletes are private or struct items that the census does not count."
+  },
+  {
+    "base": "d10950d360992888269dc1543a904ef14e5d05b5",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::reserve_dense_touched_pair_partials": 1
+    },
+    "reason": "#2822 (i2280): the keyed touched-pair store is deleted, and with it the reservation that chose between dense and keyed partials. plan_touched_pair_fold now charges the governor per dense partial and admits as many as fit, down to an in-place serial reduction.",
+    "evidence": "Gate dy3 run i2280-fold-g1 (direct-dy3-i2280-fold-g1.log) at b78a4a2f5e: public_api_census.py refused exactly this removal. At eded626399, git grep -w finds reserve_dense_touched_pair_partials only in crates/gam-solve/src/arrow_schur/reduced_solve.rs (declaration and its caller) and touched_pair_fold_2900_tests.rs; the landing names it nowhere."
   }
 ]

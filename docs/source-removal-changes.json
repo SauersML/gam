@@ -1256,5 +1256,17 @@
     ],
     "reason": "#2946: attention_kernel.rs's two QK fits become Gaussian REML smooths through gam_solve::gaussian_reml (TorusHarmonicEvaluator(2, K) with anisotropic_flat_product_torus_penalty, and the stationary kernel as its exact +-1 embedding). The unpenalized least-squares route and its BIC comparison are deleted with the private helpers only they used: the per-row harmonic and separable basis fillers (harmonic_basis_values, stationary_basis, fill_separable_basis) and the two sums-of-squares accumulators (stationary_sums_of_squares, separable_sums_of_squares).",
     "evidence": "Direct lane dy5 run landsae-S2a-2922 (base 29221e56b1, tree a9473765, patch md5 40c83ac5) ran scripts/source_removal_guard.py, which reported exactly these five private fns of crates/gam-sae/src/attention_kernel.rs as removed. git grep -c -w at 29221e56b1 finds each only in that file (fill_separable_basis 4, harmonic_basis_values 7, separable_sums_of_squares 2, stationary_basis 3, stationary_sums_of_squares 2 occurrences), and at the landing tree in no file under crates, src or tests."
+  },
+  {
+    "base": "d10950d360992888269dc1543a904ef14e5d05b5",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:enum:TouchedPairStore",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:enum:TouchedPairStoreKind",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:reserve_dense_touched_pair_partials",
+      "crates/gam-solve/src/arrow_schur/touched_pair_fold_2900_tests.rs:fn:a_dense_touched_pair_footprint_the_governor_declines_folds_keyed_2822",
+      "crates/gam-solve/src/arrow_schur/touched_pair_fold_2900_tests.rs:fn:dense_and_keyed_touched_pair_stores_fold_the_same_words_2822"
+    ],
+    "reason": "#2822 (i2280): the reduced-Schur fold marks its touched pairs as a column bitset per left index, and a governor-declined dense footprint admits fewer dense partials (down to an in-place serial reduction) instead of falling back to a keyed hash store. The keyed store is deleted with its selector: the private enum TouchedPairStore (dense or keyed), the pub enum TouchedPairStoreKind that reported which one a fold used, and the pub fn reserve_dense_touched_pair_partials, replaced by plan_touched_pair_fold's per-partial charge. The two tests that pinned the keyed fallback are restated: dense_and_keyed_touched_pair_stores_fold_the_same_words_2822 as the_touched_pair_fold_folds_the_same_words_at_every_partial_count_2822, and a_dense_touched_pair_footprint_the_governor_declines_folds_keyed_2822 as a_declined_footprint_folds_with_fewer_dense_partials_never_a_hashed_store_2822.",
+    "evidence": "Gate dy3 run i2280-fold-g1 (direct-dy3-i2280-fold-g1.log, tree e90dc86e at b78a4a2f5e): source_removal_guard.py listed exactly these five removals, and both mutant arms FIRED. At eded626399, git grep -w finds TouchedPairStore, TouchedPairStoreKind and reserve_dense_touched_pair_partials only in crates/gam-solve/src/arrow_schur/reduced_solve.rs and touched_pair_fold_2900_tests.rs, and the two deleted test names only at their declarations there; the landing blobs name none of the three. Job 1265248 at b78a4a2f5e with this change: gam-solve 1950/1950, the arrow_schur and touched-pair pins 143/143."
   }
 ]
