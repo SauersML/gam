@@ -11,9 +11,12 @@
 //! fits. The diagnostic is not needed to build the returned fit, so a fit that
 //! does not request it (the formula and Python default) does not pay for it.
 
+use csv::StringRecord;
 use gam::estimate::FitOptions;
-use gam::inference::rho_posterior::RhoPosteriorOutcome;
-use gam::init_parallelism;
+use gam::inference::rho_posterior::{RhoPosteriorNotComputed, RhoPosteriorOutcome};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     fit_term_collection_forspec,
@@ -178,4 +181,35 @@ fn tier0_adequacy_is_deterministic_across_identical_fits() {
         "the fixed-seed diagnostic must give bit-identical k̂ across identical fits"
     );
     assert_eq!(a.n_samples, b.n_samples);
+}
+
+/// A formula fit that does not request smoothing-parameter posterior inference
+/// (the `FitConfig` default, which the CLI and Python front-ends use) does not
+/// run the Tier-0 diagnostic: the returned fit, its corrected covariance and its
+/// intervals do not depend on it, so it records that it was not requested.
+#[test]
+fn default_formula_fit_does_not_run_the_tier0_diagnostic() {
+    init_parallelism();
+    let (x, y) = build_data(938_003);
+    let headers = ["x", "y"].into_iter().map(String::from).collect();
+    let rows: Vec<StringRecord> = (0..N)
+        .map(|i| StringRecord::from(vec![x[[i, 0]].to_string(), y[i].to_string()]))
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode dataset");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let FitResult::Standard(fit) = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam fit")
+    else {
+        panic!("expected a standard GAM fit");
+    };
+    assert!(
+        matches!(
+            fit.fit.artifacts.rho_posterior,
+            RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::InferenceNotRequested)
+        ),
+        "a default formula fit must not run the rho-posterior diagnostic, got {:?}",
+        fit.fit.artifacts.rho_posterior
+    );
 }

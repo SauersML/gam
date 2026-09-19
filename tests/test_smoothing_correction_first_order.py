@@ -6,9 +6,6 @@ outer Hessian on its identified subspace, is the published corrected
 covariance for any number of smoothing parameters. No sampling budget, no
 dimension gate and no cubature decides whether a fit gets it.
 
-The rho-posterior adequacy diagnostic (Tier-0 PSIS, dozens of refits) is not
-needed to build the returned fit, so an ordinary fit does not run it.
-
 A small repeated-data study pins the coverage the correction exists for:
 95% intervals for the mean and for partial dependence must cover at their
 nominal rate for Gaussian, Poisson and binomial responses.
@@ -81,17 +78,6 @@ def test_six_smooth_glm_publishes_the_first_order_correction(family, tmp_path) -
     assert np.all(np.isfinite(se_corr))
     # J V_rho J^T is a Gram: the correction only adds variance.
     assert np.all(se_corr >= se_cond * (1.0 - 1e-9))
-
-
-def test_default_fit_does_not_run_the_rho_posterior_diagnostic(tmp_path) -> None:
-    rng = np.random.default_rng(938)
-    x = rng.uniform(0.0, 1.0, 300)
-    y = np.sin(TWO_PI * x) + rng.normal(0.0, 0.3, x.size)
-    model = gamfit.fit({"x": x, "y": y}, "y ~ s(x)", family="gaussian")
-    fit_result = _saved_payload(model, tmp_path)
-    assert fit_result["artifacts"]["rho_posterior"] == {
-        "NotComputed": "InferenceNotRequested"
-    }
 
 
 # ---------------------------------------------------------------------------
