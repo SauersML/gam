@@ -103,7 +103,15 @@ def shape_predict_response(
         return competing_risks_prediction_from_ffi_payload(raw)
 
     columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
-    columns = json.loads(rust_module().ordered_prediction_columns(columns_json))
+    # Rust ships non-finite values as the strings "Infinity" / "-Infinity" /
+    # "NaN" (`finite_safe_json`); `float` decodes those tokens exactly, so every
+    # column below is a list of floats whatever its entries' finiteness.
+    columns = {
+        name: [float(value) for value in values]
+        for name, values in json.loads(
+            rust_module().ordered_prediction_columns(columns_json)
+        ).items()
+    }
     point_shape = str(parsed["point_shape"])
     point_column = str(parsed["point_column"])
 

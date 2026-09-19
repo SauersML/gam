@@ -143,6 +143,12 @@ struct SchemaCheckPayload {
 
 #[derive(Serialize)]
 struct PredictionPayload {
+    /// Non-finite-safe (see `finite_safe_json`): a log-link posterior mean
+    /// `exp(η + se²/2)` whose exponent leaves the f64 range is exactly `+∞`,
+    /// and plain `serde_json` would ship it as `null`, which the Python
+    /// shaper's `float(value)` then rejects with a `TypeError` instead of
+    /// returning the honest `inf`.
+    #[serde(with = "crate::finite_safe_json::map")]
     columns: BTreeMap<String, Vec<f64>>,
     /// Predictive-class discriminator (e.g. "standard", "transformation-normal",
     /// "bernoulli marginal-slope"). The Python `shape_predict_response` dispatcher
@@ -6281,6 +6287,32 @@ mod prediction_payload_tests {
         assert!(
             value.get("point_covariance_note").is_none(),
             "a point on the fit's own covariance carries no note"
+        );
+    }
+
+    /// A log-link posterior mean whose exponent overflows is exactly `+∞`; the
+    /// payload must carry it as a decodable token, never as `null`.
+    #[test]
+    fn prediction_payload_carries_non_finite_posterior_mean_as_a_token() {
+        let payload = PredictionPayload {
+            columns: BTreeMap::from([(
+                "posterior_mean".to_string(),
+                vec![1.5, f64::INFINITY, f64::NAN],
+            )]),
+            model_class: "standard".to_string(),
+            point_column: "posterior_mean",
+            point_shape: "estimand_explicit",
+            point_columns: None,
+            family: "log".to_string(),
+            interval_method: None,
+            covariance_source: None,
+            point_covariance_source: None,
+            point_covariance_note: None,
+        };
+        let value = serde_json::to_value(payload).expect("serialize prediction payload");
+        assert_eq!(
+            value["columns"]["posterior_mean"],
+            serde_json::json!([1.5, "Infinity", "NaN"])
         );
     }
 
