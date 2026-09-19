@@ -37,14 +37,14 @@ def _binary_frame() -> pd.DataFrame:
     ],
 )
 def test_a_link_argument_that_disagrees_with_the_formula_is_refused(formula, link):
-    with pytest.raises(gamfit.errors.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.FormulaError) as excinfo:
         gamfit.fit(_binary_frame(), formula, family="binomial", link=link)
     message = str(excinfo.value)
     assert "link(type=" in message and f'link="{link}"' in message, message
 
 
 def test_a_disagreeing_link_argument_is_refused_on_the_location_scale_path():
-    with pytest.raises(gamfit.errors.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.FormulaError) as excinfo:
         gamfit.fit(
             _binary_frame(),
             "y ~ x + link(type=probit)",

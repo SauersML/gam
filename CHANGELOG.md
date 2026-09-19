@@ -1,5 +1,26 @@
 ## Unreleased
 
+- **One exception hierarchy, chosen by the engine's error category.** Every engine
+  error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
+  internal). Python raises a class under that category's base, and the CLI exits
+  with that category's code (2, 3, 4, 5, 70), so the two classify a failure the same
+  way without reading its message. The bases are `GamfitError(Exception)`,
+  `FormulaError(GamfitError, ValueError)`, `DataError(GamfitError, ValueError)`,
+  `ConvergenceError(GamfitError, RuntimeError)`, `NotFittedError` (the bases of
+  scikit-learn's `NotFittedError`) and `InternalError(GamfitError, RuntimeError)`.
+  Every other class sits under exactly one of them, and all live in `gamfit.errors`.
+  Classes that no engine path raised are removed. `gamfit.sklearn` estimators raise
+  `gamfit.errors.NotFittedError` before `fit`, a subclass that is also scikit-learn's
+  `NotFittedError`. **Migration:** `GamError` is now
+  `GamfitError` and no longer a `ValueError`. Code that caught `ValueError` for a
+  solver failure should catch `ConvergenceError`, and code that caught `FitError`
+  should catch `ConvergenceError` or the category it means.
+- **`s()` / `te()` / `linear()` on a string or categorical column is a formula error.**
+  These fits used to succeed silently on the column's level codes, and a stray string in
+  a numeric column raised pyarrow's `ArrowInvalid`. Formula resolution in Rust now refuses it,
+  for the CLI and Python alike. The message names the column and its first
+  non-numeric value and row, and lists the terms that accept the column:
+  `factor(g)` / `group(g)`, `s(x, by=g)`, `fs(x, g)` and `s(g, bs="re")`.
 - **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
   open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
   coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
@@ -54,7 +75,7 @@
   `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
   `import gamfit` no longer loads the SAE, topology-selection or plotting code.
   **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
-  `gamfit.GamError` → `gamfit.errors.GamError`, `gamfit.Diagnostics` →
+  `gamfit.FormulaError` → `gamfit.errors.FormulaError`, `gamfit.Diagnostics` →
   `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
   `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
   `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed

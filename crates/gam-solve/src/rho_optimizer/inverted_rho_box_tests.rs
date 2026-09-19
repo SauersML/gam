@@ -3,7 +3,7 @@
 //!
 //! That test already pins that an inverted box `[-10.0, -11.855…]` reaching
 //! the runner is a typed `EstimationError::InvalidInput` rather than a
-//! `f64::clamp` `min > max` panic escaping as an opaque `GamError`. The TYPE of
+//! `f64::clamp` `min > max` panic escaping as an opaque `GamfitError`. The TYPE of
 //! the refusal is not re-asserted here.
 //!
 //! What is left uncovered, and is what these four add:
