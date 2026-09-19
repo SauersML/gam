@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import math
-import tempfile
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -377,16 +375,6 @@ def _warm_start_model_bytes(warm_start_from: Any) -> bytes | None:
             f"{type(warm_start_from).__name__}"
         )
     return bytes(warm_start_from._model_bytes)
-
-
-@contextlib.contextmanager
-def _warm_start_scratch(model_bytes: bytes | None) -> Any:
-    """A scratch directory for the warm start's one-entry cache, removed after the fit."""
-    if model_bytes is None:
-        yield None
-        return
-    with tempfile.TemporaryDirectory(prefix="gamfit-warm-start-") as scratch:
-        yield scratch
 
 
 def _jsonable_array(value: Any) -> Any:
@@ -905,16 +893,19 @@ def fit(
         the response transformation. Corresponds to the CLI flexible-link path
         (``FitConfig.flexible_link``).
     warm_start_from:
-        A fitted :class:`Model` of the same formula to resume from. The outer
-        search starts at that model's certified point (its smoothing parameters
-        and coefficient mode) and certifies as usual. If the point is still
-        stationary on this data, the search accepts it with no outer
-        iterations. Otherwise the search runs from it. It is a warm start,
-        never a shortcut past the certificate. Custom-family fits
-        (marginal-slope, survival, transformation-normal, location-scale)
-        accept it. A model of another formula, of other terms or design
-        width, or from a route that records no point is refused by name, as is
-        a fit that searches length-scale or other auxiliary coordinates.
+        A fitted :class:`Model` of the same formula to resume from. The model
+        records its certified outer point (smoothing parameters, any
+        length-scale and auxiliary coordinates, and the coefficient mode), the
+        criterion value certified there, and a fingerprint of the inputs. On
+        the same formula, data and settings, the search that certified the
+        point accepts it with no outer iterations where it is still certified,
+        and every other search of the fit runs as it runs cold. On other data
+        or settings the point cannot change which optimum is reported: a
+        search that takes the best of several independent seeds adds it to the
+        seed set, and a search that certifies its first certifiable seed does
+        not use it. The model notes say which. A model of another formula, or
+        one recording no point (fitted before this version: refit it), is
+        refused by name.
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
@@ -1157,18 +1148,11 @@ def fit(
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     try:
-        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
-            model_bytes = bytes(
-                rust_module().fit_table(
-                    headers,
-                    rows,
-                    formula,
-                    json.dumps(payload),
-                    fisher_w,
-                    warm_start_bytes,
-                    warm_start_dir,
-                )
+        model_bytes = bytes(
+            rust_module().fit_table(
+                headers, rows, formula, json.dumps(payload), fisher_w, warm_start_bytes
             )
+        )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
@@ -1286,18 +1270,11 @@ def fit_array(
     )
     warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     try:
-        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
-            model_bytes = bytes(
-                rust_module().fit_array(
-                    X_arr,
-                    Y_arr,
-                    formula,
-                    json.dumps(payload),
-                    None,
-                    warm_start_bytes,
-                    warm_start_dir,
-                )
+        model_bytes = bytes(
+            rust_module().fit_array(
+                X_arr, Y_arr, formula, json.dumps(payload), None, warm_start_bytes
             )
+        )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
