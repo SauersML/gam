@@ -2401,7 +2401,7 @@ fn fit_expectile_laws(
 ///
 ///   `V = H⁻¹ (c·Xᵀ diag(w²r²) X + φ̂·S_λ) H⁻¹`,   `c = n₊ / (n₊ − edf)`,
 ///
-/// the object mgcv's `vcov(sandwich = TRUE)` publishes for a penalized fit.
+/// the Bayesian ("penalty as prior") form of the Huber–White sandwich.
 /// Three limits pin every constant:
 ///
 /// * `S_λ → 0` recovers the Newey–Powell `A⁻¹BA⁻¹` exactly (up to `c`).
