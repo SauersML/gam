@@ -24,8 +24,9 @@
 //!
 //! That rail was not the optimum. With the ρ-guard barrier retired (#2902) and
 //! the outer box being the resolvability domain of each penalty (#2812), every
-//! fixture certifies at an interior stationary point: `railed=[]`, ρ₄ = 5.82,
-//! 7.23 and 1.58 for Poisson reps 163 and 92 and binomial rep 0, with a
+//! fixture certifies at an interior stationary point: `railed=[]`, with the
+//! certificate's coordinate 4 (the one the wheel railed) at ρ = 5.82, 7.23 and
+//! 1.58 for Poisson reps 163 and 92 and binomial rep 0, and a
 //! positive-semidefinite analytic outer Hessian. A fit that does rail is
 //! certified on its face by the exact λ→∞ limit model
 //! (`gam_solve::reml::rail_face_limit`), not at the box edge.
