@@ -5,6 +5,7 @@ use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb,
     fast_xt_diag_x, fast_xt_diag_y, rrqr_with_permutation,
 };
+use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
 use gam_terms::construction::CanonicalPenalty;
 use gam_terms::smooth::BlockwisePenalty;
@@ -1005,22 +1006,6 @@ struct ObjectiveEval {
     cost_roundoff: f64,
 }
 
-/// Unit roundoff `u = ½·eps`, the per-operation relative error bound every
-/// forward-error accumulation in this file is denominated in.
-const UNIT_ROUNDOFF: f64 = 0.5 * f64::EPSILON;
-
-/// Standard `gamma_m = m·u / (1 − m·u)` forward-error growth factor for a
-/// deterministic chain of `m` rounded operations. Returns infinity once `m·u`
-/// reaches 1, where no finite bound exists.
-fn roundoff_growth(operation_count: usize) -> f64 {
-    let accumulated = operation_count as f64 * UNIT_ROUNDOFF;
-    if accumulated < 1.0 {
-        accumulated / (1.0 - accumulated)
-    } else {
-        f64::INFINITY
-    }
-}
-
 /// A single Gaussian closed-form REML objective term, carrying its analytic
 /// VALUE together with its analytic ρ-GRADIENT and ρ-HESSIAN.
 ///
@@ -1066,7 +1051,7 @@ fn gaussian_reml_observation_measure(weights: ArrayView1<'_, f64>, n_outputs: us
         grad: 0.0,
         hess: 0.0,
         roundoff: scale.abs()
-            * roundoff_growth(active.saturating_mul(2).saturating_add(2))
+            * accumulation_growth(active.saturating_mul(2).saturating_add(2))
             * magnitude,
     }
 }
@@ -1201,7 +1186,7 @@ fn gaussian_reml_logdet_term(
         value,
         grad: 0.5 * n_outputs * (trace_h - cache.penalty_rank as f64),
         hess: 0.5 * n_outputs * trace_h_deriv,
-        roundoff: 0.5 * n_outputs * roundoff_growth(operation_count) * logdet_magnitude,
+        roundoff: 0.5 * n_outputs * accumulation_growth(operation_count) * logdet_magnitude,
     };
     (term, edf)
 }
@@ -1311,7 +1296,7 @@ fn gaussian_reml_dispersion_term(
         .saturating_mul(3)
         .saturating_add(3);
     let dp_magnitude = ywy[output].abs() + parts.total_c2.abs() + parts.penalized_residual.abs();
-    let dp_roundoff = roundoff_growth(operation_count) * dp_magnitude;
+    let dp_roundoff = accumulation_growth(operation_count) * dp_magnitude;
     // `d/d(dp) of ½ν·log(dp) = ½ν/dp`: the logarithm converts `dp`'s RELATIVE
     // error into the value's absolute error, which is why a deviance sitting at
     // its own cancellation floor leaves this term with no significant digits.
@@ -1320,7 +1305,7 @@ fn gaussian_reml_dispersion_term(
         value,
         grad: 0.5 * nu * parts.dp_grad / dp,
         hess: 0.5 * nu * (parts.dp_hess / dp - (parts.dp_grad * parts.dp_grad) / (dp * dp)),
-        roundoff: 0.5 * nu * (dp_roundoff / dp) + roundoff_growth(4) * value.abs(),
+        roundoff: 0.5 * nu * (dp_roundoff / dp) + accumulation_growth(4) * value.abs(),
     }
 }
 
@@ -1947,16 +1932,13 @@ fn validate_weighted_block_orthogonality(
     designs: &[Array2<f64>],
     weight: ArrayView1<'_, f64>,
 ) -> Result<(), EstimationError> {
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let operation_count = weight.len().saturating_mul(4);
-    let accumulated = operation_count as f64 * unit_roundoff;
-    if accumulated >= 1.0 {
+    let gamma = accumulation_growth(weight.len().saturating_mul(4));
+    if !gamma.is_finite() {
         crate::bail_invalid_estim!(
             "block-orthogonality verification has no finite floating-point error bound for {} rows",
             weight.len()
         );
     }
-    let gamma = accumulated / (1.0 - accumulated);
     for left_block in 0..designs.len() {
         for right_block in (left_block + 1)..designs.len() {
             let left = &designs[left_block];
@@ -2636,19 +2618,18 @@ pub fn gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
             pooled_response_energy += weight[row] * value * value;
         }
     }
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let operation_count = n
-        .saturating_mul(d)
-        .saturating_mul(3)
-        .saturating_add(p.saturating_mul(2))
-        .saturating_add(1);
-    let accumulated = operation_count as f64 * unit_roundoff;
-    if accumulated >= 1.0 {
+    let gamma = accumulation_growth(
+        n.saturating_mul(d)
+            .saturating_mul(3)
+            .saturating_add(p.saturating_mul(2))
+            .saturating_add(1),
+    );
+    if !gamma.is_finite() {
         crate::bail_invalid_estim!(
             "shared-dispersion REML penalty gradient has no finite floating-point error bound for {n} rows, {d} responses and {p} coefficients"
         );
     }
-    let deviance_roundoff = (accumulated / (1.0 - accumulated)) * pooled_response_energy;
+    let deviance_roundoff = gamma * pooled_response_energy;
     if !(pooled_deviance.is_finite()
         && deviance_roundoff.is_finite()
         && pooled_deviance > deviance_roundoff)
@@ -7134,7 +7115,7 @@ mod tests {
                 .map(|k| (coordinates[[k, 0]] / sigma[k]).powi(2))
                 .sum::<f64>()
                 .sqrt();
-            let gamma = roundoff_growth(n * p);
+            let gamma = accumulation_growth(n * p);
             let residual_scale = svd_residual.sqrt();
             let along = gamma * (design_frobenius * beta_norm + y_norm);
             let first_order = 2.0 * along * residual_scale;
@@ -9249,7 +9230,7 @@ mod perfect_fit_refusal_tests {
             prepared.ywy[0] - semi_normal.iter().map(|value| value * value).sum::<f64>();
         let rotated_residual = prepared.unpenalized_residual[0];
 
-        let gamma = roundoff_growth(n * p);
+        let gamma = accumulation_growth(n * p);
         let residual_scale = svd_residual.sqrt();
         let along = gamma * sigma_max * (p as f64).sqrt();
         let first_order = 2.0 * along * residual_scale;
