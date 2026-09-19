@@ -9,21 +9,33 @@ One row per (cell, library surface). For the null draws it gives the size at
 p-values from Uniform(0, 1), and the fraction of reps that produced a usable
 p-value at all. For the matched-alternative draws it gives the power at 0.05.
 
-A p-value is valid when ``P(p <= a) <= a`` under its null. The verdict tests
-exactly that, one-sidedly, at each level: over ``R`` null reps a valid
-p-value rejects at most ``Binomial(R, a)`` times, so a row is
-**ANTI-CONSERVATIVE** at ``a`` when its rejection count exceeds that law's
-upper ``1 - FALSE_ALARM / m`` quantile, ``m`` being the number of
-(row, level) checks in the report. A rep that produced no p-value (a fit that
-raised, a missing row, a chunk the safety net killed) counts as a rejection in
-that check: it may have been one, and a size taken over only the reps that
-succeeded is biased whenever failing correlates with the data being extreme.
-A row passes only if it passes in that worst case. The tolerance is the sampling law of the
-count itself (``a + ~z * MCSE``), not a hand-picked band, and the Bonferroni
+A p-value is calibrated when it is Uniform(0, 1) under its null:
+``P(p <= a) = a`` at every ``a``. A conservative p-value (size below nominal,
+a point mass near 1) fails that exactly as an anti-conservative one does, so
+every check is two-sided. Over ``R`` null reps a calibrated p-value rejects
+``Binomial(R, a)`` times at level ``a``, so a row is
+
+- **ANTI-CONSERVATIVE** at ``a`` when its rejection count exceeds that law's
+  upper ``1 - FALSE_ALARM / m`` quantile;
+- **CONSERVATIVE** at ``a`` when its rejection count falls below the law's
+  ``FALSE_ALARM / m`` quantile;
+- **NOT UNIFORM** when the Kolmogorov-Smirnov test of its null p-values
+  against Uniform(0, 1), over the whole range, has p-value at or below
+  ``FALSE_ALARM / m``.
+
+``m`` is the number of checks in the report: two per (row, level) and one KS
+per row. A rep that produced no p-value (a fit that raised, a missing row, a
+rep the safety net killed) may have been anything, and a size taken over only
+the reps that succeeded is biased whenever failing correlates with the data
+being extreme. So each check takes the completion of those reps that is worst
+for it: a rejection in the upper check, a non-rejection in the lower check,
+and for KS whichever of p = 0 or p = 1 moves the empirical CDF furthest from
+the uniform one (the supremum distance is maximized by putting every missing
+point at one end). A row passes only if it passes every check in its worst
+case. The tolerances are the sampling laws of the statistics themselves
+(``a +/- ~z * MCSE`` for a size), not hand-picked bands, and the Bonferroni
 split keeps the chance that a calibrated harness flags anything at all at or
-below ``FALSE_ALARM`` however large the grid. A conservative p-value
-(size below nominal, or a point mass at 1) is valid and never flagged; it
-shows up in the KS column and in the power.
+below ``FALSE_ALARM`` however large the grid.
 
 A row whose usable count is below its rep count lists the reasons in
 "Unusable reps". A missing p-value is a defect of that surface, never a skip.
@@ -74,6 +86,7 @@ class Row:
     ks_p: float | None
     power: float | None
     power_usable: int
+    null_p: tuple[float, ...] = ()
 
     def size(self, i: int) -> float | None:
         return self.rejections[i] / self.usable if self.usable else None
@@ -84,8 +97,28 @@ class Row:
 
 
 def reject_bound(reps: int, level: float, checks: int) -> int:
-    """Largest rejection count a valid p-value reaches except with prob FALSE_ALARM / checks."""
+    """Largest rejection count a calibrated p-value reaches except with prob FALSE_ALARM / checks."""
     return int(stats.binom.ppf(1.0 - FALSE_ALARM / checks, reps, level))
+
+
+def reject_floor(reps: int, level: float, checks: int) -> int:
+    """Smallest rejection count a calibrated p-value stays at or above except with prob FALSE_ALARM / checks."""
+    return int(stats.binom.ppf(FALSE_ALARM / checks, reps, level))
+
+
+def worst_ks_p(r: Row) -> float:
+    """KS p-value against Uniform(0, 1) with the unusable reps placed worst for it."""
+    arr = np.asarray(r.null_p, dtype=float)
+    missing = r.reps - r.usable
+    return min(
+        float(stats.kstest(np.concatenate([arr, np.full(missing, end)]), "uniform").pvalue)
+        for end in (0.0, 1.0)
+    )
+
+
+def n_checks(table: list[Row]) -> int:
+    """Checks per report: a lower and an upper size check per level, and one KS, per usable row."""
+    return sum(1 for r in table if r.usable) * (2 * len(LEVELS) + 1)
 
 
 def _cell_sort(cell: str) -> tuple[Any, ...]:
@@ -137,26 +170,36 @@ def rows(records: Iterable[Record]) -> list[Row]:
                     float(np.mean(np.asarray(alt_p) <= POWER_LEVEL)) if alt_p else None
                 ),
                 power_usable=len(alt_p),
+                null_p=tuple(float(p) for p in arr),
             )
         )
     return out
 
 
-def anti_conservative(table: list[Row]) -> list[tuple[Row, float]]:
-    """Every (row, level) whose worst-case rejection count no valid p-value reaches.
+ANTI = "ANTI-CONSERVATIVE"
+CONSERVATIVE = "CONSERVATIVE"
+NOT_UNIFORM = "NOT UNIFORM"
 
-    The worst case counts every unusable rep as a rejection (see the module
-    docstring).
+
+def miscalibrated(table: list[Row]) -> list[tuple[Row, str, float | None]]:
+    """Every failed check as ``(row, kind, level)``; ``level`` is None for KS.
+
+    Each check uses the completion of the unusable reps that is worst for it
+    (see the module docstring).
     """
-    checks = sum(1 for r in table if r.usable) * len(LEVELS)
-    flagged = []
+    checks = n_checks(table)
+    flagged: list[tuple[Row, str, float | None]] = []
     for r in table:
         if not r.usable:
             continue
         unusable = r.reps - r.usable
         for i, a in enumerate(LEVELS):
             if r.rejections[i] + unusable > reject_bound(r.reps, a, checks):
-                flagged.append((r, a))
+                flagged.append((r, ANTI, a))
+            if r.rejections[i] < reject_floor(r.reps, a, checks):
+                flagged.append((r, CONSERVATIVE, a))
+        if worst_ks_p(r) <= FALSE_ALARM / checks:
+            flagged.append((r, NOT_UNIFORM, None))
     return flagged
 
 
@@ -173,23 +216,24 @@ def _table(header: list[str], body: list[list[str]]) -> list[str]:
     return lines
 
 
+def _flag(kind: str, level: float | None) -> str:
+    return f"**{kind}**" + ("" if level is None else f" at {level:g}")
+
+
 def calibration_table(records: list[Record]) -> str:
     """The generated block of docs/pvalues.md, also the core of report.md."""
     table = rows(records)
-    flagged = anti_conservative(table)
-    bad = {(r.cell, r.surface): [] for r, _ in flagged}
-    for r, a in flagged:
-        bad[(r.cell, r.surface)].append(a)
+    bad: dict[tuple[str, str], list[str]] = {}
+    for r, kind, a in miscalibrated(table):
+        bad.setdefault((r.cell, r.surface), []).append(_flag(kind, a))
     body = []
     for r in table:
         if not r.usable:
             verdict = "**NO P-VALUE**"
         elif (r.cell, r.surface) in bad:
-            verdict = "**ANTI-CONSERVATIVE** at " + ", ".join(
-                f"{a:g}" for a in bad[(r.cell, r.surface)]
-            )
+            verdict = "; ".join(bad[(r.cell, r.surface)])
         else:
-            verdict = "valid"
+            verdict = "calibrated"
         if r.usable < r.reps:
             verdict += f"; {r.reps - r.usable} unusable"
         body.append(
@@ -205,9 +249,10 @@ def calibration_table(records: list[Record]) -> str:
                 verdict,
             ]
         )
-    checks = sum(1 for r in table if r.usable) * len(LEVELS)
+    checks = n_checks(table)
     lines = [
-        f"{len(table)} rows, {checks} size checks, family-wise false-alarm rate "
+        f"{len(table)} rows, {checks} two-sided checks (size at each level, and KS), "
+        "family-wise false-alarm rate "
         f"{FALSE_ALARM:g} (Bonferroni: each check at {FALSE_ALARM / max(checks, 1):.2g}).",
         "",
         *_table(
@@ -267,23 +312,34 @@ def render(records: list[Record], meta: dict[str, Any] | None = None) -> str:
         "## Calibration",
         "",
         calibration_table(records),
-        "## Anti-conservative",
+        "## Miscalibrated",
         "",
     ]
     table = rows(records)
-    checks = sum(1 for x in table if x.usable) * len(LEVELS)
-    flagged = anti_conservative(table)
-    if flagged:
-        for r, a in flagged:
-            i = LEVELS.index(a)
+    checks = n_checks(table)
+    flagged = miscalibrated(table)
+    for r, kind, a in flagged:
+        holes = r.reps - r.usable
+        if a is None:
             lines.append(
-                f"- `{r.cell}` {r.surface}: {r.rejections[i]} rejections at {a:g} "
-                f"over {r.usable} usable reps (size {r.size(i):.3f}) plus "
-                f"{r.reps - r.usable} unusable, of {r.reps}; a valid p-value "
-                f"exceeds {reject_bound(r.reps, a, checks)} only with the stated "
-                "false-alarm probability"
+                f"- `{r.cell}` {r.surface}: {kind}: KS D {r.ks_d:.3f} over {r.usable} "
+                f"usable reps, worst-case KS p {worst_ks_p(r):.2g} with {holes} "
+                f"unusable placed at 0 or 1; the check fires at {FALSE_ALARM / checks:.2g}"
             )
-    else:
+            continue
+        i = LEVELS.index(a)
+        if kind == ANTI:
+            bound = f"a calibrated p-value exceeds {reject_bound(r.reps, a, checks)}"
+            count = f"{r.rejections[i]} rejections plus {holes} unusable"
+        else:
+            bound = f"a calibrated p-value falls below {reject_floor(r.reps, a, checks)}"
+            count = f"{r.rejections[i]} rejections (unusable counted as none)"
+        lines.append(
+            f"- `{r.cell}` {r.surface}: {kind} at {a:g}: {count} of {r.reps} "
+            f"(size {r.size(i):.3f} over {r.usable} usable); {bound} only with "
+            "the stated false-alarm probability"
+        )
+    if not flagged:
         lines.append("None.")
     lines += ["", "## Unusable reps", ""]
     lines += unusable(records) or ["None."]

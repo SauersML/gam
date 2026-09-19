@@ -5,10 +5,12 @@ hypothesis against a different reference distribution. This page says what
 each one is, and shows how well each holds its nominal size in a seeded
 simulation grid (`bench/pvalue_calibration`).
 
-A p-value is **valid** when, under its null hypothesis, `P(p ≤ a) ≤ a` at
-every level `a`. A conservative p-value (size below nominal) is valid, but it
-costs power. An anti-conservative one (size above nominal) is not valid: it
-rejects a true null more often than its level promises.
+A p-value is **calibrated** when it is Uniform(0, 1) under its null
+hypothesis: `P(p ≤ a) = a` at every level `a`. An anti-conservative p-value
+(size above nominal) rejects a true null more often than its level promises.
+A conservative one (size below nominal, or a point mass at 1) rejects it less
+often, which hides real effects and misstates the evidence. Both are
+miscalibrated.
 
 ## What gamfit reports
 
@@ -140,12 +142,15 @@ How to read the table:
   uniform.
 - **power@0.05** is the rejection rate under the matched alternative.
 - **verdict** is **ANTI-CONSERVATIVE** at `a` when the rejection count
-  exceeds what a valid p-value reaches except with probability
-  `10⁻³ / (number of checks)`. That bound is the Binomial(R, a) quantile, not
-  a hand-picked tolerance. A rep that produced no p-value counts as a
-  rejection in this check, so a row passes only if it would pass whatever
-  those reps would have reported. Conservative rows are valid and are never
-  flagged.
+  exceeds what a calibrated p-value reaches except with probability
+  `10⁻³ / (number of checks)`, and **CONSERVATIVE** at `a` when it falls
+  below what a calibrated p-value stays above with the same probability. Both
+  bounds are Binomial(R, a) quantiles, not hand-picked tolerances. It is
+  **NOT UNIFORM** when the KS test of the null p-values against Uniform(0, 1)
+  rejects at the same per-check level. A rep that produced no p-value takes
+  the value worst for each check, so a row passes only if it would pass
+  whatever those reps would have reported. A row passes as **calibrated** only
+  when every check passes.
 
 The table below is generated from the committed baseline
 `bench/pvalue_calibration/baseline/quick/`; do not edit it by hand.

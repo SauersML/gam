@@ -2,16 +2,18 @@
 
 ``test_ci_plan_is_calibrated`` runs the real ``ci`` plan end to end (a few
 cells, 200 fixed seeds each, policed worker subprocesses) and fails when any
-gamfit p-value surface rejects its true null more often than a valid p-value
-can. The tolerance is not hand-picked: it is the upper quantile of the
-rejection count's own sampling law, ``Binomial(R, a)``, at family-wise
-false-alarm rate ``report.FALSE_ALARM`` (see ``report.reject_bound``). Every
-rep that produced no p-value counts as a rejection, so a failing fit can only
-make the check stricter.
+gamfit p-value surface is not Uniform(0, 1) under its true null: size above
+or below nominal at any level, or a KS distance from uniform that a calibrated
+p-value does not reach. The tolerances are not hand-picked: they are the
+quantiles of each statistic's own sampling law (``Binomial(R, a)`` for a
+rejection count, the KS law for the distance) at family-wise false-alarm rate
+``report.FALSE_ALARM``. Every rep that produced no p-value takes the value
+worst for each check, so a failing fit can only make the checks stricter.
 
 The other tests pin the harness's own rules on hand-built records, so a report
-that stopped flagging an anti-conservative row, or started dropping reps that
-produced no p-value, fails here rather than quietly flattering gamfit.
+that stopped flagging an anti-conservative or a conservative row, or started
+dropping reps that produced no p-value, fails here rather than quietly
+flattering gamfit.
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ def test_ci_plan_is_calibrated(tmp_path: Path) -> None:
     plan = PLANS["ci"]
     assert len(records) == len(plan.cells) * plan.reps
     # A rep that produced no p-value (a fit that raised, a missing row) is not
-    # excused here: anti_conservative counts it as a rejection. What must hold
+    # excused here: miscalibrated gives it the worst value. What must hold
     # is that every fit that did produce a p-value reported it where expected.
     for rec in records:
         if rec["status"] != "ok":
@@ -61,7 +63,10 @@ def test_ci_plan_is_calibrated(tmp_path: Path) -> None:
                     assert name in rec["p"][hyp], (rec["key"], rec["seed"], hyp, name)
     table = report.rows(records)
     assert table and all(r.reps == plan.reps for r in table)
-    flagged = [(r.cell, r.surface, a, r.rejections) for r, a in report.anti_conservative(table)]
+    flagged = [
+        (r.cell, r.surface, kind, a, r.rejections, r.ks_d)
+        for r, kind, a in report.miscalibrated(table)
+    ]
     assert not flagged, flagged
     # Every row has a power under its matched alternative.
     assert all(r.power is not None for r in table)
@@ -167,26 +172,55 @@ def _records(cell: str, null_p: list[float | None], surface: str = "gamfit.wald"
     return out
 
 
-def test_uniform_p_values_are_valid() -> None:
-    p = list((np.arange(500) + 0.5) / 500)
-    table = report.rows(_records("gaussian/n=200/smooth", p))
-    assert report.anti_conservative(table) == []
-    assert "| valid |" in report.calibration_table(_records("gaussian/n=200/smooth", p))
+GRID = list((np.arange(500) + 0.5) / 500)
+
+
+def _flags(p: list[float | None]) -> set[tuple[str, float | None]]:
+    return {(kind, a) for _, kind, a in report.miscalibrated(report.rows(_records("c/n=1/x", p)))}
+
+
+def test_uniform_p_values_are_calibrated() -> None:
+    assert _flags(GRID) == set()
+    assert "| calibrated |" in report.calibration_table(_records("gaussian/n=200/smooth", GRID))
 
 
 def test_anti_conservative_p_values_are_flagged() -> None:
     # Size 0.10 at the 0.05 level over 500 reps is ~5 MCSE above nominal.
     p = [0.02] * 50 + [0.5] * 450
     recs = _records("gaussian/n=200/smooth", p)
-    flagged = report.anti_conservative(report.rows(recs))
-    assert {a for _, a in flagged} == {0.05}
+    assert {a for kind, a in _flags(p) if kind == report.ANTI} == {0.05}
     assert "**ANTI-CONSERVATIVE** at 0.05" in report.calibration_table(recs)
 
 
-def test_conservative_p_values_are_never_flagged() -> None:
-    # A point mass at 1 (a boundary-shrunk term) is conservative, hence valid.
+def test_point_mass_at_one_is_flagged() -> None:
+    # A point mass at 1 (a boundary-shrunk term) never rejects: it is as
+    # miscalibrated as a test that rejects too often. At 0.01 over 500 reps a
+    # calibrated p-value rejects zero times with probability 0.0066, so the
+    # lower size check cannot fire there; KS covers that level.
     recs = _records("gaussian/n=200/smooth", [1.0] * 500)
-    assert report.anti_conservative(report.rows(recs)) == []
+    assert _flags([1.0] * 500) == {
+        (report.CONSERVATIVE, 0.10),
+        (report.CONSERVATIVE, 0.05),
+        (report.NOT_UNIFORM, None),
+    }
+    assert "**CONSERVATIVE** at 0.1" in report.calibration_table(recs)
+    assert "**NOT UNIFORM**" in report.render(recs, {})
+
+
+def test_size_below_nominal_is_flagged_conservative() -> None:
+    # P(p <= a) = a^2: size 0.01 at 0.10 and 0.0025 at 0.05.
+    p = [u**0.5 for u in GRID]
+    assert {(k, a) for k, a in _flags(p) if k == report.CONSERVATIVE} == {
+        (report.CONSERVATIVE, 0.10),
+        (report.CONSERVATIVE, 0.05),
+    }
+
+
+def test_non_uniform_above_the_levels_is_flagged() -> None:
+    # Exact size at 0.10, 0.05 and 0.01, but 90% of the mass sits at 0.55:
+    # only the KS check over the whole range can see it.
+    p = [0.1 * (i + 0.5) / 50 for i in range(50)] + [0.55] * 450
+    assert _flags(p) == {(report.NOT_UNIFORM, None)}
 
 
 def test_missing_p_value_is_unusable_not_dropped() -> None:
@@ -201,25 +235,44 @@ def test_missing_p_value_is_unusable_not_dropped() -> None:
 
 
 def test_unusable_reps_count_as_rejections() -> None:
-    # 500 reps at p = 0.5 never reject. Replacing enough of them with reps that
-    # produced no p-value must flag the row: those reps may have been the
-    # rejections, so dropping them could hide an anti-conservative test.
+    # Replacing the top p-values of a calibrated grid with reps that produced
+    # no p-value must flag the row: those reps may have been rejections, so
+    # dropping them could hide an anti-conservative test.
     reps, a = 500, 0.01
-    extra = report.reject_bound(reps, a, len(report.LEVELS)) + 1
-    clean = _records("gaussian/n=200/smooth", [0.5] * reps)
-    assert report.anti_conservative(report.rows(clean)) == []
-    holed = _records("gaussian/n=200/smooth", [0.5] * (reps - extra) + [None] * extra)
-    flagged = report.anti_conservative(report.rows(holed))
-    assert 0.01 in {lvl for _, lvl in flagged}
-    assert "**ANTI-CONSERVATIVE** at 0.01" in report.calibration_table(holed)
+    table = report.rows(_records("c/n=1/x", GRID))
+    base = table[0].rejections[report.LEVELS.index(a)]
+    extra = report.reject_bound(reps, a, report.n_checks(table)) - base + 1
+    holed = GRID[: reps - extra] + [None] * extra
+    assert (report.ANTI, a) in _flags(holed)
+    assert "**ANTI-CONSERVATIVE** at 0.01" in report.calibration_table(
+        _records("gaussian/n=200/smooth", holed)
+    )
+
+
+def test_unusable_reps_take_the_worst_ks_completion() -> None:
+    # The KS check places every unusable rep at whichever end of (0, 1) moves
+    # the empirical CDF furthest from uniform, never drops them.
+    from scipy import stats
+
+    p = GRID[:450] + [None] * 50
+    (row,) = report.rows(_records("c/n=1/x", p))
+    usable = np.asarray(GRID[:450])
+    at_one = stats.kstest(np.concatenate([usable, np.ones(50)]), "uniform").pvalue
+    assert report.worst_ks_p(row) == min(
+        at_one, stats.kstest(np.concatenate([usable, np.zeros(50)]), "uniform").pvalue
+    )
+    assert report.worst_ks_p(row) < row.ks_p
 
 
 def test_tolerance_is_the_binomial_quantile() -> None:
-    # The bound tightens as reps grow, in MCSE units it stays put.
+    # The bounds tighten as reps grow, in MCSE units they stay put, and they
+    # sit on both sides of nominal.
     for reps in (200, 500, 2000):
-        bound = report.reject_bound(reps, 0.05, 1)
-        z = (bound / reps - 0.05) / np.sqrt(0.05 * 0.95 / reps)
-        assert 2.5 < z < 3.6, (reps, z)
+        mcse = np.sqrt(0.05 * 0.95 / reps)
+        z_hi = (report.reject_bound(reps, 0.05, 1) / reps - 0.05) / mcse
+        z_lo = (report.reject_floor(reps, 0.05, 1) / reps - 0.05) / mcse
+        assert 2.5 < z_hi < 3.6, (reps, z_hi)
+        assert -3.6 < z_lo < -2.5, (reps, z_lo)
 
 
 def test_pygam_has_no_surface_without_a_counterpart() -> None:

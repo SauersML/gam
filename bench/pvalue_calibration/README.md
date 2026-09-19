@@ -121,21 +121,33 @@ For each (cell, surface), the report gives:
 - the Kolmogorov–Smirnov distance of the null p-values from uniform;
 - power at 0.05 under the matched alternative.
 
-A row is **ANTI-CONSERVATIVE** at level `a` when its rejection count exceeds
-`reject_bound(R, a, m)`. That bound is the `1 − 10⁻³ / m` quantile of
-Binomial(R, a), where `m` is the number of (row, level) checks in the report.
-A valid p-value exceeds it with family-wise probability at most 10⁻³. The
-tolerance comes from the rejection count's own sampling law, so it is not
-hand-picked, and it scales with R.
+A p-value is calibrated when it is Uniform(0, 1) under its null. A
+conservative p-value fails that just as an anti-conservative one does, so
+every check is two-sided. With `m` the number of checks in the report (two
+size checks per level and one KS check, per row), a row is:
 
-A rep with no p-value counts as a rejection in this check: a fit that raised,
-a missing row, or a seed the safety net killed. Such a rep may have been a
-rejection, and a size taken only over the reps that succeeded is biased
+- **ANTI-CONSERVATIVE** at `a` when its rejection count exceeds
+  `reject_bound(R, a, m)`, the `1 − 10⁻³ / m` quantile of Binomial(R, a);
+- **CONSERVATIVE** at `a` when its rejection count falls below
+  `reject_floor(R, a, m)`, the `10⁻³ / m` quantile of the same law;
+- **NOT UNIFORM** when the KS test of its null p-values against Uniform(0, 1),
+  over the whole range, has p-value at or below `10⁻³ / m`. This catches
+  shapes the three levels miss, such as a point mass at 1.
+
+A calibrated p-value trips any check with family-wise probability at most
+10⁻³. The tolerances come from each statistic's own sampling law, so they
+are not hand-picked, and they scale with R. At R = 100 and `a` = 0.01 a
+calibrated p-value rejects zero times with probability 0.37, so the lower
+size check cannot fire there; the KS check covers that level.
+
+A rep with no p-value (a fit that raised, a missing row, or a seed the safety
+net killed) takes whichever value is worst for each check: a rejection in the
+upper size check, a non-rejection in the lower one, and for KS all such reps
+at 0 or all at 1, whichever gives the larger distance. Such a rep may have
+been anything, and a size taken only over the reps that succeeded is biased
 whenever failing correlates with extreme data. A row therefore passes only if
 it passes in that worst case, while its size columns are over the usable reps.
-
-The check is one-sided: conservative rows are valid and are never flagged. A
-row whose null reps all lack a p-value is **NO P-VALUE**.
+A row whose null reps all lack a p-value is **NO P-VALUE**.
 
 ## Safety net, not a budget
 
@@ -158,13 +170,14 @@ counts it as a rejection.
 step). It contains:
 
 - `test_ci_plan_is_calibrated`, which runs the `ci` plan end to end. It fails
-  when any gamfit surface is flagged anti-conservative (counting every rep
-  without a p-value as a rejection), when a rep that fitted lacks an expected
-  surface, or when a row lacks a power;
+  when any gamfit surface is flagged anti-conservative, conservative or not
+  uniform (with every rep without a p-value placed worst for each check), when
+  a rep that fitted lacks an expected surface, or when a row lacks a power;
 - tests that pin the harness's own rules on hand-built records or a stand-in
   worker: resume, safety-net records (only a rep that had the budget to itself
-  is charged, and the seeds after it run), seeding, the verdict bound, and
-  unusable-rep accounting;
+  is charged, and the seeds after it run), seeding, both verdict bounds, that
+  a point mass at 1, a size below nominal and a non-uniform shape above the
+  levels are each flagged, and unusable-rep accounting;
 - a test that `docs/pvalues.md`'s table equals the one generated from the
   committed baseline.
 
