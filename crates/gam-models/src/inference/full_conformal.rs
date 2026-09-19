@@ -787,12 +787,17 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         // both ratios named. While the ratios keep shrinking below one, `|G|`
         // falls at least geometrically and reaches the band in finitely many
         // steps, so no step budget is needed. A zero band means a zero gradient,
-        // which returns at once.
+        // which returns at once. On the closed domain a minimizer is stationary
+        // or an end the criterion still descends through: there the
+        // constrained optimum is the end itself, and a Newton step is
+        // projected back onto the domain.
+        let at_optimal_end =
+            |rho: f64, grad: f64| (rho >= upper && grad < 0.0) || (rho <= lower && grad > 0.0);
         let mut rho = result.rho[0];
         let mut ev = self.eval(rho, z)?;
         let mut previous_ratio = 1.0_f64;
         loop {
-            if ev.grad.abs() <= ev.grad_band {
+            if ev.grad.abs() <= ev.grad_band || at_optimal_end(rho, ev.grad) {
                 return Ok(rho);
             }
             if !(ev.hess.is_finite() && ev.hess > 0.0) {
@@ -802,12 +807,14 @@ impl<'a> GaussianRemlRhoResponse<'a> {
                     ev.hess
                 ));
             }
-            let candidate = rho - ev.grad / ev.hess;
+            let candidate = (rho - ev.grad / ev.hess).clamp(lower, upper);
             let ev_candidate = self.eval(candidate, z)?;
             // A step that lands inside its own rounding band is done, whatever its
             // ratio: overshooting into the noise is the end of quadratic convergence,
             // not a failure of it.
-            if ev_candidate.grad.abs() <= ev_candidate.grad_band {
+            if ev_candidate.grad.abs() <= ev_candidate.grad_band
+                || at_optimal_end(candidate, ev_candidate.grad)
+            {
                 return Ok(candidate);
             }
             let ratio = ev_candidate.grad.abs() / ev.grad.abs();
