@@ -33,7 +33,7 @@
 //! ## Why this is its own test binary
 //!
 //! It installs a process-global `log` sink and raises the max level to `Info`.
-//! That is process state, and `log::info!` evaluates its format arguments
+//! That is process state, and `log::debug!` evaluates its format arguments
 //! eagerly, so a logger installed by one test silently taxes every other test in
 //! the same process — `measure_jet`'s target carries a wall-clock speed gate.
 
@@ -49,7 +49,7 @@ struct ScreenSink;
 
 impl log::Log for ScreenSink {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -111,7 +111,7 @@ fn dataset() -> gam::data::EncodedDataset {
 fn transformation_normal_entry_reaches_the_measure_jet_range_screen_2754() {
     init_parallelism();
     if log::set_logger(&SCREEN_SINK).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
     let ds = dataset();
     let config = FitConfig {

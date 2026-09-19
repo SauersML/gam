@@ -34,7 +34,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
     }
 
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     let covariate_spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,

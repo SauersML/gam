@@ -483,7 +483,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     }
     candidate.block.initial_beta = Some(Array1::zeros(new_p));
 
-    log::info!(
+    log::debug!(
         "[BMS cross-block identifiability] flex block reparameterised via compiler: \
          kept {kept}/{p_candidate} directions (anchor union cols={d_total}, training rows={n}, \
          joint_rank={joint_rank}, dropped_by_audit={dropped})",

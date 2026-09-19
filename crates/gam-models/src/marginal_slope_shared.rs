@@ -1044,7 +1044,7 @@ pub(crate) fn auto_outer_score_subsample(
 /// > together so two threads cannot both decide "new ρ" and double-bump.
 ///
 /// The transition at `phase_idx == AUTO_OUTER_PHASE1_BUDGET` is logged exactly
-/// once via `log::info!` with the supplied `family_label`. Each phase-1
+/// once via `log::debug!` with the supplied `family_label`. Each phase-1
 /// install also logs the planned mask size and predicted gradient
 /// noise. Callers running with auto-subsample disabled see no logging.
 pub(crate) fn maybe_install_auto_outer_subsample(
@@ -1117,7 +1117,7 @@ pub(crate) fn maybe_install_auto_outer_subsample(
             std::sync::atomic::Ordering::SeqCst,
         );
         if phase_idx == AUTO_OUTER_PHASE1_BUDGET {
-            log::info!(
+            log::debug!(
                 "[{family_label} auto-subsample] Phase 1 budget exhausted after {} evals; \
                  Phase 2 (full data) for remaining iterations",
                 AUTO_OUTER_PHASE1_BUDGET
@@ -1128,7 +1128,7 @@ pub(crate) fn maybe_install_auto_outer_subsample(
     let mask = auto_outer_score_subsample(z, stratum_secondary, outer_work_per_k_unit)?;
     let n_full = mask.n_full;
     let k = mask.len();
-    log::info!(
+    log::debug!(
         "[{family_label} auto-subsample] phase=1 eval={}/{} n={} K={} fraction={:.3} expected_grad_noise={:.2}% work_per_k_unit={} k_noise={} k_work={} cap_reason={}",
         phase_idx + 1,
         AUTO_OUTER_PHASE1_BUDGET,

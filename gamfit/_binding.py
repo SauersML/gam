@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 from functools import lru_cache
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
@@ -9,6 +10,13 @@ from ._cuda import assert_no_cuda_library_conflicts, cuda_diagnostics, prepare_c
 
 if TYPE_CHECKING:
     from ._rust_module import RustModule
+
+# Engine diagnostics arrive as records on this logger (debug and below), so
+# they are silent until a caller opts in, e.g.
+# ``logging.getLogger("gamfit").setLevel(logging.DEBUG)`` plus a handler.
+# The NullHandler keeps Python's last-resort stderr handler out of it.
+_LOGGER = logging.getLogger("gamfit")
+_LOGGER.addHandler(logging.NullHandler())
 
 
 class RustExtensionUnavailableError(ImportError):
@@ -47,8 +55,20 @@ def _normalize_rust_exception_modules(module: ModuleType) -> None:
             value.__module__ = "gamfit._rust"
 
 
-@lru_cache(maxsize=1)
 def rust_module() -> RustModule:
+    """The compiled engine, with its log filter matched to the ``gamfit`` logger.
+
+    Every engine call goes through here, so a level set on the logger takes
+    effect on the next call, and records queued by the previous call are
+    delivered.
+    """
+    module = _load_rust_module()
+    module.sync_log_level_from_python(_LOGGER.getEffectiveLevel())
+    return module
+
+
+@lru_cache(maxsize=1)
+def _load_rust_module() -> RustModule:
     prepare_cuda_libraries()
     assert_no_cuda_library_conflicts("importing gamfit._rust")
     try:

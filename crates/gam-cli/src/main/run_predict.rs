@@ -1503,7 +1503,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     }
     let phase_start = std::time::Instant::now();
     let model = SavedModel::load_from_path(&args.model)?;
-    log::info!(
+    log::debug!(
         "[PHASE] predict load-model done elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
@@ -1519,7 +1519,7 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
         .collect();
     let ds = load_datasetwith_model_schema_extra(&args.new_data, &model, &offset_extras)?;
     require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
-    log::info!(
+    log::debug!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
         phase_start.elapsed().as_secs_f64(),
         ds.values.nrows()

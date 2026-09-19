@@ -24,8 +24,9 @@ pub(super) enum WorkingWeight {
     PoissonIdentity,
     /// Gamma(shape): `shape`, independent of `eta`.
     Constant { factor: f64 },
-    /// Tweedie(p, phi): `mu^(2-p) / phi`.
-    TweediePower { p: f64, phi: f64 },
+    /// Power variance `V(mu) = mu^p` with dispersion `phi`: `mu^(2-p) / phi`.
+    /// Tweedie uses `1 < p < 2`; the inverse Gaussian is `p = 3`.
+    PowerVariance { p: f64, phi: f64 },
     /// Negative-binomial(theta): `mu * theta / (theta + mu)`.
     NegativeBinomial { theta: f64 },
 }
@@ -75,7 +76,7 @@ fn unit_weight(weight: &WorkingWeight, mu: f64) -> f64 {
     match *weight {
         WorkingWeight::PoissonIdentity => mu,
         WorkingWeight::Constant { factor } => factor,
-        WorkingWeight::TweediePower { p, phi } => mu.powf(2.0 - p) / phi,
+        WorkingWeight::PowerVariance { p, phi } => mu.powf(2.0 - p) / phi,
         WorkingWeight::NegativeBinomial { theta } => {
             if theta >= mu {
                 mu / (1.0 + mu / theta)

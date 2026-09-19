@@ -40,7 +40,7 @@ APIs such as a matrix kernel.
 
 ## CLI command and flag inventory
 
-The one global flag is `--log-level`.
+The one global flag is `-v/--verbose` (the Python counterpart is the `gamfit` logger: `logging.getLogger("gamfit").setLevel(logging.DEBUG)`).
 
 | Command | Arguments and flags |
 |---|---|

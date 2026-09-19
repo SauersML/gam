@@ -168,6 +168,15 @@ impl PyFittedModel {
         self.model.payload().inference_notes.clone()
     }
 
+    /// Informational notes recorded while the model was fit: defaults the
+    /// engine chose (the auto knot count of a default B-spline, per-margin
+    /// tensor sizes). gamfit exposes them via `model.notes` and the summary
+    /// but does not warn. Empty for payloads that predate the field.
+    #[getter]
+    fn informational_notes(&self) -> Vec<String> {
+        self.model.payload().informational_notes.clone()
+    }
+
     /// The canonical fine-grained prediction class label — e.g. `"bernoulli
     /// marginal-slope"`, `"survival marginal-slope"`, `"competing risks
     /// survival"`, `"latent survival"`, `"gaussian location-scale"`,

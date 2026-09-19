@@ -250,7 +250,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             committed += 1;
-            log::info!(
+            log::debug!(
                 "[SAE-SADDLE] descended a refused exact-A direction: basin curvature \
                  {curvature:.6e}, slope {slope:.6e}, α={:.6e}, objective \
                  {base_objective:.10e} → {committed_objective:.10e} (decrease {decrease:.6e}, \
@@ -260,7 +260,7 @@ impl SaeManifoldTerm {
             );
         }
         if committed == 0 {
-            log::info!(
+            log::debug!(
                 "[SAE-SADDLE] none of {} refused exact-A direction(s) realizes a decrease above \
                  the material floor {last_floor:.6e}; the saddle stays refused",
                 directions.len(),
@@ -564,7 +564,7 @@ impl SaeManifoldTerm {
                         step_norm_sq,
                         &lambda_smooth,
                     )?;
-                    log::info!(
+                    log::debug!(
                         "[SAE-ACCEPT] kkt fixed point at the refined root: ‖Δ‖={:.6e} \
                          ‖Π⊥null Δ‖={:.6e} after {total_inner_iter} inner iterations",
                         step_norm_sq.sqrt(),
@@ -657,7 +657,7 @@ impl SaeManifoldTerm {
                     step_norm_sq,
                     &lambda_smooth,
                 )?;
-                log::info!(
+                log::debug!(
                     "[SAE-ACCEPT] kkt fixed point: ‖g‖={grad_norm:.6e} \
                      ‖Π⊥null g‖={quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
                      ‖Δ‖={:.6e} ‖Π⊥null Δ‖={:.6e} after {total_inner_iter} inner iterations",
@@ -847,7 +847,7 @@ impl SaeManifoldTerm {
                         .unwrap_or(f64::INFINITY);
                     let predicted_relative_decrease = 0.5 * decrement_sq / limit_scale;
                     if Self::inner_decrement_certifies(predicted_relative_decrease) {
-                        log::info!(
+                        log::debug!(
                             "[SAE-ACCEPT] limit-boundary decrement certificate: ‖g‖={grad_norm:.6e} \
                              (tol {grad_tolerance:.6e}) ½λ²/scale={predicted_relative_decrease:.6e} \
                              after {total_inner_iter} inner iterations"
@@ -906,7 +906,7 @@ impl SaeManifoldTerm {
                             budget_escalation_extra = total_inner_iter
                                 .saturating_sub(refine_limit)
                                 .saturating_add(refine_limit.max(1));
-                            log::debug!(
+                            log::trace!(
                                 "SaeManifoldTerm::penalized_quasi_laplace_criterion: polish-paid \
                                  window {polish_escalations}/\
                                  {POLISH_ESCALATION_ANTI_RUNAWAY_CAP} at a budget-limit hit before \
@@ -928,7 +928,7 @@ impl SaeManifoldTerm {
                         budget_escalation_extra = total_inner_iter
                             .saturating_sub(refine_limit)
                             .saturating_add(escalation_window);
-                        log::debug!(
+                        log::trace!(
                             "SaeManifoldTerm::penalized_quasi_laplace_criterion: certificate-paid \
                              window {certificate_escalations} at fixed ρ — ½λ²/scale=\
                              {predicted_relative_decrease:.6e} still contracting (‖g‖=\
@@ -957,7 +957,7 @@ impl SaeManifoldTerm {
                             "SaeManifoldTerm::penalized_quasi_laplace_criterion: escalated inner-refinement budget overflow"
                                 .to_string()
                         })?;
-                    log::debug!(
+                    log::trace!(
                         "SaeManifoldTerm::penalized_quasi_laplace_criterion: budget escalation at fixed ρ — \
                          ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) still descending after \
                          {total_inner_iter} inner iterations; granting a progress-paid window of \
@@ -1003,7 +1003,7 @@ impl SaeManifoldTerm {
                             budget_escalation_extra = total_inner_iter
                                 .saturating_sub(refine_limit)
                                 .saturating_add(refine_limit.max(1));
-                            log::debug!(
+                            log::trace!(
                                 "SaeManifoldTerm::penalized_quasi_laplace_criterion: polish-paid \
                                  window {polish_escalations}/\
                                  {POLISH_ESCALATION_ANTI_RUNAWAY_CAP} inside the KKT band after \
@@ -1058,7 +1058,7 @@ impl SaeManifoldTerm {
                             budget_escalation_extra = total_inner_iter
                                 .saturating_sub(refine_limit)
                                 .saturating_add(refine_limit.max(1));
-                            log::debug!(
+                            log::trace!(
                                 "SaeManifoldTerm::penalized_quasi_laplace_criterion: polish-paid \
                                  window {polish_escalations}/\
                                  {POLISH_ESCALATION_ANTI_RUNAWAY_CAP} at fixed rho after \
@@ -1126,7 +1126,7 @@ impl SaeManifoldTerm {
                                     .ok()
                                 });
                             if let Some(best_factor) = refactored {
-                                log::info!(
+                                log::debug!(
                                     "[SAE-ACCEPT] best-seen decrement certificate: ‖g‖ {grad_norm:.6e} \
                                      \u{2192} {best_g:.6e}, ½λ²/scale {excursion_cert:.6e} \
                                      \u{2192} {best_cert:.6e} after {total_inner_iter} iters"
@@ -1154,7 +1154,7 @@ impl SaeManifoldTerm {
                             // then fall through to the honest refusal below.
                             self.restore_mutable_state(&excursion)?;
                         } else if Self::inner_decrement_certifies(excursion_cert) {
-                            log::info!(
+                            log::debug!(
                                 "[SAE-ACCEPT] final-gate decrement certificate: ‖g‖={grad_norm:.6e} \
                                  (tol {grad_tolerance:.6e}) λ²={newton_decrement_sq:.6e} \
                                  ½λ²/scale={excursion_cert:.6e} after \
@@ -1307,7 +1307,7 @@ impl SaeManifoldTerm {
             // round ordinal and the current total-iteration limit separately:
             // printing the iteration limit as a round denominator made a
             // 1,920-iteration ceiling read as 1,920 thirty-iteration rounds.
-            log::info!(
+            log::debug!(
                 "[SAE-REFINE] round={refine_rounds} refine_iter={refine_iter} \
                  inner_total={total_inner_iter} inner_limit={refine_limit} \
                  elapsed={:.1}s",
@@ -1334,7 +1334,7 @@ impl SaeManifoldTerm {
                 })?;
             // `grad_norm` was read at this round's entry, before its refine iterations ran,
             // so it sits beside the post-round objective under its own name (#2228).
-            log::info!(
+            log::debug!(
                 "[SAE-REFINE] round={refine_rounds} penalized_objective={new_loss_total:.10e} \
                  entry ‖g‖={grad_norm:.6e}",
             );
@@ -1417,7 +1417,7 @@ impl SaeManifoldTerm {
                         stationary_quotient_grad_norm,
                         grad_tolerance,
                     ) {
-                        log::info!(
+                        log::debug!(
                             "[SAE-ACCEPT] stall-branch kkt: ‖g‖={stationary_grad_norm:.6e} \
                              ‖Π⊥null g‖={stationary_quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
                              after {total_inner_iter} inner iterations"
@@ -1476,7 +1476,7 @@ impl SaeManifoldTerm {
                         stationary_db.view(),
                     );
                     let predicted_relative_decrease = 0.5 * newton_decrement_sq / objective_scale;
-                    log::debug!(
+                    log::trace!(
                         "SAE inner stall certificate: ‖g‖={stationary_grad_norm:.6e} \
                          ‖Π⊥null g‖={stationary_quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
                          λ²={newton_decrement_sq:.6e} ½λ²/scale={predicted_relative_decrease:.6e} \
@@ -1506,7 +1506,7 @@ impl SaeManifoldTerm {
                     // trusts it was inconsistent, and no budget can close a gap
                     // that the objective's own resolution cannot express.)
                     if Self::inner_decrement_certifies(predicted_relative_decrease) {
-                        log::info!(
+                        log::debug!(
                             "[SAE-ACCEPT] stall decrement certificate: ‖g‖={stationary_grad_norm:.6e} \
                              ½λ²/scale={predicted_relative_decrease:.6e} tol={grad_tolerance:.6e} \
                              after {total_inner_iter} inner iterations"
@@ -1632,7 +1632,7 @@ impl SaeManifoldTerm {
                     if orbit.moved() {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
-                        log::debug!(
+                        log::trace!(
                             "SAE inner refine loop: gauge-orbit descent recovered {:.6e} over \
                              {} round(s) at the objective-stall fixed point (span dim {}, \
                              maxᵢ|gᵀvᵢ|={:.6e}, {} objective evaluations) after \

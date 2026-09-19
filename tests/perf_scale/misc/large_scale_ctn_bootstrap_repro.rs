@@ -56,7 +56,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }

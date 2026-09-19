@@ -81,7 +81,7 @@ def test_accessors_read_the_compiled_model() -> None:
     reloaded = gamfit.loads(model.dumps())
     compiled = reloaded._prediction_model
     assert reloaded.formula == compiled.formula == FORMULA
-    assert reloaded.notes == list(compiled.inference_notes)
+    assert reloaded.notes == [*compiled.inference_notes, *compiled.informational_notes]
     assert reloaded.used_device is compiled.used_device
     assert reloaded.model_class == compiled.predict_class_name
     assert reloaded._training_table_kind == compiled.training_table_kind == "pandas"
@@ -94,6 +94,7 @@ def test_accessors_read_the_compiled_model() -> None:
         "saved_model_payload_string",
         "required_saved_model_payload_string",
         "inference_notes_from_model",
+        "fit_notes_from_model",
         "saved_model_predict_class_name",
     ):
         assert not hasattr(rust, removed), removed
