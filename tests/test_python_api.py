@@ -2680,9 +2680,9 @@ def test_diagnose_keeps_regression_metrics_for_gaussian_family() -> None:
     assert "auc" not in diag.metrics
 
 
-def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
-    """`GAMClassifier.score` returns AUC over `classification_metrics`, and
-    `.metrics` surfaces the full panel on a separable case."""
+def test_gamclassifier_score_is_accuracy_and_metrics_panel_is_sane() -> None:
+    """`GAMClassifier.score` is ClassifierMixin accuracy (the sklearn classifier
+    contract), and `.metrics` surfaces the full AUC/Brier/... panel."""
     _require_extension()
     rng = np.random.default_rng(20260602)
     n = 200
@@ -2693,25 +2693,28 @@ def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
 
     clf = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, y)
 
-    auc = clf.score(X, y)
-    assert 0.0 <= auc <= 1.0
-    assert auc > 0.85, f"GAMClassifier.score (AUC) unexpectedly low: {auc:.3f}"
+    accuracy = clf.score(X, y)
+    np.testing.assert_allclose(accuracy, float(np.mean(clf.predict(X) == y)), atol=0.0)
+    assert accuracy > 0.8, f"GAMClassifier.score (accuracy) unexpectedly low: {accuracy:.3f}"
 
     panel = clf.metrics(X, y)
     for key in ("auc", "pr_auc", "brier", "logloss", "nagelkerke_r2", "ece"):
         assert key in panel, f"missing classification metric {key!r}"
-    # .score must agree with the AUC entry of the full panel.
-    np.testing.assert_allclose(auc, float(panel["auc"]), atol=1e-9)
+    assert float(panel["auc"]) > 0.85
 
-    # A perfectly-separable, perfectly-ranked subset scores AUC == 1.0, and
-    # sample_weight==0 rows are dropped before scoring (sklearn scorer
-    # contract compatibility).
+    # Accuracy and AUC must be distinguishable here: relabelling y as the
+    # sign of x keeps the ranking perfect (AUC 1) but is not what score
+    # reports unless every hard label is right.
     y_ranked = (x > 0.0).astype(int)
-    perfect = clf.score(X, y_ranked)
-    assert perfect == 1.0, f"separable ranking must give AUC 1.0; got {perfect}"
-    weights = np.ones(n, dtype=float)
-    weights[0] = 0.0
-    assert clf.score(X, y_ranked, sample_weight=weights) == 1.0
+    assert float(clf.metrics(X, y_ranked)["auc"]) == 1.0
+    np.testing.assert_allclose(
+        clf.score(X, y_ranked), float(np.mean(clf.predict(X) == y_ranked)), atol=0.0
+    )
+    weights = np.zeros(n, dtype=float)
+    weights[0] = 1.0
+    assert clf.score(X, y_ranked, sample_weight=weights) == float(
+        clf.predict(X.iloc[:1])[0] == y_ranked[0]
+    )
 
 
 def test_survival_prediction_concordance_recovers_known_ordering() -> None:

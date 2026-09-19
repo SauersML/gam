@@ -4444,20 +4444,6 @@ fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResul
 }
 
 #[pyfunction]
-fn weighted_auc_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    weights: Vec<f64>,
-) -> PyResult<f64> {
-    gam::inference::diagnostics::weighted_auc_from_predictions(
-        &observed,
-        &predicted_mean,
-        Some(&weights),
-    )
-    .map_err(py_value_error)
-}
-
-#[pyfunction]
 fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
     gam::inference::diagnostics::brier_from_predictions(&observed, &predicted_mean)
         .map_err(py_value_error)
