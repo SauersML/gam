@@ -1085,7 +1085,7 @@ fn derive_smooth_collection_coefficient_transform(
         // The design lies wholly inside a constraint block that other terms of
         // the model carry, so it adds no function they do not already fit: every
         // one of its coefficient directions is unidentified, and the realized
-        // block keeps none of them. This is the whitener's drop-the-null-
+        // block keeps none of them. This is the spectral frame's drop-the-null-
         // directions rule at its extreme.
         Err(BasisError::ConstraintNullspaceCollapsed { .. }) if block_is_owned => {
             Ok(Array2::zeros((design_local.ncols(), 0)))

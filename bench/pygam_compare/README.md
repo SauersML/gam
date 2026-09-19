@@ -52,13 +52,13 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
-| `fuzz_terms` | gamfit only: 120 seeded term-structure cases × n ∈ {50, 500, 5000} × all families (1080 fits) | 1 |
-| `fuzz_terms_quick` | gamfit only: the fixed cases in `FUZZ_QUICK_CASES`, which cover every term kind, × n ∈ {50, 500} × all families (a 0-failure regression test) | 1 |
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
+| `fuzz_terms` | gamfit only: 120 seeded term-structure cases × n ∈ {50, 500, 5000} × all families (1080 fits) | 1 |
+| `fuzz_terms_quick` | gamfit only: the fixed cases in `FUZZ_QUICK_CASES`, which cover every term kind, × n ∈ {50, 500} × all families (a 0-failure regression test) | 1 |
 
 The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
 heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
@@ -78,9 +78,13 @@ below (`auto` unsets them all, so each pool sizes itself to the host);
 thread-scaling table (speedup over one thread) and a process fan-out table
 (throughput of the batch against the same process run alone).
 
-Overrides: `--reps`, `--timeout`, `--memcap-mb`, `--only-libs gamfit,pygam_gs`
-and `--shard I/K`, which runs every K-th cell starting at cell I, so K shards
-started side by side cover the plan between them.
+Overrides: `--reps`, `--timeout`, `--memcap-mb`, `--only-libs gamfit,pygam_gs`,
+`--designs d1,d2` (every n and family of just those designs, e.g. to re-run
+the designs a generator change touched) and `--shard I/K`, which runs every
+K-th design starting at design I, so K shards started side by side cover the
+plan between them. `--lib-path DIR` puts a pinned library build first on every
+worker's `PYTHONPATH` (workers never inherit the caller's), so a before/after
+comparison measures the build it names; every gamfit record carries `lib_file`.
 
 ### Convergence fuzz over term structure
 

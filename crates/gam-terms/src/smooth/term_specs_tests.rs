@@ -464,8 +464,9 @@ mod tensor_function_space_runtime_tests {
 
     /// A frozen tensor chart is the basis sum-to-zero chart composed with every
     /// later collection transform. A term residualized against an owner smooth
-    /// (`s(x) + te(x, z)`) carries a whitener, whose columns span several decades
-    /// of scale. Rebuilding the null-block ridges in that chart once read the
+    /// (`s(x) + te(x, z)`) and saved before the collection gauge became
+    /// orthonormal carries a whitener, whose columns span several decades of
+    /// scale. Rebuilding the null-block ridges in that chart once read the
     /// chart's null space off its badly scaled primary penalty, found spurious
     /// null directions, and failed every prediction with "tensor null blocks span
     /// 4 of the chart's 12 null directions". The null space is a property of the

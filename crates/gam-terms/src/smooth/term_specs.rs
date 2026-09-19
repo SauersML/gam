@@ -5495,11 +5495,11 @@ fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
 /// frozen transform.
 ///
 /// The blocks are built on an orthonormal frame of the chart's range, not on
-/// the chart's own coordinates. A frozen chart composes the identifiability
-/// basis with the fit's spectral whitener, whose column scales span as many
-/// decades as the penalty spectrum, so a relative rank cutoff on the primary
-/// in those coordinates reports spurious null directions and the blocks can
-/// never cover them. With `Z = U Σ Vᵀ` the frame `U` spans the same functions,
+/// the chart's own coordinates. A frozen chart saved before the collection
+/// gauge became orthonormal composes the identifiability basis with a spectral
+/// whitener, whose column scales span as many decades as the penalty spectrum,
+/// so a relative rank cutoff on the primary in those coordinates reports
+/// spurious null directions and the blocks can never cover them. With `Z = U Σ Vᵀ` the frame `U` spans the same functions,
 /// coordinates map by `c_U = Σ Vᵀ c_Z`, and each ridge factor `E` in `U` is `E Σ
 /// Vᵀ` in `Z`. For an orthonormal chart (every chart the fit builds itself)
 /// this is an identity, because the ridges depend on the null space only
