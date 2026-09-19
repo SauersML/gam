@@ -116,7 +116,7 @@ fn expand_cli_automatic_formula(
     Ok(automatic.formula)
 }
 
-pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
+pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     let resolved_invocation = resolve_fit_invocation(&args)?;
     let fit_config = resolved_invocation.fit_config;
     let formula_text =
@@ -126,10 +126,9 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         let out = args.out.as_ref().ok_or("CTN fitting requires --out")?;
         let required = gam::inference::ctn::required_fit_columns(&formula_text, &fit_config)?;
         let dataset = load_fit_dataset_with_roles(&args.data, &required.into_iter().collect::<Vec<_>>(), &parsed, false)?;
-        let payload = gam::inference::model_payload_builders::fit_formula_to_payload(formula_text, &dataset, &fit_config)
-            .map_err(|error| error.to_string())?;
+        let payload = gam::inference::model_payload_builders::fit_formula_to_payload(formula_text, &dataset, &fit_config)?;
         let model = SavedModel::from_payload(payload);
-        return write_model_json(out, &model);
+        return Ok(write_model_json(out, &model)?);
     }
     validate_fit_args_preflight(&args, &parsed, &fit_config)?;
     if parse_surv_response(&parsed.response)?.is_some() {
@@ -152,7 +151,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         .as_deref()
         .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
     {
-        return run_fit_multinomial(&args, &parsed, &formula_text, &fit_config);
+        return Ok(run_fit_multinomial(&args, &parsed, &formula_text, &fit_config)?);
     }
     // Transformation-normal fits go through the library materializer, which refuses
     // link(...), linkwiggle(...), frailty, a noise formula and marginal-slope
@@ -163,11 +162,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         .is_some_and(|name| name.eq_ignore_ascii_case("transformation-normal"));
     if fit_config.transformation_normal || family_names_transformation_normal {
         if fit_config.firth {
-            return Err("--firth is not supported for the transformation-normal family".to_string());
+            return Err("--firth is not supported for the transformation-normal family".into());
         }
         if !family_names_transformation_normal {
             if let Some(family) = fit_config.family.as_deref() {
-                return Err(format!("--transformation-normal conflicts with --family {family}"));
+                return Err(format!("--transformation-normal conflicts with --family {family}").into());
             }
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
@@ -181,7 +180,8 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             if canonical != "bernoulli-marginal-slope" && canonical != "binary-marginal-slope" {
                 return Err(format!(
                     "--family {family} is ignored by marginal-slope fitting; select its link in the formula"
-                ));
+                )
+                .into());
             }
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
@@ -191,21 +191,19 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     if fit_config.noise_formula.is_some() {
         if fit_config.firth {
             return Err(
-                "--firth is not supported with --predict-noise location-scale fitting".to_string(),
+                "--firth is not supported with --predict-noise location-scale fitting".into(),
             );
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
     // Several expectile levels are one joint location-scale fit, which the
     // library's formula-to-payload service assembles like any location-scale model.
-    let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)
-        .map_err(|error| error.to_string())?
+    let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)?
         .is_some_and(|levels| levels.len() > 1);
     if joint_expectile {
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
-    let requested_columns = fit_required_columns(&parsed, &fit_config)
-        .map_err(|error| error.to_string())?
+    let requested_columns = fit_required_columns(&parsed, &fit_config)?
         .into_iter()
         .collect::<Vec<_>>();
     // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
@@ -237,16 +235,16 @@ fn standard_fast_path_feature_columns(parsed: &ParsedFormula) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn canonical_standard_fit_error(error: WorkflowError) -> String {
+fn canonical_standard_fit_error(error: WorkflowError) -> CliError {
     let detail = error.to_string();
     if detail.contains("Parameter constraint violation") && detail.contains("no candidate seeds") {
-        format!(
+        CliError::from(error).context(
             "standard term fit failed: every candidate fit violates the requested coefficient \
              constraint. Remove the constraint, change its direction/bounds, or check the data. \
-             Underlying error: {error}"
+             Underlying error",
         )
     } else {
-        format!("standard formula fit failed: {error}")
+        CliError::from(error).context("standard formula fit failed")
     }
 }
 
@@ -256,7 +254,7 @@ fn run_canonical_standard_fit(
     parsed: &ParsedFormula,
     formula: &str,
     fit_config: &FitConfig,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let phase_start = std::time::Instant::now();
     log::debug!(
         "[PHASE] canonical formula fit start n={}",
@@ -313,9 +311,9 @@ fn run_canonical_standard_fit(
                 // Joint expectile levels route to the library fit above; a
                 // standard payload never carries them.
                 gam::inference::model::FittedEstimator::ExpectileLocationScale { .. } => {
-                    return Err(
-                        "a standard fit assembled a joint expectile estimator".to_string()
-                    );
+                    return Err(CliError::Internal {
+                        reason: "a standard fit assembled a joint expectile estimator".to_string(),
+                    });
                 }
             };
             let fit = payload
@@ -383,7 +381,7 @@ fn run_canonical_standard_fit(
             if feature_columns.is_empty() {
                 return Err(
                     "canonical residual-cascade result has no smooth features in its formula"
-                        .to_string(),
+                        .into(),
                 );
             }
             cli_out!(
@@ -413,7 +411,7 @@ fn run_canonical_standard_fit(
         _ => Err(
             "canonical standard fit returned a non-standard model; specialized formula families \
              must be dispatched before the standard service"
-                .to_string(),
+                .into(),
         ),
     }
 }
@@ -426,13 +424,12 @@ fn run_library_formula_fit(
     parsed: &ParsedFormula,
     formula: String,
     fit_config: &FitConfig,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let out = args
         .out
         .as_ref()
         .ok_or("fit requires --out; refusing to run a training job that writes no model")?;
-    let requested_columns = fit_required_columns(parsed, fit_config)
-        .map_err(|error| error.to_string())?
+    let requested_columns = fit_required_columns(parsed, fit_config)?
         .into_iter()
         .collect::<Vec<_>>();
     let dataset = load_fit_dataset_with_roles(&args.data, &requested_columns, parsed, false)?;
@@ -444,7 +441,7 @@ fn run_library_formula_fit(
         &dataset,
         fit_config,
     )
-    .map_err(|error| format!("formula fit failed: {error}"))?;
+    .map_err(|error| CliError::from(error).context("formula fit failed"))?;
     log::debug!(
         "[PHASE] formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
@@ -466,7 +463,7 @@ fn run_library_formula_fit(
             gam::report::criterion_display(fit.reml_score()),
         );
     }
-    write_payload_json(out, payload)
+    Ok(write_payload_json(out, payload)?)
 }
 
 /// Refuse survival-only settings on a response that is not `Surv(...)`. Only the

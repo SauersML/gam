@@ -36,7 +36,7 @@ const KAPPA: f64 = 0.3;
 /// coordinate then collapses onto the origin within 40 inner iterations, the
 /// data-supported reduction keeps only the constant column, and κ no longer moves
 /// the criterion.
-fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(super) fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 24usize;
     let p = 3usize;
     let coords = Array2::from_shape_fn((n, 2), |(row, axis)| {
@@ -96,15 +96,15 @@ fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-fn arrow_norm(vector: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_norm(vector: &SaeArrowVector) -> f64 {
     (vector.t.dot(&vector.t) + vector.beta.dot(&vector.beta)).sqrt()
 }
 
-fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
     x.t.dot(&y.t) + x.beta.dot(&y.beta)
 }
 
-fn arrow_max(vector: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_max(vector: &SaeArrowVector) -> f64 {
     vector
         .t
         .iter()
@@ -112,7 +112,7 @@ fn arrow_max(vector: &SaeArrowVector) -> f64 {
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
 }
 
-fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
     assert_eq!(x.t.len(), y.t.len(), "coordinate blocks share one layout");
     assert_eq!(x.beta.len(), y.beta.len(), "decoder blocks share one layout");
     x.t.iter()
@@ -121,7 +121,7 @@ fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
         .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
 }
 
-fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: f64) -> SaeArrowVector {
+pub(super) fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: f64) -> SaeArrowVector {
     SaeArrowVector {
         t: (&plus.t - &minus.t) / (2.0 * step),
         beta: (&plus.beta - &minus.beta) / (2.0 * step),
@@ -129,12 +129,12 @@ fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: 
 }
 
 /// `(4·fine − coarse)/3` and `|coarse − fine|`.
-fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
+pub(super) fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
     ((4.0 * fine - coarse) / 3.0, (coarse - fine).abs())
 }
 
 /// The inner stationarity residual `(g_t, g_β)` at the term's coordinates and decoder.
-fn inner_gradient(
+pub(super) fn inner_gradient(
     term: &SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
@@ -154,7 +154,7 @@ fn inner_gradient(
 
 /// The term moved by `scale·step` in the arrow layout: row-major coordinates and the
 /// basis-major decoder of the single atom.
-fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
+pub(super) fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
     let mut moved = term.clone();
     let coords = moved.assignment.coords[0].as_matrix();
     let coordinate_step =
@@ -174,7 +174,7 @@ fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeMa
 }
 
 /// The dense route's converged anchor, checked to keep every penalized column.
-fn converged_anchor(
+pub(super) fn converged_anchor(
     term: SaeManifoldTerm,
     target: &Array2<f64>,
     rho: SaeManifoldRho,
@@ -624,4 +624,73 @@ fn snapshot_restore_carries_the_curvature_derivative_2935() {
         after.len() == 1 && (after[0].1 - before[0].1).abs() <= 1.0e-12 * before[0].1.abs().max(1.0),
         "the restored κ energy channel {after:?} is not the snapshot state's {before:?}"
     );
+}
+
+/// A dictionary that carries both crosscoder block weights and a curvature
+/// coordinate lays the block tail out BEFORE the curvature tail. At `λ_block = 1`
+/// the block pricing leaves the target and the fitted state as they are, so the
+/// κ entry of the dense gradient must be the one the plain dictionary reports.
+/// Locating the block tail as an offset from the end of ρ handed the κ slot the
+/// block's implicit right-hand side and the block slot the κ one.
+#[test]
+fn crosscoder_block_weights_leave_the_curvature_gradient_entry_in_place_2935() {
+    let (term, target, rho) = curvature_fixture();
+    let (state, anchor, _) = converged_anchor(term, &target, rho);
+    let dense_gradient = |blocks: bool| -> (SaeManifoldRho, Array1<f64>) {
+        let mut at = anchor.clone();
+        if blocks {
+            at.log_lambda_block = vec![0.0];
+        }
+        let objective =
+            SaeManifoldOuterObjective::new(state.clone(), target.clone(), None, at, 0, 0.4, 1.0e-6, 1.0e-6);
+        let mut objective = if blocks {
+            objective
+                .with_crosscoder_blocks(1, vec![2])
+                .expect("one anchor column and one two-column output block")
+        } else {
+            objective
+        };
+        let at = objective.baseline_rho.clone();
+        let evaluation = objective
+            .evaluate_outer_criterion_route(&at, true, false)
+            .expect("the dense route prices the state");
+        let gradient = objective
+            .analytic_gradient_for_outer_evaluation(&at, &evaluation)
+            .expect("the dense route differentiates the state");
+        (at, gradient)
+    };
+    let (plain_rho, plain) = dense_gradient(false);
+    let (block_rho, priced) = dense_gradient(true);
+    let plain_flat = plain_rho.kappa_flat_index(0).expect("curvature coordinate");
+    let block_flat = block_rho.kappa_flat_index(0).expect("curvature coordinate");
+    let block_range = block_rho.block_flat_range();
+    println!(
+        "[#2935 block tail] plain κ entry {:.12e}; priced κ entry {:.12e}; block range \
+         {block_range:?}, κ at {block_flat}; priced gradient {priced:?}",
+        plain[plain_flat], priced[block_flat]
+    );
+    assert_eq!(block_range, plain_flat..plain_flat + 1, "the block tail precedes κ");
+    assert_eq!(block_flat, plain_flat + 1, "κ is the last coordinate");
+    assert_eq!(priced.len(), plain.len() + 1);
+    assert!(
+        plain[plain_flat].abs() > 1.0e-3,
+        "the κ entry must be material for the comparison to mean anything ({})",
+        plain[plain_flat]
+    );
+    let tolerance = 1.0e-8 * plain[plain_flat].abs().max(1.0);
+    assert!(
+        (priced[block_flat] - plain[plain_flat]).abs() <= tolerance,
+        "installing block pricing moved the κ entry from {} to {}",
+        plain[plain_flat],
+        priced[block_flat]
+    );
+    for coord in 0..plain_flat {
+        assert!(
+            (priced[coord] - plain[coord]).abs() <= 1.0e-8 * plain[coord].abs().max(1.0),
+            "installing block pricing moved entry {coord} from {} to {}",
+            plain[coord],
+            priced[coord]
+        );
+    }
+    assert!(priced[block_range.start].is_finite(), "the block entry is finite");
 }

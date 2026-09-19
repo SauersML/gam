@@ -1,58 +1,62 @@
 use super::*;
+use crate::rho_optimizer::rail_face::RailFaceLimit;
 use ndarray::array;
 
-/// #2735: the face law's pulled-back falsification point is a trial point, and a
-/// trial the criterion refuses is a statement about that point. The falsification
-/// must DECLINE with the refusal's reason — never end the fit through `?` — and it
-/// must still restore the certified point before judging.
+/// A proven λ=∞ face certifies on the proof alone, whatever the depth of the
+/// shipped rail.
+///
+/// The fixture's criterion IS the face law: `V(ρ) = 2e^{−ρ}`, which is
+/// `½tr((λ·diag(2,3))⁻¹·diag(4,6))` with `V_∞ = 0`. At `ρ̂ = 12` the KKT
+/// statistic is positive and the shipped fit is `≈ 5e−6` from the limit fit,
+/// so the face is proven and reached. The retired value probe refused it
+/// anyway: its "ideal" pull-back `½(ln(tol/gap) + ρ̂) = 0.14` e-folds fell
+/// under its one-e-fold floor ("no room inside the box to falsify the face
+/// law"), and the rail went to the finite-difference tail ladder. The proof
+/// must mint without spending a criterion evaluation.
 #[test]
-fn face_law_falsification_declines_at_a_refused_pulled_back_point_2735() {
-    const PLANTED: &str = "planted refusal at the pulled-back face point";
-    let rho_hat = 30.0_f64;
+fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
+    let rho_hat = 12.0_f64;
     let limit = RailFaceLimit {
         face: vec![0],
         face_rho: vec![rho_hat],
         first_order_form: Array2::from_diag(&array![4.0, 6.0]),
         released_penalties: vec![Array2::from_diag(&array![2.0, 3.0])],
         released_score: array![1.0, 2.0],
-        form_conditioning: 1.0,
         form_error_bound: 0.0,
         limit_beta: Array1::zeros(0),
         limit_dispersion: 1.0,
         released_curvature_drift: None,
     };
-    let proof = match certify_rail_face(&limit) {
-        RailFaceVerdict::Certified(proof) => proof,
-        other => panic!("the diagonal positive-definite face must certify, got {other:?}"),
-    };
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
-    let mut obj = problem.build_objective(
-        Vec::<f64>::new(),
-        move |seen: &mut Vec<f64>, rho: &Array1<f64>| {
-            seen.push(rho[0]);
-            if rho[0] < rho_hat - 0.5 {
-                Err(EstimationError::TrialPointRefused {
-                    reason: PLANTED.to_string(),
+    let mut obj = problem
+        .build_objective(
+            Vec::<f64>::new(),
+            |seen: &mut Vec<f64>, rho: &Array1<f64>| {
+                seen.push(rho[0]);
+                Ok(2.0 * (-rho[0]).exp())
+            },
+            |seen: &mut Vec<f64>, rho: &Array1<f64>| {
+                seen.push(rho[0]);
+                Ok(OuterEval {
+                    cost: 2.0 * (-rho[0]).exp(),
+                    gradient: array![-2.0 * (-rho[0]).exp()],
+                    hessian: HessianValue::Unavailable,
+                    inner_beta_hint: None,
                 })
-            } else {
-                Ok(1.0)
-            }
-        },
-        |_: &mut Vec<f64>, rho: &Array1<f64>| {
-            Ok(OuterEval {
-                cost: 1.0,
-                gradient: Array1::zeros(rho.len()),
-                hessian: HessianValue::Unavailable,
-                inner_beta_hint: None,
-            })
-        },
-        None::<fn(&mut Vec<f64>)>,
-        None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
+            },
+            None::<fn(&mut Vec<f64>)>,
+            None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        )
+        .with_rail_face_limit(move |_: &mut Vec<f64>, _: &Array1<f64>, face: &[usize]| {
+            assert_eq!(face, &[0]);
+            Ok(RailFaceLimitOutcome::Available(Box::new(limit.clone())))
+        });
     let rho = array![rho_hat];
+    // The rail's whole pull is the blocked KKT multiplier, so the projection
+    // zeroed it, exactly as it does for the railed rows of the tests below.
     let gradient = array![0.0];
-    let hessian = array![[1.0]];
-    let bounds = (array![0.0], array![40.0]);
+    let hessian = array![[2.0 * (-rho_hat).exp()]];
+    let bounds = (array![-30.0], array![30.0]);
     let inputs = AsymptoteRailInputs {
         rho: &rho,
         projected_gradient: &gradient,
@@ -61,30 +65,36 @@ fn face_law_falsification_declines_at_a_refused_pulled_back_point_2735() {
         hessian: &hessian,
         bounds: &bounds,
         terminal_beta: None,
-        stationarity_bound: StationarityBound::from_ladder(1.0e-3, StationarityBoundSource::SolverBand),
+        stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
         objective_tol: 1.0e-10,
-        context: "face law falsification at a refused point",
+        context: "proven face on a shallow rail",
         native_coordinate_order: None,
     };
 
-    let verdict = falsify_face_law(&mut obj, &inputs, &limit, &proof)
-        .expect("a refused pulled-back point must decline, not end the fit");
-    match verdict {
-        Err(reason) => assert!(
-            reason.contains(PLANTED),
-            "the decline must carry the refusal's reason, got {reason:?}"
-        ),
-        Ok(()) => panic!("a refused falsification point cannot falsify the face law"),
-    }
+    let (_, _, rails) = try_certify_asymptote_rail(&mut obj, &inputs)
+        .expect("certification must not error")
+        .expect("a proven, reached λ=∞ face must certify");
+    assert_eq!(rails.len(), 1);
+    assert_eq!(rails[0].index, 0);
+    assert_eq!(rails[0].side, AsymptoteSide::Upper);
     assert!(
-        obj.state.iter().any(|&r| r < rho_hat - 0.5),
-        "the pulled-back point must have been evaluated: {:?}",
-        obj.state
+        matches!(rails[0].evidence, RailTailEvidence::AnalyticFaceProof { .. }),
+        "the rail must carry the face proof, not a measured tail: {:?}",
+        rails[0].evidence
     );
-    assert_eq!(
-        obj.state.last().copied(),
-        Some(rho_hat),
-        "the certified point must be restored before the decline: {:?}",
+    assert!(
+        rails[0].evidence.admits(rails[0].tail_constant),
+        "the proof's own well-formedness rule must admit its tail constant: {:?}",
+        rails[0]
+    );
+    assert!(
+        (rails[0].tail_constant - 2.0).abs() <= 1.0e-12,
+        "the face law's tail constant is ½tr(diag(2,3)⁻¹diag(4,6)) = 2, got {}",
+        rails[0].tail_constant
+    );
+    assert!(
+        obj.state.is_empty(),
+        "the proof spends no criterion evaluation, but the criterion was evaluated at {:?}",
         obj.state
     );
 }

@@ -214,6 +214,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",

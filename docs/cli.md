@@ -104,8 +104,9 @@ no mode that swaps one for the other. Standard and location-scale mean models
 write `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`;
 location-scale models that expose a fitted response-side scale add
 `noise_scale`. With `--uncertainty`, the posterior columns are
-`posterior_mean_standard_error`, `posterior_mean_lower`, and
-`posterior_mean_upper`. Survival predictions write `eta`,
+`linear_predictor_standard_error` (posterior SD of η),
+`posterior_mean_standard_error` (posterior SD of the response),
+`posterior_mean_lower`, and `posterior_mean_upper`. Survival predictions write `eta`,
 `survival_prob_plugin` (the plug-in `S(η̂)`), `survival_prob` (the posterior
 mean `E[S(η)]`), `failure_prob`, and `risk_score`, plus `std_error`,
 `mean_lower`, and `mean_upper` with `--uncertainty`. Transformation-normal and

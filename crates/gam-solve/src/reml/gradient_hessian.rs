@@ -4771,12 +4771,25 @@ impl<'a> RemlState<'a> {
             }
             h_proj_inverse[[out_col, out_col]] = 1.0 / h_evals[src_col];
         }
+        // The eigenpairs the kernel drops, from the same decomposition: its derivative couples
+        // them to the kept ones (`PenaltySubspaceTrace::pseudo_inverse_rotation`).
+        let dropped: Vec<usize> = (0..p).filter(|index| !kept.contains(index)).collect();
+        let mut dropped_basis = Array2::<f64>::zeros((p, dropped.len()));
+        let mut dropped_eigenvalues = Array1::<f64>::zeros(dropped.len());
+        for (out_col, &src_col) in dropped.iter().enumerate() {
+            for row in 0..p {
+                dropped_basis[[row, out_col]] = h_evecs[[row, src_col]];
+            }
+            dropped_eigenvalues[out_col] = h_evals[src_col];
+        }
 
         Ok((
             log_det,
             Some(super::reml_outer_engine::PenaltySubspaceTrace {
                 u_s,
                 h_proj_inverse,
+                dropped_basis,
+                dropped_eigenvalues,
                 // Filled by the caller: only it holds the operator's own
                 // `logdet()` that this pseudo-determinant replaces (#2765).
                 logdet_correction: 0.0,

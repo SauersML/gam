@@ -1912,6 +1912,15 @@
     "evidence": "In the landing tree the name occurs 0 times (git grep -c). The replacement is declared in crates/gam-models/src/gpu_kernels/survival_rowjet.rs and crates/gam-models/src/survival/marginal_slope/row_kernel.rs, added by the same landing, and rigid_row_jet_device_admission_and_parity_2900 plus rigid_row_jet_capability_follows_the_frame_declarations_3000 exercise it."
   },
   {
+    "base": "bdd00e20fd46860b917ff233fc268f9a8f293f9d",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run.rs:enum:NegativeCurvatureClaim",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:negative_curvature_claim"
+    ],
+    "reason": "#3036 follow-up to 16db27c9a8: the gam-local NegativeCurvatureClaim and negative_curvature_claim move to opt (SauersML/opt 17dea8b4539a526ec311bc312945bb0d8a1f761f, SPEC 24: general outer-optimizer work lives in opt), beside opt::unresolvable_curvature_magnitude(alpha_max, res) = 2*res/alpha_max^2, which the predicate reads. gam re-exports both from opt under their old paths (rho_optimizer/run.rs `pub(crate) use opt::{...}`, next to certificate_curvature_shift), so every call site and the #3036 tests resolve unchanged, and gam's criterion_curvature_resolution now calls the same magnitude at NEGATIVE_CURVATURE_LADDER_LARGEST_STEP. One number decides resolvability for the adjudication and for the definiteness, seed and decrement verdicts.",
+    "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
+  },
+  {
     "base": "fb8743205e07b99be01514dd7ae14e4fbddafc85",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",

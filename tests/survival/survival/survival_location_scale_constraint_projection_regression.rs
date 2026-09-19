@@ -52,7 +52,7 @@ fn project_onto_linear_constraints_enforces_equalities_encoded_as_opposing_inequ
 /// `&beta + &corrections.row(i)` broadcast a length-`beta0.len()` vector
 /// against a length-`dim` row and ndarray's `unwrap()` turned the
 /// `IncompatibleShape` error into a Rust panic that crossed the Python
-/// boundary as `GamError("... panicked inside Rust boundary ...")`.
+/// boundary as `GamfitError("... panicked inside Rust boundary ...")`.
 ///
 /// The projection must now validate its operands up front and return a
 /// structured `Err` on a `beta0.len() != dim` mismatch instead of panicking.

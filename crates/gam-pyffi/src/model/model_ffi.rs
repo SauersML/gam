@@ -1533,7 +1533,7 @@ fn fit_table(
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
     // A refused configuration is an `InvalidConfigurationError` here exactly as
-    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamfitError`.
     let fit_config = parse_fit_config(config_json.as_deref())
         .map_err(|reason| {
             workflow_error_to_pyerr(
@@ -2163,13 +2163,11 @@ fn competing_risks_cif_impl(
         .iter()
         .map(|hazard| hazard.view())
         .collect::<Vec<_>>();
-    // `ndarray::stack` is a pure shape contract violation — keep it as a
-    // bare `PyValueError` rather than forcing it through a typed engine
-    // enum it does not belong to.
+    // Endpoints whose hazard grids differ in shape cannot be stacked.
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.errors.SurvivalError`.
+    // `Result<_, SurvivalError>`, raised as the class of its fit category.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -2249,8 +2247,8 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.errors.SurvivalError` (issue
-    // #343), no string flattening.
+    // Typed engine path: `SurvivalError` → the class of its fit category
+    // (issue #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
         cumulative_hazards,
@@ -3957,6 +3955,7 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "linear_predictor_plugin",
     "mean_plugin",
     "posterior_mean",
+    "linear_predictor_standard_error",
     "posterior_mean_standard_error",
     "posterior_mean_lower",
     "posterior_mean_upper",

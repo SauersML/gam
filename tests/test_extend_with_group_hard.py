@@ -232,7 +232,7 @@ def test_precision_hyperpriors_object_form_accepted() -> None:
 
 
 def test_precision_hyperpriors_negative_shape_is_rejected() -> None:
-    with pytest.raises(gamfit.errors.GamError, match=r"shape must be finite and > 0"):
+    with pytest.raises(gamfit.errors.GamfitError, match=r"shape must be finite and > 0"):
         gamfit.fit(
             _training_frame(),
             "y ~ x + group(g)",
@@ -241,7 +241,7 @@ def test_precision_hyperpriors_negative_shape_is_rejected() -> None:
 
 
 def test_precision_hyperpriors_negative_rate_is_rejected() -> None:
-    with pytest.raises(gamfit.errors.GamError, match=r"rate must be finite and >= 0"):
+    with pytest.raises(gamfit.errors.GamfitError, match=r"rate must be finite and >= 0"):
         gamfit.fit(
             _training_frame(),
             "y ~ x + group(g)",
