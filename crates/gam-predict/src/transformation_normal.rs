@@ -277,7 +277,9 @@ impl PredictableModel for TransformationNormalPredictor {
         if options.include_observation_interval
             && let Some(level) = options.confidence_level
         {
-            let z = crate::interval_policy::validated_central_z(level)?;
+            // The latent `h(Y) − η` is exactly standard normal by construction
+            // of the transformation model, so its band is read on `Φ`.
+            let z = crate::interval_policy::IntervalReference::Normal.central_multiplier(level)?;
             let ladder = input.auxiliary_matrix.as_ref().ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "transformation-normal prediction input is missing the response-scale \

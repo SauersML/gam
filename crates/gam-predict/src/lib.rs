@@ -26,6 +26,7 @@ pub use posterior_predict::*;
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
 pub(crate) use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
+pub use crate::interval_policy::IntervalReference;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
@@ -47,7 +48,7 @@ use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 use gam_linalg::utils::predict_gam_dimension_mismatch_message;
-use gam_math::probability::{normal_cdf, standard_normal_quantile};
+use gam_math::probability::normal_cdf;
 use gam_models::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
@@ -459,6 +460,12 @@ pub trait UncertaintyCovarianceSource {
     fn constrained_fit_result(&self) -> Option<&UnifiedFitResult> {
         None
     }
+    /// Reference law of the interval pivot (see [`IntervalReference`]). A raw
+    /// covariance is taken as given — it carries no estimated scale and no
+    /// residual degrees of freedom — so its pivot is standard normal.
+    fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
+        Ok(IntervalReference::Normal)
+    }
 }
 
 impl UncertaintyCovarianceSource for UnifiedFitResult {
@@ -487,6 +494,9 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
             .as_ref()
             .and_then(|geometry| geometry.constrained_posterior.as_ref())
             .map(|_| self)
+    }
+    fn interval_reference(&self) -> Result<IntervalReference, EstimationError> {
+        IntervalReference::of_fit(self)
     }
 }
 
@@ -1402,7 +1412,8 @@ impl PosteriorMeanOptions {
 ///
 /// This mirrors the bound construction in [`predict_gamwith_uncertainty`] using
 /// the `TransformEta` method: transform `eta ± z * eta_se` through the inverse
-/// link, then clamp to [0, 1] for bounded-response families.
+/// link, then clamp to [0, 1] for bounded-response families. `z` is the central
+/// multiplier of `reference`, the fit's [`IntervalReference`].
 ///
 /// Call this after [`PredictableModel::predict_posterior_mean`] whenever a
 /// confidence level is available so that `mean_lower` / `mean_upper` are
@@ -1410,6 +1421,7 @@ impl PosteriorMeanOptions {
 pub(crate) fn enrich_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: f64,
+    reference: IntervalReference,
     family: gam_spec::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
@@ -1433,6 +1445,7 @@ pub(crate) fn enrich_posterior_mean_bounds(
     assemble_posterior_mean_bounds(
         result,
         Some(confidence_level),
+        reference,
         EtaInterval::Symmetric,
         MeanBoundMethod::TransformEta {
             bounds: ResponseBounds::for_family(&spec.response),
@@ -2294,6 +2307,7 @@ pub(crate) fn family_observation_band<S>(
     mean_standard_error: &Array1<f64>,
     z_lower_per_row: &Array1<f64>,
     z_upper_per_row: &Array1<f64>,
+    reference: IntervalReference,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
 ) -> (Option<Array1<f64>>, Option<Array1<f64>>)
@@ -2323,7 +2337,8 @@ where
     // own family whose first two moments match the point prediction — mean `μ`
     // and total predictive variance `V = SE(μ̂)² + Var(Y|μ)` (estimation +
     // observation noise) — then read its equal-tailed quantiles at the SAME tail
-    // masses the symmetric band targeted, `Φ(−z_lower)` and `Φ(z_upper)`. When
+    // masses the symmetric band targeted, `F(−z_lower)` and `F(z_upper)` under
+    // the `reference` law the multipliers were drawn from. When
     // estimation uncertainty vanishes (`SE(μ̂) → 0`) the moment-matched
     // predictive collapses to the exact conditional law, so the band is exact;
     // with nonzero `SE(μ̂)` it is the minimal skew-correct widening. `predictive`
@@ -2341,8 +2356,8 @@ where
                 // Lower-tail probability of the lower edge and cumulative
                 // probability of the upper edge — identical tail mass to the
                 // symmetric band, routed through the correct distribution.
-                let p_lower = normal_cdf(-z_lower_per_row[i]);
-                let p_upper = normal_cdf(z_upper_per_row[i]);
+                let p_lower = reference.cdf(-z_lower_per_row[i]);
+                let p_upper = reference.cdf(z_upper_per_row[i]);
                 match predictive(mu, total_var, p_lower, p_upper) {
                     Some((q_lo, q_hi)) => {
                         lower[i] = q_lo;
@@ -2537,8 +2552,8 @@ where
             let mut upper = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let m = mean[i].clamp(0.0, 1.0);
-                let p_lo = normal_cdf(-z_lower_per_row[i]);
-                let p_hi = normal_cdf(z_upper_per_row[i]);
+                let p_lo = reference.cdf(-z_lower_per_row[i]);
+                let p_hi = reference.cdf(z_upper_per_row[i]);
                 lower[i] = bernoulli_predictive_quantile(m, p_lo);
                 upper[i] = bernoulli_predictive_quantile(m, p_hi);
             }
@@ -2859,10 +2874,12 @@ where
     }
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
 
-    // Per-row z multipliers; Edgeworth optionally splits the lower/upper tails.
+    // Per-row multipliers: the central quantile of the fit's interval reference
+    // (Student-t on `n − edf` for an estimated scale, normal otherwise), which
+    // Edgeworth then optionally splits into lower/upper tails.
     let level = options.confidence_level;
-    let z_central =
-        standard_normal_quantile(0.5 + 0.5 * level).map_err(EstimationError::InvalidInput)?;
+    let reference = source.interval_reference()?;
+    let z_central = reference.central_multiplier(level)?;
     let mut z_lower_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     let mut z_upper_per_row = Array1::<f64>::from_elem(n_rows, z_central);
     if options.edgeworth_one_sided
@@ -3048,6 +3065,7 @@ where
             &mean_standard_error,
             &z_lower_per_row,
             &z_upper_per_row,
+            reference,
             source,
             options.observation_prior_weights.as_ref(),
         )
@@ -3277,7 +3295,7 @@ where
 mod tests {
     use super::*;
     use gam_solve::constrained_posterior::constrained_projection_equal_tailed_interval;
-    use gam_math::probability::normal_pdf;
+    use gam_math::probability::{normal_pdf, standard_normal_quantile};
     use gam_models::bms::LatentMeasureKind;
     use gam_models::inference::model::SavedLatentZNormalization;
     use gam_problem::BlockRole;
@@ -3368,7 +3386,10 @@ mod tests {
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
             likelihood_family: Some(gam_spec::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+            // A known unit scale (`σ = 1` below): this fixture carries a bare
+            // covariance and no inference, so there is no `n − edf` a
+            // profiled scale could be referred to.
+            likelihood_scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
@@ -3743,6 +3764,7 @@ mod tests {
         enrich_posterior_mean_bounds(
             &mut result,
             0.95,
+            IntervalReference::Normal,
             gam_spec::LikelihoodSpec::gaussian_identity(),
             None,
         )
@@ -4439,7 +4461,12 @@ mod tests {
         )
         .expect("prediction baseline");
 
-        let z = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
+        // The uncorrected interval is `η̂ ± q·SE` with `q` the fit's own
+        // reference quantile (Student-t on n − edf for this profiled-scale
+        // fixture; pinned numerically in the test below).
+        let z = IntervalReference::of_fit(&fit)
+            .and_then(|reference| reference.central_multiplier(0.95))
+            .unwrap();
         let expected_se = (0.25_f64).sqrt();
         assert!((pred.eta_standard_error[0] - expected_se).abs() <= 1e-12);
         let expected_lower = 1.0 - z * expected_se;
@@ -4455,6 +4482,97 @@ mod tests {
             "baseline upper drifted: got {}, expected {}",
             pred.eta_upper[0],
             expected_upper
+        );
+    }
+
+    #[test]
+    fn estimated_scale_interval_multiplier_is_student_t_on_residual_df() {
+        // The fixture profiles the Gaussian scale σ̂² from n = 16 rows with
+        // edf = 1, so the interval pivot is Student-t on ν = n − edf = 15, not
+        // standard normal. A known scale on the same fit keeps Φ.
+        let (fit, x, beta, offset) = coverage_correction_fixture();
+        assert_eq!(fit.wald_residual_degrees_of_freedom(), Some(15.0));
+        let reference = IntervalReference::of_fit(&fit).expect("estimated-scale reference");
+        assert_eq!(
+            reference,
+            IntervalReference::StudentT {
+                degrees_of_freedom: 15.0
+            }
+        );
+        // t_{15}(0.975), independent high-precision reference.
+        let t15 = 2.131449545559776_f64;
+        let multiplier = reference.central_multiplier(0.95).expect("multiplier");
+        assert!(
+            (multiplier - t15).abs() <= 1e-13 * t15,
+            "multiplier {multiplier} != t_15(0.975) = {t15}"
+        );
+        let se = 0.25_f64.sqrt();
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            &fit,
+            &corrections_baseline_options(),
+        )
+        .expect("estimated-scale prediction");
+        for (tag, half_width) in [
+            ("lower", 1.0 - pred.eta_lower[0]),
+            ("upper", pred.eta_upper[0] - 1.0),
+        ] {
+            assert!(
+                (half_width - t15 * se).abs() <= 1e-12,
+                "{tag} half-width {half_width} != t_15·SE = {}",
+                t15 * se
+            );
+        }
+
+        let mut known = fit.clone();
+        known.likelihood_scale = gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 };
+        assert_eq!(
+            IntervalReference::of_fit(&known).expect("known-scale reference"),
+            IntervalReference::Normal
+        );
+        let z = standard_normal_quantile(0.975).unwrap();
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            &known,
+            &corrections_baseline_options(),
+        )
+        .expect("known-scale prediction");
+        assert!((pred.eta_upper[0] - 1.0 - z * se).abs() <= 1e-12);
+        assert!((1.0 - pred.eta_lower[0] - z * se).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn estimated_scale_without_residual_df_has_no_interval_reference() {
+        // edf = n leaves no residual degrees of freedom to estimate φ from: the
+        // t reference is undefined and must be reported, never read as Φ.
+        let mut fit = posterior_band_fixture(array![1.0], array![[0.25]]);
+        fit.inference.as_mut().expect("fixture inference").edf_total = 16.0;
+        assert_eq!(fit.wald_residual_degrees_of_freedom(), None);
+        expect_estimation_error(
+            IntervalReference::of_fit(&fit),
+            "estimated scale without residual df must be an error",
+        );
+    }
+
+    #[test]
+    fn modeled_noise_block_keeps_normal_interval_reference() {
+        // Gaussian location-scale: σ(x) is a posterior block, not a profiled
+        // scalar φ̂, so even under the Gaussian scale tag the pivot is Φ.
+        let fit = gaussian_location_scale_fit_with_covariance(
+            array![0.0],
+            array![0.0],
+            array![[1.0, 0.0], [0.0, 1.0]],
+        );
+        assert!(fit.likelihood_scale.wald_scale_is_estimated());
+        assert_eq!(
+            IntervalReference::of_fit(&fit).expect("location-scale reference"),
+            IntervalReference::Normal
         );
     }
 
@@ -5136,6 +5254,7 @@ mod tests {
             &Array1::from_elem(n, 0.01),
             &z_per_row,
             &z_per_row,
+            IntervalReference::Normal,
             &fit,
             None,
         );
