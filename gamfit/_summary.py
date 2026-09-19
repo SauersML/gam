@@ -51,7 +51,6 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "reml_score_unavailable",
     "null_space_logdet",
     "null_dim",
-    "iterations",
     "edf_total",
     "edf_rank_bound",
     "aic_conditional",
@@ -211,8 +210,11 @@ class Summary:
     deviance_explained_unavailable : str or None
         Why :attr:`deviance_explained` is ``None``. Present exactly when it is.
     scale : float or None
-        The response dispersion :math:`\\hat\\varphi` (the residual variance for
-        a Gaussian response, ``1`` for a fixed-scale family).
+        Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
+        Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
+        (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
+        families (Poisson, binomial). ``None`` only for a custom family that
+        declares no dispersion.
     log_likelihood : float or None
         Ordinary reported log-likelihood at the converged fit. Every rankable
         model carries a finite value; ``None`` is reserved for the exact
@@ -243,8 +245,6 @@ class Summary:
         evidence calculation.
     null_dim : float or None
         Dimension of the penalty null space.
-    iterations : int or None
-        Outer-loop iteration count.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
     edf_rank_bound : list of mapping
@@ -369,6 +369,8 @@ class Summary:
         ``certified`` is the
         verdict the mint gate used; ``inner_status`` is the terminal P-IRLS
         status; ``outer_iterations`` is the iteration count the proof covers;
+        ``inner_iterations`` is the P-IRLS iteration count of the final
+        coefficient solve;
         ``outer`` is ``None`` when no smoothing coordinate was optimized (there
         is no outer stationarity equation, which is *not* the same as a zero
         gradient), else a mapping carrying ``kind``, ``gradient_norm``,
@@ -420,7 +422,6 @@ class Summary:
     reml_score_unavailable: str | None = None
     null_space_logdet: float | None = None
     null_dim: float | None = None
-    iterations: int | None = None
     edf_total: float | None = None
     #: Per-block rank-bound status beside the EDF fields (#2901).
     edf_rank_bound: list[Any] = field(default_factory=list)
@@ -473,7 +474,7 @@ class Summary:
     deployment_extensions: list[dict[str, Any]] = field(default_factory=list)
     #: How the optimization that produced this fit terminated (#2411), read
     #: from the certificate the fit itself carries. Keys: ``certified``,
-    #: ``inner_status``, ``outer_iterations``, and ``outer`` — the last being
+    #: ``inner_status``, ``outer_iterations``, ``inner_iterations``, and ``outer`` — the last being
     #: ``None`` when no smoothing coordinate was optimized, else a mapping with
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.

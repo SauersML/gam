@@ -1,5 +1,15 @@
 ## Unreleased
 
+- **`basis_check` on an estimated-scale fit uses the exact added-variable F** (pyGAM audit,
+  lane pv-model-comparison). With the scale estimated (Gaussian and other
+  estimated-dispersion families), the lack-of-fit p-value compared `T/r` with
+  `F(r, ν)`. But `νφ̂` contains the numerator's own share `T·φ̂`, so `T/r` is
+  `(ν/r)·Beta(r/2, (ν − r)/2)`, not F. The test was conservative: at n = 200 under an
+  adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
+  replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
+  the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
+  Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
+  (binomial, Poisson) are unchanged. Calibration is in `bench/pvalue_calibration/pv-model-comparison/`.
 - **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
   340 names: the core API next to every research helper, basis primitive, result class and
   error type, several under two names. The top level now holds the fit and load entry

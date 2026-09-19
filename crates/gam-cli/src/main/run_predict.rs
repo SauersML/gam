@@ -1380,8 +1380,8 @@ pub(crate) fn run_predict_residual_cascade(
     Ok(())
 }
 
-/// `gam predict --conformal`: the exact full-conformal set, or with
-/// `--calibration` the split-conformal band, at coverage `--level`, built by
+/// `gam predict --conformal`: with `--training-data` the exact full-conformal
+/// set, or with `--calibration` the split-conformal band, at coverage `--level`, built by
 /// `gam_predict::conformal_routes` for a standard model.
 fn run_predict_conformal(
     args: &PredictArgs,
@@ -1393,21 +1393,44 @@ fn run_predict_conformal(
     effective_offset_column: Option<&str>,
     effective_noise_offset_column: Option<&str>,
 ) -> Result<(), String> {
-    let columns = match args.calibration.as_ref() {
-        None => gam_predict::conformal_routes::full_conformal_prediction_columns(
-            model,
-            ds.values.view(),
-            col_map,
-            args.level,
-        )?,
-        Some(calibration_path) => {
-            let response = gam::terms::inference::formula_dsl::formula_response_column(
-                &model.payload().formula,
-            )
+    let response_column = |flag: &str| {
+        gam::terms::inference::formula_dsl::formula_response_column(&model.payload().formula)
             .ok_or_else(|| {
-                "--calibration: could not resolve the response column from the saved formula"
-                    .to_string()
-            })?;
+                format!("{flag}: could not resolve the response column from the saved formula")
+            })
+    };
+    let columns = match (args.training_data.as_ref(), args.calibration.as_ref()) {
+        (None, None) => {
+            return Err(
+                "predict --conformal needs its labeled rows: pass --training-data <the table the \
+                 model was fit on> for the exact full-conformal set, or --calibration <a held-out \
+                 labeled table> for the split-conformal band"
+                    .to_string(),
+            );
+        }
+        (Some(_), Some(_)) => {
+            return Err("--training-data and --calibration are mutually exclusive".to_string());
+        }
+        (Some(training_path), None) => {
+            let extras = vec![response_column("--training-data")?];
+            let training = load_datasetwith_model_schema_extra(training_path, model, &extras)?;
+            require_dataset_rows("predict --training-data", training_path, training.values.nrows())?;
+            let training_col_map = training.column_map();
+            gam_predict::conformal_routes::full_conformal_prediction_columns(
+                model,
+                &gam_predict::conformal_routes::DesignRows {
+                    data: ds.values.view(),
+                    col_map,
+                },
+                &gam_predict::conformal_routes::DesignRows {
+                    data: training.values.view(),
+                    col_map: &training_col_map,
+                },
+                args.level,
+            )?
+        }
+        (None, Some(calibration_path)) => {
+            let response = response_column("--calibration")?;
             let mut extras = vec![response];
             extras.extend(
                 [effective_offset_column, effective_noise_offset_column]

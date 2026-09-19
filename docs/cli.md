@@ -91,7 +91,8 @@ gam predict model.gam new.csv --out predictions.csv --conformal --calibration he
 | --- | --- |
 | `--uncertainty` | Include uncertainty columns where the model supports them. |
 | `--level VALUE` | Coverage for uncertainty or conformal intervals; default `0.95`. |
-| `--conformal` | Standard models: replace the posterior band with a distribution-free conformal band. Without `--calibration` it is the exact full-conformal set of a Gaussian-identity fit that precomputed its substrate (`--precompute-conformal`), with a per-row `frozen_rho_certified` column; the finite-sample coverage theorem holds where that column is 1. |
+| `--conformal` | Standard models: replace the posterior band with a distribution-free conformal band. Needs exactly one of `--training-data` or `--calibration`. |
+| `--training-data FILE` | With `--conformal`: the exact full-conformal set of a Gaussian-identity fit at its frozen smoothing parameters, over these labeled rows (normally the training table; must include the response column). The saved model keeps only the `p x p` frozen penalty, never per-row training data. Adds a per-row `frozen_rho_certified` column; the finite-sample coverage theorem holds where that column is 1. |
 | `--calibration FILE` | With `--conformal`: the split-conformal band calibrated on this held-out labeled table, which must include the response column; any standard family. |
 | `--covariance-mode conditional|corrected` | Conditional covariance or smoothing-corrected covariance. Absent, the definition the saved fit publishes (the one `gam summary` prices its standard errors from) is used and labeled; naming one is a requirement that refuses when the fit cannot supply it. |
 | `--id-column COLUMN` | Carry an identifier column into the prediction CSV. |

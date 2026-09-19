@@ -564,10 +564,13 @@ pub struct ScanIntrospection {
     pub log_likelihood: f64,
     /// Gaussian deviance — the weighted residual sum of squares.
     pub deviance: f64,
+    /// REML-profiled Gaussian scale: the innovations quadratic (data residual
+    /// energy plus roughness energy at the posterior mode) over `n − order`,
+    /// the `order` diffuse null-space directions the restricted likelihood
+    /// integrates out.
+    pub sigma2: f64,
     /// Number of pooled knots (the smoother's natural coefficient count).
     pub n_knots: usize,
-    /// Profiled observation variance σ̂².
-    pub scale: f64,
 }
 
 /// Reconstruct the canonical fitted quantities for a spline-scan model, or
@@ -585,8 +588,8 @@ pub fn scan_introspection(model: &FittedModel) -> Result<Option<ScanIntrospectio
         reml_cost: -fit.restricted_loglik,
         log_likelihood: fit.log_likelihood,
         deviance: fit.deviance(),
+        sigma2: fit.sigma2,
         n_knots: fit.knots.len(),
-        scale: fit.sigma2,
     }))
 }
 
@@ -641,7 +644,7 @@ fn scan_summary_payload(
         deviance_explained: None,
         deviance_explained_unavailable: Some(SCAN_RECORDS_NO_NULL_DEVIANCE),
         adjusted_r_squared: None,
-        scale: Some(scan.scale),
+        scale: Some(scan.sigma2),
         log_likelihood: Some(scan.log_likelihood),
         n_obs: Some(scan.training_sample_size),
         // The scan does not compute the penalized-Hessian null-space logdet the TK
@@ -655,7 +658,6 @@ fn scan_summary_payload(
         ),
         null_space_logdet: None,
         null_dim: None,
-        iterations: 0,
         edf_total: Some(scan.edf),
         edf_rank_bound: Vec::new(),
         information_criteria: scan_information_criteria(scan)?,
@@ -719,6 +721,7 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         certified: certificate.is_none_or(|certificate| certificate.certifies()),
         inner_status: evidence.inner_status().label().to_string(),
         outer_iterations: evidence.outer_iterations(),
+        inner_iterations: fit.inner_cycles,
         outer,
         estimator: SummaryEstimator::of(fit),
     }
@@ -914,6 +917,15 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
+    // A custom family has no scalar response distribution, hence no single
+    // dispersion to report; every built-in family resolves one.
+    let scale = match fit.likelihood_family {
+        None => None,
+        Some(_) => Some(
+            fit.dispersion_phi()
+                .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?,
+        ),
+    };
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -927,7 +939,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         deviance_explained: fit_to_null.as_ref().ok().map(|fit| fit.deviance_explained),
         adjusted_r_squared: fit_to_null.as_ref().ok().and_then(|fit| fit.adjusted_r_squared),
         deviance_explained_unavailable: fit_to_null.err(),
-        scale: fit.dispersion_phi().ok(),
+        scale,
         // Declined at the same boundary and for the same reason as the
         // criterion: with `φ̂ = 0` there is no normalized density, and the
         // stored `0.0` is the `UserProvided` tag saying so. Emitting it as a
@@ -943,7 +955,6 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         },
         null_space_logdet: fit.artifacts.null_space_logdet,
         null_dim: fit.artifacts.null_space_dim.map(|dim| dim as f64),
-        iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         edf_rank_bound: fit.edf_rank_bound().to_vec(),
         information_criteria,
@@ -1272,8 +1283,14 @@ pub struct SummaryPayload {
     /// Why `deviance_explained` is `None`. Present iff it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deviance_explained_unavailable: Option<&'static str>,
-    /// The response dispersion `φ̂` (the residual variance for a Gaussian
-    /// response, `1` for a fixed-scale family).
+    /// Estimated scale (dispersion) `φ̂` of the response distribution, the
+    /// same value the log-likelihood and every standard error are evaluated
+    /// at. Families with a known scale report it (`1` for Poisson, binomial);
+    /// a Gaussian REML fit reports the residual-d.f. estimator
+    /// `φ̂ = Σ wᵢ(yᵢ − μ̂ᵢ)² / (n − edf)`, with `n` the positive-weight rows and
+    /// `edf = p − Σ_k tr(λ_k H⁻¹ S_k)` (the `edf_total` field); a spline-scan fit reports the smoother's
+    /// REML-profiled `σ̂²`. `None` only for a custom-family fit, which has no
+    /// scalar response distribution.
     pub scale: Option<f64>,
     /// Reported log-likelihood at the converged mode. Carried so
     /// `compare_models` can form the Occam-penalised conditional AIC it ranks on
@@ -1315,7 +1332,6 @@ pub struct SummaryPayload {
     pub null_space_logdet: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub null_dim: Option<f64>,
-    pub iterations: usize,
     pub edf_total: Option<f64>,
     /// Each penalty block's rank-bound status beside the EDF fields (#2901). An
     /// `Uncertified` or `NotAssessed` block's trace and EDF are published unclamped,
@@ -1425,6 +1441,10 @@ pub struct SummaryConvergence {
     pub inner_status: String,
     /// Outer iterations covered by the proof.
     pub outer_iterations: usize,
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters (P-IRLS iterations, or blockwise cycles for a
+    /// custom family).
+    pub inner_iterations: usize,
     /// `None` when no smoothing coordinate was optimized: there is no outer
     /// stationarity equation to solve, which is a different statement from a
     /// projected gradient that happened to be zero.

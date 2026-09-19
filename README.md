@@ -6,15 +6,47 @@
 [![Rust CI](https://github.com/SauersML/gam/actions/workflows/test.yml/badge.svg)](https://github.com/SauersML/gam/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
-A generalized additive model engine. The fitting code is in Rust; the
-public interfaces are a Rust CLI (`gam`) and a Python package (`gamfit`),
-which share one engine, one formula DSL, and one on-disk model format.
+gamfit fits generalized additive models from a formula, chooses every
+smoothing parameter by REML/LAML in one converged optimization, and returns
+posterior-mean predictions with credible bands and observation intervals.
+One Rust engine serves both the Python package (`gamfit`) and the CLI (`gam`).
+
+```python
+import pandas as pd
+import gamfit
+
+# 133 rows: head acceleration of a crash-test dummy, milliseconds after impact.
+mcycle = pd.read_csv("https://vincentarelbundock.github.io/Rdatasets/csv/MASS/mcycle.csv")
+
+# The mean and the noise level are both smooth functions of time.
+model = gamfit.fit(mcycle, "accel ~ s(times)", noise_formula="s(times)")
+
+bands = model.predict(mcycle, interval=0.95, observation_interval=True)
+print(bands[["posterior_mean", "posterior_mean_lower", "posterior_mean_upper",
+             "observation_lower", "observation_upper"]].head())
+```
+
+![mcycle location-scale fit: posterior mean, credible band and observation interval](docs/images/mcycle_location_scale.png)
+
+Coming from pyGAM:
+
+- **Smoothness is estimated, not searched.** REML/LAML picks every
+  smoothing parameter, so there is no `gridsearch()` and no GCV. Against
+  pyGAM's defaults gamfit wins 8, ties 28 and loses 13 of 49 held-out
+  comparisons; the [benchmarks](docs/benchmarks.md) list every loss.
+- **Predictions carry their uncertainty.** One `predict` call returns the
+  posterior mean, a credible band for it and an observation interval
+  ([predictions](docs/predictions.md)).
+- **The noise can be modelled too.** `noise_formula=` fits a
+  location-scale model like the one above, which pyGAM cannot express; on
+  `mcycle` its 95% observation interval covers 97% of the data
+  ([tour](docs/tour.md#heteroscedastic-noise-mcycle)).
+
+The [migration guide](docs/migrating-from-pygam.md) maps pyGAM calls to
+gamfit, and the [tour](docs/tour.md) works through six real datasets.
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
-
 Contributions of every kind are welcome.
-
-![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
 ## Scope
 
@@ -124,6 +156,8 @@ gamfit.fit(df, "y ~ duchon(x1, x2, x3, x4, centers=80)")
 gamfit.fit(df, "y ~ te(space, time, k=10)")
 gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
+
+![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
 Smooths on manifolds. The basis and penalty encode the wrap topology,
 so a fit on `theta ∈ [0, 2π)` has no seam at 0 / 2π, and an `S²` fit
@@ -288,13 +322,15 @@ variance for Gamma, Beta, negative-binomial, and Tweedie:
 gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
 ```
 
-Conformal prediction intervals. `interval="conformal"` gives the exact
-full-conformal set (Gaussian-identity); with a held-out `calibration` table it
-gives the split-conformal band for any standard family, like
-`gam predict --conformal --calibration`:
+Conformal prediction intervals. `interval="conformal"` with the labeled
+`training_data` gives the exact full-conformal set (Gaussian-identity) at the
+frozen smoothing parameters; with a held-out `calibration` table it gives the
+split-conformal band for any standard family, like
+`gam predict --conformal --training-data` / `--calibration`. The saved model
+holds no per-row training data, so full conformal takes the rows again:
 
 ```python
-model.predict(test, interval="conformal", conformal_level=0.9)
+model.predict(test, interval="conformal", training_data=df, conformal_level=0.9)
 model.predict(test, interval="conformal", calibration=held_out, conformal_level=0.9)
 ```
 
@@ -389,6 +425,9 @@ instead of mixing context or handle ownership across implementations.
 ## Documentation
 
 - Full Python documentation: <https://gamfit.readthedocs.io/>.
+- Migrating from pyGAM: [docs/migrating-from-pygam.md](docs/migrating-from-pygam.md).
+- Real-data tour: [docs/tour.md](docs/tour.md).
+- Benchmarks against pyGAM: [docs/benchmarks.md](docs/benchmarks.md).
 - Cookbook: [docs/cookbook.md](docs/cookbook.md).
 - Manifold smooths gallery: [docs/manifold-smooths.md](docs/manifold-smooths.md).
 - Manifold SAE dictionary: [docs/manifold-sae.md](docs/manifold-sae.md).
