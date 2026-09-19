@@ -54,10 +54,14 @@ POLL_S = 0.05
 # Every BLAS / OpenMP / Rayon pool gets one thread, so the comparison is
 # single-core CPU against single-core CPU. pyGAM's scipy/numpy BLAS and
 # gamfit's Rayon + faer pools are otherwise sized to the host and a many-core
-# runner would measure parallelism, not the algorithms. A cell's ``threads``
-# replaces the "1" (see ``thread_env``).
+# runner would measure parallelism, not the algorithms. gamfit's ndarray
+# products also run on matrixmultiply's own pool (its threading is enabled by
+# the MCMC sampler's ``burn`` dependency), which reads ``MATMUL_NUM_THREADS``
+# and not ``RAYON_NUM_THREADS``. A cell's ``threads`` replaces the "1" (see
+# ``thread_env``).
 THREAD_ENV: dict[str, str] = {
     "RAYON_NUM_THREADS": "1",
+    "MATMUL_NUM_THREADS": "1",
     "OMP_NUM_THREADS": "1",
     "OPENBLAS_NUM_THREADS": "1",
     "MKL_NUM_THREADS": "1",

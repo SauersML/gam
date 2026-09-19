@@ -76,9 +76,9 @@ scratch dir, so the installed wheel is imported instead of the source tree's
 `./gamfit`. Within a cell the libraries are interleaved rep by rep, so drift in
 host load hits all of them alike.
 
-**Threads.** `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
-`MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and `NUMEXPR_NUM_THREADS` are all
-set to 1. The comparison is single-core against single-core. Only the
+**Threads.** `RAYON_NUM_THREADS`, `MATMUL_NUM_THREADS`, `OMP_NUM_THREADS`,
+`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and
+`NUMEXPR_NUM_THREADS` are all set to 1. The comparison is single-core against single-core. Only the
 `threads` and `oversubscribe` cells change this.
 
 **Time.** Each phase is timed as both wall time (`perf_counter`) and process
