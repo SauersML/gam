@@ -30,13 +30,7 @@ pub(crate) enum InnerFailure {
     /// record. This is deliberately distinct from `BudgetExhausted`: the
     /// terminal state says which convergence predicates failed, but it does not
     /// claim that an iteration budget caused the stop.
-    InnerSolveNotConverged {
-        /// The exact producer record, retained whole rather than copied into a
-        /// second startup-only schema that could drift when the producer adds a
-        /// field.
-        source: CustomFamilyError,
-        message: String,
-    },
+    InnerSolveNotConverged { message: String },
     /// The joint Newton constrained-stationary certificate refused. The
     /// projected KKT residual exceeded 4× the residual tolerance, and the
     /// underlying H_pen spectrum / active-set inspection classified the
@@ -103,12 +97,11 @@ pub(crate) fn classify_estimation_error(
     display_message: String,
 ) -> InnerFailure {
     match error {
-        EstimationError::CustomFamily(
-            source @ CustomFamilyError::InnerSolveNotConverged { .. },
-        ) => InnerFailure::InnerSolveNotConverged {
-            source: source.clone(),
-            message: display_message,
-        },
+        EstimationError::CustomFamily(CustomFamilyError::InnerSolveNotConverged { .. }) => {
+            InnerFailure::InnerSolveNotConverged {
+                message: display_message,
+            }
+        }
         EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
             if let Some(source) = source.estimation_error() {
                 classify_estimation_error(source, display_message)

@@ -1,6 +1,9 @@
 pub mod bivariate_normal;
 pub mod categorical;
 pub mod constrained_partition;
+// The generic variance-function × inverse-link exponential-dispersion row
+// kernel (families.md F2/F3).
+pub mod edm_row;
 pub mod fast_channel;
 pub mod fractional_rank;
 pub mod gaussian_activation;
@@ -30,6 +33,8 @@ pub mod score_opt;
 pub mod serial_dependence;
 pub mod special;
 
+#[cfg(test)]
+mod edm_row_oracle_tests;
 #[cfg(test)]
 mod jet_gamma_oracle_tests;
 #[cfg(test)]

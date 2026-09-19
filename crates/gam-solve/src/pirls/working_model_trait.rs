@@ -376,6 +376,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
+        if let Some(cell) = self.spec.generic_edm_cell() {
+            return write_generic_edm_working_state(
+                cell,
+                fixed_glm_dispersion(self)?,
+                y,
+                eta,
+                priorweights,
+                mu,
+                weights,
+                z,
+                derivatives,
+            );
+        }
         match (&self.spec.response, &self.spec.link, integrated) {
             (ResponseFamily::Binomial, _, Some(integ)) => {
                 update_glmvectors_integrated_by_family(

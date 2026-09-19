@@ -440,7 +440,6 @@ pub(crate) fn binomial_mean_wiggle_operator_fixture() -> (
         wiggle_degree: degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let basis = family.wiggle_design(eta.view()).expect("wiggle basis");
     let beta_w = Array1::from_iter((0..basis.ncols()).map(|j| 0.015 * (j as f64 + 1.0)));
@@ -1142,7 +1141,6 @@ pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
         wiggle_degree: 3,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let specs = vec![
         ParameterBlockSpec {
