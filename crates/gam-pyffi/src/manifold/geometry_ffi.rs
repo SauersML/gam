@@ -4749,7 +4749,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEncodedTable>()?;
     module.add_function(wrap_pyfunction!(sae_observe_atlas_topology, module)?)?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(
         predict_multinomial_formula_pyfunc,
         module
@@ -4902,8 +4901,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sphere_basis_jet_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_hessian, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_basis_locations_1d, module)?)?;
     module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;

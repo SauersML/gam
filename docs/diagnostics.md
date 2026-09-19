@@ -206,11 +206,10 @@ Returns a `FormulaValidation` dataclass that wraps the parsed payload.
 Accepts these parser/materialization keyword arguments from `gamfit.fit`,
 with the same semantics, and does no fitting:
 `family`, `negative_binomial_theta`, `expectile_tau`, `offset`, `weights`,
-`persistent_warm_start_root`,
 `transformation_normal`, `transformation_normal_stage1`,
 `survival_likelihood`, `survival_time_anchor`, `baseline_target`,
 `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`,
-`z_column`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
+`z_column`, `residual_columns`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
 `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
 `noise_offset`, `flexible_link`, `config`.
 

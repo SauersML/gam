@@ -58,7 +58,6 @@ fn fit_request_document_from_fit_args(
         noise_offset: args.noise_offset_column.clone(),
         offset: args.offset_column.clone(),
         precompute_conformal: Some(args.precompute_conformal),
-        persistent_warm_start_root: args.persistent_warm_start_root.clone(),
         scale_dimensions: args.scale_dimensions.then_some(true),
         sigma_time_k: args.sigma_time_k,
         slope_time_k: args.slope_time_k,
@@ -120,7 +119,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // response forced to a factor) and persistence envelope, so dispatch it
     // before the scalar-response standard path. The stale note below about "the
     // CLI has no multinomial family" no longer holds for this early return.
-    if fit_config.family.as_deref() == Some("multinomial") {
+    if fit_config
+        .family
+        .as_deref()
+        .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
+    {
         return run_fit_multinomial(&args, &parsed, &formula_text, &fit_config);
     }
     // Transformation-normal fits go through the library materializer, which refuses

@@ -338,8 +338,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         Returns
         -------
         numpy.ndarray
-            Two-column float array ``[[P(y=0), P(y=1)], ...]``, clipped to
-            ``[0, 1]``.
+            Two-column float array ``[[P(y=0), P(y=1)], ...]``: the Rust
+            posterior mean of the positive class and its complement.
 
         Examples
         --------
@@ -349,9 +349,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         check_is_fitted(self, "model_")
         serving = self._strip_response_column(X)
         predicted = self.model_.predict(serving, return_type="dict")
-        positive = np.clip(
-            np.asarray(predicted["posterior_mean"], dtype=float), 0.0, 1.0
-        )
+        positive = np.asarray(predicted["posterior_mean"], dtype=float)
         negative = 1.0 - positive
         return np.column_stack([negative, positive])
 
@@ -446,13 +444,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         check_is_fitted(self, "model_")
         observed = self._encode_labels(y)
         positive = self.predict_proba(X)[:, 1].astype(float)
-        train_prev = float(np.mean(observed)) if observed.size else 0.0
         return dict(
-            rust_module().classification_metrics(
-                observed.tolist(),
-                positive.tolist(),
-                train_prev,
-            )
+            rust_module().classification_metrics(observed.tolist(), positive.tolist())
         )
 
     def score(self, X: Any, y: Any, sample_weight: Any | None = None) -> float:
