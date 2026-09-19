@@ -1,0 +1,10 @@
+# smoothing-correction-provenance
+
+TITLE: Report why smoothing-corrected covariance falls back, publish rho-posterior k-hat, and pin the Poisson cubature fold regressions
+WORK ITEM: Read audit/inference.md B1 and G4, audit/accuracy.md B1 (fold failures) and audit/pygam_tests.md F16. degenerate-smooths/covariance-refusal fix the raise, but no item owns fallback provenance or regressions on these fixtures.
+Evidence: in the released wheel, 115/200 mc.py `pois` fits (seed 1000, rep 0) raise "smoothing cubature could not calibrate its nodes" (crates/gam-inference eval.rs:1331-1420, 1437-1445). HEAD falls back silently and no test references the string. A second variant, "proposal has no positive width" (8 mc.py pois cases, haberman k=20), may bypass the HEAD fallback; verify it. Other failing folds: wage folds 2/3, cake folds 0/3, pois_add2_n300 fold 3, pois_add2_n2000 fold 4 (continuous uniform x), city_temp k=30 (2 folds).
+G4: Tier-0 PSIS k-hat is computed but hidden. skip_rho_posterior_inference is true at entry.rs:64-69 (:69); see also eval.rs:970 and gam-inference rho_posterior.rs.
+F16: monotone_decreasing reports covariance_source "conditional" while other shapes report smoothing-corrected, with no reason.
+Fix: make the SmoothingCorrectionOutcome fallback reason a field in summary().convergence / covariance_source_reason. Expose rho_posterior_khat. When k-hat flags inadequacy and K<=4, auto-escalate to Tier 1 GH, deterministic and no budget. Make the shape-constrained source consistent or state the reason.
+Coordinate: degenerate-smooths, covariance-refusal, lazy-postfit (owns rho_posterior cost; do not re-enable an eager path), summary (field placement), shape-speed, rho-uncertainty.
+Acceptance: tests fit every fixture above without raising and assert covariance_source is set with a non-empty reason whenever it is not "smoothing_corrected". Other tests assert summary().convergence contains a finite rho_posterior_khat, and assert the monotone_decreasing source/reason. They fail at HEAD (missing fields, and the width variant raises).
