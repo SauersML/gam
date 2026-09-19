@@ -1,0 +1,147 @@
+.F....F....F.FFFFF...F                                                   [100%]
+=================================== FAILURES ===================================
+____________________ test_poisson_offset_scales_prediction _____________________
+test_pg_methods.py:62: in test_poisson_offset_scales_prediction
+    np.testing.assert_allclose(m.predict(d2), 2.0 * base, rtol=1e-8)
+                               ^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_model.py:340: in predict
+    raise map_exception(exc) from exc
+../../bvenv/lib/python3.11/site-packages/gamfit/_model.py:331: in predict
+    raw = rust_module().predict_table(
+E   gamfit._rust.GamError: column 'off' is binary in schema but row 1 has value 0.6931471805599453; expected 0 or 1
+----------------------------- Captured stderr call -----------------------------
+[0s] [HGB] target_mse below mandatory floors; target_mse=1.679e-13 floors=3.000e-12
+[0s] [HGB] target_mse below mandatory floors; target_mse=4.986e-17 floors=3.000e-12
+[0s] [HGB] target_mse below mandatory floors; target_mse=1.679e-13 floors=3.000e-12
+[0s] [HGB] target_mse below mandatory floors; target_mse=1.679e-13 floors=3.000e-12
+[0s] [BFGS Adaptive] Strong Wolfe failed at iter 10. Falling back to Backtracking.
+_________________________ test_posterior_sample_shapes _________________________
+test_pg_methods.py:140: in test_posterior_sample_shapes
+    assert np.asarray(pd_["mean"]).shape == (ndraw, 7)
+                      ^^^^^^^^^^^
+E   TypeError: 'PosteriorPredictive' object is not subscriptable
+_____________________________ test_scale_estimate ______________________________
+test_pg_methods.py:201: in test_scale_estimate
+    assert cand, f"no scale/sigma/dispersion field on Summary: {sorted(fields)}"
+E   AssertionError: no scale/sigma/dispersion field on Summary: ['basis_checks', 'coefficient_se_source', 'coefficients', 'coefficients_frame', 'convergence', 'covariance_flat', 'covariance_kind', 'covariance_n', 'curvature_estimands', 'deployment_extensions', 'deviance', 'edf_total', 'extras', 'family_name', 'formula', 'from_dict', 'get', 'group_metadata', 'iterations', 'lambdas', 'log_likelihood', 'model_class', 'n_obs', 'null_dim', 'null_space_logdet', 'raw_reml_score', 'reml_score', 'reml_score_unavailable', 'smooth_terms', 'smooth_terms_frame', 'smooth_terms_unavailable', 'to_dict']
+E   assert {}
+______________________ test_expectile_tau_validation[0.0] ______________________
+test_pg_methods.py:220: in test_expectile_tau_validation
+    with pytest.raises(Exception):
+E   Failed: DID NOT RAISE Exception
+______________________ test_expectile_tau_validation[1.0] ______________________
+test_pg_methods.py:220: in test_expectile_tau_validation
+    with pytest.raises(Exception):
+E   Failed: DID NOT RAISE Exception
+_____________________ test_expectile_tau_validation[-0.1] ______________________
+test_pg_methods.py:220: in test_expectile_tau_validation
+    with pytest.raises(Exception):
+E   Failed: DID NOT RAISE Exception
+______________________ test_expectile_tau_validation[1.1] ______________________
+test_pg_methods.py:220: in test_expectile_tau_validation
+    with pytest.raises(Exception):
+E   Failed: DID NOT RAISE Exception
+______________ test_expectile_ordering_and_median_equals_gaussian ______________
+test_pg_methods.py:229: in test_expectile_ordering_and_median_equals_gaussian
+    assert np.mean(p90 > p50) > 0.95
+E   assert np.float64(0.0) > 0.95
+E    +  where np.float64(0.0) = <function mean at 0x7f400bd05e30>(array([ 4.77860966e-01,  4.20388877e-01,  1.25866156e-01, -1.50151695e-01,\n       -4.69291436e-01, -2.20578899e+00, -2...0, -9.90126866e+00,\n       -7.49168689e+00, -1.38325530e+00, -1.38325530e+00,  1.07596269e-01,\n        6.87797094e+00]) > array([ 4.77860966e-01,  4.20388877e-01,  1.25866156e-01, -1.50151695e-01,\n       -4.69291436e-01, -2.20578899e+00, -2...0, -9.90126866e+00,\n       -7.49168689e+00, -1.38325530e+00, -1.38325530e+00,  1.07596269e-01,\n        6.87797094e+00]))
+E    +    where <function mean at 0x7f400bd05e30> = np.mean
+________________ test_zero_weights_equal_row_deletion[gaussian] ________________
+test_pg_methods.py:284: in test_zero_weights_equal_row_deletion
+    np.testing.assert_allclose(mw.predict(g), md.predict(g), rtol=1e-4, atol=1e-5)
+E   AssertionError: 
+E   Not equal to tolerance rtol=0.0001, atol=1e-05
+E   
+E   Mismatched elements: 3 / 50 (6%)
+E   Mismatch at indices:
+E    [0]: 0.2669511118328455 (ACTUAL), 0.26685140264017787 (DESIRED)
+E    [1]: 0.37542781015780746 (ACTUAL), 0.3753477786139478 (DESIRED)
+E    [2]: 0.479957181675807 (ACTUAL), 0.479895722162504 (DESIRED)
+E   Max absolute difference among violations: 9.97091927e-05
+E   Max relative difference among violations: 0.00037365
+E    ACTUAL: array([ 0.266951,  0.375428,  0.479957,  0.57967 ,  0.673696,  0.761049,
+E           0.840333,  0.910066,  0.968763,  1.014942,  1.04712 ,  1.064215,
+E           1.066387,  1.054033,  1.02755 ,  0.987338,  0.933792,  0.86758 ,...
+E    DESIRED: array([ 0.266851,  0.375348,  0.479896,  0.579625,  0.673667,  0.761033,
+E           0.840328,  0.910068,  0.968772,  1.014956,  1.047138,  1.064236,
+E           1.066409,  1.054055,  1.027573,  0.98736 ,  0.933815,  0.867603,...
+==================================== PASSES ====================================
+________________ test_poisson_non_integer_offset_finite_loglik _________________
+----------------------------- Captured stderr call -----------------------------
+[1s] [HGB] target_mse below mandatory floors; target_mse=5.908e-13 floors=3.000e-12
+_____________________ test_summary_has_one_row_per_smooth ______________________
+----------------------------- Captured stderr call -----------------------------
+[3s] [thin-plate] requested 96 distinct knots but the data contain only 7 geometrically distinct selectable points; reducing the basis to 7 knots
+[3s] [thin-plate] requested 132 distinct knots but the data contain only 61 geometrically distinct selectable points; reducing the basis to 61 knots
+_________________________ test_more_basis_than_samples _________________________
+----------------------------- Captured stderr call -----------------------------
+[4s] saturated design: 134 coefficients for 133 observations (p >= n). The restricted likelihood has no residual degrees of freedom here, so REML lambda-selection is degenerate and may prefer maximum smoothing -- a converged fit with effective df near 1 is the criterion's optimum, not a solver failure (#2607).
+[7s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=4.934e-1 > escape threshold 1.690e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=1.116626e2).
+_______________ test_pvalue_and_edf_invariant_to_response_scale ________________
+----------------------------- Captured stderr call -----------------------------
+[12s] [HGB] target_mse below mandatory floors; target_mse=2.695e-12 floors=3.000e-12
+[13s] [HGB] target_mse below mandatory floors; target_mse=2.695e-12 floors=3.000e-12
+__________________________ test_integer_binary_target __________________________
+----------------------------- Captured stderr call -----------------------------
+[13m 39s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[13m 39s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.0929e87). This indicates a numerical instability.
+[14m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 2.531016e109.
+[14m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.4178e1). This indicates a numerical instability.
+[14m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1757e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[14m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1757e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[14m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.4178e1). This indicates a numerical instability.
+[14m 01s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[14m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 1.168498e91.
+[14m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.0174e78). This indicates a numerical instability.
+[14m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.5207e0). This indicates a numerical instability.
+[14m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 5.380122e118.
+[14m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1752e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[15m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[15m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.2709e101). This indicates a numerical instability.
+[15m 02s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.3641e161). This indicates a numerical instability.
+[15m 07s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 8.593191e115.
+[15m 07s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[15m 07s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.2915e1). This indicates a numerical instability.
+[15m 17s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1722e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[15m 18s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 2.703856e143.
+[15m 18s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[15m 18s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[16m 01s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[16m 01s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[16m 01s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.5494e51). This indicates a numerical instability.
+[16m 33s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[16m 33s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 3.208502e80.
+[16m 33s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0257e140). This indicates a numerical instability.
+[16m 35s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1656e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[16m 45s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[16m 45s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1726e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[16m 46s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 1.520908e132.
+[17m 47s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[17m 47s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2321e1). This indicates a numerical instability.
+[17m 48s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[17m 49s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 7.817151e149.
+=========================== short test summary info ============================
+PASSED test_pg_methods.py::test_prediction_shape
+PASSED test_pg_methods.py::test_poisson_non_integer_offset_finite_loglik
+PASSED test_pg_methods.py::test_summary_has_one_row_per_smooth
+PASSED test_pg_methods.py::test_more_basis_than_samples
+PASSED test_pg_methods.py::test_interval_ordering_and_nesting
+PASSED test_pg_methods.py::test_noise_feature_has_large_pvalue
+PASSED test_pg_methods.py::test_pvalue_and_edf_invariant_to_response_scale
+PASSED test_pg_methods.py::test_integer_binary_target
+PASSED test_pg_methods.py::test_regressor_score_at_most_one
+PASSED test_pg_methods.py::test_loglik_ordering
+PASSED test_pg_methods.py::test_poisson_weights_equal_row_duplication
+PASSED test_pg_methods.py::test_gaussian_weight_rescale_invariance
+PASSED test_pg_methods.py::test_zero_weights_equal_row_deletion[poisson]
+FAILED test_pg_methods.py::test_poisson_offset_scales_prediction - gamfit._ru...
+FAILED test_pg_methods.py::test_posterior_sample_shapes - TypeError: 'Posteri...
+FAILED test_pg_methods.py::test_scale_estimate - AssertionError: no scale/sig...
+FAILED test_pg_methods.py::test_expectile_tau_validation[0.0] - Failed: DID N...
+FAILED test_pg_methods.py::test_expectile_tau_validation[1.0] - Failed: DID N...
+FAILED test_pg_methods.py::test_expectile_tau_validation[-0.1] - Failed: DID ...
+FAILED test_pg_methods.py::test_expectile_tau_validation[1.1] - Failed: DID N...
+FAILED test_pg_methods.py::test_expectile_ordering_and_median_equals_gaussian
+FAILED test_pg_methods.py::test_zero_weights_equal_row_deletion[gaussian] - A...
+9 failed, 13 passed, 3 deselected in 1090.32s (0:18:10)
