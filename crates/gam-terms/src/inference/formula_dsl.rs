@@ -1899,9 +1899,9 @@ pub enum ParsedTerm {
     },
     /// Model-level marker for `0 + ...` / `... - 1`: the formula removes the
     /// global intercept. It consumes no column and builds no design block;
-    /// `term_builder` turns it into [`crate::smooth::ModelLevel::NoIntercept`],
-    /// which decides which remaining term carries the constant (see
-    /// `docs/formulas.md`, "Removing the intercept").
+    /// `term_builder` turns it into [`crate::smooth::ModelLevel::NoIntercept`]
+    /// unless a remaining term spans the constant, in which case the intercept
+    /// stays (see `docs/formulas.md`, "Removing the intercept").
     NoIntercept,
 }
 

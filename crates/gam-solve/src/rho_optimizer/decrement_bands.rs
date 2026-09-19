@@ -90,42 +90,7 @@ pub(crate) fn outer_decrement_bands(
         .map(|value| value * value)
         .sum::<f64>()
         .sqrt();
-    let criterion = evidence.criterion;
-    // A `log|H_β|` channel whose factor derives no forward error would be
-    // charged nothing for it, so the verdict is not taken there.
-    if criterion.is_some_and(|criterion| criterion.logdet_h != 0.0)
-        && evidence.inner_factor.is_none()
-    {
-        return Err(DecrementVerdictNotTaken::NoLogdetForwardError);
-    }
-    // An inner mode whose residual the evaluation cannot form carries an error
-    // the band would charge nothing for, so the verdict is not taken there.
-    let Some(inner_residual) = evidence
-        .inner_residual
-        .map(|charge| charge.energy.abs())
-        .filter(|energy| energy.is_finite())
-    else {
-        return Err(DecrementVerdictNotTaken::NoInnerResidual);
-    };
-    let objective_band = ObjectiveBand {
-        channels: criterion.map_or_else(
-            || gam_linalg::roundoff::accumulation_growth(1) * cost.abs(),
-            |criterion| {
-                growth
-                    * (criterion.fixed_beta.abs()
-                        + criterion.logdet_h.abs()
-                        + criterion.logdet_s.abs()
-                        + criterion.kkt.abs())
-            },
-        ),
-        factor: criterion
-            .filter(|criterion| criterion.logdet_h != 0.0)
-            .zip(evidence.inner_factor)
-            .map(|(_, factor)| 0.5 * factor.logdet_forward_error.abs())
-            .filter(|band| band.is_finite())
-            .unwrap_or(0.0),
-        inner_residual,
-    };
+    let objective_band = outer_objective_band(config, cost, evidence)?;
     // A band past the objective resolution the certificate itself asserts would
     // read any decrease as noise, so the verdict is not taken there.
     let resolution = super::run::outer_rel_cost_floor(config) * (1.0 + cost.abs());
@@ -141,6 +106,65 @@ pub(crate) fn outer_decrement_bands(
         hessian: growth * frobenius,
     };
     Ok((bands, objective_band))
+}
+
+/// The error `band_f` the evaluated `V` carries, by term (#2954), formed from
+/// the evaluation's own [`CertificateEvidence`] exactly as
+/// [`outer_decrement_bands`] forms it, without the gradient and Hessian bands or
+/// the certificate's resolvability test.
+///
+/// This is the band a comparison of two evaluated values needs (#3018): two
+/// values differ resolvably exactly when they are further apart than the sum of
+/// their bands. The count `m = n + p²` is needed only to charge published
+/// channels; a route that publishes none is charged `γ_1·|V|`. `Err` names why
+/// no band can be formed: channels on a route that declares no size, a nonzero
+/// `log|H_β|` channel whose factor derives no forward error, or no inner residual.
+pub(crate) fn outer_objective_band(
+    config: &OuterConfig,
+    cost: f64,
+    evidence: &CertificateEvidence,
+) -> Result<ObjectiveBand, DecrementVerdictNotTaken> {
+    let criterion = evidence.criterion;
+    // A `log|H_β|` channel whose factor derives no forward error would be
+    // charged nothing for it, so no band is formed there.
+    if criterion.is_some_and(|criterion| criterion.logdet_h != 0.0)
+        && evidence.inner_factor.is_none()
+    {
+        return Err(DecrementVerdictNotTaken::NoLogdetForwardError);
+    }
+    // An inner mode whose residual the evaluation cannot form carries an error
+    // the band would charge nothing for, so no band is formed there.
+    let Some(inner_residual) = evidence
+        .inner_residual
+        .map(|charge| charge.energy.abs())
+        .filter(|energy| energy.is_finite())
+    else {
+        return Err(DecrementVerdictNotTaken::NoInnerResidual);
+    };
+    let channels = match criterion {
+        None => gam_linalg::roundoff::accumulation_growth(1) * cost.abs(),
+        Some(criterion) => {
+            let size = &config.problem_size;
+            let (Some(n_obs), Some(p_coefficients)) = (size.n_obs, size.p_coefficients) else {
+                return Err(DecrementVerdictNotTaken::NoProblemSize);
+            };
+            gam_linalg::roundoff::accumulation_growth(n_obs + p_coefficients * p_coefficients)
+                * (criterion.fixed_beta.abs()
+                    + criterion.logdet_h.abs()
+                    + criterion.logdet_s.abs()
+                    + criterion.kkt.abs())
+        }
+    };
+    Ok(ObjectiveBand {
+        channels,
+        factor: criterion
+            .filter(|criterion| criterion.logdet_h != 0.0)
+            .zip(evidence.inner_factor)
+            .map(|(_, factor)| 0.5 * factor.logdet_forward_error.abs())
+            .filter(|band| band.is_finite())
+            .unwrap_or(0.0),
+        inner_residual,
+    })
 }
 
 /// The Newton-decrement stationarity verdict at a point whose curvature is in
