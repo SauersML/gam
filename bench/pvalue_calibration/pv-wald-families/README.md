@@ -309,7 +309,7 @@ two-sided: the Kolmogorov distance from U(0, 1) must stay inside its
 three-sigma DKW radius, and the size at α ∈ {.10, .05, .01} inside
 `α ± 3·√(α(1−α)/m)`. A fit that publishes no p-value fails it. At the base
 (`wood_smooth_test` at `λ̂`) it fails in all seven families, e.g. Beta
-D = 0.425. On this branch:
+D = 0.425. On this branch (head `c10060e9`, after the merge with main):
 
 | family | usable fits | size @ .10 | size @ .05 | size @ .01 | KS D (DKW radius) |
 |---|---|---|---|---|---|
@@ -317,15 +317,15 @@ D = 0.425. On this branch:
 | poisson | 200 | .125 | .065 | .020 | .040 (.129) |
 | binomial | 200 | .095 | .050 | .015 | .056 (.129) |
 | gamma | 200 | .145 | .055 | .010 | .104 (.129) |
-| negative-binomial | 195 | .118 | .062 | .021 | .091 (.130) |
+| negative-binomial | 196 | .117 | .056 | .020 | .087 (.130) |
 | tweedie(p=1.5) | 195 | .092 | .041 | .010 | .057 (.130) |
 | beta | 200 | .100 | .055 | .020 | .087 (.129) |
 
-Every replicate that fitted published a p-value. The five negative-binomial
+Every replicate that fitted published a p-value. The four negative-binomial
 and five Tweedie losses are `fit_from_formula` errors, raised before the
 summary is built (see "Out of lane" above for the Tweedie outer-optimizer
 certification failures).
 
-Pooled over the seven families (1390 fits), the size is .111 at .10
-(z = 1.3), .054 at .05 (z = 0.7) and .014 at .01 (z = 1.7). The largest single
+Pooled over the seven families (1391 fits), the size is .111 at .10
+(z = 1.3), .053 at .05 (z = 0.5) and .014 at .01 (z = 1.6). The largest single
 excursion is gamma at .10: .145, 2.1 MCSE above nominal, one of 21 cells.
