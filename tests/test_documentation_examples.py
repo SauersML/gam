@@ -4,6 +4,11 @@ A ``python`` fence is executable documentation, not pseudocode.  API signatures
 belong in ``text`` fences.  Examples which require external models, accelerators,
 or large user-owned activation arrays use ``python no-exec`` and therefore are
 not executable examples.
+
+Most fences run against a shared namespace of synthetic data (``df``,
+``model``, ...).  The pages a reader copies whole, and the first example of each
+README, run in an empty namespace instead: they must import and load everything
+they use.
 """
 from __future__ import annotations
 
@@ -17,18 +22,24 @@ import pandas as pd
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCS = (ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md")))
+READMES = (ROOT / "README.md", ROOT / "README_PYPI.md")
+DOCS = (*READMES, *sorted((ROOT / "docs").glob("*.md")))
+# Every fence on these pages is a complete program.
+SELF_CONTAINED_PAGES = frozenset({ROOT / "docs" / "tour.md", ROOT / "docs" / "migrating-from-pygam.md"})
 FENCE = re.compile(r"^```(?P<language>python|bash|sh)[ \t]*\n(?P<body>.*?)^```[ \t]*$", re.MULTILINE | re.DOTALL)
 
 
 def examples(language: str):
     for path in DOCS:
         source = path.read_text(encoding="utf-8")
+        first_python = True
         for match in FENCE.finditer(source):
             if match["language"] != language:
                 continue
+            self_contained = path in SELF_CONTAINED_PAGES or (path in READMES and first_python)
+            first_python = False
             line = source.count("\n", 0, match.start()) + 2
-            yield pytest.param(path, line, match["body"], id=f"{path.relative_to(ROOT)}:{line}")
+            yield pytest.param(path, line, match["body"], self_contained, id=f"{path.relative_to(ROOT)}:{line}")
 
 
 def synthetic_data() -> pd.DataFrame:
@@ -114,10 +125,10 @@ def python_context():
     }
 
 
-@pytest.mark.parametrize("path,line,code", list(examples("python")))
-def test_python_documentation_example(path, line, code, python_context, tmp_path, monkeypatch):
+@pytest.mark.parametrize("path,line,code,self_contained", list(examples("python")))
+def test_python_documentation_example(path, line, code, self_contained, python_context, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    namespace = dict(python_context)
+    namespace = {"__name__": "__main__"} if self_contained else dict(python_context)
     compiled = compile(code, f"{path.relative_to(ROOT)}:{line}", "exec")
     exec(compiled, namespace)
 
@@ -136,8 +147,9 @@ def cli_examples():
     for language in ("bash", "sh"):
         for parameter in examples(language):
             # pytest.param stores positional values in ``values``.
-            if parameter.values[2].lstrip().startswith("gam "):
-                yield parameter
+            path, line, code, _ = parameter.values
+            if code.lstrip().startswith("gam "):
+                yield pytest.param(path, line, code, id=parameter.id)
 
 
 @pytest.mark.parametrize("path,line,code", list(cli_examples()))

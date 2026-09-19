@@ -34,7 +34,7 @@ pub(super) fn saddle_escape_needs_curvature_search(
         return true;
     };
     if earlier_escapes > 0 {
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: saddle escape {} of this solve; a gradient-only restart \
              already failed to leave a saddle, so the search latches the declared Hessian \
              (#2939)",
@@ -57,7 +57,7 @@ pub(super) fn saddle_escape_needs_curvature_search(
         });
     match measured {
         Some(norm) if norm > band => {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: the saddle escape point's |Pg|={norm:.3e} clears the \
                  solver band {band:.3e}, so the restart keeps the gradient-only search and \
                  the mint prices the declared Hessian (#2898, #2954)"
@@ -65,7 +65,7 @@ pub(super) fn saddle_escape_needs_curvature_search(
             false
         }
         Some(norm) => {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: the saddle escape point's |Pg|={norm:.3e} is inside the \
                  solver band {band:.3e}; a gradient-only restart would stop at iteration 0, \
                  so the search latches the declared Hessian (#2939)"
@@ -73,7 +73,7 @@ pub(super) fn saddle_escape_needs_curvature_search(
             true
         }
         None => {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: the saddle escape point did not evaluate to a finite \
                  gradient; the search latches the declared Hessian (#2939)"
             );

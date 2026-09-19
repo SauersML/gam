@@ -138,7 +138,7 @@ def test_posterior_payloads_require_exact_fitted_link_identity(
         PosteriorSamples.from_ffi_payload(payload)
 
     draws = _draws()
-    object.__setattr__(draws, "_model_bytes", b"model")
+    object.__setattr__(draws, "_model", object())
     monkeypatch.setattr(
         PosteriorSamples,
         "_normalize",

@@ -40,7 +40,7 @@ use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam_inference::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
+    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
     tweedie_moment_matched_interval,
 };
 use faer::Side;
@@ -226,13 +226,13 @@ fn usable_penalized_hessian<'a>(
     let (active_dim, lift) = match gauge {
         Some(gauge) => {
             if let Err(reason) = gauge.validate() {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian behind an invalid coefficient gauge: {reason}"
                 );
                 return None;
             }
             if gauge.raw_total() != expected_dim {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian whose coefficient gauge lifts to {} \
                      coefficients; expected {expected_dim}",
                     gauge.raw_total()
@@ -245,7 +245,7 @@ fn usable_penalized_hessian<'a>(
     };
     let hessian = fit.penalized_hessian()?;
     if hessian.nrows() != active_dim || hessian.ncols() != active_dim {
-        log::warn!(
+        log::debug!(
             "{label}: ignoring penalized Hessian with shape {}x{}; expected {}x{}",
             hessian.nrows(),
             hessian.ncols(),
@@ -255,7 +255,7 @@ fn usable_penalized_hessian<'a>(
         return None;
     }
     if !hessian.iter().any(|value| value.abs() > 0.0) {
-        log::warn!("{label}: ignoring zero penalized Hessian placeholder");
+        log::debug!("{label}: ignoring zero penalized Hessian placeholder");
         return None;
     }
     Some((hessian, lift))
@@ -306,7 +306,7 @@ fn conditional_prediction_backend<'a>(
                     covariance.view(),
                 )));
             }
-            Err(reason) => log::warn!("{label}: ignoring invalid conditional {reason}"),
+            Err(reason) => log::debug!("{label}: ignoring invalid conditional {reason}"),
         }
     }
     if let Some((hessian, gauge_lift)) = usable_penalized_hessian(fit, expected_dim, label) {
@@ -342,7 +342,7 @@ fn conditional_prediction_backend<'a>(
         }) {
             Ok(backend) => return Ok(Some(backend)),
             Err(err) => {
-                log::warn!(
+                log::debug!(
                     "{label}: failed to build factorized prediction precision backend: {err}"
                 );
             }
@@ -2268,6 +2268,22 @@ where
                     .map(|(i, &mu)| phi * (mu.powi(2) + v(i))),
             ))
         }
+        // `Var(Y|μ) = φμ³`, so E[Var(Y|μ)] = φE[μ³]. Given only the first two
+        // posterior moments of μ, E[μ³] is closed by the log-normal moment
+        // identity E[μ³] = m³(1 + v/m²)³ — exact under the log link, where μ is
+        // log-normal, and the same closure the Tweedie arm uses.
+        ResponseFamily::InverseGaussian => {
+            let phi = source.observation_phi()?;
+            Some(Array1::from_iter(mean.iter().enumerate().map(|(i, &mu)| {
+                let vi = v(i);
+                let plug = phi * mu.powi(3);
+                if vi > 0.0 && mu > 0.0 {
+                    plug * (1.0 + vi / (mu * mu)).powi(3)
+                } else {
+                    plug
+                }
+            })))
+        }
         ResponseFamily::Beta { .. } => {
             let phi = source.observation_phi()?;
             Some(Array1::from_iter(mean.iter().enumerate().map(
@@ -2303,8 +2319,6 @@ fn bernoulli_predictive_quantile(success_probability: f64, cumulative_probabilit
 
 pub(crate) fn family_observation_band<S>(
     response: &ResponseFamily,
-    eta: &Array1<f64>,
-    etavar: &Array1<f64>,
     mean: &Array1<f64>,
     mean_standard_error: &Array1<f64>,
     z_lower_per_row: &Array1<f64>,
@@ -2380,24 +2394,25 @@ where
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
             // Weighted Gaussian: `Var(Y_i|μ_i) = σ̂²/w_i`, so the observation
-            // noise is per-row, not the broadcast pooled scalar (#2077). Identity
-            // link ⇒ η == μ, so this widens the band symmetrically per row.
+            // noise is per-row, not the broadcast pooled scalar (#2077). The band
+            // is centred on the response mean with its posterior variance, so it
+            // is on the response scale under any link (identity: μ = η).
             let obsvar_per_row =
-                gaussian_observation_variance_per_row(obsvar, eta.len(), prior_weights);
+                gaussian_observation_variance_per_row(obsvar, mean.len(), prior_weights);
             let obs_se = Array1::from_iter(
-                etavar
+                mean_variance
                     .iter()
                     .zip(obsvar_per_row.iter())
                     .map(|(&v, &ov)| (v + ov).max(0.0).sqrt()),
             );
             let lower = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_lower_per_row.iter())
                     .map(|((&e, &s), &zl)| e - zl * s),
             );
             let upper = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_upper_per_row.iter())
                     .map(|((&e, &s), &zu)| e + zu * s),
@@ -2485,6 +2500,20 @@ where
                     .expect("phi availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
+        }
+        ResponseFamily::InverseGaussian => {
+            // `Var(Y|μ) = φμ³`: heavier right skew than the Gamma, so the band
+            // is built from equal-tailed moment-matched inverse-Gaussian
+            // quantiles.
+            if source.observation_phi().is_none() {
+                return (None, None);
+            }
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("phi availability was checked above");
+            skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
+                inverse_gaussian_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
         ResponseFamily::Beta { .. } => {
@@ -2790,7 +2819,7 @@ where
     // within-support edge effect.
     let ood_inflation_active = options.ood_inflation && options.extrapolation_variance.is_none();
     if options.ood_inflation && !ood_inflation_active {
-        log::warn!(
+        log::debug!(
             "predict_gamwith_uncertainty: ood_inflation is enabled but an additive \
             extrapolation_variance is supplied; skipping the multiplicative OOD \
             inflation to avoid double-counting off-support uncertainty"
@@ -3055,8 +3084,6 @@ where
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
         family_observation_band(
             &spec.response,
-            &eta,
-            &etavar,
             &mean,
             &mean_standard_error,
             &z_lower_per_row,
@@ -5200,8 +5227,6 @@ mod tests {
         let z_per_row = Array1::from_elem(n, z);
         let (lower, upper) = family_observation_band(
             &ResponseFamily::RoystonParmar,
-            &Array1::zeros(n),
-            &Array1::zeros(n),
             &mean,
             &Array1::from_elem(n, 0.01),
             &z_per_row,

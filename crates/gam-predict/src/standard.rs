@@ -470,11 +470,8 @@ impl PredictableModel for StandardPredictor {
                     let z = standard_normal_quantile(0.5 + 0.5 * level)
                         .map_err(EstimationError::InvalidInput)?;
                     let z_row = Array1::from_elem(result.eta.len(), z);
-                    let etavar = result.eta_standard_error.mapv(|s| s * s);
                     let (obs_lower, obs_upper) = family_observation_band(
                         &self.family.response,
-                        &result.eta,
-                        &etavar,
                         &result.mean,
                         &unc.mean_standard_error,
                         &z_row,

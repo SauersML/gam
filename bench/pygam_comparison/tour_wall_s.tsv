@@ -1,0 +1,7 @@
+example	rows	pygam_call	pygam_s	gamfit_s	pygam_metric	gamfit_metric	note
+wage	3000	LinearGAM(s(0)+s(1)+f(2))	3.97	0.36	-	s(year) edf=1.09	year has 7 unique values; REML shrinks s(year) to near-linear
+mcycle	133	LinearGAM(s(0)).gridsearch	0.23	0.44	95% PI coverage=0.955	95% observation-interval coverage=0.955	location-scale noise_formula="s(times)" reaches coverage 0.97 with heteroscedastic bands; pyGAM has no variance model
+faithful_poisson	-	PoissonGAM(s(0))	0.48	1.67	-	-	histogram counts; family="auto" selects Poisson/log on integer counts
+monotone	300	LinearGAM(s(0, constraints='monotonic_inc'))	0.04	55.36	-	-	shape-constrained path is slow
+te	1500	LinearGAM(te(0, 1))	74.64	7.25	rmse vs truth=0.0312	rmse vs truth=0.0359	truth sin(a)cos(b)+0.5ab
+default_credit	10000	LogisticGAM(...).gridsearch	204.5	did-not-finish	accuracy=0.9739	-	gamfit was killed after 25 min

@@ -524,7 +524,7 @@ pub(crate) fn fit_standard_model(
         &mut request.spec,
     );
     if seeded > 0 {
-        log::info!(
+        log::debug!(
             "[#2750] screened the representer range of {seeded} auto measure-jet term(s) against \
              the response before the standard-fit dispatch"
         );
@@ -569,7 +569,7 @@ pub(crate) fn fit_standard_model(
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
                 Ok(mut firth_fitted) => {
-                    log::info!(
+                    log::debug!(
                         "[#1762/#2273] Firth-capable binomial base fit ({}) refused with a \
                          separation certificate ({original_report}); the Jeffreys-prior refit \
                          certified — adopting it (edf {:.2}).",
@@ -582,7 +582,7 @@ pub(crate) fn fit_standard_model(
                 Err(original_error) => {
                     let retry_report = firth_failure
                         .unwrap_or_else(|| "unknown retry failure".to_string());
-                    log::warn!(
+                    log::debug!(
                         "[#1762/#2273] Firth-capable binomial base fit ({}) failed \
                          ({original_report}); Firth retry also failed to certify \
                          ({retry_report}) — returning the original typed base evidence, not \
@@ -598,7 +598,7 @@ pub(crate) fn fit_standard_model(
                     // reduction or remove/reparameterize the separating column" --
                     // advice to do the thing that was just done automatically and
                     // failed. A caller following it gets the same refusal, and the
-                    // reason the rescue failed lives only in a `log::warn!`, which
+                    // reason the rescue failed lives only in a `log::debug!`, which
                     // is not present in a test panic message and is inert through
                     // the Python extension where this pathology is reported.
                     //
@@ -718,7 +718,7 @@ pub(crate) fn fit_standard_model(
             // (a real `Err` the caller sees), matching how the SAS / mixture
             // adaptive-link paths now report startup-validation failures
             // (#1571/#1572). The fit is NOT silently downgraded.
-            log::warn!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
+            log::debug!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
             return Err(FitFailure::raised(gam_problem::FailureCategory::Convergence, format!(
                 "flexible/learnable link requested via link(type=flexible(...)) / \
                  linkwiggle(...), but the binomial mean link-wiggle joint solve did not \
@@ -853,7 +853,7 @@ fn require_location_scale_covariance_or_decline(
         return Ok(());
     }
     if let Some(decline) = fit.posterior_moment_decline() {
-        log::warn!(
+        log::debug!(
             "[{context}] preserving converged constrained fit with unavailable posterior moments: {}",
             decline.summary(),
         );
@@ -2457,7 +2457,7 @@ fn survival_unified_fit_result(
                 }
             }
             (Some(_), None, _) => {
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason=outer-hessian-not-published \
                      rho_dimension={}",
                     lambdas.len(),
@@ -3155,7 +3155,7 @@ fn load_survival_transformation_persistent_warm_start(
     {
         return None;
     }
-    log::info!("[warm-start-cache] restored survival transformation warm start key={key}");
+    log::debug!("[warm-start-cache] restored survival transformation warm start key={key}");
     let lm_lambda = record
         .last_pirls_lm_lambda
         .filter(|value| value.is_finite() && *value > 0.0);
