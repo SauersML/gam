@@ -219,7 +219,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
-        penalty_subspace: Option<&PenaltySubspace>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
         free_basis: Option<&Array2<f64>>,
@@ -384,14 +383,11 @@ impl<'a> RemlState<'a> {
             // a zero gradient. Fail loud instead of silently mis-optimizing ρ if a
             // future penalty configuration ever lands a penalized fit here without
             // a per-component representation.
-            let owned_subspace;
-            let subspace = if let Some(penalty_subspace) = penalty_subspace {
-                penalty_subspace
-            } else {
-                owned_subspace = self.compute_penalty_subspace(e_for_logdet)?;
-                &owned_subspace
-            };
-            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            //
+            // This branch is the only consumer of the `EᵀE` eigensystem, so it
+            // is formed here rather than by the callers on every evaluation.
+            let subspace = self.compute_penalty_subspace(e_for_logdet)?;
+            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&subspace);
             if !rho.is_empty() {
                 crate::bail_invalid_estim!(
                     "penalty log|Σλ S|₊ ρ-derivatives unavailable: rho_dim={} but no canonical \
@@ -3996,6 +3992,7 @@ impl<'a> RemlState<'a> {
             gaussian_dp_floor_scale_cache: std::sync::OnceLock::new(),
             positive_weight_observation_count_cache: std::sync::OnceLock::new(),
             rho_weight_anchor_cache: std::sync::OnceLock::new(),
+            data_root_cache: Default::default(),
         })
     }
 
@@ -4067,6 +4064,8 @@ impl<'a> RemlState<'a> {
             .flat_glm_first_step_gram
             .write()
             .expect("flat-GLM first-step Gram cache lock poisoned") = None;
+        // The root-scale operator's data root is keyed to the same design.
+        self.data_root_cache.clear();
         *self
             .persistent_warm_start_key
             .write()

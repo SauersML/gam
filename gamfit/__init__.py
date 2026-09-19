@@ -31,7 +31,6 @@ API ``gamfit.fit(df, 'y ~ s(x1) + s(x2)')``.
 See https://github.com/SauersML/gam for the full guide.
 """
 
-from importlib import metadata as _metadata
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 
 from ._api import (
@@ -403,10 +402,6 @@ from .geometry import (
     TorusManifold,
 )
 
-try:
-    __version__ = _metadata.version("gamfit")
-except _metadata.PackageNotFoundError:
-    __version__ = "0.0.0+unknown"
 
 # Names whose implementation lives behind the optional ``torch`` extra. They
 # are loaded lazily while keeping the cold-start import path torch-free.
@@ -417,12 +412,13 @@ _LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
 
 
 if _TYPE_CHECKING:
+    __version__: str
     from .torch.hyperbolic import PoincareAtoms as PoincareAtoms
     from .torch.interchange import InterchangeSwapDecoder as InterchangeSwapDecoder
 
 
 def __getattr__(name: str) -> object:
-    """Lazy attribute hook for optional-extra primitives exposed at the top level.
+    """Lazy attribute hook for ``__version__`` and optional-extra primitives.
 
     A missing optional dependency (typically ``torch``) is surfaced as
     ``AttributeError`` chained from the underlying ``ModuleNotFoundError``.
@@ -430,6 +426,18 @@ def __getattr__(name: str) -> object:
     bool and that ``from gamfit import *`` does not blow up on torch-less
     installs while torch-specific modules remain under ``gamfit.torch``.
     """
+    if name == "__version__":
+        # Read from the installed distribution on first access, not at import:
+        # ``importlib.metadata`` is the largest single cost of ``import gamfit``
+        # after numpy, and a fit never needs it.
+        from importlib import metadata
+
+        try:
+            version = metadata.version("gamfit")
+        except metadata.PackageNotFoundError:
+            version = "0.0.0+unknown"
+        globals()["__version__"] = version
+        return version
     target = _LAZY_TORCH_ATTRS.get(name)
     if target is not None:
         module_path, attr = target

@@ -5951,4 +5951,8 @@ pub(crate) struct RemlState<'a> {
     pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
     pub(crate) positive_weight_observation_count_cache: std::sync::OnceLock<usize>,
     pub(crate) rho_weight_anchor_cache: std::sync::OnceLock<f64>,
+    /// The data half `R_G` (`R_GᵀR_G = XᵀWX`) of the root-scale Hessian
+    /// operator, kept for the weights it was formed at. Keyed to `x`, so
+    /// `reset_surface` clears it.
+    pub(crate) data_root_cache: laml_logdet::DataRootCache,
 }
