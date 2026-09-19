@@ -105,22 +105,17 @@ def test_group_and_re_remain_penalized_random_effects() -> None:
 
 
 def _rare_event_frame(seed: int) -> Any:
-    # A credit-default-shaped problem: about 3% events, a binary student
-    # indicator with a modest negative log odds ratio, and a smooth covariate.
+    # A credit-default-shaped problem: about 3% events and a binary student
+    # indicator whose log odds ratio sits several standard errors from 0. The
+    # balance covariate drives the outcome but is left out of the saturated
+    # fits, which therefore target the marginal cell log-odds.
     rng = np.random.default_rng(seed)
     n = 8000
     student = rng.integers(0, 2, n)
     balance = rng.uniform(-1.0, 1.0, n)
-    eta = -3.6 - 0.45 * student + 1.2 * balance
+    eta = -3.6 - 0.8 * student + 1.2 * balance
     y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    return pd.DataFrame(
-        {
-            "student": np.array(["No", "Yes"])[student],
-            "student01": student.astype(float),
-            "balance": balance,
-            "y": y,
-        }
-    )
+    return pd.DataFrame({"student": np.array(["No", "Yes"])[student], "y": y})
 
 
 def _logit(p: float) -> float:
@@ -151,8 +146,28 @@ def test_rare_event_binomial_factor_is_the_unshrunk_empirical_log_odds_ratio(
     )
 
 
+def _indicator_beside_smooth_frame(seed: int) -> Any:
+    # The saturated rare-event case is pinned above; here the point is the
+    # factor's equivalence to an unpenalized 0/1 column when a smooth shares
+    # the fit, so the smooth carries a genuine curve.
+    rng = np.random.default_rng(seed)
+    n = 8000
+    student = rng.integers(0, 2, n)
+    balance = rng.uniform(-1.0, 1.0, n)
+    eta = -0.5 - 0.8 * student + 1.5 * np.sin(2.5 * balance)
+    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+    return pd.DataFrame(
+        {
+            "student": np.array(["No", "Yes"])[student],
+            "student01": student.astype(float),
+            "balance": balance,
+            "y": y,
+        }
+    )
+
+
 def test_fixed_factor_matches_an_unpenalized_indicator_beside_a_smooth() -> None:
-    data = _rare_event_frame(seed=1)
+    data = _indicator_beside_smooth_frame(seed=1)
     factor_model = gamfit.fit(data, "y ~ factor(student) + s(balance)", family="binomial")
     indicator_model = gamfit.fit(
         data,
