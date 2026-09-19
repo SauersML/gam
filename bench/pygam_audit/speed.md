@@ -93,12 +93,15 @@ The data files are `n1e3.jsonl`, `n1e4.jsonl`, `n1e5.jsonl` and `n1e6.jsonl`.
 | gaussian | 1e6 | p1 | 31.8 (1 rep) | - | 12.1 (1 rep) | - | 2.6x | - |
 | binomial | 1e3 | p1 | 0.53 [0.51-0.58] | 0.75 | 0.0127 | 0.098 | 41x | 5.4x |
 | binomial | 1e3 | p5 | 3.66 [3.66-4.40] | 12.2 [9.6-13.0] | 0.053 | 0.38 | 69x | 9.8x |
-| binomial | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | - | - | ∞ | ∞ |
+| binomial | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.48 | 4.44 | ∞ | ∞ |
 | binomial | 1e4 | p1 | 3.10 [3.01-3.49] | - | 0.065 | 0.43 | 48x | 7.2x |
 | binomial | 1e4 | p5 | 31.4 (1 rep; trace 29.9) | - | 0.86† | 4.59† | 37x | 6.8x |
 | binomial | 1e4 | te | 30.0 (trace, 1 rep) | - | 0.72† | 4.77† | 42x | 6.3x |
-| poisson | 1e3 | p1 | 0.69† | - | 0.018† | 0.110† | 38x | 6.3x |
-| poisson | 1e3 | p5 | 3.79† | - | 0.088† | 0.50† | 43x | 7.6x |
+| binomial | 1e3 | te | 1.59 [1.47-2.49] | 4.89 | 0.049 | 0.40 | 33x | 4.0x |
+| poisson | 1e3 | p1 | 0.51 [0.50-0.63] | 0.79 | 0.016 | 0.099 | 32x | 5.2x |
+| poisson | 1e3 | p5 | 3.64 [3.36-4.41] | 9.24 | 0.065 | 0.42 | 56x | 8.6x |
+| poisson | 1e3 | te | 2.66 [2.52-2.91] | 6.00 | 0.080 | 0.45 | 34x | 5.9x |
+| poisson | 1e3 | **p20** | **timeout 400 s wall** | **timeout** | 0.76 | 4.27 | ∞ | ∞ |
 | poisson | 1e4 | p1 | 4.11† | - | 0.106† | - | 39x | - |
 | poisson | 1e4 | p5 | 27.3 (trace, 1 rep) | - | 1.01† | 4.77† | 27x | 5.7x |
 
@@ -131,6 +134,7 @@ memory than pyGAM in every measured config.**
 | gaussian | 1e5 | p5 | **0.41 s** | 0.58 s | **0.71x (gamfit wins)** |
 | gaussian | 1e6 | p1 | 3.65 s | 4.43 s | **0.82x (gamfit wins)** |
 | binomial | 1e3 | p1 / p5 | 55 / 52 ms | 1.6 / 4.7 ms | **35x / 11x** |
+| binomial | 1e3 | **te** | **1.36 s [1.19-1.37]** | 2.5 ms | **544x** (about 1.3 ms/row) |
 | binomial | 1e4 | p1 | 470 ms | 11.5 ms | **41x** |
 | poisson | 1e3 / 1e4 | p1 | 4.8 / 36 ms† | 1.4 / 15 ms† | 2.4-3.4x |
 
@@ -327,10 +331,14 @@ This is exact, not an approximation.
 
 **Files:** `model_payload_builders.rs:285-338`, `request.rs:690-709`, `gamfit/_model.py`. **Size: M.**
 
-### F7 — Binomial predict is 11-41x slower than pyGAM: an exact logit-normal mean plus an always-on adaptive quadrature cross-check. HIGH, bug
+### F7 — Binomial predict is 11-544x slower than pyGAM: an exact logit-normal mean plus an always-on adaptive quadrature cross-check. HIGH, bug
 
 **Evidence.**
 - Binomial predict costs about 48 µs/row; it is 35x slower than pyGAM at 1e3 rows and 41x at 1e4.
+- For `te(x0, x1)` binomial it is much worse: 1.36 s [1.19-1.37] for 1e3 rows, about 1.3 ms/row
+  against pyGAM's 2.5 ms total, which is **544x** (3 reps). I did not trace why te costs 27x more
+  per row than s(x). My guess is that te predictions carry a larger posterior σ, which pushes rows
+  onto the 160-term erfcx series plus the adaptive cross-check.
   Poisson and Gaussian cost about 3 µs/row.
 - `crates/gam-solve/src/quadrature.rs:1127-1150`: `logit_posterior_meanwith_deriv_controlled`
   computes the erfcx series candidate (up to `LOGIT_MAX_TERMS=160`, line 454), then **always**
@@ -404,6 +412,7 @@ This is exact, not an approximation.
 
 ## 5. Open measurement gaps
 
+- n=1e3 is complete: 144 configs × 3 reps. p20 timed out for all three families, with both gamfit variants.
 - n=1e5 and 1e6 GLM, and n=1e5 te, were still running.
 - At 0.2 core per process, a single gamfit binomial fit at 1e5 p5 is expected to take more than
   25 min wall.
