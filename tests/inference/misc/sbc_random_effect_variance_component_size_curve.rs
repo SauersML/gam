@@ -237,14 +237,27 @@ fn poisson_null_random_effect_size_is_within_monte_carlo_error() {
     assert_null_size_within_monte_carlo_error(Family::Poisson);
 }
 
+/// Under a real group effect (sd 1) the rejection rate at `α = 0.05` over
+/// `N_POWER_REPLICATIONS` seeded fits must clear the null band `α + 2·MCSE(α)`:
+/// the test has power beyond its size.
 #[test]
 fn a_real_group_effect_is_detected() {
+    const N_POWER_REPLICATIONS: u64 = 40;
+    const ALPHA: f64 = 0.05;
     init_parallelism();
+    let m = N_POWER_REPLICATIONS as f64;
+    let null_band = ALPHA + 2.0 * (ALPHA * (1.0 - ALPHA) / m).sqrt();
     for family in [Family::Gaussian, Family::Binomial, Family::Poisson] {
-        let p_value = group_p_value(family, 0, 1.0);
+        let rejections = (0..N_POWER_REPLICATIONS)
+            .into_par_iter()
+            .filter(|&rep| group_p_value(family, rep, 1.0) <= ALPHA)
+            .count();
+        let power = rejections as f64 / m;
+        eprintln!("{family:?}: power at α={ALPHA} is {power:.3} (null band {null_band:.3})");
         assert!(
-            p_value < 1e-3,
-            "{family:?}: a group effect with sd 1 read p = {p_value}"
+            power > null_band,
+            "{family:?}: a group effect with sd 1 was rejected in {rejections}/{N_POWER_REPLICATIONS} \
+             fits at α={ALPHA}, not above the null band {null_band:.3}"
         );
     }
 }
