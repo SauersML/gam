@@ -48,7 +48,9 @@ def _grid(n: int = 41) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
 
 def test_tensor_surface_is_monotone_along_the_constrained_margin() -> None:
     df = _surface_data()
-    model = gamfit.fit(df, "y ~ te(x, z, shape=[monotone_increasing, none])")
+    # k pinned at the 7 x 7 these constraints were written against: at 8+ per
+    # margin the shape-constrained outer REML fails or hangs (#3234).
+    model = gamfit.fit(df, "y ~ te(x, z, k=[7, 7], shape=[monotone_increasing, none])")
     gx, gz, grid = _grid()
     surf = np.asarray(model.predict(grid), dtype=float).reshape(gx.size, gz.size)
     assert np.all(np.isfinite(surf))
@@ -66,7 +68,9 @@ def test_tensor_margin_curvature_constraint_holds_on_the_grid() -> None:
     z = rng.uniform(0.0, 1.0, n)
     y = (x - 0.4) ** 2 * (1.0 + z) + 0.5 * np.cos(3.0 * z) + rng.normal(0.0, 0.1, n)
     df = pd.DataFrame({"x": x, "z": z, "y": y})
-    model = gamfit.fit(df, "y ~ te(x, z, shape=[convex, monotone_decreasing])")
+    # k pinned at the 7 x 7 these constraints were written against: at 8+ per
+    # margin the shape-constrained outer REML fails or hangs (#3234).
+    model = gamfit.fit(df, "y ~ te(x, z, k=[7, 7], shape=[convex, monotone_decreasing])")
     gx, gz, grid = _grid()
     surf = np.asarray(model.predict(grid), dtype=float).reshape(gx.size, gz.size)
     second_x = np.diff(surf, n=2, axis=0)

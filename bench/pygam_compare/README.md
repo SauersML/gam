@@ -67,6 +67,8 @@ These are the plans (see `plans.py`):
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
+| `fuzz_families` | gamfit only: n ∈ {50, 500, 5000}, every family/link label × every support-edge regime (convergence fuzz, below) | 3 |
+| `fuzz_families_quick` | gamfit only: n ∈ {50, 500}, every family/link label × {base, edge, zeros, lowdisp} (the 0-failure regression test) | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
 
@@ -79,6 +81,35 @@ Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
 It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
 scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
 absolute numbers.
+
+The `fuzz_families` plans are a convergence fuzz, not a comparison
+(`fuzz_families.py`). A cell is one family/link label, n and an `ff-<regime>`
+design. The labels cover every response family in gamfit's family registry
+with every link its legality table admits: Gamma (log, inverse), the inverse
+Gaussian (canonical `1/μ²`, log), the negative binomial, Tweedie at p = 1.2, 1.5 and
+1.8, beta, scaled t, Poisson, binomial with trials (every binomial link) and the
+Gaussian on its inverse link. gamfit has no quasi families. The regime places
+the data at an edge of the family's support: responses at the boundary, a mean
+spanning orders of magnitude, a region with no events, near-degenerate or
+extreme dispersion, no signal, or extreme units (the module docstring lists
+them). Every fit is `y ~ s(x0) + s(x1)`.
+
+`failure_cause` classifies each rep. A rep fails when it hung (hit the safety
+net), crashed, raised, did not certify its optimum, predicted a non-finite point
+or interval, or reported a scale more than `SCALE_Z_MAX` = 10 standard errors
+from the truth. The standard error is that of the oracle Pearson estimate at the
+true mean, recomputed from the rep's seeded draw. The scale is not judged at
+`lowdisp`, where the basis's approximation error is as large as the noise, so a
+correct fit's scale carries it. A binomial draw with no events at all has a
+constant response, and a typed refusal of it is correct, not a failure. The
+triage table (causes by count, with an example rep for each) prints with:
+
+```bash
+python -m pygam_compare.fuzz_families RUN_DIR [RUN_DIR ...]
+```
+
+`test_fuzz_families_quick.py` runs the quick plan and requires zero failures;
+`test_fuzz_families_fixtures.py` pins the cells whose root causes were fixed.
 
 The `threads` and `oversubscribe` plans measure parallelism rather than compare
 libraries. A cell's `threads` sets every pool variable listed under **Threads**

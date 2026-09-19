@@ -14,7 +14,7 @@ use gam_math::probability::{normal_cdf, normal_pdf};
 use gam_problem::types::{InverseLink, LikelihoodSpec};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
@@ -72,10 +72,12 @@ pub enum LatentConditioningSpan {
 /// replays or the conditional location-scale calibration
 /// `ζ = (z − m(a))/√v(a)` (#905, gam#2926). A fit mints at most one of the two.
 ///
-/// This is the one owner of that composition. The saved marginal-slope predictor
-/// reads its kernel score through it, and so does
-/// `FittedModel::latent_conditional_residual`, which returns ζ for new rows
-/// (gam#3016).
+/// This is the one owner of that composition (gam#3016). The fit computes the
+/// score its kernel is fitted on through it ([`Self::apply_on_span`] on the
+/// training rows, [`Self::calibrate`] wherever the fit applies a calibration it
+/// just estimated), the saved marginal-slope predictor reads its kernel score
+/// through it, and so does `FittedModel::latent_conditional_residual`, which
+/// returns ζ for new rows.
 #[derive(Clone, Copy)]
 pub(crate) struct FittedLatentScoreMap<'a> {
     pub(crate) normalization: &'a SavedLatentZNormalization,
@@ -83,6 +85,23 @@ pub(crate) struct FittedLatentScoreMap<'a> {
     pub(crate) conditional: Option<&'a LatentZConditionalCalibration>,
     /// Where `primary_design` carries the conditioning span `a`.
     pub(crate) span: LatentConditioningSpan,
+}
+
+/// The normalisation of a score that is already on its fitted scale.
+static IDENTITY_NORMALIZATION: SavedLatentZNormalization =
+    SavedLatentZNormalization { mean: 0.0, sd: 1.0 };
+
+impl<'a> FittedLatentScoreMap<'a> {
+    /// The conditional location-scale step alone, for a fit applying the
+    /// calibration it just estimated to scores it has already normalised.
+    pub(crate) fn conditional_only(conditional: &'a LatentZConditionalCalibration) -> Self {
+        Self {
+            normalization: &IDENTITY_NORMALIZATION,
+            rank_int: None,
+            conditional: Some(conditional),
+            span: LatentConditioningSpan::PrimaryDesign,
+        }
+    }
 }
 
 impl FittedLatentScoreMap<'_> {
@@ -93,19 +112,76 @@ impl FittedLatentScoreMap<'_> {
         primary_design: &DesignMatrix,
         context: &str,
     ) -> Result<Array1<f64>, EstimationError> {
+        let design = self.conditional.map(|_| primary_design.to_dense());
+        let a_block = design
+            .as_ref()
+            .map(|design| self.conditioning_span(design.view()))
+            .transpose()?;
+        self.apply_on_span(z_raw, a_block, context)
+    }
+
+    /// The fitted latent score of each row with the conditioning span `a`
+    /// already in hand, as the fit has it on its training rows. `a_block` is
+    /// read only by a conditional calibration, which refuses its absence.
+    pub(crate) fn apply_on_span(
+        &self,
+        z_raw: &Array1<f64>,
+        a_block: Option<ArrayView2<'_, f64>>,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
         let normalized = self
             .normalization
             .apply(z_raw, context)
             .map_err(EstimationError::from)?;
-        self.conditional_step(&self.rank_int_step(&normalized), primary_design)
+        self.calibrate(normalized.view(), a_block)
+            .map_err(EstimationError::InvalidInput)
+    }
+
+    /// The calibration steps on normalised scores: the rank-INT or the
+    /// conditional location-scale map, whichever the fit minted.
+    pub(crate) fn calibrate(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_block: Option<ArrayView2<'_, f64>>,
+    ) -> Result<Array1<f64>, String> {
+        let z = self.rank_int_step(z);
+        let Some(cal) = self.conditional else {
+            return Ok(z);
+        };
+        let a_block = a_block.ok_or_else(|| {
+            "conditional latent calibration needs its conditioning span a, and none was supplied"
+                .to_string()
+        })?;
+        cal.apply(z.view(), a_block)
+    }
+
+    /// The columns of the dense primary design that carry `a`.
+    fn conditioning_span<'d>(
+        &self,
+        design: ArrayView2<'d, f64>,
+    ) -> Result<ArrayView2<'d, f64>, EstimationError> {
+        match self.span {
+            LatentConditioningSpan::PrimaryDesign => Ok(design),
+            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
+                let width = design.ncols();
+                if ncols > width {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "conditional latent calibration names the trailing {ncols} columns of the \
+                         primary design as its conditioning span, but that design has only \
+                         {width} columns"
+                    )));
+                }
+                Ok(design.slice_move(ndarray::s![.., width - ncols..]))
+            }
+        }
     }
 
     /// The rank-INT step on normalised scores, or the identity when the fit
     /// minted none.
-    fn rank_int_step(&self, z: &Array1<f64>) -> Array1<f64> {
+    fn rank_int_step(&self, z: ArrayView1<'_, f64>) -> Array1<f64> {
         match self.rank_int {
             Some(cal) => z.mapv(|zi| cal.apply_at_predict(zi)),
-            None => z.clone(),
+            None => z.to_owned(),
         }
     }
 
@@ -120,21 +196,7 @@ impl FittedLatentScoreMap<'_> {
             return Ok(z.clone());
         };
         let design = primary_design.to_dense();
-        let a_block = match self.span {
-            LatentConditioningSpan::PrimaryDesign => design.view(),
-            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
-                let width = design.ncols();
-                if ncols > width {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "conditional latent calibration names the trailing {ncols} columns of the \
-                         primary design as its conditioning span, but that design has only \
-                         {width} columns"
-                    )));
-                }
-                design.slice(ndarray::s![.., width - ncols..])
-            }
-        };
-        cal.apply(z.view(), a_block)
+        cal.apply(z.view(), self.conditioning_span(design.view())?)
             .map_err(EstimationError::InvalidInput)
     }
 }
@@ -765,7 +827,7 @@ impl BernoulliMarginalSlopePredictor {
     /// having passed the strict normality check, so no transform was
     /// applied at fit time either.
     fn apply_latent_z_calibration(&self, z: &Array1<f64>) -> Array1<f64> {
-        self.latent_score_map().rank_int_step(z)
+        self.latent_score_map().rank_int_step(z.view())
     }
 
     /// Apply the (optional) conditional location-scale latent-z calibration

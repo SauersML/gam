@@ -3881,6 +3881,37 @@ impl FittedModel {
         Ok(required)
     }
 
+    /// Columns [`Self::latent_conditional_residual`] reads: the prediction
+    /// columns less a survival response's time columns, since ζ is a function
+    /// of the score and the conditioning covariates alone (gam#3016). A time
+    /// column the formula also names as a covariate stays. The CLI and PyFFI
+    /// residual commands project their frames onto this one set.
+    pub fn latent_conditional_residual_columns(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut required = self.prediction_required_columns()?;
+        let parsed = parse_formula(self.payload().formula.as_str()).map_err(|e| e.to_string())?;
+        let mut covariates = std::collections::BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut covariates);
+        let mut time_columns = Vec::new();
+        if let Some((entry, exit, _event)) =
+            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend(entry);
+            time_columns.push(exit);
+        } else if let Some((left, right, _event)) =
+            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend([left, right]);
+        }
+        for column in time_columns {
+            if !covariates.contains(&column) {
+                required.remove(&column);
+            }
+        }
+        Ok(required)
+    }
+
     /// Columns a *post-fit diagnostic* command (diagnose / sample / report)
     /// needs **beyond** [`Self::prediction_required_columns`].
     ///

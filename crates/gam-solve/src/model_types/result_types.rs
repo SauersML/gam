@@ -2963,15 +2963,11 @@ pub enum SmoothingCorrectionMethod {
         active_rank: usize,
         rho_dimension: usize,
     },
-    /// Sigma-point integration is a named approximation: it integrates the
-    /// smoothing-parameter posterior over a finite node set rather than in
-    /// closed form, so it must never be reported as exact WPS.
-    ///
-    /// It no longer carries a `rho_hessian_stabilization` ledger. That field
-    /// recorded a relative ridge this branch used to add to the rho-Hessian
-    /// before inverting it for its own copy of `V_rho`; the branch now reuses
-    /// the certified, UNPERTURBED inverse the first-order path produces, so
-    /// there is no perturbation left to record (#2728).
+    /// Sigma-point integration of the smoothing-parameter posterior over a
+    /// finite node set. No fit mints this any more: the correction is the
+    /// analytic first-order one for every smoothing dimension. The variant is
+    /// kept only so models saved by earlier releases still deserialize, and it
+    /// is never reported as exact WPS.
     SigmaPointCubature {
         rank: usize,
         n_points: usize,
@@ -3006,6 +3002,10 @@ pub enum SmoothingCorrectionAbsence {
     /// outer search ran first-order.
     OuterHessianNotAnalytic { detail: String },
     /// The optimum is certified on an infinite-smoothing rail, where ρ has no finite variance.
+    ///
+    /// No longer produced: the correction excludes railed coordinates exactly as the outer
+    /// certificate does (at a rail `∂β̂/∂ρ_k → 0`, so they contribute nothing). Kept so fits
+    /// saved before that change still load.
     RailCertified { detail: String },
     /// The corrected covariance could not be truncated to the constrained feasible set.
     ConstrainedTruncationRefused { detail: String },
@@ -3098,24 +3098,19 @@ pub struct FitInference {
     /// Method that produced `smoothing_correction`. Required whenever a matrix
     /// is present; `None` means no correction was retained.
     pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
-    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
-    /// RETAINED even when `smoothing_correction`/`smoothing_correction_method`
-    /// above hold a cubature upgrade instead. `compute_smoothing_correction_auto`
-    /// always computes the first-order correction before deciding whether to
-    /// escalate to sigma-point cubature; discarding it once cubature is chosen
-    /// made the #946 WPS-corrected-EDF/AIC channel go dark precisely when
-    /// smoothing-parameter uncertainty is large enough to matter — the regime
-    /// the correction exists for (see `model_comparison_from_unified`'s
-    /// `method_certified_exact` gate, which is exact-provenance-only by
-    /// design). `Some` exactly when `smoothing_correction_method_first_order`
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction
+    /// read by the #946 WPS-corrected-EDF/AIC channel (see
+    /// `model_comparison_from_unified`'s `method_certified_exact` gate). A fresh
+    /// fit sets it equal to `smoothing_correction`; it differs only on models
+    /// saved by earlier releases whose primary pair held a sigma-point
+    /// cubature. `Some` exactly when `smoothing_correction_method_first_order`
     /// is `Some(FirstOrderIdentifiedSubspace{..})`; `None` when the first-order
-    /// geometry itself was unavailable (mirrors `smoothing_correction` in that
-    /// case — there is nothing to retain either way).
+    /// geometry itself was unavailable.
     #[serde(default)]
     pub smoothing_correction_first_order: Option<Array2<f64>>,
     /// Provenance for `smoothing_correction_first_order`. Always either `None`
     /// or `Some(FirstOrderIdentifiedSubspace{..})` — this field never holds
-    /// `SigmaPointCubature`, unlike `smoothing_correction_method` above.
+    /// `SigmaPointCubature`.
     #[serde(default)]
     pub smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     /// The typed reason a fit that selected smoothing parameters publishes no
@@ -5881,19 +5876,15 @@ impl UnifiedFitResult {
     ///     Var(β|y) = E_ρ[φ·H(ρ)⁻¹] + Cov_ρ[β̂(ρ)],
     /// ```
     ///
-    /// which integrates conditional covariance over the smoothing posterior.
-    /// Its difference from covariance conditional on the mode can have either
-    /// sign: total covariance compares against the *average* conditional
-    /// covariance, not its value at `ρ̂`. Interval calibration must therefore
-    /// be checked against the intended posterior or repeated-data coverage. Use
+    /// evaluated to first order at `ρ̂` (Wood, Pya & Säfken 2016):
+    /// `Vp = Vβ + J V_ρ Jᵀ`, with `J = ∂β̂/∂ρ` from the implicit function
+    /// theorem and `V_ρ` the inverse outer Hessian on its identified subspace.
+    /// Interval calibration is checked against repeated-data coverage. Use
     /// [`Self::beta_covariance`] instead only when `λ` is fixed by the caller,
     /// or when you specifically want the conditional-on-`λ̂` object.
     ///
     /// The smoothing contribution is small where the outer criterion is sharply
-    /// determined and can be large where it is broad. Large differences require
-    /// inspecting the posterior integration diagnostics;
-    /// [`SmoothingCorrectionMethod::SigmaPointCubature::max_node_criterion_rise`]
-    /// is the published diagnostic for the one that produced #2728.
+    /// determined and can be large where it is broad.
     pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
         self.covariance_corrected.as_ref().or_else(|| {
             has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts)
@@ -6245,12 +6236,11 @@ impl UnifiedFitResult {
             .and_then(|inference| inference.smoothing_correction_method)
     }
 
-    /// The exact first-order IFT smoothing-parameter-uncertainty correction,
-    /// retained even when [`Self::smoothing_correction`] holds a cubature
-    /// upgrade instead. This is the accessor the #946 WPS corrected-EDF/AIC
-    /// channel must read from: it is populated whenever the first-order
-    /// geometry was computable, independent of whether the fit's PRIMARY
-    /// correction escalated to sigma-point cubature for some other consumer.
+    /// The exact first-order IFT smoothing-parameter-uncertainty correction.
+    /// This is the accessor the #946 WPS corrected-EDF/AIC channel reads: it is
+    /// populated whenever the first-order geometry was computable, including on
+    /// models saved by earlier releases whose primary correction was a
+    /// sigma-point cubature.
     pub fn smoothing_correction_first_order(&self) -> Option<&Array2<f64>> {
         self.inference
             .as_ref()

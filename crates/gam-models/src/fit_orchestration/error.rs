@@ -567,24 +567,6 @@ impl FitFailure {
         }
     }
 
-    /// The Jeffreys arming evidence the custom-family refusal this failure ends
-    /// in carries (#979), read through context, annotation and fatal
-    /// outer-evaluation wrappers. `None` for every other failure.
-    #[must_use]
-    pub fn jeffreys_arming_evidence(
-        &self,
-    ) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
-        match self {
-            Self::Context { source, .. } | Self::Annotated { source, .. } => {
-                source.jeffreys_arming_evidence()
-            }
-            Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
-            Self::Estimation(err) => Self::custom_family_leaf(err)
-                .and_then(CustomFamilyError::jeffreys_arming_evidence),
-            Self::SurvivalMarginalSlope(_) | Self::Workflow(_) | Self::Raised { .. } => None,
-        }
-    }
-
     /// The fixed category of the error this failure ends in.
     #[must_use]
     pub fn category(&self) -> FailureCategory {
@@ -657,6 +639,27 @@ impl FitFailure {
             },
             Self::Workflow(err) => match err.as_ref() {
                 WorkflowError::Fit(failure) => failure.terminal_inner_mode_evidence(),
+                _ => None,
+            },
+            Self::SurvivalMarginalSlope(_) | Self::Raised { .. } => None,
+        }
+    }
+
+    /// The Jeffreys arming evidence the custom-family refusal this failure ends
+    /// in carries ([`CustomFamilyError::jeffreys_arming_evidence`]), seen
+    /// through the wrappers that only carry it.
+    #[must_use]
+    pub fn jeffreys_arming_evidence(&self) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
+        match self {
+            Self::Context { source, .. } | Self::Annotated { source, .. } => {
+                source.jeffreys_arming_evidence()
+            }
+            Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
+            Self::Estimation(err) => {
+                Self::custom_family_leaf(err).and_then(CustomFamilyError::jeffreys_arming_evidence)
+            }
+            Self::Workflow(err) => match err.as_ref() {
+                WorkflowError::Fit(failure) => failure.jeffreys_arming_evidence(),
                 _ => None,
             },
             Self::SurvivalMarginalSlope(_) | Self::Raised { .. } => None,

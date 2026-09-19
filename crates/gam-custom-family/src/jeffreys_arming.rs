@@ -64,68 +64,53 @@ pub fn fit_custom_family_arming_on_evidence_with_rho_prior<
     rho_prior: gam_problem::RhoPrior,
 ) -> Result<UnifiedFitResult, CustomFamilyError> {
     arm_on_evidence(
-        |arming| match arming {
-            Arming::Unarmed => fit_custom_family_with_rho_prior(
-                &family.with_jeffreys_armed(None),
-                specs,
-                options,
-                rho_prior.clone(),
-            ),
-            Arming::Armed { evidence, unarmed } => {
-                let warm_specs = unarmed
-                    .map(|fit| warm_started_specs(specs, fit))
-                    .transpose()?;
-                fit_custom_family_with_rho_prior(
-                    &family.with_jeffreys_armed(Some(evidence)),
-                    warm_specs.as_deref().unwrap_or(specs),
-                    options,
-                    rho_prior.clone(),
-                )
-            }
-        },
+        fit_custom_family_with_rho_prior(
+            &family.with_jeffreys_armed(None),
+            specs,
+            options,
+            rho_prior.clone(),
+        ),
         |fit| fit,
         CustomFamilyError::jeffreys_arming_evidence,
+        |evidence, certified| {
+            let warm_specs = certified
+                .map(|fit| warm_started_specs(specs, &fit))
+                .transpose()?;
+            fit_custom_family_with_rho_prior(
+                &family.with_jeffreys_armed(Some(evidence)),
+                warm_specs.as_deref().unwrap_or(specs),
+                options,
+                rho_prior,
+            )
+        },
     )
 }
 
-/// Which member of a family's objective one run of [`arm_on_evidence`] fits.
-pub enum Arming<'a, T> {
-    /// The unarmed objective, which every lifecycle fits first.
-    Unarmed,
-    /// The armed objective, on the evidence the unarmed run produced. `unarmed`
-    /// is that run's result when it certified (its posterior was proved
-    /// improper), for a warm start; a refused unarmed run leaves it `None`.
-    Armed {
-        evidence: &'a JeffreysArmingEvidence,
-        unarmed: Option<&'a T>,
-    },
-}
-
-/// The arming lifecycle over a whole fitting route (#979, #3164).
+/// The arming lifecycle over any solve that ends in a fit: the rule
+/// [`fit_custom_family_arming_on_evidence`] applies to one inner fit, applied
+/// to a caller whose unarmed and armed members each run a whole route, such
+/// as an outer search over length-scale or auxiliary coordinates.
 ///
-/// `run` fits the route once under the member it is handed: every inner solve,
-/// outer search and final fit of that run on the same member, so the route
-/// solves one objective whichever driver path it takes. The unarmed run goes
-/// first; it is refit armed once, only on typed evidence:
+/// - `unarmed` is the unarmed member's outcome. A certified fit (`fit_of`)
+///   whose posterior is not proved improper (neither its cone-truncated
+///   posterior nor its unconstrained posterior on `ker(S_λ)`, #3164) is
+///   returned as it is; a refusal whose `refusal_evidence` is `None` is
+///   returned unchanged.
+/// - Otherwise `armed` solves the armed member once, given the evidence and,
+///   when the unarmed member certified, its outcome to warm-start from.
 ///
-/// - an unarmed result that certifies with no evidence is returned as it is;
-/// - a refusal whose `refusal_evidence` is `Some` arms the refit, with no
-///   certified mode to start from; any other refusal is returned unchanged;
-/// - a certified result whose posterior is proved improper (its cone-truncated
-///   posterior, or its unconstrained posterior on `ker(S_λ)`) arms the refit,
-///   handed that result for a warm start.
-///
-/// `fit` reads a result's fitted model. The armed result publishes its evidence
-/// on `FitArtifacts::jeffreys_arming_evidence`.
+/// The armed fit publishes its evidence on
+/// `FitArtifacts::jeffreys_arming_evidence`.
 pub fn arm_on_evidence<T, E>(
-    mut run: impl FnMut(Arming<'_, T>) -> Result<T, E>,
-    fit: impl Fn(&mut T) -> &mut UnifiedFitResult,
-    refusal_evidence: impl Fn(&E) -> Option<JeffreysArmingEvidence>,
+    unarmed: Result<T, E>,
+    fit_of: impl Fn(&mut T) -> &mut UnifiedFitResult,
+    refusal_evidence: impl FnOnce(&E) -> Option<JeffreysArmingEvidence>,
+    armed: impl FnOnce(&JeffreysArmingEvidence, Option<T>) -> Result<T, E>,
 ) -> Result<T, E> {
-    let (evidence, unarmed) = match run(Arming::Unarmed) {
-        Ok(mut result) => match certified_fit_evidence(fit(&mut result)) {
-            None => return Ok(result),
-            Some(evidence) => (evidence, Some(result)),
+    let (evidence, certified) = match unarmed {
+        Ok(mut outcome) => match certified_fit_evidence(fit_of(&mut outcome)) {
+            None => return Ok(outcome),
+            Some(evidence) => (evidence, Some(outcome)),
         },
         Err(refusal) => match refusal_evidence(&refusal) {
             None => return Err(refusal),
@@ -135,14 +120,11 @@ pub fn arm_on_evidence<T, E>(
     log::debug!(
         "[custom-family] arming the Jeffreys/Firth prior on the unarmed fit's evidence: \
          {evidence:?}; warm start from the unarmed mode: {}",
-        unarmed.is_some(),
+        certified.is_some(),
     );
-    let mut armed = run(Arming::Armed {
-        evidence: &evidence,
-        unarmed: unarmed.as_ref(),
-    })?;
-    fit(&mut armed).artifacts.jeffreys_arming_evidence = Some(evidence);
-    Ok(armed)
+    let mut refit = armed(&evidence, certified)?;
+    fit_of(&mut refit).artifacts.jeffreys_arming_evidence = Some(evidence);
+    Ok(refit)
 }
 
 /// The evidence a certified fit carries that its own posterior is improper:

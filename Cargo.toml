@@ -64,6 +64,7 @@ members = [
     "crates/gam-pyffi",
     "crates/gam-runtime",
     "crates/gam-test-support",
+    "crates/gam-build-identity",
 ]
 resolver = "3"
 

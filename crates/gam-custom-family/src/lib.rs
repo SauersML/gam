@@ -175,7 +175,7 @@ pub use covariance::{
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;
 pub use jeffreys_arming::{
-    Arming, JeffreysArming, arm_on_evidence, fit_custom_family_arming_on_evidence,
+    JeffreysArming, arm_on_evidence, fit_custom_family_arming_on_evidence,
     fit_custom_family_arming_on_evidence_with_rho_prior,
 };
 pub(crate) use jeffreys::*;
