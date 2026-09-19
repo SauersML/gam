@@ -1312,9 +1312,20 @@ impl PointCovarianceProvenance {
     /// The provenance of a posterior-mean point integrated from `fit`'s own
     /// posterior.
     pub fn of_fit(fit: &UnifiedFitResult) -> Option<Self> {
+        // An expectile fit is identity-link: its posterior-mean point is the
+        // mode Xβ̂ and integrates no covariance, so its declined sandwich
+        // qualifies only the intervals, which `refuse_declined_covariance`
+        // refuses.
         fit.artifacts
             .covariance_declined
             .clone()
+            .filter(|declined| {
+                !matches!(
+                    declined,
+                    gam_solve::model_types::CovarianceDeclined::
+                        ExpectileSandwichRequiresDenseCovariance { .. }
+                )
+            })
             .map(|declined| Self::ConditionalOnFittedLatentLaw { declined })
     }
 

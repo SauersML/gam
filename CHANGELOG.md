@@ -1,5 +1,38 @@
 ## Unreleased
 
+- **Model comparison ranks on the smoothing-corrected AIC, in one Rust function** (pyGAM
+  audit d11). `gamfit.compare_models`, `Model.evidence_ratio_vs` and the new `gam compare`
+  used to rank on an uncorrected `−2·loglik + 2·edf` that the Python FFI assembled from
+  summary fields. It counted no estimated scale and no correction for having estimated
+  the smoothing parameters, and on `y ~ s(x)` against `y ~ s(x) + s(z)` with `z` pure
+  noise it preferred the noise model in 9 of 20 fixed-seed replicates; the corrected
+  ranking prefers the true model in 18 of 20. The fitted summary
+  now carries `aic_conditional = −2·loglik + 2·(edf + scale_dof)`, `edf_corrected`
+  (Wood, Pya and Säfken 2016: `edf + tr(X'WX·J V_ρ Jᵀ)/scale`), `aic_corrected`,
+  `scale_dof` and, when no correction exists (the O(n) spline scan keeps no ρ covariance),
+  `aic_corrected_unavailable`. `compare_saved_models` ranks on `aic_corrected` and refuses
+  a fit without it, with that reason; it never falls back to the conditional AIC. Both
+  `compare_models` and `gam compare MODEL... --names ...` print its serialized result.
+  `compare_models` takes fitted models (or their saved bytes) only; summary mappings and
+  `cv_scores` are gone. The REML/LAML `score_table` stays, for nested comparisons that
+  share the family, data and unpenalized fixed-effect space.
+  **Migration:** `Model.conditional_aic` is removed; read `model.summary().aic_corrected`
+  (or `aic_conditional`). Ranking rows are dicts keyed `name`, `aic_corrected`,
+  `delta_aic`, `evidence_ratio`, `aic_conditional`, `edf_corrected`, `edf_conditional`.
+- Rust: `gam_solve::inference::information_criteria` (`corrected_edf`,
+  `information_criteria`, `InformationCriteria`) is the one place the criteria are formed.
+  `evidence::compare_models` takes `ComparisonCandidate`s and returns
+  `criterion = "aic_corrected"`; `criterion_gap` is now `log_evidence_ratio`. The pyffi
+  bindings `model_conditional_aic` and `compare_reml_fits` and the helper
+  `ranking_score_from_summary_payload` are deleted.
+
+- **Fitted models pickle, copy and cross process boundaries** (pyGAM audit api F1 / PKG-02).
+  `pickle.dumps`, `copy.deepcopy`, `joblib.dump` and `joblib.Parallel` refused a fitted
+  `Model`, `MultinomialModel` or sklearn `GAMRegressor`/`GAMClassifier` with
+  `cannot pickle '_FittedModel'`. They now serialize the saved-model bytes `dumps()` returns
+  and rebuild through `gamfit.loads`, so a round trip is byte-identical and every accessor
+  returns bit-identical values. The compiled prediction handle is never pickled; it is
+  rebuilt from the bytes.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`

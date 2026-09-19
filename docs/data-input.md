@@ -16,8 +16,11 @@ before crossing the Rust FFI boundary.
 | `Sequence[Mapping[str, Any]]` | Records. The full set of keys across rows defines the column order; each row must contain every key. |
 | `Sequence[Sequence]` (2-D) | Columns auto-named `x0`, `x1`, …. All rows must have the same width. |
 
-pandas/polars/pyarrow are detected at runtime via `_try_import`. They
-are not required at install time.
+numpy is the only required dependency. pandas, polars and pyarrow are
+recognised only when the caller has already imported them (gamfit checks
+`sys.modules` and never imports a table library itself), and pandas frames need
+no pyarrow: their columns cross as NumPy arrays. Polars and pyarrow tables
+cross through the Arrow C stream they export.
 
 Equivalent inputs for a two-column dataset:
 
@@ -35,9 +38,20 @@ np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0]])  # columns become x0, x1
 
 ## Validation rules
 
-Numeric columns cross the FFI boundary as one contiguous `float64` block and
-categorical columns as labels (Arrow-capable inputs — pyarrow, polars, and
-pandas with the Arrow C stream — are decoded from Arrow memory directly).
+Every column crosses the FFI boundary in the layout its source declares: a
+numeric NumPy or pandas column as `float64` (nullable `Int64`/`boolean` NA
+becomes a missing cell), a pandas categorical as codes plus its levels, and a
+string, object or plain-Python column as its raw values. Polars and pyarrow
+tables are decoded from Arrow memory directly. The engine then applies one rule
+to every untyped column: it is a factor if any cell is a string, otherwise
+numeric. A cell that is neither a number, a string nor missing (a date, a
+timestamp, a complex number, an arbitrary object) raises `gamfit.DataError`
+naming its type, row and column, whichever library it came from. A column
+whose declared dtype is neither numbers nor labels (NumPy or pandas
+`datetime64`, `timedelta64`, `complex`; an Arrow date or timestamp) raises
+`gamfit.DataError` naming the column; encode such values as numbers first.
+Labels are trimmed on every path, and a label of only whitespace raises
+`gamfit.DataError` naming its row and column.
 Table normalization itself enforces only shape rules, because it runs before
 any formula is known:
 
@@ -142,5 +156,4 @@ preds = model.predict(
 # preds = {"patient_id": ["P001", "P002"], "linear_predictor": [...], "mean": [...]}
 ```
 
-The id column is excluded from the model and may be any type that
-`stringify_cell` accepts.
+The id column is excluded from the model and may hold numbers or strings.
