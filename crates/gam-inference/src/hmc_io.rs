@@ -3287,8 +3287,8 @@ mod tests {
         ) {
             self.steps.lock().expect("step record").push(step.clone());
         }
-        fn max_representable_order(&self) -> usize {
-            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+        fn is_representable_order(&self, order: usize) -> bool {
+            gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
     }
 
@@ -3339,12 +3339,14 @@ mod tests {
     struct ScriptedCorrector {
         script: Vec<f64>,
         requests: std::sync::Mutex<Vec<Vec<usize>>>,
+        representability_queries: std::sync::Mutex<Vec<usize>>,
     }
     impl ScriptedCorrector {
         fn new(script: Vec<f64>) -> Self {
             Self {
                 script,
                 requests: std::sync::Mutex::new(Vec::new()),
+                representability_queries: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn requests(self) -> Vec<Vec<usize>> {
@@ -3409,8 +3411,12 @@ mod tests {
         ) {
             assert_eq!(step.axis_orders.len(), 1, "the scripted corrector is one-axis");
         }
-        fn max_representable_order(&self) -> usize {
-            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+        fn is_representable_order(&self, order: usize) -> bool {
+            self.representability_queries
+                .lock()
+                .expect("query record")
+                .push(order);
+            gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
     }
 
@@ -3566,6 +3572,30 @@ mod tests {
             ),
             "typed refusal at order {max_order} expected, got {refusal}"
         );
+    }
+
+    #[test]
+    fn the_order_search_asks_representability_only_of_the_orders_it_raises_to_784() {
+        // A search that resolves at order 6 raises 4 → 5 → 6, so it asks the rule builder
+        // about orders 5 and 6 alone. Taking the ceiling from a scan of every order up to it
+        // built a few hundred rules, most of a second, on the first non-Gaussian fit of
+        // every process.
+        let target = AnharmonicBlock {
+            lambdas: array![2.0],
+            a: 0.05,
+        };
+        let corrector = ScriptedCorrector::new(vec![1e-2, 1e-4, 1e-7]);
+        let marginal = gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
+            &corrector, &target, 1e-6,
+        )
+        .expect("a fast-contracting axis resolves");
+        assert_eq!(marginal.axis_orders, vec![6]);
+        let queries = corrector
+            .representability_queries
+            .lock()
+            .expect("query record")
+            .clone();
+        assert_eq!(queries, vec![5, 6], "representability queries {queries:?}");
     }
 
     #[test]
@@ -6353,11 +6383,11 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         log::debug!("[#784] block quadrature order search: {step}");
     }
 
-    /// `block_quadrature_marginal_correction` refuses the order past this one as
+    /// `block_quadrature_marginal_correction` refuses an order this rejects as
     /// [`BlockQuadratureRefusal::UnrepresentableOrder`], or as an integration refusal when the
     /// rule cannot be built, because it integrates with the same rule builder.
-    fn max_representable_order(&self) -> usize {
-        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
+    fn is_representable_order(&self, order: usize) -> bool {
+        gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
     }
 }
 
