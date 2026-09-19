@@ -3585,19 +3585,8 @@ mod root_cause_tests {
         assert!(kkt.stationarity <= 1e-12);
     }
 
-    /// The user's large-scale pathological case: a fit with `n=320000`,
-    /// `p=20`, projected stationarity residual `‖g‖ = 1.465e-5`. The old
-    /// absolute test `‖g‖ < 1e-6` rejects this as non-converged, even
-    /// though the normalized residual is ~2.6e-8. After the fix, the
-    /// scale-invariant certificate accepts it under EITHER bound.
-    #[test]
-    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
-        let n = 320_000usize;
-        let p = 20usize;
-        let g_norm = 1.465e-5;
-        let tol = 1e-6;
-
-        let state = WorkingState {
+    fn certificate_state(n: usize, p: usize, natural_scale: f64) -> WorkingState {
+        WorkingState {
             eta: LinearPredictor::new(Array1::zeros(n)),
             gradient: Array1::zeros(p),
             hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
@@ -3607,19 +3596,20 @@ mod root_cause_tests {
             penalty_term: 0.0,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            // At convergence the score and penalty gradient nearly cancel;
-            // both are O(√n) for standardized columns. Use a representative
-            // magnitude so the natural-scale bound has something to chew on.
-            gradient_natural_scale: 1.0e3,
-        };
+            gradient_natural_scale: natural_scale,
+        }
+    }
 
-        // Dimension-based bound: tol * sqrt(n) * sqrt(p) ≈ 1e-6 * 565.7 * 4.47 ≈ 2.5e-3
-        // Natural-scale bound: 1.465e-5 / (1 + 1e3) ≈ 1.5e-8
-        // Both pass; old absolute test 1.465e-5 < 1e-6 fails.
-        assert!(
-            state.certifies_kkt(g_norm, tol),
-            "scale-invariant certificate should accept large-scale pathological case"
-        );
+    /// The large-scale case: `n=320000`, `p=20`, projected stationarity
+    /// residual `‖g‖ = 1.465e-5` on a natural scale of `1e3`. An absolute
+    /// test `‖g‖ < 1e-6` rejects it, though its dimensionless residual is
+    /// `1.5e-8`; the certificate accepts it.
+    #[test]
+    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
+        let g_norm = 1.465e-5;
+        let tol = 1e-6;
+        let state = certificate_state(320_000, 20, 1.0e3);
+        assert!(state.certifies_kkt(g_norm, tol));
         assert!(
             !(g_norm < tol),
             "this test must witness the failure of the old absolute test; \
@@ -3627,113 +3617,67 @@ mod root_cause_tests {
         );
     }
 
-    /// The strict KKT certificate must be invariant under uniform rescaling
-    /// of the objective `F → c·F` (which scales `‖g‖`, `‖score‖`, and
-    /// `‖S·β‖` all by the same `c`). The additive `1` floor in the
-    /// natural-scale denominator makes the test approximately invariant
-    /// at small natural scale and exactly invariant in the limit.
+    /// The certificate is exactly invariant under a uniform rescaling of the
+    /// gradient (`F → c·F`, or `β → β/c`), which scales `‖g‖`, `‖score‖` and
+    /// `‖S·β‖` together, at EVERY natural scale — not only once the natural
+    /// scale dominates an additive floor.
     #[test]
     pub(crate) fn certifies_kkt_is_scale_invariant() {
-        let n = 1000usize;
-        let p = 10usize;
-        let tol = 1e-6;
-        let g_norm = 1.0;
-        let natural_scale = 5.0e6; // dominates the +1 floor
-
-        let mk_state = |g: Array1<f64>, ns: f64| WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: g,
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: ns,
-        };
-
-        let base = mk_state(Array1::zeros(p), natural_scale);
-        let scaled = mk_state(Array1::zeros(p), natural_scale * 1000.0);
-
-        // Numerator scales by c; denominator scales by c when the natural
-        // scale dominates. So r_g is invariant.
-        assert_eq!(
-            base.certifies_kkt(g_norm, tol),
-            scaled.certifies_kkt(g_norm * 1000.0, tol),
-            "KKT classification must be invariant under uniform F → c·F"
-        );
+        let tol = 1e-8;
+        for natural_scale in [1.0e-5, 1.0, 5.0e6] {
+            for residual in [1.0e-10, 1.0e-6] {
+                let g_norm = residual * natural_scale;
+                let verdict = certificate_state(1000, 10, natural_scale).certifies_kkt(g_norm, tol);
+                assert_eq!(verdict, residual < tol);
+                for c in [1.0e-6, 1.0e6] {
+                    assert_eq!(
+                        certificate_state(1000, 10, natural_scale * c).certifies_kkt(g_norm * c, tol),
+                        verdict,
+                        "KKT classification must be invariant under g → c·g (scale {natural_scale:e}, c {c:e})"
+                    );
+                }
+            }
+        }
     }
 
-    /// The two scale-invariant certificates must each be sufficient on its
-    /// own (acceptance under EITHER suffices). One is data-driven (natural
-    /// scale), the other purely structural (sqrt(n)·sqrt(p)). Both should
-    /// accept obviously-converged states; failures of one should not block
-    /// the other.
+    /// The canonical inverse-Gaussian inner solve at a small-unit response:
+    /// P-IRLS stopped at `‖g‖ = 4.72e-12` on a natural scale of order `1e-5`,
+    /// two steps into a solve whose mode (the same data at ten times the
+    /// units) sits nine steps away. The dimension bound `τ·√n·√p` and the
+    /// additive `1 +` floor both read that residual in the gradient's own
+    /// units and certified it; its dimensionless residual `4.7e-7` is far
+    /// above `τ` and must not certify.
     #[test]
-    pub(crate) fn certifies_kkt_accepts_under_either_bound() {
-        let n = 100usize;
-        let p = 5usize;
-        let tol = 1e-6;
-
-        let state_well_scaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 1.0e6,
-        };
-        // Natural-scale bound: 1.0 / (1+1e6) ≈ 1e-6 → at threshold; pass.
-        // Dimension bound: 1.0 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.2e-5 → fail.
-        // Acceptance under EITHER: pass (via natural-scale).
-        assert!(state_well_scaled.certifies_kkt(0.99e-6 * (1.0 + 1.0e6), tol));
-
-        let state_unscaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 0.0,
-        };
-        // Natural-scale bound: 2e-6 / 1 = 2e-6 → fail (above tol=1e-6).
-        // Dimension bound: 2e-6 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.236e-5 → pass.
-        // Acceptance under EITHER: pass (via dimension).
-        assert!(state_unscaled.certifies_kkt(2.0e-6, tol));
+    pub(crate) fn certifies_kkt_refuses_small_unit_residual_far_from_mode() {
+        let tol = 1e-10;
+        let state = certificate_state(500, 23, 1.0e-5);
+        assert!(!state.certifies_kkt(4.72e-12, tol));
+        assert!(!state.near_stationary_kkt(4.72e-12, tol));
+        assert!(state.certifies_kkt(4.72e-12 * 1.0e-4, tol));
     }
 
-    /// The near-stationary band is exactly 10× the strict KKT tolerance,
-    /// applied under either bound. It classifies a usable but non-strictly
+    /// An exactly zero residual is stationary on any natural scale, zero
+    /// included; a nonzero residual on a zero natural scale is not resolved by
+    /// the ratio and is left to the exact Newton decrement.
+    #[test]
+    pub(crate) fn certifies_kkt_on_zero_natural_scale() {
+        let tol = 1e-6;
+        let state = certificate_state(100, 5, 0.0);
+        assert!(state.certifies_kkt(0.0, tol));
+        assert!(state.near_stationary_kkt(0.0, tol));
+        assert!(!state.certifies_kkt(2.0e-6, tol));
+        assert!(!state.near_stationary_kkt(2.0e-6, tol));
+    }
+
+    /// The near-stationary band is exactly 10× the strict KKT tolerance on the
+    /// same dimensionless residual. It classifies a usable but non-strictly
     /// converged minimum as `StalledAtValidMinimum` rather than as a hard
     /// non-convergence.
     #[test]
     pub(crate) fn near_stationary_kkt_uses_ten_times_band() {
-        let n = 100usize;
-        let p = 4usize;
         let tol = 1e-6;
-        let state = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 99.0,
-        };
-        // Natural-scale band: relative ‖g‖ = g/(1+99) = g/100 ≤ 10·tol = 1e-5
-        // ⇒ accept when g ≤ 1e-3.
+        let state = certificate_state(100, 4, 100.0);
+        // Relative ‖g‖ = g/100 ≤ 10·tol = 1e-5 ⇒ accept when g ≤ 1e-3.
         assert!(state.near_stationary_kkt(9.9e-4, tol));
         assert!(!state.near_stationary_kkt(2.0e-3, tol));
         // Strict KKT at the same point should be ~10× tighter.

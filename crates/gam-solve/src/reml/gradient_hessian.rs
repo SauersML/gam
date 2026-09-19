@@ -3681,6 +3681,29 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// The row weights `W` of the data curvature `XᵀWX` that the penalized
+    /// Hessian `XᵀWX + S_λ` carries at `rho`. On the Gaussian identity link the
+    /// working weight is the prior weight, so no solve is needed; otherwise it
+    /// is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the cached P-IRLS
+    /// solve at `rho`, and a refused solve is returned as its error.
+    pub(crate) fn data_curvature_weights(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Ok(self.weights.to_owned());
+        }
+        let pilot = self.execute_pirls_if_needed(rho)?;
+        if pilot.solveweights.len() != self.weights.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "P-IRLS returned {} working weights for {} rows",
+                pilot.solveweights.len(),
+                self.weights.len()
+            )));
+        }
+        Ok(pilot.solveweights.to_owned())
+    }
+
     /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
     ///
     /// For each penalty block `j` this sets
@@ -3729,19 +3752,7 @@ impl<'a> RemlState<'a> {
         if n_rho == 0 {
             return Ok(None);
         }
-        let weights = if reml_is_gaussian_identity(&self.config.likelihood) {
-            self.weights.to_owned()
-        } else {
-            let pilot = self.execute_pirls_if_needed(base)?;
-            if pilot.solveweights.len() != self.weights.len() {
-                return Err(EstimationError::LayoutError(format!(
-                    "analytic initial-sp seed: pilot fit carries {} working weights for {} rows",
-                    pilot.solveweights.len(),
-                    self.weights.len()
-                )));
-            }
-            pilot.solveweights.to_owned()
-        };
+        let weights = self.data_curvature_weights(base)?;
         let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
             EstimationError::RemlOptimizationFailed(format!(
                 "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
