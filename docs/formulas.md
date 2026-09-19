@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -167,7 +167,7 @@ Removing the intercept therefore removes the constant only when no term
 could represent it. A term that spans the constant keeps the intercept, and
 the model is exactly the one written with it:
 
-- **A fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main effect of a
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
   factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
   REML-estimated ridge. Beside the free intercept that ridge shrinks only the
   contrasts between levels, so the overall level is free and the level
@@ -201,7 +201,6 @@ support shrinkage.
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -218,7 +217,7 @@ random intercepts.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
@@ -238,9 +237,11 @@ So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
-`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+`factor()`, `group()` and `re()` take no options: the penalty
 strength is always estimated, so `factor(site, k=3)` is rejected as an
-unknown option instead of being ignored. A categorical column is also
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for
@@ -760,6 +761,17 @@ so naming an option never changes a fit by itself.
 Examples:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+space, time, x, z, h = (rng.uniform(0, 1, n) for _ in range(5))
+theta, u, v = (rng.uniform(0, 2 * np.pi, n) for _ in range(3))
+df = {"space": space, "time": time, "x": x, "z": z, "h": h, "theta": theta, "u": u, "v": v,
+      "y": np.sin(2 * np.pi * space) * time + np.sin(theta) * h + np.cos(u) + np.sin(v)
+           + x * z + rng.normal(0, 0.3, n)}
+
 gamfit.fit(df, "y ~ te(space, time, k=[12, 8])")
 gamfit.fit(df, "y ~ te(space, time, k=(12, 8))")
 gamfit.fit(df, "y ~ te(space, time, k_space=12, k_time=8)")
@@ -814,6 +826,14 @@ per-axis shrinkage. Setting `scale_dimensions=True` on `fit()`
 enables it globally across compatible spatial smooths.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pc = rng.normal(0, 1, (400, 4))
+df = {"pc1": pc[:, 0], "pc2": pc[:, 1], "pc3": pc[:, 2], "pc4": pc[:, 3],
+      "y": np.sin(pc[:, 0]) + 0.5 * pc[:, 1] ** 2 + rng.normal(0, 0.3, 400)}
+
 gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
@@ -864,6 +884,13 @@ y ~ x + link(type=flexible(probit))
 The formula value wins if both are set.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(30, 80, 400)
+df = {"age": age, "case": (rng.uniform(size=age.size) < 1 / (1 + np.exp(-(age - 55) / 8))).astype(float)}
+
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
 

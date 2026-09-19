@@ -97,6 +97,32 @@ pub(crate) fn aft_absolute_newton_direction(
     })
 }
 
+/// Number of backtracking trials, starting at `alpha0` and contracting by
+/// `contraction`, whose predicted second-order gain
+/// `m(α) = α·g·δ + ½α²·κ` stays above the objective's rounding band. Below
+/// that band the Armijo sufficient-increase test compares log-likelihoods
+/// that round to the same value, so a further trial can only accept rounding
+/// noise (#3185). `m` is increasing in `α > 0` wherever it is positive, so the
+/// trials resolvable from `alpha0` are exactly the leading run above the band.
+pub(crate) fn aft_resolvable_trial_count(
+    alpha0: f64,
+    slope: f64,
+    curvature_gain: f64,
+    contraction: f64,
+    objective_band: f64,
+) -> usize {
+    let mut trials = 0_usize;
+    let mut alpha = alpha0;
+    loop {
+        let predicted_gain = alpha * slope + 0.5 * alpha * alpha * curvature_gain;
+        if !(predicted_gain.is_finite() && predicted_gain > objective_band) {
+            return trials;
+        }
+        trials += 1;
+        alpha *= contraction;
+    }
+}
+
 impl SurvivalLocationScaleFamily {
     /// Recompute every block's linear predictor `η_b = D_b · β_b + o_b` from
     /// the joint coefficient vector `theta` (block-concatenated) and the block
@@ -390,15 +416,13 @@ impl SurvivalLocationScaleFamily {
             // A trial whose predicted gain m(α) is inside the objective band
             // cannot be told from no change, so the trial count is the number
             // of step lengths whose predicted gain is above that resolution.
-            let max_steps = {
-                let mut count = 0_usize;
-                let mut a = alpha;
-                while model_gain(a) > gain_band {
-                    count += 1;
-                    a *= constants::BACKTRACK_CONTRACTION;
-                }
-                count
-            };
+            let max_steps = aft_resolvable_trial_count(
+                alpha,
+                slope,
+                curvature_gain,
+                constants::BACKTRACK_CONTRACTION,
+                gain_band,
+            );
             // A trial whose block-state rebuild or likelihood evaluation errors
             // is INVALID (`Ok(None)`): contract without consulting the test.
             let accepted = match backtracking_line_search::<_, Infallible>(

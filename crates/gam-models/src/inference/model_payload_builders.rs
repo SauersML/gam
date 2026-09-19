@@ -308,6 +308,7 @@ fn standard_conformal_penalty(
         crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
             &gram,
             normal_matrix,
+            fit.lambdas.len(),
         )
     });
     match penalty {
@@ -1517,7 +1518,21 @@ fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint:
 /// An automatic `.` term is expanded against `dataset` first, so the payload
 /// stores (and `model.formula` shows) the formula that was actually fitted, and
 /// the expansion's notes lead the payload's inference notes.
+///
+/// On a one-thread pool the fit runs on the pool's worker, so its parallel
+/// loops never hand work across threads
+/// (`gam_linalg::parallel::run_on_single_worker_pool`).
 pub fn fit_formula_to_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+) -> Result<FittedModelPayload, WorkflowError> {
+    gam_linalg::parallel::run_on_single_worker_pool(|| {
+        fit_formula_to_payload_here(formula, dataset, fit_config)
+    })
+}
+
+fn fit_formula_to_payload_here(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,

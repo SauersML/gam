@@ -355,7 +355,7 @@ fn summary_smooth_terms(
     // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
     // off the fit inside that walk, which is where `fd998d957` put them.
     let rows =
-        gam_solve::estimate::smooth_term_summary_rows(&design, spec, fit, whitening_gram_full);
+        gam_solve::estimate::smooth_term_summary_rows(&design, fit, whitening_gram_full);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
@@ -1483,7 +1483,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()

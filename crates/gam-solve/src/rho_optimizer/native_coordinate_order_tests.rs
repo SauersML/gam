@@ -67,13 +67,9 @@ fn criterion_eval(theta: &Array1<f64>) -> OuterEval {
 }
 
 fn permuted_run() -> Result<OuterResult, EstimationError> {
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let problem = OuterProblem::new(4)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_bounds(Array1::from_elem(4, -BOX), Array1::from_elem(4, BOX))
         .with_initial_rho(array![0.0, 5.0, -3.0, 4.0])
         .with_max_iter(1)

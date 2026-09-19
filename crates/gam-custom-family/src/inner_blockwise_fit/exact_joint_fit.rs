@@ -1756,17 +1756,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // and trial-value calls; the conditioning changes slowly across cycles
         // so re-estimating per cycle (one `O(p·k)` burst) is already cheap
         // against the work it guards.
-        let jeffreys_skippable_this_cycle: bool = if options.seed_screening {
-            // Seed screening only ranks seeds: skip the O(p · per-axis-Hdot)
-            // full Jeffreys gradient/curvature loop. The value-only Jeffreys
-            // term (folded into the objective baseline / trial penalties via
-            // `custom_family_joint_jeffreys_value`, gated independently on
-            // `joint_jeffreys_subspace.is_some()`) still bounds the screening
-            // score on separating directions; only the per-axis step curvature
-            // — the wrong cost class for ranking on a K-block coupled family —
-            // is dropped here (gam#729/#808).
-            true
-        } else if joint_jeffreys_subspace.is_some() {
+        let jeffreys_skippable_this_cycle: bool = if joint_jeffreys_subspace.is_some() {
             // EXPECTED-INFORMATION GUARD (gam#1020): the skippable
             // certificate probes the OBSERVED Hessian source; it only
             // transfers to the Jeffreys gate when the family's Jeffreys
@@ -7441,12 +7431,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             last_cycle_obj_change_below_tol,
             lastobjective,
         );
-        // A seed-screening solve that stops at its cap is expected (gam#2943).
-        if converged || options.seed_screening {
-            log::debug!("{verdict}");
-        } else {
-            log::debug!("{verdict}");
-        }
+        log::debug!("{verdict}");
     }
 
     // If joint Newton converged, skip the blockwise loop entirely.
@@ -7709,16 +7694,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     )
                 })
                 .unwrap_or_else(|| "last_newton_math=<none>".to_string());
-            // A seed-screening solve stops at its deliberate cap: that is the
-            // expected end of a ranking probe, not a failure to report at debug
-            // (gam#2943).
-            let exhaustion_level = if options.seed_screening {
-                log::Level::Trace
-            } else {
-                log::Level::Debug
-            };
-            log::log!(
-                exhaustion_level,
+            log::debug!(
                 "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT:objective_start={:.6e} objective_end={:.6e} objective_drop={:+.3e} beta_inf={:.3e} exit_unprojected_kkt_inf={:.3e} total_p={} total_n={} block_widths={:?} block_beta_inf={:?} block_grad_inf={:?} block_diag_hessian_default={} {}; rejecting this outer REML/LAML evaluation",
                 cycles_done,
                 initial_joint_objective,
@@ -7747,8 +7723,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // fit-able, so aborting the whole fit prevents the optimizer
                 // from ever leaving the valley.
                 let block_diag = exit_report.format_bubbled_error();
-                log::log!(
-                    exhaustion_level,
+                log::debug!(
                     "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}; returning a non-converged inner mode for outer-rho rejection"
                 );
             }

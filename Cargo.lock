@@ -3577,6 +3577,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gam-build-identity"
+version = "0.3.157"
+
+[[package]]
 name = "gam-cli"
 version = "0.3.157"
 dependencies = [
@@ -3584,6 +3588,7 @@ dependencies = [
  "comfy-table",
  "csv",
  "gam",
+ "gam-build-identity",
  "gam-data",
  "gam-math",
  "gam-predict",
@@ -3862,7 +3867,6 @@ dependencies = [
  "statrs 0.19.0",
  "tempfile",
  "thiserror 2.0.19",
- "wide 1.5.0",
 ]
 
 [[package]]
@@ -3916,6 +3920,7 @@ dependencies = [
  "csv",
  "faer",
  "gam",
+ "gam-build-identity",
  "gam-math",
  "gam-predict",
  "gam-runtime",

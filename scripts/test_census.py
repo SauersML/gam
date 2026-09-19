@@ -85,10 +85,208 @@ def tokens(source):
         position = token.end()
 
 
+CLOSING = {"(": ")", "[": "]", "{": "}"}
+IDENT = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+class Cursor:
+    """An iterator over one file's tokens that can also look ahead."""
+
+    def __init__(self, items):
+        self.items, self.index = list(items), 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.index >= len(self.items):
+            raise StopIteration
+        self.index += 1
+        return self.items[self.index - 1]
+
+    def peek(self, offset=0):
+        at = self.index + offset
+        return self.items[at] if at < len(self.items) else None
+
+    def group(self):
+        """Consume the balanced delimited group at the cursor and return its inner tokens."""
+        opening = next(self, None)
+        if opening not in CLOSING:
+            raise ValueError("expected a delimited group")
+        stack, inner = [CLOSING[opening]], []
+        for token in self:
+            if token in CLOSING:
+                stack.append(CLOSING[token])
+            elif token in (")", "]", "}"):
+                if token != stack.pop():
+                    raise ValueError("mismatched Rust delimiters")
+                if not stack:
+                    return inner
+            inner.append(token)
+        raise ValueError("unterminated Rust delimited group")
+
+
+def elements(inner):
+    """Split a token run into its top-level elements: tokens, and delimited groups as one element each."""
+    cursor, found = Cursor(inner), []
+    while cursor.peek() is not None:
+        if cursor.peek() in CLOSING:
+            delimiter = cursor.peek()
+            found.append((delimiter, cursor.group()))
+        else:
+            found.append(next(cursor))
+    return found
+
+
+def test_attributes_before_fn(inner):
+    """The name tokens after `fn` for every test attribute in a token run (`$` for a macro metavariable)."""
+    names, cursor, pending = [], Cursor(inner), False
+    for token in cursor:
+        if token == "#" and cursor.peek() == "[":
+            next(cursor)
+            depth, taken = 1, []
+            for part in cursor:
+                depth += part == "["
+                depth -= part == "]"
+                if depth == 0:
+                    break
+                taken.append(part)
+            pending |= taken == ["test"] or (taken[:2] == ["cfg_attr", "("] and
+                                             any(taken[i:i + 2] == [",", "test"] for i in range(len(taken))))
+        elif pending and token == "fn":
+            names.append(cursor.peek())
+            pending = False
+    return names
+
+
+class GeneratedTests:
+    """A `macro_rules!` whose one rule repeats a named `#[test] fn $name` per invocation item.
+
+    A generated test has no name in the source until the macro is invoked, so the census names it from the
+    invocation: each repetition item contributes the identifier its `$name:ident` fragment binds (#3241/#3242).
+    Only the shape that can be read without evaluating Rust is accepted: one rule, whose matcher is one repetition
+    `$( $name:ident <tokens and delimited groups> ) <sep>? <*|+>` with fragments other than `$name` only inside
+    groups, and whose transcriber is one repetition holding exactly one test function named `$name`. Anything else
+    that generates a test refuses, as an unnamed test attribute does.
+    """
+
+    def __init__(self, name, body):
+        rules = [rule for rule in split_rules(body) if rule]
+        if len(rules) != 1:
+            raise ValueError(f"test-generating macro {name}! has {len(rules)} rules; the census reads one")
+        rule = elements(rules[0])
+        if len(rule) != 4 or rule[1:3] != ["=", ">"] or not isinstance(rule[0], tuple) or not isinstance(rule[3], tuple):
+            raise ValueError(f"test-generating macro {name}! has a rule the census cannot read")
+        self.name = name
+        self.pattern, self.separator, self.at_least_one = repetition(name, rule[0][1])
+        head = self.pattern[0] if self.pattern else None
+        if not (isinstance(head, tuple) and head[0] == "$" and head[2] == "ident"):
+            raise ValueError(f"test-generating macro {name}!'s repetition does not start with $name:ident")
+        if any(isinstance(item, tuple) and item[0] == "$" for item in self.pattern[1:]):
+            raise ValueError(f"test-generating macro {name}! binds a top-level fragment besides the test name")
+        transcribed, _, _ = repetition(name, rule[3][1], transcriber=True)
+        generated = test_attributes_before_fn(transcribed)
+        fragment = head[1]
+        if len(generated) != 1 or generated[0] != "$" or not contains(transcribed, ["fn", "$", fragment]):
+            raise ValueError(f"test-generating macro {name}! does not generate one test named ${fragment}")
+
+    def names(self, inner):
+        """The test names one invocation generates, or a refusal when it does not match the pattern."""
+        items, found, position = elements(inner), [], 0
+        while position < len(items):
+            if found and self.separator is not None:
+                if items[position] != self.separator:
+                    raise ValueError(f"invocation of {self.name}! does not match its pattern")
+                position += 1
+            candidate = items[position] if position < len(items) else None
+            if not isinstance(candidate, str) or not IDENT.fullmatch(candidate):
+                raise ValueError(f"invocation of {self.name}! does not name a test")
+            found.append(candidate)
+            position += 1
+            for expected in self.pattern[1:]:
+                actual = items[position] if position < len(items) else None
+                if isinstance(expected, tuple):
+                    if not (isinstance(actual, tuple) and actual[0] == expected[0]):
+                        raise ValueError(f"invocation of {self.name}! does not match its pattern")
+                elif actual != expected:
+                    raise ValueError(f"invocation of {self.name}! does not match its pattern")
+                position += 1
+        if self.at_least_one and not found:
+            raise ValueError(f"invocation of {self.name}! repeats `+` with no item")
+        return found
+
+
+def split_rules(body):
+    rules, current, depth = [], [], 0
+    for token in body:
+        depth += token in CLOSING
+        depth -= token in (")", "]", "}")
+        if token == ";" and depth == 0:
+            rules.append(current)
+            current = []
+        else:
+            current.append(token)
+    rules.append(current)
+    return rules
+
+
+def repetition(name, inner, transcriber=False):
+    """The one `$( ... ) sep? op` a matcher (or transcriber) is made of: its elements, separator and `+`."""
+    cursor = Cursor(inner)
+    if cursor.peek() != "$" or cursor.peek(1) != "(":
+        raise ValueError(f"test-generating macro {name}! is not one repetition")
+    next(cursor)
+    body = cursor.group()
+    rest = cursor.items[cursor.index:]
+    if rest and rest[-1] in ("*", "+") and len(rest) <= 2:
+        separator = rest[0] if len(rest) == 2 else None
+        if transcriber:
+            return body, separator, rest[-1] == "+"
+        pattern, walker = [], Cursor(body)
+        while walker.peek() is not None:
+            if walker.peek() == "$":
+                next(walker)
+                if walker.peek() == "(":
+                    raise ValueError(f"test-generating macro {name}! nests a repetition")
+                fragment = next(walker, None)
+                if next(walker, None) != ":":
+                    raise ValueError(f"test-generating macro {name}! has an untyped fragment")
+                pattern.append(("$", fragment, next(walker, None)))
+            elif walker.peek() in CLOSING:
+                delimiter = walker.peek()
+                pattern.append((delimiter, walker.group()))
+            else:
+                pattern.append(next(walker))
+        return pattern, separator, rest[-1] == "+"
+    raise ValueError(f"test-generating macro {name}! is not one repetition")
+
+
+def contains(run, needle):
+    return any(run[i:i + len(needle)] == needle for i in range(len(run) - len(needle) + 1))
+
+
 def rust_test_names(source):
-    stream = iter(tokens(source))
+    stream = Cursor(tokens(source))
+    generators = {}
     pending_test = False
     for token in stream:
+        if (not pending_test and token == "macro_rules" and stream.peek() == "!" and stream.peek(1)
+                and IDENT.fullmatch(stream.peek(1)) and stream.peek(2) in CLOSING):
+            # A macro whose body writes `#[test] fn $name` is a test generator: its tests are named by its
+            # invocations below. Any other macro body is read in place, as before.
+            start = stream.index
+            name = stream.peek(1)
+            next(stream), next(stream)
+            body = stream.group()
+            if "$" in test_attributes_before_fn(body):
+                generators[name] = GeneratedTests(name, body)
+            else:
+                stream.index = start
+            continue
+        if not pending_test and token in generators and stream.peek() == "!" and stream.peek(1) in CLOSING:
+            next(stream)
+            yield from generators[token].names(stream.group())
+            continue
         if token == "#":
             opening = next(stream, None)
             if opening == "!":

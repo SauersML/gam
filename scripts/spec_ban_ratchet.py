@@ -25,6 +25,11 @@ It has no rule for the SPEC bans that live in the SHAPE of production code:
   gcv          a `gcv` / `ubre` identifier segment      SPEC "REML (or LAML) always used, never GCV"
   python-math  numpy / scipy / torch / jax linear algebra or scipy.optimize in
                production `gamfit/`                     SPEC "Python should be a thin wrapper"
+  roundoff     the unit roundoff `EPSILON/2` or Wilkinson's `γ_k = k·ε/(1 − k·ε)`
+               written out by hand instead of read from their one owner,
+               `gam_math::roundoff` (re-exported by `gam_linalg::roundoff`)
+                                                        SPEC "Hard-coded knobs and magic constants
+                                                        ... should be avoided"
 
 Test code is out of scope, with the same notion of "test" as build.rs'
 `compute_test_mask` (whole-file test directories, `#![cfg(test)]`, and
@@ -71,7 +76,7 @@ LEDGER_REL = "scripts/spec_ban_ledger.tsv"
 SCRIPT_REL = "scripts/spec_ban_ratchet.py"
 TEST_SUPPORT_CRATES = ("crates/gam-test-support/", "crates/gam-linalg-test-support/")
 ISSUE_URL = re.compile(r"^https://github\.com/SauersML/gam/issues/\d+$")
-RULES = ("grid", "box", "jitter", "unconverged", "magic", "fd", "gcv", "python-math")
+RULES = ("grid", "box", "jitter", "unconverged", "magic", "fd", "gcv", "python-math", "roundoff")
 
 
 class CannotMeasure(Exception):
@@ -470,6 +475,23 @@ def rule_gcv(text: str):
     return hits
 
 
+# The one file allowed to spell the unit roundoff out: it defines it.
+ROUNDOFF_OWNER = "crates/gam-math/src/roundoff.rs"
+# `0.5 * EPSILON` / `EPSILON / 2` / `EPSILON * 0.5` (not `0.5 * EPSILON.ln()`), and
+# the growth factor's `.. EPSILON / (1.0 - ..` denominator in either the `ε` or the
+# parenthesized form. Two local copies of `u` that differ by that factor of two
+# are the drift this rule exists to stop.
+_ROUNDOFF_COPY = re.compile(
+    r"(?<![\w.])0\.5(?:_?f64)?\s*\*\s*f64::EPSILON(?![\w.])"
+    r"|f64::EPSILON\s*(?:/\s*2(?:\.0*)?(?:_?f64)?|\*\s*0\.5(?:_?f64)?)(?![\w.])"
+    r"|EPSILON\s*\)?\s*/\s*\(\s*1\.0\s*-"
+)
+
+
+def rule_roundoff(text: str):
+    return [(m.start(), re.sub(r"\s+", " ", m.group(0))) for m in _ROUNDOFF_COPY.finditer(text)]
+
+
 RUST_RULES = {
     "grid": rule_grid,
     "box": rule_box,
@@ -478,6 +500,7 @@ RUST_RULES = {
     "magic": rule_magic,
     "fd": rule_fd,
     "gcv": rule_gcv,
+    "roundoff": rule_roundoff,
 }
 
 
@@ -559,6 +582,8 @@ def _hits_for(files, rules):
     for rel, (raw, text) in files.items():
         starts = _line_starts(text)
         for rule, fn in rules.items():
+            if rule == "roundoff" and rel == ROUNDOFF_OWNER:
+                continue
             for off, token in fn(text):
                 ln = bisect.bisect_right(starts, off)
                 hits.append((rule, rel, token.replace("\t", " "), ln, raw[ln - 1].strip()))
@@ -711,6 +736,7 @@ PLANTS = {
     "magic": "fn f(g: f64) -> bool {\n    g.abs() < 1e-8\n}\n",
     "fd": "fn f(x: f64, h: f64) -> f64 {\n    (loss(x + h) - loss(x - h)) / (2.0 * h)\n}\n",
     "gcv": "fn f() -> f64 {\n    gcv_score(1.0)\n}\n",
+    "roundoff": "fn band(n: usize) -> f64 {\n    let u = 0.5 * f64::EPSILON;\n    n as f64 * u\n}\n",
 }
 PY_PLANT = "import numpy as np\n\ndef f(a):\n    return np.linalg.solve(a, a)\n"
 

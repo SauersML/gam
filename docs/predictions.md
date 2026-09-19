@@ -75,6 +75,15 @@ first.
 ## Wald intervals
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 preds = model.predict(test_df, interval=0.95)
 # columns: linear_predictor_plugin, mean_plugin, posterior_mean,
 #          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
@@ -92,6 +101,15 @@ For response-scale prediction intervals, also pass
 `observation_interval=True`:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 preds = model.predict(test_df, interval=0.95, observation_interval=True)
 # adds observation_lower, observation_upper when the family supports it
 ```
@@ -130,15 +148,30 @@ limit:
 --calibration FILE) --level L` runs the same routes; exactly one of the two
 labeled tables is required.
 
-With `training_data` it is the exact full-conformal set at the fitted (frozen)
-smoothing parameters, for a Gaussian-identity model fitted without prior
-weights, offsets, or a link wiggle. The saved model keeps only the `p x p`
-frozen penalty `S_lambda`, never per-row training data, so the labeled rows
-(normally the training table, response column included) are passed again at
-predict time. The output adds `frozen_rho_certified`: the finite-sample
-coverage theorem holds on rows where it is 1.
+With `training_data` it is the full-conformal set of the fit that re-selects
+the smoothing strength by REML on the labeled rows plus the candidate test row,
+for a Gaussian-identity model fitted without prior weights, offsets, or a link
+wiggle. The test row is treated exactly like a training row, so the
+finite-sample coverage theorem holds. The saved model keeps only the `p x p`
+frozen penalty `S_lambda` and its smoothing-parameter count, never per-row
+training data, so the labeled rows (normally the training table, response
+column included) are passed again at predict time. The output adds
+`conformal_certificate`: `0` (exact_frozen, nothing to re-select) or `1`
+(honest_refit) where the guarantee holds, and a negative code for a typed
+refusal (`-1` several smoothing parameters, `-2` a model saved without the
+count, `-3` to `-6` a degenerate criterion or refit), where the row carries the
+frozen-smoothing set with no finite-sample guarantee.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 full = model.predict(
     test_df, interval="conformal", training_data=train_df, conformal_level=0.95
 )
@@ -150,6 +183,17 @@ coverage `≥ conformal_level` regardless of model misspecification, and applies
 to any standard GAM family.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 500)
+data = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 500)}
+train_df = {k: v[:300] for k, v in data.items()}
+cal_df = {k: v[300:] for k, v in data.items()}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 preds = model.predict(
     test_df,
     interval="conformal",
@@ -172,6 +216,14 @@ For models fitted via `gamfit.fit_array(...)` (positional columns
 `x0, x1, ..., x{p-1}`), predict directly from a numeric feature matrix:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+X_train = rng.uniform(0, 1, (300, 2))
+y = np.sin(6 * X_train[:, 0]) + X_train[:, 1] ** 2 + rng.normal(0, 0.2, 300)
+X_test = rng.uniform(0, 1, (20, 2))
+
 model = gamfit.fit_array(X_train, y, "y ~ s(x0) + s(x1)")
 y_hat = model.predict_array(X_test)                    # 1-D ndarray of point predictions
 table = model.predict_array(X_test, interval=0.95)     # adds posterior-mean uncertainty columns
@@ -187,6 +239,13 @@ name. The companion `model.design_matrix_array(X)` returns the same typed
 ## Carrying an identifier column
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 5, 300)
+model = gamfit.fit({"x": x, "y": np.cos(x) + rng.normal(0, 0.3, 300)}, "y ~ s(x)")
+
 preds = model.predict(
     [
         {"patient_id": "P001", "x": 1.5},
@@ -211,6 +270,19 @@ core on a default time grid (derived from the entry/exit columns in
 interpolate that surface at arbitrary user times.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 75, n), rng.normal(27, 4, n)
+t = rng.exponential(1 / np.exp(-3 + 0.04 * (age - 55) + 0.05 * (bmi - 27)))
+c = rng.exponential(20, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c) + 0.1,
+                         "event": (t < c).astype(float), "age": age, "bmi": bmi})
+test_df = train_df.head(20)
+
 model = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi")
 pred = model.predict(test_df)
 
@@ -252,6 +324,21 @@ helpers chunk internally before assembling the result. To stream
 without materializing the full matrix, iterate the chunk generators:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 75, n), rng.normal(27, 4, n)
+t = rng.exponential(1 / np.exp(-3 + 0.04 * (age - 55) + 0.05 * (bmi - 27)))
+c = rng.exponential(20, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c) + 0.1,
+                         "event": (t < c).astype(float), "age": age, "bmi": bmi})
+test_df = train_df.head(20)
+blocks = []
+process = blocks.append
+
 pred = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi").predict(test_df)
 for row_slice, time_slice, block in pred.survival_at_chunks(
     times=[1, 5, 10, 20, 50, 100],
@@ -267,6 +354,19 @@ generators for the matching surfaces.
 ### Stream to CSV
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 75, n), rng.normal(27, 4, n)
+t = rng.exponential(1 / np.exp(-3 + 0.04 * (age - 55) + 0.05 * (bmi - 27)))
+c = rng.exponential(20, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c) + 0.1,
+                         "event": (t < c).astype(float), "age": age, "bmi": bmi})
+test_df = train_df.head(20)
+
 pred = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi").predict(test_df)
 pred.write_survival_at_csv("surv.csv", times=[1, 5, 10, 20])
 ```
@@ -282,6 +382,19 @@ For the location-scale survival likelihood, passing any `interval=...`
 populates delta-method standard errors:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age, bmi = rng.uniform(40, 75, n), rng.normal(27, 4, n)
+t = rng.exponential(1 / np.exp(-3 + 0.04 * (age - 55) + 0.05 * (bmi - 27)))
+c = rng.exponential(20, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, c) + 0.1,
+                         "event": (t < c).astype(float), "age": age, "bmi": bmi})
+test_df = train_df.head(20)
+
 model = gamfit.fit(
     train_df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
@@ -301,6 +414,21 @@ joint coefficient covariance through every cause-specific surface and the
 Aalen-Johansen CIF recurrence:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age = rng.uniform(40, 75, n)
+t1 = rng.exponential(1 / np.exp(-3.0 + 0.025 * (age - 55)))
+t2 = rng.exponential(1 / np.exp(-3.2 - 0.02 * (age - 55)))
+c = rng.exponential(22, n)
+cause = np.select([(t1 < t2) & (t1 < c), (t2 < t1) & (t2 < c)], [1.0, 2.0], 0.0)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum.reduce([t1, t2, c]) + 0.1,
+                         "cause": cause, "age": age})
+test_df = train_df.head(20)
+
 # event codes 1..K in the event column select the joint competing-risks fit
 model = gamfit.fit(train_df, "Surv(entry, exit, cause) ~ s(age)")
 pred = model.predict(
@@ -327,6 +455,21 @@ Fit one cause-specific survival endpoint per event type, then assemble
 Aalen-Johansen cumulative incidence functions on a shared grid:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+n = 400
+age = rng.uniform(40, 75, n)
+t1 = rng.exponential(1 / np.exp(-3.0 + 0.025 * (age - 55)))
+t2 = rng.exponential(1 / np.exp(-3.2 - 0.02 * (age - 55)))
+c = rng.exponential(22, n)
+train_df = pd.DataFrame({"entry": 0.0, "exit": np.minimum.reduce([t1, t2, c]) + 0.1,
+                         "disease": ((t1 < t2) & (t1 < c)).astype(float),
+                         "death": ((t2 < t1) & (t2 < c)).astype(float), "age": age})
+test_df = train_df.head(20)
+
 disease_pred = gamfit.fit(train_df, "Surv(entry, exit, disease) ~ s(age)").predict(test_df)
 death_pred = gamfit.fit(train_df, "Surv(entry, exit, death) ~ s(age)").predict(test_df)
 
@@ -350,6 +493,15 @@ GAM that has a finite coefficient-frame representation. Its defining identity
 is:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 affine = model.design_matrix(test_df)
 fitted_eta = affine.offset + affine.matrix @ affine.coefficients
 ```
@@ -381,6 +533,15 @@ variance can therefore be computed without constructing the full row-by-row
 covariance — always through `eta_gradient`, never through `matrix`:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 affine = model.design_matrix(test_df)
 covariance = affine.covariance_smoothing_corrected
 if covariance is None:
@@ -397,8 +558,17 @@ own derivative and no second buffer is allocated). Posterior draws use that same
 frame, so custom fitted-linear-predictor draws are:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 affine = model.design_matrix(test_df)
-posterior = model.sample(train_df)
+posterior = model.sample(train_df, samples=200)
 eta_draws = affine.offset + posterior.samples @ affine.matrix.T
 ```
 

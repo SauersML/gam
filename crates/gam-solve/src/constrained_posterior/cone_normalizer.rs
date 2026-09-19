@@ -36,7 +36,11 @@
 //! added to. A row with no posterior spread along its normal (its normal in the kernel of the
 //! pseudo-inverse the criterion prices) removes no mass and is skipped, as [`super`] skips it.
 //! No dependence filter is needed: nothing below forms `W⁻¹`, so rows whose normals are linearly
-//! dependent are admissible.
+//! dependent are admissible. A row repeated exactly is the same half-space, and the intersection
+//! holds it once, so it enters once. EP would give each copy its own site and count its
+//! truncation once per copy. A family whose cone is declared over its data rows repeats a row
+//! for every tied data row: the transformation-normal cone `ψ_iᵀA_k ≥ 0` repeats each response
+//! row once per data row of an intercept-only fit.
 //!
 //! # The orthant in its smaller coordinates
 //!
@@ -901,12 +905,22 @@ impl ConeNormalizer {
         let center = beta - &y;
         let p = beta.len();
         let mut units: Vec<(Array1<f64>, f64)> = Vec::new();
+        let mut half_spaces = std::collections::HashSet::<Vec<u64>>::new();
         for row in 0..rows.nrows() {
             let norm = rows.row(row).dot(&rows.row(row)).sqrt();
             if !(norm > 0.0) {
                 continue;
             }
-            units.push((rows.row(row).mapv(|value| value / norm), bounds[row] / norm));
+            let unit = rows.row(row).mapv(|value| value / norm);
+            let bound = bounds[row] / norm;
+            // A row repeated exactly bounds the same half-space, and an intersection holds it
+            // once: `P(u ≥ 0)` is the same with the repeat as without it. EP is not, since it
+            // gives each copy its own site, so a repeat enters once.
+            let half_space: Vec<u64> =
+                unit.iter().chain(std::iter::once(&bound)).map(|value| (value + 0.0).to_bits()).collect();
+            if half_spaces.insert(half_space) {
+                units.push((unit, bound));
+            }
         }
         // `M⁻¹a` for every row, from whichever is fewer: one solve per row, or one per supported
         // column (`M⁻¹a = Σ_c a_c M⁻¹e_c`, exact since `a` vanishes off its support).
@@ -1162,6 +1176,19 @@ mod tests {
         move |rhs: &Array1<f64>| inverse.dot(rhs)
     }
 
+    /// One undamped EP sweep read straight off the definitions: each site's cavity from the
+    /// posterior re-formed from the sites (`Σ_z = (I + KG)⁻¹K`) after every site.
+    fn sequential_site_sweep(state: &mut OrthantLogMass) {
+        for j in 0..state.m0.len() {
+            let (tau_c, nu_c) = cavity(state, j);
+            let update = site_update(tau_c, nu_c);
+            state.tau[j] = update.tau;
+            state.nu[j] = update.nu;
+            state.post = state.form_posterior().expect("admissible sites");
+        }
+        state.site_system = std::sync::OnceLock::new();
+    }
+
     /// The change of `ln Z_EP` need not fall monotonically. This orthant is where EP was refused on
     /// the #2765 named gate for one growing sweep (seven rows correlated up to 0.98; job 1264873,
     /// change 1.047e-5 after 1.546e-7 at sweep 5). Continued undamped from there, the same
@@ -1194,13 +1221,7 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("EP settles on the recorded orthant: {refusal}"));
         let mut checked = mass.clone();
         let q = m0.len();
-        for j in 0..q {
-            let (tau_c, nu_c) = cavity(&checked, j);
-            let update = site_update(tau_c, nu_c);
-            checked.tau[j] = update.tau;
-            checked.nu[j] = update.nu;
-            checked.post = checked.form_posterior().expect("admissible sites");
-        }
+        sequential_site_sweep(&mut checked);
         let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
         let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
         eprintln!(
@@ -1312,13 +1333,7 @@ mod tests {
         let mass = OrthantLogMass::converge(&m0, &w)
             .unwrap_or_else(|refusal| panic!("EP settles on the correlated orthant: {refusal}"));
         let mut checked = mass.clone();
-        for j in 0..q {
-            let (tau_c, nu_c) = cavity(&checked, j);
-            let update = site_update(tau_c, nu_c);
-            checked.tau[j] = update.tau;
-            checked.nu[j] = update.nu;
-            checked.post = checked.form_posterior().expect("admissible sites");
-        }
+        sequential_site_sweep(&mut checked);
         let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
         let step_band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
         eprintln!(
@@ -1715,5 +1730,110 @@ mod tests {
         );
         assert!(normalizer.retained_rows() > 1000, "most guard rows are inside the mass horizon");
         assert_eq!(normalizer.orthant_dimension(), 3);
+    }
+
+    /// gam#3135 (the property gam-2959 proposed for #2959 M7): the rank-one sweep stops at a fixed
+    /// point of the definition's sweep. On a correlated three-row orthant, a twelve-row banded one
+    /// and a twelve-row one near rank one, a further sweep that re-forms the posterior after every
+    /// site moves `ln P` by no more than the rounding band EP stops at.
+    #[test]
+    fn the_rank_one_sweep_stops_at_a_fixed_point_of_the_sequential_site_sweep_3135() {
+        let correlated = (
+            array![-1.5, 0.2, 1.0],
+            array![[1.0, 0.5, -0.3], [0.5, 2.0, 0.4], [-0.3, 0.4, 0.8]],
+        );
+        let rows = 12usize;
+        let banded = (
+            Array1::from_shape_fn(rows, |i| 1.5 * (1.3 * i as f64).sin()),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let scale = (0.5 + 0.1 * i as f64) * (0.5 + 0.1 * j as f64);
+                scale * 0.6_f64.powi((i as i32 - j as i32).abs())
+            }),
+        );
+        let near_rank_one = (
+            Array1::from_shape_fn(rows, |i| 0.3 * (0.7 * i as f64).cos() - 0.2),
+            Array2::from_shape_fn((rows, rows), |(i, j)| {
+                let (a, b) = (1.0 + 0.05 * i as f64, 1.0 + 0.05 * j as f64);
+                0.97 * a * b + if i == j { 0.03 * a * a } else { 0.0 }
+            }),
+        );
+        for (m0, w) in [correlated, banded, near_rank_one] {
+            let q = m0.len();
+            let mass = OrthantLogMass::converge(&m0, &w).expect("the orthant converges");
+            let (_, magnitude) = mass.evaluate_log_mass().expect("a finite EP log mass");
+            let mut checked = mass.clone();
+            sequential_site_sweep(&mut checked);
+            let (after, _) = checked.evaluate_log_mass().expect("a finite EP log mass");
+            let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+            eprintln!(
+                "[3135-EP] q = {q}: ln P {:.15e} after {} sweeps; a sequential sweep moves it {:e} (band {band:e})",
+                mass.log_mass(),
+                mass.sweeps(),
+                (after - mass.log_mass()).abs()
+            );
+            assert!(
+                (after - mass.log_mass()).abs() <= band,
+                "q = {q}: a sequential sweep from the rank-one stop moves ln P {:.15e} by {:e}, \
+                 above the band {band:e}",
+                mass.log_mass(),
+                (after - mass.log_mass()).abs()
+            );
+        }
+    }
+
+
+    /// An exactly repeated row is one half-space: `C` is the value of the rows without the repeat,
+    /// bit for bit. Positive control: EP handed the copies counts each one's truncation.
+    #[test]
+    fn a_repeated_row_enters_the_normalizer_once_1082() {
+        let h = array![[2.0, 0.8, 0.3], [0.8, 1.5, -0.4], [0.3, -0.4, 1.2]];
+        let solve = dense_solve(&h);
+        let beta = array![0.0, 0.2, 0.5];
+        let gradient = array![0.3, 0.0, 0.0];
+        let distinct = array![[1.0, 0.0, 0.0], [0.0, 0.6, 0.8]];
+        let distinct_bounds = array![0.0, 0.1];
+        let copies = 38;
+        let repeated = Array2::from_shape_fn((2 * copies, 3), |(i, j)| distinct[[i % 2, j]]);
+        let repeated_bounds = Array1::from_shape_fn(2 * copies, |i| distinct_bounds[i % 2]);
+        let once = ConeNormalizer::evaluate(&distinct, &distinct_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the distinct rows");
+        let with_copies = ConeNormalizer::evaluate(&repeated, &repeated_bounds, &beta, &gradient, &solve)
+            .expect("normalizer on the repeated rows");
+        assert_eq!(with_copies.retained_rows(), once.retained_rows(), "each half-space enters once");
+        assert_eq!(
+            with_copies.value().to_bits(),
+            once.value().to_bits(),
+            "C with {copies} copies of each row {} against C without them {}",
+            with_copies.value(),
+            once.value()
+        );
+        // The active row alone: one half-space, where EP is exact, against 38 sites on it.
+        let v = solve(&array![1.0, 0.0, 0.0])[0];
+        let m = -0.3 * v;
+        let exact = normal_logcdf(m / v.sqrt());
+        let single = OrthantLogMass::converge(&array![m], &array![[v]]).expect("one site");
+        let copied = OrthantLogMass::converge(
+            &Array1::from_elem(copies, m),
+            &Array2::from_elem((copies, copies), v),
+        )
+        .expect("the copied sites converge");
+        eprintln!(
+            "[1082-EP] one row at z = {:.6}: ln Φ {exact:.15e}; EP on one site {:.15e}; EP on {copies} copies \
+             {:.15e} in {} sweeps",
+            m / v.sqrt(),
+            single.log_mass(),
+            copied.log_mass(),
+            copied.sweeps()
+        );
+        assert!(
+            (single.log_mass() - exact).abs() <= band(64, exact.abs().max(1.0)),
+            "one site is exact: {} against ln Φ {exact}",
+            single.log_mass()
+        );
+        assert!(
+            (copied.log_mass() - exact).abs() > 1.0e3 * band(64, exact.abs().max(1.0)),
+            "positive control: EP on {copies} copies of one row gives {} against ln Φ {exact}",
+            copied.log_mass()
+        );
     }
 }
