@@ -1,0 +1,52 @@
+[run] binom_add4_n300 n=300 binomial :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=0.020507
+   pygam_grid     ok=5/5 truth_mse=0.034701
+   gamfit         ok=4/5 truth_mse=0.014463  ERR=['IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.456e-3 |Pg|=1.456e-3 bound=1.343e-3 (rung=curvature-resolvability derived_standard=true) hessian_psd=yes curvature_source=terminal-analytic railed=[] → NOT STATIONARY (|Pg|=1.456e-3 > bound=1.343e-3); tail-snap declined: no super-bound coordinate; solver provenance: origin=Solver, plan=solve']
+[run] binom_add4_n1000 n=1000 binomial :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=0.0092024
+   pygam_grid     ok=5/5 truth_mse=0.007874
+   gamfit         ok=5/5 truth_mse=0.0043404
+[run] binom_add4_n5000 n=5000 binomial :: y ~ s(x0) + s(x1) + s(x2) + s(x3)
+   pygam_default  ok=5/5 truth_mse=0.0019572
+   pygam_grid     ok=5/5 truth_mse=0.0015411
+   gamfit         ok=5/5 truth_mse=0.00061949
+[run] binom_sin2_n500 n=500 binomial :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.004176
+   pygam_grid     ok=5/5 truth_mse=0.0042539
+   gamfit         ok=5/5 truth_mse=0.0039722
+[run] binom_sin2_n3000 n=3000 binomial :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.00094575
+   pygam_grid     ok=5/5 truth_mse=0.0010247
+   gamfit         ok=5/5 truth_mse=0.00085788
+[run] nearsep_n200 n=200 binomial :: y ~ s(x) + s(z)
+   pygam_default  ok=5/5 truth_mse=0.0020939
+   pygam_grid     ok=5/5 truth_mse=0.001886
+   gamfit         ok=3/5 truth_mse=0.0079637  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.264e-3 |Pg|=1.264e-3 bound=3.394e-4 (rung=curvature-resolvability derived_standar']
+[run] nearsep_n1000 n=1000 binomial :: y ~ s(x) + s(z)
+   pygam_default  ok=5/5 truth_mse=0.0014375
+   pygam_grid     ok=5/5 truth_mse=0.00090517
+   gamfit         ok=5/5 truth_mse=0.00073011
+[run] pois_add2_n300 n=300 poisson :: y ~ s(x0) + s(x1)
+   pygam_default  ok=5/5 truth_mse=0.56488
+   pygam_grid     ok=5/5 truth_mse=0.16799
+   gamfit         ok=4/5 truth_mse=0.18145  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain']
+[run] pois_add2_n2000 n=2000 poisson :: y ~ s(x0) + s(x1)
+   pygam_default  ok=5/5 truth_mse=0.090207
+   pygam_grid     ok=5/5 truth_mse=0.043364
+   gamfit         ok=4/5 truth_mse=0.0446  ERR=['IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain']
+[run] pois_add2_n10000 n=10000 poisson :: y ~ s(x0) + s(x1)
+   pygam_default  ok=5/5 truth_mse=0.035542
+   pygam_grid     ok=5/5 truth_mse=0.020973
+   gamfit         ok=5/5 truth_mse=0.018998
+[run] pois_lowcount_n500 n=500 poisson :: y ~ s(x)
+   pygam_default  ok=5/5 truth_mse=0.0051932
+   pygam_grid     ok=5/5 truth_mse=0.0056836
+   gamfit         ok=5/5 truth_mse=0.0068971
+[run] gamma_add2_n300 n=300 gamma :: y ~ s(x0) + s(x1)
+   pygam_default  ok=5/5 truth_mse=0.63708
+   pygam_grid     ok=5/5 truth_mse=0.42244
+   gamfit         ok=5/5 truth_mse=0.2611
+[run] gamma_add2_n2000 n=2000 gamma :: y ~ s(x0) + s(x1)
+   pygam_default  ok=5/5 truth_mse=0.17994
+   pygam_grid     ok=5/5 truth_mse=0.090546
+   gamfit         ok=5/5 truth_mse=0.058797

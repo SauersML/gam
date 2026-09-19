@@ -3,8 +3,12 @@
 Usage: worker.py LIB FAMILY N DESIGN SEED
 
   LIB     gamfit | pygam | pygam_gs
-  FAMILY  gaussian | binomial | poisson
-  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | fz<case>
+  FAMILY  gaussian | binomial | poisson, a binomial variant of the
+          ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), or a
+          positive-continuous family of the ``positive_*`` plans (see
+          ``POSITIVE_FAMILIES``)
+  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
+          | by (see ``make_data``) | fz<case>
 
 A ``fz<case>`` design is a convergence-fuzz case (``fuzz_terms.py``): a seeded
 term structure — tensor, ``ti``, ``by=``, factor, random-effect, cyclic, 2-D
@@ -56,7 +60,79 @@ else:  # run as a script by run.py: this directory is sys.path[0]
 
 LIBS = ("gamfit", "pygam", "pygam_gs")
 FAMILIES = ("gaussian", "binomial", "poisson")
+# Binomial variants of the ``binomial_*`` plans (audit lane sweep-binomial).
+# ``binomial`` itself is the balanced case (prevalence about 0.5).
+# ``binomial_p10`` / ``binomial_p01`` shift the logit by ``logit(0.1)`` /
+# ``logit(0.01)`` for rare outcomes; ``binomial_trials`` is a grouped binomial
+# with ``m_i`` trials per row drawn uniformly from ``1..TRIALS_MAX``, fitted as
+# the observed proportion ``y_i / m_i`` with prior weight ``m_i`` by both
+# libraries (the binomial likelihood with ``m_i`` trials up to a constant).
+BINOMIAL_FAMILIES = ("binomial_p10", "binomial_p01", "binomial_trials")
+BINOMIAL_PREVALENCE = {"binomial_p10": 0.1, "binomial_p01": 0.01}
+BINOMIAL_SLOPE = 1.5
+TRIALS_MAX = 20
+# Positive-continuous families of the ``positive_*`` plans (audit lane
+# sweep-positive). The mean is ``exp(0.5 + 0.7 eta)`` unless stated.
+#   gamma_log           Gamma, shape 3, log link.
+#   gamma_skew          Gamma, shape 1/2, mean ``exp(0.7 eta - 2)``: heavy right
+#                       skew with most responses near zero.
+#   gamma_inverse       Gamma, shape 3, fitted on the canonical inverse link;
+#                       the truth is ``1 / mu = 1 + 0.2 eta``, which stays
+#                       positive for every design (``|eta| <= sqrt(p)``).
+#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3, log link.
+#   lognormal_gaussian  ``log y = 0.5 + 0.7 eta + N(0, 0.5^2)`` fitted as a
+#                       Gaussian on the log scale (response and mean are logs).
+#   lognormal_gamma     the same draw of ``y`` fitted by Gamma(log) on the raw
+#                       scale; the mean is ``E[y] = exp(0.5 + 0.7 eta + 0.125)``.
+#   student_t           ``y = eta + 0.5 t_3``, fitted with scale and degrees
+#                       of freedom estimated.
+POSITIVE_FAMILIES = (
+    "gamma_log",
+    "gamma_skew",
+    "gamma_inverse",
+    "inverse_gaussian",
+    "lognormal_gaussian",
+    "lognormal_gamma",
+    "student_t",
+)
+ALL_FAMILIES = FAMILIES + BINOMIAL_FAMILIES + POSITIVE_FAMILIES
+GAMMA_SHAPE, GAMMA_SKEW_SHAPE, GAMMA_SKEW_LEVEL = 3.0, 0.5, -2.0
+GAMMA_INVERSE_SLOPE = 0.2
+INVERSE_GAUSSIAN_PHI = 0.3
+LOGNORMAL_SD = 0.5
+STUDENT_T_DF, STUDENT_T_SCALE = 3.0, 0.5
+# pyGAM fits every binomial variant, the Gamma families (log and inverse
+# links) and both log-normal fits. It has no scaled-t family, and its InvGaussGAM stores sqrt(phi) as its
+# scale (see inverse_gaussian_scale.py), so it is not a like-for-like
+# comparator: those two run gamfit alone and report absolute times and the
+# certification rate.
+PYGAM_FAMILIES = frozenset(
+    {
+        *FAMILIES,
+        *BINOMIAL_FAMILIES,
+        "gamma_log",
+        "gamma_skew",
+        "gamma_inverse",
+        "lognormal_gaussian",
+        "lognormal_gamma",
+    }
+)
+# gamfit (family, link) of each family whose name is not a gamfit family.
+GAMFIT_FAMILY: dict[str, tuple[str, str | None]] = {
+    **{family: ("binomial", None) for family in BINOMIAL_FAMILIES},
+    "gamma_log": ("gamma", None),
+    "gamma_skew": ("gamma", None),
+    "gamma_inverse": ("gamma", "inverse"),
+    "inverse_gaussian": ("inverse-gaussian", None),
+    "lognormal_gaussian": ("gaussian", None),
+    "lognormal_gamma": ("gamma", None),
+    "student_t": ("student-t", None),
+}
 DESIGNS = ("p1", "p5", "p20", "te")
+# Designs beyond the core grid, run by the Gaussian sweep plans: a tensor plus
+# an additive smooth, and a factor-by smooth (one curve per level).
+EXTRA_DESIGNS = ("te+s", "by")
+BY_LEVELS = ("a", "b", "c")
 INTERVAL_LEVEL = 0.95
 TEST_SEED_OFFSET = 1000
 # The fuzz interval phase checks that intervals are finite on this many
@@ -66,24 +142,48 @@ FUZZ_INTERVAL_ROWS = 200
 FloatArray = NDArray[np.float64]
 
 
+def supports(lib: str, family: str) -> bool:
+    return lib == "gamfit" or family in PYGAM_FAMILIES
+
+
 def design_width(design: str) -> int | None:
     """Covariate count of an additive design ``p<k>``; ``None`` otherwise."""
     match = re.fullmatch(r"p([1-9][0-9]*)", design)
     return None if match is None else int(match.group(1))
 
 
+def is_binomial(family: str) -> bool:
+    return family == "binomial" or family in BINOMIAL_FAMILIES
+
+
 def make_data(
     n: int, design: str, family: str, seed: int
-) -> tuple[FloatArray, FloatArray, FloatArray]:
-    """Draw ``(X, y, mu)``: covariates, response, true response-scale mean.
+) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray | None]:
+    """Draw ``(X, y, mu, weights)``: covariates, response, true response-scale
+    mean, and the per-row trial counts (``None`` for families without them).
 
     Same generators as the pyGAM audit (bench/pygam_audit/speed/worker.py) so
-    numbers stay comparable with the audit's speed.md tables.
+    numbers stay comparable with the audit's speed.md tables. The extra designs:
+
+      te+s  ``sin(2 pi x0) cos(2 pi x1) + sin(2 pi x2)``, fitted as
+            ``te(x0, x1) + s(x2)``;
+      by    ``sin(2 pi x0 + g) + (g - 1) / 2`` for a factor ``g`` with levels
+            ``BY_LEVELS`` (column 1 of ``X`` holds its integer code), fitted
+            as a factor-by smooth of ``x0``.
     """
     rng = np.random.default_rng(seed)
     if design == "te":
         X = rng.uniform(0.0, 1.0, (n, 2))
         eta = np.sin(2 * np.pi * X[:, 0]) * np.cos(2 * np.pi * X[:, 1])
+    elif design == "te+s":
+        X = rng.uniform(0.0, 1.0, (n, 3))
+        eta = np.sin(2 * np.pi * X[:, 0]) * np.cos(2 * np.pi * X[:, 1])
+        eta += np.sin(2 * np.pi * X[:, 2])
+    elif design == "by":
+        x = rng.uniform(0.0, 1.0, n)
+        g = rng.integers(0, len(BY_LEVELS), n).astype(float)
+        X = np.column_stack([x, g])
+        eta = np.sin(2 * np.pi * x + g) + (g - 1) / 2
     elif design_width(design) is not None:
         p = design_width(design)
         X = rng.uniform(0.0, 1.0, (n, p))
@@ -91,43 +191,98 @@ def make_data(
         for j in range(p):
             eta += np.sin(2 * np.pi * X[:, j] + j) / np.sqrt(p)
     else:
-        raise ValueError(f"unknown design {design!r}; expected p<k> or te")
+        raise ValueError(
+            f"unknown design {design!r}; expected p<k> or one of te, {EXTRA_DESIGNS}"
+        )
     if family == "gaussian":
         mu = eta
         y = eta + rng.normal(0.0, 0.5, n)
     elif family == "binomial":
-        mu = special.expit(1.5 * eta)
+        mu = special.expit(BINOMIAL_SLOPE * eta)
         y = (rng.uniform(size=n) < mu).astype(float)
+    elif family in BINOMIAL_PREVALENCE:
+        base = special.logit(BINOMIAL_PREVALENCE[family])
+        mu = special.expit(base + BINOMIAL_SLOPE * eta)
+        y = (rng.uniform(size=n) < mu).astype(float)
+    elif family == "binomial_trials":
+        mu = special.expit(BINOMIAL_SLOPE * eta)
+        trials = rng.integers(1, TRIALS_MAX + 1, n).astype(float)
+        y = rng.binomial(trials.astype(np.int64), mu) / trials
+        return X, y, mu, trials
     elif family == "poisson":
         mu = np.exp(0.5 + 0.7 * eta)
         y = rng.poisson(mu).astype(float)
+    elif family in ("gamma_log", "gamma_skew"):
+        shape = GAMMA_SHAPE if family == "gamma_log" else GAMMA_SKEW_SHAPE
+        level = 0.5 if family == "gamma_log" else GAMMA_SKEW_LEVEL
+        mu = np.exp(level + 0.7 * eta)
+        y = rng.gamma(shape, mu / shape)
+    elif family == "gamma_inverse":
+        mu = 1.0 / (1.0 + GAMMA_INVERSE_SLOPE * eta)
+        y = rng.gamma(GAMMA_SHAPE, mu / GAMMA_SHAPE)
+    elif family == "inverse_gaussian":
+        mu = np.exp(0.5 + 0.7 * eta)
+        # numpy's wald(mean, scale) has variance mean^3 / scale.
+        y = rng.wald(mu, 1.0 / INVERSE_GAUSSIAN_PHI)
+    elif family in ("lognormal_gaussian", "lognormal_gamma"):
+        log_mean = 0.5 + 0.7 * eta
+        log_y = log_mean + rng.normal(0.0, LOGNORMAL_SD, n)
+        if family == "lognormal_gaussian":
+            mu, y = log_mean, log_y
+        else:
+            mu, y = np.exp(log_mean + LOGNORMAL_SD**2 / 2), np.exp(log_y)
+    elif family == "student_t":
+        mu = eta
+        y = eta + STUDENT_T_SCALE * rng.standard_t(STUDENT_T_DF, n)
     else:
-        raise ValueError(f"unknown family {family!r}; expected one of {FAMILIES}")
-    return X, y, mu
+        raise ValueError(f"unknown family {family!r}; expected one of {ALL_FAMILIES}")
+    return X, y, mu, None
 
 
-def mean_deviance(family: str, y: FloatArray, mu: FloatArray) -> float:
-    """Mean unit deviance of held-out ``y`` at predicted mean ``mu``."""
-    if family == "gaussian":
+def mean_deviance(
+    family: str, y: FloatArray, mu: FloatArray, trials: FloatArray | None = None
+) -> float:
+    """Mean unit deviance of held-out ``y`` at predicted mean ``mu``.
+
+    A grouped binomial is the per-trial deviance: the rows are weighted by
+    their trial counts.
+    """
+    if family in ("gaussian", "lognormal_gaussian", "student_t"):
         return float(np.mean((y - mu) ** 2))
-    if family == "binomial":
+    if family.startswith("gamma") or family == "lognormal_gamma":
+        return float(np.mean(2 * (-np.log(y / mu) + (y - mu) / mu)))
+    if family == "inverse_gaussian":
+        return float(np.mean((y - mu) ** 2 / (mu**2 * y)))
+    if is_binomial(family):
         unit = special.xlogy(y, y / mu) + special.xlogy(1 - y, (1 - y) / (1 - mu))
-        return float(np.mean(2 * unit))
+        return float(np.average(2 * unit, weights=trials))
     unit = special.xlogy(y, y / mu) - (y - mu)
     return float(np.mean(2 * unit))
 
 
 def mean_logscore(
-    family: str, y: FloatArray, mu: FloatArray, predictive_sd: FloatArray | None
-) -> float:
+    family: str,
+    y: FloatArray,
+    mu: FloatArray,
+    predictive_sd: FloatArray | None,
+    trials: FloatArray | None = None,
+) -> float | None:
     """Mean negative log predictive density of held-out ``y`` (lower is better).
 
-    Binomial and Poisson are scored at the predicted mean. Gaussian needs a
+    Binomial and Poisson are scored at the predicted mean; a grouped binomial
+    scores the observed count out of its trials, per trial. Gaussian needs a
     predictive scale: the library's own 95% prediction interval gives it as
     ``(upper - lower) / (2 z_0.975)``, which prices both the fitted scale and
-    the posterior variance of the mean.
+    the posterior variance of the mean. The positive families need their fitted
+    shape / dispersion, which the libraries do not expose alike, so they report
+    no log score.
     """
-    if family == "binomial":
+    if family in POSITIVE_FAMILIES:
+        return None
+    if trials is not None:
+        counts = np.rint(y * trials)
+        return float(-np.sum(stats.binom.logpmf(counts, trials, mu)) / np.sum(trials))
+    if is_binomial(family):
         return float(-np.mean(special.xlogy(y, mu) + special.xlogy(1 - y, 1 - mu)))
     if family == "poisson":
         return float(-np.mean(stats.poisson.logpmf(y, mu)))
@@ -160,7 +315,8 @@ class Adapter:
 
     version: str
 
-    def fit(self, X: FloatArray, y: FloatArray) -> None:
+    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
+        """Fit ``y`` on ``X``; ``weights`` are binomial trial counts or ``None``."""
         raise NotImplementedError
 
     def predict(self, X: FloatArray) -> FloatArray:
@@ -177,25 +333,46 @@ class Adapter:
         raise NotImplementedError
 
 
+WEIGHTS_COLUMN = "trials"
+
+
 class GamfitAdapter(Adapter):
     def __init__(self, family: str, design: str, p: int) -> None:
         self.gamfit: Any = importlib.import_module("gamfit")
         self.version = str(self.gamfit.__version__)
         self.family = family
+        self.gamfit_family, self.link = GAMFIT_FAMILY.get(family, (family, None))
         self.names = [f"x{j}" for j in range(p)]
+        self.factor = design == "by"
         if design == "te":
             self.formula = "y ~ te(x0, x1)"
+        elif design == "te+s":
+            self.formula = "y ~ te(x0, x1) + s(x2)"
+        elif self.factor:
+            self.names = ["x0"]
+            self.formula = "y ~ s(x0, by=g)"
         else:
             self.formula = "y ~ " + " + ".join(f"s({nm})" for nm in self.names)
         self.model: Any = None
 
-    def _table(self, X: FloatArray) -> dict[str, FloatArray]:
-        return {nm: X[:, j] for j, nm in enumerate(self.names)}
+    def _table(self, X: FloatArray) -> dict[str, Any]:
+        table: dict[str, Any] = {nm: X[:, j] for j, nm in enumerate(self.names)}
+        if self.factor:
+            table["g"] = np.asarray(BY_LEVELS)[X[:, 1].astype(int)]
+        return table
 
-    def fit(self, X: FloatArray, y: FloatArray) -> None:
+    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
         data = self._table(X)
         data["y"] = y
-        self.model = self.gamfit.fit(data, self.formula, family=self.family)
+        if weights is not None:
+            data[WEIGHTS_COLUMN] = weights
+        self.model = self.gamfit.fit(
+            data,
+            self.formula,
+            family=self.gamfit_family,
+            link=self.link,
+            weights=None if weights is None else WEIGHTS_COLUMN,
+        )
 
     def predict(self, X: FloatArray) -> FloatArray:
         return np.asarray(self.model.predict(self._table(X)), dtype=float).reshape(-1)
@@ -221,12 +398,14 @@ class GamfitAdapter(Adapter):
 
     def model_info(self) -> dict[str, Any]:
         summ = self.model.summary()
-        conv = getattr(summ, "convergence", None)
+        conv = json.loads(json.dumps(summ.convergence, default=str))
         return {
             "edf": None if summ.edf_total is None else float(summ.edf_total),
             "ncoef": None if summ.coefficients is None else len(summ.coefficients),
-            "iterations": summ.iterations,
-            "convergence": json.loads(json.dumps(conv, default=str)),
+            "iterations": self.model.outer_iterations,
+            "inner_iterations": self.model.inner_iterations,
+            "certified": conv.get("certified") if isinstance(conv, dict) else None,
+            "convergence": conv,
         }
 
 
@@ -239,29 +418,47 @@ class PygamAdapter(Adapter):
         self.family = family
         if design == "te":
             self.terms: Any = pygam.te(0, 1)
+        elif design == "te+s":
+            self.terms = pygam.te(0, 1) + pygam.s(2)
+        elif design == "by":
+            # pyGAM's ``by=`` is a numeric multiplier only; its factor-by smooth
+            # is the tensor of a spline in x0 with the categorical marginal of
+            # the factor, which spans one curve per level with its level offset.
+            self.terms = pygam.te(0, 1, dtype=["numerical", "categorical"])
         else:
             self.terms = pygam.s(0)
             for j in range(1, p):
                 self.terms = self.terms + pygam.s(j)
+        if family not in PYGAM_FAMILIES:
+            raise ValueError(f"pyGAM has no {family!r} comparator")
         self.dist, self.link = {
             "gaussian": ("normal", "identity"),
             "binomial": ("binomial", "logit"),
             "poisson": ("poisson", "log"),
-        }[family]
+            "gamma_log": ("gamma", "log"),
+            "gamma_skew": ("gamma", "log"),
+            "gamma_inverse": ("gamma", "inverse"),
+            "lognormal_gaussian": ("normal", "identity"),
+            "lognormal_gamma": ("gamma", "log"),
+        }["binomial" if is_binomial(family) else family]
         self.gridsearch = gridsearch
         self.model: Any = None
 
-    def fit(self, X: FloatArray, y: FloatArray) -> None:
+    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
         if self.family == "gaussian":
             # LinearGAM is GAM(normal, identity) plus prediction_intervals,
             # which the Gaussian log score needs.
             g = self.pygam.LinearGAM(self.terms)
         else:
             g = self.pygam.GAM(self.terms, distribution=self.dist, link=self.link)
+        # A grouped binomial is the proportion with its trials as prior
+        # weights: pyGAM's binomial IRLS weight is then ``m_i mu (1 - mu)``,
+        # the grouped-binomial Fisher information.
+        extra = {} if weights is None else {"weights": weights}
         if self.gridsearch:
-            g.gridsearch(X, y, progress=False)
+            g.gridsearch(X, y, progress=False, **extra)
         else:
-            g.fit(X, y)
+            g.fit(X, y, **extra)
         self.model = g
 
     def predict(self, X: FloatArray) -> FloatArray:
@@ -369,8 +566,8 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
         if lib != "gamfit":
             raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
         return run_fuzz(family, n, design, seed)
-    X, y, _ = make_data(n, design, family, seed)
-    Xt, yt, mut = make_data(n, design, family, seed + TEST_SEED_OFFSET)
+    X, y, _, w = make_data(n, design, family, seed)
+    Xt, yt, mut, wt = make_data(n, design, family, seed + TEST_SEED_OFFSET)
     out: dict[str, Any] = {"base_rss_mb": rss_peak_mb()}
     errors: dict[str, str] = {}
 
@@ -394,9 +591,9 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
     if adapter is not None:
         out["lib_version"] = adapter.version
         out["after_import_rss_mb"] = rss_peak_mb()
-        phase("fit", lambda: adapter.fit(X, y))
+        phase("fit", lambda: adapter.fit(X, y, w))
     if adapter is not None and "fit" not in errors:
-        phase("fit_warm", lambda: adapter.fit(X, y))
+        phase("fit_warm", lambda: adapter.fit(X, y, w))
     if adapter is not None and not {"fit", "fit_warm"} & errors.keys():
         out["rss_after_fit_mb"] = rss_peak_mb()
         pred: FloatArray | None = phase("pred", lambda: adapter.predict(Xt))
@@ -407,17 +604,17 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
         if pred is not None:
             out["rmse_mu"] = float(np.sqrt(np.mean((pred - mut) ** 2)))
             out["rmse_y"] = float(np.sqrt(np.mean((pred - yt) ** 2)))
-            out["deviance"] = mean_deviance(family, yt, pred)
+            out["deviance"] = mean_deviance(family, yt, pred, wt)
         if iv is not None:
             lo, hi, sd = iv
             out["coverage"] = float(np.mean((mut >= lo) & (mut <= hi)))
             out["ci_width"] = float(np.mean(hi - lo))
             if pred is not None:
                 out["logscore"] = phase(
-                    "logscore", lambda: mean_logscore(family, yt, pred, sd), timed=False
+                    "logscore", lambda: mean_logscore(family, yt, pred, sd, wt), timed=False
                 )
         elif pred is not None and family != "gaussian":
-            out["logscore"] = mean_logscore(family, yt, pred, None)
+            out["logscore"] = mean_logscore(family, yt, pred, None, wt)
     out["peak_rss_mb"] = rss_peak_mb()
     usage = resource.getrusage(resource.RUSAGE_SELF)
     out["cpu_user_s"] = usage.ru_utime

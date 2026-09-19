@@ -7400,90 +7400,125 @@ pub(crate) fn ensure_by_variable_specs_match(
     }
 }
 
-/// Choose a deterministic orthonormal basis for a subspace from its projector.
+/// Function Gram `G = ∫ b bᵀ` and slope energy `D₁ = ∫ b' b'ᵀ` of a factor-smooth
+/// marginal, in the coefficient chart of its design (`b = Tᵀ b_raw` when the
+/// marginal carries an identifiability transform `T`).
 ///
-/// Eigenvectors belonging to a repeated eigenvalue are defined only up to an
-/// arbitrary orthogonal rotation.  That freedom is harmless when consumers use
-/// the whole projector `ZZ^T`, but it changes model semantics when each column
-/// receives its own smoothing parameter.  We remove the eigensolver gauge by
-/// repeatedly projecting coefficient coordinate axes into the subspace and
-/// selecting the largest residual (with stable lowest-index tie breaking).
-/// The result depends only on the subspace projector and the declared
-/// coefficient chart, never on the orientation returned by an eigensolver.
-fn canonical_nullspace_directions(z: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
-    let (coefficient_dim, nullity) = z.dim();
-    if nullity == 0 {
-        return Ok(Array2::zeros((coefficient_dim, 0)));
+/// Both integrate over the marginal's own modeling interval (one period for a
+/// periodic marginal). The slope energy is returned as a thunk because only a
+/// null space of more than one dimension needs it.
+fn factor_smooth_marginal_function_metrics<'a>(
+    metadata: &'a BasisMetadata,
+    fallback_degree: Option<usize>,
+    width: usize,
+    term_name: &'a str,
+) -> Result<
+    (
+        Array2<f64>,
+        impl FnOnce() -> Result<Array2<f64>, BasisError> + 'a,
+    ),
+    BasisError,
+> {
+    enum Marginal<'m> {
+        Open(&'m Array1<f64>, usize),
+        Periodic(f64, f64, usize, usize),
+        Cubic(&'m Array1<f64>),
     }
-    if coefficient_dim < nullity || z.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_basis!(
-            "null-space basis must be finite with rows >= columns, got {}x{}",
-            coefficient_dim,
-            nullity
-        );
-    }
-
-    let tolerance = 128.0 * f64::EPSILON * coefficient_dim.max(1) as f64;
-    let mut canonical = Array2::<f64>::zeros((coefficient_dim, nullity));
-    for accepted in 0..nullity {
-        let mut best_coordinate = usize::MAX;
-        let mut best_norm = 0.0_f64;
-        let mut best = Array1::<f64>::zeros(coefficient_dim);
-
-        for coordinate in 0..coefficient_dim {
-            // `P e_j = Z (Z^T e_j)` without materializing the full projector.
-            let mut candidate = Array1::<f64>::zeros(coefficient_dim);
-            for row in 0..coefficient_dim {
-                candidate[row] = (0..nullity)
-                    .map(|axis| z[[row, axis]] * z[[coordinate, axis]])
-                    .sum();
-            }
-            // Two-pass modified Gram--Schmidt keeps the selected directions
-            // orthogonal even when successive projected coordinates are close.
-            for _ in 0..2 {
-                for axis in 0..accepted {
-                    let direction = canonical.column(axis);
-                    let projection = direction.dot(&candidate);
-                    candidate.scaled_add(-projection, &direction);
+    let (marginal, transform) = match metadata {
+        BasisMetadata::BSpline1D {
+            knots,
+            identifiability_transform,
+            periodic,
+            degree,
+            ..
+        } => {
+            let Some(degree) = degree.or(fallback_degree) else {
+                crate::bail_invalid_basis!(
+                    "factor smooth term '{}': the B-spline marginal records no degree",
+                    term_name
+                );
+            };
+            let marginal = match periodic {
+                Some((start, period, num_basis)) => {
+                    Marginal::Periodic(*start, *period, degree, *num_basis)
                 }
-            }
-            let norm = candidate.dot(&candidate).sqrt();
-            let tie_band = tolerance * best_norm.max(1.0);
-            if best_coordinate == usize::MAX || norm > best_norm + tie_band {
-                best_coordinate = coordinate;
-                best_norm = norm;
-                best = candidate;
-            }
+                None => Marginal::Open(knots, degree),
+            };
+            (marginal, identifiability_transform.as_ref())
         }
-
-        if best_coordinate == usize::MAX || best_norm <= tolerance {
+        BasisMetadata::CubicRegression1D {
+            knots,
+            identifiability_transform,
+        } => (Marginal::Cubic(knots), identifiability_transform.as_ref()),
+        _ => {
             crate::bail_invalid_basis!(
-                "null-space projector exposed only {} of {} independent directions",
-                accepted,
-                nullity
+                "factor smooth term '{}' needs the function metric of its marginal to split the \
+                 null space into function components, but the marginal is neither a B-spline \
+                 nor a cubic regression spline",
+                term_name
             );
         }
-        best.mapv_inplace(|value| value / best_norm);
-        // Fix the remaining sign gauge for reproducible metadata/debug output.
-        let sign_anchor = best
-            .iter()
-            .enumerate()
-            .max_by(|(left_index, left), (right_index, right)| {
-                left.abs()
-                    .partial_cmp(&right.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| right_index.cmp(left_index))
-            })
-            .map(|(_, value)| *value)
-            .unwrap_or(1.0);
-        if sign_anchor < 0.0 {
-            best.mapv_inplace(|value| -value);
+    };
+    let to_chart = move |raw: Array2<f64>| -> Result<Array2<f64>, BasisError> {
+        let chart = match transform {
+            Some(t) => t.t().dot(&raw).dot(t),
+            None => raw,
+        };
+        if chart.dim() != (width, width) {
+            crate::bail_dim_basis!(
+                "factor smooth term '{}': marginal function metric is {:?} but the marginal has {} columns",
+                term_name,
+                chart.dim(),
+                width
+            );
         }
-        canonical.column_mut(accepted).assign(&best);
-    }
-    Ok(canonical)
+        Ok(chart)
+    };
+    let gram = match &marginal {
+        Marginal::Open(knots, degree) => crate::basis::bspline_function_gram(knots, *degree)?,
+        Marginal::Periodic(start, period, degree, num_basis) => {
+            crate::basis::periodic_bspline_function_gram(*start, start + period, *degree, *num_basis)?
+        }
+        Marginal::Cubic(knots) => crate::basis::cubic_regression_function_gram(knots)?,
+    };
+    let gram = to_chart(gram)?;
+    let slope_energy = move || {
+        let raw = match marginal {
+            Marginal::Open(knots, degree) => {
+                crate::basis::bspline_derivative_penalty_matrix(knots.view(), degree, 1)?
+            }
+            Marginal::Periodic(_, period, degree, num_basis) => {
+                crate::basis::cyclic_bspline_derivative_penalty_matrix(degree, num_basis, period, 1)?
+            }
+            Marginal::Cubic(knots) => crate::basis::cubic_regression_slope_energy(knots)?,
+        };
+        to_chart(raw)
+    };
+    Ok((gram, slope_energy))
 }
 
+/// Per-level penalties `GΦ_gΦ_gᵀG` of the marginal null components (see
+/// [`crate::basis::null_function_mass_components`]).
+fn factor_smooth_null_component_penalties(
+    marginal_penalty: &Array2<f64>,
+    metadata: &BasisMetadata,
+    fallback_degree: Option<usize>,
+    term_name: &str,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    let width = marginal_penalty.nrows();
+    let (gram, slope_energy) =
+        factor_smooth_marginal_function_metrics(metadata, fallback_degree, width, term_name)?;
+    let components = crate::basis::null_function_mass_components(
+        marginal_penalty,
+        &gram,
+        slope_energy,
+        "factor-smooth null components",
+    )?;
+    Ok(components
+        .iter()
+        .map(|factor| factor.t().dot(factor))
+        .collect())
+}
 
 /// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
 ///
@@ -7787,43 +7822,37 @@ pub(crate) fn build_factor_smooth(
     // and curves away from the true per-group line (gam#712 real arm, gam#713;
     // gam#903 sleepstudy forecast ran ~74% over the lme4 BLUP bar).
     //
-    // mgcv's `bs="fs"` fixes this by penalizing each null-space dimension
-    // SEPARATELY (`smooth.construct.fs.smooth.spec` adds one rank-1 penalty per
-    // null coordinate), each replicated block-diagonally across levels under a
-    // single shared smoothing parameter — so REML fits a distinct
-    // random-intercept variance and random-slope variance, the partial pooling
-    // that makes the forecast track lme4's correlated random-effect BLUP. A
-    // single *combined* null penalty (one λ for intercept+slope together) cannot
-    // express the typically very different intercept and slope variances, which
-    // is the residual forecast gap. We mirror mgcv exactly: for each orthonormal
-    // canonical null direction `z_k` of the marginal wiggliness penalty, add
-    // `I_L ⊗ (z_k z_kᵀ)` as its own penalty. The marginal's combined double
-    // penalty was disabled above, so the null space is penalized once, per
-    // dimension. With linear data REML drives the curvature λ up and degrades
-    // `fs` to a linear random slope (edf → ≈2/group); with genuine curvature the
-    // wiggliness λ stays small and the wiggle survives (data-adaptive, not a
-    // cap). Gated by `marginal.double_penalty` (the DSL `double_penalty=`),
-    // which on this flavour means exactly "penalize the null space too".
-    if use_per_dim_null
-        && let Some(Some(z)) = inner
-            .active_penalties
-            .first()
-            .map(|penalty| &penalty.null_eigenvectors)
-        && z.nrows() == p
-    {
-        let z = canonical_nullspace_directions(z)?;
-        for k in 0..z.ncols() {
-            // Rank-1 marginal penalty `z_k z_kᵀ`, replicated block-diagonally
-            // across levels into `I_L ⊗ (z_k z_kᵀ)`. Its own λ is one shared
-            // variance for this null component (intercept or slope) across all
-            // groups — the random-effect structure of mgcv `fs`.
-            let zk = z.column(k);
-            let mut p_k = Array2::<f64>::zeros((p, p));
-            for a in 0..p {
-                for b in 0..p {
-                    p_k[[a, b]] = zk[a] * zk[b];
-                }
-            }
+    // A single *combined* null penalty (one λ for intercept and slope together)
+    // cannot express the typically very different intercept and slope
+    // variances, which is the residual forecast gap, so each null COMPONENT gets
+    // its own penalty, replicated block-diagonally across levels under one
+    // shared smoothing parameter: REML then fits a distinct random-intercept
+    // variance and random-slope variance.
+    //
+    // A null component is a set of functions, so the split is made in function
+    // space (SPEC rule 5), not along coefficient axes: the null space is split
+    // into `L²`-orthonormal functions ordered by slope energy (the constant, the
+    // centred linear function, …), and each component's penalty charges the
+    // `L²` mass of the level's curve along it (`null_function_mass_components`).
+    // Coefficient-axis directions would make "the intercept variance" depend on
+    // how the marginal happens to be parameterized. The marginal's combined
+    // double penalty was disabled above, so the null space is penalized once,
+    // per component. With linear data REML drives the curvature λ up and
+    // degrades `fs` to a linear random slope (edf → ≈2/group); with genuine
+    // curvature the wiggliness λ stays small and the wiggle survives
+    // (data-adaptive, not a cap). Gated by `marginal.double_penalty` (the DSL
+    // `double_penalty=`), which on this flavour means exactly "penalize the null
+    // space too".
+    if use_per_dim_null && let Some(wiggliness) = inner.active_penalties.first() {
+        let components = factor_smooth_null_component_penalties(
+            &wiggliness.matrix,
+            &inner.metadata,
+            Some(spec.marginal.degree),
+            term_name,
+        )?;
+        for p_k in components {
+            // `I_L ⊗ R_k`: one shared variance for this null component across
+            // all groups.
             let mut s_null = Array2::<f64>::zeros((q, q));
             for level in 0..n_levels {
                 let start = level * p;
@@ -8127,13 +8156,23 @@ pub fn build_single_local_smooth_term(
                     term.name
                 );
             }
-            // Capture the marginal penalty's null directions BEFORE the penalty
-            // vector is rebuilt below; the sum-to-zero null-space ridge replicates
-            // these `z_k` into the contrast space (mgcv `bs="fs"` double-penalty).
-            let inner_null_eigenvectors = inner_built
-                .active_penalties
-                .first()
-                .and_then(|penalty| penalty.null_eigenvectors.clone());
+            // Split the marginal penalty's null space into its function
+            // components BEFORE the penalty vector is rebuilt below; the
+            // sum-to-zero null-space ridges replicate these into the contrast
+            // space.
+            let inner_degree = match inner.as_ref() {
+                SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec.degree),
+                _ => None,
+            };
+            let inner_null_components = match inner_built.active_penalties.first() {
+                Some(penalty) => factor_smooth_null_component_penalties(
+                    &penalty.matrix,
+                    &inner_built.metadata,
+                    inner_degree,
+                    &term.name,
+                )?,
+                None => Vec::new(),
+            };
             let base = inner_built
                 .design
                 .try_to_dense_by_chunks("sum-to-zero factor smooth")
@@ -8194,7 +8233,7 @@ pub fn build_single_local_smooth_term(
             // groups and vice-versa — systematic truth-recovery loss even when
             // the pooled total edf matches mgcv's (the observed `sz` 1.23× gap).
             //
-            // We mirror mgcv exactly by splitting the per-marginal penalty
+            // We therefore split the per-marginal penalty
             // `Σ_{k=1}^{L} d_kᵀ S d_k` back into its `L` independent
             // rank-controlled summands BEFORE mapping to the contrast space, each
             // carrying its own λ:
@@ -8249,64 +8288,50 @@ pub fn build_single_local_smooth_term(
                 }
             }
 
-            // Null-space ridge, mirroring the `bs="fs"` double-penalty
-            // construction (#1605, same defect class as #700/#712/#713). The
-            // marginal wiggliness penalty `S` shapes curvature but leaves the
+            // Null-space ridges (#1605, same defect class as #700/#712/#713).
+            // The marginal wiggliness penalty `S` shapes curvature but leaves the
             // {const, linear} null space of each deviation curve COMPLETELY
             // unpenalized. With that null space free, the single combined
             // wiggliness smoothing parameter cannot separate the per-group
             // intercept/slope variance from the curvature variance, so REML
             // parks the wiggliness `λ` high — over-smoothing (under-fitting) the
-            // deviation blocks even when the truth lives in their span (the `sz`
-            // recovery gap vs the `fs` superset). mgcv's `bs="fs"` fixes the
-            // analogous gap by penalizing each null-space dimension SEPARATELY
-            // under its own shared variance; we mirror that here while keeping
-            // the zero-sum reparameterization, so the constraint (and the
-            // identifiability of `sz` vs `fs`) is preserved. For each orthonormal
-            // canonical null direction `z_k` of the marginal penalty, add the
-            // rank-1 marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
-            // sum-to-zero contrast space, each carrying its own `λ`.
-            if let Some(z) = inner_null_eigenvectors.as_ref()
-                && z.nrows() == p
-            {
-                let z = canonical_nullspace_directions(z)?;
-                for k in 0..z.ncols() {
-                    let zk = z.column(k);
-                    let mut p_k = Array2::<f64>::zeros((p, p));
-                    for a in 0..p {
-                        for b in 0..p {
-                            p_k[[a, b]] = zk[a] * zk[b];
+            // deviation blocks even when the truth lives in their span. Each
+            // function component `R_k` of the marginal null space (the constant,
+            // the centred linear function, …; see `null_function_mass_components`)
+            // gets its own `λ`, mapped into the SAME `(I + 11ᵀ)` sum-to-zero
+            // contrast space, so the constraint (and the identifiability of `sz`
+            // vs `fs`) is preserved. The split is made with the marginal's
+            // function metric, so which deviations each `λ` shrinks does not
+            // depend on the coefficient chart (SPEC rule 5).
+            for p_k in &inner_null_components {
+                // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ R_k` form): each is
+                // one shared variance for that null component of every level's
+                // deviation, the exchangeable random-effect structure; only the
+                // curvature (wiggliness) penalty is split per group above.
+                let stz_pooled_null = {
+                    let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
+                    for a in 0..l_minus_one {
+                        for b in 0..l_minus_one {
+                            let factor = if a == b { 2.0 } else { 1.0 };
+                            let mut block =
+                                s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                            block.assign(&p_k.mapv(|v| v * factor));
                         }
                     }
-                    // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ z_k z_kᵀ` form):
-                    // they govern the per-group intercept/slope shrinkage, which
-                    // mgcv pools under one variance even for `sz`; only the
-                    // curvature (wiggliness) penalty is split per group above.
-                    let stz_pooled_null = {
-                        let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
-                        for a in 0..l_minus_one {
-                            for b in 0..l_minus_one {
-                                let factor = if a == b { 2.0 } else { 1.0 };
-                                let mut block =
-                                    s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
-                                block.assign(&p_k.mapv(|v| v * factor));
-                            }
-                        }
-                        s_big
-                    };
-                    let (s_null, null_scale) =
-                        normalize_penalty_in_constrained_space(&stz_pooled_null);
-                    candidates.push(PenaltyCandidate {
-                        matrix: ConstructiveQuadratic::try_from_dense_psd(
-                            s_null,
-                            "grouped factor-smooth null penalty",
-                        )?,
-                        source: PenaltySource::DoublePenaltyNullspace,
-                        normalization_scale: null_scale,
-                        kronecker_factors: None,
-                        op: None,
-                    });
-                }
+                    s_big
+                };
+                let (s_null, null_scale) =
+                    normalize_penalty_in_constrained_space(&stz_pooled_null);
+                candidates.push(PenaltyCandidate {
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        s_null,
+                        "grouped factor-smooth null penalty",
+                    )?,
+                    source: PenaltySource::DoublePenaltyNullspace,
+                    normalization_scale: null_scale,
+                    kronecker_factors: None,
+                    op: None,
+                });
             }
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
             let mut dropped_penalties = std::mem::take(&mut inner_built.dropped_penalties);
