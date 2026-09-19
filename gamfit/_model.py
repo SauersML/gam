@@ -673,7 +673,9 @@ class Model:
         :math:`T` by the LR factor would correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
-        constrained refit dropping the smooth, then Bartlett-corrects *that*:
+        constrained fit that fixes the smooth's coefficients at zero while
+        holding every other smoothing parameter at the full fit's
+        :math:`\\hat\\lambda`, then Bartlett-corrects *that*:
         :math:`W^* = W / c`, :math:`c = 1 + \\Delta\\varepsilon / d`.
 
         The reference :math:`W` is scored against is the statistic's own null
@@ -716,7 +718,24 @@ class Model:
         :math:`\\alpha = 0.05` and up to 1.6x anti-conservative at
         :math:`10^{-4}`), or ``"unit_weight_fallback"``.
 
-        For each penalized (shape-unconstrained) smooth term it returns
+        It returns one row per tested smooth term, always with the same keys.
+        The published p-value is exactly one of:
+
+        * ``p_value`` — the tail of the Bartlett-corrected statistic, resolved
+          to within ``p_value_bound``;
+        * ``p_value_upper_bound`` — the published accuracy does not separate
+          the tail from zero, so it is reported as ``p < p_value_upper_bound``
+          (the top of the certified interval) rather than as a residue such
+          as ``0.0``;
+        * ``unavailable_reason`` — a stable label
+          (``"empty_coefficient_block"``, ``"degenerate_reference"``,
+          ``"full_refit_failed"``, ``"null_fit_not_converged"``,
+          ``"null_fit_unsupported"``,
+          ``"null_log_likelihood_not_finite"``, ``"tail_not_computable"``)
+          with ``unavailable_message`` saying what happened; every inference
+          field of such a row is ``None``.
+
+        For a term with an inference row it also carries
         ``statistic_lr`` (the raw :math:`W`), ``ref_df`` (the null mean
         :math:`d = \\sum_j w_j`, which is what the Bartlett factor is
         denominated in — *not* a chi-square degrees of freedom),
@@ -726,13 +745,15 @@ class Model:
         estimated-scale channel above, ``None`` off the profiled Gaussian),
         ``bartlett_factor``
         :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
-        ``p_value_corrected`` (the magic-by-default value), ``material`` (the
+        ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
+        ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
+        ``"lawley_lr_fixed_lambda"`` when the family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
-        null refit converged, else ``"none"`` (the uncorrected reference stands,
-        never weakened).
+        factor is computable at this ``n``, else
+        ``"none"`` (the uncorrected reference stands, never weakened).
 
         A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
         :math:`f = 0` is the apex of the constraint cone and the fitted

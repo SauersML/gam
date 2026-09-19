@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "plan": "quick",
+  "safety_net": "timeout_s (per chunk) and memcap_mb (per worker) are a harness safety net, not a solver budget",
+  "thread_env": {
+    "RAYON_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1"
+  },
+  "invocations": [
+    {
+      "plan": {
+        "name": "quick",
+        "description": "every family x every null structure at n=200, except that the ti null runs for Gaussian only; 100 reps, gamfit and pyGAM (committed baseline behind docs/pvalues.md)",
+        "cells": [
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "smooth"
+          },
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "linear"
+          },
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "factor"
+          },
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "re"
+          },
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "concurvity"
+          },
+          {
+            "family": "binomial",
+            "n": 200,
+            "null": "smooth"
+          },
+          {
+            "family": "binomial",
+            "n": 200,
+            "null": "linear"
+          },
+          {
+            "family": "binomial",
+            "n": 200,
+            "null": "factor"
+          },
+          {
+            "family": "binomial",
+            "n": 200,
+            "null": "re"
+          },
+          {
+            "family": "binomial",
+            "n": 200,
+            "null": "concurvity"
+          },
+          {
+            "family": "poisson",
+            "n": 200,
+            "null": "smooth"
+          },
+          {
+            "family": "poisson",
+            "n": 200,
+            "null": "linear"
+          },
+          {
+            "family": "poisson",
+            "n": 200,
+            "null": "factor"
+          },
+          {
+            "family": "poisson",
+            "n": 200,
+            "null": "re"
+          },
+          {
+            "family": "poisson",
+            "n": 200,
+            "null": "concurvity"
+          },
+          {
+            "family": "gamma",
+            "n": 200,
+            "null": "smooth"
+          },
+          {
+            "family": "gamma",
+            "n": 200,
+            "null": "linear"
+          },
+          {
+            "family": "gamma",
+            "n": 200,
+            "null": "factor"
+          },
+          {
+            "family": "gamma",
+            "n": 200,
+            "null": "re"
+          },
+          {
+            "family": "gamma",
+            "n": 200,
+            "null": "concurvity"
+          },
+          {
+            "family": "negbin",
+            "n": 200,
+            "null": "smooth"
+          },
+          {
+            "family": "negbin",
+            "n": 200,
+            "null": "linear"
+          },
+          {
+            "family": "negbin",
+            "n": 200,
+            "null": "factor"
+          },
+          {
+            "family": "negbin",
+            "n": 200,
+            "null": "re"
+          },
+          {
+            "family": "negbin",
+            "n": 200,
+            "null": "concurvity"
+          },
+          {
+            "family": "gaussian",
+            "n": 200,
+            "null": "ti"
+          }
+        ],
+        "reps": 100,
+        "chunk": 10,
+        "timeout_s": 3600.0,
+        "libs": [
+          "gamfit",
+          "pygam",
+          "pygam_gs"
+        ]
+      },
+      "jobs": 4,
+      "memcap_mb": 2011.96044921875,
+      "resumed_with_records": 2516,
+      "chunks": 9,
+      "host": "vm",
+      "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+      "python": "3.11.15",
+      "nproc": 4,
+      "total_ram_mb": 16095.68359375,
+      "git_sha": "4f17dc876bda56b4e7b0102e262f339eed90a09e",
+      "started": "2026-09-19T10:03:16Z",
+      "finished": "2026-09-19T15:10:51Z"
+    }
+  ],
+  "lib_versions": [
+    "gamfit=0.1.268",
+    "pygam=0.12.0",
+    "pygam_gs=0.12.0"
+  ]
+}
