@@ -101,6 +101,9 @@ pub(crate) enum Command {
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Rank fitted models on their smoothing-corrected AIC and print the
+    /// comparison as JSON.
+    Compare(CompareArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
@@ -525,6 +528,24 @@ pub(crate) struct DiagnoseArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct CompareArgs {
+    #[arg(
+        value_name = "MODEL",
+        required = true,
+        num_args = 1..,
+        help = "Fitted model files produced by `gam fit`, all on the same data and family"
+    )]
+    pub(crate) models: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        num_args = 1..,
+        help = "One label per model, in order (default: the model paths)"
+    )]
+    pub(crate) names: Option<Vec<String>>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct SampleArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -608,6 +629,10 @@ pub(crate) enum FamilyArg {
     GammaLog,
     Tweedie,
     Beta,
+    /// Robust scaled Student-t response on the identity link; its scale and
+    /// degrees of freedom are estimated jointly with the smoothing parameters.
+    #[value(alias = "student_t", alias = "t")]
+    StudentT,
     RoystonParmar,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes

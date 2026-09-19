@@ -49,12 +49,18 @@ import gamfit; CUDA probing happens lazily at runtime.
 `crates/gam-solve/src/gpu_kernels/arrow_schur.rs` owns the arrow-Schur latent-coordinate CUDA helpers. Dense Direct/SqrtBA solves use CUDA row-block Cholesky, Schur accumulation into the shared beta block, cuSOLVER for the reduced beta step, and row-local GPU back-substitution. Large matrix-free systems use the GPU Schur matvec hook instead of forming a dense shared beta factor.
 
 `crates/gam-models/src/bms/gpu/` owns the Bernoulli marginal-slope FLEX
-row-primary Hessian assembly. When
-`row_primary_hessian_decision(n, r).use_gpu` is true and the latent
-measure is standard-normal, the BMS row path packs per-row cell
-coefficient families, derivative moments, row scalars, and observed
-point terms into a structure-of-arrays bundle and launches the FLEX row
-kernel. The kernel runs one CUDA block per row, parallelises the per-cell
+row-primary Hessian assembly. The device row kernel declares what it
+computes, `BMS_FLEX_ROW_KERNEL_CAPABILITY`: the Gaussian cell-moment
+latent integral (the standard-normal law) with score-warp and
+link-deviation blocks of any width. A family's model is checked against
+that declaration before anything else, so an empirical latent law (global,
+local, or the conditional location-scale route that resolves to one) always
+takes the CPU row kernel under `gpu=auto`. Under `gpu=required` the fit is
+refused at entry, naming the missing capability. When
+`row_primary_hessian_decision(model, n).use_gpu` is true, the BMS row path
+packs per-row cell coefficient families, derivative moments, row scalars,
+and observed point terms into a structure-of-arrays bundle and launches
+the FLEX row kernel. The kernel runs one CUDA block per row, parallelises the per-cell
 moment contractions, finalises the implicit-function-theorem solve, and
 writes the symmetric row Hessian back to host-pinned storage.
 
@@ -78,9 +84,9 @@ evidence logdet also checks the same runtime switch before CPU
 eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense
 Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free
 PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
-`row_primary_hessian_decision(n, r)`; any GPU error under `gpu=auto`
-returns to the existing CPU rayon row loop, while `gpu=required`
-propagates the error.
+`row_primary_hessian_decision(model, n)`, which selects the device kernel
+only for a model the kernel declares. Once the device kernel is selected,
+a GPU error propagates under every policy and is never retried on the CPU.
 
 ## Transfer And Precision Policy
 

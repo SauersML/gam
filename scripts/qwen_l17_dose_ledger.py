@@ -35,6 +35,10 @@ For each feature (weekday, month, color):
    exact directional Fisher dose ``½ (Jδ)ᵀ F (Jδ)`` of the move it applied, by
    one JVP. The returned plan, whose ``predicted_nats`` is that exact directional
    value, is one ledger row. A typed refusal is recorded, never dropped.
+   Every patched forward also records each top-k router's expert sets, and the row
+   carries ``router_topk_changes``, the number of token rows whose set differs from
+   the base forward's: the scorer's small-dose expansion holds only before the
+   first such change along a chord.
 
 Each feature's result is cached as ``feature_{feature}.json``, so a run cut short
 resumes where it stopped. The ledger is written once every feature is done.
@@ -49,7 +53,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -188,6 +192,26 @@ def dose_ladder(
     return ladder
 
 
+def router_topk_changes(base_calls: list[np.ndarray], patched_calls: list[np.ndarray]) -> int:
+    """Count the token rows whose top-k expert set differs between two forwards.
+
+    Each forward records one ``(tokens, k)`` index array per router call, in call
+    order. The logits are smooth in the activation only while every router keeps
+    its expert set, so a nonzero count puts the patched dose outside the region the
+    small-dose expansion describes. Order within a row is not part of the set.
+    """
+    if len(base_calls) != len(patched_calls):
+        raise ValueError(
+            f"the patched forward made {len(patched_calls)} router calls; the base made {len(base_calls)}"
+        )
+    changes = 0
+    for base, patched in zip(base_calls, patched_calls):
+        if base.shape != patched.shape:
+            raise ValueError(f"router call shapes differ: base {base.shape}, patched {patched.shape}")
+        changes += int(np.any(np.sort(base, axis=-1) != np.sort(patched, axis=-1), axis=-1).sum())
+    return changes
+
+
 def ledger_row(
     plan: dict[str, Any],
     *,
@@ -197,6 +221,7 @@ def ledger_row(
     split: str,
     fraction_index: int,
     target_nats: float,
+    router_topk_changes: int,
 ) -> dict[str, Any]:
     """One scored intervention, copied from the public plan and never re-priced."""
     return {
@@ -216,6 +241,7 @@ def ledger_row(
         "resident_metric_nats_kind": str(plan["resident_metric_nats_kind"]),
         "iterations": int(plan["iterations"]),
         "displacement": float(plan["displacement"]),
+        "router_topk_changes": int(router_topk_changes),
     }
 
 
@@ -274,8 +300,43 @@ def float32_readout(model: Any, layer: Any, position: int) -> Any:
     return Float32Readout()
 
 
+def router_modules(model: Any) -> list[Any]:
+    """The model's top-k expert routers; none for a dense model.
+
+    The frozen model's routers are ``Qwen3_5MoeTopKRouter``, whose forward returns
+    ``(logits, scores, indices)``. A config that declares experts with no router
+    found, or routers under a config with none, is refused rather than scored as
+    dense.
+    """
+    routers = [module for module in model.modules() if type(module).__name__.endswith("TopKRouter")]
+    config = getattr(model.config, "text_config", model.config)
+    experts = int(getattr(config, "num_experts", 0) or 0)
+    if bool(experts) != bool(routers):
+        raise RuntimeError(
+            f"the config declares {experts} experts but {len(routers)} top-k router modules were found"
+        )
+    return routers
+
+
+def record_router_topk(routers: list[Any], forward: Callable[[], Any]) -> tuple[Any, list[np.ndarray]]:
+    """Run ``forward`` and return its result with every router call's top-k indices."""
+    calls: list[np.ndarray] = []
+    handles = [
+        router.register_forward_hook(
+            lambda _module, _inputs, output: calls.append(output[2].detach().cpu().numpy())
+        )
+        for router in routers
+    ]
+    try:
+        result = forward()
+    finally:
+        for handle in handles:
+            handle.remove()
+    return result, calls
+
+
 def run_feature(
-    model: Any, tokenizer: Any, layer: Any, task: Any, atom: int, out_dir: Path
+    model: Any, tokenizer: Any, layer: Any, task: Any, atom: int, out_dir: Path, routers: list[Any]
 ) -> dict[str, Any]:
     import torch
     import gamfit
@@ -386,6 +447,10 @@ def run_feature(
             for _ in range(protocol["floor_repetitions"])
         ]
         floor_nats = dose_floor(repeat_nats, protocol["floor_multiplier"])
+        _, base_routing = record_router_topk(
+            routers, lambda: MATRIX.spliced_logits(readout, item["ids"], row).detach()
+        )
+        routing_by_delta: dict[tuple[float, ...], int] = {}
         coord = float(base_coord[b])
         gate = float(base_gate[b])
         metric_row = MATRIX.nearest_fitted_row(fit_coord, coord, period)
@@ -414,13 +479,19 @@ def run_feature(
             base_logits: Any = logits,
             base_readout: Any = readout,
             input_ids: Any = item["ids"],
+            base_calls: list[np.ndarray] = base_routing,
+            changes_by_delta: dict[tuple[float, ...], int] = routing_by_delta,
         ) -> dict[str, Any]:
             requested = torch.tensor(plan["delta"], dtype=torch.float64, device=device) @ lift64
             patched_row = base_row + requested.to(base_row.dtype)
             applied = patched_row - base_row
-            patched = MATRIX.spliced_logits(base_readout, input_ids, patched_row).detach()
+            patched, patched_calls = record_router_topk(
+                routers, lambda: MATRIX.spliced_logits(base_readout, input_ids, patched_row).detach()
+            )
+            effective_delta = (applied.to(torch.float64) @ lift64.T).cpu().tolist()
+            changes_by_delta[tuple(effective_delta)] = router_topk_changes(base_calls, patched_calls)
             return {
-                "effective_delta": (applied.to(torch.float64) @ lift64.T).cpu().tolist(),
+                "effective_delta": effective_delta,
                 "exact_directional_nats": MATRIX.exact_directional_nats(
                     base_readout, input_ids, base_row, applied
                 ),
@@ -453,6 +524,12 @@ def run_feature(
             except ValueError as error:
                 refusals.append({**record, "refusal": str(error)})
                 continue
+            landed = tuple(float(value) for value in plan["effective_delta"])
+            if landed not in routing_by_delta:
+                raise RuntimeError(
+                    f"{base_prompt_id} f{fraction_index}: the landed move was never probed, so its "
+                    "router top-k sets are unknown"
+                )
             rows.append(
                 ledger_row(
                     plan,
@@ -462,6 +539,7 @@ def run_feature(
                     split=base["split"],
                     fraction_index=fraction_index,
                     target_nats=target_nats,
+                    router_topk_changes=routing_by_delta[landed],
                 )
             )
 
@@ -513,7 +591,11 @@ def main() -> int:
     layer = CALENDAR.resolve_layers(model)[protocol["layer"]]
     hook_module = next(name for name, module in model.named_modules() if module is layer)
     log(f"model {protocol['model']} revision {revision}; hook module {hook_module}")
-    features = [run_feature(model, tokenizer, layer, task, atom, args.out) for atom, task in enumerate(tasks)]
+    routers = router_modules(model)
+    log(f"{len(routers)} top-k router modules; each patched forward is compared with its base forward")
+    features = [
+        run_feature(model, tokenizer, layer, task, atom, args.out, routers) for atom, task in enumerate(tasks)
+    ]
     import gamfit
 
     ledger = assemble_ledger(
@@ -538,6 +620,7 @@ def main() -> int:
             "max_templates": protocol["max_templates"],
             "bases": protocol["bases"],
             "fit_iterations": protocol["fit_iterations"],
+            "router_modules": len(routers),
             "features": list(protocol["features"]),
             "rank": protocol["rank"],
             "chart_dim": protocol["chart_dim"],

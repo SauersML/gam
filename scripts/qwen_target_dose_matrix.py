@@ -10,8 +10,11 @@ prompt's label-position residual with the lifted move, measures
 directional Fisher dose ``½ (Jδ)ᵀ F (Jδ)`` of the same move by one JVP. The solve
 takes no accuracy or probe budget: every call that returns a plan has resolved the
 displacement to its representation limit, and the report publishes each plan's
-relative landing error and probe count. A call the chart cannot satisfy must end in
-a typed refusal, which is recorded, never dropped.
+relative landing error and probe count. Each landing is also checked against the
+bracket its own probe readings imply (``landing_certificate``): it must be the
+reading equal to the target or the closer endpoint of the final bracket, which
+bounds the miss by half that bracket's reading gap. A call the chart cannot satisfy
+must end in a typed refusal, which is recorded, never dropped.
 
 Gate 4, the month semantic replay. Each held-out month base is moved by +1..+6
 months through the public ``ManifoldSAE.steer``, using the fitted chart's own
@@ -105,6 +108,48 @@ def realized_shift(realized_label: int, source_label: int, n_labels: int) -> int
 
 def relative_landing_error(measured_nats: float, target_nats: float) -> float:
     return abs(measured_nats - target_nats) / target_nats
+
+
+def landing_certificate(
+    target_nats: float, readings: list[float], landed_nats: float
+) -> dict[str, Any]:
+    """Check one target-dose landing against the bracket its own probe readings imply.
+
+    ``steer_to_target`` starts its bracket at the unprobed zero move, whose dose is
+    0, and every later observation replaces the bracket endpoint on its side of the
+    target. The final bracket is therefore the last reading below the target (0 if
+    none fell below) and the last reading above it. The solve returns a reading
+    equal to the target, or, once no representable displacement is left inside the
+    bracket, the endpoint whose reading is closer, the upper one on a tie. The
+    target lies inside the bracket, so a certified landing misses it by at most
+    half the bracket's reading gap. That bound is the probe's own resolution at
+    this dose, derived from the record and not a tolerance.
+    """
+    if landed_nats == target_nats:
+        return {
+            "final_bracket_nats": [target_nats, target_nats],
+            "landing_bound_nats": 0.0,
+            "landing_error_nats": 0.0,
+            "certified": target_nats in readings,
+        }
+    below = [value for value in readings if value < target_nats]
+    above = [value for value in readings if value > target_nats]
+    lo = below[-1] if below else 0.0
+    if not above:
+        return {
+            "final_bracket_nats": [lo, None],
+            "landing_bound_nats": None,
+            "landing_error_nats": abs(landed_nats - target_nats),
+            "certified": False,
+        }
+    hi = above[-1]
+    expected = hi if hi - target_nats <= target_nats - lo else lo
+    return {
+        "final_bracket_nats": [lo, hi],
+        "landing_bound_nats": 0.5 * (hi - lo),
+        "landing_error_nats": abs(landed_nats - target_nats),
+        "certified": landed_nats == expected,
+    }
 
 
 def nearest_fitted_row(fit_coord: np.ndarray, coordinate: float, period: float) -> int:
@@ -349,12 +394,24 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
                     "t_from": [float(base_coord[b])],
                     "direction": [direction],
                 }
+                readings: list[float] = []
+
+                def observed(plan: dict[str, Any], _readings: list[float] = readings) -> dict[str, Any]:
+                    observation = probe(plan)
+                    _readings.append(float(observation["measured_nats"]))
+                    return observation
+
                 try:
-                    plan = sae.steer_to_target(request, probe)
+                    plan = sae.steer_to_target(request, observed)
                 except ValueError as error:
-                    record.update(outcome="typed_refusal", refusal=str(error))
+                    record.update(outcome="typed_refusal", refusal=str(error), probe_readings_nats=readings)
                     dose_records.append(record)
                     continue
+                if int(plan["iterations"]) != len(readings):
+                    raise RuntimeError(
+                        f"steer_to_target reported {plan['iterations']} probes but called the probe "
+                        f"{len(readings)} times"
+                    )
                 record.update(
                     outcome="plan",
                     measured_nats=float(plan["measured_nats"]),
@@ -365,6 +422,8 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
                     relative_landing_error=relative_landing_error(
                         float(plan["measured_nats"]), target
                     ),
+                    probe_readings_nats=readings,
+                    landing=landing_certificate(target, readings, float(plan["measured_nats"])),
                 )
                 dose_records.append(record)
 
@@ -383,6 +442,12 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
             "max_relative_landing_error": max(
                 (record["relative_landing_error"] for record in plans), default=None
             ),
+            "certified_landings": sum(record["landing"]["certified"] for record in plans),
+            "uncertified_landings": [
+                f"{record['base_prompt_id']}:{record['direction']:+.0f}:{record['target_nats']}"
+                for record in plans
+                if not record["landing"]["certified"]
+            ],
             "probe_counts": sorted({record["iterations"] for record in plans}),
         },
         "dose_records": dose_records,

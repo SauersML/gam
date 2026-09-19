@@ -26,16 +26,23 @@ J. Appl. Comput. Topol. 3 (2019).
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._binding import rust_module as _rust_module
 
+if TYPE_CHECKING:
+    from ._rust import SheafConsistencyPenalty as _RustSheafConsistencyPenalty
 
-def _rust_sheaf_class() -> type[Any]:
+
+def _rust_sheaf_class() -> type[_RustSheafConsistencyPenalty]:
     module = _rust_module()
-    cls = getattr(module, "SheafConsistencyPenalty", None)
+    # Probed with a default so a stale local extension build that predates the
+    # pyclass yields the actionable error below instead of a bare AttributeError.
+    cls: type[_RustSheafConsistencyPenalty] | None = getattr(
+        module, "SheafConsistencyPenalty", None
+    )
     if cls is None:
         raise AttributeError(
             "gamfit._rust does not expose SheafConsistencyPenalty; "
@@ -129,13 +136,15 @@ def _infer_stalk_dims(
                 dims[u] = int(r_uv.shape[1])
             if dims[v] is None:
                 dims[v] = int(r_uv.shape[0])
+    inferred: list[int] = []
     for vtx, d in enumerate(dims):
         if d is None:
             raise ValueError(
                 f"SheafConsistencyPenalty: could not infer stalk dim for vertex {vtx}; "
                 "pass stalk_dims explicitly"
             )
-    return [int(d) for d in dims]
+        inferred.append(d)
+    return inferred
 
 
 class SheafConsistencyPenalty:

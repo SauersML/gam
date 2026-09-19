@@ -99,10 +99,16 @@ def test_scan_model_predicts_and_summarizes(degree, penalty_order, order):
     edf = float(summary.edf_total)
     assert order < edf < n, f"edf {edf} must lie in ({order}, {n})"
 
-    # conditional_aic: always the conditional AIC. The scan's concentrated diffuse
-    # REML value is a different estimand and must never be substituted here.
-    expected_conditional_aic = -2.0 * log_likelihood + 2.0 * edf
-    assert float(model.conditional_aic) == pytest.approx(expected_conditional_aic)
+    # aic_conditional: always the conditional AIC, counting the profiled
+    # Gaussian scale. The scan's concentrated diffuse REML value is a different
+    # estimand and must never be substituted here. The scan keeps no
+    # smoothing-parameter covariance correction, so the corrected AIC is absent
+    # and says why.
+    assert summary.scale_dof == 1.0
+    expected_conditional_aic = -2.0 * log_likelihood + 2.0 * (edf + 1.0)
+    assert float(summary.aic_conditional) == pytest.approx(expected_conditional_aic)
+    assert summary.aic_corrected is None
+    assert "spline-scan" in summary.aic_corrected_unavailable
 
     # term_blocks: exactly one contiguous coefficient block for the smooth.
     blocks = model.term_blocks
@@ -289,4 +295,4 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
     l0 = model.smoothing_parameters()
     l1 = reloaded.smoothing_parameters()
     assert l1 == l0
-    assert reloaded.conditional_aic == model.conditional_aic
+    assert s1.aic_conditional == s0.aic_conditional

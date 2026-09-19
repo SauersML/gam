@@ -84,9 +84,7 @@ class SaeSupervisedFit:
             "n_supervised": self.n_supervised,
             "latent_dim": len(self.latent_names),
             "sae": self.sae.summary(),
-            "head": self.model.summary().to_dict()
-            if hasattr(self.model.summary(), "to_dict")
-            else dict(self.model.summary()),
+            "head": self.model.summary().to_dict(),
         }
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -261,6 +259,12 @@ def sae_supervised(
         atom_topology=str(atom_topology),
         **sae_call_kwargs,
     )
+    if not isinstance(sae, ManifoldSAE):
+        raise RuntimeError(
+            f"sae_manifold_fit returned the null model {type(sae).__name__} "
+            "(no manifold atom was retained), so there are no per-row latent "
+            "assignments to fit a supervised head on"
+        )
     latents = np.asarray(sae.assignments, dtype=np.float64)
     if latents.ndim != 2 or latents.shape[0] != n:
         raise RuntimeError(

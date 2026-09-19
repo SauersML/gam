@@ -43,6 +43,8 @@ See https://github.com/SauersML/gam for the full guide.
 
 from importlib import import_module as _import_module
 from importlib import metadata as _metadata
+from types import ModuleType as _ModuleType
+from typing import TYPE_CHECKING as _TYPE_CHECKING
 
 from ._api import (
     CtnStage1,
@@ -118,7 +120,34 @@ _SUBMODULES = frozenset(
 )
 
 
-def __getattr__(name: str):
+if _TYPE_CHECKING:
+    from . import (
+        basis,
+        cuda,
+        diagnostics,
+        errors,
+        examples,
+        geometry,
+        identifiability,
+        inference,
+        kernels,
+        kernels_jax,
+        kernels_torch,
+        manifolds,
+        penalties,
+        plot,
+        reml,
+        response_geometry,
+        results,
+        sae,
+        sklearn,
+        smooth,
+        topology,
+        torch,
+    )
+
+
+def __getattr__(name: str) -> _ModuleType:
     """Import a public submodule on first access.
 
     A submodule whose optional dependency (e.g. ``torch``) is missing raises

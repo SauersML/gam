@@ -2926,6 +2926,15 @@ fn fit_bernoulli_marginal_slope_terms_under(
         ));
     }
     let initial_family = make_family(&marginal_design, &slope_design, initial_sigma);
+    // The row-kernel decision every cache build reads, made once before the
+    // search: `gpu=required` for a model the device row kernel does not compute
+    // is refused here, naming the missing capability, instead of at every trial
+    // point as a seed refusal (gam#3000).
+    if initial_family.flex_active() {
+        initial_family
+            .flex_row_kernel_decision()
+            .map_err(FitFailure::input)?;
+    }
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -3038,7 +3047,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
     // the driver's fast path; a fit that also searches length-scale or auxiliary
     // coordinates runs the driver's own search, which the point does not describe.
-    if options.required_warm_start.is_some()
+    if options.warm_start.is_some()
         && !(setup.auxiliary_dim() == 0
             && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
     {

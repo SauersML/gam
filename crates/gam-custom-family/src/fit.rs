@@ -1,4 +1,4 @@
-//! The public fit entry points (`fit_custom_family`,
+//! The public fit entry points (`fit        .filter(|_| problem.searches_every_seed() && !warm_start_present && !outer_cache_attached);custom_family`,
 //! `fit_custom_family_with_rho_prior`, fixed-lambda variants), result assembly +
 //! output-channel wiring, the raw-coordinate lift, and the effective-df-floor
 //! rho-bound machinery.
@@ -2384,8 +2384,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
 
     let label_layout = penalty_label_layout_with_joint(specs, penalty_counts.clone(), joint_specs)?;
     let mut rho0 = label_layout.initial_rho.clone();
-    let (persistent_warm_start_cache, mut persistent_warm_start) =
-        load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
+    // One warm-start source per fit: a `warm_start_from` point (gam#3002) replaces
+    // the persistent store's records and artifacts.
+    let (persistent_warm_start_cache, mut persistent_warm_start) = if options.warm_start.is_some() {
+        (None, None)
+    } else {
+        load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len())
+    };
     // The cross-fit `FitArtifact` transfer (consume/capture below) reuses
     // per-block β/ρ from a structurally-matching prior fit under a descriptor
     // key that deliberately EXCLUDES the response. Per the
@@ -2958,33 +2963,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // A low-level caller-keyed session wins. Otherwise derive the outer stream
     // from the same explicit store and structural key used by the block record
     // and cross-fit artifact owners.
-    // A caller's required warm start (`warm_start_from`) must fit this outer
-    // problem exactly; a point of another width is a model with other terms or
-    // another design, and the fit is refused rather than run cold.
-    if let Some(required) = options.required_warm_start.as_ref() {
-        let beta_dim: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-        if options.cache_session.is_none()
-            || required.rho_dim != n_rho
-            || required.beta_dim != beta_dim
-        {
-            return Err(CustomFamilyError::InvalidInput {
-                context: "warm_start_from",
-                reason: format!(
-                    "the model's certified point has {} smoothing coordinates and {} coefficients, \
-                     this fit has {n_rho} and {beta_dim}: it differs in its terms or its design width",
-                    required.rho_dim, required.beta_dim,
-                ),
-            });
-        }
-        required
-            .consumed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    let cache_session = options.cache_session.clone().or_else(|| {
-        persistent_warm_start_cache.as_ref().and_then(|cache| {
-            gam_solve::persistent_warm_start::open_outer_session(&cache.store, &cache.key)
+    // One warm-start source per fit: a warm start replaces the opportunistic
+    // outer cache.
+    let cache_session = if options.warm_start.is_some() {
+        None
+    } else {
+        options.cache_session.clone().or_else(|| {
+            persistent_warm_start_cache.as_ref().and_then(|cache| {
+                gam_solve::persistent_warm_start::open_outer_session(&cache.store, &cache.key)
+            })
         })
-    });
+    };
     let outer_cache_attached = cache_session.is_some();
     let problem = if let Some(session) = cache_session {
         let key_hex = session.key().to_hex();
@@ -3004,6 +2993,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         p
     } else {
         problem
+    };
+    // The one warm-start rule (gam#3002, `OuterProblem::with_warm_start`): on the
+    // parent's inputs the point resumes the search that certified it, and every
+    // other search runs cold; on other inputs it can only join the independent
+    // multistart. A point of another width belongs to another search.
+    let problem = match options.warm_start.as_ref() {
+        Some(warm_start) => problem.with_warm_start(warm_start),
+        None => problem,
     };
 
     // An inner failure at one trial rho makes that trial infeasible, not the
@@ -3040,7 +3037,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             } else {
                 outer.warm_start_for(rho)
             };
-            return match outerobjectivegradienthessian_labeled(
+            return match evaluate_on_branch(
                 family,
                 specs,
                 &outer_options,
@@ -3133,7 +3130,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             outer.warm_start_for(rho)
         };
-        let eval_result = match outerobjectivegradienthessian_labeled(
+        let eval_result = match evaluate_on_branch(
             family,
             specs,
             &outer_options,
@@ -3291,7 +3288,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             } else {
                 outer.warm_start_for(rho)
             };
-            match outerobjectivegradienthessian_labeled(
+            match evaluate_on_branch(
                 family,
                 specs,
                 &outer_options,
@@ -3851,13 +3848,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )?;
     // The certified point in the outer objective's own coordinates, for a later
     // fit that resumes from this model (`warm_start_from`).
+    // The input fingerprint is the fit entry's to add; this layer does not see
+    // the request.
     let outer_warm_start = gam_solve::model_types::OuterWarmStartRecord {
-        rho: rho_star.to_vec(),
+        theta: rho_star.to_vec(),
+        value: Some(certified_outer.final_value()),
         beta: inner
             .block_states
             .iter()
             .flat_map(|state| state.beta.iter().copied())
             .collect(),
+        input_fingerprint: None,
     };
     let mut fit = assemble_custom_family_fit_result(
         inner,
