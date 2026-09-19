@@ -111,6 +111,7 @@ pub enum GpuKernel {
     MarginalSlopeRows,
     RemlTrace,
     FinalInference,
+    PolyaGammaBatch,
 }
 
 impl GpuKernel {
@@ -127,6 +128,7 @@ impl GpuKernel {
             Self::MarginalSlopeRows => "marginal-slope-rows",
             Self::RemlTrace => "reml-trace",
             Self::FinalInference => "final-inference",
+            Self::PolyaGammaBatch => "polya-gamma-batch",
         }
     }
 }
@@ -213,6 +215,12 @@ pub enum GpuEligibility {
     /// Backend is compiled in, but the workload (n, m, ...) is below the
     /// runtime threshold for this kernel.
     WorkloadBelowThreshold,
+    /// Backend is compiled in and computes the model, but no CPU/GPU crossover
+    /// has been measured for this kernel, so no workload size is known to favor
+    /// the device. `auto` keeps the CPU kernel without probing a device (a
+    /// threshold borrowed from another kernel's crossover would be a guess, not
+    /// a measurement); `required` runs the device kernel like [`Self::Eligible`].
+    CrossoverUnmeasured,
     /// Backend is compiled in and the workload is large enough; the only
     /// remaining gates are policy and runtime probe.
     Eligible,
@@ -257,11 +265,16 @@ pub fn decide(
     let runtime_available = match (policy, eligibility) {
         (_, GpuEligibility::CapabilityMissing { .. } | GpuEligibility::BackendNotCompiled)
         | (GpuPolicy::Off, _)
-        | (GpuPolicy::Auto, GpuEligibility::WorkloadBelowThreshold) => false,
+        | (
+            GpuPolicy::Auto,
+            GpuEligibility::WorkloadBelowThreshold | GpuEligibility::CrossoverUnmeasured,
+        ) => false,
         (GpuPolicy::Auto, GpuEligibility::Eligible)
         | (
             GpuPolicy::Required,
-            GpuEligibility::WorkloadBelowThreshold | GpuEligibility::Eligible,
+            GpuEligibility::WorkloadBelowThreshold
+            | GpuEligibility::CrossoverUnmeasured
+            | GpuEligibility::Eligible,
         ) => device_runtime::GpuRuntime::resolve(policy)?.is_some(),
     };
     Ok(decide_under(policy, runtime_available, kernel, eligibility))
@@ -287,6 +300,9 @@ pub fn decide_under(
         (GpuPolicy::Auto, GpuEligibility::WorkloadBelowThreshold) => {
             (false, "cpu-workload-below-gpu-threshold")
         }
+        (GpuPolicy::Auto, GpuEligibility::CrossoverUnmeasured) => {
+            (false, "cpu-gpu-kernel-crossover-unmeasured")
+        }
         (GpuPolicy::Auto, GpuEligibility::Eligible) if !runtime_available => {
             (false, "cpu-gpu-runtime-unavailable")
         }
@@ -300,12 +316,14 @@ pub fn decide_under(
         // Under `required`, the workload-threshold gate is intentionally bypassed:
         // the user explicitly asked for GPU regardless of size.
         (GpuPolicy::Required, GpuEligibility::WorkloadBelowThreshold)
+        | (GpuPolicy::Required, GpuEligibility::CrossoverUnmeasured)
         | (GpuPolicy::Required, GpuEligibility::Eligible) => (true, "gpu-required-supported"),
     };
     let missing_capability = match eligibility {
         GpuEligibility::CapabilityMissing { missing } => Some(missing),
         GpuEligibility::BackendNotCompiled
         | GpuEligibility::WorkloadBelowThreshold
+        | GpuEligibility::CrossoverUnmeasured
         | GpuEligibility::Eligible => None,
     };
     GpuDecision {
@@ -362,7 +380,7 @@ pub fn log_backend_inventory_once() {
             "none"
         };
         log::trace!(
-            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference,polya-gamma-batch",
             global_policy().as_str(),
             compiled_backends
         );
@@ -616,5 +634,31 @@ mod policy_tests {
         let no_device = decide_under(GpuPolicy::Auto, false, kernel, GpuEligibility::Eligible);
         assert!(!no_device.use_gpu);
         assert_eq!(no_device.reason, "cpu-gpu-runtime-unavailable");
+    }
+
+    /// #3024: a kernel with no measured crossover stays on the CPU under
+    /// `auto` whatever the host, and runs on the device under `required`.
+    #[test]
+    fn unmeasured_crossover_keeps_auto_on_cpu_and_required_on_device_3024() {
+        let kernel = GpuKernel::MarginalSlopeRows;
+        for runtime_available in [false, true] {
+            let auto = decide_under(
+                GpuPolicy::Auto,
+                runtime_available,
+                kernel,
+                GpuEligibility::CrossoverUnmeasured,
+            );
+            assert!(!auto.use_gpu);
+            assert_eq!(auto.reason, "cpu-gpu-kernel-crossover-unmeasured");
+            assert!(auto.require_supported().is_ok());
+            let required = decide_under(
+                GpuPolicy::Required,
+                runtime_available,
+                kernel,
+                GpuEligibility::CrossoverUnmeasured,
+            );
+            assert!(required.use_gpu);
+            assert!(required.require_supported().is_ok());
+        }
     }
 }

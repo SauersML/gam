@@ -1055,13 +1055,17 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
 
         // The device pullback is written for the four-primary Gaussian frame. A
-        // follow-up-varying slope, or a declared latent law, takes the ordinary
-        // per-row CPU path rather than a silently different lowering.
-        if G::FOLLOW_UP_VARYING || G::ANCHORED {
-            return None;
-        }
-        let n = self.family.n;
-        match survival_rigid_row_vgh_device_selected(n) {
+        // follow-up-varying slope, or a declared latent law, is a capability the
+        // device kernel lacks: the ordinary per-row CPU path runs it rather than
+        // a silently different lowering, and `gpu=required` refuses it.
+        let missing = if G::FOLLOW_UP_VARYING {
+            Some("a follow-up-varying slope")
+        } else if G::ANCHORED {
+            Some("a declared latent law")
+        } else {
+            None
+        };
+        match survival_rigid_row_vgh_device_selected(missing) {
             Ok(true) => {}
             Ok(false) => return None,
             Err(error) => return Some(Err(error)),
@@ -1070,6 +1074,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         #[cfg(target_os = "linux")]
         {
             use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
+            let n = self.family.n;
             let probit_scale = self.family.probit_frailty_scale();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary
             // projections — the same quantities the per-row path computes).
@@ -1130,9 +1135,9 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
             Some(Ok((ch.value, grads, hesss)))
         }
 
-        // Non-Linux hosts can never pass device admission (the selector is
-        // `cfg!(target_os = "linux") && …`), so the early `None` above is the
-        // only exit and the per-row cache path handles every row.
+        // Off Linux the device backend is not compiled, so the decision above
+        // never selects it: `auto` has already returned `None` and `required`
+        // its refusal, and the per-row cache path handles every row.
         #[cfg(not(target_os = "linux"))]
         None
     }

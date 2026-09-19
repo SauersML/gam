@@ -218,8 +218,8 @@ pub(crate) fn device_pirls_stage3_ready() -> Result<bool, gam_gpu::gpu_error::Gp
 ///
 /// Magic by default: no flags. When [`device_pirls_stage3_ready`] returns
 /// `true` the GPU branch fires for every cubature batch where the problem
-/// geometry justifies it (family in JIT-cached set, `p ≥ 32`,
-/// `n ≥ row_kernel_min_n`, dense design). A pre-admission `Ok(None)` uses the
+/// geometry justifies it (family in JIT-cached set, dense design). A
+/// pre-admission `Ok(None)` uses the
 /// CPU executor; once admitted, typed geometry/runtime failures propagate and
 /// are never retried on a different implementation.
 ///

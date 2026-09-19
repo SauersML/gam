@@ -1063,19 +1063,11 @@ fn plan_dispatch(
             "complete SAE row jet refuses one K={k}, q={q}, p={p}, beta={n_beta} row: the q^2*p second channel alone is {second_channel_bytes} bytes and simultaneous host residency is {one_row_host_bytes} bytes, exceeding the cgroup-aware budget {host_budget}"
         ));
     }
-    if mode == gam_gpu::GpuPolicy::Off {
-        return Ok(SaeRowJetExecutionPlan {
-            path: SaeRowJetPath::Cpu,
-            tile_rows: 1,
-            ledger,
-        });
-    }
-
-    // This lower bound is derived from the smallest runtime calibration point.
-    // It lets ordinary CPU-sized fits avoid creating a CUDA context at all.
-    if mode == gam_gpu::GpuPolicy::Auto
-        && total_rows < gam_gpu::policy::GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N
-    {
+    // No CPU/GPU crossover has been measured for the SAE row jet (#3024), so no
+    // row count is known to favor the device: `off` and `auto` keep the CPU
+    // path without probing, so a CPU fit creates no CUDA context, and only
+    // `required` runs the device, at any size.
+    if mode != gam_gpu::GpuPolicy::Required {
         return Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Cpu,
             tile_rows: 1,
@@ -1085,60 +1077,23 @@ fn plan_dispatch(
 
     #[cfg(not(target_os = "linux"))]
     {
-        if mode == gam_gpu::GpuPolicy::Required {
-            return Err(
-                "complete SAE row jet requires CUDA, which is unavailable on this platform"
-                    .to_string(),
-            );
-        }
-        Ok(SaeRowJetExecutionPlan {
-            path: SaeRowJetPath::Cpu,
-            tile_rows: 1,
-            ledger,
-        })
+        Err("complete SAE row jet requires CUDA, which is unavailable on this platform".to_string())
     }
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = if mode == gam_gpu::GpuPolicy::Required {
-            gam_gpu::device_runtime::GpuRuntime::require()
-                .map_err(|error| format!("complete SAE row jet requires CUDA: {error}"))?
-        } else {
-            let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(mode)
-                .map_err(|error| format!("complete SAE row-jet CUDA admission failed: {error}"))?
-            else {
-                return Ok(SaeRowJetExecutionPlan {
-                    path: SaeRowJetPath::Cpu,
-                    tile_rows: 1,
-                    ledger,
-                });
-            };
-            runtime
-        };
-        if mode == gam_gpu::GpuPolicy::Auto && total_rows < runtime.policy.row_kernel_min_n {
-            return Ok(SaeRowJetExecutionPlan {
-                path: SaeRowJetPath::Cpu,
-                tile_rows: 1,
-                ledger,
-            });
-        }
+        let runtime = gam_gpu::device_runtime::GpuRuntime::require()
+            .map_err(|error| format!("complete SAE row jet requires CUDA: {error}"))?;
         let tile_rows = ledger.maximum_rows(runtime.memory_budget_bytes, host_budget);
         if tile_rows == 0 {
-            if mode == gam_gpu::GpuPolicy::Required {
-                return Err(format!(
-                    "complete SAE row jet cannot fit one tile: fixed_device={} device_per_row={} host_per_row={} device_budget={} host_budget={}",
-                    ledger.fixed_device_bytes,
-                    ledger.device_bytes_per_row,
-                    ledger.host_bytes_per_row,
-                    runtime.memory_budget_bytes,
-                    host_budget
-                ));
-            }
-            return Ok(SaeRowJetExecutionPlan {
-                path: SaeRowJetPath::Cpu,
-                tile_rows: 1,
-                ledger,
-            });
+            return Err(format!(
+                "complete SAE row jet cannot fit one tile: fixed_device={} device_per_row={} host_per_row={} device_budget={} host_budget={}",
+                ledger.fixed_device_bytes,
+                ledger.device_bytes_per_row,
+                ledger.host_bytes_per_row,
+                runtime.memory_budget_bytes,
+                host_budget
+            ));
         }
         Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Device,

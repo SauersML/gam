@@ -1,10 +1,10 @@
 //! Survival marginal-slope rigid per-row V/G/H jet on the GPU.
 //!
 //! The production cache builder requests exactly the order-2 channels
-//! `(value, gradient[4], Hessian[4][4])`. Large admitted batches execute the
+//! `(value, gradient[4], Hessian[4][4])`. Device-selected batches execute the
 //! order-2 CUDA lowering of the canonical five-feature row program followed by
-//! its mechanical four-primary pullback; smaller or
-//! unavailable-device batches use the ordinary per-row cache path. Contracted
+//! its mechanical four-primary pullback; every other batch uses the ordinary
+//! per-row cache path. Contracted
 //! third/fourth derivatives have separate live CPU consumers whose directions
 //! vary by row and are intentionally not part of this batch API.
 //!
@@ -42,31 +42,40 @@ pub(crate) struct SurvivalRowInputs {
     pub(crate) cov_ones: f64,
 }
 
-/// Whether this batch is admitted to the production CUDA V/G/H path.
+/// The device kernel's decision for a rigid survival row model, through the
+/// shared [`gam_gpu::decide`] gate (#3000). `missing` names the capability the
+/// model needs and the four-primary Gaussian device pullback lacks, if any.
 ///
-/// The batch runs one independent row program per row with no cross-row
-/// reduction, so the row count is the work, and what the device has to
-/// overcome is probe, transfer and launch latency. That crossover is the
-/// dispatch policy's `fused_kernel_min_n`, which device calibration derives
-/// from the device's measured row crossover; the Pólya-Gamma batch takes the
-/// same admission. A batch below
-/// `GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N`, which no reachable
-/// policy admits, returns before availability is resolved, so a CPU-sized fit
-/// creates no CUDA context. The row count used to be compared against a local
-/// 100,000-row literal (#2900 row 6.11).
-///
-/// Admission is a capability decision made before execution, not an
-/// operating-system guess. A large CPU-only Linux fit therefore stays on the
-/// ordinary row-kernel schedule; once a real device is admitted, subsequent
-/// compile/launch failures remain errors and are never hidden by a retry.
-#[inline]
-pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> Result<bool, String> {
-    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve_if_fused_batch_exceeds_floor(
-        gam_gpu::global_policy(),
-        n_rows,
-    )
-    .map_err(String::from)?;
-    Ok(runtime.is_some_and(|runtime| n_rows >= runtime.policy().fused_kernel_min_n))
+/// No CPU/GPU crossover has been measured for this kernel (#3024), so no row
+/// count is known to favor the device: `auto` keeps the per-row CPU path
+/// without probing, so a CPU fit creates no CUDA context, and `required` runs
+/// the device batch at any size. A model the kernel does not compute is never
+/// sent to it; under `required` that is a refusal naming the capability, not a
+/// silent CPU run. Once the device is selected, compile/launch failures remain
+/// errors and are never hidden by a retry.
+pub(crate) fn survival_rigid_row_vgh_device_decision(
+    missing: Option<&'static str>,
+) -> Result<gam_gpu::GpuDecision, String> {
+    let eligibility = if let Some(missing) = missing {
+        gam_gpu::GpuEligibility::CapabilityMissing { missing }
+    } else if !cfg!(target_os = "linux") {
+        gam_gpu::GpuEligibility::BackendNotCompiled
+    } else {
+        gam_gpu::GpuEligibility::CrossoverUnmeasured
+    };
+    gam_gpu::decide(gam_gpu::GpuKernel::MarginalSlopeRows, eligibility).map_err(String::from)
+}
+
+/// Whether the production CUDA V/G/H path runs this batch: the decision of
+/// [`survival_rigid_row_vgh_device_decision`], with `gpu=required` for a model
+/// the kernel cannot run turned into an `Err`.
+pub(crate) fn survival_rigid_row_vgh_device_selected(
+    missing: Option<&'static str>,
+) -> Result<bool, String> {
+    let decision = survival_rigid_row_vgh_device_decision(missing)?;
+    decision.clone().log();
+    decision.require_supported()?;
+    Ok(decision.use_gpu)
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.

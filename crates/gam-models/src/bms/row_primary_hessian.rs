@@ -1769,10 +1769,7 @@ impl BernoulliMarginalSlopeFamily {
     /// read at fit entry (where `gpu=required` for a model the device kernel
     /// does not compute is refused before any seed) and by every cache build.
     pub(super) fn flex_row_kernel_decision(&self) -> Result<gam_gpu::GpuDecision, String> {
-        crate::bms::gpu::flex::require_row_primary_hessian_supported(
-            &self.flex_row_model(),
-            self.y.len(),
-        )
+        crate::bms::gpu::flex::require_row_primary_hessian_supported(&self.flex_row_model())
     }
 
     pub(super) fn build_row_primary_hessian_cache(

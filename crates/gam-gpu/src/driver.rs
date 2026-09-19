@@ -454,11 +454,14 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 /// `libcuda.so.1` but no cuBLAS at all), those calls panic out of the
 /// PyO3 FFI boundary instead of returning a typed error.
 ///
-/// `GpuRuntime::probe()` calls this for every compute library it depends on;
-/// failure retains the exact stack-selection or loader error in the typed GPU
-/// refusal. What keeps cudarc's loader panic off the call path is the probe's
-/// separate walk over cudarc's own names (`require_cudarc_library`).
-pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
+/// `GpuRuntime::probe()` calls this for every compute library it depends on.
+/// No candidate opening is [`GpuError::DriverLibraryUnavailable`] (the host
+/// ships no such library: typed absence to the probe); a candidate that exists
+/// but fails to load, or a userspace stack that cannot be preloaded, is a
+/// fault of a present installation. What keeps cudarc's loader panic off the
+/// call path is the probe's separate walk over cudarc's own names
+/// (`require_cudarc_library`).
+pub fn require_cuda_compute_library(stem: &str) -> Result<(), GpuError> {
     // Cache the probe per stem and KEEP the loaded handle alive for the process
     // lifetime. Dropping the `Library` here dlclose's it; that dlopen+dlclose
     // cycle tears down the compute library's global init state, after which
@@ -467,7 +470,7 @@ pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
     // then silently declines and falls back to CPU). Holding the handle keeps the
     // library mapped and initialized so cudarc reuses it intact.
     static PROBED: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+        std::sync::Mutex<std::collections::HashMap<String, Result<(), GpuError>>>,
     > = OnceLock::new();
     static KEEP_ALIVE: OnceLock<std::sync::Mutex<Vec<Library>>> = OnceLock::new();
     let probed = PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -477,7 +480,8 @@ pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
         }
     }
     #[cfg(target_os = "linux")]
-    preload_cuda_userspace_libraries()?;
+    preload_cuda_userspace_libraries()
+        .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?;
     let outcome = match load_library_names(&cuda_compute_library_candidate_names(stem)) {
         Ok(library) => {
             if let Ok(mut keep) = KEEP_ALIVE
@@ -488,7 +492,7 @@ pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
             }
             Ok(())
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(error),
     };
     if let Ok(mut cache) = probed.lock() {
         cache.insert(stem.to_string(), outcome.clone());

@@ -1816,5 +1816,20 @@
     ],
     "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
     "evidence": "source_removal_guard.py and public_api_census.py run against base 26afd99f5f report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
+  },
+  {
+    "base": "3b8622004a6e39f6fe027f9f4adecc1413661307",
+    "items": [
+      "crates/gam-gpu/src/calibration.rs:const:_",
+      "crates/gam-gpu/src/device_runtime.rs:fn:resolve_if_fused_batch_exceeds_floor",
+      "crates/gam-gpu/src/policy.rs:const:MIN_CALIBRATABLE_FUSED_KERNEL_N",
+      "crates/gam-gpu/src/policy.rs:const:MIN_CALIBRATABLE_ROW_KERNEL_N",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_admits_large_batch_and_refuses_small",
+      "crates/gam-gpu/src/policy.rs:fn:polya_gamma_batch_target_is_gpu",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:assert_dispatch_worthy_and_report",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:sub_crossover_batch_routes_to_cpu_bitwise_on_every_host"
+    ],
+    "reason": "#3024 and #3000: GPU admission no longer borrows row-count floors that were never measured for the kernel they gate. The fused/row-kernel minimum-n policy fields, the MIN_CALIBRATABLE_* constants with their compile-time asserts, resolve_if_fused_batch_exceeds_floor and polya_gamma_batch_target_is_gpu are deleted; every GPU kernel (BMS flex row Hessian, survival rowjet, SAE rowjet, Polya-Gamma batch) now dispatches through gam_gpu::decide, which answers CrossoverUnmeasured (CPU) until a per-kernel crossover is measured. The tests that pinned the borrowed floor (polya_gamma_admits_large_batch_and_refuses_small, sub_crossover_batch_routes_to_cpu_bitwise_on_every_host and its assert_dispatch_worthy_and_report helper) asserted the removed behaviour and are replaced by decide-level tests. A host with libcuda but no cuBLAS now reports GpuAbsence::ComputeLibraryUnavailable instead of failing the fit (#3000).",
+    "evidence": "source_removal_guard.py and public_api_census.py run against base 3b8622004a report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-gpu --lib; gam-models bms::gpu, rigid_row_jet_device_admission_and_parity_2900, survival_dense_hessian_is_bitwise_invariant_to_the_worker_count_2337, multistart_member_2359; gam-inference --lib polya; gam-sae --lib."
   }
 ]
