@@ -634,12 +634,7 @@ fn profile_noise_floor(losses: &[f64], t: &[f64], t_bar: f64, stt: f64) -> Resul
             Array1::from_vec(vec![0.0]),
             Array1::from_vec(vec![1.0 - 2.0 * f64::EPSILON]),
         )
-        .with_initial_rho(Array1::from_vec(vec![0.5]))
-        .with_seed_config(gam_solve::seeding::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(Array1::from_vec(vec![0.5]));
     let refuse = |reason: String| EstimationError::TrialPointRefused { reason };
     let mut objective = problem.build_objective(
         (),

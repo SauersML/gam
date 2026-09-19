@@ -21,12 +21,10 @@ pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> Ca
         converged: result.converged,
         block_logdet_h: result.block_logdet_h,
         block_logdet_s: result.block_logdet_s,
-        joint_workspace: result.joint_workspace.clone(),
         kkt_residual: result.kkt_residual.clone(),
         active_constraints: result.active_constraints.clone(),
         terminal_working_sets: result.terminal_working_sets.clone(),
         terminal_likelihood_score: result.terminal_likelihood_score.clone(),
-        rho_mode_responses: None,
         objective_state: result.objective_state.clone(),
     }
 }
@@ -59,9 +57,9 @@ pub(crate) fn inner_solve_not_converged_error(
         theta_dim: rho_dim + psi_dim,
         rho_dim,
         psi_dim,
-        // The budget the solve actually ran against: the configured cap after
-        // any seed-screening cap, exactly as the inner loop derives it.
-        cycle_budget: Some(capped_inner_max_cycles(options, options.inner_max_cycles)),
+        // The budget the solve actually ran against, exactly as the inner loop
+        // derives it.
+        cycle_budget: Some(options.inner_max_cycles.max(1)),
         // Recorded by the exact joint route from its KKT refusal report; the
         // terminal `kkt_residual` is `None` off a converged iterate by design.
         carrying_block: inner.terminal_carrying_block.clone(),
