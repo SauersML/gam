@@ -7305,6 +7305,9 @@ fn predict_columns(
                 columns.insert("observation_lower".to_string(), obs_lower);
                 columns.insert("observation_upper".to_string(), obs_upper);
             }
+            // Identity link: the response IS the linear predictor, so both
+            // scales share one posterior SD.
+            columns.insert("linear_predictor_standard_error".to_string(), se.clone());
             columns.insert("posterior_mean_standard_error".to_string(), se);
             columns.insert("posterior_mean_lower".to_string(), lower);
             columns.insert("posterior_mean_upper".to_string(), upper);
@@ -7458,6 +7461,12 @@ fn predict_columns(
         );
         columns.insert("mean_plugin".to_string(), resolved.mean_plugin.to_vec());
         columns.insert("posterior_mean".to_string(), posterior_mean.to_vec());
+        if let Some(eta_standard_error) = resolved.linear_predictor_standard_error {
+            columns.insert(
+                "linear_predictor_standard_error".to_string(),
+                eta_standard_error.to_vec(),
+            );
+        }
         if let Some(standard_error) = resolved.posterior_mean_standard_error {
             columns.insert(
                 "posterior_mean_standard_error".to_string(),
