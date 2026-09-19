@@ -47,6 +47,9 @@ use gam::terms::sae::inference::atom_shape_race::{
     AtomShapeRaceVerdict, matched_control_verdicts, run_atom_shape_race,
     shape_reconstruction_rank_edge, validate_control_mean_l0,
 };
+use gam::terms::sae::inference::intervention_shard::{
+    ExecutedParameterRead, ExecutedParameterReads, ParameterEditScope,
+};
 
 use crate::py_value_error;
 
@@ -1622,6 +1625,47 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     Ok(out)
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #2946 — use-site parameter edits against the reads their forward executed
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Check each use-site parameter edit a torch runner executed against the parameter
+/// reads its forward made (#2946 Stage D, #2951). `edits` holds one
+/// `(parameter, ordinal, read_module, read_op)` per use-site edit, with the names its
+/// discovery reported for that read. `reads` holds the forward's reads in execution
+/// order as `(parameter, ordinal, module, op)`. The comparison is the carrier's
+/// [`ParameterEditScope::check_executed_reads`], so the first refusal raises
+/// `ValueError` naming the edit and the read.
+#[pyfunction]
+pub(crate) fn check_parameter_use_site_reads(
+    edits: Vec<(String, usize, String, String)>,
+    reads: Vec<(String, usize, String, String)>,
+) -> PyResult<()> {
+    let executed = ExecutedParameterReads::new(
+        reads
+            .into_iter()
+            .map(|(parameter, ordinal, read_module, read_op)| ExecutedParameterRead {
+                parameter,
+                ordinal,
+                read_module,
+                read_op,
+            })
+            .collect(),
+    )
+    .map_err(|refusal| py_value_error(format!("{refusal:?}: {refusal}")))?;
+    for (index, (parameter, ordinal, read_module, read_op)) in edits.into_iter().enumerate() {
+        ParameterEditScope::UseSite {
+            ordinal,
+            read_module,
+            read_op,
+            positions: None,
+        }
+        .check_executed_reads(&parameter, &executed)
+        .map_err(|refusal| py_value_error(format!("use-site edit {index}: {refusal:?}: {refusal}")))?;
+    }
+    Ok(())
+}
+
 /// Register the inference-instrument `#[pyfunction]`s and classes on the
 /// extension module. Kept here (rather than inline in `lib.rs`) so the wiring
 /// is one line at the call site.
@@ -1647,5 +1691,6 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(label_shuffle_permutation, module)?)?;
     module.add_function(wrap_pyfunction!(randomization_p_value, module)?)?;
     module.add_function(wrap_pyfunction!(adjudicate_atom_shape, module)?)?;
+    module.add_function(wrap_pyfunction!(check_parameter_use_site_reads, module)?)?;
     Ok(())
 }

@@ -626,6 +626,12 @@ def execute(args):
 
     with open(os.path.join(args.harvest, "registry.json")) as handle:
         export = json.load(handle)
+    # The registry export names the read the edit targets, as discovery reported it.
+    site = next(
+        (u for u in export["use_sites"] if u["tensor_id"] == "W_O.0" and u["ordinal"] == 0), None
+    )
+    if site is None:
+        raise SystemExit("the registry export records no W_O.0#0 use site")
     with open(args.settings) as handle:
         declared = json.load(handle)
     run = torch.load(export["run"], map_location="cpu", weights_only=True)
@@ -659,7 +665,14 @@ def execute(args):
             executed = execute_native(model, tokens)
             substituted = []
         else:
-            edit = UseSiteParameterEdit("W_O.0", 0, FactoredDelta(left=left, right=right), scope)
+            edit = UseSiteParameterEdit(
+                "W_O.0",
+                0,
+                FactoredDelta(left=left, right=right),
+                scope,
+                read_module=site["module"],
+                read_op=site["op"],
+            )
             result = execute_parameter_edits(model, tokens, [edit], leading_shape=(tokens.shape[0], seq_len))
             executed = result.output
             substituted = [site.use_site_id for site in result.substituted]

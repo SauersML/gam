@@ -16,6 +16,8 @@ is named:
   ``W + ΔW`` with tied weights;
 * a use-site edit of the tied tensor or of the shared body moves only that use,
   and differs from the global edit;
+* a use-site edit names its read by discovery's module and op, and Rust refuses
+  it when another module or op made the read at its ordinal;
 * declared positions take only those rows from the edited run of the op, on
   the op's current intervened input, and declaring every row equals the
   every-position edit;
@@ -30,6 +32,8 @@ Fixed seeds throughout; no clock entropy.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 import pytest
@@ -57,6 +61,7 @@ from gamfit.torch.parameter_interventions import (
 _TOKENS = torch.tensor([[3, 1, 4, 1, 5, 2]])
 _LEADING = (1, 6)
 _EVERY_ROW = tuple(range(_LEADING[1]))
+_LINEAR = resolve_name(F.linear)
 
 
 class _WeightScale(torch.nn.Module):
@@ -198,6 +203,19 @@ def _original(model: torch.nn.Module, tensor_id: str) -> torch.Tensor:
     return torch.from_numpy(parameter_values(model, tensor_id))
 
 
+def _use_site_edit(
+    model: torch.nn.Module, tensor_id: str, ordinal: int, delta: Any, positions: Any
+) -> UseSiteParameterEdit:
+    """A use-site edit named by the module and op discovery reports for its read,
+    as a driver builds one."""
+    (site,) = [
+        site
+        for site in discover_parameter_use_sites(model, _TOKENS)
+        if site.use_site_id == f"{tensor_id}#{ordinal}"
+    ]
+    return UseSiteParameterEdit(tensor_id, ordinal, delta, positions, site.module, site.op)
+
+
 def _splice(clean: torch.Tensor, moved: torch.Tensor, positions: tuple[int, ...]) -> torch.Tensor:
     index = torch.as_tensor(positions)
     combined = clean.clone()
@@ -311,7 +329,7 @@ def test_a_transpose_view_multiplied_by_matmul_is_an_identity_use_of_the_same_te
     original = _original(model, "embed.weight")
     delta = _ramp((7, 4))
     run = execute_parameter_edits(
-        model, _TOKENS, [UseSiteParameterEdit("embed.weight", 1, delta, None)]
+        model, _TOKENS, [_use_site_edit(model, "embed.weight", 1, delta, None)]
     )
     reference = F.embedding(_TOKENS, original) @ (original + torch.from_numpy(delta)).t()
     assert np.array_equal(run.output.values, reference.numpy())
@@ -364,14 +382,14 @@ def test_zero_deltas_reproduce_native_bitwise_and_nonzero_deltas_do_not() -> Non
     zero_factors = FactoredDelta(np.zeros((7, 2)), np.zeros((4, 2)))
     for edit in (
         GlobalParameterEdit("embed.weight", zero, None),
-        UseSiteParameterEdit("embed.weight", 1, zero, None),
+        _use_site_edit(model, "embed.weight", 1, zero, None),
         GlobalParameterEdit("embed.weight", zero_factors, None),
     ):
         assert np.array_equal(execute_parameter_edits(model, _TOKENS, [edit]).output.values, native)
     moved = _ramp((7, 4))
     for edit in (
         GlobalParameterEdit("embed.weight", moved, None),
-        UseSiteParameterEdit("embed.weight", 1, moved, None),
+        _use_site_edit(model, "embed.weight", 1, moved, None),
     ):
         assert not np.array_equal(
             execute_parameter_edits(model, _TOKENS, [edit]).output.values, native
@@ -415,7 +433,7 @@ def test_use_site_edit_of_the_tied_tensor_moves_only_the_head() -> None:
     original = _original(model, "embed.weight")
     delta = _ramp((7, 4))
     use_site = execute_parameter_edits(
-        model, _TOKENS, [UseSiteParameterEdit("embed.weight", 1, delta, None)]
+        model, _TOKENS, [_use_site_edit(model, "embed.weight", 1, delta, None)]
     )
     global_edit = execute_parameter_edits(
         model, _TOKENS, [GlobalParameterEdit("embed.weight", delta, None)]
@@ -436,7 +454,7 @@ def test_use_site_edit_of_the_shared_body_moves_only_its_second_call() -> None:
     delta = _ramp((6, 4))
     edited = _original(model, "body.0.weight") + torch.from_numpy(delta)
     run = execute_parameter_edits(
-        model, _TOKENS, [UseSiteParameterEdit("body.0.weight", 1, delta, None)]
+        model, _TOKENS, [_use_site_edit(model, "body.0.weight", 1, delta, None)]
     )
     with torch.no_grad():
         x = model.embed(_TOKENS)
@@ -445,6 +463,45 @@ def test_use_site_edit_of_the_shared_body_moves_only_its_second_call() -> None:
         reference = model.head(model.scale(x))
     assert np.array_equal(run.output.values, reference.numpy())
     assert [site.use_site_id for site in run.substituted] == ["body.0.weight#1"]
+
+
+def test_a_use_site_edit_refuses_when_its_names_are_not_the_read_at_its_ordinal() -> None:
+    model = _model()
+    delta = _ramp((7, 4))
+
+    def edit(model: torch.nn.Module, ordinal: int, module: str, op: str) -> Any:
+        return execute_parameter_edits(
+            model, _TOKENS, [UseSiteParameterEdit("embed.weight", ordinal, delta, None, module, op)]
+        )
+
+    # Control: named as discovery names the head read, the edit executes there.
+    run = edit(model, 1, "head", _LINEAR)
+    assert [site.use_site_id for site in run.substituted] == ["embed.weight#1"]
+    # Another op, or another module, at that ordinal is another read.
+    with pytest.raises(ValueError, match="LabelMismatch"):
+        edit(model, 1, "head", resolve_name(F.embedding))
+    with pytest.raises(ValueError, match="LabelMismatch"):
+        edit(model, 1, "embed", _LINEAR)
+    # An ordinal off by one reaches the embedding lookup, which the head's names do not name.
+    with pytest.raises(ValueError, match="LabelMismatch"):
+        edit(model, 0, "head", _LINEAR)
+    # The root module's own forward is named "", and the transposed tie reads there.
+    transposed = _seeded(_TransposedTie())
+    tie = edit(transposed, 1, "", resolve_name(torch.Tensor.t))
+    assert [site.use_site_id for site in tie.substituted] == ["embed.weight#1"]
+    with pytest.raises(ValueError, match="LabelMismatch"):
+        edit(transposed, 1, "embed", resolve_name(torch.Tensor.t))
+    # The cotangent runner checks the same names.
+    cotangent = _ramp(execute_native(model, _TOKENS).values.shape) - 0.1
+    with pytest.raises(ValueError, match="LabelMismatch"):
+        execute_parameter_cotangents(
+            model,
+            _TOKENS,
+            [UseSiteParameterEdit("body.0.weight", 0, _ramp((6, 4)), None, "body.2", _LINEAR)],
+            [OutputReadout(_EVERY_ROW)],
+            [cotangent],
+            ["body.0.weight#0"],
+        )
 
 
 def test_declared_positions_read_the_edit_only_at_those_rows() -> None:
@@ -491,7 +548,7 @@ def test_declared_positions_at_the_embedding_edit_a_suffix_of_rows() -> None:
     run = execute_parameter_edits(
         model,
         _TOKENS,
-        [UseSiteParameterEdit("embed.weight", 0, delta, suffix)],
+        [_use_site_edit(model, "embed.weight", 0, delta, suffix)],
         leading_shape=_LEADING,
     )
     original = _original(model, "embed.weight")
@@ -515,7 +572,7 @@ def test_both_runs_of_a_declared_use_see_the_current_intervened_input() -> None:
         _TOKENS,
         [
             GlobalParameterEdit("embed.weight", embed_delta, None),
-            UseSiteParameterEdit("body.0.weight", 0, body_delta, positions),
+            _use_site_edit(model, "body.0.weight", 0, body_delta, positions),
         ],
         leading_shape=_LEADING,
     )
@@ -547,8 +604,8 @@ def test_edited_execution_never_writes_into_the_module() -> None:
         _TOKENS,
         [
             GlobalParameterEdit("embed.weight", _ramp((7, 4)), None),
-            UseSiteParameterEdit(
-                "body.2.weight", 0, FactoredDelta(_ramp((4, 1)), _ramp((6, 1))), (2,)
+            _use_site_edit(
+                model, "body.2.weight", 0, FactoredDelta(_ramp((4, 1)), _ramp((6, 1))), (2,)
             ),
         ],
         leading_shape=_LEADING,
@@ -589,18 +646,18 @@ def test_edits_refuse_what_they_cannot_execute_faithfully() -> None:
         )
     with pytest.raises(ValueError, match="more than one edit at use site"):
         run(
-            UseSiteParameterEdit("body.0.weight", 0, delta, None),
-            UseSiteParameterEdit("body.0.weight", 0, delta, None),
+            _use_site_edit(model, "body.0.weight", 0, delta, None),
+            _use_site_edit(model, "body.0.weight", 0, delta, None),
         )
     with pytest.raises(ValueError, match="both a global edit and a use-site edit"):
         run(
             GlobalParameterEdit("body.0.weight", delta, None),
-            UseSiteParameterEdit("body.0.weight", 0, delta, None),
+            _use_site_edit(model, "body.0.weight", 0, delta, None),
         )
     with pytest.raises(ValueError, match="never reached"):
-        run(UseSiteParameterEdit("body.0.weight", 2, delta, None))
+        run(UseSiteParameterEdit("body.0.weight", 2, delta, None, "body.0", _LINEAR))
     with pytest.raises(ValueError, match="non-negative integer"):
-        UseSiteParameterEdit("body.0.weight", -1, delta, None)
+        UseSiteParameterEdit("body.0.weight", -1, delta, None, "body.0", _LINEAR)
     with pytest.raises(TypeError, match="floating-point tensor"):
         execute_native(_TupleOutput(), torch.ones(1, 2, dtype=torch.float64))
 
@@ -658,7 +715,7 @@ def test_declared_positions_refuse_where_rows_are_not_positions() -> None:
         execute_parameter_edits(
             model,
             _TOKENS,
-            [UseSiteParameterEdit("embed.weight", 0, _ramp((7, 4)), (0,))],
+            [_use_site_edit(model, "embed.weight", 0, _ramp((7, 4)), (0,))],
             leading_shape=(1, 5),
         )
     # ``W.t()`` returns the weight's transpose, which has no sequence axis.
@@ -667,7 +724,7 @@ def test_declared_positions_refuse_where_rows_are_not_positions() -> None:
         execute_parameter_edits(
             transposed,
             _TOKENS,
-            [UseSiteParameterEdit("embed.weight", 1, _ramp((7, 4)), (0,))],
+            [_use_site_edit(transposed, "embed.weight", 1, _ramp((7, 4)), (0,))],
             leading_shape=_LEADING,
         )
     # One call reading two edited tensors with different declared rows.
@@ -776,7 +833,7 @@ def test_use_cotangent_rows_at_declared_positions_come_from_the_edited_run() -> 
     model = _model()
     delta = _ramp((6, 4))
     positions = (1, 4)
-    edits = [UseSiteParameterEdit("body.0.weight", 0, delta, positions)]
+    edits = [_use_site_edit(model, "body.0.weight", 0, delta, positions)]
     executed = execute_parameter_edits(model, _TOKENS, edits, leading_shape=_LEADING)
     cotangent = _ramp(executed.output.values.shape) - 0.1
     run = execute_parameter_cotangents(
@@ -810,7 +867,7 @@ def test_use_cotangent_rows_at_declared_positions_come_from_the_edited_run() -> 
     every = execute_parameter_cotangents(
         model,
         _TOKENS,
-        [UseSiteParameterEdit("body.0.weight", 0, delta, None)],
+        [_use_site_edit(model, "body.0.weight", 0, delta, None)],
         [OutputReadout(_EVERY_ROW)],
         [cotangent],
         ["body.0.weight#0"],

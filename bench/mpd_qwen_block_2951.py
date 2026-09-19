@@ -159,14 +159,23 @@ def _literal_factors(weight: np.ndarray, components: list[dict]) -> tuple[np.nda
     return left, right
 
 
-def _edit(declared: dict, delta: FactoredDelta):
+def _edit(declared: dict, delta: FactoredDelta, labels: dict[tuple[str, int], tuple[str, str]]):
     tensor_id = declared["tensor_id"]
     positions = declared["positions"]
     if declared["scope"] == "global":
         return GlobalParameterEdit(tensor_id=tensor_id, delta=delta, positions=positions)
     if declared["scope"] == "use_site":
+        ordinal = int(declared["ordinal"])
+        if (tensor_id, ordinal) not in labels:
+            raise SystemExit(f"discovery found no use site {tensor_id}#{ordinal} to name the edit's read")
+        module, op = labels[(tensor_id, ordinal)]
         return UseSiteParameterEdit(
-            tensor_id=tensor_id, ordinal=int(declared["ordinal"]), delta=delta, positions=positions
+            tensor_id=tensor_id,
+            ordinal=ordinal,
+            delta=delta,
+            positions=positions,
+            read_module=module,
+            read_op=op,
         )
     raise SystemExit(f"an edit scope must be global or use_site; got {declared['scope']!r}")
 
@@ -188,6 +197,12 @@ def execute(args: argparse.Namespace) -> int:
     rows = int(declaration["rows"])
     inputs = torch.from_numpy(_rows(args.harvest, rows, hidden)).view(1, rows, hidden)
     weights = {name: parameter_values(mlp, name) for name in PARAMETERS}
+    # Discovery names each read a use-site edit targets. It runs before the stage
+    # hooks are registered, so its forward is not captured.
+    labels = {
+        (use.tensor_id, use.ordinal): (use.module, use.op)
+        for use in discover_parameter_use_sites(mlp, inputs)
+    }
     captured: dict[str, torch.Tensor] = {}
 
     def keep_output(name: str):
@@ -227,7 +242,7 @@ def execute(args: argparse.Namespace) -> int:
                 ones = f"ones{left.shape[1]}"
                 if ones not in files:
                     save(ones, np.ones(left.shape[1], dtype=np.float64))
-                edits.append(_edit(declared, FactoredDelta(left=left, right=right)))
+                edits.append(_edit(declared, FactoredDelta(left=left, right=right), labels))
                 declared_edits.append(
                     {
                         **declared,
