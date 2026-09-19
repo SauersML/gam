@@ -607,6 +607,50 @@ pub trait BlockExcessTarget {
         }
         out
     }
+
+    /// The feasible interval of a one-axis block, when the likelihood is defined
+    /// only on part of the axis. `None` (the default) means every `t` is in the
+    /// likelihood's domain, or that the target does not describe its domain.
+    ///
+    /// A block whose integrand is cut off inside the Laplace Gaussian's mass has a
+    /// jump (or a root-type kink) at the cut, and a Gauss–Hermite rule over the whole
+    /// line then converges only algebraically in its order. With the interval the
+    /// sampler integrates the truncated Gaussian instead, through a rule transported
+    /// onto `(t_lo, t_hi)`, whose integrand is smooth on the whole transported axis.
+    fn axis_truncation(&self) -> Option<Box<dyn BlockAxisTruncation + '_>> {
+        None
+    }
+}
+
+/// One end of a one-axis block's feasible interval (see
+/// [`BlockExcessTarget::axis_truncation`]).
+///
+/// The cut is a fixed boundary of the linear predictor: row `row` leaves the
+/// likelihood's domain when its displaced predictor `η̂_row + s_row(t)` crosses a
+/// constant, and `s_row(t) = row_slope · t` along the axis. The cut therefore sits at
+/// `t` and moves only through `η̂_row`, the block curvature and the block direction;
+/// the sampler carries that motion into the per-row moment channels at `row`, so
+/// the exact gradient assembly needs no extra channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockAxisCut {
+    /// The whitened block displacement at which the domain ends.
+    pub t: f64,
+    /// The observation row whose predictor crosses its domain boundary there.
+    pub row: usize,
+    /// `∂s_row/∂t`, nonzero.
+    pub row_slope: f64,
+}
+
+/// The feasible interval `(lower.t, upper.t)` of a one-axis block and the slope of
+/// its excess, which the cut's derivative needs at every node.
+pub trait BlockAxisTruncation {
+    /// The lower end, or `None` when the domain is unbounded below.
+    fn lower(&self) -> Option<BlockAxisCut>;
+    /// The upper end, or `None` when the domain is unbounded above.
+    fn upper(&self) -> Option<BlockAxisCut>;
+    /// `∂ΔF/∂t` at `t`, given the displaced score
+    /// [`BlockExcessTarget::displaced_neg_score`] already computed there.
+    fn excess_slope(&self, t: f64, displaced_neg_score: &Array1<f64>) -> f64;
 }
 
 // ───────────────────────── injected sampler traits ───────────────────────────

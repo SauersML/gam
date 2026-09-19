@@ -829,6 +829,22 @@ pub fn deviance_eta_row_with_log_measure_scale(
 }
 
 /// [`deviance_eta_row_with_log_measure_scale`] on a row measure formed once.
+/// Whether [`deviance_eta_row_on_measure`] evaluates this family and link through
+/// the reciprocal-power rows, whose domain is `η > 0`
+/// ([`require_reciprocal_link_domain`]). Every other pair it evaluates is defined
+/// on the whole line. A row of zero prior weight is outside either rule: the
+/// oracle returns zeros for it before any domain check.
+pub fn linear_predictor_positive_domain(
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+) -> bool {
+    reciprocal_power_link(inverse_link).is_some()
+        && matches!(
+            likelihood.spec.response,
+            ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian
+        )
+}
+
 #[inline]
 pub fn deviance_eta_row_on_measure(
     row: usize,
