@@ -1,6 +1,6 @@
 """Streaming Arrow-Schur SAE-manifold joint fit at LLM-atom scale.
 
-This drives the *real* ``gamfit.sae_manifold_fit`` joint solve — not a
+This drives the *real* ``gamfit.sae.sae_manifold_fit`` joint solve — not a
 synthetic stand-in. The fit dispatches its execution plan from the problem
 size and the hardware memory budget (``GpuRuntime``): when the dense in-core
 working set ``n_obs · (M_total + K) · 8 bytes`` exceeds the in-core threshold
@@ -67,7 +67,7 @@ def main() -> None:
     ))
     use_streaming, chunk_size = bool(plan["streaming"]), int(plan["chunk_size"])
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z,
         K=N_ATOMS,
         atom_topology="euclidean",

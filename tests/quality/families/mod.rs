@@ -33,6 +33,7 @@ mod quality_vs_mgcv_tensor_ti_2d_gaussian;
 mod quality_vs_mgcv_tensor_tp_2d_gaussian;
 mod quality_vs_numpyro_nuts_poisson_loglink;
 mod quality_vs_properscoring_crps_gaussian_location_scale;
+mod quality_vs_pygam_student_t_outliers;
 mod quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized;
 mod quality_vs_pymc_nuts_binomial_logit;
 mod quality_vs_scipy_conjugate_gaussian_posterior;

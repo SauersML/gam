@@ -17,7 +17,6 @@ def test_ctn_small_score_units_keep_affine_directions(tmp_path):
         "duchon(PC1, PC2, PC3, PC4, PC5, PC6, centers=8, scale_dims=true)",
         transformation_normal=True,
         config={"transformation_normal_config": {"response_num_internal_knots": 2}},
-        persistent_warm_start_root=tmp_path / "warm",
     )
     # Vary only the observed score to check the frozen conditional transform.
     held = data.iloc[[0] * 9].copy()

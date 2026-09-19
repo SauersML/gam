@@ -3,8 +3,8 @@
 //! Self-contained seam extracted from the pyffi monolith (issue #780): the pure
 //! free functions that render a fitted-model summary `PyDict` payload into HTML
 //! and human-readable previews -- recursive value rendering for mappings / lists
-//! / tuples, the coefficients-table HTML builder and its column-collector, the
-//! float formatter (mantissa-trim + exponent-normalize) and the HTML escaper --
+//! / tuples, the coefficients-table HTML builder and its column-collector and
+//! the HTML escaper (floats go through gam-report's one formatter) --
 //! together with the two preview/row-limit constants they share. They depend on
 //! nothing in the rest of the module; the `#[pyfunction]`s that consume them
 //! (`summary_repr`, `summary_html`) stay in the parent module via a focused
@@ -19,7 +19,7 @@ pub(crate) const SUMMARY_VALUE_PREVIEW_LIMIT: usize = 6;
 
 pub(crate) fn summary_render_value(value: &Bound<'_, PyAny>) -> PyResult<String> {
     if let Ok(float_value) = value.cast::<PyFloat>() {
-        return Ok(summary_format_float(float_value.extract::<f64>()?));
+        return Ok(gam::report::format_significant(float_value.extract::<f64>()?));
     }
     if let Ok(mapping) = value.cast::<PyDict>() {
         return summary_render_mapping_value(mapping);
@@ -169,68 +169,6 @@ pub(crate) fn summary_coefficient_columns(
         }
     }
     Ok(columns)
-}
-
-pub(crate) fn summary_format_float(value: f64) -> String {
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value == f64::INFINITY {
-        return "inf".to_string();
-    }
-    if value == f64::NEG_INFINITY {
-        return "-inf".to_string();
-    }
-    if value == 0.0 {
-        return "0".to_string();
-    }
-
-    let exponent = value.abs().log10().floor() as i32;
-    let mut out = if !(-4..6).contains(&exponent) {
-        let raw = format!("{:.5e}", value);
-        summary_normalize_exponent(&raw)
-    } else {
-        let places = (6 - exponent - 1).max(0) as usize;
-        summary_trim_float(format!("{:.*}", places, value))
-    };
-    if out == "-0" {
-        out = "0".to_string();
-    }
-    out
-}
-
-pub(crate) fn summary_normalize_exponent(raw: &str) -> String {
-    let Some((mantissa, exponent)) = raw.split_once('e') else {
-        return raw.to_string();
-    };
-    let mantissa = summary_trim_float(mantissa.to_string());
-    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
-        ('-', rest)
-    } else if let Some(rest) = exponent.strip_prefix('+') {
-        ('+', rest)
-    } else {
-        ('+', exponent)
-    };
-    let digits = digits.trim_start_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-    let padded = if digits.len() == 1 {
-        format!("0{digits}")
-    } else {
-        digits.to_string()
-    };
-    format!("{mantissa}e{sign}{padded}")
-}
-
-pub(crate) fn summary_trim_float(mut value: String) -> String {
-    if value.contains('.') {
-        while value.ends_with('0') {
-            value.pop();
-        }
-        if value.ends_with('.') {
-            value.pop();
-        }
-    }
-    value
 }
 
 pub(crate) fn summary_html_escape(input: &str) -> String {

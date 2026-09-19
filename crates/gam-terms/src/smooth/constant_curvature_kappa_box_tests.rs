@@ -43,9 +43,10 @@ fn spec_with(strategy: CenterStrategy, dim: usize) -> TermCollectionSpec {
                     identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

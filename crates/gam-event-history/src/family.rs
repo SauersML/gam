@@ -2378,7 +2378,7 @@ pub(crate) fn fit_at_rank(
                         None
                     };
                     if let Some(next_order) = raised {
-                        log::info!(
+                        log::debug!(
                             "[event-history] Gauss-Hermite order {order} cannot represent a posterior on this cohort; raising it to {next_order}"
                         );
                         order = next_order;
@@ -2423,7 +2423,7 @@ pub(crate) fn fit_at_rank(
                 check(&order_candidate, &fit, &current_gradient, &covariance, &sd)?;
             gauss_hermite.candidate = next_order;
             if gauss_hermite.coefficient_shift > spec.quadrature_tolerance {
-                log::info!(
+                log::debug!(
                     "[event-history] Gauss-Hermite order {order} moves the coefficients by {:.3} posterior sd at order {next_order}; refitting",
                     gauss_hermite.coefficient_shift
                 );
@@ -2469,7 +2469,7 @@ pub(crate) fn fit_at_rank(
         let mut mesh = check(&mesh_candidate, &fit, &current_gradient, &covariance, &sd)?;
         mesh.candidate = refinement + 1;
         if mesh.coefficient_shift > spec.quadrature_tolerance {
-            log::info!(
+            log::debug!(
                 "[event-history] mesh refinement {refinement} moves the coefficients by {:.3} posterior sd at refinement {}; refitting",
                 mesh.coefficient_shift,
                 refinement + 1
@@ -2973,7 +2973,7 @@ fn propose_atom(
         let gaps = Array1::from_iter(values.iter().skip(1).map(|mu| values[0] - mu));
         let shifts = Array1::from_iter(values.iter().zip(refined_values.iter()).map(|(a, b)| (b - a).abs()));
         let alignment = vectors.column(0).dot(&refined_vectors.column(0)).abs().min(1.0);
-        log::info!(
+        log::debug!(
             "[event-history] rank {rank} → {}: curvature spectrum at Gauss-Hermite orders {order}/{}: eigenvalues {values:.4e}, refined {refined_values:.4e}, gaps to the top {gaps:.3e}, rung shifts {shifts:.3e}, rung perturbation ‖ΔC‖₂ {delta_norm:.3e}, top-eigenvector angle {:.3e} rad",
             rank + 1,
             curvature.next_order,
@@ -3038,7 +3038,7 @@ fn propose_atom(
         if unresolved.is_empty() {
             break (refined, directions);
         }
-        log::info!(
+        log::debug!(
             "[event-history] rank {rank} → {}: directions {unresolved:?} are not resolved under the selected prior precision {lambda:.4e}; sampling them again under it",
             rank + 1
         );
@@ -3061,7 +3061,7 @@ fn propose_atom(
             refined.mode_scale,
             &spreads,
         );
-        log::info!(
+        log::debug!(
             "[event-history] rank {rank} → {}: a rung of curvature error moves the proposed start by {shift:.3e} posterior sd (mode scale {:.4e}, posterior sd along each direction {spreads:?})",
             rank + 1,
             refined.mode_scale
@@ -3122,7 +3122,7 @@ fn propose_atom(
             refined.mode_scale,
             &spreads,
         );
-        log::info!(
+        log::debug!(
             "[event-history] rank {rank} → {}: a mesh rung of curvature error (refinement {refinement} → {next_refinement}) moves the proposed start by {mesh_shift:.3e} posterior sd",
             rank + 1
         );
@@ -3136,7 +3136,7 @@ fn propose_atom(
             ));
         }
     }
-    log::info!(
+    log::debug!(
         "[event-history] rank {rank} → {}: sampled profile proposal: prior log-precision {:.3} → {:.3}, evidence {:.3} → {:.3} nats, mode scale {:.4} → {:.4}",
         rank + 1,
         atom.ridge.log_lambda,
@@ -3377,7 +3377,7 @@ fn fit_event_history_on_grid(
             ""
         };
         if !atom.ridge.accepted {
-            log::info!(
+            log::debug!(
                 "[event-history] rank {rank} → {}: score eigenvalue {:.4e} at log-rate {:.3}{}, standardised gain {:.3} nats; the evidence keeps the loading at zero (prior log-precision {:.3}, evidence {:.3} nats): refused",
                 rank + 1,
                 atom.eigenvalue,
@@ -3428,7 +3428,7 @@ fn fit_event_history_on_grid(
                     rank_path.push(step);
                     break;
                 }
-                log::info!(
+                log::debug!(
                     "[event-history] rank {rank} → {}: score eigenvalue {:.4e} at log-rate {:.3}{}, standardised gain {:.3} nats, prior log-precision {:.3}, evidence {:.3} nats, mode scale {:.4}: accepted; log-likelihood {:.3} → {:.3}, fitted log-rate {:.3}",
                     rank + 1,
                     atom.eigenvalue,
@@ -3502,7 +3502,7 @@ fn fit_event_history_on_grid(
             Err(error) => {
                 // No certified optimum at the next rank: the path stops with
                 // the reason recorded rather than failing the whole fit.
-                log::info!(
+                log::debug!(
                     "[event-history] rank {rank} → {}: the evidence accepted the atom but its model reached no certified optimum, refused ({error})",
                     rank + 1
                 );
@@ -3539,7 +3539,7 @@ fn certified_rank(
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let started = std::time::Instant::now();
     let fit = fit_at_rank(cohort, spec, atoms, start, None, admitted, from_refinement, reference_refinement)?;
-    log::info!(
+    log::debug!(
         "[event-history] rank {atoms}: certified at Gauss-Hermite order {}, mesh refinement {} ({:.2} s)",
         fit.quadrature.gauss_hermite_order,
         fit.quadrature.mesh_refinement,
@@ -3580,13 +3580,13 @@ fn raise_incumbent(
             let Some(next_order) =
                 positivity_raise(order, fit.nodes.max_subject_nodes(), rank_spec.quadrature_tolerance)
             else {
-                log::info!(
+                log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}), the ladder's top certifiable rung: the path stops at the certified rank-{rank} model with growth unresolved",
                     rank + 1
                 );
                 return Ok(None);
             };
-            log::info!(
+            log::debug!(
                 "[event-history] rank {rank} → {}: the decision is unresolved at Gauss-Hermite order {order} ({reason}); refitting the incumbent at order {next_order}",
                 rank + 1
             );
@@ -3596,13 +3596,13 @@ fn raise_incumbent(
         Rung::Mesh => {
             let next = refinement + 1;
             if next > cohort.mesh_refinement_ceiling() {
-                log::info!(
+                log::debug!(
                     "[event-history] rank {rank} → {}: the decision is unresolved at mesh refinement {refinement} ({reason}), the mesh's top rung: the path stops at the certified rank-{rank} model with growth unresolved",
                     rank + 1
                 );
                 return Ok(None);
             }
-            log::info!(
+            log::debug!(
                 "[event-history] rank {rank} → {}: the decision is unresolved at mesh refinement {refinement} ({reason}); refitting the incumbent at refinement {next}",
                 rank + 1
             );
@@ -3652,7 +3652,7 @@ pub(crate) fn fit_event_history(
             // The reference midpoint map does not contract at this grid's step
             // length, and a finer grid shortens the step.
             Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
-                log::info!("[event-history] reference refinement {refinement}: {refusal}; refining the reference grid");
+                log::debug!("[event-history] reference refinement {refinement}: {refusal}; refining the reference grid");
                 refinement += 1;
                 continue;
             }
@@ -3691,7 +3691,7 @@ pub(crate) fn fit_event_history(
             reason: "the reference certificate read no finer grid".to_string(),
         })?;
         let nats = coarse.discrepancy(&next.refresh_normaliser(states)?, fit.marks())?;
-        log::info!(
+        log::debug!(
             "[event-history] reference refinement {refinement} (rank {}, Gauss-Hermite order {}, mesh {}): fixed-coefficient steps {:?} posterior sd (bands {:?}); grid {chosen}'s tail estimate {certificate:.3e} is within {}; the next grid moves the log normalisers by {nats:.3e} nats; {:.3} s",
             fit.rank(),
             fit.quadrature.gauss_hermite_order,

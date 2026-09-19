@@ -4506,5 +4506,21 @@
     },
     "reason": "gam#3002: OuterWarmStart's four methods staged a saved model's point as a one-entry outer cache session. They are replaced by resolve_warm_start, which builds a gam_model_api::WarmStart (the point, its certified value, and whether the inputs are the parent's), and every outer search takes it through OuterProblem::with_warm_start. See docs/source-removal-changes.json at the same base.",
     "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
+  },
+  {
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "removed": {
+      "crates/gam-math/src/probability.rs::signed_weighted_chi_square_sf_to_tolerance": 1
+    },
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The caller-tolerance Imhof evaluator lost all relative accuracy below about 1e-16, because 1/2 + I/pi cancels there. Its tolerance argument was the reason the smooth-term LR driver clamped the request to [1e-13, 1e-3]. It is replaced by signed_weighted_chi_square_sf in crates/gam-math/src/probability/weighted_chi_square.rs, re-exported from gam_math::probability. The replacement takes no tolerance and returns a TailProbability whose relative error bound is derived. Its only caller, smooth_term_lr.rs (conditional_tail_with_bound), calls the replacement.",
+    "evidence": "public_api_census.py, run with base 0b7f21d97b and head 5e41417f1c, reported exactly this identity as removed (13342 public function declarations before, 13343 after). git grep -c -w signed_weighted_chi_square_sf_to_tolerance finds 0 files under crates, src and tests at the landing tree. crates/gam-math/tests/tail_references.rs passes all five of its tests against the stored mpmath references."
   }
 ]

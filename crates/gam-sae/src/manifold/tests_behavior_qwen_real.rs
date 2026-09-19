@@ -124,7 +124,7 @@ fn zz2015_tiny_inner_crawl_terminates() {
     match env_logger::builder().is_test(false).try_init() {
         Ok(()) => {}
         Err(already_installed) => {
-            log::debug!("zz2015: reusing the installed logger ({already_installed})");
+            log::trace!("zz2015: reusing the installed logger ({already_installed})");
         }
     }
     let activation_full = read_npy_f32_2d(&olmo_fixture_path("qwen35_9b_actsL21_pca64_2000.npy"));

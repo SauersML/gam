@@ -24,7 +24,7 @@ def main() -> None:
     ])
     x += 0.18 * rng.standard_normal(x.shape)
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=1,

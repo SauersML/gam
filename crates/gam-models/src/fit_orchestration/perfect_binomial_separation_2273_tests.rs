@@ -102,9 +102,9 @@ fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
 /// Fit `formula` on the exact-separation fixture at `n` through the
 /// production formula-fit entry point and assert a MODEL is minted (not a
 /// hard error) — the #2273 contract. `firth` mirrors the CLI's `--firth`
-/// flag; `false` is the default CLI path (automatic Firth retry still
-/// engages internally when the base error is Firth-retryable, per
-/// `firth_can_rescue` in `fit_orchestration/fit.rs`).
+/// flag; `false` is the default CLI path (the automatic Firth retry still
+/// engages internally when the base fit raised a separation certificate, per
+/// `firth_rescue_evidence` in `fit_orchestration/fit.rs`).
 fn assert_exact_separation_mints(n: usize, formula: &str, firth: bool) {
     let ds = perfectly_separated_binomial(n);
     let cfg = FitConfig {

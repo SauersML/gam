@@ -8,6 +8,10 @@ re-trace each GLM curvature-correction operator ``-X^T diag(c * X v_k) X``
 column by column, three times per evaluation, so the outer search spent
 minutes per step and never reached a certified optimum.
 
+Binomial and Poisson search those forty coordinates with ARC on the exact
+LAML outer Hessian; before that, gradient-only BFGS rebuilt the 40x40
+curvature from secant pairs and the fit timed out at every n (audit F1/F2).
+
 Asserted here is the certificate, never the wall time: the fit returns, and
 the optimizer's own stationarity verdict is certified.
 """
@@ -31,6 +35,8 @@ def _many_smooth_data(family: str, n: int) -> tuple[dict[str, np.ndarray], str]:
         eta += np.sin(2.0 * np.pi * x[:, j] + j) / np.sqrt(_N_SMOOTHS)
     if family == "gaussian":
         y = eta + rng.normal(0.0, 0.5, n)
+    elif family == "poisson":
+        y = rng.poisson(np.exp(0.5 + 0.7 * eta)).astype(float)
     else:
         y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-1.5 * eta))).astype(float)
     names = [f"x{j}" for j in range(_N_SMOOTHS)]
@@ -40,7 +46,7 @@ def _many_smooth_data(family: str, n: int) -> tuple[dict[str, np.ndarray], str]:
     return data, formula
 
 
-@pytest.mark.parametrize("family", ["gaussian", "binomial"])
+@pytest.mark.parametrize("family", ["gaussian", "binomial", "poisson"])
 def test_twenty_smooth_additive_model_converges_with_a_certificate(family: str) -> None:
     data, formula = _many_smooth_data(family, 1000)
     model = gamfit.fit(data, formula, family=family)
