@@ -1189,14 +1189,22 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
         let design = gam_linalg::matrix::DesignMatrix::from(x);
         let coordinates = fit.lambdas.len();
         let outer_hessian = Array2::<f64>::eye(coordinates);
+        let rho = fit.lambdas.mapv(f64::ln);
+        let unbounded_below = Array1::<f64>::from_elem(coordinates, f64::NEG_INFINITY);
+        let unbounded_above = Array1::<f64>::from_elem(coordinates, f64::INFINITY);
         let (at_zero_step, zero_radius) = super::identified_hessian::certify_fitted_identified_rank(
             pirls,
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian,
-            &Array1::<f64>::zeros(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian,
+                gradient: &Array1::<f64>::zeros(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect("a zero step certifies the fitted rank");
         assert_eq!(zero_radius, 0.0);
@@ -1238,9 +1246,14 @@ fn a_fits_identified_rank_refuses_over_a_step_that_reaches_its_band_2901() {
             &spectrum,
             &fit.lambdas,
             &design,
-            &outer_hessian.mapv(|entry| entry / reaching_step),
-            &Array1::<f64>::ones(coordinates),
-            &[],
+            super::identified_hessian::OuterCertificatePoint {
+                hessian_rho: &outer_hessian.mapv(|entry| entry / reaching_step),
+                gradient: &Array1::<f64>::ones(coordinates),
+                railed: &[],
+                rho: &rho,
+                lower: &unbounded_below,
+                upper: &unbounded_above,
+            },
         )
         .expect_err("a step reaching the band refuses the fitted rank");
         assert!(
