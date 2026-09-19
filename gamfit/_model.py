@@ -113,7 +113,8 @@ class Model:
 
     Use :meth:`predict` for named table inputs, :meth:`predict_array` only for
     models fitted from positional arrays, :meth:`summary` for typed fit
-    metadata, and :meth:`save` / :meth:`dumps` for persistence.
+    metadata, and :meth:`save` / :meth:`dumps` for persistence. ``pickle``,
+    ``copy`` and ``joblib`` go through the same :meth:`dumps` bytes.
     """
 
     __slots__ = ("_model_bytes", "_prediction_model", "_training_table_kind")
@@ -125,6 +126,15 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         self._training_table_kind = _training_table_kind
+
+    def __reduce__(self) -> tuple[Any, tuple[bytes]]:
+        """Pickle (and ``copy.copy`` / ``copy.deepcopy``) through the saved-model
+        bytes, rebuilt by :func:`gamfit.loads`: the archive :meth:`dumps` returns
+        is the only serialized form, and the compiled prediction handle is
+        rebuilt from it rather than pickled."""
+        from ._api import loads  # local import avoids cycle
+
+        return (loads, (self._model_bytes,))
 
     def predict(
         self,
@@ -1428,6 +1438,13 @@ class MultinomialModel:
         # fitted model and downstream property accessors deserve a cheap
         # attribute read rather than an FFI round-trip per call.
         self._metadata = rust_module().multinomial_model_metadata_pyfunc(self._model_bytes)
+
+    def __reduce__(self) -> tuple[Any, tuple[bytes]]:
+        """Pickle (and ``copy.copy`` / ``copy.deepcopy``) through the saved-model
+        bytes, rebuilt by :func:`gamfit.loads`, exactly as :meth:`Model.__reduce__`."""
+        from ._api import loads  # local import avoids cycle
+
+        return (loads, (self._model_bytes,))
 
     # ------------------------------------------------------------------ class metadata
     @property
