@@ -17,7 +17,7 @@ fn runtime_at_width(width: usize) -> DeviationRuntime {
     (2..=64usize)
         .filter_map(|n_knots| DeviationRuntime::try_new(tier_knots(n_knots), 0.0, 3).ok())
         .find(|runtime| 2 + runtime.basis_dim() == width)
-        .unwrap_or_else(|| panic!("no knot count lands the BMS primary width on {width}"))
+        .expect("a knot count lands the BMS primary width on every tested width")
 }
 
 fn check_width(width: usize, is_score_warp: bool) {
