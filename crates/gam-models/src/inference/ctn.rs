@@ -296,7 +296,7 @@ pub(crate) fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitC
     let mut payload = fit_formula_to_payload(formula, &outcome_data, &outcome_config)?;
     payload.score_transform = Some(Box::new(transform));
     payload.score_crossfit_folds = folds;
-    payload.inference_notes.push("CTN is frozen at prediction. Uncertainty is conditional on that fitted transform; standard normality is assumed, not certified.".into());
+    payload.informational_notes.push("CTN is frozen at prediction. Uncertainty is conditional on that fitted transform; standard normality is assumed, not certified.".into());
     Ok(payload)
 }
 

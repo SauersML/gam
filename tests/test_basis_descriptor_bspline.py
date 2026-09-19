@@ -1,4 +1,4 @@
-"""Callable-basis contract for :class:`gamfit.BSpline`.
+"""Callable-basis contract for :class:`gamfit.smooth.BSpline`.
 
 Covers: shape conventions, autograd-consistency between ``.evaluate`` and
 ``.jacobian`` / ``.hessian``, partition-of-unity, and bit-equality with the
@@ -15,9 +15,9 @@ torch = pytest.importorskip("torch")
 import gamfit
 
 
-def _make_spec() -> "gamfit.BSpline":
+def _make_spec() -> "gamfit.smooth.BSpline":
     knots = np.linspace(0.0, 1.0, 8 + 2 * 3)  # degree=3 clamped layout
-    return gamfit.BSpline(knots=knots, degree=3, periodic=False)
+    return gamfit.smooth.BSpline(knots=knots, degree=3, periodic=False)
 
 
 def test_evaluate_shape_and_dtype() -> None:

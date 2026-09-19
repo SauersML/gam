@@ -528,7 +528,8 @@ pub struct FittedModelPayload {
     pub estimator: FittedEstimator,
     /// Human-readable advisories produced while materializing this model —
     /// e.g. an mgcv-style "k was reduced to the data support" note when a
-    /// cubic-regression marginal is capped, or a basis-degradation note. These
+    /// cubic-regression marginal is capped, or a basis-degradation note: each
+    /// says the model differs from what was literally requested. These
     /// are surfaced to CLI users via `print_inference_summary`; persisting them
     /// here lets the Python (gamfit) interface surface the SAME advisories as
     /// warnings / `model.notes` instead of silently dropping them at the FFI
@@ -536,6 +537,14 @@ pub struct FittedModelPayload {
     /// such field) deserializing cleanly as "no notes".
     #[serde(default)]
     pub inference_notes: Vec<String>,
+    /// Defaults the engine chose on the user's behalf while building the
+    /// model — the internal-knot count of a default B-spline, per-margin
+    /// tensor sizes, how an interaction was wired. Part of the fit's record
+    /// (`model.notes`, the summary) but, unlike [`Self::inference_notes`],
+    /// not an advisory: front ends do not warn about them. `#[serde(default)]`
+    /// keeps payloads written before the split loading as "none".
+    #[serde(default)]
+    pub informational_notes: Vec<String>,
     /// Scalar terms the training rows could not identify and materialization
     /// removed before the fit, each with the formula it came from and the residual
     /// norm and rank tolerance that decided it (#2627). `#[serde(default)]` keeps
@@ -1039,6 +1048,7 @@ impl FittedModelPayload {
             family,
             estimator: FittedEstimator::Likelihood,
             inference_notes: Vec::new(),
+            informational_notes: Vec::new(),
             unidentified_scalar_terms: Vec::new(),
             basis_adequacy: Vec::new(),
             used_device: false,
@@ -1164,6 +1174,7 @@ impl FittedModelPayload {
                 linear_terms: Vec::new(),
                 smooth_terms: Vec::new(),
                 random_effect_terms: Vec::new(),
+                level: Default::default(),
             });
     }
 
@@ -1301,16 +1312,34 @@ pub enum ModelKind {
     TransformationNormal,
 }
 
+/// Saved-family tag of a joint multi-level expectile location-scale fit.
+pub const JOINT_EXPECTILE_FAMILY_TAG: &str = "expectile-location-scale";
+
+/// Prediction column carrying the level-`tau` curve of a joint expectile fit.
+pub fn expectile_curve_column_name(tau: f64) -> String {
+    format!("expectile_{tau}")
+}
+
 /// Statistical criterion represented by a saved fitted surface.
 ///
 /// `Likelihood` means the persisted [`LikelihoodSpec`] is also the fitted
 /// observation law. `Expectile` records the asymmetric least-squares target;
 /// it intentionally defines no observation sampler on its own.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// `ExpectileLocationScale` records a joint multi-level expectile fit on a
+/// Gaussian location-scale surface: level `levels[k]` is the curve
+/// `μ(x) + standardized_expectiles[k]·E[σ(x)]`. The standardized expectiles
+/// are strictly increasing, which is what makes the curves non-crossing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "estimator_kind", rename_all = "kebab-case")]
 pub enum FittedEstimator {
     Likelihood,
-    Expectile { tau: f64 },
+    Expectile {
+        tau: f64,
+    },
+    ExpectileLocationScale {
+        levels: Vec<f64>,
+        standardized_expectiles: Vec<f64>,
+    },
 }
 
 /// The family name every surface (summary, CLI fit line, Python
@@ -3615,7 +3644,7 @@ impl FittedModel {
                 if likelihood.is_latent_cloglog() {
                     *latent_cloglog_state = Some(*state);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted latent-cloglog link state discarded: likelihood {likelihood:?} \
                          has no latent-cloglog slot"
                     );
@@ -3626,7 +3655,7 @@ impl FittedModel {
                     *sas_state = Some(*state);
                     payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted SAS link state discarded: likelihood {likelihood:?} is not \
                          binomial-SAS"
                     );
@@ -3637,7 +3666,7 @@ impl FittedModel {
                     *sas_state = Some(*state);
                     payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted beta-logistic link state discarded: likelihood {likelihood:?} is \
                          not binomial beta-logistic"
                     );
@@ -3649,7 +3678,7 @@ impl FittedModel {
                     payload.mixture_link_param_covariance =
                         covariance.as_ref().map(array2_to_nested_vec);
                 } else {
-                    log::warn!(
+                    log::debug!(
                         "fitted mixture link state discarded: likelihood {likelihood:?} is not a \
                          binomial mixture link"
                     );
@@ -3703,8 +3732,34 @@ impl FittedModel {
     }
 
     #[inline]
-    pub fn estimator(&self) -> FittedEstimator {
-        self.payload().estimator
+    pub fn estimator(&self) -> &FittedEstimator {
+        &self.payload().estimator
+    }
+
+    /// Point-payload shape this model's prediction publishes. A joint expectile
+    /// fit publishes one curve per level (`expectile_curves`); every other
+    /// model publishes its class shape (`PredictModelClass::point_shape`).
+    pub fn prediction_point_shape(&self) -> &'static str {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { .. } => "expectile_curves",
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => {
+                self.predict_model_class().point_shape()
+            }
+        }
+    }
+
+    /// Point columns of a joint expectile fit, one per level in increasing
+    /// level order; `None` for every other estimator.
+    pub fn expectile_curve_columns(&self) -> Option<Vec<String>> {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { levels, .. } => Some(
+                levels
+                    .iter()
+                    .map(|&tau| expectile_curve_column_name(tau))
+                    .collect(),
+            ),
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => None,
+        }
     }
 
     /// Columns this model consumes from a prediction frame — its *input
@@ -4149,13 +4204,14 @@ impl FittedModel {
     /// `E[g⁻¹(η)] ≠ g⁻¹(E[η])` by Jensen. The curvature-based classification is:
     ///   * all log-link families (Poisson / Gamma / Tweedie / NegativeBinomial):
     ///     `E[exp η] = exp(η + se²/2) ≠ exp(η)` (log-normal MGF);
+    ///   * the reciprocal links (`1/η` for Gaussian / Gamma, `η^{-1/2}` for
+    ///     Inverse-Gaussian) and Inverse-Gaussian's log link;
     ///   * all Binomial links (logit / probit / cloglog / SAS / BetaLogistic /
     ///     Mixture / LatentCLogLog): bounded sigmoidal inverse links;
     ///   * Beta (logit link): `E[σ(η)] ≠ σ(E[η])`;
     ///   * Royston–Parmar (curved survival-probability inverse link).
     /// The integral collapses to the plug-in (so the cheaper plug-in path is
-    /// exact and taken instead) only for the effectively-linear identity-link
-    /// Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
+    /// exact and taken instead) only for the linear identity-link Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
     /// curved regardless of family. This curvature partition mirrors
     /// `families::family_runtime::posterior_mean`, the compute path that produces the
     /// corrected mean for each of these families.
@@ -4168,11 +4224,18 @@ impl FittedModel {
         let family = self.likelihood();
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
-            // mean equals the plug-in and the cheaper exact path is taken.
-            ResponseFamily::Gaussian => false,
-            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
+            // mean equals the plug-in and the cheaper exact path is taken. The
+            // inverse link `1/η` is curved. Student-t is identity-only.
+            ResponseFamily::StudentT { .. } => false,
+            ResponseFamily::Gaussian => {
+                !matches!(&family.link, InverseLink::Standard(StandardLink::Identity))
+            }
+            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η). Gamma's
+            // inverse link and both Inverse-Gaussian links (`η^{-1/2}`, `exp`)
+            // are curved as well.
             ResponseFamily::Poisson
             | ResponseFamily::Gamma
+            | ResponseFamily::InverseGaussian
             | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => true,
             // Beta (logit link): E[σ(η)] ≠ σ(E[η]).
@@ -4507,7 +4570,7 @@ impl FittedModel {
         // predictor goes through the generic interval drivers, which refuse it, so
         // pricing it here would turn such a model's interval into an error.
         if self.predict_model_class() != PredictModelClass::Standard || self.has_link_wiggle() {
-            log::warn!(
+            log::debug!(
                 "measure-jet extrapolation variance is fused only by the standard, \
                  link-wiggle-free predictor; the {:?} model's interval omits it",
                 self.predict_model_class()
@@ -4577,7 +4640,7 @@ impl FittedModel {
             let (Some(frozen), CenterStrategy::UserProvided(centers)) =
                 (mj.frozen_quadrature.as_ref(), &mj.center_strategy)
             else {
-                log::warn!(
+                log::debug!(
                     "measure-jet term '{}' is not frozen (UserProvided centers + frozen \
                     quadrature); skipping its extrapolation variance",
                     term.name
@@ -4648,7 +4711,7 @@ impl FittedModel {
             let mut lambda_phys = Vec::with_capacity(n_levels);
             let spectrum = if per_scale.is_empty() {
                 let Some(lam) = fused else {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}' has no fitted amplitude in the penalty \
                         layout; skipping its extrapolation variance",
                         term.name
@@ -4656,7 +4719,7 @@ impl FittedModel {
                     continue;
                 };
                 let Some(c) = frozen.fused_penalty_normalization_scale else {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}' is missing the fused penalty normalization scale; \
                         skipping its extrapolation variance",
                         term.name
@@ -4672,7 +4735,7 @@ impl FittedModel {
                         .enumerate()
                         .all(|(i, &(level, _))| level == i);
                 if !levels_complete {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}': {} fitted per-scale amplitudes for {} band \
                         scales; skipping its extrapolation variance",
                         term.name,
@@ -4682,7 +4745,7 @@ impl FittedModel {
                     continue;
                 }
                 if frozen.penalty_normalization_scales.len() != n_levels {
-                    log::warn!(
+                    log::debug!(
                         "measure-jet term '{}': {} frozen penalty normalization scales for {} \
                         band scales; skipping its extrapolation variance",
                         term.name,
@@ -4769,7 +4832,7 @@ impl FittedModel {
                     let MeasureJetIdentifiability::FrozenTransform { transform } =
                         &mj.identifiability
                     else {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': identifiability is not a frozen transform; \
                              skipping its input-measurement-error variance",
                             term.name
@@ -4778,7 +4841,7 @@ impl FittedModel {
                     };
                     let full_cols = design.design.ncols();
                     if fit.beta.len() != full_cols {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': joint coefficient vector length {} disagrees \
                              with the replayed design's {} columns; skipping its \
                              input-measurement-error variance",
@@ -4789,7 +4852,7 @@ impl FittedModel {
                         break 'input_var;
                     }
                     if design.smooth.term_designs.len() != spec.smooth_terms.len() {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': smooth design/term count mismatch ({} vs {}); \
                              skipping its input-measurement-error variance",
                             term.name,
@@ -4803,7 +4866,7 @@ impl FittedModel {
                     let reduced = transform.ncols();
                     let term_cols = design.smooth.term_designs[smooth_idx].ncols();
                     if term_cols != reduced {
-                        log::warn!(
+                        log::debug!(
                             "measure-jet term '{}': replayed reduced width {term_cols} disagrees \
                              with the frozen transform ({m_aug}×{reduced}); skipping its \
                              input-measurement-error variance",
@@ -4838,7 +4901,7 @@ impl FittedModel {
                     };
                     if let Some(t) = head_t.as_ref() {
                         if t.ncols() != head_width {
-                            log::warn!(
+                            log::debug!(
                                 "measure-jet term '{}': reconstructed head lift width {} disagrees \
                                  with the frozen head block {head_width}; skipping its \
                                  input-measurement-error variance",
@@ -4865,7 +4928,7 @@ impl FittedModel {
                                 input_var[i] = sigma2 * norm_sq;
                             }
                             Err(e) => {
-                                log::warn!(
+                                log::debug!(
                                     "measure-jet term '{}': ambient gradient failed ({e}); \
                                      skipping its input-measurement-error variance",
                                     term.name
@@ -4961,14 +5024,14 @@ impl FittedModel {
             // neither of these may replace it. Log them so a temp file left
             // behind in the model directory is explainable.
             if let Err(flush_err) = std::io::Write::flush(&mut writer) {
-                log::debug!(
+                log::trace!(
                     "model publish: flushing the failed temp '{}' errored: {flush_err}",
                     tmp.display()
                 );
             }
             drop(writer);
             if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::debug!(
+                log::trace!(
                     "model publish: could not remove the failed temp '{}': {rm_err}",
                     tmp.display()
                 );
@@ -4990,7 +5053,7 @@ impl FittedModel {
             // The rename below still publishes the model, so this is not fatal
             // — but the contents are no longer known to have reached disk, and
             // that is exactly what a post-crash truncated model looks like.
-            log::warn!(
+            log::debug!(
                 "model publish: fsync of '{}' failed, contents may not survive a crash: {sync_err}",
                 tmp.display()
             );
@@ -4998,7 +5061,7 @@ impl FittedModel {
         drop(inner);
         if let Err(e) = fs::rename(&tmp, path) {
             if let Err(rm_err) = fs::remove_file(&tmp) {
-                log::debug!(
+                log::trace!(
                     "model publish: could not remove the unpublished temp '{}': {rm_err}",
                     tmp.display()
                 );
@@ -5017,7 +5080,7 @@ impl FittedModel {
             // Platforms that cannot fsync a directory land here; the model file
             // itself is already durable, only the rename's durability is
             // unconfirmed.
-            log::debug!(
+            log::trace!(
                 "model publish: directory fsync of '{}' failed: {sync_err}",
                 parent.display()
             );
@@ -5210,12 +5273,15 @@ impl FittedModel {
                 ),
             });
         }
-        let expectile_family_tag = {
+        let (expectile_family_tag, joint_expectile_family_tag) = {
             let family = self.family.trim().to_ascii_lowercase();
-            family == "expectile" || family.starts_with("expectile(")
+            (
+                family == "expectile" || family.starts_with("expectile("),
+                family == JOINT_EXPECTILE_FAMILY_TAG,
+            )
         };
-        match self.estimator {
-            FittedEstimator::Likelihood if expectile_family_tag => {
+        match &self.estimator {
+            FittedEstimator::Likelihood if expectile_family_tag || joint_expectile_family_tag => {
                 return Err(FittedModelError::SchemaMismatch {
                     reason:
                         "saved family is tagged expectile but estimator metadata says likelihood"
@@ -5224,6 +5290,7 @@ impl FittedModel {
             }
             FittedEstimator::Likelihood => {}
             FittedEstimator::Expectile { tau } => {
+                let tau = *tau;
                 if !tau.is_finite() || tau <= 0.0 || tau >= 1.0 {
                     return Err(FittedModelError::SchemaMismatch {
                         reason: format!(
@@ -5245,6 +5312,62 @@ impl FittedModel {
                             self.model_kind,
                             self.family,
                             self.family_state.likelihood(),
+                        ),
+                    });
+                }
+            }
+            FittedEstimator::ExpectileLocationScale {
+                levels,
+                standardized_expectiles,
+            } => {
+                let gaussian_identity_location_scale = self.model_kind == ModelKind::LocationScale
+                    && matches!(
+                        &self.family_state,
+                        FittedFamily::LocationScale { likelihood, .. }
+                            if likelihood == &LikelihoodSpec::gaussian_identity()
+                    );
+                if !gaussian_identity_location_scale || !joint_expectile_family_tag {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator requires a \
+                             `{JOINT_EXPECTILE_FAMILY_TAG}`-tagged Gaussian location-scale fit; \
+                             got model_kind={:?}, family={:?}, likelihood={:?}",
+                            self.model_kind,
+                            self.family,
+                            self.family_state.likelihood(),
+                        ),
+                    });
+                }
+                if levels.len() < 2 || levels.len() != standardized_expectiles.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator needs at least two levels, each with \
+                             one standardized expectile; got {} levels and {} expectiles",
+                            levels.len(),
+                            standardized_expectiles.len()
+                        ),
+                    });
+                }
+                if levels.iter().any(|tau| !tau.is_finite() || *tau <= 0.0 || *tau >= 1.0)
+                    || levels.windows(2).any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile levels must be strictly increasing and \
+                             strictly inside (0, 1), got {levels:?}"
+                        ),
+                    });
+                }
+                if standardized_expectiles.iter().any(|c| !c.is_finite())
+                    || standardized_expectiles
+                        .windows(2)
+                        .any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile standardized expectiles must be finite and \
+                             strictly increasing (the non-crossing guarantee), got \
+                             {standardized_expectiles:?}"
                         ),
                     });
                 }
@@ -6125,17 +6248,38 @@ fn validate_frozen_term_collectionspec(
 /// saved before that has one λ fewer for each such term. The refusal names those
 /// terms when the spec has any.
 ///
-/// `spec` is the mean predictor's spec, so the saved count is the Mean block's
-/// λ when the fit records one, and the fit's λ otherwise.
+/// `spec` is the mean predictor's spec, so the saved count is the λ of the
+/// block that spec builds: the Mean block of a single-predictor fit, or the
+/// Location block of a location-scale fit, whose trailing Scale block carries
+/// the noise predictor's own λ. Counting every λ of a location-scale fit against
+/// the location spec refused every such summary as a stale layout. The walk
+/// reads λ from global index 0, so that block must lead the fit; a fit with
+/// neither role counts all of its λ.
 pub fn saved_lambdas_index_rebuilt_layout(
     spec: &TermCollectionSpec,
     rebuilt_penalties: usize,
     fit: &UnifiedFitResult,
     context: &str,
 ) -> Result<(), FittedModelError> {
-    let saved_lambdas = fit
+    let spec_block = fit
         .block_by_role(BlockRole::Mean)
-        .map_or(fit.lambdas.len(), |block| block.lambdas.len());
+        .or_else(|| fit.block_by_role(BlockRole::Location));
+    if let Some(block) = spec_block {
+        if !fit
+            .blocks
+            .first()
+            .is_some_and(|first| std::ptr::eq(first, block))
+        {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{context}: the {} block the saved spec builds is not the fit's leading block, \
+                     so its smoothing parameters do not start at global index 0",
+                    block.role.name()
+                ),
+            });
+        }
+    }
+    let saved_lambdas = spec_block.map_or(fit.lambdas.len(), |block| block.lambdas.len());
     if rebuilt_penalties == saved_lambdas {
         return Ok(());
     }
@@ -6322,6 +6466,7 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     }
 
@@ -7951,9 +8096,10 @@ mod tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 
@@ -7987,6 +8133,39 @@ mod tests {
                 .to_string();
         assert!(generic.contains("different penalty layout"), "{generic}");
         assert!(!generic.contains("third-order"), "{generic}");
+    }
+
+    /// A location-scale fit's resolved spec is the location predictor's, so the
+    /// rebuilt layout is checked against the Location block's λ alone; the
+    /// trailing Scale block's λ belong to the noise predictor. Counting both
+    /// refused every Gaussian location-scale summary table as a stale layout.
+    #[test]
+    fn a_location_scale_fit_checks_the_location_block_lambdas() {
+        let block = |role, width: usize, lambdas: usize| FittedBlock {
+            beta: Array1::zeros(width),
+            role,
+            edf: 1.0,
+            lambdas: Array1::ones(lambdas),
+        };
+        let spec = matern_termspec_2953(None);
+        let fit = saved_fit(vec![
+            block(BlockRole::Location, 3, 4),
+            block(BlockRole::Scale, 2, 2),
+        ]);
+        assert!(saved_lambdas_index_rebuilt_layout(&spec, 4, &fit, "replay").is_ok());
+        let stale = saved_lambdas_index_rebuilt_layout(&spec, 6, &fit, "replay")
+            .expect_err("a rebuild that disagrees with the Location block must refuse")
+            .to_string();
+        assert!(stale.contains("4 smoothing parameters"), "{stale}");
+
+        let scale_first = saved_fit(vec![
+            block(BlockRole::Scale, 2, 2),
+            block(BlockRole::Location, 3, 4),
+        ]);
+        let shifted = saved_lambdas_index_rebuilt_layout(&spec, 4, &scale_first, "replay")
+            .expect_err("a Location block that does not lead the fit must refuse")
+            .to_string();
+        assert!(shifted.contains("not the fit's leading block"), "{shifted}");
     }
 
     /// #2953, through a real replay: the saved per-smooth summary rebuilds the

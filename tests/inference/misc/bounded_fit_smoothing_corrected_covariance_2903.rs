@@ -36,7 +36,7 @@ struct StderrInfoLogger;
 
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -109,7 +109,7 @@ fn build_poisson_frame() -> gam::data::EncodedDataset {
 fn bounded_fit_publishes_smoothing_corrected_covariance_2903() {
     INIT_LOGGER.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
     let data = build_poisson_frame();

@@ -147,6 +147,13 @@ pub(crate) fn update_glmvectors(
         LinkFunction::Log => {
             write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
         }
+        // A reciprocal-power link's Fisher weight depends on the variance
+        // function, which only the likelihood knows.
+        LinkFunction::Inverse | LinkFunction::InverseSquared => {
+            crate::bail_invalid_estim!(
+                "the {link:?} link's working state is family-specific; route it through the likelihood's IRLS update"
+            )
+        }
     }
 }
 
@@ -403,6 +410,7 @@ pub(crate) fn update_glmvectors_integrated_by_family(
 pub(crate) fn computeworkingweight_derivatives_from_eta(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
+    y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
 ) -> Result<
@@ -421,9 +429,72 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
     let mut dmu_deta = Array1::<f64>::zeros(n);
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
+    if let Some((standard, exponent)) = reciprocal_power_link(inverse_link) {
+        let family = match likelihood.spec.response {
+            ResponseFamily::Gaussian => PowerVarianceEdm::Gaussian,
+            ResponseFamily::Gamma => PowerVarianceEdm::Gamma,
+            ResponseFamily::InverseGaussian => PowerVarianceEdm::InverseGaussian,
+            ref other => crate::bail_invalid_estim!(
+                "the {standard:?} link is not legal for the {other:?} family"
+            ),
+        };
+        write_reciprocal_link_eta_curvature(
+            family,
+            standard,
+            exponent,
+            fixed_glm_dispersion(likelihood)?,
+            eta,
+            priorweights,
+            WorkingDerivativeBuffersMut {
+                c: &mut c,
+                d: &mut d,
+                dmu_deta: &mut dmu_deta,
+                d2mu_deta2: &mut d2mu_deta2,
+                d3mu_deta3: &mut d3mu_deta3,
+            },
+        )?;
+        return Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3));
+    }
     match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
             dmu_deta.fill(1.0);
+        }
+        ResponseFamily::InverseGaussian => {
+            log_link_working_state::write_log_link_eta_curvature(
+                &inverse_gaussian_log_link_rule(fixed_glm_dispersion(likelihood)?),
+                eta,
+                priorweights,
+                WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                },
+            )?;
+        }
+        ResponseFamily::StudentT { .. } => {
+            // The EM weight `(ν+1)/(A + r²)` depends on the response, so this
+            // is the one family whose working-weight jet needs `y`.
+            let scale = StudentTScale::from_likelihood(likelihood)?;
+            let (mut mu, mut weights, mut z) =
+                (Array1::zeros(n), Array1::zeros(n), Array1::zeros(n));
+            write_student_t_working_state(
+                y,
+                eta,
+                priorweights,
+                &scale,
+                &mut mu,
+                &mut weights,
+                &mut z,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                }),
+            )?;
         }
         ResponseFamily::Poisson => {
             log_link_working_state::write_log_link_eta_curvature(
@@ -463,7 +534,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             let exponent = 2.0 - p;
             log_link_working_state::write_log_link_eta_curvature(
                 &log_link_working_state::LogLinkRule {
-                    weight: log_link_working_state::WorkingWeight::TweediePower { p, phi },
+                    weight: log_link_working_state::WorkingWeight::PowerVariance { p, phi },
                     curvature: log_link_working_state::WorkingCurvature::Proportional {
                         c_ratio: exponent,
                         d_ratio: exponent * exponent,

@@ -45,7 +45,7 @@ def test_periodic_atom_oos_r2_noise_sweep(noise: float):
     z_train = z[:300]
     z_test = z[300:]
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=z_train,
         K=1,
         atom_basis="periodic",

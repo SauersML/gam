@@ -1,4 +1,4 @@
-"""Tests for ``gamfit.InterchangeSwapDecoder`` (DAS interchange decoder)."""
+"""Tests for ``gamfit.torch.InterchangeSwapDecoder`` (DAS interchange decoder)."""
 from __future__ import annotations
 
 import importlib
@@ -9,7 +9,7 @@ torch: Any = pytest.importorskip("torch")
 
 
 def _make_decoder(D: int = 6, F: int = 4, *, seed: int = 0):
-    from gamfit import InterchangeSwapDecoder
+    from gamfit.torch import InterchangeSwapDecoder
 
     torch.manual_seed(seed)
     return InterchangeSwapDecoder(D, F)
@@ -130,9 +130,9 @@ def test_gate_and_W_dec_are_separate_parameters() -> None:
     assert dec.W_dec.shape == (dec.D, dec.F)
 
 
-def test_module_resolves_at_top_level() -> None:
+def test_module_resolves_from_gamfit_torch() -> None:
     import gamfit
 
-    assert gamfit.InterchangeSwapDecoder is not None
-    dec = gamfit.InterchangeSwapDecoder(D=4, F=2)
+    assert gamfit.torch.InterchangeSwapDecoder is not None
+    dec = gamfit.torch.InterchangeSwapDecoder(D=4, F=2)
     assert dec(torch.randn(1, 2)).shape == (1, 4)

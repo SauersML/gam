@@ -3,7 +3,7 @@
 //!
 //! #1596 — `link(type=flexible(logit))` on a parametric, identifiable binomial
 //! predictor silently fell back to plain logit: the coupled link-wiggle joint
-//! Newton solve failed KKT certification, and a suppressed `log::warn!` fallback
+//! Newton solve failed KKT certification, and a suppressed `log::debug!` fallback
 //! returned the no-wiggle baseline `Ok(...)`, bit-identical to a fixed-logit fit
 //! (no wiggle block, deviance unchanged). A flexible-link request must NEVER
 //! silently return the fixed base link: it must either engage the warp (and, on

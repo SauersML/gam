@@ -419,7 +419,7 @@ mod tests {
         SmoothTermSpec {
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
             frozen_parametric_residualization: None,
         }
@@ -476,6 +476,7 @@ mod tests {
                     },
                 },
             )],
+            level: Default::default(),
         };
         let pd = table(&spec, "s(x):by=g[b]", PartialDependenceGrid::TrainingRange { n_points: 5 })
             .expect("by-level table");
@@ -510,6 +511,7 @@ mod tests {
                     by: ByVariableSpec::Numeric,
                 },
             )],
+            level: Default::default(),
         };
         let pd = table(&spec, "s(x, by=z)", PartialDependenceGrid::TrainingRange { n_points: 3 })
             .expect("numeric by table");
@@ -536,6 +538,7 @@ mod tests {
             ],
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         };
         let gated = table(&spec, "x:g[b]", PartialDependenceGrid::TrainingRange { n_points: 2 })
             .expect("gated linear table");
@@ -571,6 +574,7 @@ mod tests {
                     frozen_global_orthogonality: None,
                 },
             )],
+            level: Default::default(),
         };
         let spanning = table(&spec, "s(x, g, bs=sz)", PartialDependenceGrid::TrainingRange { n_points: 3 })
             .err()

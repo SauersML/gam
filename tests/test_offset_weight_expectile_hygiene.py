@@ -84,13 +84,13 @@ def test_expectile_tau_with_another_family_is_refused(kwargs: dict[str, Any]) ->
     data = _gaussian_data()
     if kwargs.get("family") == "poisson":
         data["y"] = np.abs(np.round(data["y"] * 3.0))
-    with pytest.raises(gamfit.InvalidConfigurationError, match="expectile_tau"):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match="expectile_tau"):
         gamfit.fit(data, "y ~ s(x)", **kwargs)
 
 
 @pytest.mark.parametrize("tau", [0.0, 1.0, 1.5, -0.2])
 def test_expectile_tau_outside_the_open_unit_interval_is_refused(tau: float) -> None:
-    with pytest.raises(gamfit.InvalidConfigurationError, match=r"strictly in \(0, 1\)"):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match=r"strictly in \(0, 1\)"):
         gamfit.fit(_gaussian_data(), "y ~ s(x)", family="expectile", expectile_tau=tau)
 
 
@@ -98,7 +98,7 @@ def test_expectile_tau_outside_the_open_unit_interval_is_refused(tau: float) -> 
 def test_non_finite_expectile_tau_is_refused(tau: float) -> None:
     # A non-finite float has no JSON spelling, so the wire request itself is
     # refused before field validation; it is still a configuration error.
-    with pytest.raises(gamfit.InvalidConfigurationError):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError):
         gamfit.fit(_gaussian_data(), "y ~ s(x)", family="expectile", expectile_tau=tau)
 
 
@@ -173,5 +173,5 @@ def test_zero_weight_rows_drop_factor_levels_they_alone_carry() -> None:
 def test_all_zero_weights_are_refused() -> None:
     data, _ = _zero_weight_problem("gaussian")
     data["w"] = np.zeros_like(data["w"])
-    with pytest.raises(gamfit.InvalidConfigurationError, match="zero on every row"):
+    with pytest.raises(gamfit.errors.InvalidConfigurationError, match="zero on every row"):
         gamfit.fit(data, "y ~ s(x)", weights="w")

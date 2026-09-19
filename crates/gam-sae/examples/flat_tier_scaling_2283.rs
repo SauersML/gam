@@ -125,8 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let score_mode = gam_gpu::GpuPolicy::parse(&mode)
         .ok_or_else(|| format!("--score-mode must be off|auto|required, got {mode}"))?;
     let level = match arg_value("log").as_deref() {
+        Some("trace") => log::LevelFilter::Trace,
         Some("debug") => log::LevelFilter::Debug,
-        Some("info") => log::LevelFilter::Info,
         _ => log::LevelFilter::Warn,
     };
     gam_solve::progress_log::init_logging_at(level);

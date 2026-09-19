@@ -2213,7 +2213,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         return (a, b, groups, multiplier_dependence);
     }
     if rank == 0 {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to 0 rows (all active rows numerically zero)",
             k
         );
@@ -2312,7 +2312,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     }
 
     if rank < k {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
             k,
             rank,
@@ -3097,11 +3097,27 @@ pub(crate) fn kkt_dual_channel_violations(
     complementarity: f64,
     gradient_scale: f64,
 ) -> (bool, bool) {
-    let dual_infeasible = dual_violation > ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
-        && dual_violation / gradient_scale > ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
-    let complementarity_violated = complementarity > ACTIVE_SET_KKT_COMPLEMENTARITY_TOL
-        && complementarity / gradient_scale > ACTIVE_SET_KKT_COMPLEMENTARITY_TOL;
-    (dual_infeasible, complementarity_violated)
+    (
+        exceeds_at_gradient_scale(dual_violation, ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL, gradient_scale),
+        exceeds_at_gradient_scale(complementarity, ACTIVE_SET_KKT_COMPLEMENTARITY_TOL, gradient_scale),
+    )
+}
+
+/// Whether a gradient-unit KKT residual (stationarity `‖g − Aᵀλ‖∞`, a negative
+/// multiplier, or `|λ·slack|`) exceeds `tolerance` both absolutely AND relative
+/// to the gradient scale `max(1, ‖g‖∞)`.
+///
+/// All three channels carry the gradient's units: rescaling the response
+/// `y → c·y` scales `g`, `λ` and therefore every one of these residuals by `c`
+/// (or `c²` for a Gaussian deviance) while leaving the constrained minimizer's
+/// geometry unchanged. The relative branch is what makes the verdict invariant
+/// under that rescale; the `max(1, ·)` floor keeps a vanishing gradient from
+/// turning roundoff into a violation. This is the one contract the inner
+/// active-set solver and the outer REML startup gate both judge by, so a point
+/// the solver certifies is never one the gate then refuses. A non-finite
+/// residual is never within tolerance.
+pub(crate) fn exceeds_at_gradient_scale(residual: f64, tolerance: f64, gradient_scale: f64) -> bool {
+    !(residual <= tolerance || residual / gradient_scale.max(1.0) <= tolerance)
 }
 
 /// The part of the metric projection's stationarity residual above what its
@@ -3916,6 +3932,43 @@ pub fn solve_quadratic_with_linear_constraints(
 
 #[cfg(test)]
 mod tests {
+
+    /// A gradient-unit KKT residual is judged at the gradient's own scale.
+    ///
+    /// The captured cell is a monotone smooth on 300 rows with `y` scaled by
+    /// `1e6`: its solver-certified vertex carried complementarity `9.65e-5`
+    /// against `‖g‖∞ = 1.52e6`, a relative residual of `6e-11`, and the
+    /// absolute `1e-7` gate refused it. The same geometry at every response
+    /// scale must get the same verdict, and a residual that is a genuine
+    /// violation relative to the gradient must stay one at every scale whose
+    /// gradient is above the unit floor.
+    #[test]
+    fn gradient_unit_kkt_residual_verdict_is_invariant_to_response_scale() {
+        use super::exceeds_at_gradient_scale;
+        let tolerance = 1.0e-7;
+        let (roundoff, gradient) = (9.650e-5_f64, 1.519e6_f64);
+        for scale in [1.0e-6, 1.0e-3, 1.0, 1.0e3, 1.0e6] {
+            assert!(
+                !exceeds_at_gradient_scale(roundoff * scale, tolerance, gradient * scale),
+                "scale {scale}: a residual at 6e-11 of the gradient is roundoff, not a violation"
+            );
+            let violation = 1.0e-3 * gradient;
+            if gradient * scale >= 1.0 {
+                assert!(
+                    exceeds_at_gradient_scale(violation * scale, tolerance, gradient * scale),
+                    "scale {scale}: a residual at 1e-3 of the gradient is a violation"
+                );
+            }
+        }
+        assert!(
+            exceeds_at_gradient_scale(f64::NAN, tolerance, gradient),
+            "a non-finite residual is never within tolerance"
+        );
+        assert!(
+            exceeds_at_gradient_scale(1.0e-6, tolerance, 0.0),
+            "a vanishing gradient does not relax the absolute tolerance"
+        );
+    }
 
     /// #2469: a direction joins the active set's Gram–Schmidt bases when
     /// `ReorthogonalizedRowBasis` resolves its residual. Against `e₁` in three

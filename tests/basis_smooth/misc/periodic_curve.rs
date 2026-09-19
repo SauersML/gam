@@ -91,13 +91,14 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: gam::terms::smooth::ShapeConstraint::None,
+        shape: gam::terms::smooth::ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let mut spec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![term],
+        level: Default::default(),
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap();
     assert_eq!(design.smooth.terms.len(), 1);

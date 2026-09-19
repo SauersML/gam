@@ -749,7 +749,7 @@ pub fn duchon_effective_nullspace_order(
         if fresh {
             let requested_cols = polynomial_block_from_order(centers, order).ncols();
             let effective_cols = polynomial_block_from_order(centers, effective).ncols();
-            log::warn!(
+            log::debug!(
                 "Duchon nullspace order={:?} in dim={} with {} centers leaves no radial kernel columns (polynomial_cols={}); degrading to {:?} (polynomial_cols={})",
                 order,
                 centers.ncols(),
@@ -808,7 +808,7 @@ pub(crate) fn duchon_order_for_operator_margin(
         let key = (dim, power.to_bits(), order, max_operator_derivative_order);
         let fresh = seen.lock().map(|mut s| s.insert(key)).unwrap_or(true);
         if fresh {
-            log::warn!(
+            log::debug!(
                 "Duchon nullspace order={:?} with power={} in dim={} leaves 2*(p+s)={} \
                  below the pointwise/collocation margin dimension+{}={} required by the \
                  active operators; auto-raising to {:?} so the kernel stays well-posed",

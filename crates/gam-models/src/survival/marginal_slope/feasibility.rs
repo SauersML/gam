@@ -364,7 +364,7 @@ impl SurvivalMarginalSlopeFamily {
             // the domain, which is a statement about how it got there and not
             // about this step. Decline rather than invent an answer — the row
             // program refuses at `β` itself and names the row.
-            log::debug!(
+            log::trace!(
                 "[survival-marginal-slope/follow-up-domain] declining a joint step limit: the \
                  base iterate is already outside the domain (min η′₁ = {base_margin:.6e})"
             );
@@ -398,7 +398,7 @@ impl SurvivalMarginalSlopeFamily {
                 infeasible = midpoint;
             }
         }
-        log::debug!(
+        log::trace!(
             "[survival-marginal-slope/follow-up-domain] joint step limited to α={feasible:.6e} \
              (base min η′₁ = {base_margin:.6e}, |δ|∞ = {step_scale:.6e})"
         );
@@ -593,7 +593,7 @@ impl SurvivalMarginalSlopeFamily {
             // so reaching here means the time seed is itself infeasible. That is
             // a different defect and this rule must not paper over it: leave the
             // seed alone and let the row evaluator refuse and name its row.
-            log::warn!(
+            log::debug!(
                 "[survival-marginal-slope/follow-up-domain] the slope origin does not \
                  restore the domain (min η′₁ = {origin_margin:.6e} there, {margin:.6e} at the \
                  seed); the time block's derivative guard must be violated at this theta",
@@ -626,7 +626,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         let retreated = &states[slope].beta * (1.0 - interior);
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/follow-up-domain] warm-start slope seed was short of \
              the derivative guard (min η′₁ = {margin:.6e}, guard {:.6e}); retreated {:.4}% \
              toward the block origin",

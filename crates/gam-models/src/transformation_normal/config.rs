@@ -6,7 +6,7 @@ pub struct TransformationNormalConfig {
     pub response_degree: usize,
     /// Number of interior knots for the response-direction deviation basis (default 10).
     pub response_num_internal_knots: usize,
-    /// Difference penalty order for the response-direction roughness penalty (default 2).
+    /// Derivative order `m` of the response-direction roughness penalty `∫(f^(m))²` (default 2).
     pub response_penalty_order: usize,
     /// Additional penalty orders for the response-direction (default \[1\]).
     pub response_extra_penalty_orders: Vec<usize>,

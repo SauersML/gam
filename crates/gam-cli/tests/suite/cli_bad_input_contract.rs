@@ -142,11 +142,12 @@ fn expectile_tau_is_held_to_the_expectile_family_and_the_open_unit_interval() {
         &["--expectile-tau", "0.9"][..],
         &["--family", "gaussian", "--expectile-tau", "0.9"],
         &["--predict-noise", "s(x)", "--expectile-tau", "0.9"],
+        &["--family", "gaussian", "--expectile-tau", "0.1,0.9"],
     ] {
         let output = fit(extra);
         assert_eq!(output.status.code(), Some(1), "{extra:?}: {}", stderr(&output));
         assert!(
-            stderr(&output).contains("expectile_tau = 0.9 requires family = \"expectile\""),
+            stderr(&output).contains("requires family = \"expectile\""),
             "{extra:?}: {}",
             stderr(&output)
         );

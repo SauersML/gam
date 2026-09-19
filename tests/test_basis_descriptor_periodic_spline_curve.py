@@ -1,4 +1,4 @@
-"""Callable-basis contract for :class:`gamfit.PeriodicSplineCurve`."""
+"""Callable-basis contract for :class:`gamfit.smooth.PeriodicSplineCurve`."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import gamfit
 
 
 def test_evaluate_shape_and_periodicity() -> None:
-    spec = gamfit.PeriodicSplineCurve(n_knots=12, degree=3)
+    spec = gamfit.smooth.PeriodicSplineCurve(n_knots=12, degree=3)
     B = 20
     t = torch.linspace(0.0, 1.0 - 1e-6, B, dtype=torch.float64)
     phi = spec.evaluate(t)
@@ -27,7 +27,7 @@ def test_evaluate_shape_and_periodicity() -> None:
 
 
 def test_jacobian_shape() -> None:
-    spec = gamfit.PeriodicSplineCurve(n_knots=8, degree=3)
+    spec = gamfit.smooth.PeriodicSplineCurve(n_knots=8, degree=3)
     t = torch.linspace(0.05, 0.95, 9, dtype=torch.float64, requires_grad=True)
     jac = spec.jacobian(t)
     assert jac.shape == (9, 8, 1)

@@ -107,7 +107,7 @@ def test_pca_instance_exposes_supported_backends() -> None:
     manual __init__ that never assigns SUPPORTED_BACKENDS, so the attribute
     is invisible on instances even though the class-body line exists."""
     basis = np.random.default_rng(0).standard_normal((7, 4))
-    spec = gamfit.Pca(basis=basis)
+    spec = gamfit.smooth.Pca(basis=basis)
     assert hasattr(spec, "SUPPORTED_BACKENDS"), (
         "Pca() instance is missing SUPPORTED_BACKENDS — slots=True + manual "
         "__init__ ate it. Declare it as ClassVar[frozenset[str]]."
@@ -123,7 +123,7 @@ def test_pca_instance_exposes_supported_backends() -> None:
 
 def test_matern_declares_supported_backends() -> None:
     """Regression for #232: Matern was missing the declaration entirely."""
-    value = getattr(gamfit.Matern, "SUPPORTED_BACKENDS", None)
+    value = getattr(gamfit.smooth.Matern, "SUPPORTED_BACKENDS", None)
     assert isinstance(value, frozenset) and value, (
         "Matern.SUPPORTED_BACKENDS must be a non-empty frozenset"
     )
@@ -133,7 +133,7 @@ def test_matern_declaration_matches_implementation() -> None:
     """If `_evaluate_numpy` exists, 'numpy' must be advertised, and vice versa.
     Catches the drift described in #232 (both evaluators exist but tests
     expect torch-only)."""
-    cls = gamfit.Matern
+    cls = gamfit.smooth.Matern
     has_numpy = "_evaluate_numpy" in cls.__dict__
     has_torch = "_evaluate_torch" in cls.__dict__
     advertised = set(cls.SUPPORTED_BACKENDS)
@@ -189,7 +189,7 @@ def test_bspline_basis_size_after_one_evaluate() -> None:
     """Regression for #235: NumPy/Torch evaluate auto-resolve knots but never
     cache them on the spec, so JAX (which reads basis_size before dispatch)
     blows up."""
-    spec = gamfit.BSpline(degree=3, periodic=False)
+    spec = gamfit.smooth.BSpline(degree=3, periodic=False)
     x = np.linspace(0.0, 1.0, 9)
     spec.evaluate(x, backend="numpy")
     # The error message in bspline_basis_size promises this works.
@@ -205,7 +205,7 @@ def test_bspline_jax_evaluate_after_numpy_evaluate() -> None:
     """End-to-end #235 repro: numpy evaluate then jax evaluate."""
     jax = pytest.importorskip("jax")
     jnp = jax.numpy
-    spec = gamfit.BSpline(degree=3, periodic=False)
+    spec = gamfit.smooth.BSpline(degree=3, periodic=False)
     x = np.linspace(0.0, 1.0, 9)
     spec.evaluate(x, backend="numpy")
     out = spec.evaluate(jnp.asarray(x), backend="jax")
@@ -215,7 +215,7 @@ def test_bspline_jax_evaluate_after_numpy_evaluate() -> None:
 def test_bspline_knots_cached_after_evaluate() -> None:
     """Stronger #235 invariant: knots are written back to the spec so any
     subsequent backend (including JAX) can read static output shape."""
-    spec = gamfit.BSpline(degree=3, periodic=False)
+    spec = gamfit.smooth.BSpline(degree=3, periodic=False)
     x = np.linspace(0.0, 1.0, 9)
     assert spec.knots is None or isinstance(spec.knots, int)
     spec.evaluate(x, backend="numpy")
