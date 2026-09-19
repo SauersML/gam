@@ -92,7 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, unit_measure_deviance_and_log_kernel_from_eta, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -1143,6 +1143,9 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
+        // The dense route never counts the design's nonzeros, and says so.
+        assert_eq!(decision.nnz_x, None);
+        assert!(decision.format_fields(decision.path_str()).contains("nnz_x=na"));
     }
 
     #[test]
@@ -1166,7 +1169,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 300);
+        assert_eq!(decision.nnz_x, Some(300));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
         assert_eq!(decision.nnz_h_est, Some(300));
         assert!(decision.density_h_est.expect("density") < 0.01);
@@ -1183,7 +1186,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 64);
+        assert_eq!(decision.nnz_x, Some(64));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(64));
         assert_eq!(decision.nnz_h_est, Some(64));
         assert!(decision.density_h_est.expect("density") < 0.05);
@@ -2251,6 +2254,74 @@ mod tests {
         .expect("fixed-Gaussian strict eta likelihood");
         assert_eq!(data_kernel, strict_kernel);
         assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
+    }
+
+    #[test]
+    fn unit_measure_single_pass_objective_is_bit_identical_to_the_two_pass_objective() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(2_026_091_9);
+        let n = 4096usize;
+        let eta = Array1::from_iter((0..n).map(|_| -6.0 + 8.0 * rng.random::<f64>()));
+        let bernoulli_y = eta.mapv(|e| {
+            let p = 1.0 / (1.0 + (-e).exp());
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
+        });
+        let bernoulli_w = Array1::from_iter((0..n).map(|i| if i % 97 == 0 { 0.0 } else { 1.0 }));
+        let trials = Array1::from_iter((0..n).map(|i| (1 + i % 9) as f64));
+        let trials_y = Array1::from_iter(
+            (0..n).map(|i| (rng.random::<f64>() * (trials[i] + 1.0)).floor().min(trials[i]) / trials[i]),
+        );
+        let poisson_eta = eta.mapv(|e| 0.25 * e);
+        let poisson_y = poisson_eta.mapv(|e| (rng.random::<f64>() * 2.0 * e.exp()).floor());
+        let poisson_w = Array1::from_iter((0..n).map(|_| 0.5 + rng.random::<f64>()));
+
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let log = InverseLink::Standard(StandardLink::Log);
+        let binomial = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            logit.clone(),
+        ));
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            log.clone(),
+        ));
+        let cases = [
+            ("bernoulli", &binomial, &logit, &bernoulli_y, &eta, &bernoulli_w),
+            ("binomial trials", &binomial, &logit, &trials_y, &eta, &trials),
+            ("poisson", &poisson, &log, &poisson_y, &poisson_eta, &poisson_w),
+        ];
+        for (label, likelihood, link, y, eta, w) in cases {
+            let deviance =
+                calculate_deviance_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("two-pass deviance");
+            let log_kernel =
+                pirls_data_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view(), deviance)
+                    .expect("two-pass data log-kernel");
+            let (fused_deviance, fused_log_kernel) =
+                unit_measure_deviance_and_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("single-pass objective")
+                    .expect("unit-measure family takes the single pass");
+            assert_eq!(fused_deviance.to_bits(), deviance.to_bits(), "{label} deviance");
+            assert_eq!(fused_log_kernel.to_bits(), log_kernel.to_bits(), "{label} log-kernel");
+        }
+
+        let profiled_gaussian = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(
+            unit_measure_deviance_and_log_kernel_from_eta(
+                poisson_y.view(),
+                &poisson_eta,
+                &profiled_gaussian,
+                &profiled_gaussian.spec.link,
+                poisson_w.view(),
+            )
+            .expect("profiled Gaussian is declined, not rejected")
+            .is_none()
+        );
     }
 
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
@@ -4336,6 +4407,143 @@ mod root_cause_tests {
             });
             assert_deviance_monotone(&trace, &format!("Logistic(seed={})", seed));
         }
+    }
+
+    pub(crate) fn capture_pirls_lm_attempts<F, R>(run: F) -> (R, usize)
+    where
+        F: FnOnce() -> R,
+    {
+        super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT.with(|count| count.set(Some(0)));
+        let result = run();
+        let attempts = super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT
+            .with(|count| count.take())
+            .unwrap();
+        (result, attempts)
+    }
+
+    /// Rare-event logistic cold start (pyGAM audit F18). A ~3%-prevalence
+    /// response whose log-odds rise steeply with a skewed covariate (the
+    /// credit-default shape: logit p = −10.65 + 0.0055·balance) makes the
+    /// undamped Newton step from the prevalence-intercept seed overshoot by
+    /// orders of magnitude: it drives η to ≈ +11 on the high-balance rows.
+    /// The Levenberg–Marquardt damping must climb from `u ≈ 1e-16` to O(1)
+    /// before a trial is accepted. The geometric reject schedule alone
+    /// (×2, ×4, ×8, …) needs ~11 trials to cross those 16 decades, each
+    /// re-solving a step the tiny damping leaves unchanged. Moré's
+    /// interpolated rejection update takes the damping to the radius the
+    /// rejected trial indicates in one or two trials. This pins the cost in
+    /// LM attempts (damped solves plus trial evaluations), not wall clock.
+    #[test]
+    pub(crate) fn rare_event_logistic_cold_start_reaches_damping_in_few_trials() {
+        let n = 4000;
+        let n_basis = 10;
+        let mut rng_state: u64 = 0x5EED_F18_0000_0001;
+        let mut uniform = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((rng_state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+        };
+        let mut balance = Vec::with_capacity(n);
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // Box–Muller N(835, 480), truncated at zero like a card balance.
+            let (u1, u2) = (uniform(), uniform());
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let b = (835.0 + 480.0 * z).max(0.0);
+            let p = 1.0 / (1.0 + (10.65 - 0.0055 * b).exp());
+            y[i] = if uniform() < p { 1.0 } else { 0.0 };
+            balance.push(b);
+        }
+        let positives: f64 = y.sum();
+        assert!(
+            positives > 0.01 * n as f64 && positives < 0.08 * n as f64,
+            "fixture must be rare-event, got {positives} positives of {n}"
+        );
+        // Intercept plus a hat-function (linear B-spline) basis on the
+        // covariate range, with a second-difference penalty on the hats.
+        let (lo, hi) = balance
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+                (lo.min(b), hi.max(b))
+            });
+        let h = (hi - lo) / (n_basis - 1) as f64;
+        let p = n_basis + 1;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for (i, &b) in balance.iter().enumerate() {
+            x[[i, 0]] = 1.0;
+            for k in 0..n_basis {
+                let knot = lo + k as f64 * h;
+                x[[i, k + 1]] = (1.0 - ((b - knot) / h).abs()).max(0.0);
+            }
+        }
+        let mut root = Array2::<f64>::zeros((n_basis - 2, p));
+        for r in 0..n_basis - 2 {
+            root[[r, r + 1]] = 1.0;
+            root[[r, r + 2]] = -2.0;
+            root[[r, r + 3]] = 1.0;
+        }
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            prior_mean: Array1::zeros(p),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let (result, attempts) = capture_pirls_lm_attempts(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
+                PirlsProblem {
+                    x: x.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                    gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
+                },
+                PenaltyConfig {
+                    canonical_penalties: &canonical,
+                    reparam_invariant: None,
+                    p,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        let (_, working) = result.expect("rare-event logistic P-IRLS fit should succeed");
+        assert_eq!(working.status, PirlsStatus::Converged);
+        // Every attempt beyond one per iteration is a rejected trial. The
+        // geometric schedule alone spent 10 rejections (21 attempts over 11
+        // iterations) climbing from `u` to the accepted damping; the
+        // interpolated update needs 2.
+        let rejected = attempts.saturating_sub(working.iterations);
+        assert!(
+            rejected <= 3,
+            "rare-event cold start spent {rejected} rejected LM trials \
+             ({attempts} attempts over {} iterations)",
+            working.iterations
+        );
     }
 
     #[test]

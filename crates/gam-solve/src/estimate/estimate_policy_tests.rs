@@ -125,8 +125,16 @@ fn two_smooth_bump_design(n: usize) -> (Array2<f64>, Vec<Array2<f64>>, Vec<f64>)
 /// retired #2359 split held non-Gaussian links to gradient-only BFGS, which
 /// rebuilt that curvature from secant pairs and needed 48-61 outer
 /// iterations on a one-smooth n=1000 logistic fit. Newton steps on the exact
-/// surface converge in a handful; the bound below sits far under the
-/// secant-rebuild count and far over the Newton count.
+/// surface converge in a handful per seed.
+///
+/// `fit.iterations` sums the seeds the multi-start budget runs (two here).
+/// Since #2954 the search stops at the caller's `tol` on each component's own
+/// scale rather than at `tol·(1 + |V|)`, a band ~340× looser at this fit's
+/// `V ≈ 341`: each binomial seed now takes 12 exact-Newton iterations (an
+/// `e⁻¹`-per-step approach along the heavily penalised coordinate, then the
+/// quadratic phase), 24 in all, where the looser band stopped each at ~10. The
+/// bound is two seeds of fifteen, still under the secant rebuild's count at
+/// the looser band.
 #[test]
 fn non_gaussian_search_converges_in_newton_iterations() {
     let n = 600;
@@ -191,7 +199,7 @@ fn non_gaussian_search_converges_in_newton_iterations() {
         .unwrap_or_else(|error| panic!("{name}: fit failed: {error:?}"));
         assert!(fit.outer_converged, "{name}: outer search must converge");
         assert!(
-            fit.iterations <= 20,
+            fit.iterations <= 30,
             "{name}: {} outer iterations; the exact-Hessian search converges in a \
              handful, a secant rebuild of the same curvature takes several dozen",
             fit.iterations
