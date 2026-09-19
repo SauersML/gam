@@ -9325,6 +9325,35 @@ pub(crate) fn run_fixed_point_outer_solver(
     label: &str,
     failure_prefix: &str,
 ) -> Result<OuterResult, FixedPointOuterRunError> {
+    // Judge the seed before walking from it. The walk's own stop is a step-norm
+    // test, never stationarity (see the certificate after the walk), so a seed
+    // that is already stationary is walked anyway: a smoothing parameter on its
+    // rail keeps proposing an outward EFS step, and nothing short of the
+    // unprogressing-walk window ends it. On the ISLR `Default` logistic fit the
+    // #784 corrected continuation starts from the certified Laplace optimum, which
+    // is stationary under the correction too (the BFGS continuation later
+    // certified it at zero iterations, |g| = 5.9e-6), yet the walk spent ~60
+    // corrected evaluations there. The screening certificate is the one the walk's
+    // stop is judged by, so passing it here is the same claim with zero steps.
+    // A refusal is no verdict on the walk; it proceeds from the same seed.
+    if obj.capability().gradient == Derivative::Analytic {
+        let mut seed_result = OuterResult::new(seed.clone(), f64::NAN, 0, true, the_plan);
+        if let Ok(certificate) = certify_outer_optimality_with_fidelity(
+            obj,
+            config,
+            context,
+            &mut seed_result,
+            CertificationFidelity::Screening,
+        ) {
+            log::info!(
+                "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
+                 no fixed-point step taken",
+                seed_result.final_value,
+            );
+            seed_result.criterion_certificate = Some(certificate);
+            return Ok(seed_result);
+        }
+    }
     // Shared publication slot for the recurrent-restored-incumbent stop
     // (#2235 verdict 2): the bridge is moved into the driver, so the streak
     // count comes back through this cell and is stamped onto the returned
