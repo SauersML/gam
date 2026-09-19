@@ -1035,13 +1035,7 @@ where
     let problem = contract
         .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
         .with_bounds(lower, upper)
-        .with_initial_rho(seed.clone())
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            num_auxiliary_trailing: dim,
-            ..Default::default()
-        });
+        .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(
         (),
         cost_fn,

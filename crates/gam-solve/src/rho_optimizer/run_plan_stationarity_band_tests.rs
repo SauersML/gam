@@ -106,13 +106,7 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
             Array1::from_elem(1, -WRONG_RAIL_FACE),
             Array1::from_elem(1, WRONG_RAIL_FACE),
         )
-        .with_initial_rho(reseed)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(reseed);
     let mut recovery_obj = recovery_problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
