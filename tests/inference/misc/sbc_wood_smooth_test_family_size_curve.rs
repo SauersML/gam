@@ -32,7 +32,9 @@
 //! sub-unit-edf term to the same `χ²₁`, so it shares the shape.
 
 use csv::StringRecord;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use gam_solve::estimate::smooth_term_summary_rows;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -198,6 +200,8 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
 }
 
 fn assert_null_size_within_monte_carlo_error(family: Family) {
+    // The fits run on rayon workers, which need the wide worker stack.
+    init_parallelism();
     let outcomes: Vec<(u64, Result<NullRow, String>)> = (0..N_REPLICATIONS)
         .into_par_iter()
         .map(|rep| (rep, null_row(family, rep)))

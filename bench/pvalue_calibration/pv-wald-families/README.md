@@ -217,8 +217,9 @@ lane. At n ≥ 200 the effect is inside Monte-Carlo error for every family.
 **What the trace-ratio `ref_df` floor buys.** `analyze.py --ablation`
 recomputes each p-value against `max(1, round(edf))` (the rank summed,
 without `tr(F)²/tr(F²)`): that is oversized in five families at .05 (see the
-`ref_df=rank` rows), so the Wood reference df is doing real work and the new
-regression test fails when it is removed (below).
+`ref_df=rank` rows), so the Wood reference df is doing real work. At 500
+replications the bench detects its removal; the 200-replication CI gate does
+not (below).
 
 ## Regression test
 
@@ -230,7 +231,20 @@ kill), gate
 finite for every replicate and `p > .5` for edf < 0.01. It uses the Rust
 simulator (same DGPs, different RNG stream from the Python bench).
 
-__MUTATION__
+What it catches, checked by mutating the `ref_df` line of `wood_smooth_test`
+locally and running the gate (the mutations were never committed):
+
+| mutation of `ref_df` | gate result |
+|---|---|
+| `edf` (the #1360 reference, pre-floor) | **fails**: gaussian and gamma, e.g. `Gamma rep 0: ref_df 4.9e-7 undefined or below one at edf 4.9e-7` |
+| `rank_used` (drop the trace ratio) | passes in all 7. Sizes rise (poisson .044→.075 and binomial .032→.080 at .05; poisson .064→.140 at .10), but every one stays under the 200-rep bound (.0808 / .1424) |
+| raw trace ratio, without the `rank_used` floor | passes, and should: for PSD `F`, `tr(F)²/tr(F²) ≥ 1`, so the floor binds only when round(edf) ≥ 2 exceeds the ratio, which these null terms don't reach |
+
+So the gate protects the boundary behaviour (`ref_df` defined and ≥ 1 as
+edf → 0, and no small p for a switched-off term) and any gross size
+failure. At 200 replications its MCSE is too coarse to detect a size of
+~.075 at nominal .05; that sensitivity is the job of the 500-replication
+bench, not of CI.
 
 ## Out of lane, noted
 
