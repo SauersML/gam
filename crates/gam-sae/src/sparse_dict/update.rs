@@ -5742,10 +5742,10 @@ mod exact_solve_tests {
         };
         let fit = match fit_sparse_dictionary(x.view(), &config) {
             Ok(fit) => fit,
-            // The fit is deterministic, so rerunning it at every shorter budget reproduces
-            // the trajectory the failing run walked. EV per budget separates a fit still
-            // climbing when the budget ran out from a routing limit cycle whose up-swings
-            // keep the plateau window from confirming (#2822).
+            // The fit is deterministic, so rerunning it at every shorter budget gives the
+            // final EV each budget reaches. `max_epochs` bounds every inner run of the REML
+            // schedule, not the whole fit, so these are complete shorter fits, not epochs of
+            // the failing run (#2822).
             Err(error @ SparseDictionaryError::InnerNonConvergence { .. }) => {
                 let trajectory: Vec<String> = (1..config.max_epochs)
                     .map(|budget| {
