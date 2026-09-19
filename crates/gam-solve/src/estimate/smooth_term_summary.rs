@@ -76,7 +76,8 @@ use ndarray::Array2;
 /// has no valid reference. They carry the variance-component score test the
 /// fit recorded in `FitArtifacts::variance_component_tests` (exact spectral
 /// reference; see `gam_terms::inference::variance_component_test`), or its
-/// typed absence.
+/// typed absence. On a fit whose route does not run that test (the record is
+/// `None`), such a smooth keeps the Wald row.
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -207,8 +208,11 @@ pub fn smooth_term_summary_rows(
         penalty_cursor += k;
         // A smooth whose penalties cover every direction has its null on the
         // variance boundary, so its row is the recorded variance-component
-        // test, exactly as for a random effect above.
-        if design.smooth_variance_component_penalties(term).is_some() {
+        // test, exactly as for a random effect above — on every fit whose route
+        // runs that test. A route that does not (`None`) keeps the Wald row.
+        if fit.artifacts.variance_component_tests.is_some()
+            && design.smooth_variance_component_penalties(term).is_some()
+        {
             let (ref_df, chi_sq, pvalue, pvalue_unavailable) =
                 variance_component_row(recorded_test(fit, &term.name, &global_range), edf);
             rows.push(SmoothTermSummary {
@@ -284,6 +288,7 @@ fn recorded_test<'a>(
 ) -> Option<&'a VarianceComponentTestRecord> {
     fit.artifacts
         .variance_component_tests
+        .as_deref()?
         .iter()
         .find(|record| record.term == name && record.coefficient_range == *range)
 }

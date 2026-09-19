@@ -6892,7 +6892,7 @@ mod tests {
                 outer_warm_start: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
-                variance_component_tests: Vec::new(),
+                variance_component_tests: None,
             },
             inner_cycles: 0,
         })

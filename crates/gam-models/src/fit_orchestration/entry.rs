@@ -2366,10 +2366,10 @@ fn attach_basis_adequacy(
     // The variance-component test needs only the design and the converged
     // fit, so it runs whether or not the covariate frame is available.
     standard.fit.artifacts.variance_component_tests =
-        crate::fit_orchestration::drivers::variance_component_test_records(
+        Some(crate::fit_orchestration::drivers::variance_component_test_records(
             &standard.design,
             &standard.fit,
-        );
+        ));
     if let Some(inputs) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
             inputs.frame.view(),

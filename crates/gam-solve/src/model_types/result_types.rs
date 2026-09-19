@@ -2720,12 +2720,16 @@ pub struct FitArtifacts {
     /// on the training fit's own IRLS row state
     /// (`gam_terms::inference::variance_component_test`). The summary rows of
     /// those terms read their p-value (or its typed absence) from here, so the
-    /// CLI, Rust and persisted-model surfaces report the same number. Empty on
-    /// a model with no such term and on a payload written before the test
-    /// existed; a summary treats a term missing from it as not recorded.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// CLI, Rust and persisted-model surfaces report the same number.
+    ///
+    /// `Some(records)` when the fit's route runs the test (empty on a model
+    /// with no such term); a summary then treats a term missing from it as not
+    /// recorded. `None` when the route does not run it, and on a payload
+    /// written before the test existed: those smooth rows keep the Wood Wald
+    /// test, and random-effect rows report the test as not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variance_component_tests:
-        Vec<gam_terms::inference::variance_component_test::VarianceComponentTestRecord>,
+        Option<Vec<gam_terms::inference::variance_component_test::VarianceComponentTestRecord>>,
 }
 
 /// A certified outer point (gam#3002): `theta`, the outer coordinates in the order

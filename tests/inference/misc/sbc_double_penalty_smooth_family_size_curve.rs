@@ -32,6 +32,12 @@
 //! like an oversized one.
 //!
 //! A power control fits a real `s(x2)` and requires the test to find it.
+//!
+//! The Gaussian location-scale route (`noise_formula`) scores the mean block's
+//! test from its own row state, `wᵢ/σ̂ᵢ²` and `(yᵢ − μ̂ᵢ)/σ̂ᵢ²`, so it has its
+//! own null gate: the same null `s(x2)` in the mean, under a noise scale that
+//! varies with `x1`. The level of `σ̂` is treated as estimated, because `σ̂` is
+//! fitted to the residuals the score is built from.
 
 use csv::StringRecord;
 use gam::{
@@ -149,14 +155,28 @@ struct SmoothRow {
 
 /// `y` at `sin(2πx1) + effect·sin(2πx2)`; `effect = 0` is the null.
 fn dataset(family: Family, rep: u64, effect: f64) -> gam::data::EncodedDataset {
-    let mut rng = StdRng::seed_from_u64(SEED + 1_000_000 * family.index() + rep);
+    dataset_with(
+        SEED + 1_000_000 * family.index() + rep,
+        |eta, _, rng| family.draw(eta, rng),
+        effect,
+    )
+}
+
+/// The rows of `dataset`, with the response drawn by `draw(η, x1, rng)`.
+fn dataset_with(
+    seed: u64,
+    draw: impl Fn(f64, f64, &mut StdRng) -> f64,
+    effect: f64,
+) -> gam::data::EncodedDataset {
+    let mut rng = StdRng::seed_from_u64(seed);
     let unit = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let rows: Vec<StringRecord> = (0..N_OBS)
         .map(|_| {
             let x1 = unit.sample(&mut rng);
             let x2 = unit.sample(&mut rng);
-            let y = family.draw(
+            let y = draw(
                 (2.0 * PI * x1).sin() + effect * (2.0 * PI * x2).sin(),
+                x1,
                 &mut rng,
             );
             StringRecord::from(vec![
@@ -208,11 +228,21 @@ fn tested_row(family: Family, rep: u64, effect: f64) -> Result<SmoothRow, String
 }
 
 fn assert_null_size_within_monte_carlo_error(family: Family) {
+    assert_null_rows_within_monte_carlo_error(&format!("{family:?}"), N_REPLICATIONS, |rep| {
+        tested_row(family, rep, 0.0)
+    });
+}
+
+fn assert_null_rows_within_monte_carlo_error(
+    family: &str,
+    replications: u64,
+    null_row: impl Fn(u64) -> Result<SmoothRow, String> + Sync,
+) {
     // The fits run on rayon workers, which need the wide worker stack.
     init_parallelism();
-    let outcomes: Vec<(u64, Result<SmoothRow, String>)> = (0..N_REPLICATIONS)
+    let outcomes: Vec<(u64, Result<SmoothRow, String>)> = (0..replications)
         .into_par_iter()
-        .map(|rep| (rep, tested_row(family, rep, 0.0)))
+        .map(|rep| (rep, null_row(rep)))
         .collect();
 
     let mut rows = Vec::new();
@@ -224,8 +254,8 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
         }
     }
     assert!(
-        (failed_fits.len() as f64) <= MAX_FAILED_FIT_SHARE * N_REPLICATIONS as f64,
-        "{family:?}: {} of {N_REPLICATIONS} null fits failed, first: {}",
+        (failed_fits.len() as f64) <= MAX_FAILED_FIT_SHARE * replications as f64,
+        "{family}: {} of {replications} null fits failed, first: {}",
         failed_fits.len(),
         failed_fits[0]
     );
@@ -233,14 +263,14 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
     for (rep, row) in &rows {
         assert!(
             row.p_value.is_finite() && (0.0..=1.0).contains(&row.p_value),
-            "{family:?} rep {rep}: p-value out of range: {}",
+            "{family} rep {rep}: p-value out of range: {}",
             row.p_value
         );
         // The effective reference df `(Σμ)²/Σμ²` of a weighted χ² sum is at
         // least one, whatever edf REML chose.
         assert!(
             row.ref_df.is_finite() && row.ref_df >= 1.0,
-            "{family:?} rep {rep}: ref_df {} undefined or below one at edf {}",
+            "{family} rep {rep}: ref_df {} undefined or below one at edf {}",
             row.ref_df,
             row.edf
         );
@@ -271,17 +301,61 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
         ));
     }
     eprintln!(
-        "{family:?}: {} usable fits, {} failed; {}",
+        "{family}: {} usable fits, {} failed; {}",
         rows.len(),
         failed_fits.len(),
         report.join("; ")
     );
     assert!(
         miscalibrated.is_empty(),
-        "{family:?}: the smooth-term p-value is miscalibrated under a true-null \
+        "{family}: the smooth-term p-value is miscalibrated under a true-null \
          s({NULL_TERM}):\n{}",
         miscalibrated.join("\n")
     );
+}
+
+/// Seed offset of the location-scale cells, past every family's seeds.
+const LOCATION_SCALE_SEED: u64 = SEED + 100_000_000;
+/// Null replications of the location-scale cell. Its scale shape is fitted,
+/// so the tail at `α = 0.01` is where a σ̂ error would show, and 200 reps
+/// cannot resolve it: the band there is `.01 ± .014`, as wide as the size
+/// itself. At 1000 reps it is `.01 ± .0063`.
+const LOCATION_SCALE_NULL_REPLICATIONS: u64 = 1000;
+
+/// The mean `s(x2)` row of `y ~ s(x1) + s(x2)`, noise `~ s(x1)`, with
+/// `y ~ N(sin(2πx1) + effect·sin(2πx2), (0.3·e^{x1})²)`.
+fn location_scale_tested_row(rep: u64, effect: f64) -> Result<SmoothRow, String> {
+    let data = dataset_with(
+        LOCATION_SCALE_SEED + rep,
+        |eta, x1, rng| eta + Normal::new(0.0, 0.3 * x1.exp()).expect("normal").sample(rng),
+        effect,
+    );
+    let config = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("s(x1)".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(FORMULA, &data, &config).map_err(|e| format!("{e:?}"))?;
+    let FitResult::GaussianLocationScale(location_scale) = result else {
+        panic!("location-scale rep {rep}: expected a Gaussian location-scale fit");
+    };
+    let fit = &location_scale.fit;
+    let rows = smooth_term_summary_rows(&fit.mean_design, &fit.meanspec_resolved, &fit.fit, None);
+    let row = rows
+        .iter()
+        .find(|row| row.name.contains(NULL_TERM))
+        .unwrap_or_else(|| panic!("location-scale rep {rep}: no summary row for s({NULL_TERM})"));
+    let p_value = row.pvalue.unwrap_or_else(|| {
+        panic!(
+            "location-scale rep {rep}: s({NULL_TERM}) reported no p-value (edf {}, {:?})",
+            row.edf, row.pvalue_unavailable
+        )
+    });
+    Ok(SmoothRow {
+        p_value,
+        edf: row.edf,
+        ref_df: row.ref_df,
+    })
 }
 
 /// Two-sided one-sample Kolmogorov–Smirnov test of `values` against `U(0, 1)`:
@@ -348,6 +422,15 @@ fn beta_null_smooth_size_is_within_monte_carlo_error() {
     assert_null_size_within_monte_carlo_error(Family::Beta);
 }
 
+#[test]
+fn gaussian_location_scale_null_mean_smooth_size_is_within_monte_carlo_error() {
+    assert_null_rows_within_monte_carlo_error(
+        "Gaussian location-scale",
+        LOCATION_SCALE_NULL_REPLICATIONS,
+        |rep| location_scale_tested_row(rep, 0.0),
+    );
+}
+
 /// Replications of the power control.
 const POWER_REPLICATIONS: u64 = 40;
 
@@ -370,6 +453,27 @@ fn gaussian_real_smooth_effect_is_detected() {
     assert!(
         rejected as f64 >= 0.9 * POWER_REPLICATIONS as f64,
         "a real s({NULL_TERM}) effect was found at α = 0.01 in only \
+         {rejected}/{POWER_REPLICATIONS} fits: {p_values:?}"
+    );
+}
+
+/// The location-scale mean smooth's power control, at the same effect.
+#[test]
+fn gaussian_location_scale_real_mean_smooth_effect_is_detected() {
+    init_parallelism();
+    let p_values: Vec<f64> = (0..POWER_REPLICATIONS)
+        .into_par_iter()
+        .map(|rep| {
+            location_scale_tested_row(rep, 0.5)
+                .unwrap_or_else(|reason| panic!("power rep {rep}: fit failed: {reason}"))
+                .p_value
+        })
+        .collect();
+    let rejected = p_values.iter().filter(|&&p| p <= 0.01).count();
+    eprintln!("Gaussian location-scale power at α = 0.01: {rejected}/{POWER_REPLICATIONS}");
+    assert!(
+        rejected as f64 >= 0.9 * POWER_REPLICATIONS as f64,
+        "a real mean s({NULL_TERM}) effect was found at α = 0.01 in only \
          {rejected}/{POWER_REPLICATIONS} fits: {p_values:?}"
     );
 }
