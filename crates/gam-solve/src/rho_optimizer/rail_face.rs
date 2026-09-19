@@ -168,6 +168,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_math::roundoff::accumulation_growth;
 use crate::model_types::FacePositivityRoute;
 use gam_terms::construction::CanonicalPenalty;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -349,14 +350,6 @@ pub(crate) fn released_rank(matrix: &Array2<f64>) -> Result<usize, String> {
     Ok(values.len())
 }
 
-/// `γ_n = n·u/(1 − n·u)`, `u = ε/2`: the standard bound on the relative
-/// rounding error of an `n`-term floating-point inner product (Higham,
-/// *Accuracy and Stability*, §3.1).
-fn rounding_gamma(n: usize) -> f64 {
-    let nu = (n as f64) * 0.5 * f64::EPSILON;
-    nu / (1.0 - nu)
-}
-
 /// `½·tr(A⁻¹C)` for a symmetric positive-definite `A`, computed on `A`'s own
 /// spectrum so a near-singular `A` reports its failure instead of amplifying
 /// round-off through an explicit inverse.
@@ -450,7 +443,7 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
     // (bounded on its operands, `form_error_bound`) plus the symmetric
     // eigensolver's own backward error `γ_q‖C‖` — Weyl moves every eigenvalue
     // by at most the norm of the perturbation.
-    let gamma_q = rounding_gamma(q);
+    let gamma_q = accumulation_growth(q);
     let curvature_band = limit.form_error_bound + gamma_q * form_norm;
     let positive_form = min_curvature > curvature_band;
 
@@ -759,7 +752,7 @@ impl OverlapFace<'_> {
     fn evaluate(&self, t: &[f64], with_gradients: bool) -> Result<OverlapPoint, String> {
         let q = self.q;
         let m = self.penalties.len();
-        let gamma_q = rounding_gamma(q);
+        let gamma_q = accumulation_growth(q);
         let mut pinned = Array2::<f64>::zeros((q, q));
         let mut weighted = Array2::<f64>::zeros((q, q));
         let mut any_pinned = false;
@@ -788,7 +781,7 @@ impl OverlapFace<'_> {
             }
             let top = range_values.iter().fold(0.0_f64, |acc, v| acc.max(*v));
             let gap = range_values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
-            let perturbation = (gamma_q + (m as f64) * rounding_gamma(m + 1)) * top;
+            let perturbation = (gamma_q + (m as f64) * accumulation_growth(m + 1)) * top;
             (null, perturbation / gap)
         } else {
             (Array2::<f64>::eye(q), 0.0)
@@ -812,8 +805,8 @@ impl OverlapFace<'_> {
         // `M/(1+η) ≼ M̃ ≼ M/(1−η)`, so `|P̃ − P| ≤ ρP` with `ρ = η/(1−η)`.
         let conditioning = sigma_max / sigma_min;
         let arithmetic = gamma_q
-            + (m as f64) * rounding_gamma(m + 1)
-            + (q as f64 + 1.0) * rounding_gamma(q * q + q);
+            + (m as f64) * accumulation_growth(m + 1)
+            + (q as f64 + 1.0) * accumulation_growth(q * q + q);
         let eta = arithmetic * conditioning;
         // The leaked basis perturbs `M` by at most `2θ(1 + ‖A_free‖/σ_min)‖M‖`:
         // once through the outer `Q`, once through the reduced solve.
@@ -936,7 +929,7 @@ fn certify_overlapping_face(
     curvature_band: f64,
 ) -> Result<(f64, f64), String> {
     let m = overlap.penalties.len();
-    let gamma_m = rounding_gamma(m + 1);
+    let gamma_m = accumulation_growth(m + 1);
     let mut vertices: Vec<Vec<f64>> = Vec::new();
     let mut vertex_values: Vec<OverlapPoint> = Vec::new();
     let mut vertex_index: std::collections::HashMap<Vec<u64>, usize> =
@@ -1030,7 +1023,7 @@ fn certify_overlapping_face(
             let error = at_vertex.positive_error
                 + at_centroid.negative_error
                 + linear_error
-                + rounding_gamma(3)
+                + accumulation_growth(3)
                     * (at_vertex.positive + at_centroid.negative + linear.abs());
             lower = lower.min(bound);
             worst_error = worst_error.max(error);
@@ -1529,7 +1522,7 @@ fn assemble_face_limit(input: FaceLimitAssembly<'_>) -> RailFaceLimitOutcome {
     let drift_norm = released_curvature_drift
         .as_ref()
         .map_or(0.0, |drift_q| drift_q.dot(drift_q).sqrt());
-    let form_error_bound = rounding_gamma(k_matrix.nrows())
+    let form_error_bound = accumulation_growth(k_matrix.nrows())
         * ((frobenius(&k_matrix) + frobenius(&s_rest)) * (1.0 + form_conditioning)
             + score_norm * score_norm / dispersion
             + 2.0 * score_norm * drift_norm);
