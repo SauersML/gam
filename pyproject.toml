@@ -55,6 +55,7 @@ Changelog = "https://gamfit.readthedocs.io/en/latest/changelog/"
 [project.optional-dependencies]
 test = [
   "pytest>=8",
+  "mypy>=2.3",
   "numpy>=1.26",
   "pandas>=2.0",
   "pyarrow>=14",
@@ -73,12 +74,15 @@ pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
 type = [
-  "mypy>=1.18",
+  "mypy>=2.3",
   "numpy>=1.26",
   "pandas>=2.0",
   "pandas-stubs",
   "pyarrow>=14",
+  "pyarrow-stubs",
   "polars>=1",
+  "jax>=0.4",
+  "safetensors",
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
   "scikit-learn-stubs",
@@ -114,6 +118,7 @@ testpaths = ["tests"]
 # ordinary failures: SPEC.md forbids XFAIL/XPASS masking.
 markers = [
   "slow: test is too slow for the default CI Python-API job (run explicitly or locally)",
+  "static_typing: mypy --strict over gamfit; needs the `type` extras plus torch and jax",
 ]
 
 [tool.mypy]

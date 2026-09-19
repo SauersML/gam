@@ -7,10 +7,12 @@ import tempfile
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, overload
 
-from ._binding import RustExtensionUnavailableError, extension_status, rust_module
-from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
+from ._binding import RustExtensionUnavailableError, extension_status
+from ._binding import rust_module as rust_module
+from ._calibrated_slope import CtnStage1 as CtnStage1
+from ._calibrated_slope import normalize_ctn_stage1
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -22,6 +24,28 @@ from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
+
+if TYPE_CHECKING:
+    from ._model import MultinomialModel
+    from ._rust import ManifoldSAESupport
+    from ._sae_manifold import ManifoldSAE
+
+# ``family`` spellings that route ``fit`` to the multinomial-logit solver; the
+# runtime check also folds case and ``_``/``-``, which a Literal cannot express.
+MultinomialFamily: TypeAlias = Literal[
+    "multinomial",
+    "multinomial-logit",
+    "multinomial_logit",
+    "categorical",
+    "categorical-logit",
+    "categorical_logit",
+    "softmax",
+]
+# Every class ``load``/``loads`` can return; the payload header selects one.
+LoadedModel: TypeAlias = (
+    "Model | MultinomialModel | ResponseGeometryModel | ManifoldSAE | ManifoldSAESupport"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
@@ -183,7 +207,8 @@ def cross_fit_shared_precision_groups(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return json.loads(raw)
+    fitted: dict[str, dict[str, Any]] = json.loads(raw)
+    return fitted
 
 
 def build_info() -> dict[str, Any]:
@@ -594,6 +619,53 @@ def fit(
     data: Any,
     formula: str,
     *,
+    family: MultinomialFamily,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
+    offset: str | None = ...,
+    weights: str | None = ...,
+    persistent_warm_start_root: str | Path | None = ...,
+    transformation_normal: bool | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
+    survival_likelihood: str | None = ...,
+    survival_time_anchor: float | None = ...,
+    baseline_target: str | None = ...,
+    baseline_scale: float | None = ...,
+    baseline_shape: float | None = ...,
+    baseline_rate: float | None = ...,
+    baseline_makeham: float | None = ...,
+    z_column: str | None = ...,
+    residual_columns: Sequence[str] | None = ...,
+    link: str | None = ...,
+    slope_formula: str | None = ...,
+    frailty_kind: str | None = ...,
+    frailty_sd: float | None = ...,
+    hazard_loading: str | None = ...,
+    scale_dimensions: bool | None = ...,
+    firth: bool | None = ...,
+    noise_formula: str | None = ...,
+    noise_offset: str | None = ...,
+    flexible_link: bool | None = ...,
+    warm_start_from: None = ...,
+    precision_hyperpriors: Any | None = ...,
+    constraints: Mapping[str, Any] | None = ...,
+    response_geometry: None = ...,
+    response_columns: list[str] | tuple[str, ...] | None = ...,
+    response_coordinates: str | None = ...,
+    response_reference: int | None = ...,
+    fisher_rao_w: Any | None = ...,
+    latents: Mapping[str, Any] | None = ...,
+    penalties: Sequence[Any] | None = ...,
+    smooths: Mapping[Any, Any] | None = ...,
+    config: dict[str, Any] | None = ...,
+) -> MultinomialModel: ...
+
+
+@overload
+def fit(
+    data: Any,
+    formula: str,
+    *,
     family: str = ...,
     negative_binomial_theta: float | None = ...,
     expectile_tau: float | None = ...,
@@ -621,6 +693,7 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
@@ -667,6 +740,7 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
+    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
@@ -712,6 +786,7 @@ def fit(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
@@ -723,7 +798,7 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel:
+) -> Model | MultinomialModel | ResponseGeometryModel:
     """Fit a GAM model from a formula and tabular data.
 
     Manifold sparse autoencoders have their own explicit
@@ -1208,6 +1283,7 @@ def fit_array(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
+    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
@@ -1304,7 +1380,7 @@ def fit_array(
 SUPPORT_SAE_SCHEMA = "gamfit.ManifoldSAE/support-v2"
 
 
-def model_from_dict(payload: Any) -> Any:
+def model_from_dict(payload: Any) -> ManifoldSAE | ManifoldSAESupport:
     """Rebuild a manifold-SAE from an already-decoded ``to_dict()`` payload.
 
     :func:`load` owns the on-disk case, where the schema tag is read out of the
@@ -1335,7 +1411,7 @@ def model_from_dict(payload: Any) -> Any:
     return ManifoldSAE.from_dict(payload)
 
 
-def load(path: str | Path) -> Any:
+def load(path: str | Path) -> LoadedModel:
     """Load a fitted model previously written with :func:`gamfit.save`.
 
     Reads the file and dispatches through :func:`loads`.
@@ -1373,7 +1449,7 @@ def save(model: Any, path: str | Path) -> None:
     saver(path)
 
 
-def loads(model_bytes: bytes) -> Any:
+def loads(model_bytes: bytes) -> LoadedModel:
     """Load a fitted model from an in-memory bytes payload.
 
     The Rust ``saved_model_kind`` reads the payload header and selects the
@@ -1441,7 +1517,13 @@ def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeomet
     from ._response_geometry import SharedGaussianRemlTangentFit
 
     def _model_from_b64(encoded: str) -> Model:
-        return loads(base64.b64decode(encoded.encode("ascii")))
+        model = loads(base64.b64decode(encoded.encode("ascii")))
+        if not isinstance(model, Model):
+            raise ValueError(
+                "response-geometry coordinate archive does not hold a scalar Model; "
+                f"got {type(model).__name__}"
+            )
+        return model
 
     models = tuple(
         _model_from_b64(encoded) for encoded in payload.get("coordinate_models_b64", [])

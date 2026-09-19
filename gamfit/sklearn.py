@@ -414,7 +414,10 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.predict(X_test)[:5]
         array([1, 0, 1, 1, 0])
         """
-        return self.classes_.take(np.argmax(self.predict_proba(X), axis=1))
+        labels: np.ndarray = self.classes_.take(
+            np.argmax(self.predict_proba(X), axis=1)
+        )
+        return labels
 
     def metrics(self, X: Any, y: Any) -> dict[str, float]:
         """Classification-metric panel for ``X`` against true labels ``y``.
@@ -518,8 +521,8 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         arr = np.asarray(y).reshape(-1)
         positive = self.classes_[1]
         negative = self.classes_[0]
-        is_positive = arr == positive
-        is_negative = arr == negative
+        is_positive: np.ndarray = arr == positive
+        is_negative: np.ndarray = arr == negative
         unknown = ~(is_positive | is_negative)
         if np.any(unknown):
             raise ValueError(

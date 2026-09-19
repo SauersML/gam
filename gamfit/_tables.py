@@ -5,7 +5,10 @@ import math
 import numbers
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from ._rust import _EncodedTable
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
@@ -44,7 +47,7 @@ class PreNormalizedTable:
 
     __slots__ = ("headers", "rows", "kind")
 
-    def __init__(self, headers: list[str], rows: Any, kind: str) -> None:
+    def __init__(self, headers: list[str], rows: _EncodedTable, kind: str) -> None:
         self.headers = headers
         self.rows = rows
         self.kind = kind
@@ -73,7 +76,9 @@ def _try_import(name: str) -> Any | None:
 CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
-def normalize_table(data: Any, *, required_columns=None) -> tuple[list[str], Any, str]:
+def normalize_table(
+    data: Any, *, required_columns: Sequence[str] | None = None
+) -> tuple[list[str], _EncodedTable, str]:
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
     if required_columns is not None:
