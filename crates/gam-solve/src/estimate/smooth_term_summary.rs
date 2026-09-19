@@ -151,6 +151,7 @@ pub fn smooth_term_summary_rows(
         // double-counts shared coefficients and can exceed the model total.
         let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k_pen);
+        let lambdas = term_lambdas(fit, penalty_cursor, k_pen);
         penalty_cursor += k_pen;
         // Random-effect smooths are variance-component tests on the boundary; a
         // naive coefficient Wald χ² p-value is anti-conservative, so only EDF is
@@ -160,10 +161,12 @@ pub fn smooth_term_summary_rows(
             edf,
             ref_df: edf.max(0.0),
             chi_sq: None,
+            statistic: None,
             pvalue: None,
             continuous_order: None,
             basis_note: None,
             edf_rank_bound,
+            lambdas,
             pvalue_unavailable: None,
         });
     }
@@ -192,6 +195,7 @@ pub fn smooth_term_summary_rows(
             (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
+        let lambdas = term_lambdas(fit, penalty_cursor, k);
         penalty_cursor += k;
         let pvalue_unavailable = smooth_pvalue_unavailable(&term.shape);
         let smooth_test = if pvalue_unavailable.is_none() {
@@ -223,6 +227,7 @@ pub fn smooth_term_summary_rows(
                 .map(|test| test.ref_df)
                 .unwrap_or(edf.max(0.0)),
             chi_sq: smooth_test.as_ref().map(|test| test.statistic),
+            statistic: smooth_test.as_ref().map(|test| test.reference_statistic),
             pvalue: smooth_test.as_ref().map(|test| test.p_value),
             continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
             basis_note: match &term.metadata {
@@ -232,11 +237,22 @@ pub fn smooth_term_summary_rows(
                 _ => None,
             },
             edf_rank_bound,
+            lambdas,
             pvalue_unavailable,
         });
     }
 
     rows
+}
+
+/// The smoothing parameters of the `count` penalty blocks a term owns from
+/// `start` in the fit's flat layout — the same window its EDF is read over.
+fn term_lambdas(fit: &UnifiedFitResult, start: usize, count: usize) -> Vec<f64> {
+    fit.lambdas
+        .as_slice()
+        .and_then(|all| all.get(start..start + count))
+        .map(<[f64]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// The whitening Gram with the intercept direction projected out,

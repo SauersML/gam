@@ -358,8 +358,9 @@ document from saved models).
 gamfit.compare_models([model_a, model_b])
 ```
 
-Diagnostics and reports. `model.summary()` gives the coefficient table and
-per-term effective degrees of freedom; `model.diagnose(data)` returns
+Diagnostics and reports. `model.summary()` gives the parametric and
+smooth-term tables, deviance explained, AIC and the convergence certificate
+(`gam summary MODEL` prints the same text); `model.diagnose(data)` returns
 residuals and fit metrics; `model.plot(...)` draws partial effects and
 residuals; `model.report("out.html")` writes a self-contained HTML report.
 

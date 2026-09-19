@@ -10,8 +10,8 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    BlockRole, ContinuousSmoothnessOrderStatus, UnifiedFitResult,
+    smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -59,15 +59,9 @@ pub(crate) use gam_predict::{
 
 pub(crate) use gam::report;
 
-pub(crate) use gam::probability::{
-    inverse_gaussian_cdf, normal_cdf, normal_two_sided_probability, standard_normal_quantile,
-    student_t_two_sided_probability,
-};
+pub(crate) use gam::probability::{inverse_gaussian_cdf, normal_cdf, standard_normal_quantile};
 
-pub(crate) use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, TermCollectionSpec,
-};
+pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
 

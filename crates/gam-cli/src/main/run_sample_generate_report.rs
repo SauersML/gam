@@ -374,12 +374,14 @@ pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
     // gamfit prints the same string from the same payload.
     let text = if args.json {
         serde_json::to_string_pretty(&summary)
+            .map(|json| json + "\n")
             .map_err(|err| format!("failed to serialize summary: {err}"))?
     } else {
         render_summary_text(&summary)
     };
     use std::io::Write as _;
-    writeln!(std::io::stdout(), "{text}")
+    std::io::stdout()
+        .write_all(text.as_bytes())
         .map_err(|error| format!("failed to write the summary: {error}"))
 }
 
@@ -563,16 +565,9 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 }
 
                 // Continuous smoothness order
-                let reportweights = Array1::<f64>::ones(ds.values.nrows());
-                let summary = build_model_summary(
-                    &design,
-                    &spec,
-                    &fit,
-                    family.clone(),
-                    y.view(),
-                    reportweights.view(),
-                )?;
-                for st in &summary.smooth_terms {
+                let smooth_rows =
+                    smooth_term_summary_rows(&design, &spec, &fit, fit.weighted_gram());
+                for st in &smooth_rows {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {
                             ContinuousSmoothnessOrderStatus::Ok => "Ok",
