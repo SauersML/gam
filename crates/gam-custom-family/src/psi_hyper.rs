@@ -22,6 +22,30 @@ pub struct ExplicitJeffreysCurvatureDrifts {
 /// observed joint Hessian and the family publishes no motion of it (gam#2922), carrying the
 /// family's reason. The observed Hessian's motion would differentiate a different matrix than the
 /// value prices.
+/// A family's batched outer-gradient terms must carry one entry per outer hyperparameter
+/// (ρ then ψ) in each of their three vectors. A length that disagrees is a family bug, not a
+/// decline, so it is reported rather than silently replaced by the generic path.
+fn batched_outer_gradient_terms_match(
+    batch: &BatchedOuterGradientTerms,
+    expected: usize,
+) -> Result<(), CustomFamilyError> {
+    let lengths = [
+        batch.objective_theta.len(),
+        batch.trace_h_inv_hdot.len(),
+        batch.trace_s_pinv_sdot.len(),
+    ];
+    if lengths.iter().any(|&len| len != expected) {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "batched outer gradient terms: objective_theta/trace_h_inv_hdot/trace_s_pinv_sdot \
+                 lengths {}/{}/{} disagree with the {expected} outer hyperparameters",
+                lengths[0], lengths[1], lengths[2],
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn unpublished_jeffreys_information_psi_motion(psi: usize, reason: &str) -> CustomFamilyError {
     CustomFamilyError::UnsupportedConfiguration {
         reason: format!(
@@ -2813,6 +2837,20 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    // gam#3003: a converged mode the family proves is not a mode of this trial
+    // point's posterior refuses the trial point, as an unconverged one does.
+    if let Some(reason) = family
+        .coefficient_mode_refusal(
+            specs,
+            &inner.block_states,
+            inner.log_likelihood,
+            inner.penalty_value,
+            &inner.s_lambdas,
+        )
+        .map_err(CustomFamilyError::from)?
+    {
+        return Err(CustomFamilyError::TrialPointRefused { reason });
+    }
     // gam#2765: the constrained Laplace normalizer's inputs at this mode.
     inner.cone_normalizer = custom_family_cone_normalizer_input(family, specs, options, &inner)?;
     let ranges = block_param_ranges(specs);
@@ -2987,97 +3025,93 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             && inner_kkt_residual_is_negligible
             && (eval_mode == EvalMode::ValueAndGradient
                 || eval_mode == EvalMode::ValueGradientHessian)
-            && let Ok(Some(batch)) = family.batched_outer_gradient_terms(
+            && let Some(batch) = family.batched_outer_gradient_terms(
                 synced_joint_states.as_ref(),
                 specs,
                 hyper_layout.as_ref(),
                 rho_current,
                 options,
                 hessian_workspace.clone(),
-            )
+            )?
         {
             let expected = rho_dim + psi_dim;
-            if batch.objective_theta.len() == expected
-                && batch.trace_h_inv_hdot.len() == expected
-                && batch.trace_s_pinv_sdot.len() == expected
-            {
-                let mut gradient = Array1::<f64>::zeros(expected);
-                for j in 0..expected {
-                    let trace_term = if include_logdet_h {
-                        0.5 * batch.trace_h_inv_hdot[j]
-                    } else {
-                        0.0
-                    };
-                    let det_term = if include_logdet_s {
-                        0.5 * batch.trace_s_pinv_sdot[j]
-                    } else {
-                        0.0
-                    };
-                    gradient[j] = batch.objective_theta[j] + trace_term - det_term;
-                }
-                if eval_mode == EvalMode::ValueGradientHessian {
-                    batched_gradient_override = Some(gradient);
+            batched_outer_gradient_terms_match(&batch, expected)?;
+            let mut gradient = Array1::<f64>::zeros(expected);
+            for j in 0..expected {
+                let trace_term = if include_logdet_h {
+                    0.5 * batch.trace_h_inv_hdot[j]
                 } else {
-                    let no_dh =
-                        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
-                            Ok(None)
-                        };
-                    let no_d2h = |_: &Array1<f64>,
-                                  _: &Array1<f64>|
-                     -> Result<Option<DriftDerivResult>, CustomFamilyError> {
+                    0.0
+                };
+                let det_term = if include_logdet_s {
+                    0.5 * batch.trace_s_pinv_sdot[j]
+                } else {
+                    0.0
+                };
+                gradient[j] = batch.objective_theta[j] + trace_term - det_term;
+            }
+            if eval_mode == EvalMode::ValueGradientHessian {
+                batched_gradient_override = Some(gradient);
+            } else {
+                let no_dh =
+                    |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
                         Ok(None)
                     };
-                    let value_only = joint_outer_evaluate(
-                        &inner,
-                        specs,
-                        &per_block,
-                        rho_current,
-                        &beta_flat,
-                        h_joint_unpen,
-                        &ranges,
-                        total,
-                        rho_curvature_scale,
-                        hessian_logdet_correction,
-                        include_logdet_h,
-                        include_logdet_s,
-                        // The batched BMS gradient contracts traces through the
-                        // family's smooth pseudo-logdet operator. Pair it with the
-                        // same scalar value convention; the projected-subspace
-                        // value belongs only to the generic projected-gradient path.
-                        false,
-                        completion_moves_with_psi,
-                        EvalMode::ValueOnly,
-                        options,
-                        gam_problem::RhoPrior::Flat,
-                        family.pseudo_logdet_mode(),
-                        &no_dh,
-                        None,
-                        &no_d2h,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        robust_jeffreys_hphi.clone(),
-                        None,
-                    )?;
-                    return Ok(OuterObjectiveEvalResult {
-                        objective: value_only.objective,
-                        criterion_components: value_only.criterion_components,
-                        gradient,
-                        outer_hessian: gam_problem::HessianValue::Unavailable,
-                        warm_start: value_only.warm_start,
-                        inner_converged: inner.converged,
-                        hyper_values: hyper_layout.values().clone(),
-                        ext_mode_response_cols: None,
-                        criterion_rank: value_only.criterion_rank,
-                        inner: inner.clone(),
-                    });
-                }
+                let no_d2h = |_: &Array1<f64>,
+                              _: &Array1<f64>|
+                 -> Result<Option<DriftDerivResult>, CustomFamilyError> {
+                    Ok(None)
+                };
+                let value_only = joint_outer_evaluate(
+                    &inner,
+                    specs,
+                    &per_block,
+                    rho_current,
+                    &beta_flat,
+                    h_joint_unpen,
+                    &ranges,
+                    total,
+                    rho_curvature_scale,
+                    hessian_logdet_correction,
+                    include_logdet_h,
+                    include_logdet_s,
+                    // The batched BMS gradient contracts traces through the
+                    // family's smooth pseudo-logdet operator. Pair it with the
+                    // same scalar value convention; the projected-subspace
+                    // value belongs only to the generic projected-gradient path.
+                    false,
+                    completion_moves_with_psi,
+                    EvalMode::ValueOnly,
+                    options,
+                    gam_problem::RhoPrior::Flat,
+                    family.pseudo_logdet_mode(),
+                    &no_dh,
+                    None,
+                    &no_d2h,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    robust_jeffreys_hphi.clone(),
+                    None,
+                )?;
+                return Ok(OuterObjectiveEvalResult {
+                    objective: value_only.objective,
+                    criterion_components: value_only.criterion_components,
+                    gradient,
+                    outer_hessian: gam_problem::HessianValue::Unavailable,
+                    warm_start: value_only.warm_start,
+                    inner_converged: inner.converged,
+                    hyper_values: hyper_layout.values().clone(),
+                    ext_mode_response_cols: None,
+                    criterion_rank: value_only.criterion_rank,
+                    inner: inner.clone(),
+                });
             }
         }
 
@@ -3446,41 +3480,35 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         )?;
         let workspace_for_batch = match inner.joint_workspace.clone() {
             Some(workspace) => Some(workspace),
-            None => family
-                .exact_newton_joint_hessian_workspace_with_options(
-                    &synced_states_for_batch,
-                    specs,
-                    options,
-                )
-                .ok()
-                .flatten(),
+            None => family.exact_newton_joint_hessian_workspace_with_options(
+                &synced_states_for_batch,
+                specs,
+                options,
+            )?,
         };
-        if let Ok(Some(batch)) = family.batched_outer_gradient_terms(
+        if let Some(batch) = family.batched_outer_gradient_terms(
             &synced_states_for_batch,
             specs,
             hyper_layout.as_ref(),
             rho_current,
             options,
             workspace_for_batch.clone(),
-        ) {
-            // Sanity check: batched output must match (rho_dim + psi_dim).
+        )? {
             let expected = rho_dim + psi_dim;
-            if batch.objective_theta.len() == expected
-                && batch.trace_h_inv_hdot.len() == expected
-                && batch.trace_s_pinv_sdot.len() == expected
-                && let Some(joint_bundle_value_only) = build_joint_hessian_closures(
-                    family,
-                    &inner.block_states,
-                    specs,
-                    total,
-                    options,
-                    inner.joint_workspace.clone(),
-                    // The bundle's directional closures feed only the
-                    // `EvalMode::ValueOnly` `joint_outer_evaluate` below — the
-                    // gradient is supplied by the family's batched terms — so
-                    // no directional jet cache needs priming (gam#979).
-                    EvalMode::ValueOnly,
-                )?
+            batched_outer_gradient_terms_match(&batch, expected)?;
+            if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
+                family,
+                &inner.block_states,
+                specs,
+                total,
+                options,
+                inner.joint_workspace.clone(),
+                // The bundle's directional closures feed only the
+                // `EvalMode::ValueOnly` `joint_outer_evaluate` below — the
+                // gradient is supplied by the family's batched terms — so
+                // no directional jet cache needs priming (gam#979).
+                EvalMode::ValueOnly,
+            )?
             {
                 let mut gradient = Array1::<f64>::zeros(expected);
                 for j in 0..expected {

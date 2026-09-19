@@ -20,7 +20,7 @@ use ndarray::{Array1, Array2};
 use std::sync::{Arc, Mutex};
 
 /// A rigid probit family on 24 rows and a β-state for it.
-fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+pub(super) fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     let n = 24usize;
     let marginal_x = Array2::from_shape_fn((n, 3), |(i, j)| {
         if j == 0 {
@@ -78,7 +78,7 @@ fn rigid_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
     (family, states)
 }
 
-fn member(family: &BernoulliMarginalSlopeFamily) -> BernoulliMarginalSlopeFamily {
+pub(super) fn member(family: &BernoulliMarginalSlopeFamily) -> BernoulliMarginalSlopeFamily {
     family.outer_search_member(Arc::new(gam_runtime::resource::SearchLaneBudget::new(
         u64::MAX, None,
     )))
@@ -127,24 +127,20 @@ fn a_multistart_member_reuses_only_its_own_rigid_tensors_2359() {
     };
     let (first_a, first_b, other, parent) =
         (kernel(&first), kernel(&first), kernel(&second), kernel(&family));
-    assert_eq!(
-        first_a.third_full_cache().as_ptr(),
-        first_b.third_full_cache().as_ptr(),
+    assert!(
+        std::ptr::eq(first_a.third_rows(), first_b.third_rows()),
         "a member did not keep its own third tensors"
     );
-    assert_eq!(
-        first_a.fourth_full_cache().as_ptr(),
-        first_b.fourth_full_cache().as_ptr(),
+    assert!(
+        std::ptr::eq(first_a.fourth_rows(), first_b.fourth_rows()),
         "a member did not keep its own fourth tensors"
     );
-    assert_ne!(
-        other.third_full_cache().as_ptr(),
-        first_a.third_full_cache().as_ptr(),
+    assert!(
+        !std::ptr::eq(other.third_rows(), first_a.third_rows()),
         "a member reused another member's third tensors"
     );
-    assert_ne!(
-        parent.fourth_full_cache().as_ptr(),
-        first_a.fourth_full_cache().as_ptr(),
+    assert!(
+        !std::ptr::eq(parent.fourth_rows(), first_a.fourth_rows()),
         "a member reused the process-wide store's fourth tensors"
     );
 }

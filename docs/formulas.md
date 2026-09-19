@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -167,7 +167,7 @@ Removing the intercept therefore removes the constant only when no term
 could represent it. A term that spans the constant keeps the intercept, and
 the model is exactly the one written with it:
 
-- **A fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main effect of a
+- **A fixed factor** — `+ g`, `factor(g)`, or the main effect of a
   factor `by=` smooth. `0 + g` is `g`: every level keeps its column and its
   REML-estimated ridge. Beside the free intercept that ridge shrinks only the
   contrasts between levels, so the overall level is free and the level
@@ -201,7 +201,6 @@ support shrinkage.
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -218,7 +217,7 @@ random intercepts.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
@@ -238,9 +237,11 @@ So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
-`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+`factor()`, `group()` and `re()` take no options: the penalty
 strength is always estimated, so `factor(site, k=3)` is rejected as an
-unknown option instead of being ignored. A categorical column is also
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for

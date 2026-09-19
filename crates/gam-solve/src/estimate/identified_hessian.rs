@@ -1065,7 +1065,7 @@ mod tests {
         );
     }
 
-    /// pyGAM audit F1: a flat coordinate just inside the λ→∞ face of its
+    /// A flat coordinate just inside the λ→∞ face of its
     /// resolvability domain carries a long Newton step toward that face, and the
     /// step ends on the face. On `y ~ s(x0) + … + s(x19)` (binomial, n = 10000) the
     /// displacement was 11 at ρ = 23.5 with the face at 25.4; its penalty sets
