@@ -5519,15 +5519,14 @@ pub(crate) enum BlockCorrectionDecision {
 /// orders are latched (#2748).
 ///
 /// A one-axis piece (every piece under the split, or a one-direction block) is
-/// integrated by the composite Gauss–Kronrod rule instead, and its latched rule is
-/// the partition the admission adapted: `axis_partitions[k]` holds piece `k`'s
-/// interior breakpoints, and its `axis_orders` entry is the partition's node count.
+/// integrated by the composite Gauss–Kronrod rule instead, whose partition is
+/// adapted at every evaluation to that evaluation's axis; its `axis_orders` entry is
+/// the admission's node count.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
-    pub(crate) axis_partitions: Vec<Vec<gam_problem::laplace_sampler_contract::AxisBreakpoint>>,
 }
 
 pub(crate) struct RemlState<'a> {

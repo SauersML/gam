@@ -607,6 +607,8 @@ impl<'a> RemlState<'a> {
         // (#2748), so a latched evaluation integrates the fine rule alone and
         // carries the admission's paired errors as its certificate: on a
         // three-axis block the lower rules are five times the fine rule's nodes.
+        // A one-axis piece is the exception: its composite rule adapts to every
+        // evaluation's axis (below).
         let laplace_floor = if n_eff > 0.0 {
             1.0 / n_eff
         } else {
@@ -685,7 +687,6 @@ impl<'a> RemlState<'a> {
         let piece_count = if axis_split { m } else { 1 };
         let mut pieces: Vec<BlockPieceQuadrature> = Vec::with_capacity(piece_count);
         let mut axis_orders: Vec<usize> = Vec::with_capacity(m);
-        let mut axis_partitions = Vec::with_capacity(piece_count);
         for k in 0..piece_count {
             let (first_axis, width) = if axis_split { (k, 1) } else { (0, m) };
             let axis_target;
@@ -708,31 +709,18 @@ impl<'a> RemlState<'a> {
                 };
             let mut quadrature = if width == 1 {
                 // One axis: the composite Gauss–Kronrod rule, whose bisection resolves a
-                // wall no representable Gauss–Hermite order reaches.
-                let partition = match &latched_quadrature {
-                    Some(latch) => {
-                        let Some(breakpoints) = latch.axis_partitions.get(k) else {
-                            return Err(EstimationError::InvalidInput(format!(
-                                "the #784 latch holds {} axis partitions for piece {k}",
-                                latch.axis_partitions.len()
-                            )));
-                        };
-                        gam_problem::laplace_sampler_contract::CompositeAxisPartition::Latched(
-                            breakpoints,
-                        )
-                    }
-                    None => gam_problem::laplace_sampler_contract::CompositeAxisPartition::Adapt {
-                        next_order_remainder,
-                    },
-                };
-                let composite = corrector
-                    .composite_axis_marginal_correction(piece_target, partition)
-                    .map_err(|refusal| match &latched_quadrature {
-                        Some(_) => EstimationError::InvalidInput(refusal.to_string()),
-                        None => order_search_refused(refusal),
-                    })?;
-                axis_partitions.push(composite.breakpoints);
-                composite.marginal
+                // wall no representable Gauss–Hermite order reaches. Its partition is
+                // adapted at every evaluation, latched or not: the axis is a Hessian
+                // eigenvector at this ρ, whose sign is arbitrary and whose wall moves,
+                // and on adult the admission's partitions carried to the next ρ left
+                // every axis near 1e-3 against its 1.5e-9 target. Each evaluation's own
+                // rule resolves its target, so the criterion moves by less than the
+                // targets between rules, and its gradient is the derivative of the rule
+                // that priced it.
+                corrector
+                    .composite_axis_marginal_correction(piece_target, next_order_remainder)
+                    .map_err(order_search_refused)?
+                    .marginal
             } else {
                 match &latched_quadrature {
                     Some(latch) => corrector
@@ -864,7 +852,6 @@ impl<'a> RemlState<'a> {
                 axis_orders: axis_orders.clone(),
                 axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
-                axis_partitions,
             });
             let mut decision = self.block_correction_decision_guard();
             if *decision == BlockCorrectionDecision::DecidingAtOptimum {

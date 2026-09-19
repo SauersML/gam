@@ -263,20 +263,7 @@ pub struct AxisBreakpoint {
     pub one_minus_v: f64,
 }
 
-/// How [`LaplaceMarginalCorrector::composite_axis_marginal_correction`] partitions
-/// its axis.
-#[derive(Clone, Copy, Debug)]
-pub enum CompositeAxisPartition<'a> {
-    /// Adapt the partition from the whole axis, bisecting the cell with the largest
-    /// Gauss–Kronrod error share until the axis error resolves
-    /// `min(|Δ|, next_order_remainder)`.
-    Adapt { next_order_remainder: f64 },
-    /// Integrate over the partition an admission already adapted (its interior
-    /// breakpoints, increasing), so every ρ of a latched fit shares one rule.
-    Latched(&'a [AxisBreakpoint]),
-}
-
-/// A one-axis composite Gauss–Kronrod correction and the partition it used.
+/// A one-axis composite Gauss–Kronrod correction and the partition it adapted.
 #[derive(Clone, Debug)]
 pub struct CompositeAxisMarginal {
     /// `axis_orders` is `[node_count]`, so a block's node count stays the sum of
@@ -746,6 +733,14 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
     /// representable order, against a `1.5e-9` target. A composite rule places its
     /// nodes where the error is, so the wall costs a few bisections.
     ///
+    /// The partition starts as the whole axis and the cell with the largest error
+    /// share is bisected until the axis error resolves `min(|Δ|, next_order_remainder)`.
+    /// It is adapted afresh on every call: the axis is an eigenvector of the Hessian
+    /// at this ρ, whose sign is arbitrary and whose wall moves with ρ, so a partition
+    /// adapted at another ρ is a rule for another integrand (#784: on `adult` the
+    /// admission's partitions left every later evaluation near `1e-3` against a
+    /// `1.5e-9` target).
+    ///
     /// The error is the Gauss–Kronrod difference of each cell's embedded Gauss rule,
     /// taken on the self-normalised value, so a Gaussian axis (`ΔF ≡ 0`) reports
     /// `Δ = 0` with error exactly `0`. The refusal carries `axis 0` and
@@ -753,7 +748,7 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
     fn composite_axis_marginal_correction(
         &self,
         target: &dyn BlockExcessTarget,
-        partition: CompositeAxisPartition<'_>,
+        next_order_remainder: f64,
     ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal>;
 
     /// Publish one step of [`select_block_quadrature_orders`]: the rule it evaluated,

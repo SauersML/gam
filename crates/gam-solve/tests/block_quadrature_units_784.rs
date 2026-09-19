@@ -19,7 +19,7 @@ use std::sync::{Mutex, PoisonError};
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::laplace_sampler_contract::{
     BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureOrderRefusal,
-    BlockQuadratureOrderStep, BlockQuadratureRefusal, CompositeAxisMarginal, CompositeAxisPartition,
+    BlockQuadratureOrderStep, BlockQuadratureRefusal, CompositeAxisMarginal,
     LaplaceMarginalCorrector, set_laplace_marginal_corrector,
 };
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -149,14 +149,8 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
     fn composite_axis_marginal_correction(
         &self,
         target: &dyn BlockExcessTarget,
-        partition: CompositeAxisPartition<'_>,
+        next_order_remainder: f64,
     ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
-        let resolution_target = match partition {
-            CompositeAxisPartition::Adapt {
-                next_order_remainder,
-            } => next_order_remainder,
-            CompositeAxisPartition::Latched(_) => f64::INFINITY,
-        };
         self.block_quadrature_marginal_correction(target, &[4])
             .map(|marginal| CompositeAxisMarginal {
                 marginal,
@@ -166,7 +160,7 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
                 axis: 0,
                 axis_orders: vec![4],
                 paired_error: f64::INFINITY,
-                resolution_target,
+                resolution_target: next_order_remainder,
                 cause,
             })
     }

@@ -3312,9 +3312,9 @@ mod tests {
         fn composite_axis_marginal_correction(
             &self,
             target: &dyn super::BlockExcessTarget,
-            partition: super::CompositeAxisPartition<'_>,
+            next_order_remainder: f64,
         ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
-            super::composite_axis_marginal_correction(target, partition)
+            super::composite_axis_marginal_correction(target, next_order_remainder)
         }
         fn publish_order_search_step(
             &self,
@@ -3413,12 +3413,6 @@ mod tests {
         }
     }
 
-    fn adapt(next_order_remainder: f64) -> super::CompositeAxisPartition<'static> {
-        super::CompositeAxisPartition::Adapt {
-            next_order_remainder,
-        }
-    }
-
     #[test]
     fn composite_axis_is_exactly_zero_for_gaussian_axis_784() {
         // ΔF ≡ 0 makes every node's e^x − 1 exactly zero, so S, every cell's δS and
@@ -3427,7 +3421,7 @@ mod tests {
             lambdas: array![2.0],
             a: 0.0,
         };
-        let out = super::composite_axis_marginal_correction(&target, adapt(1e-9))
+        let out = super::composite_axis_marginal_correction(&target, 1e-9)
             .expect("a Gaussian axis integrates");
         assert_eq!(out.marginal.value, 0.0);
         assert_eq!(out.marginal.quadrature_error, 0.0);
@@ -3447,7 +3441,7 @@ mod tests {
             a: 0.05,
         };
         let remainder = 1e-10;
-        let out = super::composite_axis_marginal_correction(&target, adapt(remainder))
+        let out = super::composite_axis_marginal_correction(&target, remainder)
             .expect("a quartic axis resolves");
         let reference = super::block_quadrature_marginal_correction(&target, &[40])
             .expect("order-40 reference");
@@ -3496,7 +3490,7 @@ mod tests {
                 .is_err(),
                 "wall b={b}: the Gauss–Hermite search resolved it"
             );
-            let out = super::composite_axis_marginal_correction(&target, adapt(remainder))
+            let out = super::composite_axis_marginal_correction(&target, remainder)
                 .unwrap_or_else(|refusal| panic!("wall b={b}: {refusal}"));
             let marginal = &out.marginal;
             assert!(marginal.quadrature_error < remainder, "wall b={b}: {:e}", marginal.quadrature_error);
@@ -3508,44 +3502,94 @@ mod tests {
         }
     }
 
+    /// The composite rule's value and error over the interior `breakpoints`, with every
+    /// node's excess read from `target`: the pass a partition carried from another ρ
+    /// would make.
+    fn composite_error_on_partition(
+        target: &WallAxis,
+        breakpoints: &[super::AxisBreakpoint],
+    ) -> (f64, f64) {
+        let rule = super::CompositeKronrodRule::new().expect("the Kronrod pair");
+        let ends: Vec<super::AxisBreakpoint> = std::iter::once(super::AxisBreakpoint {
+            v: 0.0,
+            one_minus_v: 1.0,
+        })
+        .chain(breakpoints.iter().copied())
+        .chain(std::iter::once(super::AxisBreakpoint {
+            v: 1.0,
+            one_minus_v: 0.0,
+        }))
+        .collect();
+        let inv_sqrt_lambda = target.lambdas[0].sqrt().recip();
+        let cells: Vec<super::CompositeCell> = ends
+            .windows(2)
+            .map(|pair| {
+                let mut cell = super::CompositeCell::new(pair[0], pair[1], &rule).expect("a cell");
+                for i in 0..cell.z.len() {
+                    let excess = super::BlockExcessTarget::excess(
+                        target,
+                        &Array1::from_elem(1, cell.z[i] * inv_sqrt_lambda),
+                    );
+                    cell.x[i] = if excess.is_finite() { -excess } else { f64::NEG_INFINITY };
+                }
+                cell
+            })
+            .collect();
+        let sums = super::composite_sums(&cells, &rule).expect("the partition integrates");
+        (sums.value, sums.error)
+    }
+
     #[test]
-    fn latched_composite_partition_reproduces_the_adapted_pass_784() {
-        // The latched partition is the adapted one, so the final pass runs over the
-        // same nodes in the same order: every output agrees bitwise.
-        let target = WallAxis {
+    fn composite_axis_resolves_the_mirrored_wall_a_carried_partition_misses_784() {
+        // The block axes are Hessian eigenvectors, whose sign is arbitrary and whose wall
+        // moves with ρ. `WallAxis { b: −b, z0: −z0 }` is the same wall seen along the
+        // flipped axis, ΔF(z) ↦ ΔF(−z), so it has the same Δ. On adult the fit latched
+        // the admission's partitions, and every later evaluation stayed near 1e-3
+        // against its 1.5e-9 target: a partition bisected down onto the wall at +z0
+        // leaves the wall at −z0 in a coarse cell. Adapting at every evaluation
+        // resolves both walls to the target.
+        let remainder = 1.5e-9;
+        let wall = WallAxis {
             lambdas: array![1.7],
             b: 30.0,
             z0: 0.23,
             z_step: None,
         };
-        let adapted = super::composite_axis_marginal_correction(&target, adapt(1e-9))
+        let mirrored = WallAxis {
+            lambdas: array![1.7],
+            b: -30.0,
+            z0: -0.23,
+            z_step: None,
+        };
+        let adapted = super::composite_axis_marginal_correction(&wall, remainder)
             .expect("the wall resolves");
-        assert!(!adapted.breakpoints.is_empty());
-        let latched = super::composite_axis_marginal_correction(
-            &target,
-            super::CompositeAxisPartition::Latched(&adapted.breakpoints),
-        )
-        .expect("the latched partition integrates");
-        let (a, l) = (&adapted.marginal, &latched.marginal);
-        assert_eq!(a.value.to_bits(), l.value.to_bits());
-        assert_eq!(a.quadrature_error.to_bits(), l.quadrature_error.to_bits());
-        assert_eq!(a.rho_gradient, l.rho_gradient);
-        assert_eq!(a.node_count, l.node_count);
-        assert_eq!(adapted.breakpoints, latched.breakpoints);
-        let (am, lm) = (a.moments.as_ref().expect("moments"), l.moments.as_ref().expect("moments"));
-        assert_eq!(am.e_t, lm.e_t);
-        assert_eq!(am.e_tt, lm.e_tt);
-        // A partition that is not increasing is refused before any node is placed.
-        let reversed: Vec<_> = adapted.breakpoints.iter().rev().copied().collect();
-        if reversed.len() > 1 {
-            assert!(
-                super::composite_axis_marginal_correction(
-                    &target,
-                    super::CompositeAxisPartition::Latched(&reversed),
-                )
-                .is_err()
-            );
-        }
+        assert!(!adapted.breakpoints.is_empty(), "the wall needs a bisection");
+        assert!(adapted.marginal.quadrature_error < remainder);
+        // The helper reproduces the adapted pass on its own partition.
+        let (value, error) = composite_error_on_partition(&wall, &adapted.breakpoints);
+        assert_eq!(value.to_bits(), adapted.marginal.value.to_bits());
+        assert_eq!(error.to_bits(), adapted.marginal.quadrature_error.to_bits());
+        // Carried to the mirrored axis, the same partition does not resolve the wall.
+        let (carried_value, carried_error) =
+            composite_error_on_partition(&mirrored, &adapted.breakpoints);
+        assert!(
+            carried_error > remainder,
+            "the carried partition resolved the mirrored wall: value {carried_value}, error \
+             {carried_error:e} against {remainder:e}"
+        );
+        // Adapted afresh, the mirrored wall resolves, to the wall's own Δ.
+        let readapted = super::composite_axis_marginal_correction(&mirrored, remainder)
+            .expect("the mirrored wall resolves");
+        let marginal = &readapted.marginal;
+        assert!(marginal.quadrature_error < remainder, "error {:e}", marginal.quadrature_error);
+        assert!(
+            (marginal.value - adapted.marginal.value).abs()
+                <= marginal.quadrature_error + adapted.marginal.quadrature_error,
+            "mirrored {} against {}",
+            marginal.value,
+            adapted.marginal.value
+        );
+        assert_ne!(readapted.breakpoints, adapted.breakpoints);
     }
 
     #[test]
@@ -3560,7 +3604,7 @@ mod tests {
             z0: 0.0,
             z_step: Some(0.1),
         };
-        let refusal = super::composite_axis_marginal_correction(&target, adapt(f64::MIN_POSITIVE))
+        let refusal = super::composite_axis_marginal_correction(&target, f64::MIN_POSITIVE)
             .expect_err("an unresolvable step is refused");
         match refusal.cause {
             super::BlockQuadratureRefusal::CompositeRoundingFloor {
@@ -3578,7 +3622,7 @@ mod tests {
             other => panic!("expected the rounding floor, got {other}"),
         }
         // The same step against a representable target resolves.
-        let resolved = super::composite_axis_marginal_correction(&target, adapt(1e-10))
+        let resolved = super::composite_axis_marginal_correction(&target, 1e-10)
             .expect("the step resolves at 1e-10");
         let truth = (0.539_827_837_277_028_9_f64).ln(); // ln Φ(0.1)
         assert!((resolved.marginal.value - truth).abs() < 1e-10, "{}", resolved.marginal.value);
@@ -3664,9 +3708,9 @@ mod tests {
         fn composite_axis_marginal_correction(
             &self,
             target: &dyn super::BlockExcessTarget,
-            partition: super::CompositeAxisPartition<'_>,
+            next_order_remainder: f64,
         ) -> Result<super::CompositeAxisMarginal, super::BlockQuadratureOrderRefusal> {
-            super::composite_axis_marginal_correction(target, partition)
+            super::composite_axis_marginal_correction(target, next_order_remainder)
         }
         fn publish_order_search_step(
             &self,
@@ -6603,7 +6647,7 @@ fn cubic_power_iteration_refinement(
 pub use gam_problem::laplace_sampler_contract::{
     AxisBreakpoint, BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments,
     BlockQuadratureOrderRefusal, BlockQuadratureRefusal, CompositeAxisMarginal,
-    CompositeAxisPartition, LaplaceTrustworthiness, laplace_skewness_threshold,
+    LaplaceTrustworthiness, laplace_skewness_threshold,
     laplace_trustworthiness_from_skewness,
 };
 
@@ -6659,9 +6703,9 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
     fn composite_axis_marginal_correction(
         &self,
         target: &dyn BlockExcessTarget,
-        partition: CompositeAxisPartition<'_>,
+        next_order_remainder: f64,
     ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
-        composite_axis_marginal_correction(target, partition)
+        composite_axis_marginal_correction(target, next_order_remainder)
     }
 
     fn publish_order_search_step(
@@ -7657,33 +7701,27 @@ fn reserve_composite_chunk(
 /// composite Gauss–Kronrod rule over `v = 1/(1 + e^{−z})`, and the same gradient
 /// channels as [`block_quadrature_marginal_correction`] (#784).
 ///
-/// Under `Adapt` the partition starts as the whole axis and the cell with the largest
-/// error share above its own rounding band is bisected until the error resolves
+/// The partition starts as the whole axis and the cell with the largest error share
+/// above its own rounding band is bisected until the error resolves
 /// `min(|Δ|, next_order_remainder)`, evaluating the excess alone. Two stops are
 /// refused, typed: a cell whose midpoint rounds onto an end, and an unresolved error
-/// no cell of which is above its rounding band. The final partition, or the `Latched` one, is then integrated once with the
-/// displaced scores; its value, error and moments all come from that pass, whose
-/// weights `w_K ψ e^{−ΔF}` depend on the node only through `z`, and whose nodes are
-/// `t = z/√λ`, exactly the Gauss–Hermite moment contract.
+/// no cell of which is above its rounding band. The final partition is then integrated
+/// once with the displaced scores; its value, error and moments all come from that
+/// pass, whose weights `w_K ψ e^{−ΔF}` depend on the node only through `z`, and whose
+/// nodes are `t = z/√λ`, exactly the Gauss–Hermite moment contract.
 pub fn composite_axis_marginal_correction<T: BlockExcessTarget + ?Sized>(
     target: &T,
-    partition: CompositeAxisPartition<'_>,
+    next_order_remainder: f64,
 ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
-    composite_axis_marginal_correction_in_chunks(target, partition, usize::MAX)
+    composite_axis_marginal_correction_in_chunks(target, next_order_remainder, usize::MAX)
 }
 
 fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
     target: &T,
-    partition: CompositeAxisPartition<'_>,
+    next_order_remainder: f64,
     chunk_limit: usize,
 ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
     use BlockQuadratureRefusal::Integration;
-    let next_order_remainder = match partition {
-        CompositeAxisPartition::Adapt {
-            next_order_remainder,
-        } => next_order_remainder,
-        CompositeAxisPartition::Latched(_) => f64::INFINITY,
-    };
     let refuse = |cause: BlockQuadratureRefusal,
                   node_count: usize,
                   paired_error: f64,
@@ -7773,158 +7811,122 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
         v: 1.0,
         one_minus_v: 0.0,
     };
-    let mut cells: Vec<CompositeCell> = match partition {
-        CompositeAxisPartition::Adapt { .. } => {
-            let mut cells = vec![CompositeCell::new(whole_lower, whole_upper, &rule).map_err(early)?];
-            evaluate_excess(&mut cells, table_bytes(1)).map_err(early)?;
-            let mut shares: Vec<CompositeCellSums> =
-                cells.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
-            // Each cell's `δS` band from the target's rounding of `x`, read only once the
-            // cell is a candidate for bisection: it costs one target evaluation a node.
-            let mut excess_bands: Vec<Option<f64>> = vec![None; cells.len()];
-            let excess_band_of = |cell: &CompositeCell,
-                                  share: &CompositeCellSums,
-                                  cell_count: usize|
-             -> Result<f64, BlockQuadratureRefusal> {
-                let (reservation, _) = reserve_composite_chunk(table_bytes(cell_count), node_bytes, 1)
-                    .map_err(|reason| working_memory(cell_count * rule.len(), reason))?;
-                let mut t = Array1::<f64>::zeros(1);
-                let mut bands = Vec::with_capacity(rule.len());
-                for (&z, &x) in cell.z.iter().zip(&cell.x) {
-                    if x == f64::NEG_INFINITY {
-                        bands.push(0.0);
-                        continue;
-                    }
-                    t[0] = z * inv_sqrt_lambda;
-                    let band = target.excess_rounding_band(&t);
-                    if !(band >= 0.0) {
-                        return Err(Integration(format!(
-                            "composite_axis_marginal_correction: the target's excess rounding band \
-                             at t = {:e} is {band}, not a non-negative bound",
-                            t[0]
-                        )));
-                    }
-                    bands.push(band);
-                }
-                drop(reservation);
-                Ok(share.excess_band_s(cell, &rule, &bands))
-            };
-            loop {
-                let node_count = cells.len() * rule.len();
-                let sums = combine_composite_sums(&shares).map_err(|cause| {
-                    refuse(cause, node_count, f64::INFINITY, next_order_remainder)
-                })?;
-                let resolution_target = sums.value.abs().min(next_order_remainder);
-                if sums.error == 0.0 || sums.error < resolution_target {
-                    break;
-                }
-                // Bisect the largest error share that is a measurement: above the band
-                // its own arithmetic can leave. A share inside it is noise, and splitting
-                // the cell splits the noise without reducing it.
-                let measurable = |c: usize, excess_band: f64| {
-                    sums.cell_errors[c] > sums.share_band(c, &shares[c], excess_band)
-                };
-                let worst = loop {
-                    let candidate = (0..cells.len())
-                        .filter(|&c| sums.cell_errors[c] > 0.0)
-                        .filter(|&c| excess_bands[c].is_none_or(|band| measurable(c, band)))
-                        .max_by(|&a, &b| sums.cell_errors[a].total_cmp(&sums.cell_errors[b]));
-                    match candidate {
-                        Some(c) if excess_bands[c].is_some() => break Some(c),
-                        Some(c) => {
-                            excess_bands[c] = Some(
-                                excess_band_of(&cells[c], &shares[c], cells.len()).map_err(|cause| {
-                                    refuse(cause, node_count, sums.error, resolution_target)
-                                })?,
-                            );
-                        }
-                        None => break None,
-                    }
-                };
-                let Some(worst) = worst else {
-                    let mut rounding_floor = 0.0;
-                    for c in 0..cells.len() {
-                        let band = match excess_bands[c] {
-                            Some(band) => band,
-                            None => excess_band_of(&cells[c], &shares[c], cells.len()).map_err(
-                                |cause| refuse(cause, node_count, sums.error, resolution_target),
-                            )?,
-                        };
-                        rounding_floor += sums.share_band(c, &shares[c], band);
-                    }
-                    return Err(refuse(
-                        BlockQuadratureRefusal::CompositeRoundingFloor {
-                            cells: cells.len(),
-                            rounding_floor,
-                        },
-                        node_count,
-                        sums.error,
-                        resolution_target,
-                    ));
-                };
-                let Some(mid) = cells[worst].midpoint() else {
-                    let (lower_z, upper_z) = cells[worst].z_bounds();
-                    return Err(refuse(
-                        BlockQuadratureRefusal::IndivisibleCompositeCell {
-                            lower_z,
-                            upper_z,
-                            cell_error: sums.cell_errors[worst],
-                        },
-                        node_count,
-                        sums.error,
-                        resolution_target,
-                    ));
-                };
-                let (lower, upper) = (cells[worst].lower, cells[worst].upper);
-                let mut halves = vec![
-                    CompositeCell::new(lower, mid, &rule),
-                    CompositeCell::new(mid, upper, &rule),
-                ]
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
-                evaluate_excess(&mut halves, table_bytes(cells.len() + 1))
-                    .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
-                let half_shares: Vec<CompositeCellSums> =
-                    halves.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
-                shares.splice(worst..=worst, half_shares);
-                excess_bands.splice(worst..=worst, [None, None]);
-                cells.splice(worst..=worst, halves);
+    let mut cells = vec![CompositeCell::new(whole_lower, whole_upper, &rule).map_err(early)?];
+    evaluate_excess(&mut cells, table_bytes(1)).map_err(early)?;
+    let mut shares: Vec<CompositeCellSums> =
+        cells.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
+    // Each cell's `δS` band from the target's rounding of `x`, read only once the
+    // cell is a candidate for bisection: it costs one target evaluation a node.
+    let mut excess_bands: Vec<Option<f64>> = vec![None; cells.len()];
+    let excess_band_of = |cell: &CompositeCell,
+                          share: &CompositeCellSums,
+                          cell_count: usize|
+     -> Result<f64, BlockQuadratureRefusal> {
+        let (reservation, _) = reserve_composite_chunk(table_bytes(cell_count), node_bytes, 1)
+            .map_err(|reason| working_memory(cell_count * rule.len(), reason))?;
+        let mut t = Array1::<f64>::zeros(1);
+        let mut bands = Vec::with_capacity(rule.len());
+        for (&z, &x) in cell.z.iter().zip(&cell.x) {
+            if x == f64::NEG_INFINITY {
+                bands.push(0.0);
+                continue;
             }
-            cells
-        }
-        CompositeAxisPartition::Latched(breakpoints) => {
-            let ends: Vec<AxisBreakpoint> = std::iter::once(whole_lower)
-                .chain(breakpoints.iter().copied())
-                .chain(std::iter::once(whole_upper))
-                .collect();
-            // Increasing in each cell's precise coordinate, the one `midpoint` bisects in:
-            // near v = 1 neighbouring breakpoints can share the rounded `v = 1`.
-            let increasing = |lower: AxisBreakpoint, upper: AxisBreakpoint| {
-                if upper.v <= lower.one_minus_v {
-                    lower.v < upper.v
-                } else {
-                    upper.one_minus_v < lower.one_minus_v
-                }
-            };
-            let interior = |b: &AxisBreakpoint| {
-                b.v > 0.0 && b.one_minus_v > 0.0 && b.v.is_finite() && b.one_minus_v.is_finite()
-            };
-            if !breakpoints.iter().all(interior)
-                || ends.windows(2).any(|pair| !increasing(pair[0], pair[1]))
-            {
-                return Err(early(Integration(
-                    "composite_axis_marginal_correction: the latched breakpoints are not strictly \
-                     increasing inside (0, 1)"
-                        .to_string(),
+            t[0] = z * inv_sqrt_lambda;
+            let band = target.excess_rounding_band(&t);
+            if !(band >= 0.0) {
+                return Err(Integration(format!(
+                    "composite_axis_marginal_correction: the target's excess rounding band \
+                     at t = {:e} is {band}, not a non-negative bound",
+                    t[0]
                 )));
             }
-            ends.windows(2)
-                .map(|pair| CompositeCell::new(pair[0], pair[1], &rule))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(early)?
+            bands.push(band);
         }
+        drop(reservation);
+        Ok(share.excess_band_s(cell, &rule, &bands))
     };
+    loop {
+        let node_count = cells.len() * rule.len();
+        let sums = combine_composite_sums(&shares).map_err(|cause| {
+            refuse(cause, node_count, f64::INFINITY, next_order_remainder)
+        })?;
+        let resolution_target = sums.value.abs().min(next_order_remainder);
+        if sums.error == 0.0 || sums.error < resolution_target {
+            break;
+        }
+        // Bisect the largest error share that is a measurement: above the band
+        // its own arithmetic can leave. A share inside it is noise, and splitting
+        // the cell splits the noise without reducing it.
+        let measurable = |c: usize, excess_band: f64| {
+            sums.cell_errors[c] > sums.share_band(c, &shares[c], excess_band)
+        };
+        let worst = loop {
+            let candidate = (0..cells.len())
+                .filter(|&c| sums.cell_errors[c] > 0.0)
+                .filter(|&c| excess_bands[c].is_none_or(|band| measurable(c, band)))
+                .max_by(|&a, &b| sums.cell_errors[a].total_cmp(&sums.cell_errors[b]));
+            match candidate {
+                Some(c) if excess_bands[c].is_some() => break Some(c),
+                Some(c) => {
+                    excess_bands[c] = Some(
+                        excess_band_of(&cells[c], &shares[c], cells.len()).map_err(|cause| {
+                            refuse(cause, node_count, sums.error, resolution_target)
+                        })?,
+                    );
+                }
+                None => break None,
+            }
+        };
+        let Some(worst) = worst else {
+            let mut rounding_floor = 0.0;
+            for c in 0..cells.len() {
+                let band = match excess_bands[c] {
+                    Some(band) => band,
+                    None => excess_band_of(&cells[c], &shares[c], cells.len()).map_err(
+                        |cause| refuse(cause, node_count, sums.error, resolution_target),
+                    )?,
+                };
+                rounding_floor += sums.share_band(c, &shares[c], band);
+            }
+            return Err(refuse(
+                BlockQuadratureRefusal::CompositeRoundingFloor {
+                    cells: cells.len(),
+                    rounding_floor,
+                },
+                node_count,
+                sums.error,
+                resolution_target,
+            ));
+        };
+        let Some(mid) = cells[worst].midpoint() else {
+            let (lower_z, upper_z) = cells[worst].z_bounds();
+            return Err(refuse(
+                BlockQuadratureRefusal::IndivisibleCompositeCell {
+                    lower_z,
+                    upper_z,
+                    cell_error: sums.cell_errors[worst],
+                },
+                node_count,
+                sums.error,
+                resolution_target,
+            ));
+        };
+        let (lower, upper) = (cells[worst].lower, cells[worst].upper);
+        let mut halves = vec![
+            CompositeCell::new(lower, mid, &rule),
+            CompositeCell::new(mid, upper, &rule),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
+        evaluate_excess(&mut halves, table_bytes(cells.len() + 1))
+            .map_err(|cause| refuse(cause, node_count, sums.error, resolution_target))?;
+        let half_shares: Vec<CompositeCellSums> =
+            halves.iter().map(|cell| CompositeCellSums::of(cell, &rule)).collect();
+        shares.splice(worst..=worst, half_shares);
+        excess_bands.splice(worst..=worst, [None, None]);
+        cells.splice(worst..=worst, halves);
+    }
     let node_count = cells.len() * rule.len();
 
     // The final pass: every node once more, with its displaced score, streaming the
