@@ -76,8 +76,6 @@ def wants_table(
 def shape_predict_response(
     raw: str,
     *,
-    headers: list[str],
-    rows: list[list[str]],
     table_kind: str | None,
     training_table_kind: str,
     interval: float | None,

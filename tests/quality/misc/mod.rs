@@ -6,6 +6,7 @@ mod feature_correctness_sweep;
 mod fit_quality_stress;
 mod mega_batch_j;
 mod mega_batch_k;
+mod quality_expectile_band_coverage_heteroscedastic;
 mod quality_expectile_gam_heteroscedastic_truth;
 mod quality_expectile_joint_noncrossing;
 mod quality_llm_weekday_circle;

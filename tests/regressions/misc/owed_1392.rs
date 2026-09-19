@@ -19,13 +19,12 @@
 //! far worse than the test mean (negative R²).
 //!
 //! Two fixes, both ancestors of `HEAD`:
-//!   (a) #1364 (`49ea80471`): `create_difference_penalty_matrix`
-//!       (`src/terms/basis/bspline_eval.rs`) normalizes each order's spans by
-//!       their geometric-mean span, making the divisor a unitless local/typical
-//!       ratio — invariant to a global rescaling of `x` and identically `1` for
-//!       uniform knots (recovering the plain integer-difference penalty). The
-//!       null space `{1, x}` is preserved exactly (one constant divisor per
-//!       order scales `D` uniformly).
+//!   (a) #1364 (`49ea80471`): the 1-D B-spline roughness penalty is unit-free
+//!       under a global rescaling of `x`. It is now the exact function-space
+//!       Gram `∫(f⁽ᵐ⁾)²` (`bspline_derivative_penalty_matrix`,
+//!       `crates/gam-terms/src/basis/derivative_penalty.rs`), which transforms
+//!       by the single scalar `c^(1-2m)` under `x ↦ c·x`, so its null space
+//!       `{1, x}` and its Frobenius-normalized shape are exactly invariant.
 //!   (b) #1365 (`a14a76d87`): the single 1-D bending penalty is now
 //!       Frobenius-normalized in `bspline_penalty_candidates`
 //!       (`src/terms/basis/bspline_build.rs`), recording the norm in
@@ -202,9 +201,9 @@ fn pspline_fit_is_covariate_scale_invariant_1392() {
     assert!(
         worst < 1e-3 * signal_range,
         "s(x, bs=\"ps\") is NOT covariate-scale invariant: refitting on 100·x drifts the curve \
-         by {worst:.3e} ({:.4}% of the signal range). The difference penalty must normalize each \
-         order's Greville spans by their geometric mean (bspline_eval.rs create_difference_penalty_matrix, \
-         #1364) so REML λ does not track the covariate units.",
+         by {worst:.3e} ({:.4}% of the signal range). The roughness penalty ∫(f^(m))² must be \
+         Frobenius-normalized so its shape is unit-free (#1364/#1365) and REML λ does not track the \
+         covariate units.",
         100.0 * worst / signal_range
     );
 }

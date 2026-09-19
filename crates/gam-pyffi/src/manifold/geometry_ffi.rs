@@ -4810,6 +4810,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
@@ -4924,7 +4925,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
-    module.add_function(wrap_pyfunction!(compare_reml_fits, module)?)?;
+    module.add_function(wrap_pyfunction!(compare_models, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
@@ -5114,7 +5115,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
-    module.add_function(wrap_pyfunction!(model_conditional_aic, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
@@ -6915,26 +6915,25 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-    warm_start: Option<(&[u8], &str)>,
+    warm_start_model: Option<&[u8]>,
 ) -> Result<Vec<u8>, WorkflowError> {
     // The stderr `[OUTER step]` log stream (installed by `progress_log::
     // init_logging` at module import) carries solver progress for the Python
     // bindings; the former always-on TUI session lane has been removed.
     let mut fit_config = parse_fit_config(config_json)?;
-    // `warm_start_from`: the saved model's certified outer point, staged under the
-    // caller's scratch directory for this one fit.
-    if let Some((model_bytes, scratch_dir)) = warm_start {
-        let prior = load_model_impl(model_bytes)?;
-        fit_config.outer_warm_start = Some(
-            gam::families::fit_orchestration::OuterWarmStart::from_model(
-                prior.payload(),
-                &formula,
-                std::path::PathBuf::from(scratch_dir),
-            )?,
-        );
-    }
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
+    }
+    // `warm_start_from` (gam#3002): the saved model's certified outer point,
+    // resolved against exactly the data and request this fit runs on.
+    if let Some(model_bytes) = warm_start_model {
+        let prior = load_model_impl(model_bytes)?;
+        fit_config.warm_start = Some(gam::families::fit_orchestration::resolve_warm_start(
+            prior.payload(),
+            &formula,
+            &dataset,
+            &fit_config,
+        )?);
     }
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,

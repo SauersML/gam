@@ -11,6 +11,11 @@
 /// and `gam-problem` — all at or below the gam-solve tier.
 pub mod alo;
 
+/// Conditional and Wood–Pya–Säfken smoothing-corrected AIC of a converged fit:
+/// the single formula behind the fitted summary, `gam diagnose`, and the
+/// `compare_models` ranking.
+pub mod information_criteria;
+
 /// `Certificate` implementations for the gam-solve-owned certificate types
 /// (`OuterCriterionCertificate`, `CoresetCertificate`, `CollapseEvent`).
 /// Descended from the monolith `inference::certificate_impls` (#1521): the impls
