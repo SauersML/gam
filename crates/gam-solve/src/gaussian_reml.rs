@@ -739,7 +739,7 @@ pub fn gaussian_reml_fit_blocks_exact(
         .column(0)
         .to_owned();
     // #2812: the ρ domain is derived per block from the weighted design Gram
-    // and the block's penalty; the seed lattice spans the same domain.
+    // and the block's penalty; the outer start is clamped into the same domain.
     let (rho_lower, rho_upper) = crate::estimate::rho_domain::resolvability_domain_from_gram_blocks(
         &xtwx,
         blockwise_penalties
@@ -764,9 +764,28 @@ pub fn gaussian_reml_fit_blocks_exact(
         penalty_spectrum,
     };
 
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
-    let mut problem = OuterProblem::new(f_blocks)
+    // One start: the caller's ρ, else the commensurate-curvature start of each
+    // block (its data-curvature trace against its penalty trace), clamped into
+    // the block's resolvability domain. The certified outer search refines it.
+    let xtwx_diag = xtwx.diag();
+    let start_rho = match init_rhos {
+        Some(rhos) => Array1::from_iter(rhos.iter().copied()),
+        None => Array1::from_iter(blockwise_penalties.iter().map(|penalty| {
+            crate::seeding::commensurate_curvature_rho(
+                xtwx_diag,
+                penalty.col_range.clone(),
+                penalty.local.diag().sum(),
+            )
+            .unwrap_or(0.0)
+        })),
+    };
+    let start_rho = Array1::from_iter(start_rho.iter().enumerate().map(|(k, rho)| {
+        rho.clamp(
+            rho_lower.get(k).copied().unwrap_or(f64::NEG_INFINITY),
+            rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
+        )
+    }));
+    let problem = OuterProblem::new(f_blocks)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(false)
@@ -774,22 +793,10 @@ pub fn gaussian_reml_fit_blocks_exact(
         .with_tolerance(1.0e-10)
         .with_required_projected_gradient_norm(Some(1.0e-8))
         .with_bounds(rho_lower.clone(), rho_upper.clone())
-        .with_seed_config(seed_config)
         .with_rho_canonical_keys(Some(canonical_keys))
         .with_fallback_policy(FallbackPolicy::Disabled)
-        .with_problem_size(n, p_total);
-    if let Some(rhos) = init_rhos {
-        problem = problem
-            .with_initial_rho(Array1::from_iter(rhos.iter().enumerate().map(
-                |(k, rho)| {
-                    rho.clamp(
-                        rho_lower.get(k).copied().unwrap_or(f64::NEG_INFINITY),
-                        rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
-                    )
-                },
-            )))
-            .with_screen_initial_rho(true);
-    }
+        .with_problem_size(n, p_total)
+        .with_initial_rho(start_rho);
     let mut objective = problem.build_objective(
         profile,
         gaussian_reml_blocks_profile_cost,

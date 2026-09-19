@@ -772,9 +772,10 @@ fn zz_measure_hifreq_tensor_k8_lambda_readout() {
 //
 // So un-saturating the design did NOT move this heuristic's preference, and the
 // issue's premise needs one more correction on top of the saturation one: THIS
-// LINE DOES NOT NAME THE OPTIMIZER'S STARTING POINT. `initial.sp` contributes ONE
-// candidate to a 5-seed screening cascade (`rho_optimizer/seed_screening.rs`),
-// and the cascade's ranking is what picks the start. The two report on different
+// LINE DID NOT NAME THE OPTIMIZER'S STARTING POINT. `initial.sp` contributed ONE
+// candidate to a 5-seed screening cascade whose ranking picked the start (that
+// cascade is gone: the outer search now enters from the one derived start,
+// `rho_optimizer::run_plan::outer_start_point`). The two reported on different
 // evaluators -- a `compute_cost` score against a cap-3 PIRLS cost -- so the
 // numbers above are NOT comparable across that boundary and no ratio between them
 // means anything. What is legitimate to conclude is narrower and still useful:

@@ -847,28 +847,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         order
     }
 
-    fn outer_seed_config(&self, n_params: usize) -> gam_solve::seeding::SeedConfig {
-        let mut config = gam_solve::seeding::SeedConfig::default();
-        if n_params == 0 {
-            return config;
-        }
-        // #979: BMS startup seed screening runs real inner solves. With the
-        // default multi-seed pool, large marginal-slope fits can spend minutes
-        // rejecting equivalent seeds before the first outer step. Keep the
-        // principled GLM candidate grid alive (the symmetric over-/under-smooth
-        // stability anchors at rho={2,4} that startup validation relies on),
-        // but budget exactly one screened start so only a single inner solve
-        // is paid at startup rather than the full screening cascade.
-        config.max_seeds = 6;
-        config.seed_budget = 1;
-        // Two cycles is below the observed KKT reachability floor for
-        // marginal-slope startup seeds: it rejects every candidate, then pays
-        // an immediate second screening pass at cap=8. Start at the first
-        // viable cap and let the existing cascade escalate only when needed.
-        config.screen_max_inner_iterations = 8;
-        config
-    }
-
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }

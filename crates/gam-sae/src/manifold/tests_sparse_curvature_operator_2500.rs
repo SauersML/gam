@@ -589,7 +589,6 @@ fn ard_curvature_derivative_matches_the_dense_exact_a_on_a_deflating_fixture_250
 #[test]
 fn threshold_gate_outer_solve_is_not_aborted_by_an_unmodelled_sparse_operator_2500() {
     use gam_solve::rho_optimizer::OuterProblem;
-    use gam_solve::seeding::SeedConfig;
 
     let (term, target, rho) = threshold_gate_tiny_fixture(true);
     let init_flat = rho.to_flat(&term.assignment).expect("the seed rho is bound to the term's assignment");
@@ -598,11 +597,6 @@ fn threshold_gate_outer_solve_is_not_aborted_by_an_unmodelled_sparse_operator_25
         SaeManifoldOuterObjective::new(term, target, None, rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(init_flat)
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold");
     if let Err(err) = &result {
         let msg = err.to_string();

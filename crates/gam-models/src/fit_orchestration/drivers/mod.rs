@@ -73,7 +73,6 @@ use gam_terms::smooth::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
 use std::ops::Range;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 // Fit-result carriers relocated out of `gam_terms::smooth::term_specs` with the

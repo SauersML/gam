@@ -1014,7 +1014,7 @@ where
     }
     // Sign convention (issue #396, see `solver::evidence`): `tk_score` is a
     // minimised TK / REML cost, so LOWER is better. Route through the shared
-    // priority selector so topology ranking, seed screening, and model
+    // priority selector so topology ranking, candidate selection, and model
     // comparison share one deterministic ordering contract (#782).
     ranked = rank_priority_candidates(
         ranked

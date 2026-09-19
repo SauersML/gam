@@ -548,22 +548,6 @@ pub trait CustomFamily {
         }
     }
 
-    /// Family-specific outer seeding policy.
-    ///
-    /// The default preserves the generic custom-family behavior. Families with
-    /// a strong warm start can override this to keep seed screening from
-    /// dominating the fit.
-    fn outer_seed_config(&self, n_params: usize) -> gam_problem::SeedConfig {
-        if n_params == 0 {
-            return gam_problem::SeedConfig::default();
-        }
-        let mut config = gam_problem::SeedConfig::default();
-        config.max_seeds = if n_params <= 4 { 6 } else { 4 };
-        config.seed_budget = 1;
-        config.screen_max_inner_iterations = 2;
-        config
-    }
-
     /// Whether outer hyper-derivative evaluation must use a joint exact path.
     ///
     /// Default `false` allows the generic blockwise diagonal fallback when a

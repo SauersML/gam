@@ -14,7 +14,7 @@ pub use gam_problem::{EfsEval, FixedPointCertificateEval, FixedPointCoordinateCe
 /// - [`SeedOutcome::NoSlot`] — the objective has no inner-β slot at all. The
 ///   provided β is silently discarded. This is the contract reply for
 ///   objectives whose inner iterate is conceptually empty (e.g. line-search
-///   bridges, screening proxies, fixed-spec objectives).
+///   bridges, fixed-spec objectives).
 ///
 /// Genuine seeding failures (wrong dimension when a slot exists, internal
 /// allocation faults, …) are reported via `Err(EstimationError)`.
@@ -73,8 +73,7 @@ pub enum SeedOutcome {
 ///   stale or non-finite Hessian.
 /// - Use `eval_cost()` / `OuterEval::infeasible()` for infeasible trial points.
 ///   Return `Err(...)` only when the evaluation artifact itself cannot be
-///   constructed. Such errors are fatal across screening, multistart, and
-///   solver plans; they are never reinterpreted as another numerical trial.
+///   constructed. Such errors are fatal across every solver plan; they are never reinterpreted as another numerical trial.
 /// - `eval_cost()` is used only for cost-based optimization paths.
 /// - `eval()` is the main evaluation path (cost + gradient + optional Hessian).
 /// - `eval_efs()` is used only by the EFS solver. It runs the inner solve,
@@ -88,43 +87,6 @@ pub trait OuterObjective {
 
     /// Evaluate cost only for cost-based optimization paths.
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError>;
-
-    /// Evaluate the seed-screening ranking proxy at this `rho`.
-    ///
-    /// Used exclusively by the `rank_seeds_with_screening` cascade. The
-    /// default delegates to [`OuterObjective::eval_cost`], which preserves
-    /// behavior for non-REML objectives.
-    ///
-    /// Concrete REML-state objectives override this to return the per-seed
-    /// minimum penalized deviance observed during the inner P-IRLS solve
-    /// (a monotonically descending quantity that remains a meaningful
-    /// quality signal even at a 3-iteration screening cap), instead of the
-    /// V_LAML criterion (which is dominated by a poorly-conditioned
-    /// `0.5·log|H|` term at partial-fit β̂ and ranks seeds little better
-    /// than random). The proxy fires *only* in screening mode; outside
-    /// screening it must return the regular V_LAML cost so the optimization
-    /// objective is unchanged.
-    ///
-    /// # Why the `eval_cost` default is correct for everyone else (#969)
-    ///
-    /// The partial-fit pathology is CAUSED by the screening cap: it is the
-    /// `0.5·log|H|` term evaluated at a β̂ whose inner solve was truncated
-    /// by `screening_max_inner_iterations`. An objective only suffers it if
-    /// it (a) consumes that cap atomic AND (b) ranks on a curvature-bearing
-    /// criterion at the truncated iterate — which is exactly the REML/LAML
-    /// state-objective family, all of which override this method (or are
-    /// built via `build_objective_with_screening_proxy`). Objectives that
-    /// never wire the cap pay the full inner solve during screening, so
-    /// their screened cost IS the true criterion — slower, but a correct
-    /// ranking by definition, and a proxy could only degrade it. Any future
-    /// objective that starts honoring the screening cap on a
-    /// curvature-bearing criterion must override this with its own
-    /// monotonically-descending inner quantity (the penalized-deviance
-    /// pattern above generalizes: rank on the best inner merit seen, never
-    /// on a curvature term at a truncated iterate).
-    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.eval_cost(rho)
-    }
 
     /// Evaluate cost + gradient + (if capable) Hessian.
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError>;
@@ -373,7 +335,7 @@ pub trait OuterObjective {
     /// and `None` otherwise.
     ///
     /// The default returns `None` so non-REML objectives (line-search-only
-    /// inner bridges, screening proxies, the EFS / hybrid-EFS sub-objectives)
+    /// inner bridges, the EFS / hybrid-EFS sub-objectives)
     /// keep the host BFGS branch unconditionally — only the concrete
     /// REML-state objectives override this to consult
     /// `crate::estimate::reml::outer_eval::outer_reml_device_admission`.
@@ -920,12 +882,6 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         Ok(v)
     }
 
-    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        // Screening proxies run at sub-converged β̂ and aren't a meaningful
-        // best-so-far signal; forward without persisting.
-        self.inner.eval_screening_proxy(rho)
-    }
-
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let r = self.inner.eval(rho)?;
         self.trace_eval(rho, r.cost, Some(&r.gradient), "value+gradient");
@@ -1061,7 +1017,6 @@ pub struct ClosureObjective<
     Fr = fn(&mut S),
     Fefs = fn(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo = fn(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
-    Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fseed = fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
 > {
     pub state: S,
@@ -1106,10 +1061,6 @@ pub struct ClosureObjective<
     /// pseudo-log-determinant over a rank that moves with the inner mode; `None` means
     /// one criterion everywhere.
     pub(crate) criterion_rank_fn: Option<Box<dyn Fn(&S) -> Option<usize>>>,
-    /// Optional seed-screening ranking proxy closure. When `None`,
-    /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
-    /// default), preserving legacy behavior for non-REML objectives.
-    pub(crate) screening_proxy_fn: Option<Fsp>,
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
     pub(crate) seed_fn: Option<Fseed>,
@@ -1118,15 +1069,14 @@ pub struct ClosureObjective<
     pub(crate) terminal_eval_order: Option<OuterEvalOrder>,
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> OuterObjective
-    for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fseed> OuterObjective
+    for ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fseed>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
     Fr: FnMut(&mut S),
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
-    Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fseed: FnMut(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
 {
     fn capability(&self) -> OuterCapability {
@@ -1136,14 +1086,6 @@ where
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         crate::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
         (self.cost_fn)(&mut self.state, rho)
-    }
-
-    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        crate::estimate::reml::outer_eval::record_current_outer_theta_for_ift(rho);
-        match self.screening_proxy_fn.as_mut() {
-            Some(f) => f(&mut self.state, rho),
-            None => (self.cost_fn)(&mut self.state, rho),
-        }
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
@@ -1313,7 +1255,7 @@ where
     }
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> {
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fseed> {
     pub fn with_exact_polish<Fpolish>(mut self, transition: Fpolish) -> Self
     where
         Fpolish: FnMut(&mut S) -> bool + 'static,
@@ -1374,20 +1316,19 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs,
     }
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
+impl<S, Fc, Fe, Fr, Fefs, Feo> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo>
 where
     Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
     Fr: FnMut(&mut S),
     Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
     Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
-    Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
 {
 
     pub fn with_seed_inner_state<Fseed>(
         self,
         seed_fn: Fseed,
-    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
+    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fseed>
     where
         Fseed: FnMut(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
     {
@@ -1404,7 +1345,6 @@ where
             rail_face_limit_fn: self.rail_face_limit_fn,
             criterion_invariance_fn: self.criterion_invariance_fn,
             criterion_rank_fn: self.criterion_rank_fn,
-            screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
             terminal_eval_order: self.terminal_eval_order,
         }
@@ -1687,7 +1627,6 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
         .into_iter()
         .flatten()
         .chain(active_set.into_iter().flatten())
-        .chain(result.refused_seed_points.iter_mut())
     {
         if point.len() == perm.len() {
             *point = permute_to_native(point, perm);
@@ -1929,11 +1868,6 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         let native = self.to_native(rho);
         self.inner.eval_cost(&native)
-    }
-
-    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
-        let native = self.to_native(rho);
-        self.inner.eval_screening_proxy(&native)
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {

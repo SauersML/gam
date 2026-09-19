@@ -112,7 +112,6 @@ pub(crate) use rayon::prelude::*;
 
 pub(crate) use std::cell::RefCell;
 
-pub(crate) use std::sync::atomic::AtomicUsize;
 
 pub(crate) use std::sync::Arc;
 

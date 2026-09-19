@@ -67,7 +67,6 @@ use super::*;
 #[test]
 fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     use gam_solve::rho_optimizer::OuterProblem;
-    use gam_solve::seeding::SeedConfig;
     // #2234 — surface the exact-A refusal and `[SAE-SADDLE]` descent lines; the
     // telemetry counts refusals but cannot say whether any descent committed.
     gam_runtime::test_support::install_diagnostic_logger();
@@ -161,12 +160,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         1.0e-6,
     );
     let problem = OuterProblem::new(n_params)
-        .with_initial_rho(initial_flat.clone())
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(initial_flat.clone());
     let outcome = problem.run(&mut objective, "zz stall diagnostic 2234");
     match &outcome {
         Ok(result) => eprintln!(

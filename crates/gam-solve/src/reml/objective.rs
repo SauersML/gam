@@ -342,8 +342,8 @@ impl<'a> RemlState<'a> {
 
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
-            // converged inner modes — partial fits accepted from seed
-            // screening (cap=3) routinely yield indefinite Hessians, and
+            // converged inner modes — partial fits under an outer-imposed
+            // inner cap routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
             let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
@@ -402,52 +402,6 @@ impl<'a> RemlState<'a> {
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
         Ok(cost)
-    }
-
-    /// Seed-screening ranking proxy.
-    ///
-    /// In screening mode (`screening_max_inner_iterations > 0`), runs the
-    /// inner P-IRLS solve under the active iteration cap and returns the
-    /// minimum penalized deviance (`-2·log L + βᵀSβ`, plus the structural
-    /// ridge contribution carried in `stable_penalty_term`) observed across
-    /// all inner iterations. Penalized deviance descends monotonically along
-    /// any inner descent path P-IRLS takes, so this minimum is a meaningful
-    /// quality signal even when the inner solver was capped before reaching
-    /// the mode — strictly better than ranking by the partial-fit V_LAML
-    /// criterion, whose `0.5·log|H|` term is dominated by noise at a
-    /// poorly-conditioned partial β̂.
-    ///
-    /// Outside of screening mode this delegates to `Self::compute_cost` so
-    /// the optimization objective itself is never changed by this method's
-    /// presence.
-    pub(crate) fn compute_screening_proxy(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        let in_screening = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
-        if !in_screening {
-            return self.compute_cost(p);
-        }
-        // Use the same bundle pipeline as `compute_cost`, but read the proxy
-        // directly from `pirls_result.min_penalized_deviance` instead of
-        // assembling the LAML criterion. Bundle assembly already runs
-        // P-IRLS under the screening cap; reusing it keeps the screening
-        // path's behavioural invariants (no warm-start update, no LRU write,
-        // no KKT enforcement at partial fits).
-        let bundle = match self.obtain_eval_bundle(p) {
-            Ok(bundle) => bundle,
-            Err(err) if err.is_inner_solve_retreat() => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Ok(f64::INFINITY);
-            }
-            Err(e) => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Err(e);
-            }
-        };
-        let proxy = bundle.pirls_result.min_penalized_deviance;
-        if proxy.is_finite() {
-            Ok(proxy)
-        } else {
-            Ok(f64::INFINITY)
-        }
     }
 
     ///

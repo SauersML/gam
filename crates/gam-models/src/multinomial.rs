@@ -3514,32 +3514,6 @@ pub(crate) fn penalized_multinomial_formula_parts(
         // sample-count floor changes the statistical fit and is not a prior.
         rho_lower_bound: None,
         use_outer_hessian,
-        // #715 real-data arm ("canonical-gauge null direction rejects all REML
-        // seeds"): skip the multi-seed outer screening cascade and let the
-        // pinned `init_lambda` ρ flow straight to the outer optimizer.
-        //
-        // The multinomial family declares `levenberg_on_ill_conditioning() ->
-        // true`: near the simplex boundary (the near-separable penguins regime)
-        // the softmax Fisher weight `W = diag(p) − p pᵀ → 0`, so the joint
-        // information `H = JᵀWJ + S_λ` can become full-rank but
-        // ILL-CONDITIONED. The self-vanishing LM damping that keeps the inner
-        // joint-Newton from oscillating on those near-singular modes converges
-        // only GEOMETRICALLY. The default screening policy ranks candidate seeds
-        // with a 2-cycle inner cap (`outer_seed_config`); under geometric
-        // LM-damped descent two cycles never reach a finite, meaningful proxy
-        // objective, so EVERY capped seed can collapse to non-finite cost and
-        // the cascade escalates to ×4, ×16, then an UNCAPPED full inner solve
-        // PER SEED on the near-singular Hessian. That is the adapter-level face
-        // of "all REML startup seeds rejected" and the multi-minute timeout.
-        //
-        // The pinned seed is already principled here: `init_lambda` gives every
-        // (class, term) ρ a sensible moderate warm start, and the per-term
-        // effective-df-floor upper bounds (`effective_df_floor_rho_upper_bounds`,
-        // #715 arm (a)) keep any λ from collapsing the smooth onto its polynomial
-        // null space. So the outer ARC/BFGS optimizer performs the real REML ρ
-        // search from this seed; screening only adds the cascade cost and, on the
-        // near-separable arm, the rejection stall.
-        screen_initial_rho: false,
         // #1101: compute the joint Laplace posterior covariance `H⁻¹` (and the
         // influence matrix `F = H⁻¹ X'WX`) at the converged mode so the saved
         // model can surface delta-method per-class probability standard errors

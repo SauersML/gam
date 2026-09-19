@@ -11,10 +11,8 @@ use super::evaluation::{
 };
 use super::external_options::resolve_external_family;
 use super::optimizer::{
-    external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-    standard_reml_search_prefers_gradient_only,
+    freeze_lambda_search_nuisance_at_canonical_anchor, standard_reml_search_prefers_gradient_only,
 };
-use super::penalty::REML_SEED_SCREENING_RHO_CAP;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
@@ -26,61 +24,11 @@ use crate::mixture_link::{
     sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials, sas_link_complement,
 };
 use gam_linalg::utils::StableSolver;
-use gam_problem::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
-};
+use gam_problem::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::atomic::Ordering;
-
-#[test]
-fn gaussian_external_reml_uses_one_analytic_seed() {
-    // The profiled-Gaussian path scores its data-derived `initial.sp` and
-    // summed-penalty diagonal candidates before constructing the outer
-    // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, LinkFunction::Identity);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
-    // Coordinate count must not silently re-enable heuristic global shifts:
-    // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Logit);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert_eq!(
-        cfg.max_seeds, 2,
-        "high-dimensional GLM REML must generate the alternate ARC startup basin"
-    );
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "high-dimensional GLM REML must request both generated starts so ARC's GLM cap is not nullified"
-    );
-}
-
-#[test]
-fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, LinkFunction::Logit);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert!(cfg.max_seeds > 1);
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "GLM REML must request the alternate ARC startup basin"
-    );
-}
 
 #[test]
 fn profiled_gaussian_search_consumes_exact_outer_curvature() {
@@ -1996,10 +1944,9 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, LinkFunction::Logit);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
-    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)
+    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None)
         .expect("the anchor must succeed on a pristine state");
     let anchored_bits = pristine.frozen_beta_phi.load(Ordering::Relaxed);
     assert_ne!(
@@ -2027,7 +1974,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         Some(&[3.0]),
-        &seed_config,
     )
     .expect("the anchor must succeed regardless of what a caller donated");
     assert_eq!(
@@ -2072,7 +2018,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         None,
-        &seed_config,
     );
     assert!(
         matches!(refusal, Err(EstimationError::InvalidInput(_))),
@@ -2374,7 +2319,7 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         // the seeded optimum, or re-certify it in place?
         //
         // The cache hit logs `action=resume-and-recertify` and installs the
-        // prior fit's ρ as `initial_rho` with `screen_initial_rho = false`
+        // prior fit's ρ as `initial_rho`
         // (`rho_optimizer/run.rs`, the `CacheSeedDecision::ExactFinal` arm),
         // plus the prior β as an inner seed. If that point is already
         // certified, the outer search has nothing to do and must return it

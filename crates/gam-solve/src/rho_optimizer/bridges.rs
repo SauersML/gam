@@ -1535,7 +1535,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
@@ -1743,7 +1743,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // iterations, BEFORE invoking the inner solve. Cap stays fixed
         // within line-search cost probes (`eval_cost` never touches the
         // atomic). A cap of 0 means "no cap from this source"; the inner
-        // solver still honors `pirls_max_iterations` and the screening cap.
+        // solver still honors `pirls_max_iterations`.
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
@@ -1838,7 +1838,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         //
         // #1426: read the inner-PIRLS convergence flag for the solve THIS eval
         // just ran (the feedback atomics are updated by `execute_pirls_if_needed`
-        // after each non-screening solve, so the snapshot now reflects this ρ).
+        // after each inner solve, so the snapshot now reflects this ρ).
         // A non-finite / non-converged inner solve makes the reported
         // cost/gradient untrustworthy; the guard must not record it as
         // best-so-far nor count it toward a stall. `None` (no feedback wired)
@@ -2168,11 +2168,11 @@ pub(crate) const INNER_CAP_CEILING: usize = 64;
 ///   thrashing.
 ///
 /// A cap of 0 means "no cap from this source"; the inner solver still
-/// honors `pirls_max_iterations` and the screening cap. The cap is
+/// honors `pirls_max_iterations`. The cap is
 /// floored at 3 (anything less is below noise) and ceilinged at 64
 /// (the inner noise floor at large scale; further iters would be
 /// pure waste).
-/// Did the inner PIRLS for the most recent non-screening outer eval converge?
+/// Did the inner PIRLS for the most recent outer eval converge?
 ///
 /// Reads the inner-progress feedback snapshot the cap schedule already consumes.
 /// Returns the snapshot's `last_converged` flag, defaulting to `true` when there
@@ -2266,8 +2266,8 @@ pub(crate) fn first_order_inner_cap_schedule(
         return next.clamp(INNER_CAP_FLOOR, INNER_CAP_CEILING);
     }
 
-    // No feedback yet (first outer iter, or right after a screening
-    // bundle reset). Coarse iter-count fallback for the first 1-2
+    // No feedback yet (first outer iter, or right after a bundle
+    // reset). Coarse iter-count fallback for the first 1-2
     // outer iters so the cold-start cap is shallow even before the
     // adaptive signal kicks in.
     match accepted_iters {
@@ -2406,7 +2406,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
@@ -3423,7 +3423,7 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;

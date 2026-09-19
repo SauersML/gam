@@ -124,39 +124,6 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
     }
 }
 
-#[test]
-fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
-    let config = default_test_family().outer_seed_config(6);
-    assert_eq!(
-        config.risk_profile,
-        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear
-    );
-    assert_eq!(config.seed_budget, 1);
-    // The BMS marginal-slope startup screen caps inner iterations at the first
-    // viable reachability floor (8). Two cycles sits below the observed KKT
-    // reachability floor for these startup seeds: it rejects every candidate
-    // and then immediately pays a second screening pass at cap=8, so the
-    // production config (`outer_seed_config`) starts at 8 and lets the cascade
-    // escalate only when needed. See d388d12e7.
-    assert_eq!(config.screen_max_inner_iterations, 8);
-    assert_eq!(config.max_seeds, 6);
-
-    let seeds = gam_solve::seeding::generate_rho_candidates(
-        6,
-        None,
-        &config,
-        gam_solve::seeding::OrderedRhoBounds::new(-12.0, 12.0).expect("fixture seed domain"),
-    );
-    for anchor in [2.0, 4.0] {
-        assert!(
-            seeds
-                .iter()
-                .any(|seed| seed.iter().all(|rho| (*rho - anchor).abs() < 1e-12)),
-            "missing symmetric GLM startup anchor rho={anchor}"
-        );
-    }
-}
-
 fn empty_termspec() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: vec![],

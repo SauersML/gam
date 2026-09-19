@@ -375,11 +375,6 @@ fn run_full_fit(
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(4)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .unwrap_or_else(|e| {
             // The two #1782 failure surfaces both land here: the threshold-gate / euclidean

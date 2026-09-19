@@ -488,11 +488,6 @@ fn run_wide_outer_fit(
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("#2080 wide-p outer penalized quasi-Laplace fit must terminate, not hang / abort");
     assert!(
@@ -665,11 +660,6 @@ fn run_k1_generated_seed_outer_fit(
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let mut ledger = LivelockLedger::default();
     let result = OuterProblem::new(n_params)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(
             &mut LivelockRecorder {
                 inner: &mut objective,
@@ -828,12 +818,7 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
     let mut objective = fit_seeded.3;
     let n_params = seed.len();
     let mut problem = OuterProblem::new(n_params)
-        .with_max_iter(cfg.outer_max_iter)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_max_iter(cfg.outer_max_iter);
     if cfg.pin_initial_rho {
         problem = problem.with_initial_rho(seed.clone());
     }
@@ -1137,11 +1122,6 @@ fn entangled_two_circle_outer_reml_separates_2080() {
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold entangled two-circle")
         .expect("#2080 entangled two-circle outer penalized quasi-Laplace fit must terminate, not abort");
     assert!(

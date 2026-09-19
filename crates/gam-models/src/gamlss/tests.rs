@@ -4178,7 +4178,6 @@ impl Zz2155Problem {
         wiggle_degree: degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let mut frozen_eta = eta0.clone();
     let mut beta_eta = beta_eta0.clone();

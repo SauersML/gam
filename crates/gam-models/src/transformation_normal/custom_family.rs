@@ -182,17 +182,6 @@ impl CustomFamily for TransformationNormalFamily {
         false
     }
 
-    fn outer_seed_config(&self, n_params: usize) -> gam_solve::seeding::SeedConfig {
-        gam_solve::seeding::SeedConfig {
-            max_seeds: if n_params <= 8 { 1 } else { 2 },
-            seed_budget: 1,
-            screen_max_inner_iterations: 2,
-            risk_profile: gam_solve::seeding::SeedRiskProfile::Gaussian,
-            num_auxiliary_trailing: 0,
-            over_smoothing_probe_rho: None,
-        }
-    }
-
     fn max_feasible_step_size(
         &self,
         block_states: &[ParameterBlockState],

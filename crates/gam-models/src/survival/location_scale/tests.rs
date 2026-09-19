@@ -332,12 +332,7 @@ fn certified_survival_fit_quadratic() -> gam_solve::rho_optimizer::CertifiedOute
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_tolerance(1.0e-8)
         .with_max_iter(40)
-        .with_initial_rho(array![0.5])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.5]);
     let mut objective = problem.build_objective(
         (),
         |_: &mut (), theta: &Array1<f64>| Ok(0.5 * (theta[0] - 0.25).powi(2)),

@@ -1672,11 +1672,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &[marginal_terms.clone(), slope_terms.clone()],
         kappa_options_ref,
         &setup,
-        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             assert_eq!(
@@ -1808,13 +1806,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
             let outer_options = crate::outer_subsample::exact_outer_options(&tolerance_options);
             let cycle_budget_evidence = || {
-                let load_cap = |cap: &Option<Arc<AtomicUsize>>| {
-                    cap.as_ref().map(|value| value.load(std::sync::atomic::Ordering::Relaxed))
-                };
                 format!(
-                    "inner cycle budget inputs: base={}, screening_cap={:?}",
+                    "inner cycle budget inputs: base={}",
                     outer_options.inner_max_cycles,
-                    load_cap(&outer_options.screening_max_inner_iterations),
                 )
             };
             let selection = if let Some(value_selection) = owned_value_mode {

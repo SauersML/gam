@@ -2106,12 +2106,7 @@ fn optimize_survival_transformation_smoothing(
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
         .with_bounds(lower.clone(), upper.clone())
-        .with_initial_rho(seed_rho.clone())
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(seed_rho.clone());
     let mut obj = problem.build_objective_with_eval_order(
         (),
         |_: &mut (), rho: &Array1<f64>| {

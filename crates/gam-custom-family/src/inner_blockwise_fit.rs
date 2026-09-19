@@ -3209,7 +3209,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // plateau-flat-objective convergence certificate in the inner-cycle
     // body now handles that case directly, so the cap stays fixed at the
     // baseline for the lifetime of this outer call.
-    let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
+    let inner_max_cycles = inner_max_cycles_base.max(1);
     // Each block's assembled penalty matrix depends only on that block's
     // penalties and smoothing parameters. Build these setup matrices in
     // parallel, but keep the coordinate-descent and line-search loops below

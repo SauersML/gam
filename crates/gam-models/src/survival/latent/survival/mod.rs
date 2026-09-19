@@ -1079,11 +1079,9 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         &[Vec::new()],
         &kappa_options,
         &setup,
-        crate::seeding::SeedRiskProfile::Survival,
         true,
         false,
         true,
-        None,
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             check_designs(specs, designs)?;

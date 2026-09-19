@@ -325,83 +325,6 @@ pub(crate) fn outerobjective_from_coefficient_mode_labeled<
         .map_err(CustomFamilyError::from)
 }
 
-pub(crate) fn custom_family_seed_screening_proxy_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &gam_problem::RhoPrior,
-) -> Result<(f64, ConstrainedWarmStart, bool), CustomFamilyError> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
-    let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
-    // Seed screening only RANKS candidate seeds by their penalized inner merit;
-    // it is capped and never produces the final fit. Mark the inner solve as a
-    // screening solve so it skips the O(p · per-axis-Hdot) full Jeffreys/Firth
-    // curvature loop and keeps only the cheap value-only Jeffreys term in the
-    // score (gam#729/#808). For a K-block coupled family (Dirichlet/multinomial)
-    // each per-axis directional derivative is O(K²·n·p), so paying the full term
-    // for every cascade candidate over the joint width is the wrong cost class
-    // and made the coupled fit non-completing in screening alone. The real fit
-    // (after a seed is selected) runs with `seed_screening = false`, so the
-    // load-bearing Firth curvature is fully present where it matters.
-    let mut screening_options = BlockwiseFitOptions {
-        seed_screening: true,
-        ..options.clone()
-    };
-    // gam#1587: the screening inner solve must apply the same full-width joint
-    // penalty so the ranked proxy objective matches the real penalized fit.
-    if !layout.joint_specs.is_empty() {
-        let total_compiled: usize = specs.iter().map(|s| s.design.ncols()).sum();
-        let joint_log_lambdas = layout.joint_log_lambdas(rho);
-        let bundle = gam_problem::JointPenaltyBundle::from_validated_geometry(
-            std::sync::Arc::clone(&layout.joint_specs),
-            std::sync::Arc::clone(&layout.joint_roots),
-            joint_log_lambdas,
-            total_compiled,
-        )?;
-        screening_options.joint_penalties = Some(std::sync::Arc::new(bundle));
-    }
-    let mut inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        &screening_options,
-        physical_warm_start.as_ref().or(warm_start),
-    )?;
-    refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    let prior_terms = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
-    // A capped screening iterate is deliberately not a certified coefficient
-    // mode. Its Laplace determinants are therefore undefined, and using them
-    // here would either rank noisy partial-fit curvature or (correctly) fail
-    // once determinant construction is restricted to converged modes. Rank on
-    // the same curvature-free penalized merit minimized by the inner solver.
-    // Accepted inner steps decrease this quantity, so the terminal capped
-    // iterate is a meaningful seed-quality signal. Full outer evaluations keep
-    // requiring convergence and certified REML/LAML determinants.
-    let score = checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        0.0,
-        "custom-family labeled seed-screening proxy",
-    )? + prior_terms.0;
-    let warm = ConstrainedWarmStart {
-        rho: rho.clone(),
-        block_beta: inner
-            .block_states
-            .iter()
-            .map(|state| state.beta.clone())
-            .collect(),
-        active_sets: inner.active_sets.clone(),
-        cached_inner: Some(cached_inner_mode_from_result(&inner)),
-    };
-    Ok((score, warm, inner.converged))
-}
-
 pub(crate) fn split_log_lambdas(
     flat: &Array1<f64>,
     penalty_counts: &[usize],
@@ -522,18 +445,6 @@ pub(crate) fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + '
         Ok(x.matrixvectormultiply(&beta) + off)
     })?;
     Ok(())
-}
-
-#[inline]
-pub(crate) fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles: usize) -> usize {
-    let mut cap = base_cycles;
-    if let Some(screening) = options.screening_max_inner_iterations.as_ref() {
-        let screening_cap = screening.load(Ordering::Relaxed);
-        if screening_cap > 0 {
-            cap = cap.min(screening_cap);
-        }
-    }
-    cap.max(1)
 }
 
 pub(crate) fn weighted_normal_equations(

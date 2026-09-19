@@ -85,11 +85,6 @@ pub(crate) fn survival_blockwise_fit_options(
         cache_session: spec.cache_session.clone(),
         persistent_warm_start_store: spec.persistent_warm_start_store.clone(),
         cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
-        // Constant-scale (parametric-AFT) fits pin the time-warp ρ seed at the
-        // identified affine-baseline limit; re-screening that already-correct
-        // seed across the flat unidentified time ridge only stalls. Genuinely
-        // flexible scale/spatial fits keep the default `true` and full screening.
-        screen_initial_rho: !survival_constant_scale(spec),
         ..BlockwiseFitOptions::default()
     }
 }

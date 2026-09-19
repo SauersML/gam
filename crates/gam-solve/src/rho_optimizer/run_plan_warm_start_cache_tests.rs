@@ -567,8 +567,8 @@ fn exact_final_cache_hit_resumes_and_recertifies_without_resolving() {
     // Accelerator half AND proof the run RESUMED from the cached rho: the recertify
     // must certify in ~0-1 outer iterations. The Hessian-free gradient solve here
     // could not reach the 2.5 optimum from the -3.0 initial in a single step, so a
-    // bound of 1 is only reachable if the solver was SEEDED at the cached rho
-    // (screen_initial_rho = false). A regression that cold-solved from -3.0 on
+    // bound of 1 is only reachable if the solver was SEEDED at the cached rho.
+    // A regression that cold-solved from -3.0 on
     // every cache hit would blow this bound -- skipping that work is the whole
     // point of the cache -- and no other test would catch it.
     assert!(

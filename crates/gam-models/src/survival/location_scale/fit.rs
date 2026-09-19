@@ -837,11 +837,9 @@ pub(crate) fn fit_survival_location_scale_terms(
         &[threshold_terms, log_sigma_terms],
         kappa_options,
         &joint_setup,
-        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();

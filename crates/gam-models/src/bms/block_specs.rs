@@ -2820,11 +2820,9 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
         &[marginal_terms.clone(), slope_terms.clone()],
         kappa_options_ref,
         &setup,
-        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {

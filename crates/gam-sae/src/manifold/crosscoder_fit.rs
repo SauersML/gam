@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
-use gam_solve::seeding::SeedConfig;
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
 use ndarray::{Array1, Array2, s};
 use serde::Serialize;
@@ -884,12 +883,7 @@ pub fn run_sae_crosscoder_fit(
 
     let objective = if request.run_outer_rho_search {
         let problem = OuterProblem::new(n_params)
-            .with_initial_rho(initial_flat)
-            .with_seed_config(SeedConfig {
-                max_seeds: 1,
-                seed_budget: 1,
-                ..Default::default()
-            });
+            .with_initial_rho(initial_flat);
         let result = problem.run(&mut objective, "SAE manifold crosscoder");
         certify_crosscoder_outer(objective, result)?
     } else {

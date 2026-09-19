@@ -1,14 +1,5 @@
 use super::*;
 
-#[inline]
-fn should_start_next_seed(
-    started_seeds: usize,
-    seed_budget: usize,
-    has_certified_candidate: bool,
-) -> bool {
-    started_seeds < seed_budget || !has_certified_candidate
-}
-
 /// The criterion value and iteration count a first-order run ended at, when it ended by
 /// converging or stalling: the ends at which the search may cross into the stratum of a
 /// trial it refused for keeping a different rank (#2765). A budget verdict or a failure
@@ -38,114 +29,6 @@ fn stratum_run_end(
     }
 }
 
-/// Drop from `seeds` every point an earlier certify-resume round already
-/// STARTED and already had REFUSED (#2569).
-///
-/// Slot 0 is never dropped: it is the caller's `initial_rho`, which on a resume
-/// is the reseed point the retry exists to explore. Everything else in the
-/// cascade is regenerated identically each round from a state `obj.reset()` has
-/// restored, so a seed already in the record terminates exactly where it
-/// terminated before — measured on #2569 as one cold seed re-run 17 times to
-/// the identical `|g|` after the identical 42 outer iterations. Returns the
-/// surviving cascade and how many seeds were replayed rather than re-run.
-/// The seeds this outer call has not already started and had refused.
-///
-/// #2569 built the filter and exempted slot 0, because slot 0 carries the
-/// certify-resume loop's reseed point and "the resume exists to explore it".
-/// #2748 measured what that exemption costs when the reseed does not MOVE: on
-/// the `n = 4000` matern flexible cell the outer re-dispatched from slot 0
-/// round after round — `entering seed 0 of 7 (started 0, budget 1)` every time
-/// — and the dispatch's EFS arm re-derived one identical non-converged fixed
-/// point, `final_value = 2.786987e3` to seven digits across four runs at
-/// roughly thirteen minutes each, before the cell died at its wall.
-///
-/// The exemption's own justification is what corrects it. A reseed point earns
-/// its exemption by being NEW, not by sitting at index 0; a slot-0 point that
-/// is already in this run's refusal record is not a reseed the loop has yet to
-/// explore, it is the one it already explored. So the index test is replaced by
-/// the value test the justification was always stating. A resume that genuinely
-/// moves has a slot-0 point absent from the record and is untouched, which is
-/// every case #2569 measured.
-///
-/// This is also the answer to "what may persist across `obj.reset()`", which
-/// #2748 asked as though a solver needed new memory. Nothing new does. The
-/// record consulted here already survives the reset, because it never lived in
-/// the objective: it is carried on the config by the loop that owns the reset
-/// (`OuterConfig::previously_refused_seed_points`). What was missing was not a
-/// place to remember, it was reading the memory that exists with the predicate
-/// that matches it.
-///
-/// The cascade is never emptied. If every generated seed is a recorded replay
-/// the caller's own start is kept so a plan runner still has something to
-/// enter, and the replay count reports that the round had nothing new.
-fn seeds_without_recorded_refusals(
-    seeds: Vec<Array1<f64>>,
-    previously_refused: &[Array1<f64>],
-) -> (Vec<Array1<f64>>, usize) {
-    if previously_refused.is_empty() || seeds.len() < 2 {
-        return (seeds, 0);
-    }
-    let mut kept: Vec<Array1<f64>> = Vec::with_capacity(seeds.len());
-    let mut replayed = 0usize;
-    let mut caller_start: Option<Array1<f64>> = None;
-    for (seed_idx, seed) in seeds.into_iter().enumerate() {
-        if previously_refused.iter().any(|refused| refused == &seed) {
-            if seed_idx == 0 {
-                caller_start = Some(seed);
-            }
-            replayed += 1;
-            continue;
-        }
-        kept.push(seed);
-    }
-    match caller_start {
-        Some(start) if kept.is_empty() => (vec![start], replayed.saturating_sub(1)),
-        _ => (kept, replayed),
-    }
-}
-
-/// Seed start points this plan run STARTED and whose mandatory analytic
-/// certificate then REFUSED (#2569).
-///
-/// Derived in one place from the rejection ledger the seed loop already keeps,
-/// rather than recorded at each of its refusal sites, so the set cannot drift
-/// from what the ledger reports. Only the `"certificate"` phase qualifies: a
-/// seed rejected at screening, domain entry or validation never reached a
-/// solver, and its refusal carries no statement about where the search would
-/// have terminated.
-fn certificate_refused_seed_points(
-    seed_rejections: &[SeedRejection],
-    seeds: &[Array1<f64>],
-    budget_exhausted: &[Array1<f64>],
-) -> Vec<Array1<f64>> {
-    let mut points: Vec<Array1<f64>> = Vec::new();
-    for rejection in seed_rejections
-        .iter()
-        .filter(|rejection| rejection.phase == "certificate")
-    {
-        if let Some(seed) = seeds.get(rejection.seed_idx)
-            && !points.contains(seed)
-        {
-            points.push(seed.clone());
-        }
-    }
-    // #2748 — a seed whose METRIC-FREE solver exhausted its iteration budget
-    // states where the search terminated just as definitely as a refused
-    // certificate does, and the filter's own justification above ("a seed
-    // rejected at screening, domain entry or validation never reached a
-    // solver") admits it: this one reached a solver and ran it to the end.
-    // It was nonetheless recorded nowhere, because the seed loop `continue`s
-    // an exhausted iterate as "resumable work, not a fit candidate" — true,
-    // and orthogonal to whether re-entering the same point would re-derive
-    // the same exhaustion. It would; see [`budget_exhausted_replay_point`].
-    for seed in budget_exhausted {
-        if !points.contains(seed) {
-            points.push(seed.clone());
-        }
-    }
-    points
-}
-
 /// A one-shot reseed retry returns its own outcome, and that outcome knows only
 /// the reseed's iterations. Fold in what the enclosing attempt already spent, so
 /// the total covers every start (#2817).
@@ -166,46 +49,40 @@ fn with_enclosing_attempt_ledger(
     }
 }
 
-/// The seed point of an exhausted iterate, when re-entering it would provably
-/// reproduce the exhaustion — otherwise `None`.
+/// The one point the outer search starts from.
 ///
-/// The certify-resume loop varies exactly two things across dispatches: the
-/// outer BFGS metric (`warm_start_outer_hessian`) and the operator trust radius
-/// (`operator_initial_trust_radius`). A solver that consumes neither is a
-/// function of its seed alone, so `obj.reset()` puts it back in the state it
-/// ran from and the next dispatch recomputes what the last one already has.
-/// [`Solver::Efs`] is that solver: a multiplicative fixed-point iteration with
-/// no curvature model and no trust region. #2748 measured the consequence —
-/// four dispatches of the `n = 4000` matern flexible cell, each running the
-/// fixed point to `max_iter = 200` and each returning `final_value = 2.786987e3`
-/// to seven digits, at roughly thirteen minutes apiece.
+/// The caller's `initial_rho` when it has the search's dimension (a cache
+/// resume, a reseed retry, or a model-derived start such as the analytic
+/// `initial.sp` the standard REML path computes); otherwise the caller's
+/// full-length `heuristic_log_lambdas`; otherwise `ρ = 0`, which is `λ = 1` on
+/// the normalized penalties every term builder emits. The result is clamped
+/// into the model domain's envelope so no start sits on a face the search does
+/// not have (SPEC rule 20, #2902 row 9).
 ///
-/// `Arc` and `Bfgs` DO consume the transferred metric, so their retry from the
-/// same point is a different trajectory and is deliberately not recorded here;
-/// `HybridEfs` takes safeguarded gradient steps on the ψ coordinates and is
-/// excluded for the same reason. The claim this function makes is only ever
-/// "this exact run has already been performed", never "this point is bad".
-fn budget_exhausted_replay_point(
-    solver: Solver,
-    seed: &Array1<f64>,
-) -> Option<Array1<f64>> {
-    matches!(solver, Solver::Efs).then(|| seed.clone())
-}
-
-/// Parsimonious screening has exactly two roles: the flexible slot-0 basin and
-/// the deliberately promoted, more-smoothed slot-1 basin. The remaining budget
-/// is failure recovery, not an instruction to solve extra certified basins.
-const PARSIMONY_COMPARISON_SEED_COUNT: usize = 2;
-
-#[inline]
-fn should_await_promoted_parsimony_seed(
-    seed_budget: usize,
-    started_seeds: usize,
-    promoted_seed_is_redundant: bool,
-) -> bool {
-    seed_budget >= PARSIMONY_COMPARISON_SEED_COUNT
-        && started_seeds < PARSIMONY_COMPARISON_SEED_COUNT
-        && !promoted_seed_is_redundant
+/// There is exactly one start. A start that does not certify is continued by
+/// the certify-resume loop from its own checkpoint, and a certified saddle is
+/// left along its negative-curvature direction; neither re-enters the search
+/// from an unrelated lattice point.
+pub(crate) fn outer_start_point(
+    config: &OuterConfig,
+    n_params: usize,
+    model_domain_bounds: &(Array1<f64>, Array1<f64>),
+) -> Result<Array1<f64>, EstimationError> {
+    if let Some(initial) = config.initial_rho.as_ref()
+        && initial.len() == n_params
+    {
+        return Ok(initial.clone());
+    }
+    let envelope = gam_problem::OrderedRhoBounds::envelope(
+        model_domain_bounds.0.iter().copied(),
+        model_domain_bounds.1.iter().copied(),
+    )?;
+    Ok(match config.heuristic_log_lambdas.as_deref() {
+        Some(heuristic) if heuristic.len() == n_params => {
+            heuristic.iter().map(|&value| envelope.clamp(value)).collect()
+        }
+        _ => Array1::from_elem(n_params, envelope.clamp(0.0)),
+    })
 }
 
 /// The typed ray a custom-family inner solve reported when it stopped
@@ -420,7 +297,7 @@ pub(crate) fn eligible_transferred_outer_hessian<'a>(
     })
 }
 
-/// A multistart candidate that has cleared the analytic outer certificate.
+/// The solver's claimed stop, once it has cleared the analytic outer certificate.
 ///
 /// Keeping the winner slot typed this way prevents a solver status bit from
 /// participating in ranking.  Raw solver iterates and exhausted checkpoints
@@ -434,7 +311,7 @@ impl CertifiedOuterCandidate {
         context: &str,
         mut candidate: OuterResult,
     ) -> Result<Self, (OuterResult, EstimationError)> {
-        // #2359: this is the multi-start's FILTER, not the mint. It spends
+        // #2359: this is the first-order FILTER, not the mint. It spends
         // first-order evidence only; the single order-four curvature audit is
         // paid once, on the winner, at the `PlanRunOutcome::Converged` exit
         // below. A candidate that is stationary but sits on inadmissible
@@ -453,10 +330,6 @@ impl CertifiedOuterCandidate {
             }
             Err(error) => Err((candidate, error)),
         }
-    }
-
-    fn result(&self) -> &OuterResult {
-        &self.0
     }
 
     fn into_result(self) -> OuterResult {
@@ -564,392 +437,59 @@ pub(crate) fn run_outer_with_plan(
     // active-set search face. In particular, freezing a model-lower-rail
     // coordinate creates a singleton search interval whose "upper" endpoint
     // is still the MODEL LOWER bound; recording it as an active model upper
-    // bound silently erases the feasible inward derivative (#2514). The seed
-    // lattice is clamped into this domain's envelope (#2902 row 9).
+    // bound silently erases the feasible inward derivative (#2514).
     let model_domain_bounds = outer_model_domain_bounds_template(config, cap.n_params);
-    let mut seeds = crate::seeding::generate_rho_candidates(
-        cap.n_params,
-        config.heuristic_log_lambdas.as_deref(),
-        &config.seed_config,
-        gam_problem::OrderedRhoBounds::envelope(
-            model_domain_bounds.0.iter().copied(),
-            model_domain_bounds.1.iter().copied(),
-        )?,
-    );
-    // Explicit model-derived candidates precede the generic generator and are
-    // not truncated by `SeedConfig::max_seeds`. Insert in reverse so the
-    // primary `initial_rho` remains slot zero and the caller's candidate order
-    // is preserved. Bounds projection and exact deduplication happen below.
-    for candidate in config.initial_rho_candidates.iter().rev() {
-        if !seeds.iter().any(|seed| seed == candidate) {
-            seeds.insert(0, candidate.clone());
-        }
-    }
-    if let Some(initial_rho) = config.initial_rho.as_ref() {
-        if let Some(position) = seeds.iter().position(|seed| seed == initial_rho) {
-            let initial = seeds.remove(position);
-            seeds.insert(0, initial);
-        } else {
-            seeds.insert(0, initial_rho.clone());
-        }
-    }
-    if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "no seeds generated for outer optimization ({context})"
-        )));
-    }
-
     crate::estimate::reml::outer_eval::record_current_outer_rho_model_upper_bounds_for_ift(
         &model_domain_bounds.1,
     );
     let bounds_template = outer_search_bounds_template(config, cap.n_params);
-    let mut projected_seeds = Vec::with_capacity(seeds.len());
-    for seed in seeds {
-        let projected = project_to_bounds(&seed, Some(&bounds_template));
-        if !projected_seeds.contains(&projected) {
-            projected_seeds.push(projected);
-        }
-    }
-    seeds = projected_seeds;
-    if seeds.is_empty() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "no bounded seeds generated for outer optimization ({context})"
-        )));
-    }
-
-    // #2569 — replay, rather than re-derive, a seed verdict this outer call
-    // already recorded. `config.previously_refused_seed_points` is non-empty
-    // only on a certify-resume round, and holds seeds an earlier round started
-    // and whose analytic certificate refused. The resume reseeds `initial_rho`
-    // and resets the objective, so every seed in this cascade that is already
-    // in the record is re-entered from the identical state that already refused
-    // it, and the trace shows it terminating at the identical gradient after the
-    // identical iteration count. #2748: that includes slot 0 when the reseed did
-    // not move it, which is the case a slot-0 index exemption could never see. A
-    // seed that was never started is never in the list, so the
-    // `should_start_next_seed` fall-through keeps every rescue it could
-    // previously perform.
-    let generated_seed_count = seeds.len();
-    let (kept_seeds, replayed_seeds) =
-        seeds_without_recorded_refusals(seeds, &config.previously_refused_seed_points);
-    seeds = kept_seeds;
-    if replayed_seeds > 0 {
-        log::info!(
-            "[OUTER] {context}: replaying {replayed_seeds} recorded seed refusal(s) instead of \
-             re-running them ({}/{generated_seed_count} seeds kept); a resume re-enters a \
-             non-initial seed from the state that already refused it (#2569/#2080)",
-            seeds.len(),
-        );
-    }
-
-    let seed_budget =
-        effective_seed_budget_for_config(&config.seed_config, the_plan.solver).min(seeds.len());
-    // Who owns the one budgeted slot: the caller, or the heuristics?
-    //
-    // `config.initial_rho` with `screen_initial_rho == false` is the caller
-    // saying "start HERE and do not re-rank it". Two independent things
-    // downstream can displace that seed — the screening ranker below, and the
-    // neutral-baseline promotion after it — so both consult this one predicate.
-    // They disagreed before: the ranker honoured the caller and the promotion
-    // then moved the always-injected `[0.0]` baseline in front of it, which at
-    // `seed_budget == 1` does not reorder the cascade, it REPLACES the seed.
-    //
-    // The seed it replaced is not always a heuristic guess. A cache resume
-    // installs its checkpoint ρ through exactly this field (see the
-    // `CacheSeedDecision::{Seed, ExactFinal}` arms in `OuterProblem::run`,
-    // which set `initial_rho` and clear `screen_initial_rho`), so the promotion
-    // was discarding resumed work and re-starting the fit from λ=1 —
-    // `all_saturated_cached_rho_is_honored_as_seed` measured it doing that with
-    // a checkpoint at ρ=[10,−10] and every evaluation landing at [0,0].
-    let explicit_initial_rho_owns_single_seed_budget = config.initial_rho.is_some()
-        && seed_budget == 1
-        && seeds.len() > 1
-        && !config.screen_initial_rho;
-    if !explicit_initial_rho_owns_single_seed_budget
-        && should_screen_seeds(config, the_plan.solver, seeds.len(), seed_budget)
-    {
-        // Screening RANKS the seeds; it does not decide whether they can be
-        // used. `rank_seeds_with_screening` says so itself — with no screening
-        // cap configured it returns the seeds unranked and the run proceeds —
-        // so "unranked" is an outcome this code already supports.
-        //
-        // `fatal_outer_evaluation` here overrode that unconditionally, and it
-        // overrode the producer's classification with it. Measured on the
-        // coxph-frailty arm: the refusal reached this line already typed and
-        // already correct (`Custom-family fit failed: inner solve refused this
-        // trial point: …`), `is_trial_point_infeasible()` answered true for it,
-        // and the whole fit died anyway — over a ranking.
-        //
-        // A trial-point refusal at a screening probe means that seed could not
-        // be scored, not that the problem is unfittable. Keep the generated
-        // order and let the seeds be evaluated for real; if the cause is
-        // structural it recurs there and is reported with its own context.
-        // Anything the producer did NOT call rho-local still escalates.
-        let screened = rank_seeds_with_screening(obj, config, context, &seeds);
-        seeds = match screened {
-            Ok(ranked) => ranked,
-            Err(error) if error.is_trial_point_infeasible() => {
-                log::warn!(
-                    "[OUTER] {context}: seed screening could not rank the seeds \
-                     ({error}); continuing with the generated order",
-                );
-                seeds
-            }
-            Err(error) => {
-                return Err(EstimationError::fatal_outer_evaluation(
-                    "outer seed screening",
-                    error,
-                ));
-            }
-        };
-    }
-    if !explicit_initial_rho_owns_single_seed_budget {
-        prioritize_neutral_bfgs_glm_seed(
-            &mut seeds,
-            &config.seed_config,
-            the_plan.solver,
-            seed_budget,
-        );
-    }
-    log::debug!(
-        "[OUTER] {context}: trying generated seeds directly (generated={}, budget={})",
-        seeds.len(),
-        seed_budget,
+    let seed_as_generated = project_to_bounds(
+        &outer_start_point(config, cap.n_params, &model_domain_bounds)?,
+        Some(&bounds_template),
     );
-    if seed_budget < config.seed_config.seed_budget.max(1) {
-        log::debug!(
-            "[OUTER] {context}: capped requested seed budget {} -> {} for {:?} ({:?})",
-            config.seed_config.seed_budget.max(1),
-            seed_budget,
-            the_plan.solver,
-            config.seed_config.risk_profile,
-        );
-    }
-    if seeds.len() > seed_budget {
-        log::debug!(
-            "[OUTER] {context}: trying up to {seed_budget}/{} generated seeds in heuristic order",
-            seeds.len(),
-        );
-    }
+    let seed_idx = 0usize;
 
+    // The certified winner, when the search from the start certifies.
     let mut best: Option<CertifiedOuterCandidate> = None;
-    // The lowest evaluated state that did not certify: refused certifications and
-    // budget-exhausted iterates alike. It is the resume checkpoint, and it is
-    // what a certified winner is compared against before it publishes (#2596,
-    // #2627).
+    // The evaluated state the search ended on when it did not certify: a
+    // refused certification or a budget-exhausted iterate. It is the resume
+    // checkpoint (#2596, #2627).
     let mut best_checkpoint: Option<OuterResult> = None;
-    // First confirmed-tail snapped reseed published by a refused certification
-    // (#2348 Inc 2b). Consumed once, after the seed cascade, for a single
-    // polishing retry pinned at the snapped rail point.
+    // Confirmed-tail snapped reseed published by a refused certification
+    // (#2348 Inc 2b). Consumed once, after the search, for a single polishing
+    // retry pinned at the snapped rail point.
     let mut tail_snap_reseed_point: Option<Array1<f64>> = None;
-    // First negative-curvature escape reseed published by a refused
-    // certification whose interior reduced Hessian is a certified strict saddle
-    // (#2357). Consumed once, after the seed cascade, for a single retry seeded
-    // off the saddle ridge so the outer search descends to the true PSD minimum.
+    // Negative-curvature escape reseed published by a refused certification
+    // whose interior reduced Hessian is a certified strict saddle (#2357).
+    // Consumed once, after the search, for a single retry seeded off the saddle
+    // ridge so the outer search descends to the true PSD minimum.
     let mut saddle_escape_reseed_point: Option<Array1<f64>> = None;
-    // A reactive domain-entry path is created inside a seed attempt only after
-    // that objective's exact seed cost is non-finite. Already-feasible seeds
-    // therefore stay on the zero-heavy-entry path.
+    // A reactive domain-entry path is created only after the objective's exact
+    // start cost is non-finite. An already-feasible start therefore stays on
+    // the zero-heavy-entry path.
     let reactive_domain_scalar_contract = obj.reactive_domain_scalar_contract()?;
     let reactive_domain_entry_available = reactive_domain_scalar_contract.is_some();
-    // Sole owner of every seed refusal. Objective failures enter this ledger
+    // Sole owner of every start refusal. Objective failures enter this ledger
     // while their `ObjectiveEvalError` still carries the originating typed
     // `EstimationError`; there is no parallel prose ledger to reconcile later.
     let mut seed_rejections: Vec<SeedRejection> = Vec::new();
-    // #2748 — seed points whose metric-free solver ran to its iteration budget.
-    // Kept apart from `seed_rejections` deliberately: that ledger drives the
-    // structural early exit (`uniform_structural_key`), and an exhausted
-    // iterate is not a failure of the kind that ladder counts.
-    let mut budget_exhausted_seed_points: Vec<Array1<f64>> = Vec::new();
     let layout = cap.theta_layout();
-    // Number of smoothing (ρ) coordinates, used to break a near-LAML-tie toward
-    // the more-penalized basin in the non-Gaussian multi-start keep-best.
-    let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
-    // Iterations spent by every seed this attempt started. `OuterResult.iterations`
-    // is the total across solver starts, but a seed's result knows only its own
-    // run, so a sweep whose earlier seeds exhausted their budgets used to read as
-    // one short run (#2817).
+    // Iterations spent by the search this attempt started (#2817).
     let mut spent_seed_iterations: usize = 0;
-    // Set to `Some(key)` when every observed rejection so far carries
-    // the same genuinely structural `(KktRefusalDiagnosis,
-    // carrying_block)` pair AND we've seen at least
-    // `STRUCTURAL_EARLY_EXIT_MIN_COUNT` consistent failures. Once set,
-    // the remaining ρ candidates are skipped.
-    let mut structural_early_exit_key: Option<(
-        gam_problem::diagnostics::KktRefusalDiagnosis,
-        Option<String>,
-    )> = None;
-    // Two matching structural observations are enough to break the
-    // loop. A single observation could be transient noise — an
-    // exploration seed in a degenerate ρ corner, a one-off domain
-    // excursion that happens to surface at the cert site. Requiring
-    // k=2 across DIFFERENT seeds is the smallest sample size that
-    // distinguishes noise from a structural rank/alias/active-set
-    // defect; recoverable cert refusals such as phantom multipliers are
-    // not eligible for this key.
-    const STRUCTURAL_EARLY_EXIT_MIN_COUNT: usize = 2;
-    // Generic cross-seed structural-failure bail (#1036). The structural
-    // early-exit above only fires for genuinely structural `CertRefused`
-    // diagnoses; it never sees the `RemlConvergenceError` / non-PD per-row
-    // H_tt / KKT-stuck class, which classifies as Budget/TrustRegion/Other and
-    // burned all 12 seeds (sphere: 3.5h for one failed candidate). This
-    // detector keys on the generic `(variant, signed-order-of-magnitude
-    // pivot/KKT bucket)` signature: when the LAST `n_struct` seeds reject with
-    // an identical *quantified* signature, the blocker is the design, not the
-    // warm-start, so we bail and skip the remaining seeds. A single deviating
-    // signature breaks the trailing run, so genuine seed-luck still runs the
-    // full cascade.
-    const GENERIC_STRUCTURAL_BAIL_MIN_RUN: usize = 3;
-    // `Some((signature, run_len))` once the generic detector has fired on a
-    // trailing run of identical quantified signatures. Drives the aggregated
-    // "structural: <signature> on seeds a..b; remaining N seeds skipped" note.
-    let mut generic_structural_bail: Option<(
-        crate::startup_stats::GenericFailureSignature,
-        usize,
-        usize,
-    )> = None;
-    // #2080 — the reactive continuation's COLD ENTRY leg is seed-independent, so
-    // its refusal is recorded once and replayed rather than re-derived per seed.
-    //
-    // `ContinuationPath::step` takes `entering = self.warm.is_none()` and pins
-    // that leg at `s_next = 1.0`; `continuation_path.rs`'s own
-    // `literal_endpoint_bits_survive_without_affine_rounding` pins
-    // `rho_target_at(1.0)` as BITWISE `rho_entry`, which is `bounds_template.1`.
-    // The scalar leg is `contract.at(1.0)`, likewise the contract's literal entry
-    // state, and the walk is opened with an EMPTY warm start
-    // (`cold_entry_beta = Array1::zeros(0)`). All three inputs are loop
-    // invariants: `bounds_template` and `reactive_domain_scalar_contract` are
-    // built above this cascade, and `obj.reset()` runs immediately before the
-    // path is constructed. So every seed submits the SAME problem to the same
-    // cold solver on that first leg, and a refusal there is a property of the
-    // FIXTURE, not of the seed. Only the seed's own `eval_cost` probe above and
-    // the LATER legs — which descend toward the seed's literal rho — are
-    // seed-dependent, and those are untouched.
-    //
-    // Measured (#2599's `test_sae_fit_is_deterministic_for_fixed_seed`, K=2,
-    // n=400/p=64, private TMPDIR, no timeout): four attempts, 247 of 248 log
-    // lines byte-identical across the seed blocks with the sole difference being
-    // the seed index in the refusal message, 1650 inner iterations reported
-    // identically in each. Re-deriving a constant of the problem once per seed
-    // buys nothing; `max_seeds` / `seed_budget` are inert against it.
-    let mut cold_entry_leg_refusal: Option<String> = None;
-    // Non-converged outcomes this ladder has already produced, by value.
-    //
-    // `uniform_structural_key` below catches a cascade of seeds that are
-    // REJECTED for the same reason. It cannot see the other uniform failure
-    // mode: a seed that RUNS, exhausts its budget, and lands on the point a
-    // previous seed already landed on.
-    //
-    // What was actually observed on gam#2748 (n = 4000 matern flexible), stated
-    // without the inference I first drew from it: inside ONE EFS dispatch, the
-    // fixed point reached `max_iter=200` at `final_value = 2.786987e3` — the
-    // same value to seven digits — twice, 12 m 42 s apart, and the cell died at
-    // its 3600 s wall. Whether those were two iterations of THIS ladder or one
-    // seed re-entered elsewhere is not decidable from that log, because nothing
-    // printed the seed index at the point the solver was entered; the `seed N`
-    // strings there come only from the early screening messages. The marker
-    // added at the head of this loop is what makes the next run answer it.
-    let mut non_converged_outcome_values: Vec<f64> = Vec::new();
 
-    'seed_attempts: for (seed_idx, seed_as_generated) in seeds.iter().enumerate() {
-        // The seed the solver starts from: the generated point, or that point
+    'seed_attempt: {
+        // The point the solver starts from: the derived start, or that point
         // with the under-penalized block's strengths raised by the ratio the
         // inner solve read off its ray (#2695).
         let mut seed_owned = seed_as_generated.clone();
         let seed = &mut seed_owned;
-        // The seed index at the point the ladder enters a solver (gam#2748).
-        // Every other `seed N` line in an outer log comes from a screening or
-        // rejection message, so a seed that runs straight through to the solver
-        // printed no index at all — and a log showing only `seed 0` was
-        // therefore consistent both with one seed and with several. One line
-        // here makes "how many seeds ran, and which one produced this outcome"
-        // a reading rather than an inference.
         log::info!(
-            "[OUTER] {context}: entering seed {seed_idx} of {} (started {started_seeds},              budget {seed_budget}) on {the_plan}",
-            seeds.len(),
+            "[OUTER] {context}: entering the outer search from the single derived start on \
+             {the_plan}"
         );
-        if !should_start_next_seed(started_seeds, seed_budget, best.is_some()) {
-            // A certified winner on a face of the declared outer domain is a
-            // stationary point of the criterion's flat asymptote. |Pg| is negligible
-            // there whatever the criterion scores, so its KKT pass is correct and
-            // says nothing about value. Such a winner ends the cascade only when no
-            // unrun seed starts below it beyond the criterion's resolution. A seed
-            // that does is run, and keep-best separates the two certified points by
-            // value. An interior winner keeps the budget rule unchanged, so only a
-            // railed winner pays for these start evaluations. #1082 q12: the seed on
-            // the upper faces certified at 286.23 after 0 iterations and ended the
-            // cascade before the rho = 2 seed, which starts at 247.25 and certified
-            // at 158.628 when it still ran.
-            let railed_winner_value = best
-                .as_ref()
-                .map(CertifiedOuterCandidate::result)
-                .filter(|winner| !certificate_railed_coordinates(&winner.rho, config).is_empty())
-                .map(|winner| winner.final_value);
-            let Some(winner_value) = railed_winner_value else {
-                break;
-            };
-            obj.reset();
-            install_matching_initial_inner_seed(obj, config, seed, context)?;
-            let start_value = match obj.eval_cost(seed) {
-                Ok(value) => value,
-                Err(error) if error.is_trial_point_infeasible() => f64::INFINITY,
-                Err(error) => return Err(error),
-            };
-            let starts_below_winner = start_value.is_finite()
-                && winner_value - start_value
-                    > crate::rho_optimizer::outer_value_agreement_bound(winner_value, start_value);
-            log::info!(
-                "[OUTER] {context}: certified winner (value={winner_value:.6e}) is railed on the \
-                 domain face; seed {seed_idx} starts at {start_value:.6e}, {}",
-                if starts_below_winner { "running it" } else { "skipping it" }
-            );
-            if !starts_below_winner {
-                continue 'seed_attempts;
-            }
-        }
-        // Domain entry is a property of this literal seed. A loop-local path
-        // cannot leak its state or regime into another candidate.
+        // Domain entry is a property of this literal start.
         let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
-        // Probe whether the seed cascade has slipped into a uniform structural
-        // failure mode that the remaining candidates cannot escape.
-        if structural_early_exit_key.is_none() {
-            if let Some(key) =
-                uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
-            {
-                log::warn!(
-                    "[OUTER] {context}: structural early-exit after {} uniform structural \
-                     rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
-                    seed_rejections.len(),
-                    key.0.as_str(),
-                    key.1.as_deref().unwrap_or("<unknown>"),
-                    seeds.len().saturating_sub(seed_idx),
-                );
-                structural_early_exit_key = Some(key);
-                break;
-            }
-        }
-        // Generic cross-seed structural bail (#1036). Reactive domain entry is
-        // only a repair for an undefined literal seed value; it does not turn
-        // later, repeated structural solver failures into path re-entry.
-        if structural_early_exit_key.is_none() && generic_structural_bail.is_none() {
-            if let Some((sig, run_len)) = crate::startup_stats::consecutive_generic_signature(
-                &seed_rejections,
-                GENERIC_STRUCTURAL_BAIL_MIN_RUN,
-            ) {
-                let first_seed = seed_rejections[seed_rejections.len() - run_len].seed_idx;
-                let last_seed = seed_rejections[seed_rejections.len() - 1].seed_idx;
-                let label = crate::startup_stats::generic_signature_label(&sig);
-                log::warn!(
-                    "[OUTER] {context}: generic structural bail after {run_len} consecutive \
-                     identical failure signatures ({label}) on seeds {first_seed}..{last_seed}; \
-                     skipping remaining {} seed(s)",
-                    seeds.len().saturating_sub(seed_idx),
-                );
-                generic_structural_bail = Some((sig, first_seed, last_seed));
-                break;
-            }
-        }
         obj.reset();
         if let Some(observer) =
             crate::estimate::outer_eval_capture::take_outer_seed_observer(cap.psi_dim)
@@ -957,16 +497,16 @@ pub(crate) fn run_outer_with_plan(
             // An observer must not decide the fit it observes.
             //
             // The finite-difference audit this hook replaced once ended in `?`.
-            // When its own evaluation refused at a cold seed -- common on a
+            // When its own evaluation refused at a cold start -- common on a
             // spatial basis, where the inner solve has not converged at theta_0
             // -- the error propagated out of `run_plan` and ABORTED THE WHOLE
-            // RUN, where with the audit disabled the identical seed would simply
-            // have been rejected, recorded in `seed_rejections`, and the cascade
-            // would have moved on. Arming the instrument changed the outcome it
-            // was measuring. So a refusal is warned about, the objective is
-            // reset to its pristine baseline, and the real seed path below
-            // (including any curvature homotopy) is bit-identical to a run with
-            // no observer, on the refusal path as well as the success path.
+            // RUN, where with the audit disabled the identical start would
+            // simply have been searched. Arming the instrument changed the
+            // outcome it was measuring. So a refusal is warned about, the
+            // objective is reset to its pristine baseline, and the real path
+            // below (including any curvature homotopy) is bit-identical to a
+            // run with no observer, on the refusal path as well as the success
+            // path.
             let full_fidelity_guard = config
                 .outer_inner_cap
                 .as_ref()
@@ -987,8 +527,8 @@ pub(crate) fn run_outer_with_plan(
                 &mut runner_probe;
             if let Err(err) = observer(probe) {
                 log::warn!(
-                    "[OUTER] {context}: outer-seed observer refused at seed {seed_idx} \
-                     ({err}); the seed cascade proceeds unchanged"
+                    "[OUTER] {context}: outer-seed observer refused at the start ({err}); the \
+                     search proceeds unchanged"
                 );
             }
             drop(full_fidelity_guard);
@@ -996,30 +536,26 @@ pub(crate) fn run_outer_with_plan(
         }
         // Certified curvature-homotopy entry leg (#1007). When the objective
         // has a certified anchor (the SAE-manifold `η = 0` Eckart-Young
-        // relaxation), run the predictor-corrector `η`-walk from it INSTEAD of
-        // relying on the blind multi-seed multistart: a single walk along the
-        // unique optimal branch reaches the real (`η = 1`) objective, leaving
-        // the inner state warm there. The min-pivot invariant + step-halving
-        // make the walk certified; a degenerate anchor or a detected
-        // bifurcation returns `false` (the term is left at the full basis) and
-        // the seed cascade below takes over — the outcome is recorded on the
-        // fit payload either way, never a silent fallback. The walk runs once
-        // per accepted seed entry right after `reset`, so cross-seed state
-        // hygiene is unchanged (#1003): `reset` restores the pristine `η = 1`
-        // baseline before each walk.
+        // relaxation), run the predictor-corrector `η`-walk from it: a single
+        // walk along the unique optimal branch reaches the real (`η = 1`)
+        // objective, leaving the inner state warm there. The min-pivot
+        // invariant + step-halving make the walk certified; a degenerate
+        // anchor or a detected bifurcation returns `false` (the term is left at
+        // the full basis) and the direct search below takes over — the outcome
+        // is recorded on the fit payload either way, never a silent fallback.
+        // The walk runs right after `reset`, so state hygiene is unchanged
+        // (#1003): `reset` restores the pristine `η = 1` baseline first.
         let curvature_entry_refused = match obj.curvature_homotopy_entry(seed) {
             Some(Ok(arrived)) => {
-                log::info!(
-                    "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} arrived={arrived}"
-                );
+                log::info!("[OUTER] {context}: curvature-homotopy entry arrived={arrived}");
                 !arrived
             }
             Some(Err(err)) => {
                 // A hard anchor-construction failure is not a feasibility gate:
-                // fall through to the ordinary seed cascade.
+                // fall through to the direct search.
                 log::warn!(
-                    "[OUTER] {context}: curvature-homotopy entry seed {seed_idx} errored ({err}); \
-                     deferring to seed cascade"
+                    "[OUTER] {context}: curvature-homotopy entry errored ({err}); searching \
+                     directly from the start"
                 );
                 obj.reset();
                 false
@@ -1029,32 +565,23 @@ pub(crate) fn run_outer_with_plan(
         if curvature_entry_refused {
             // A refused walk is NEVER a feasibility gate. By contract the walk
             // leaves the term at the full `η = 1` basis (a degenerate anchor or
-            // a detected branch bifurcation), so the NORMAL seed cascade below
-            // — `accept_seed_without_outer_iterations` and the direct solve at
-            // `seed` — takes over from the
-            // pristine cold state. Rejecting the seed here instead emptied the
-            // candidate set for objectives WITHOUT a continuation path (#1095:
-            // a periodic K=1 circle whose walk "buys nothing" and refuses on a
-            // small-N pivot bifurcation — periodic K=1 does not advertise
-            // reactive domain entry, so every one of its seeds was rejected
-            // before any solver started). Reset to the baseline so the cascade
-            // opens each seed from its own cold default, exactly as a hard
-            // anchor-construction error already does above.
+            // a detected branch bifurcation), so the direct search below —
+            // `accept_seed_without_outer_iterations` and the solve at `seed` —
+            // takes over from the pristine cold state (#1095: a periodic K=1
+            // circle whose walk refuses on a small-N pivot bifurcation and which
+            // does not advertise reactive domain entry).
             log::info!(
-                "[OUTER] {context}: curvature-homotopy entry refused seed {seed_idx}; deferring \
-                 to the seed cascade from the pristine baseline"
+                "[OUTER] {context}: curvature-homotopy entry refused; searching directly from \
+                 the pristine baseline"
             );
             obj.reset();
         }
         install_matching_initial_inner_seed(obj, config, seed, context)?;
         // Zero-iteration acceptance, decided HERE rather than in the objective.
         //
-        // Whether a seed is already stationary is a question about the
+        // Whether a start is already stationary is a question about the
         // stationarity BAND, and the band lives with `OuterConfig`
-        // (`outer_gradient_tolerance`), not with the objective -- which is why
-        // `accept_seed_without_outer_iterations` has never once returned `Some`
-        // in production: every implementation of it lacks the one input the
-        // decision needs, so the branch below it had never executed.
+        // (`outer_gradient_tolerance`), not with the objective.
         //
         // Measured (#2363): a fit resumed from a prior fit's terminal
         // certificate is stationary where it starts. |Pg| at the resumed rho is
@@ -1063,12 +590,11 @@ pub(crate) fn run_outer_with_plan(
         // of magnitude. It then takes one outer iteration to go nowhere, which
         // this skips along with its inner solves.
         //
-        // Two things make accepting safe rather than a gamble: the branch
-        // RE-CERTIFIES what it accepts through
-        // `CertifiedOuterCandidate::from_solver_claim` and falls back into the
-        // seed cascade when that fails, so an over-eager acceptance costs
-        // nothing; and it fires only for a rho a previous outer run already
-        // certified as terminal, never for a heuristic or a mid-run checkpoint.
+        // The branch RE-CERTIFIES what it accepts through
+        // `CertifiedOuterCandidate::from_solver_claim` and, when that fails,
+        // runs the ordinary search from the same start, so an over-eager
+        // acceptance costs nothing; and it fires only for a rho a previous
+        // outer run already certified as terminal.
         let zero_iteration_cost = match obj.accept_seed_without_outer_iterations(seed)? {
             Some(cost) => Some(cost),
             None => certified_resume_is_already_stationary(
@@ -1081,37 +607,21 @@ pub(crate) fn run_outer_with_plan(
             ),
         };
         if let Some(seed_cost) = zero_iteration_cost {
-            started_seeds += 1;
             let mut candidate = OuterResult::new(seed.clone(), seed_cost, 0, true, *the_plan);
             candidate.origin = OuterResultOrigin::SeedAcceptedWithoutIteration;
             match CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate) {
                 Ok(candidate) => {
-                    if candidate_improves_best(
-                        candidate.result(),
-                        best.as_ref().map(CertifiedOuterCandidate::result),
-                    ) {
-                        best = Some(candidate);
-                    }
-                    break;
+                    started_seeds += 1;
+                    best = Some(candidate);
+                    break 'seed_attempt;
                 }
-                Err((checkpoint, error)) => {
+                Err((_, error)) => {
                     log::warn!(
-                        "[OUTER] {context}: zero-iteration seed {seed_idx} claimed acceptance but \
-                         failed analytic certification: {error}"
+                        "[OUTER] {context}: zero-iteration start claimed acceptance but failed \
+                         analytic certification ({error}); searching from it"
                     );
-                    if tail_snap_reseed_point.is_none() {
-                        tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
-                    }
-                    if saddle_escape_reseed_point.is_none() {
-                        saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
-                    }
-                    retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
-                    seed_rejections.push(SeedRejection::from_estimation_error(
-                        seed_idx,
-                        "certificate",
-                        &error,
-                    ));
-                    continue 'seed_attempts;
+                    obj.reset();
+                    install_matching_initial_inner_seed(obj, config, seed, context)?;
                 }
             }
         }
@@ -1121,9 +631,6 @@ pub(crate) fn run_outer_with_plan(
         // activates the certified heavy-smoothing path; a hard evaluation error
         // remains a seed refusal and is never converted into a pseudo-value.
         let mut reactive_domain_entry_requested = false;
-        // Set when this seed's continuation walk is answered by the recorded
-        // cold-entry-leg verdict instead of being walked again (#2080).
-        let mut replayed_cold_entry_refusal: Option<String> = None;
         if reactive_domain_entry_available {
             match obj.eval_cost(seed) {
                 Ok(cost) if cost.is_finite() => {
@@ -1134,43 +641,24 @@ pub(crate) fn run_outer_with_plan(
                 }
                 Ok(_) => {
                     reactive_domain_entry_requested = true;
-                    if let Some(recorded) = cold_entry_leg_refusal.as_ref() {
-                        // The cold entry leg already refused on an earlier seed,
-                        // and that leg's `(rho, scalars, warm start)` do not
-                        // depend on the seed (see `cold_entry_leg_refusal`). The
-                        // walk cannot reach a later, seed-dependent leg without
-                        // clearing this one, so re-running it would reproduce the
-                        // recorded verdict digit for digit.
-                        log::info!(
-                            "[OUTER] {context}: exact seed {seed_idx} has undefined criterion, but \
-                             the seed-independent cold entry leg has already refused; replaying \
-                             that verdict instead of re-walking it"
-                        );
-                        replayed_cold_entry_refusal = Some(format!(
-                            "{recorded} (replayed: the continuation's cold entry leg is evaluated \
-                             at the legal upper box with the objective's entry scalars and an \
-                             empty warm start, none of which depend on the seed)"
-                        ));
-                    } else {
-                        log::info!(
-                            "[OUTER] {context}: exact seed {seed_idx} has undefined criterion; \
-                             entering through certified heavy-smoothing continuation"
-                        );
-                        // The failed cold probe may have left objective-owned
-                        // trial state. Re-enter from the pristine baseline;
-                        // successful path evaluations establish a fresh
-                        // exact-seed handoff.
-                        obj.reset();
-                        continuation_path = Some(
-                            crate::continuation_path::ContinuationPath::heavy_entry_for_rho(
-                                seed.clone(),
-                                bounds_template.1.clone(),
-                                reactive_domain_scalar_contract
-                                    .clone()
-                                    .expect("reactive scalar contract checked above"),
-                            )?,
-                        );
-                    }
+                    log::info!(
+                        "[OUTER] {context}: exact seed {seed_idx} has undefined criterion; \
+                         entering through certified heavy-smoothing continuation"
+                    );
+                    // The failed cold probe may have left objective-owned
+                    // trial state. Re-enter from the pristine baseline;
+                    // successful path evaluations establish a fresh
+                    // exact-seed handoff.
+                    obj.reset();
+                    continuation_path = Some(
+                        crate::continuation_path::ContinuationPath::heavy_entry_for_rho(
+                            seed.clone(),
+                            bounds_template.1.clone(),
+                            reactive_domain_scalar_contract
+                                .clone()
+                                .expect("reactive scalar contract checked above"),
+                        )?,
+                    );
                 }
                 Err(err) => {
                     log::warn!(
@@ -1182,7 +670,7 @@ pub(crate) fn run_outer_with_plan(
                         "domain-entry",
                         &err,
                     ));
-                    continue 'seed_attempts;
+                    break 'seed_attempt;
                 }
             }
         }
@@ -1198,9 +686,8 @@ pub(crate) fn run_outer_with_plan(
         // The heavy-smoothing walk warms the cold inner solve after the literal
         // `eval_cost` demonstrated that its Laplace evidence is undefined (the
         // K>=2 routing-collapse failure Object 1 exists to repair).
-        let mut continuation_arrived =
-            continuation_path.is_none() && replayed_cold_entry_refusal.is_none();
-        let mut continuation_arrival_refusal: Option<String> = replayed_cold_entry_refusal.take();
+        let mut continuation_arrived = continuation_path.is_none();
+        let mut continuation_arrival_refusal: Option<String> = None;
         if continuation_path.is_some() {
             {
                 let path = continuation_path
@@ -1219,19 +706,9 @@ pub(crate) fn run_outer_with_plan(
                     let step = match path.step(obj, &cold_entry_beta) {
                         Ok(step) => step,
                         Err(err) => {
-                            let msg = format!(
+                            continuation_arrival_refusal = Some(format!(
                                 "reactive domain entry refused before exact-target arrival: {err}"
-                            );
-                            if legs_descended == 0 {
-                                // Nothing has been accepted yet, so this is the
-                                // COLD ENTRY leg — the one evaluated at the legal
-                                // upper box with the contract's entry scalars and
-                                // an empty warm start. Record it so the remaining
-                                // seeds replay the verdict rather than recompute
-                                // a constant of the problem (#2080).
-                                cold_entry_leg_refusal = Some(msg.clone());
-                            }
-                            continuation_arrival_refusal = Some(msg);
+                            ));
                             break;
                         }
                     };
@@ -1317,13 +794,12 @@ pub(crate) fn run_outer_with_plan(
                         .to_string()
                 });
                 log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
-                seed_rejections.push(SeedRejection::from_message_with_producer_verdict(
+                seed_rejections.push(SeedRejection::from_message(
                     seed_idx,
                     "domain-entry",
                     msg,
-                    false,
                 ));
-                continue 'seed_attempts;
+                break 'seed_attempt;
             }
             // Independently re-evaluate the literal target and require a finite
             // exact criterion before any optimizer can start.
@@ -1339,13 +815,12 @@ pub(crate) fn run_outer_with_plan(
                                non-finite after certified continuation arrival"
                         .to_string();
                     log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
-                    seed_rejections.push(SeedRejection::from_message_with_producer_verdict(
+                    seed_rejections.push(SeedRejection::from_message(
                         seed_idx,
                         "domain-entry",
                         msg,
-                        false,
                     ));
-                    continue 'seed_attempts;
+                    break 'seed_attempt;
                 }
                 Err(err) => {
                     return Err(EstimationError::fatal_outer_evaluation(
@@ -1356,7 +831,6 @@ pub(crate) fn run_outer_with_plan(
             }
         }
         let t_seed_start = std::time::Instant::now();
-        let seed_slot;
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc => {
                 let seed_eval = eval_seed_restoring_rays(
@@ -1380,7 +854,7 @@ pub(crate) fn run_outer_with_plan(
                             "validation",
                             &err,
                         ));
-                        continue 'seed_attempts;
+                        break 'seed_attempt;
                     }
                     Err(err) => {
                         return Err(EstimationError::fatal_objective_evaluation(
@@ -1401,7 +875,7 @@ pub(crate) fn run_outer_with_plan(
                             "validation",
                             &err,
                         ));
-                        continue 'seed_attempts;
+                        break 'seed_attempt;
                     }
                     Err(err) => {
                         return Err(EstimationError::fatal_objective_evaluation(
@@ -1420,7 +894,7 @@ pub(crate) fn run_outer_with_plan(
                             "validation",
                             &err,
                         ));
-                        continue 'seed_attempts;
+                        break 'seed_attempt;
                     }
                     return Err(EstimationError::fatal_objective_evaluation(
                         "outer ARC second-order seed validation",
@@ -1428,7 +902,6 @@ pub(crate) fn run_outer_with_plan(
                     ));
                 }
                 started_seeds += 1;
-                seed_slot = started_seeds;
 
                 let cheap_materializable_operator = matches!(
                     seed_eval.hessian,
@@ -1458,7 +931,7 @@ pub(crate) fn run_outer_with_plan(
                                     "validation",
                                     &err,
                                 ));
-                                continue 'seed_attempts;
+                                break 'seed_attempt;
                             }
                         }
                     }
@@ -1886,28 +1359,11 @@ pub(crate) fn run_outer_with_plan(
                             // (#1355); here it covers the budget-exhaustion exit.
                             let best_exit =
                                 cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
-                            // The best-feasible-iterate substitution must produce
-                            // THIS seed's `result` (an expression that feeds the
-                            // multi-start keep-best below), NOT short-circuit the
-                            // whole function with a bare `return`. A bare `return`
-                            // here discards any CONVERGED fit an earlier seed already
-                            // stored in `best`: on a #1476 concurvity double-penalty
-                            // surface the flexible slot-0 seed converges to the
-                            // genuine interior optimum (cost ~133), then the promoted
-                            // heavy slot-1 seed (#1426) budget-exhausts on the
-                            // null-space annihilation shelf and its best-feasible
-                            // iterate is a degenerate box corner with a SPURIOUSLY
-                            // LOWER cached cost (~65, projected |g| ≫ tol — an invalid
-                            // REML the line search could not improve). Returning it
-                            // directly shipped that corner (edf_total→1, the supported
-                            // smooth annihilated) even though keep-best already held
-                            // the converged optimum. Flowing it through keep-best as a
-                            // NON-converged candidate lets `candidate_improves_best`
-                            // reject it (a converged best always beats a non-converged
-                            // candidate). When this seed is the ONLY one (the original
-                            // single-start #1371 case) `best` is still None, so
-                            // keep-best adopts it unchanged — that behavior is
-                            // preserved byte-for-byte.
+                            // The best-feasible-iterate substitution produces this
+                            // run's non-converged `result`; it never counts as a
+                            // converged fit, so it flows into the checkpoint slot
+                            // and the post-run certify/reseed ladder decides
+                            // whether it can be minted (#1371, #1476).
                             match best_exit {
                                 Some(best)
                                     if best.value.is_finite()
@@ -1919,9 +1375,8 @@ pub(crate) fn run_outer_with_plan(
                                          (value={:.6e}) is worse than the best feasible iterate \
                                          seen (value={:.6e}); substituting the best iterate so a \
                                          degenerate box-corner does not over-shrink a supported \
-                                         penalty direction (#1371). The substituted iterate flows \
-                                         through the multi-start keep-best as a non-converged \
-                                         candidate so an earlier converged seed still wins (#1476).",
+                                         penalty direction (#1371). The substituted iterate is a \
+                                         non-converged checkpoint, never a converged fit.",
                                         last_solution.final_value,
                                         best.value,
                                     );
@@ -2129,7 +1584,7 @@ pub(crate) fn run_outer_with_plan(
                                 "validation",
                                 &err,
                             ));
-                            continue 'seed_attempts;
+                            break 'seed_attempt;
                         }
                         Err(err) => {
                             return Err(EstimationError::fatal_objective_evaluation(
@@ -2139,7 +1594,6 @@ pub(crate) fn run_outer_with_plan(
                         }
                     };
                     started_seeds += 1;
-                    seed_slot = started_seeds;
                     let device_input = crate::gpu::reml_outer::RemlOuterGpuInput {
                         seed_rho: seed.clone(),
                         bounds: bounds_dev,
@@ -2184,15 +1638,6 @@ pub(crate) fn run_outer_with_plan(
                         };
                         crate::gpu::reml_outer::run_reml_outer_on_device(device_input, evaluator)
                     };
-                    // `seed_slot` is the per-seed index assigned above; it is
-                    // consumed only by the host-BFGS logging summary, which
-                    // the device-resident branch replaces with its own
-                    // device-BFGS summary log below.
-                    if seed_slot == 0 {
-                        log::debug!(
-                            "[OUTER] {context}: device-BFGS seed_slot underflow at seed {seed_idx}"
-                        );
-                    }
                     match device_outcome {
                         Ok(outcome) => {
                             log::info!(
@@ -2243,7 +1688,7 @@ pub(crate) fn run_outer_with_plan(
                                         "validation",
                                         &eval_error,
                                     ));
-                                    continue 'seed_attempts;
+                                    break 'seed_attempt;
                                 }
                                 Err(eval_error) => {
                                     return Err(EstimationError::fatal_objective_evaluation(
@@ -2264,7 +1709,7 @@ pub(crate) fn run_outer_with_plan(
                                         "validation",
                                         &eval_error,
                                     ));
-                                    continue 'seed_attempts;
+                                    break 'seed_attempt;
                                 }
                                 Err(eval_error) => {
                                     return Err(EstimationError::fatal_objective_evaluation(
@@ -2297,7 +1742,7 @@ pub(crate) fn run_outer_with_plan(
                                 "validation",
                                 &err,
                             ));
-                            continue 'seed_attempts;
+                            break 'seed_attempt;
                         }
                         Err(err) => {
                             return Err(EstimationError::fatal_objective_evaluation(
@@ -2321,7 +1766,7 @@ pub(crate) fn run_outer_with_plan(
                                 "validation",
                                 &err,
                             ));
-                            continue 'seed_attempts;
+                            break 'seed_attempt;
                         }
                         Err(err) => {
                             return Err(EstimationError::fatal_objective_evaluation(
@@ -2331,14 +1776,13 @@ pub(crate) fn run_outer_with_plan(
                         }
                     };
                     started_seeds += 1;
-                    seed_slot = started_seeds;
                     // The seed a BFGS run is handed, and the (cost, gradient)
                     // it is handed WITH it. `with_initial_sample` below means
                     // `opt::Bfgs` never re-evaluates here, so a zero gradient
                     // in this sample is a zero-iteration "convergence" at
                     // whatever rho this seed happens to be.
                     log::info!(
-                        "[OUTER] {context}: BFGS seed {seed_idx} (slot {seed_slot}) cost={:.6e} \
+                        "[OUTER] {context}: BFGS start cost={:.6e} \
                          |g|={:.6e} rho={:?}",
                         seed_eval.cost,
                         seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
@@ -2813,7 +2257,6 @@ pub(crate) fn run_outer_with_plan(
                 ) {
                     Ok(result) => {
                         started_seeds += 1;
-                        seed_slot = started_seeds;
                         Ok(result)
                     }
                     Err(FixedPointOuterRunError::SeedRejected(err)) => {
@@ -2825,7 +2268,7 @@ pub(crate) fn run_outer_with_plan(
                             "validation",
                             &err,
                         ));
-                        continue 'seed_attempts;
+                        break 'seed_attempt;
                     }
                     Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
                         log::warn!(
@@ -2850,7 +2293,6 @@ pub(crate) fn run_outer_with_plan(
                     }
                     Err(FixedPointOuterRunError::Failed(err)) => {
                         started_seeds += 1;
-                        seed_slot = started_seeds;
                         Err(err)
                     }
                 }
@@ -2869,7 +2311,6 @@ pub(crate) fn run_outer_with_plan(
                 ) {
                     Ok(result) => {
                         started_seeds += 1;
-                        seed_slot = started_seeds;
                         Ok(result)
                     }
                     Err(FixedPointOuterRunError::SeedRejected(err)) => {
@@ -2881,7 +2322,7 @@ pub(crate) fn run_outer_with_plan(
                             "validation",
                             &err,
                         ));
-                        continue 'seed_attempts;
+                        break 'seed_attempt;
                     }
                     Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
                         log::warn!(
@@ -2906,7 +2347,6 @@ pub(crate) fn run_outer_with_plan(
                     }
                     Err(FixedPointOuterRunError::Failed(err)) => {
                         started_seeds += 1;
-                        seed_slot = started_seeds;
                         Err(err)
                     }
                 }
@@ -2917,9 +2357,7 @@ pub(crate) fn run_outer_with_plan(
         match result {
             Ok(candidate) => {
                 log::debug!(
-                    "[outer-timing] seed {}/{} ({:?}): {:.3}s  cost={:.6e}  converged={}",
-                    seed_slot,
-                    seed_budget,
+                    "[outer-timing] start ({:?}): {:.3}s  cost={:.6e}  converged={}",
                     the_plan.solver,
                     seed_elapsed,
                     candidate.final_value,
@@ -2927,161 +2365,28 @@ pub(crate) fn run_outer_with_plan(
                 );
                 spent_seed_iterations = spent_seed_iterations.saturating_add(candidate.iterations);
                 if !candidate.solver_claimed_convergence() {
-                    // #2748 — record the point BEFORE the checkpoint consumes
-                    // the candidate. An exhausted iterate is resumable work and
-                    // not a fit candidate, which is why the cascade continues;
-                    // it is ALSO a completed deterministic run of a metric-free
-                    // solver from a known point, which is why the next dispatch
-                    // must not perform it again. Those two facts are
-                    // independent, and only the first was being kept.
-                    if let Some(point) = seeds
-                        .get(seed_idx)
-                        .and_then(|seed| budget_exhausted_replay_point(the_plan.solver, seed))
-                        && !budget_exhausted_seed_points.contains(&point)
-                    {
-                        log::info!(
-                            "[OUTER] {context}: seed {seed_idx} exhausted its {:?} budget at                              final_value={:.6e}; recording the point so a later dispatch replays                              the outcome instead of re-deriving it (#2748)",
-                            the_plan.solver,
-                            candidate.final_value,
-                        );
-                        budget_exhausted_seed_points.push(point);
-                    }
+                    // An exhausted iterate is resumable work, not a fit
+                    // candidate: it is the resume checkpoint and never
+                    // populates the certified winner slot.
                     retain_best_outer_checkpoint(&mut best_checkpoint, candidate);
-                    // Continue the declared multistart budget in search of a
-                    // stationary seed; it may never populate or short-circuit
-                    // the certified winner slot.
-                    continue 'seed_attempts;
+                    break 'seed_attempt;
                 }
-                let candidate = match CertifiedOuterCandidate::from_solver_claim(
-                    obj, config, context, candidate,
-                ) {
-                    Ok(candidate) => candidate,
+                match CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate) {
+                    Ok(candidate) => best = Some(candidate),
                     Err((checkpoint, error)) => {
                         log::warn!(
-                            "[OUTER] {context}: seed {seed_idx} solver convergence claim failed \
-                             analytic certification: {error}; retaining only a resume checkpoint"
+                            "[OUTER] {context}: solver convergence claim failed analytic \
+                             certification: {error}; retaining only a resume checkpoint"
                         );
-                        if tail_snap_reseed_point.is_none() {
-                            tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
-                        }
-                        if saddle_escape_reseed_point.is_none() {
-                            saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
-                        }
+                        tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
+                        saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
                         retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                         seed_rejections.push(SeedRejection::from_estimation_error(
                             seed_idx,
                             "certificate",
                             &error,
                         ));
-                        continue 'seed_attempts;
                     }
-                };
-                // #1373: for GLM/survival models the seed screening deliberately
-                // places the most-flexible (low-lambda) seed at slot 0 and the
-                // heaviest interior (high-lambda) seed at slot 1 so the budget-2
-                // multi-start straddles both basins. The flexible basin can
-                // converge to a LAML that is epsilon better while overshooting
-                // on the response scale. Break that near-tie toward the
-                // more-smoothed basin for those families only. Gaussian
-                // location-scale needs the same promoted seed order, but keeps
-                // Gaussian's plain lowest-cost keep-best policy.
-                let parsimonious_keep_best = config
-                    .seed_config
-                    .risk_profile
-                    .uses_parsimonious_keep_best();
-                let candidate_improved = if parsimonious_keep_best {
-                    candidate_improves_best_parsimonious(
-                        candidate.result(),
-                        best.as_ref().map(CertifiedOuterCandidate::result),
-                        rho_dim,
-                    )
-                } else {
-                    candidate_improves_best(
-                        candidate.result(),
-                        best.as_ref().map(CertifiedOuterCandidate::result),
-                    )
-                };
-                // A seed that ran its budget out and stopped where an earlier
-                // seed already stopped is the completed-run twin of a uniform
-                // structural rejection: the remaining seeds reach the same
-                // attractor, and each costs a full solve to say so again
-                // (gam#2748). Compare on the exact bits — two independent runs
-                // agreeing to the last bit is the signature of the same
-                // attractor, whereas a tolerance would also swallow genuinely
-                // distinct nearby optima. Only NON-converged outcomes count: a
-                // converged optimum reached from several seeds is the multi-start
-                // working, and keep-best still wants every one of them.
-                let mut ladder_reached_a_repeated_attractor = false;
-                if !candidate.result().converged() {
-                    let value = candidate.result().final_value;
-                    if value.is_finite() {
-                        if non_converged_outcome_values
-                            .iter()
-                            .any(|seen| seen.to_bits() == value.to_bits())
-                        {
-                            ladder_reached_a_repeated_attractor = true;
-                        } else {
-                            non_converged_outcome_values.push(value);
-                        }
-                    }
-                }
-                if candidate_improved {
-                    best = Some(candidate);
-                }
-                if ladder_reached_a_repeated_attractor {
-                    log::warn!(
-                        "[OUTER] {context}: seed {seed_idx} exhausted its budget at exactly the                          value a previous seed already reached (bit-identical); the remaining                          seeds descend to the same attractor, so stopping the ladder here                          instead of re-deriving it up to {} more time(s)",
-                        seed_budget.saturating_sub(started_seeds)
-                    );
-                    break 'seed_attempts;
-                }
-                let quality_compare_remaining_gaussian_seeds =
-                    config.seed_config.risk_profile.uses_lowest_cost_keep_best()
-                        && seed_budget > 1
-                        && started_seeds < seed_budget;
-                // #1373: do not let the first-converged flexible seed (slot 0)
-                // short-circuit the multi-start before the deliberately-promoted
-                // parsimonious seed (slot 1) has been solved. Without this, the
-                // converged break below fires on slot 0 and the heavy basin that
-                // the screening order placed at slot 1 — precisely to let
-                // keep-best reject an overshoot — is never evaluated. This gate
-                // waits for exactly those two comparison roles. Any larger budget
-                // exists to recover from failed candidates; it must not launch a
-                // third expensive solve after both basins already certified.
-                //
-                // #1575: but the heavy seed is only ever DECISIVE when slot 0
-                // could be beaten (an under-penalized overshoot, a flat-valley
-                // near-tie, or a non-converged stall). When slot 0 instead
-                // converged to a curvature-pinned, well-penalized optimum (every
-                // smoothing λ ≥ 1, residual gradient 100× inside the parsimony tie
-                // band), the heavy seed merely re-derives the identical cost/ρ —
-                // doubling the binomial/survival outer cost-eval count for
-                // nothing. Waive the await in exactly that redundant case; every
-                // overshoot/stall/flat-valley path keeps the full guard.
-                let promoted_seed_is_redundant = best
-                    .as_ref()
-                    .is_some_and(|b| parsimony_second_seed_is_redundant(b.result(), rho_dim));
-                let non_gaussian_await_parsimony_seed = parsimonious_keep_best
-                    && should_await_promoted_parsimony_seed(
-                        seed_budget,
-                        started_seeds,
-                        promoted_seed_is_redundant,
-                    );
-                // A railed certified winner does not end the cascade here. The start
-                // check at the head of the next attempt decides by that seed's start
-                // value (see the rail note there).
-                let certified_winner_is_railed = best
-                    .as_ref()
-                    .map(CertifiedOuterCandidate::result)
-                    .is_some_and(|winner| {
-                        !certificate_railed_coordinates(&winner.rho, config).is_empty()
-                    });
-                if best.is_some()
-                    && !quality_compare_remaining_gaussian_seeds
-                    && !non_gaussian_await_parsimony_seed
-                    && !certified_winner_is_railed
-                {
-                    break;
                 }
             }
             Err(e) => {
@@ -3089,9 +2394,7 @@ pub(crate) fn run_outer_with_plan(
                     return Err(e);
                 }
                 log::debug!(
-                    "[outer-timing] seed {}/{} ({:?}): {:.3}s  FAILED: {}",
-                    seed_slot,
-                    seed_budget,
+                    "[outer-timing] start ({:?}): {:.3}s  FAILED: {}",
                     the_plan.solver,
                     seed_elapsed,
                     e,
@@ -3101,146 +2404,11 @@ pub(crate) fn run_outer_with_plan(
         }
     }
 
-    // #2596, #2627 — a certified winner that an evaluated state of this attempt
-    // beats does not publish.
-    //
-    // A certificate answers "is this ρ stationary?". It does not answer "is this
-    // the best ρ we found?". The two come apart on a face of the declared domain:
-    // the criterion is flat there and the box-KKT projection leaves |Pg|
-    // negligible whatever the criterion scores, so a face seed certifies in zero
-    // iterations while the interior searches that already reached far lower
-    // values end on a refused certificate or an exhausted budget. Publishing the
-    // face shipped an intercept-only fit on #2596 (110.94 over a refused 4.19),
-    // #561 seed 201 (315.15 over 230.68) and the penguins species fit (272.66
-    // over an evaluated 21.44). The warning that named each inversion published
-    // anyway.
-    //
-    // The incumbent is the lowest checkpoint the attempt kept. Its stored value is
-    // where a search stopped, so it is re-evaluated at its own ρ before it can
-    // outrank anything. The gap is judged at the criterion's own rounding
-    // envelope, [`outer_value_agreement_bound`], because two values of one
-    // criterion closer than that cannot be ranked. Beyond it the winner loses.
-    // The search continues once from the incumbent, with the same one-shot reseed
-    // the tail-snap and saddle-escape retries use. If that does not certify, the
-    // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
-    // incumbent is the resume checkpoint.
-    let mut dominance: Option<(f64, f64)> = None;
-    if let (Some(certified), Some(incumbent)) = (best.as_ref(), best_checkpoint.as_ref()) {
-        let winner_value = certified.result().final_value;
-        let cached_band =
-            crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent.final_value);
-        if winner_value.is_finite()
-            && incumbent.final_value.is_finite()
-            && winner_value - incumbent.final_value > cached_band
-        {
-            let incumbent_rho = incumbent.rho.clone();
-            obj.reset();
-            install_matching_initial_inner_seed(obj, config, &incumbent_rho, context)?;
-            let incumbent_value = match obj.eval_cost(&incumbent_rho) {
-                Ok(value) => value,
-                // The stored checkpoint cannot be re-evaluated at its own ρ, so the
-                // gap cannot be judged and the certified winner is published. This
-                // warning is the only trace the branch leaves (#2953).
-                Err(error) if error.is_trial_point_infeasible() => {
-                    log::warn!(
-                        "[OUTER] {context}: certified winner rho={:?} cost={:.6e} sits above a stored \
-                         checkpoint rho={:?} cost={:.6e} by more than the criterion's rounding envelope \
-                         {:.3e}, but re-evaluating that checkpoint was refused ({error}); the dominance is \
-                         unresolved and the winner is published (#2953)",
-                        certified.result().rho.to_vec(),
-                        winner_value,
-                        incumbent_rho.to_vec(),
-                        incumbent.final_value,
-                        cached_band,
-                    );
-                    f64::INFINITY
-                }
-                Err(error) => return Err(error),
-            };
-            obj.reset();
-            let band =
-                crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent_value);
-            if incumbent_value.is_finite() && winner_value - incumbent_value > band {
-                dominance = Some((incumbent_value, band));
-            }
-        }
-    }
-    if let Some((incumbent_value, band)) = dominance
-        && let Some(certified) = best.take()
-        && let Some(mut incumbent) = best_checkpoint.take()
-    {
-        let plateau = certified.into_result();
-        incumbent.final_value = incumbent_value;
-        log::warn!(
-            "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
-             evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
-             envelope {:.3e}); it is not published, and the search continues from that state \
-             (#2596, #2627)",
-            plateau.rho.to_vec(),
-            plateau.final_value,
-            incumbent.rho.to_vec(),
-            incumbent.final_value,
-            plateau.final_value - incumbent.final_value,
-            band,
-        );
-        if allow_tail_snap_reseed {
-            let mut retry_config = config.clone();
-            retry_config.initial_rho = Some(incumbent.rho.clone());
-            retry_config.screen_initial_rho = false;
-            retry_config.seed_config.max_seeds = 1;
-            retry_config.seed_config.seed_budget = 1;
-            match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
-                Ok(PlanRunOutcome::Exhausted(retry_checkpoint)) => {
-                    log::warn!(
-                        "[OUTER] {context}: the retry from the dominating incumbent exhausted \
-                         at cost {:.6e} without certifying (#2627)",
-                        retry_checkpoint.final_value,
-                    );
-                    if retry_checkpoint.final_value < incumbent.final_value {
-                        incumbent.rho = retry_checkpoint.rho;
-                        incumbent.final_value = retry_checkpoint.final_value;
-                    }
-                }
-                Ok(PlanRunOutcome::DominatedPlateau(retry)) => {
-                    log::warn!(
-                        "[OUTER] {context}: the retry from the dominating incumbent ended on \
-                         another dominated plateau at cost {:.6e} (#2627)",
-                        retry.plateau.final_value,
-                    );
-                    if retry.incumbent.final_value < incumbent.final_value {
-                        incumbent.rho = retry.incumbent.rho;
-                        incumbent.final_value = retry.incumbent.final_value;
-                    }
-                }
-                Ok(outcome) => {
-                    return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
-                }
-                Err(retry_error) => {
-                    log::warn!(
-                        "[OUTER] {context}: the retry from the dominating incumbent failed \
-                         ({retry_error}); returning the dominated plateau with the incumbent as \
-                         the resume checkpoint (#2627)"
-                    );
-                }
-            }
-        }
-        incumbent.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
-        incumbent.iterations = spent_seed_iterations;
-        return Ok(PlanRunOutcome::DominatedPlateau(DominatedPlateau {
-            plateau,
-            incumbent,
-            band,
-        }));
-    }
-
     if let Some(certified) = best {
         let mut result = certified.into_result();
         // Certification attaches a certificate and changes no count, so the
         // winner's total is the ledger, its own run included.
         result.iterations = spent_seed_iterations;
-        result.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
         // NO mint audit here (#2359). Every candidate above was screened at
         // order three, and the winner's order-four audit is paid EXACTLY ONCE —
         // but it is paid by `run_outer`, not here.
@@ -3291,10 +2459,10 @@ pub(crate) fn run_outer_with_plan(
             .as_ref()
             .map(FullFidelityInnerCapGuard::lift);
         if finalize_cap_guard.is_some() {
-            // Certification may have happened before later multistart trials.
+            // Certification evaluated trial points after the search ended.
             // Clear every search-state cache before installing the selected
             // point so a rho-only hit cannot leave the objective owning the
-            // last rejected trial's inner mode.
+            // last trial's inner mode.
             obj.reset();
         }
         let finalize_outcome = obj.finalize_outer_result(&result.rho, the_plan);
@@ -3319,9 +2487,6 @@ pub(crate) fn run_outer_with_plan(
         );
         let mut retry_config = config.clone();
         retry_config.initial_rho = Some(reseed);
-        retry_config.screen_initial_rho = false;
-        retry_config.seed_config.max_seeds = 1;
-        retry_config.seed_config.seed_budget = 1;
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
             Ok(outcome) => {
@@ -3352,9 +2517,6 @@ pub(crate) fn run_outer_with_plan(
         );
         let mut retry_config = config.clone();
         retry_config.initial_rho = Some(reseed);
-        retry_config.screen_initial_rho = false;
-        retry_config.seed_config.max_seeds = 1;
-        retry_config.seed_config.seed_budget = 1;
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
             Ok(outcome) => {
@@ -3370,62 +2532,38 @@ pub(crate) fn run_outer_with_plan(
     }
 
     if let Some(mut checkpoint) = best_checkpoint {
-        checkpoint.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
-        // Every started seed's iterations, this checkpoint's own included.
+        // Every start's iterations, this checkpoint's own included.
         checkpoint.iterations = spent_seed_iterations;
         return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 
     Err({
-        // `screened` reflects how many seeds we actually iterated. With
-        // the current cheap-screen pipeline (rank_seeds_with_screening
-        // runs upstream), screened equals the size of the consumed
-        // candidate list. `exact_validated` counts every seed that
-        // attempted a full eval — i.e. either reached the rejection
-        // sites in this loop or made it into `started_seeds`.
-        let n_generated = seeds.len();
-        let n_screened = n_generated;
+        // One start was generated and screened; it either reached a rejection
+        // site in this attempt or started the solver.
         let n_exact_validated = seed_rejections.len() + started_seeds;
         let stats = StartupStats::from_rejections(
-            n_generated,
-            n_screened,
+            1,
+            1,
             n_exact_validated,
             started_seeds,
             &seed_rejections,
         );
-        let structural = structural_early_exit_key
-            .clone()
-            .or_else(|| uniform_structural_key(&seed_rejections, 1));
-        let early_exit_note = if structural_early_exit_key.is_some() {
-            "early-exit triggered: every observed seed reported the same structural rejection"
-                .to_string()
-        } else if let Some((sig, first_seed, last_seed)) = generic_structural_bail.as_ref() {
-            let label = crate::startup_stats::generic_signature_label(sig);
-            let skipped = seeds.len().saturating_sub(*last_seed + 1);
-            format!(
-                "structural: {label} on seeds {first_seed}..{last_seed}; \
-                 remaining {skipped} seeds skipped"
-            )
-        } else {
-            String::new()
-        };
+        let structural = uniform_structural_key(&seed_rejections, 1);
         if started_seeds == 0 {
             EstimationError::StartupSeedsRefused(format_no_seeds_passed(
                 context,
                 &stats,
                 &seed_rejections,
                 structural.as_ref(),
-                &early_exit_note,
+                "",
             ))
         } else {
-            // Mixed outcome: at least one seed started the outer
-            // optimiser but none converged. Keep the structured payload
-            // so the caller sees both the started_seeds count and the
-            // per-rejection breakdown.
+            // The start reached the outer optimiser but did not converge. Keep
+            // the structured payload so the caller sees the per-rejection
+            // breakdown.
             let header = format!(
-                "all {started_seeds} seed candidates failed ({context}); \
-                 generated={}, screened={}, exact_validated={}, solver_started={}",
+                "the outer start failed ({context}); generated={}, screened={}, \
+                 exact_validated={}, solver_started={}",
                 stats.generated, stats.screened, stats.exact_validated, stats.solver_started,
             );
             let body = format_no_seeds_passed(
@@ -3433,7 +2571,7 @@ pub(crate) fn run_outer_with_plan(
                 &stats,
                 &seed_rejections,
                 structural.as_ref(),
-                &early_exit_note,
+                "",
             );
             EstimationError::RemlOptimizationFailed(format!("{header}\n{body}"))
         }

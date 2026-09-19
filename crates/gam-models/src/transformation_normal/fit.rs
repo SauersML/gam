@@ -531,7 +531,6 @@ pub(crate) fn fit_transformation_normal(
         &block_term_indices_slice,
         kappa_options,
         &joint_setup,
-        gam_solve::seeding::SeedRiskProfile::Gaussian,
         analytic_gradient,
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
@@ -541,7 +540,6 @@ pub(crate) fn fit_transformation_normal(
         // repeat a full CTN inner solve and caused every large-scale lane to
         // exhaust the 2400-second command budget before marginal-slope began.
         true,
-        None,
         outer_derivative_policy,
         // fit_fn
         |theta,

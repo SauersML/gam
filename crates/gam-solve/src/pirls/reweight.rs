@@ -2104,7 +2104,7 @@ where
         // 10× relaxed band). A convergence verdict keyed on wall-clock is
         // non-deterministic under CPU contention — the same fit converges to
         // a different β in a parallel sweep than it does run alone, which
-        // cascades into different outer seed screening and load-unstable
+        // cascades into different outer search paths and load-unstable
         // fire/collapse decisions downstream (gam#979). It also accepted
         // iterates up to 10× outside `convergence_tolerance`, an
         // unrequested weakening of the inner certificate. Convergence is
