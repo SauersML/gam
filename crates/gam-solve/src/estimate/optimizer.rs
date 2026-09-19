@@ -7,7 +7,8 @@ use crate::estimate::evaluation::{
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
 use crate::estimate::prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
+    reject_prefit_unpenalized_rank_deficiency,
 };
 use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
@@ -1115,6 +1116,7 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    reject_prefit_unidentifiable_unpenalized_space(w, p, &canonical)?;
     // Student-t `(σ, ν)` are outer LAML hyperparameters searched jointly with
     // ρ in the coordinates `(ln(σ/s₀), ln ν)` (see `student_t_outer_point`).
     // Install the zero seed before any evaluation reads the family.

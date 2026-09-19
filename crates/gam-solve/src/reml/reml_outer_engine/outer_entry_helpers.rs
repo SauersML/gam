@@ -259,7 +259,11 @@ pub(crate) fn profiled_gaussian_residual_dof(
         Ok(dof)
     } else {
         Err(format!(
-            "profiled Gaussian residual degrees of freedom must be positive; got              n({n_observations}) − M_p({nullspace_dim}) = {dof}. Every unpenalized              coefficient direction consumes one observation, so this design leaves              nothing to estimate the Gaussian scale from: penalize the offending              directions or drop them."
+            "profiled Gaussian residual degrees of freedom must be positive; got \
+             n({n_observations}) − M_p({nullspace_dim}) = {dof}. Every unpenalized \
+             coefficient direction consumes one observation, so this design leaves \
+             nothing to estimate the Gaussian scale from: penalize the offending \
+             directions or drop them."
         ))
     }
 }
