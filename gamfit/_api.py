@@ -997,16 +997,16 @@ def fit(
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
-        ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``; whitespace
-        differences are ignored). Values are one of ``"monotone_increasing"``,
+        ``"s(x)"`` or ``"s(x, k=12)"``; whitespace differences are ignored).
+        Values are one of ``"monotone_increasing"``,
         ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. Shape
-        constraints are enforced by the inner solver as joint linear
-        inequalities ``A·β ≥ b`` on the coefficient vector; when active at
-        convergence the outer REML score uses the tangent-projected LAML
-        formulation. This is the same functionality exposed by mgcv's
-        ``scop=...`` argument and the ``scam`` R library. Currently restricted
-        to univariate 1D B-spline / thin-plate / Duchon smooths.
+        ``"none"`` / ``None`` for the default unconstrained fit. The mapping
+        is rewritten into the formula option ``s(x, shape=...)``. The
+        constraint is exact on the B-spline control polygon (``β = C·δ``
+        with ``δ ≥ 0``), so it holds everywhere on the knot range, and the
+        term stays centred like an unconstrained smooth. Only open 1-D
+        B-spline ``s(x)`` smooths accept it; see ``docs/formulas.md``
+        (Shape-constrained smooths).
 
         Example::
 
