@@ -19,8 +19,19 @@
 //! made *independent* of `x1` (no collinearity): it breaks **even worse** with
 //! the over-rich default (mean truth-RMSE 0.52 vs 0.39), so the defect is basis
 //! over-richness, not the near-rank-1 block. A k-sweep confirms a basis of ~10–15
-//! recovers truth at RMSE ≈ 0.12 either way. The fix caps the default univariate
-//! basis at an mgcv-like ~12 functions (`heuristic_knots_for_column`), flat in n.
+//! recovers truth at RMSE ≈ 0.12 either way. The original fix capped the default
+//! univariate basis at ~12 functions, flat in n.
+//!
+//! That cap hid the optimizer stall rather than fixing it, and it froze the
+//! default's bias at every n (slop.md G1). Once the outer REML optimizer's
+//! rail and asymptote certificates landed, the stall no longer reproduced at any
+//! basis size the design can identify: on this design with 4 seeds at n=120 the
+//! mean truth-RMSE is 0.093 for the pilot basis, and also 0.093 at k=24 and at
+//! k=40. The one remaining failure is p ≥ n (k=40 gives 157 coefficients for
+//! 120 rows), where the Hessian is singular by construction. The default now
+//! starts at the pilot size and grows only when the basis fails its own adequacy
+//! test, bounded by the covariate's support and by keeping p < n. So these tests
+//! still pin the #1680 recovery, now under a default that is no longer capped.
 //! This is the same defect class as the thin-plate over-sizing in #1074, and it
 //! is mechanistically adjacent to the double-penalty null-space pathologies
 //! (#1266 / #1371) and the additive term-order non-invariance
@@ -156,10 +167,10 @@ fn fit_and_predict(data: &gam::data::EncodedDataset, pts: &[RowPoint]) -> Vec<f6
 /// design and a control where `x2`/`x3` are INDEPENDENT of `x1` — and require
 /// BOTH to recover truth. Before the basis-dimension cap the independent control
 /// recovered *worse* than the collinear one (mean truth-RMSE ≈ 0.52 vs ≈ 0.39),
-/// which is the proof the defect was basis over-richness rather than the
-/// near-rank-1 block. Both now land near mgcv's ballpark (≈ 0.12) with the
-/// default basis, so a regression that re-inflates the default would turn this
-/// red on the independent design even if the collinear test somehow survived.
+/// which showed the defect was not the near-rank-1 block. Both now land near
+/// mgcv's ballpark (≈ 0.12) with the default basis, so a regression that brings
+/// back the over-parameterized stall would turn this red on the independent
+/// design even if the collinear test somehow survived.
 #[test]
 fn near_collinear_is_basis_richness_not_collinearity() {
     const SEEDS: [u64; 4] = [0, 1, 2, 3];
@@ -194,7 +205,7 @@ fn near_collinear_is_basis_richness_not_collinearity() {
         collinear_mean <= MAX_MEAN_RMSE && indep_mean <= MAX_MEAN_RMSE,
         "default-basis additive recovery is poor: collinear mean {collinear_mean:.4}, independent \
          mean {indep_mean:.4} (threshold {MAX_MEAN_RMSE:.2}). The independent control breaking \
-         proves the defect is over-rich DEFAULT basis dimension, not the near-rank-1 block (#1680)."
+         means the defect is the over-parameterized fit, not the near-rank-1 block (#1680)."
     );
 }
 
