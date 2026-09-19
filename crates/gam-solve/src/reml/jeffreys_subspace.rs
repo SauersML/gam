@@ -159,7 +159,7 @@ impl BottomProfile {
                     value *= self.e[k];
                     remaining -= k;
                 }
-                debug_assert_eq!(remaining, 0, "t^{p}·w^({q}) needs p ≤ q + 4");
+                assert_eq!(remaining, 0, "t^{p}·w^({q}) needs p ≤ q + 4");
                 value
             })
             .sum()

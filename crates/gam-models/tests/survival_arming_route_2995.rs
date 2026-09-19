@@ -25,7 +25,6 @@ use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::utils::splitmix64;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SLOPE: f64 = 0.85;
@@ -36,8 +35,6 @@ const COVARIATE_EFFECT: f64 = 0.4;
 /// Inner-solver cycles seen, and how many of them evaluated the Jeffreys term.
 static PROBE_CYCLES: AtomicUsize = AtomicUsize::new(0);
 static ARMED_CYCLES: AtomicUsize = AtomicUsize::new(0);
-/// The probe counters are process-wide, so fits run one at a time.
-static SERIAL: Mutex<()> = Mutex::new(());
 
 struct ProbeCounter;
 
@@ -176,7 +173,6 @@ struct Solved {
 }
 
 fn solve(label: &str, formula: &str, data: &gam_data::EncodedDataset, baseline_target: &str) -> Solved {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     PROBE_CYCLES.store(0, Ordering::Relaxed);
     ARMED_CYCLES.store(0, Ordering::Relaxed);
     let result = fit_from_formula(formula, data, &config(baseline_target))
