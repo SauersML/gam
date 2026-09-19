@@ -5222,6 +5222,7 @@ pub(crate) fn compute_kkt_refusal_report(
     let mut hpen_eigenvalues_sorted_desc: Vec<f64> = Vec::new();
     let mut hpen_condition_number = f64::NAN;
     let mut hpen_nullity_at_rank_tol = 0usize;
+    let mut hpen_rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, total_p);
     let mut hpen_null_direction = None;
     let mut hlik_max_abs_eigenvalue = None;
     let mut hpen_spectrum_unavailable = false;
@@ -5231,10 +5232,10 @@ pub(crate) fn compute_kkt_refusal_report(
             materialize_joint_hessian_source(source, total_p, "KKT refusal diagnostic spectrum")
     {
         // Capture the likelihood-only spectrum BEFORE the penalty is folded in.
-        // If the relative rank cutoff (`KKT_REFUSAL_RANK_TOL·λ_max`) that flags a
-        // direction "null" was inflated by a likelihood-side curvature blow-up
-        // rather than the penalty, `λ_max(H_lik) ≈ λ_max(H_pen)`; a penalty-driven
-        // inflation leaves `λ_max(H_lik)` small. Runs only on the refusal path.
+        // A flagged direction's likelihood part is what tells a gauge null from a
+        // penalty-only identification, and `λ_max(H_lik) ≈ λ_max(H_pen)` says the
+        // curvature scale is set by the likelihood rather than the penalty. Runs
+        // only on the refusal path.
         let mut h_likelihood = h_joint.clone();
         symmetrize_dense_in_place(&mut h_likelihood);
         if let Ok((lik_evals, _)) = FaerEigh::eigh(&h_likelihood, Side::Lower) {
@@ -5256,7 +5257,17 @@ pub(crate) fn compute_kkt_refusal_report(
                     .iter()
                     .map(|x: &f64| x.abs())
                     .fold(f64::INFINITY, f64::min);
-                let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+                // "Rank deficient" is a statement about RANK, so a direction
+                // counts as null only when its curvature is below H_pen's own
+                // eigensolver resolution (#2977 S6). The conditioning ratio
+                // `KKT_REFUSAL_RANK_TOL·λ_max` labelled full-rank stiff Hessians
+                // rank deficient: one −log q̇ guard row at 1/guard² = 1e12 put 48
+                // of 59 identified directions "null" (#3003), and that label is
+                // Jeffreys-arming evidence.
+                let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
+                if max_abs > 0.0 {
+                    hpen_rank_tol = cutoff / max_abs;
+                }
                 hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
                 hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
                     max_abs / min_abs
@@ -5358,7 +5369,7 @@ pub(crate) fn compute_kkt_refusal_report(
         hpen_eigenvalues_sorted_desc,
         hpen_condition_number,
         hpen_nullity_at_rank_tol,
-        hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+        hpen_rank_tol,
         hpen_null_direction,
         active_set_rows_total,
         accepted_step_inf,
@@ -5577,8 +5588,8 @@ mod kkt_refusal_spectrum_format_tests {
     fn indefinite_hpen_render_keeps_signed_extremes_and_magnitude_diagnostics_2659() {
         // The negative eigenvalue has the greatest magnitude. Algebraic
         // extrema are therefore (+5, -9), while the condition and rank cutoff
-        // must still use max|λ|=9 and min|λ|=1e-12.
-        let spectrum = vec![5.0_f64, 1.0e-12, -9.0];
+        // must still use max|λ|=9 and min|λ|=1e-16, below the √3·ε·9 resolution.
+        let spectrum = vec![5.0_f64, 1.0e-16, -9.0];
         let max_abs = spectrum
             .iter()
             .map(|value| value.abs())
@@ -5587,7 +5598,8 @@ mod kkt_refusal_spectrum_format_tests {
             .iter()
             .map(|value| value.abs())
             .fold(f64::INFINITY, f64::min);
-        let rank_cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+        let rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, spectrum.len());
+        let rank_cutoff = rank_tol * max_abs;
         let nullity = spectrum
             .iter()
             .filter(|value| value.abs() < rank_cutoff)
@@ -5604,13 +5616,13 @@ mod kkt_refusal_spectrum_format_tests {
             hpen_eigenvalues_sorted_desc: spectrum,
             hpen_condition_number: max_abs / min_abs,
             hpen_nullity_at_rank_tol: nullity,
-            hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+            hpen_rank_tol: rank_tol,
             hpen_null_direction: Some(KktNullDirectionDiagnostic {
                 projected_gradient_component_inf: 0.0,
                 vector_block_inf: vec![0.0],
                 carrying_block: Some(0),
-                penalized_curvature: 1.0e-12,
-                likelihood_curvature: 1.0e-12,
+                penalized_curvature: 1.0e-16,
+                likelihood_curvature: 1.0e-16,
                 likelihood_max_abs_eigenvalue: Some(5.0),
             }),
             active_set_rows_total: 0,
@@ -5628,7 +5640,7 @@ mod kkt_refusal_spectrum_format_tests {
             diagnosis: KktRefusalDiagnosis::RankDeficientHPen,
             constrained_fixed_point_verdict: None,
         };
-        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e12, nullity@1e-10=1 \
+        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e16, nullity@4e-16=1 \
              (of 3 eigenvalues)";
 
         assert_eq!(max_abs, 9.0);
