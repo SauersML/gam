@@ -312,6 +312,7 @@ fn fit_real_chart(
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &term.assignment)?;
     let seed = init_rho.to_flat(&term.assignment)?;
     let n_params = seed.len();
+    let p_beta = term.beta_dim();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         post_peel.clone(),
@@ -323,6 +324,7 @@ fn fit_real_chart(
         1.0e-6,
     );
     let result = OuterProblem::new(n_params)
+        .with_problem_size(post_peel.len(), p_beta)
         .with_initial_rho(seed)
         .with_max_iter(outer_iters)
         .run(&mut objective, label)

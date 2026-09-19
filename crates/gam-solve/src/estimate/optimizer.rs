@@ -938,6 +938,8 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
 
     // The anchors are clamped into the envelope of the design's own #2812
     // resolvability domain, the domain the λ search then runs on (#2902 row 9).
+    // Past the ρ = 0 anchor they are tried only when its inner solve refused,
+    // and the search domain is then read at these same prior weights.
     let (domain_lower, domain_upper) =
         crate::estimate::rho_domain::resolvability_domain_from_design(
             reml_state.weights,
@@ -1140,27 +1142,6 @@ where
         .as_ref()
         .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
-    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
-    // from the conditioned design's Gram on that penalty's columns and the
-    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20).
-    let rho_resolvability =
-        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
-            w_o.view(),
-            &x_fit,
-            canonical_shared.as_slice(),
-        )
-        .map_err(EstimationError::LayoutError)?;
-    // The domain is a numerical device, not the prior: the ρ-posterior
-    // integrates over all of ℝ^K and continues the criterion past each
-    // saturated face (#2812).
-    let rho_continuation = rho_resolvability.continuation();
-    let crate::estimate::rho_domain::ResolvabilityDomain {
-        lower: rho_domain_lower,
-        upper: rho_domain_upper,
-        lower_is_limit: rho_lower_is_limit,
-        upper_is_limit: rho_upper_is_limit,
-        ..
-    } = rho_resolvability;
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
         x_fit,
@@ -1219,6 +1200,51 @@ where
         k,
         heuristic_log_lambdas,
     )?;
+    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
+    // from the conditioned design's Gram on that penalty's columns and the
+    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20). The
+    // Gram is the data curvature `XᵀWX` of the penalized Hessian, so `W` is the
+    // Fisher working weight of the canonical anchor's inner solve at ρ = 0 (the
+    // solve the nuisance freeze above ran, before any warm start): its scale
+    // follows the response's units (`μ³/4` for the inverse-Gaussian `1/μ²`
+    // link), and a prior-weight Gram leaves the domain fixed while `λ̂` moves
+    // with those units, off the domain's lower face in small units. When that
+    // solve returns a typed per-rho refusal (`is_trial_point_infeasible`) there
+    // is no fitted working weight at ρ = 0, and the Gram is read at the prior
+    // weights. Every other failure is not about ρ = 0 and is propagated.
+    let domain_weights = if k == 0 {
+        w_o.to_owned()
+    } else {
+        match reml_state.data_curvature_weights(&Array1::zeros(k)) {
+            Ok(weights) => weights,
+            Err(error) if !error.is_trial_point_infeasible() => return Err(error),
+            Err(error) => {
+                log::debug!(
+                    "[OUTER] ρ-domain Gram read at the prior weights: the canonical anchor's \
+                     inner solve at ρ = 0 refused ({error})"
+                );
+                w_o.to_owned()
+            }
+        }
+    };
+    let rho_resolvability =
+        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
+            domain_weights.view(),
+            &reml_state.x,
+            canonical_shared.as_slice(),
+        )
+        .map_err(EstimationError::LayoutError)?;
+    // The domain is a numerical device, not the prior: the ρ-posterior
+    // integrates over all of ℝ^K and continues the criterion past each
+    // saturated face (#2812).
+    let rho_continuation = rho_resolvability.continuation();
+    let crate::estimate::rho_domain::ResolvabilityDomain {
+        lower: rho_domain_lower,
+        upper: rho_domain_upper,
+        lower_is_limit: rho_lower_is_limit,
+        upper_is_limit: rho_upper_is_limit,
+        ..
+    } = rho_resolvability;
     if let Some(store) = opts.persistent_warm_start_store.clone() {
         // Attach only after the canonical nuisance anchor so cache history
         // cannot influence the criterion frame.
@@ -1427,9 +1453,18 @@ where
                 Array1::from_iter(h.iter().map(|&v| start_bounds.clamp(v)))
             } else {
                 let anchor = Array1::from_elem(k, start_bounds.clamp(weight_log_geom_mean));
-                reml_state
-                    .analytic_initial_sp_rho(&anchor, start_bounds)
-                    .unwrap_or(anchor)
+                // The pilot P-IRLS solve behind the `initial.sp` point runs at
+                // `anchor`. A typed per-rho refusal there
+                // (`is_trial_point_infeasible`) leaves no working weight to
+                // balance against, so the search enters at `anchor` and steps
+                // past it exactly as it steps past any infeasible trial point.
+                // Every other failure is not about `anchor` and is propagated.
+                match reml_state.analytic_initial_sp_rho(&anchor, start_bounds) {
+                    Ok(Some(start)) => start,
+                    Ok(None) => anchor,
+                    Err(error) if error.is_trial_point_infeasible() => anchor,
+                    Err(error) => return Err(error),
+                }
             };
             log::debug!(
                 "[OUTER] standard REML single start: {:?} (bounds {:.3}..{:.3})",

@@ -3,7 +3,10 @@
 use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
-use gam_gpu::{GpuDecision, GpuEligibility, GpuKernel, decide};
+use gam_gpu::{
+    GpuDecision, GpuDispatchPolicy, GpuKernel, RowKernelAdmission, RuntimeDeviceProbe,
+    decide_row_kernel,
+};
 
 use crate::bms::LatentIntegral;
 
@@ -66,33 +69,26 @@ impl BmsFlexRowKernelCapability {
 }
 
 /// Decide which kernel builds the row-primary Hessian for `model` over `n`
-/// rows. The stages run in the order of what they cost to evaluate: the device
-/// kernel is eligible only for a model it declares, then only when compiled
-/// in, then only at or above the row-kernel threshold. Fewer rows than
-/// `MIN_CALIBRATABLE_ROW_KERNEL_N`, the smallest threshold any policy can
-/// carry, are below it on every device, so the device is probed for its own
-/// threshold only above that floor.
+/// rows, through the one row-kernel decision: the device kernel is eligible
+/// only for a model it declares, then only when compiled in, then only at or
+/// above the row-kernel threshold, and the device is probed only above
+/// `MIN_CALIBRATABLE_ROW_KERNEL_N`, the smallest threshold any policy carries.
 pub(crate) fn row_primary_hessian_decision(
     model: &BmsFlexRowModel,
     n: usize,
 ) -> Result<GpuDecision, GpuError> {
-    let eligibility = if let Some(missing) = BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model) {
-        GpuEligibility::CapabilityMissing { missing }
-    } else if !BmsFlexGpuBackend::compiled() {
-        GpuEligibility::BackendNotCompiled
-    } else if n < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N {
-        GpuEligibility::WorkloadBelowThreshold
-    } else {
-        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())? {
-            Some(runtime) if n < runtime.policy().row_kernel_min_n => {
-                GpuEligibility::WorkloadBelowThreshold
-            }
-            // At or above this device's threshold, or no device at all, which
-            // `decide` reports as such.
-            Some(_) | None => GpuEligibility::Eligible,
-        }
-    };
-    decide(GpuKernel::MarginalSlopeRows, eligibility)
+    decide_row_kernel(
+        gam_gpu::global_policy(),
+        RowKernelAdmission {
+            kernel: GpuKernel::MarginalSlopeRows,
+            missing_capability: BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model),
+            compiled: BmsFlexGpuBackend::compiled(),
+            rows: n,
+            floor: GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N,
+            threshold: |device| device.row_kernel_min_n,
+        },
+        &mut RuntimeDeviceProbe,
+    )
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns `gpu=required` for a

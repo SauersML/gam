@@ -178,7 +178,6 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     };
     let rows = smooth_term_summary_rows(
         &fit.design,
-        &fit.resolvedspec,
         &fit.fit,
         fit.fit.weighted_gram(),
     );
