@@ -600,6 +600,7 @@ mod tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let base_design =
             build_term_collection_design(data.view(), &spec).expect("build base spatial design");

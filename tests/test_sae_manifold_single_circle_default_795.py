@@ -58,7 +58,7 @@ def test_single_circle_quickstart_converges_with_default_regularizers() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             # No `isometry_weight=` here on purpose — exercise the shipped default.
-            fit = gamfit.sae_manifold_fit(
+            fit = gamfit.sae.sae_manifold_fit(
                 X=z,
                 K=1,
                 d_atom=1,
@@ -86,7 +86,7 @@ def test_single_circle_positive_isometry_recovers_honest_chart_span() -> None:
     z = _planted_circle()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=z,
             K=1,
             d_atom=1,

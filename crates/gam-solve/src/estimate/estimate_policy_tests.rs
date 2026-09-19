@@ -27,7 +27,7 @@ use crate::mixture_link::{
 };
 use gam_linalg::utils::StableSolver;
 use gam_problem::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
+    InverseLink, LikelihoodSpec, ResponseFamily, SeedRiskProfile, StandardLink,
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -39,7 +39,7 @@ fn gaussian_external_reml_uses_one_analytic_seed() {
     // The profiled-Gaussian path scores its data-derived `initial.sp` and
     // summed-penalty diagonal candidates before constructing the outer
     // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, LinkFunction::Identity);
+    let cfg = external_reml_seed_config(2, true);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
     assert_eq!(cfg.max_seeds, 1);
     assert_eq!(cfg.seed_budget, 3);
@@ -50,7 +50,7 @@ fn gaussian_external_reml_uses_one_analytic_seed() {
 fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
     // Coordinate count must not silently re-enable heuristic global shifts:
     // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
+    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, true);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
     assert_eq!(cfg.max_seeds, 1);
     assert_eq!(cfg.seed_budget, 3);
@@ -59,7 +59,7 @@ fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
 
 #[test]
 fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Logit);
+    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, false);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
     assert_eq!(
         cfg.max_seeds, 2,
@@ -73,7 +73,7 @@ fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
 
 #[test]
 fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, LinkFunction::Logit);
+    let cfg = external_reml_seed_config(2, false);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
     assert!(cfg.max_seeds > 1);
     assert_eq!(
@@ -85,23 +85,18 @@ fn generalized_external_reml_keeps_multistart_policy() {
 #[test]
 fn profiled_gaussian_search_consumes_exact_outer_curvature() {
     assert!(
-        !standard_reml_search_prefers_gradient_only(LinkFunction::Identity),
+        !standard_reml_search_prefers_gradient_only(true),
         "quadratic Gaussian identity REML must route its available exact Hessian into search"
     );
 }
 
 #[test]
 fn non_gaussian_search_reserves_order_four_for_mint() {
-    for link in [
-        LinkFunction::Logit,
-        LinkFunction::Probit,
-        LinkFunction::Log,
-    ] {
-        assert!(
-            standard_reml_search_prefers_gradient_only(link),
-            "{link:?} must retain the optimize-3 / certify-4 derivative ceiling"
-        );
-    }
+    assert!(
+        standard_reml_search_prefers_gradient_only(false),
+        "non-Gaussian families (including identity-link Student-t) must retain the \
+         optimize-3 / certify-4 derivative ceiling"
+    );
 }
 
 #[test]
@@ -517,6 +512,120 @@ fn prefit_binomial_separation_reads_through_a_scalar_ridge_but_not_a_basis_penal
     let basis = canonical_block(1..3);
     reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &basis)
         .expect("a multi-column basis penalty keeps its columns out of the certificate");
+}
+
+/// A double penalty's null-space ridge bounds its block's kernel the way a
+/// one-column ridge bounds a parametric column: the certificate reads the
+/// design along that kernel, and only along it. The block is three basis
+/// columns `(a, b, c)` with the roughness penalty on `u = (a − b)/√2` and `c`,
+/// and the ridge on `v = (a + b)/√2`. Neither `a` nor `b` separates alone.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::ones(y.len());
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let v = array![half, half, 0.0];
+    let u = array![half, -half, 0.0];
+    let e = array![0.0, 0.0, 1.0];
+    let outer = |a: &Array1<f64>| {
+        let column = a.view().insert_axis(ndarray::Axis(1));
+        column.dot(&column.t())
+    };
+    let roughness = outer(&u) + outer(&e);
+    let ridge = outer(&v);
+    let double_penalty = gam_terms::construction::canonicalize_penalty_specs(
+        &[roughness.clone(), ridge]
+            .into_iter()
+            .map(|local| PenaltySpec::Block {
+                local,
+                col_range: 1..4,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect::<Vec<_>>(),
+        &[1, 2],
+        4,
+        "prefit separation null-space ridge",
+    )
+    .expect("canonicalize the double penalty")
+    .0;
+    let design_from = |a: [f64; 4], b: [f64; 4]| {
+        let mut x = Array2::<f64>::ones((4, 4));
+        for row in 0..4 {
+            x[[row, 1]] = a[row];
+            x[[row, 2]] = b[row];
+            x[[row, 3]] = [0.5, -0.5, 0.25, -0.25][row];
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+
+    // a + b = (−2, −1, 1, 2) separates along the ridge's direction.
+    let kernel_separated = design_from([1.0, -2.0, 2.0, -1.0], [-3.0, 1.0, -1.0, 3.0]);
+    let err = reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &kernel_separated,
+        &double_penalty,
+    )
+    .expect_err("separation along the penalty null space must be certified");
+    match err {
+        EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin,
+            column_indices,
+            ..
+        } => {
+            assert!(min_signed_margin > 0.0, "margin {min_signed_margin}");
+            assert_eq!(column_indices, vec![0, 1, 2, 3]);
+        }
+        other => panic!("expected a linear separation certificate, got {other:?}"),
+    }
+
+    // a − b = (−2, −1, 1, 2) separates only along the roughness penalty's range.
+    let range_separated = design_from([1.0, -2.0, 2.0, -1.0], [3.0, -1.0, 1.0, -3.0]);
+    reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &range_separated,
+        &double_penalty,
+    )
+    .expect("a direction the roughness penalty bounds certifies nothing");
+
+    // Alone on its block, the roughness penalty leaves `v` unpenalized.
+    let roughness_only = gam_terms::construction::canonicalize_penalty_specs(
+        &[PenaltySpec::Block {
+            local: roughness,
+            col_range: 1..4,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        }],
+        &[1],
+        4,
+        "prefit separation unpenalized kernel",
+    )
+    .expect("canonicalize the roughness penalty")
+    .0;
+    assert!(matches!(
+        reject_prefit_binomial_separation(
+            &cfg,
+            y.view(),
+            w.view(),
+            &kernel_separated,
+            &roughness_only,
+        ),
+        Err(EstimationError::PrefitLinearSeparationDetected { .. })
+    ));
 }
 
 #[test]
@@ -2002,7 +2111,7 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, LinkFunction::Logit);
+    let seed_config = external_reml_seed_config(1, false);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
     freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)

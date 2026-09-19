@@ -237,7 +237,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<f64, EstimationError> {
         match (&self.spec.response, &self.spec.link) {
-            (ResponseFamily::Gaussian, _) => Ok(eta),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => Ok(eta),
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
                 integrated_inverse_link_mean_and_derivative(
                     quadctx,
@@ -307,7 +307,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError> {
         match (&self.spec.response, &self.spec.link) {
-            (ResponseFamily::Gaussian, _) => Ok((eta, (se_eta * se_eta).max(0.0))),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => {
+                Ok((eta, (se_eta * se_eta).max(0.0)))
+            }
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }

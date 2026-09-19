@@ -55,6 +55,7 @@ fn frozen_bspline_spec_and_data() -> (TermCollectionSpec, Array2<f64>) {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     // Build once to recover the realized knots + composed identifiability chart,
@@ -98,6 +99,7 @@ fn frozen_bspline_spec_and_data() -> (TermCollectionSpec, Array2<f64>) {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     (frozen, data)
@@ -190,6 +192,7 @@ fn nonzero_anchor_derivative_carries_exact_affine_slope() {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let value = build_term_collection_design(data.view(), &spec).expect("anchored value design");

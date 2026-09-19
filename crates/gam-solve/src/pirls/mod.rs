@@ -28,6 +28,7 @@ mod reweight;
 mod row_pass;
 mod sparse_system;
 mod state;
+mod student_t;
 mod working_model_trait;
 mod workspace;
 
@@ -62,6 +63,7 @@ pub use glm_update::*;
 pub use low_rank::*;
 pub use newton_solve::*;
 pub(crate) use sparse_system::*;
+pub(crate) use student_t::*;
 pub(crate) use working_model_trait::*;
 pub use workspace::*;
 

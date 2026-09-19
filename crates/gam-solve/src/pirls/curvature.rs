@@ -293,6 +293,11 @@ pub(crate) fn weight_family_for_glm_likelihood(
         ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "Royston-Parmar is not a GLM weight family".to_string(),
         )),
+        ResponseFamily::StudentT { .. } => Err(EstimationError::InvalidInput(
+            "Student-t is not an exponential-dispersion weight family; its observed \
+             curvature is evaluated by StudentTScale"
+                .to_string(),
+        )),
     }
 }
 
@@ -322,7 +327,10 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
-    if matches!(spec.response, ResponseFamily::Gamma) {
+    if matches!(
+        spec.response,
+        ResponseFamily::Gamma | ResponseFamily::StudentT { .. }
+    ) {
         return true;
     }
     if !matches!(spec.response, ResponseFamily::Binomial) {
@@ -381,6 +389,40 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     }
     if hessian_d.len() != n {
         *hessian_d = Array1::<f64>::zeros(n);
+    }
+    if fisher_weights.len() != n {
+        crate::bail_invalid_estim!(
+            "observed Hessian Fisher-weight length mismatch: expected {n}, got {}",
+            fisher_weights.len()
+        );
+    }
+
+    if matches!(likelihood.spec.response, ResponseFamily::StudentT { .. }) {
+        let scale = StudentTScale::from_likelihood(likelihood)?;
+        let certified: Vec<(f64, f64, f64)> = (0..n)
+            .map(|i| -> Result<(f64, f64, f64), EstimationError> {
+                let prior = priorweights[i];
+                if !(prior.is_finite() && prior >= 0.0) {
+                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "prior weight",
+                        eta: eta[i],
+                        value: prior,
+                    });
+                }
+                if prior == 0.0 {
+                    return Ok((0.0, 0.0, 0.0));
+                }
+                let (w, c, d) = scale.observed_weight_jet(i, y[i], eta[i])?;
+                Ok((prior * w, prior * c, prior * d))
+            })
+            .collect::<Result<_, _>>()?;
+        for (i, &(w, c, d)) in certified.iter().enumerate() {
+            hessian_weights[i] = w;
+            hessian_c[i] = c;
+            hessian_d[i] = d;
+        }
+        return Ok(());
     }
 
     let weight_family = weight_family_for_glm_likelihood(likelihood)?;
@@ -466,14 +508,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         hessian_weights[i] = w;
         hessian_c[i] = c;
         hessian_d[i] = d;
-    }
-    // The caller supplies Fisher weights for the observed-vs-Fisher contract;
-    // certify that this parallel surface has the same row cardinality.
-    if fisher_weights.len() != n {
-        crate::bail_invalid_estim!(
-            "observed Hessian Fisher-weight length mismatch: expected {n}, got {}",
-            fisher_weights.len()
-        );
     }
     Ok(())
 }

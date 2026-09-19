@@ -517,6 +517,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     derivatives,
                 )
             }
+            (ResponseFamily::StudentT { .. }, _, _) => {
+                let scale = StudentTScale::from_likelihood(self)?;
+                write_student_t_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    &scale,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )
+            }
             (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
                 "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
             )),

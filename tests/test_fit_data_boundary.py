@@ -16,7 +16,7 @@ import gamfit
 )
 def test_fit_rejects_numeric_degeneracy_with_typed_column_error(values, problem):
     frame = pd.DataFrame({"y": [0.0, 1.0, 2.0], "offender": values})
-    with pytest.raises(gamfit.DataError, match="column 'offender'.*" + problem):
+    with pytest.raises(gamfit.errors.DataError, match="column 'offender'.*" + problem):
         gamfit.fit(frame, "y ~ offender", family="gaussian")
 
 
@@ -29,5 +29,5 @@ def test_fit_rejects_numeric_degeneracy_with_typed_column_error(values, problem)
     ],
 )
 def test_fit_rejects_structural_degeneracy_with_typed_column_error(frame, column, problem):
-    with pytest.raises(gamfit.DataError, match=f"column '{column}'.*{problem}"):
+    with pytest.raises(gamfit.errors.DataError, match=f"column '{column}'.*{problem}"):
         gamfit.fit(frame, "y ~ group" if "group" in frame.columns else "y ~ x", family="gaussian")

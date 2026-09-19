@@ -91,7 +91,7 @@ def _cylinder_inputs(n: int = 13) -> tuple[np.ndarray, np.ndarray]:
 
 def test_cylinder_numpy_frame() -> None:
     theta, ell = _cylinder_inputs()
-    phi = gamfit.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
+    phi = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
     assert isinstance(phi, np.ndarray)
     assert phi.ndim == 2
     assert phi.shape[0] == theta.size
@@ -101,8 +101,8 @@ def test_cylinder_numpy_frame() -> None:
 @needs_torch
 def test_cylinder_torch_matches_numpy() -> None:
     theta, ell = _cylinder_inputs()
-    phi_np = gamfit.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
-    phi_t = gamfit.Cylinder(n_knots=(7, 4)).evaluate(
+    phi_np = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
+    phi_t = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(
         _torch.as_tensor(theta), _torch.as_tensor(ell)
     )
     assert isinstance(phi_t, _torch.Tensor)
@@ -112,8 +112,8 @@ def test_cylinder_torch_matches_numpy() -> None:
 @needs_jax
 def test_cylinder_jax_matches_numpy() -> None:
     theta, ell = _cylinder_inputs()
-    phi_np = gamfit.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
-    phi_j = gamfit.Cylinder(n_knots=(7, 4)).evaluate(
+    phi_np = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
+    phi_j = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(
         _jnp.asarray(theta), _jnp.asarray(ell)
     )
     # jax array module starts with "jax" or "jaxlib"
@@ -135,7 +135,7 @@ def _sphere_inputs() -> np.ndarray:
 
 def test_sphere_numpy_frame() -> None:
     pts = _sphere_inputs()
-    sph = gamfit.Sphere(n_centers=12)
+    sph = gamfit.smooth.Sphere(n_centers=12)
     phi = sph.evaluate(pts[:, 0], pts[:, 1])
     assert isinstance(phi, np.ndarray)
     assert phi.shape[0] == pts.shape[0]
@@ -153,7 +153,7 @@ def _ard_target(rng_seed: int = 1) -> np.ndarray:
 
 def test_ard_penalty_value_grad_numpy() -> None:
     t = _ard_target()
-    pen = gamfit.ARDPenalty(weight=1.0)
+    pen = gamfit.penalties.ARDPenalty(weight=1.0)
     value, grad = pen.value_grad(t)
     assert isinstance(grad, np.ndarray)
     assert grad.shape == t.shape
@@ -164,7 +164,7 @@ def test_ard_penalty_value_grad_numpy() -> None:
 @needs_torch
 def test_ard_penalty_torch_grad_matches_numpy() -> None:
     t_np = _ard_target()
-    pen = gamfit.ARDPenalty(weight=1.0)
+    pen = gamfit.penalties.ARDPenalty(weight=1.0)
     value_np, grad_np = pen.value_grad(t_np)
 
     t_t = _torch.tensor(t_np, dtype=_torch.float64, requires_grad=True)
@@ -181,7 +181,7 @@ def test_ard_penalty_torch_grad_matches_numpy() -> None:
 @needs_jax
 def test_ard_penalty_jax_grad_matches_numpy() -> None:
     t_np = _ard_target()
-    pen = gamfit.ARDPenalty(weight=1.0)
+    pen = gamfit.penalties.ARDPenalty(weight=1.0)
     value_np, grad_np = pen.value_grad(t_np)
 
     t_j = _jnp.asarray(t_np)
@@ -210,6 +210,6 @@ def test_numpy_coordinate_joins_the_torch_frame() -> None:
     # torch + jax is the refused mix (test_detect_frame_mixed_raises).
     theta_np = np.linspace(0.0, 1.0, 5)
     ell_t = _torch.linspace(0.0, 1.0, 5, dtype=_torch.float64)
-    phi = gamfit.Cylinder(n_knots=(5, 4)).evaluate(theta_np, ell_t)
+    phi = gamfit.topology.Cylinder(n_knots=(5, 4)).evaluate(theta_np, ell_t)
     assert isinstance(phi, _torch.Tensor)
     assert phi.shape[0] == 5

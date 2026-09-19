@@ -354,8 +354,8 @@ def test_constrained_reml_weak_active_set_boundary_is_typed() -> None:
         active = cast("torch.Tensor", out.active_indices)  # type: ignore[attr-defined]
         assert (active.numel() > 0) is expected_active
 
-    with pytest.raises(gamfit.GradientUnavailableError, match="weakly active"):
-        gamfit.gaussian_reml_fit_with_constraints_backward(
+    with pytest.raises(gamfit.errors.GradientUnavailableError, match="weakly active"):
+        gamfit.reml.gaussian_reml_fit_with_constraints_backward(
             x_np,
             y_boundary[:, None],
             _PENALTY,

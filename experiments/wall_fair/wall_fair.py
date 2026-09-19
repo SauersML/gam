@@ -173,7 +173,7 @@ def build_strata(x: np.ndarray) -> list[StratumSpec]:
 
 
 def fit_block_dictionary(x: np.ndarray, n_blocks: int, args: argparse.Namespace) -> Any:
-    return gamfit.block_sparse_dictionary_fit(
+    return gamfit.sae.block_sparse_dictionary_fit(
         np.ascontiguousarray(x, dtype=np.float32),
         int(n_blocks),
         block_size=int(args.block_size),
@@ -436,7 +436,7 @@ def main() -> None:
     }
     payload = {
         "experiment": "wall_fair",
-        "engine": "gamfit.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
+        "engine": "gamfit.sae.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
         "settings": settings,
         "layers": layers,
     }

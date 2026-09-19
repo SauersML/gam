@@ -583,6 +583,7 @@ pub(crate) fn materialize_survival<'a>(
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     };
     // Both supplied and CTN-generated scores have an explicit column here.

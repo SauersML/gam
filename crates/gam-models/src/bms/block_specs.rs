@@ -1417,6 +1417,7 @@ mod runaway_tests {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 

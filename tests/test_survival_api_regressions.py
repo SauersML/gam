@@ -163,7 +163,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
             },
         )
         pred = model.predict(rows)
-        assert isinstance(pred, gamfit.CompetingRisksPrediction)
+        assert isinstance(pred, gamfit.results.CompetingRisksPrediction)
         assert pred.covariance_source is None
         assert pred.endpoint_names == ("cause_1", "cause_2")
         assert pred.cif.shape == (2 * 3, pred.times.size)
@@ -195,7 +195,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit(tmp_path) -> None:
         # landed the fit-side corrected matrix for custom-family (competing
         # risks) fits, so the default mode must work end-to-end here.
         interval_pred = model.predict(rows, interval=0.9)
-        assert isinstance(interval_pred, gamfit.CompetingRisksPrediction)
+        assert isinstance(interval_pred, gamfit.results.CompetingRisksPrediction)
         assert interval_pred.interval_level == 0.9
         assert interval_pred.covariance_source == "smoothing-corrected"
         np.testing.assert_allclose(interval_pred.cif, pred.cif)

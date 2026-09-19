@@ -57,7 +57,7 @@ def run_scale(D: int, K: int, n: int, top_k: int, noise: float, seed: int, n_ite
     rec: dict = {"D": D, "K": K, "n": n, "top_k": top_k, "noise": noise}
     t0 = time.time()
     try:
-        m = gamfit.sae_manifold_fit(
+        m = gamfit.sae.sae_manifold_fit(
             x, K=K, d_atom=1, atom_topology="circle", top_k=top_k,
             n_iter=n_iter, random_state=0,
         )

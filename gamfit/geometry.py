@@ -121,7 +121,7 @@ class ProductManifold:
 # Runtime rebind: replace each stub with the matching `gamfit._rust` pyclass.
 # Static analysis sees the class definitions above; runtime sees the Rust
 # implementation, so existing callers and `isinstance` checks against the
-# top-level `gamfit.X` re-export resolve to the live Rust type.
+# `gamfit.geometry.X` export resolve to the live Rust type.
 # ---------------------------------------------------------------------------
 _rust = rust_module()
 for _name in __all__:
