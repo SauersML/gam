@@ -254,6 +254,7 @@ pub(crate) const ARC_UNPROGRESSING_STALL_SENTINEL: &str = "OUTER_ARC_UNPROGRESSI
 
 /// Verdict produced by folding one accepted outer iterate into
 /// [`CostStallGuard::observe`].
+#[derive(Debug)]
 pub(crate) enum CostStallVerdict {
     /// The objective is still improving (or the no-improvement window has not
     /// yet filled). Keep descending.
@@ -384,10 +385,11 @@ pub(crate) struct CostStallExit {
 /// objective has effectively stopped decreasing. See the `cost_stall` field
 /// doc on [`OuterFirstOrderBridge`] for the full rationale (#1089).
 pub(crate) struct CostStallGuard {
-    /// Relative improvement floor: an accepted step counts as "no improvement"
-    /// when `(best - cost) <= rel_tol * (1 + |best|)`. Derived from the outer
-    /// convergence tolerance so it tracks the configured precision rather than
-    /// a free-standing magic constant.
+    /// Relative improvement floor, used only where the evaluations carry no
+    /// objective band: an accepted step counts as "no improvement" when
+    /// `(best - cost) <= rel_tol * (1 + |best|)`. Where both the incumbent and
+    /// the trial carry a band, the resolution is their sum instead
+    /// ([`Self::resolution_against_incumbent`], #3018).
     rel_tol: f64,
     /// Consecutive accepted-step window with no improvement before declaring
     /// convergence.
@@ -418,6 +420,15 @@ pub(crate) struct CostStallGuard {
     /// Facts staged by the bridge for the sample it is about to observe; adopted
     /// only if that sample becomes the incumbent.
     staged_curvature: Option<IncumbentCurvature>,
+    /// `band_f(V)` at the incumbent's value: the bound on how far the computed
+    /// criterion can sit from the exact one there, from the evaluation's own
+    /// certificate evidence ([`super::decrement_bands::outer_objective_band`]).
+    /// `None` when that evaluation carried no evidence the band is formed from.
+    best_band: Option<f64>,
+    /// `band_f` of the sample the bridge is about to observe
+    /// ([`Self::stage_objective_band`]); adopted only if that sample becomes
+    /// the incumbent.
+    staged_band: Option<f64>,
     /// Set when a filled window at a strict-saddle incumbent grants an escape.
     /// The second-order bridge takes it and adjudicates the incumbent's negative
     /// curvature against the criterion before the escape is spent (#1082).
@@ -490,7 +501,7 @@ pub(crate) struct CostStallGuard {
     /// window was licensed to continue a non-stationary stall on the ARC route;
     /// `None` before the first. What the next licence is judged against (see
     /// [`Self::license_continuation`]).
-    continuation_incumbent: Option<(f64, f64)>,
+    continuation_incumbent: Option<(f64, f64, Option<f64>)>,
     /// #2241 — the most recent trusted accepted iterates `(ρ_i, f_i)` (finite
     /// cost, inner solve converged), newest last, capped at `window + 1`
     /// entries. This is the raw evidence for the published probe scale: during
@@ -521,6 +532,8 @@ impl CostStallGuard {
             best_hessian_psd: None,
             best_curvature: None,
             staged_curvature: None,
+            best_band: None,
+            staged_band: None,
             strict_saddle_refusal: false,
             no_improve_streak: 0,
             infeasible_streak: 0,
@@ -603,7 +616,8 @@ impl CostStallGuard {
     /// licensed window, the search bought either
     ///
     /// * resolved descent: the incumbent improved by more than the criterion's
-    ///   resolution `rel_tol·(1 + |V|)`, the same floor that decides whether one
+    ///   resolution between the two incumbents
+    ///   ([`Self::resolution_between`]), the same test that decides whether one
     ///   step counts as an improvement; or
     /// * stationarity: the incumbent's projected gradient contracted;
     ///
@@ -647,15 +661,16 @@ impl CostStallGuard {
         }
         let licensed = match self.continuation_incumbent {
             None => true,
-            Some((previous_value, previous_grad_norm)) => {
-                let resolution = self.rel_tol * (1.0 + self.best_value.abs());
+            Some((previous_value, previous_grad_norm, previous_band)) => {
+                let resolution = self.resolution_between(previous_band, self.best_band);
                 previous_value - self.best_value > resolution
                     || self.best_grad_norm < previous_grad_norm
                     || self.best_hessian_psd == Some(false)
             }
         };
         if licensed {
-            self.continuation_incumbent = Some((self.best_value, self.best_grad_norm));
+            self.continuation_incumbent =
+                Some((self.best_value, self.best_grad_norm, self.best_band));
         }
         licensed
     }
@@ -779,6 +794,47 @@ impl CostStallGuard {
         self.staged_curvature = curvature;
     }
 
+    /// `band_f(cost)` formed from the certificate evidence the evaluation of
+    /// `cost` published (#3018); `None` when that evidence does not form it.
+    pub(crate) fn objective_band(
+        &self,
+        cost: f64,
+        evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
+    ) -> Option<f64> {
+        super::decrement_bands::outer_objective_band(&self.claim_config, cost, evidence)
+            .ok()
+            .map(|band| band.total())
+            .filter(|band| band.is_finite())
+    }
+
+    /// Stage `band_f` of the sample about to be observed ([`Self::objective_band`]).
+    /// A sample staged with `None` is judged by [`Self::rel_tol`].
+    pub(crate) fn stage_objective_band(&mut self, band: Option<f64>) {
+        self.staged_band = band;
+    }
+
+    /// The smallest decrease between two criterion values the evaluations can
+    /// resolve (#3018).
+    ///
+    /// Each computed value sits within its own `band_f` of the exact criterion,
+    /// so the exact values are ordered as the computed ones are exactly when the
+    /// computed values are further apart than `band_f(V_a) + band_f(V_b)`. A
+    /// decrease inside that sum is one the criterion does not represent: it may
+    /// be rounding in either evaluation. When either value carries no band, the
+    /// relative floor `rel_tol·(1 + |V_best|)` stands in for it.
+    fn resolution_between(&self, band_a: Option<f64>, band_b: Option<f64>) -> f64 {
+        match (band_a, band_b) {
+            (Some(a), Some(b)) if self.best_value.is_finite() => a + b,
+            _ => self.rel_tol * (1.0 + self.best_value.abs()),
+        }
+    }
+
+    /// The resolution of a trial carrying `band` against the incumbent
+    /// ([`Self::resolution_between`]). Infinite before the first incumbent.
+    fn resolution_against_incumbent(&self, band: Option<f64>) -> f64 {
+        self.resolution_between(self.best_band, band)
+    }
+
     fn best_curvature_note(&self) -> String {
         self.best_curvature.as_ref().map_or_else(
             || "no reduced-Hessian facts recorded".to_string(),
@@ -808,6 +864,7 @@ impl CostStallGuard {
         hessian_psd: Option<bool>,
     ) {
         let staged_curvature = self.staged_curvature.take();
+        let staged_band = self.staged_band.take();
         if !value.is_finite() {
             return;
         }
@@ -816,6 +873,7 @@ impl CostStallGuard {
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = staged_curvature;
+        self.best_band = staged_band;
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.window_trials.clear();
@@ -880,6 +938,7 @@ impl CostStallGuard {
         hessian_psd: Option<bool>,
     ) -> CostStallVerdict {
         let staged_curvature = self.staged_curvature.take();
+        let staged_band = self.staged_band.take();
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
@@ -911,13 +970,14 @@ impl CostStallGuard {
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.record_recent(rho, value);
         let improvement = self.best_value - value;
-        let floor = self.rel_tol * (1.0 + self.best_value.abs());
+        let floor = self.resolution_against_incumbent(staged_band);
         if value < self.best_value {
             self.best_value = value;
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
             self.best_hessian_psd = hessian_psd;
             self.best_curvature = staged_curvature;
+            self.best_band = staged_band;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
@@ -1026,6 +1086,7 @@ impl CostStallGuard {
     /// fires before any finite iterate has been recorded (there would be nothing
     /// to halt back to).
     pub(crate) fn observe_infeasible(&mut self, rho: &Array1<f64>) -> CostStallVerdict {
+        self.staged_band = None;
         if self.best_rho.is_none() || !self.best_value.is_finite() {
             // No feasible iterate recorded yet: an infeasible run this early is
             // the inner solver's startup problem, not a converged stall. Keep
@@ -1075,6 +1136,7 @@ impl CostStallGuard {
     /// becomes the incumbent.
     pub(crate) fn observe_rejected_trial(&mut self, rho: &Array1<f64>) {
         self.staged_curvature = None;
+        self.staged_band = None;
         self.infeasible_streak = 0;
         self.record_window_trial(rho);
     }
@@ -1098,6 +1160,7 @@ impl CostStallGuard {
         rho: &Array1<f64>,
         kept_rank: usize,
     ) -> CostStallVerdict {
+        self.staged_band = None;
         if self.best_rho.is_none() || !self.best_value.is_finite() {
             return CostStallVerdict::Continue;
         }
@@ -1166,6 +1229,7 @@ impl CostStallGuard {
         hessian_psd: Option<bool>,
     ) -> CostStallVerdict {
         if !value.is_finite() {
+            self.staged_band = None;
             return CostStallVerdict::Continue;
         }
         if !inner_converged {
@@ -1199,7 +1263,7 @@ impl CostStallGuard {
         // iterate and publishes a degenerate EDF≈1 constant fit. Only adopt the
         // probe when it does not regress the incumbent best.
         let regresses = self.best_value.is_finite()
-            && value > self.best_value + self.rel_tol * (1.0 + self.best_value.abs());
+            && value > self.best_value + self.resolution_against_incumbent(self.staged_band);
         if regresses {
             // Spurious corner: keep the better incumbent. Fold the probe in as an
             // ordinary (non-improving) observation so `best_rho`/`best_grad_norm`
@@ -1220,6 +1284,7 @@ impl CostStallGuard {
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = self.staged_curvature.take();
+        self.best_band = self.staged_band.take();
         self.no_improve_streak = self.window;
         self.publish_stall(rho, value, grad_norm)
     }
@@ -1959,9 +2024,17 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             x.len(),
             self.first_order_evals
         );
-        let evaluated = self
-            .obj
-            .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
+        // #3018: the cost-stall guard judges each decrease against the objective
+        // band this evaluation's own evidence forms. The capture is taken before
+        // any error is surfaced, so a failed evaluation leaves it disarmed.
+        let capture_evidence = self.cost_stall.is_some();
+        if capture_evidence {
+            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
+        }
+        let evaluated = self.obj.eval_with_order(x, OuterEvalOrder::ValueAndGradient);
+        let evidence = capture_evidence
+            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
+        let evaluated = evaluated
             .map_err(|err| into_objective_error("outer eval failed", err))
             .and_then(|eval| {
                 finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)
@@ -2039,7 +2112,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // It is captured HERE rather than at fold time because the snapshot is
         // only valid immediately after this ρ's solve.
         let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
-        if self.cost_stall.is_some() {
+        if let Some(guard) = self.cost_stall.as_ref() {
             // The stall guard's stationarity test must use the bound-PROJECTED
             // gradient norm (KKT residual), not the raw `g_norm` above — a
             // separation fit pins log-λ directions at the bound with a
@@ -2057,6 +2130,9 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                 cost: eval.cost,
                 projected_grad_norm,
                 inner_converged,
+                objective_band: evidence
+                    .as_ref()
+                    .and_then(|evidence| guard.objective_band(eval.cost, evidence)),
             };
             if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
                 self.pending_first_order.remove(0);
@@ -2221,6 +2297,7 @@ impl OuterFirstOrderBridge<'_> {
         let Some(guard) = self.cost_stall.as_mut() else {
             return Ok(());
         };
+            guard.stage_objective_band(sample.objective_band);
             match guard.observe(
                 &sample.rho,
                 sample.cost,
@@ -2755,6 +2832,10 @@ impl OuterSecondOrderBridge<'_> {
             return None;
         };
         guard.stage_sample_curvature(curvature.clone());
+        let band = evidence
+            .as_ref()
+            .and_then(|evidence| guard.objective_band(cost, evidence));
+        guard.stage_objective_band(band);
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
         // box: it counts coordinates pinned at the LOWER bound for the
@@ -3301,7 +3382,11 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // #2954: the online decrement stop decides on the certificate's verdict,
         // which reads this evaluation's own parts. The capture is taken before
         // the error is surfaced, so a failed evaluation leaves it disarmed.
-        let capture_evidence = self.decrement_verdict_config.is_some();
+        //
+        // #3018: the cost-stall guard judges each decrease against the objective
+        // bands this evidence forms, so the guard arms the capture too.
+        let capture_evidence =
+            self.decrement_verdict_config.is_some() || self.cost_stall.is_some();
         if capture_evidence {
             crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
         }
@@ -3656,6 +3741,9 @@ pub(crate) struct PendingOuterEval {
     pub(crate) cost: f64,
     pub(crate) projected_grad_norm: f64,
     pub(crate) inner_converged: bool,
+    /// `band_f(cost)` from this evaluation's own certificate evidence
+    /// ([`CostStallGuard::objective_band`], #3018).
+    pub(crate) objective_band: Option<f64>,
 }
 
 /// The one evaluated trial a trust-region-type solver has not yet accepted or
@@ -3831,6 +3919,7 @@ impl OuterOperatorBridge<'_> {
     /// at.
     fn observe_unprogressing_stall(&mut self, trial: &PendingOuterEval) -> Option<ObjectiveEvalError> {
         let guard = self.cost_stall.as_mut()?;
+        guard.stage_objective_band(trial.objective_band);
         match guard.observe_second_order(
             &trial.rho,
             trial.cost,
@@ -3953,10 +4042,17 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
             x.len(),
         );
-        let eval = self
+        // #3018: see the first-order bridge's matching capture.
+        let capture_evidence = self.cost_stall.is_some();
+        if capture_evidence {
+            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
+        }
+        let evaluated = self
             .obj
-            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
-            .map_err(|err| into_objective_error("outer eval failed", err))?;
+            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian);
+        let evidence = capture_evidence
+            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
+        let eval = evaluated.map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -3968,7 +4064,10 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         }
         self.last_value_grad_rho = Some(x.clone());
         // Hold this trial until the ratio test decides it (#3017).
-        if self.cost_stall.is_some() {
+        if let Some(guard) = self.cost_stall.as_ref() {
+            let objective_band = evidence
+                .as_ref()
+                .and_then(|evidence| guard.objective_band(eval.cost, evidence));
             self.accepted_trials.stage(PendingOuterEval {
                 rho: x.clone(),
                 cost: eval.cost,
@@ -3978,6 +4077,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
                     self.cost_stall_bounds.as_ref(),
                 ),
                 inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
+                objective_band,
             });
         }
         log::debug!(
