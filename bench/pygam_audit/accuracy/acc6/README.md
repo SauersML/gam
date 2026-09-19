@@ -131,6 +131,10 @@ The coal gap to pyGAM is not smoothing-parameter uncertainty.
 On independent datasets drawn from a coal-shaped rate (`coal_like_n150`),
 where the paired test is valid, gamfit's ρ-marginal mean is 1.27% *worse* in
 truth-MSE than the shipped mean (t = +1.74; gamfit replicate table below).
+With the full integral the median change is zero on the same generator. Its
+mean (+15%) comes from four replicates on which the diagnostic's Laplace
+approximation fails at a boundary optimum (see the note under the full-Laplace
+replicate table).
 
 ### Whole `bench_accuracy.py` battery (first-order ρ-marginal vs shipped)
 
@@ -148,23 +152,36 @@ separate noise from signal.
 | chicago | poisson | 4863 | dev | 5/5 | 1.51094 | 1.5108 | 1.51072 | -0.006% | -1.02 |
 | coal | poisson | 150 | dev | 5/5 | 1.17671 | 1.17691 | 1.17551 | -0.131% | -0.61 |
 | faithful | poisson | 200 | dev | 5/5 | 1.29798 | 1.29977 | 1.30016 | +0.027% | +0.51 |
+| gamma_add2_n2000 | gamma | 2000 | truth_mse | 5/5 | 0.0533839 | 0.0530536 | 0.0531111 | +0.092% | +0.31 |
+| gamma_add2_n300 | gamma | 300 | truth_mse | 5/5 | 0.197985 | 0.215007 | 0.219347 | +2.077% | +5.10 * |
 | haberman | binomial | 306 | dev | 4/5 | 1.09102 | 1.08744 | 1.08701 | -0.038% | -1.90 |
 | heart_failure | binomial | 299 | dev | 3/5 | 1.04969 | 1.04263 | 1.0419 | -0.064% | -1.03 |
 | nearsep_n200 | binomial | 200 | truth_mse | 1/5 | 0.0024787 | 0.00278859 | 0.00279569 |  |  |
+| pois_add2_n2000 | poisson | 2000 | truth_mse | 5/5 | 0.0463528 | 0.0468199 | 0.0468365 | +0.033% | +0.88 |
+| pois_add2_n300 | poisson | 300 | truth_mse | 5/5 | 0.154867 | 0.157076 | 0.156929 | -0.121% | -2.59 |
+| pois_lowcount_n500 | poisson | 500 | truth_mse | 5/5 | 0.00500477 | 0.00490617 | 0.00490599 | -0.003% | -0.02 |
 | prostate_pc | binomial | 654 | dev | 5/5 | 1.22828 | 1.22917 | 1.22943 | +0.022% | +3.26 * |
 | trees | gamma | 31 | dev | 5/5 | 0.00724614 | 0.00729679 | 0.00737107 | +1.165% | +1.53 |
 
-Flagged (|t| above the 5% quantile) improvements: 1; regressions: 2.
+Flagged (|t| above the 5% quantile) improvements: 1; regressions: 3.
 
 Gaussian cases (40), all identical to the shipped prediction: add4_n1000, add4_n200, add4_n5000, bike, bump2d_n1000, bump2d_n4000, cake, city_temp, g1d_doppler_n100, g1d_doppler_n2000, g1d_doppler_n500, g1d_sin1_n100, g1d_sin1_n2000, g1d_sin1_n500, g1d_sin3_n100, g1d_sin3_n10000, g1d_sin3_n2000, g1d_sin3_n500, g1d_sin6_n100, g1d_sin6_n10000, g1d_sin6_n2000, g1d_sin6_n500, gagurine, head_circumference, hepatitis, hetero_n3000, hetero_n500, lidar, mcycle, nottem, null3_n200, null3_n2000, outlier_n2000, outlier_n300, penguins_mass, quakes, quakes_space, sleepstudy, toy_interaction, wage.
 
 Every Gaussian case is identical by construction (identity link). On the
 non-Gaussian cases:
 
-- The changes are at most ±1.5%.
+- The changes are at most ±2.1%.
 - Their signs are mixed.
-- The few with a large fold t go both ways: binom_sin2_n500 −0.44%,
-  binom_add4_n1000 +0.47%, prostate_pc +0.02%.
+- The few with a large fold t go both ways: binom_sin2_n500 −0.44% is
+  better, while binom_add4_n1000 +0.47%, gamma_add2_n300 +2.08% and
+  prostate_pc +0.02% are worse.
+
+The pois_add2, pois_lowcount and gamma_add2 rows were run on a build of the
+merged main branch. The other rows were run on the branch point. Each row
+compares the three predictions from the same fits, so the build only matters
+within a row.
+`nearsep_n1000` has no row, because its first fold never finished (see the
+side findings).
 
 ### gamfit on independent replicates (`rho_marginal_replicates.py`, R = 40)
 
@@ -195,19 +212,58 @@ fitted once, and truth-MSE is scored on 2000 fresh covariate draws. `*` marks
 | hetero_n500 | gaussian | -1.11% | -0.89 |
 | outlier_n300 | gaussian | -6.43% | -1.34 |
 | binom_sin2_n3000 | binomial | -1.22% | -1.90 |
+| faithful | poisson | -0.08% | -1.00 |
+| lidar | gaussian | +0.09% | +0.68 |
+| binom_sin2_n500 | binomial | -0.22% | +0.26 |
+| pois_lowcount_n500 | poisson | -2.22% | -0.44 |
 
 ### Full Laplace on independent replicates (R = 40, truth-MSE on a 400-point grid)
 
 These replicates are independent datasets, so the paired t is a valid test
 here, unlike on overlapping folds.
 
-| generator | first-order vs plug-in | t | full Laplace vs plug-in | t |
-|---|---:|---:|---:|---:|
-| binom_sin2_n500 | -0.171% | -4.38 | +2.234% | +2.69 |
-| hetero_n500 | +0.000% | 0 (identity link) | +0.253% | +0.64 |
-| outlier_n300 | +0.000% | 0 (identity link) | +7.767% | +1.25 |
-| pois_lowcount_n500 | +0.160% | +0.94 | +2.070% | +2.95 |
-| sin1_n100 | +0.000% | 0 (identity link) | +1.727% | +2.19 |
+| generator | replicates | first-order vs plug-in | t | median | full Laplace vs plug-in | t | median |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| binom_sin2_n500 | 40/40 | -0.171% | -4.38 | -0.198% | +2.234% | +2.69 | +1.367% |
+| coal_like_n150 | 39/40 (1 non-finite) | +0.070% | +0.63 | +0.000% | +15.453% | +2.12 | -0.000% |
+| hetero_n500 | 40/40 | +0.000% | 0 (identity link) | +0.000% | +0.253% | +0.64 | +0.000% |
+| outlier_n300 | 40/40 | +0.000% | 0 (identity link) | +0.000% | +7.767% | +1.25 | +0.520% |
+| pois_lowcount_n500 | 40/40 | +0.160% | +0.94 | +0.251% | +2.070% | +2.95 | +2.062% |
+| sin1_n100 | 40/40 | +0.000% | 0 (identity link) | +0.000% | +1.727% | +2.19 | +1.605% |
+
+`coal_like_n150` needs a note. Its +15% mean is an artifact of this
+diagnostic, not a property of the integral:
+
+- **The median is zero and the mean is not.** The mean comes from four
+  replicates (seeds 1017, 1025, 1027 and 1029) that lose 73% to 179%. Each one
+  reproduces when rerun on its own.
+- **Why those four lose.** On each of them ρ̂ lies on the diagnostic's lower
+  bound for the null-space penalty (log λ₂ = −15, the linear trend left
+  unpenalized).
+  - Below that bound the LAML surface is flat, and above it the surface rises
+    steeply: +41 LAML units at log λ₂ ≥ 7.4 on seed 1017, and +26 on seed
+    1027.
+  - The finite-difference Hessian across the bound sees a curvature near 1e-3
+    and turns it into a Laplace standard deviation of 27 to 37 in log λ₂.
+  - The Gaussian then puts a third of its mass on fits that shrink the linear
+    trend away. That mass has posterior density e⁻²⁶ to e⁻⁴¹ relative to ρ̂,
+    and on it the truth-MSE is 12 to 14 times the plug-in's.
+  - The remaining nodes sit on the flat side, where the prediction does not
+    move (truth-MSE ratio 1.000).
+  - So the correct integral on these replicates is essentially the plug-in,
+    and the loss measures the Gaussian approximation failing at a boundary
+    optimum.
+- **The non-finite replicate.** Seed 1028 gave a non-finite full-Laplace mean
+  in the batch run, with two active directions. Its ρ̂ is on the same bound.
+  - There the finite-difference Hessian depends on the inner solver's warm
+    start: at the same ρ̂ its eigenvalues were [−0.057, 0.527] in one rerun
+    and [0.069, 0.202] after a different fit history.
+  - Rerun on its own, it has one active direction and is finite, equal to the
+    plug-in to 2e-6.
+  - It is excluded from the row above rather than replaced by the rerun.
+- **The other generators do not have this problem.** On pois_lowcount_n500,
+  binom_sin2_n500 and sin1_n100 the median and the mean agree, so their losses
+  are broad and not driven by a few failed approximations.
 
 ## Conclusion
 
@@ -230,6 +286,13 @@ here, unlike on overlapping folds.
   So the small first-order gain on binom_sin2_n500 is not the leading term of
   a larger gain from doing the integral properly. Doing the integral
   properly reverses it.
+- **On the coal-shaped generator the full integral gains nothing.**
+  - The median change over replicates is zero. The LAML surface is flat
+    along directions in which the prediction does not move.
+  - The large mean loss is the Laplace approximation failing where ρ̂ sits
+    on a boundary, not the integral.
+  - A shipped ρ-integral would need a posterior approximation that survives
+    that case, to buy a change that is zero where the approximation holds.
 - **That is expected.** REML's ρ̂ is a good point estimate for prediction.
   Averaging over ρ adds variance-driven bias through the curvature of g⁻¹
   without reducing error.
@@ -270,6 +333,18 @@ Nothing is shipped:
   1038; gamma_add2_n300 seeds 1011, 1017 and 1037; binom_add4_n1000 seed
   1035; coal_like_n150 seed 1035. These replicates cannot be scored for the
   ρ-marginal mean, so they drop out of its pairing.
+- **`nearsep_n1000` (binomial, n = 1000).** Its first fold never finished.
+  - On the branch point it ran for over two hours of CPU time before the run
+    was stopped.
+  - On a build of merged main it ran for 22 minutes. Its log went silent at
+    58 s, after an outer "cost-stall STUCK (NOT a flat valley)" line, and the
+    run was stopped.
+  - Three native stack samples all place the time inside the outer cost
+    evaluation, in `RemlState::compute_cost_charging` →
+    `block_local_quadrature_correction` →
+    `BlockExcessTarget::excess_with_displaced_neg_score_batch` →
+    `Gam784BlockTarget::likelihood_surface_at`.
+  - The case is not measured here.
 - **`toy_classification` (binomial, n = 5000, six terms).** Its 5 folds did
   not finish inside a 25-minute bench timeout on a 4-CPU box running about
   8 jobs, so it has no row in the battery table. The timeout belongs to this
