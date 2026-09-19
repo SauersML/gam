@@ -13,7 +13,7 @@ Measures, per cell, over the pyGAM audit's data-generating processes
   a `p < p_value_upper_bound` row as rejecting at every alpha above the bound.
 
 Usage:
-    python run.py <cell> <first_rep> <last_rep_exclusive> <out.jsonl>
+    python run.py <cell> <first_rep> <last_rep_exclusive> <out.jsonl> [<stall_seconds>]
     python run.py --summarize <out.jsonl> [<out.jsonl> ...]
 
 Each replicate is seeded `default_rng(1000 + rep)`, the audit's convention, so
@@ -57,38 +57,77 @@ def dataset(cell: str, rep: int) -> dict[str, np.ndarray]:
     return dict(x1=X[:, 0], x2=X[:, 1], x3=X[:, 2], y=y)
 
 
-def run(cell: str, first: int, last: int, out_path: str) -> None:
+def replicate(cell: str, rep: int) -> dict:
     import gamfit
 
     warnings.simplefilter("ignore")
-    family = CELLS[cell][0]
+    data = dataset(cell, rep)
+    record: dict = {"cell": cell, "rep": rep}
+    t0 = time.time()
+    try:
+        model = gamfit.fit(data, FORMULA, family=CELLS[cell][0])
+    except Exception as exc:  # a fit that did not converge is not a fit
+        record["fit_error"] = str(exc)[:300]
+    else:
+        try:
+            rows = model.smooth_significance(data)
+        except Exception as exc:
+            record["raised"] = str(exc)[:300]
+        else:
+            record["rows"] = [
+                {
+                    "name": r["name"],
+                    **{k: r.get(k) for k in KEYS},
+                    "statistic_lr": r.get("statistic_lr"),
+                    "p_value_bound": r.get("p_value_bound"),
+                }
+                for r in rows
+            ]
+    record["seconds"] = round(time.time() - t0, 2)
+    return record
+
+
+def _serve(conn) -> None:
+    while (job := conn.recv()) is not None:
+        conn.send(replicate(*job))
+
+
+def run(cell: str, first: int, last: int, out_path: str, stall_seconds: float | None) -> None:
+    """Run replicates `first..last`, appending one JSON line each.
+
+    With `stall_seconds`, each replicate runs in a worker process and one that
+    has not returned by then is recorded as `stalled` and the worker replaced.
+    That is the harness finishing the study, not a result: the summary reports
+    stalled replicates separately and never scores them.
+    """
     with open(out_path, "a") as out:
+        if stall_seconds is None:
+            for rep in range(first, last):
+                out.write(json.dumps(replicate(cell, rep)) + "\n")
+                out.flush()
+            return
+        import multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        worker = None
         for rep in range(first, last):
-            data = dataset(cell, rep)
-            record: dict = {"cell": cell, "rep": rep}
-            t0 = time.time()
-            try:
-                model = gamfit.fit(data, FORMULA, family=family)
-            except Exception as exc:  # a fit that did not converge is not a fit
-                record["fit_error"] = str(exc)[:300]
+            if worker is None:
+                parent, child = ctx.Pipe()
+                worker = ctx.Process(target=_serve, args=(child,), daemon=True)
+                worker.start()
+            parent.send((cell, rep))
+            if parent.poll(stall_seconds):
+                record = parent.recv()
             else:
-                try:
-                    rows = model.smooth_significance(data)
-                except Exception as exc:
-                    record["raised"] = str(exc)[:300]
-                else:
-                    record["rows"] = [
-                        {
-                            "name": r["name"],
-                            **{k: r.get(k) for k in KEYS},
-                            "statistic_lr": r.get("statistic_lr"),
-                            "p_value_bound": r.get("p_value_bound"),
-                        }
-                        for r in rows
-                    ]
-            record["seconds"] = round(time.time() - t0, 2)
+                worker.kill()
+                worker.join()
+                worker = None
+                record = {"cell": cell, "rep": rep, "stalled": stall_seconds, "seconds": stall_seconds}
             out.write(json.dumps(record) + "\n")
             out.flush()
+        if worker is not None:
+            parent.send(None)
+            worker.join()
 
 
 def kind(row: dict) -> str | None:
@@ -118,13 +157,22 @@ def summarize(paths: list[str]) -> None:
                 rec = json.loads(line)
                 records.setdefault(rec["cell"], []).append(rec)
     for cell, recs in sorted(records.items()):
-        recs = sorted({r["rep"]: r for r in recs}.values(), key=lambda r: r["rep"])
-        fitted = [r for r in recs if "fit_error" not in r]
+        # A replicate re-run after a stall supersedes the stall record.
+        by_rep: dict[int, dict] = {}
+        for r in recs:
+            if "stalled" not in r or r["rep"] not in by_rep:
+                by_rep[r["rep"]] = r
+        recs = sorted(by_rep.values(), key=lambda r: r["rep"])
+        stalled = [r for r in recs if "stalled" in r]
+        fitted = [r for r in recs if "fit_error" not in r and "stalled" not in r]
         raised = [r for r in fitted if "raised" in r]
         rows = [row for r in fitted if "rows" in r for row in r["rows"]]
         kinds = [kind(row) for row in rows]
         print(f"## {cell}: {len(recs)} reps, {len(fitted)} converged fits, "
-              f"{len(recs) - len(fitted)} fit errors, {len(raised)} raised")
+              f"{len(recs) - len(fitted) - len(stalled)} fit errors, {len(raised)} raised, "
+              f"{len(stalled)} stalled (no return within the harness limit; not scored)")
+        if stalled:
+            print(f"stalled reps: {[r['rep'] for r in stalled]}")
         malformed = sum(k is None for k in kinds)
         print(f"rows: {len(rows)}; p_value {kinds.count('p_value')}, "
               f"p_value_upper_bound {kinds.count('p_value_upper_bound')}, "
@@ -167,4 +215,5 @@ if __name__ == "__main__":
     if sys.argv[1] == "--summarize":
         summarize(sys.argv[2:])
     else:
-        run(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+        stall = float(sys.argv[5]) if len(sys.argv) > 5 else None
+        run(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], stall)

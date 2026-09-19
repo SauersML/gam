@@ -596,7 +596,8 @@ class Model:
         ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
+        ``"lawley_lr_fixed_lambda"`` when the family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
         factor is computable at this ``n``, else
         ``"none"`` (the uncorrected reference stands, never weakened).

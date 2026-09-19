@@ -1039,7 +1039,9 @@ struct SmoothTermLrRow {
     /// The human-readable form of `unavailable_reason`, carrying the refit's
     /// own error for the two refit reasons.
     unavailable_message: Option<String>,
-    /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null) ≥ 0`.
+    /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)`: `≥ 0`
+    /// at a known scale, and supported on `[reference_deterministic_offset, ∞)`
+    /// (which starts below zero) when the scale is profiled.
     statistic_lr: Option<f64>,
     /// The statistic's first-order null mean `Σ_j w_j = 2·tr(F_jj) − tr(F_jj²)`
     /// (Wood's `edf1`), which is the `d` the Bartlett factor `c = 1 + Δε/d` is
