@@ -18,7 +18,7 @@ use crate::basis::{
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
-    default_spatial_center_strategy, default_spherical_harmonic_degree,
+    default_spatial_center_strategy, default_spherical_harmonic_degree, low_rank_center_resolution,
     select_r_uniform_subsample_centers, thin_plate_penalty_order,
 };
 use crate::fit_notes::FitNoteSink;
@@ -200,6 +200,9 @@ impl From<DataError> for TermBuilderError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
@@ -3196,7 +3199,7 @@ pub(crate) fn build_smooth_basis(
                 cap_default_spatial_centers(options, default_centers)?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3433,7 +3436,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("curvature smooth requires at least 2 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3501,7 +3504,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("measurejet smooth requires at least 3 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3568,7 +3571,7 @@ pub(crate) fn build_smooth_basis(
                 )?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3885,7 +3888,7 @@ pub(crate) fn build_smooth_basis(
                 CenterStrategy::UserProvided(sampled)
             } else if is_periodic {
                 if centers_explicit {
-                    spatial_center_strategy_for_dimension(centers, cols.len())
+                    default_spatial_center_strategy(centers, cols.len())
                 } else {
                     auto_spatial_center_strategy(centers, cols.len())
                 }
@@ -4506,23 +4509,6 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
 // Data-aware helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn spatial_center_strategy_for_dimension(
-    num_centers: usize,
-    d: usize,
-) -> CenterStrategy {
-    if d <= 3 {
-        // In low-dimensional spatial smooths, an explicit `k` is a resolution
-        // request rather than a request for marginal quantile-midpoint centers.
-        // Use deterministic maximin geometry so Matérn/GP and Duchon REML see a
-        // well-resolved native kernel block with small fill distance instead of
-        // compensating for holes or endpoint under-resolution by over-smoothing
-        // low-noise signals (#504).
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    }
-}
-
 /// Center geometry for a non-periodic Duchon smooth.
 ///
 /// In one dimension the represented domain is the interval between the observed
@@ -4538,13 +4524,17 @@ pub(crate) fn spatial_center_strategy_for_dimension(
 /// equal-mass strategies, where there is no canonical coordinate-aligned grid.
 /// The `Auto` wrapper is retained for inferred 1-D counts so adaptive resolution
 /// can still resize the interval grid before freezing its realized centers.
-fn duchon_center_strategy(num_centers: usize, d: usize, automatic: bool) -> CenterStrategy {
+pub(crate) fn duchon_center_strategy(
+    num_centers: usize,
+    d: usize,
+    automatic: bool,
+) -> CenterStrategy {
     let realized = if d == 1 {
         CenterStrategy::UniformGrid {
             points_per_dim: num_centers,
         }
     } else {
-        spatial_center_strategy_for_dimension(num_centers, d)
+        default_spatial_center_strategy(num_centers, d)
     };
     if automatic {
         CenterStrategy::Auto(Box::new(realized))
@@ -5271,7 +5261,7 @@ fn resolve_nonperiodic_bspline_knotspec(
                 .map_err(|e| e.to_string())?;
         }
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n_knots),
+            num_internal_knots: n_knots,
             placement,
             adaptive: true,
         });
@@ -5769,7 +5759,7 @@ pub(crate) fn default_duchon_center_count(
     // implicit low-rank cap while preserving the user's explicit `centers=`/`k=`
     // request above.  The polynomial null space must still fit, so tiny
     // high-order bases are raised to the smallest admissible count.
-    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
+    let mgcv_default = low_rank_center_resolution(d);
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
     // `default_num_centers` starves `planned_count` below the univariate spline
@@ -6131,7 +6121,7 @@ fn quantile_bspline_knotspec(
         .map_err(|e| e.to_string())?;
     let Some(domain) = domain else {
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         });

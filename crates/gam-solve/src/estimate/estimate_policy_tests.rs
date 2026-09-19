@@ -10,10 +10,7 @@ use super::evaluation::{
     sas_log_delta_edge_barriercostgradhess,
 };
 use super::external_options::resolve_external_family;
-use super::optimizer::{
-    external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-};
-use super::penalty::REML_SEED_SCREENING_RHO_CAP;
+use super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
@@ -25,61 +22,11 @@ use crate::mixture_link::{
     sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials, sas_link_complement,
 };
 use gam_linalg::utils::StableSolver;
-use gam_problem::{
-    InverseLink, LikelihoodSpec, ResponseFamily, SeedRiskProfile, StandardLink,
-};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::atomic::Ordering;
-
-#[test]
-fn gaussian_external_reml_uses_one_analytic_seed() {
-    // The profiled-Gaussian path scores its data-derived `initial.sp` and
-    // summed-penalty diagonal candidates before constructing the outer
-    // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, true);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
-    // Coordinate count must not silently re-enable heuristic global shifts:
-    // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, true);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-    assert_eq!(cfg.max_seeds, 1);
-    assert_eq!(cfg.seed_budget, 3);
-    assert_eq!(cfg.over_smoothing_probe_rho, None);
-}
-
-#[test]
-fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, false);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert_eq!(
-        cfg.max_seeds, 2,
-        "high-dimensional GLM REML must generate the alternate ARC startup basin"
-    );
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "high-dimensional GLM REML must request both generated starts so ARC's GLM cap is not nullified"
-    );
-}
-
-#[test]
-fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, false);
-    assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
-    assert!(cfg.max_seeds > 1);
-    assert_eq!(
-        cfg.seed_budget, 2,
-        "GLM REML must request the alternate ARC startup basin"
-    );
-}
 
 /// Two-smooth fixture for the outer-curvature routing check: an intercept plus
 /// one Gaussian-bump block per covariate, each block under its own
@@ -125,8 +72,16 @@ fn two_smooth_bump_design(n: usize) -> (Array2<f64>, Vec<Array2<f64>>, Vec<f64>)
 /// retired #2359 split held non-Gaussian links to gradient-only BFGS, which
 /// rebuilt that curvature from secant pairs and needed 48-61 outer
 /// iterations on a one-smooth n=1000 logistic fit. Newton steps on the exact
-/// surface converge in a handful; the bound below sits far under the
-/// secant-rebuild count and far over the Newton count.
+/// surface converge in a handful per seed.
+///
+/// `fit.iterations` sums the seeds the multi-start budget runs (two here).
+/// Since #2954 the search stops at the caller's `tol` on each component's own
+/// scale rather than at `tol·(1 + |V|)`, a band ~340× looser at this fit's
+/// `V ≈ 341`: each binomial seed now takes 12 exact-Newton iterations (an
+/// `e⁻¹`-per-step approach along the heavily penalised coordinate, then the
+/// quadratic phase), 24 in all, where the looser band stopped each at ~10. The
+/// bound is two seeds of fifteen, still under the secant rebuild's count at
+/// the looser band.
 #[test]
 fn non_gaussian_search_converges_in_newton_iterations() {
     let n = 600;
@@ -191,7 +146,7 @@ fn non_gaussian_search_converges_in_newton_iterations() {
         .unwrap_or_else(|error| panic!("{name}: fit failed: {error:?}"));
         assert!(fit.outer_converged, "{name}: outer search must converge");
         assert!(
-            fit.iterations <= 20,
+            fit.iterations <= 30,
             "{name}: {} outer iterations; the exact-Hessian search converges in a \
              handful, a secant rebuild of the same curvature takes several dozen",
             fit.iterations
@@ -2359,10 +2314,9 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, false);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
-    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)
+    freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None)
         .expect("the anchor must succeed on a pristine state");
     let anchored_bits = pristine.frozen_beta_phi.load(Ordering::Relaxed);
     assert_ne!(
@@ -2390,7 +2344,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         Some(&[3.0]),
-        &seed_config,
     )
     .expect("the anchor must succeed regardless of what a caller donated");
     assert_eq!(
@@ -2435,7 +2388,6 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         &resolved,
         1,
         None,
-        &seed_config,
     );
     assert!(
         matches!(refusal, Err(EstimationError::InvalidInput(_))),
@@ -2737,7 +2689,7 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         // the seeded optimum, or re-certify it in place?
         //
         // The cache hit logs `action=resume-and-recertify` and installs the
-        // prior fit's ρ as `initial_rho` with `screen_initial_rho = false`
+        // prior fit's ρ as `initial_rho`
         // (`rho_optimizer/run.rs`, the `CacheSeedDecision::ExactFinal` arm),
         // plus the prior β as an inner seed. If that point is already
         // certified, the outer search has nothing to do and must return it
