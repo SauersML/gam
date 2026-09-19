@@ -274,7 +274,7 @@ fn convergence_text(convergence: &SummaryConvergence) -> String {
         "NOT certified"
     };
     let mut text = format!(
-        "{verdict}; inner P-IRLS {}; {} outer iterations",
+        "{verdict}; inner P-IRLS: {}; {} outer iterations",
         convergence.inner_status, convergence.outer_iterations
     );
     match &convergence.outer {
@@ -390,7 +390,7 @@ mod tests {
             coefficient_se_source: Some("smoothing-corrected".to_string()),
             convergence: Some(SummaryConvergence {
                 certified: true,
-                inner_status: "converged".to_string(),
+                inner_status: "Converged".to_string(),
                 outer_iterations: 7,
                 outer: Some(SummaryOuterCertificate {
                     kind: "analytic_gradient".to_string(),
@@ -436,7 +436,7 @@ Conditional AIC: 155.5
 Corrected AIC: 157.25
 Effective dof: 6.875
 Coefficient covariance: smoothing-corrected
-Convergence: certified; inner P-IRLS converged; 7 outer iterations; analytic_gradient stationarity: projected gradient 1.5e-09 <= bound 1e-06; Hessian positive semidefinite
+Convergence: certified; inner P-IRLS: Converged; 7 outer iterations; analytic_gradient stationarity: projected gradient 1.5e-09 <= bound 1e-06; Hessian positive semidefinite
 ";
         assert_eq!(render_summary_text(&fixed_small_model()), golden);
     }

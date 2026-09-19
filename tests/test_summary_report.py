@@ -76,24 +76,27 @@ def test_gaussian_deviance_explained_is_one_minus_deviance_over_null_deviance():
     assert summary.deviance_explained_unavailable is None
 
 
-def test_linear_gaussian_deviance_explained_is_the_ols_r_squared():
+def test_linear_gaussian_deviance_explained_is_the_fits_r_squared():
+    # The linear coefficient carries a REML-selected ridge, so the fit is not
+    # OLS; the reference is the R-squared of the fit's own fitted values.
     df = _gaussian_frame()
-    x = df["x1"].to_numpy()
     y = df["y"].to_numpy()
     n = len(y)
-    summary = gamfit.fit(df, "y ~ x1").summary()
+    model = gamfit.fit(df, "y ~ x1")
+    summary = model.summary()
 
-    design = np.column_stack([np.ones(n), x])
-    beta, *_ = np.linalg.lstsq(design, y, rcond=None)
-    rss = float(np.sum((y - design @ beta) ** 2))
+    rss = float(np.sum((y - np.asarray(model.predict(df))) ** 2))
     tss = float(np.sum((y - y.mean()) ** 2))
+    assert summary.deviance == pytest.approx(rss, rel=1e-12)
     r_squared = 1.0 - rss / tss
-    assert summary.deviance_explained == pytest.approx(r_squared, rel=1e-9)
+    assert 0.0 <= summary.deviance_explained <= 1.0
+    assert summary.deviance_explained == pytest.approx(r_squared, rel=1e-12)
+    # Residual df is n minus the effective degrees of freedom.
     assert summary.adjusted_r_squared == pytest.approx(
-        1.0 - (1.0 - r_squared) * (n - 1) / (n - 2), rel=1e-9
+        1.0 - (rss / (n - summary.edf_total)) / (tss / (n - 1)), rel=1e-12
     )
-    rows = {row["name"]: row for row in summary.parametric_terms}
-    assert rows["x1"]["estimate"] == pytest.approx(beta[1], rel=1e-9)
+    assert summary.parametric_statistic == "t"
+    assert [row["name"] for row in summary.parametric_terms] == ["Intercept", "x1"]
 
 
 def test_poisson_null_deviance_is_the_intercept_only_deviance():

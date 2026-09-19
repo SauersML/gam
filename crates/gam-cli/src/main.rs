@@ -61,9 +61,7 @@ pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 
-pub(crate) use gam::smooth::{
-    BoundedCoefficientPriorSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
-};
+pub(crate) use gam::smooth::{SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 // #1521: relocated DOWN into gam_terms::smooth (was families::...::drivers).
 pub(crate) use gam::terms::smooth::build_term_collection_design;
 
