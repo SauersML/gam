@@ -1,4 +1,4 @@
-"""Probe which (family, link) cells gamfit 0.1.267 accepts through the Python API."""
+"""Probe which (family, link) cells the audited gamfit wheel accepts through the Python API."""
 import numpy as np, pandas as pd, gamfit, warnings
 warnings.filterwarnings("ignore")
 rng = np.random.default_rng(0)

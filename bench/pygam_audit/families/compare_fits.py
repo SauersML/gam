@@ -1,4 +1,4 @@
-"""Head-to-head fit quality: gamfit 0.1.267 vs pyGAM 0.12.0 per response family.
+"""Head-to-head fit quality: the audited gamfit wheel vs pyGAM 0.12.0 per response family.
 
 Metric: RMSE of the fitted mean (response scale) against the known truth on a
 held-out grid, 95% interval coverage of the true mean, wall time.  pyGAM is run

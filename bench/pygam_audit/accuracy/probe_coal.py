@@ -1,6 +1,6 @@
 import os; os.environ["RAYON_NUM_THREADS"]="1"
 import numpy as np, gamfit, warnings; warnings.filterwarnings("ignore")
-import pygam.datasets.load_datasets as L; L.PATH=os.path.abspath("pygam_data")
+import pygam.datasets.load_datasets as L; L.PATH=os.environ.get("PYGAM_DATA_DIR", os.path.expanduser("~/.cache/gamfit-bench/pygam_data"))
 from pygam import PoissonGAM, s
 from sklearn.model_selection import KFold
 X,y=L.coal(); x=X[:,0]; y=np.asarray(y,float)

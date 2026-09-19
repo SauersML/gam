@@ -26,12 +26,16 @@ def worst(v, o, s):
 
 for sh in shapes:
     o, s = SH[sh]
-    t = time.time()
+    t = time.time(); c = time.process_time()
     m = gamfit.fit(d, f"y ~ s(x, shape={sh})")
+    print(sh, f"fit wall {time.time()-t:.1f}s cpu {time.process_time()-c:.1f}s", m.summary().convergence.get("certified"), flush=True)
+    t = time.time(); c = time.process_time()
     r = m.predict({"x": g}, interval=0.95)
+    print(sh, f"predict wall {time.time()-t:.1f}s cpu {time.process_time()-c:.1f}s", flush=True)
+    t = time.time()
     name = [b.name for b in m.term_blocks if b.kind != "intercept"][0]
     p = m.partial_dependence(name, d, grid=g) if "data" in m.partial_dependence.__code__.co_varnames else m.partial_dependence(name, grid=g)
-    print(sh, f"fit {time.time()-t:.1f}s",
+    print(sh, f"pdep {time.time()-t:.1f}s",
           "plugin", f"{worst(r['mean_plugin'], o, s):.2e}",
           "post_mean", f"{worst(r['posterior_mean'], o, s):.2e}",
           "lower", f"{worst(r['posterior_mean_lower'], o, s):.2e}",

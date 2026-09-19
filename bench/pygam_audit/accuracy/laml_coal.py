@@ -4,7 +4,7 @@ null-space ridge (double penalty), sum-to-zero, intercept. Poisson log link."""
 import os; os.environ["RAYON_NUM_THREADS"]="1"
 import numpy as np, warnings; warnings.filterwarnings("ignore")
 from scipy.interpolate import BSpline
-import pygam.datasets.load_datasets as L; L.PATH=os.path.abspath("pygam_data")
+import pygam.datasets.load_datasets as L; L.PATH=os.environ.get("PYGAM_DATA_DIR", os.path.expanduser("~/.cache/gamfit-bench/pygam_data"))
 from sklearn.model_selection import KFold
 import gamfit
 X,y=L.coal(); x=X[:,0]; y=np.asarray(y,float)

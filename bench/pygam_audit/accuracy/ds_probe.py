@@ -1,6 +1,6 @@
 import numpy as np, os
 import pygam.datasets.load_datasets as L
-L.PATH=os.path.abspath('pygam_data')
+L.PATH=os.environ.get("PYGAM_DATA_DIR", os.path.expanduser("~/.cache/gamfit-bench/pygam_data"))
 for name in ['mcycle','coal','faithful','wage','trees','default','cake','hepatitis','toy_classification','head_circumference','chicago','toy_interaction']:
     kw={'n':5000} if name=='toy_interaction' else {}
     np.random.seed(0)

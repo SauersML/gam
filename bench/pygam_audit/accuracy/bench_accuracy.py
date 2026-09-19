@@ -52,7 +52,10 @@ warnings.filterwarnings("ignore")
 
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE / "results"
-PYGAM_DATA = HERE / "pygam_data"
+PYGAM_DATA = Path(os.environ.get("PYGAM_DATA_DIR", Path.home() / ".cache" / "gamfit-bench" / "pygam_data"))
+PYGAM_DATA_URL = "https://raw.githubusercontent.com/dswah/pyGAM/v0.12.0/pygam/datasets/{}.csv"
+PYGAM_DATASETS = ("cake", "chicago", "coal", "default", "faithful", "head_circumference",
+                  "hepatitis_A_bulgaria", "mcycle", "trees", "wage")
 REPO_DATASETS = Path("/home/user/gam/bench/datasets")
 
 import gamfit  # noqa: E402
@@ -60,7 +63,21 @@ import pygam  # noqa: E402
 from pygam import GAM, LinearGAM, LogisticGAM, PoissonGAM, GammaGAM, s, f, te, l  # noqa: E402
 import pygam.datasets.load_datasets as L  # noqa: E402
 
-L.PATH = str(PYGAM_DATA)  # the 0.12.0 wheel ships loaders without the CSVs
+
+
+def _fetch_pygam_data():
+    """The 0.12.0 wheel ships loaders without the CSVs; fetch them from the tag into a cache (never vendored)."""
+    import urllib.request
+
+    PYGAM_DATA.mkdir(parents=True, exist_ok=True)
+    for name in PYGAM_DATASETS:
+        dest = PYGAM_DATA / f"{name}.csv"
+        if not dest.exists():
+            urllib.request.urlretrieve(PYGAM_DATA_URL.format(name), dest)
+
+
+_fetch_pygam_data()
+L.PATH = str(PYGAM_DATA)
 
 
 # ----------------------------------------------------------------------------
