@@ -2422,7 +2422,7 @@ fn spherical_design_route(
     if matches!(spec.method, SphereMethod::Harmonic) {
         let max_degree = spec
             .max_degree
-            .unwrap_or_else(|| default_spherical_harmonic_degree(data.nrows()));
+            .unwrap_or_else(|| default_spherical_harmonic_degree(data.nrows(), spec.penalty_order));
         if !(1..=4).contains(&spec.penalty_order) {
             crate::bail_invalid_basis!(
                 "spherical-harmonic {context} penalty_order must be one of 1, 2, 3, 4; got {}",

@@ -11,13 +11,13 @@
 //! here unchanged, so no front door resolves a basis of its own.
 //!
 //! An omitted basis size takes the formula front door's univariate default for
-//! the same kind on the same data: the open B-spline internal-knot heuristic,
+//! the same kind on the same data: the open B-spline internal-knot pilot,
 //! the cyclic basis dimension, and the 1-D Duchon center count.
 
 use super::*;
 use crate::term_builder::{
-    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, default_cyclic_basis_dim,
-    default_duchon_center_count, heuristic_knots_for_column, univariate_spline_basis_dim,
+    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, cyclic_basis_dim_for_column,
+    default_duchon_center_count, pilot_internal_knots_for_column, univariate_spline_basis_dim,
 };
 
 /// Where a position basis's knots or centers come from.
@@ -216,7 +216,7 @@ fn bspline_locations(
         let internal_knots = match request {
             PositionBasisLocations::Given(knots) => return Ok((knots, degree)),
             PositionBasisLocations::Count(count) => count,
-            PositionBasisLocations::Default => heuristic_knots_for_column(t),
+            PositionBasisLocations::Default => pilot_internal_knots_for_column(t),
         };
         let auto = auto_knot_vector_1d_quantile(t, internal_knots, degree)
             .map_err(|err| err.to_string())?;
@@ -233,7 +233,7 @@ fn bspline_locations(
         }
         PositionBasisLocations::Count(count) => count,
         PositionBasisLocations::Default => {
-            default_cyclic_basis_dim(heuristic_knots_for_column(t), degree)
+            cyclic_basis_dim_for_column(t, degree)
         }
     };
     if num_basis < degree + 1 {
@@ -286,13 +286,13 @@ pub struct ResolvedBasisLocations {
 /// `duchon_basis(x)` the centers of `duchon(x)`:
 ///
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the
-///   internal-knot count (the request's, or [`heuristic_knots_for_column`])
+///   internal-knot count (the request's, or [`pilot_internal_knots_for_column`])
 ///   is placed at quantiles by [`auto_knot_vector_1d_quantile`].
 /// - Cyclic B-spline: an explicit grid is used as given; otherwise the uniform
 ///   grid over `[min t, max t]` with one cyclic control per interval. An
 ///   integer `K` names the same dimension it does for an open basis,
 ///   `K + degree + 1` controls; the default is the formula's cyclic basis
-///   dimension [`default_cyclic_basis_dim`].
+///   dimension [`cyclic_basis_dim_for_column`].
 /// - Duchon: an explicit center vector is used as given; otherwise the center
 ///   count (the request's, at least 2, or the formula's 1-D Duchon default) is
 ///   placed by equal mass.
@@ -321,7 +321,7 @@ pub fn resolve_basis_locations_1d(
         PositionBasisKind::BSpline if !periodic => {
             let internal_knots = match request {
                 PositionBasisLocations::Count(count) => count,
-                _ => heuristic_knots_for_column(t),
+                _ => pilot_internal_knots_for_column(t),
             };
             let auto = auto_knot_vector_1d_quantile(t, internal_knots, order)
                 .map_err(|err| err.to_string())?;
@@ -334,7 +334,7 @@ pub fn resolve_basis_locations_1d(
         PositionBasisKind::BSpline => {
             let num_basis = match request {
                 PositionBasisLocations::Count(count) => count + order + 1,
-                _ => default_cyclic_basis_dim(heuristic_knots_for_column(t), order),
+                _ => cyclic_basis_dim_for_column(t, order),
             };
             let low = t.iter().copied().fold(f64::INFINITY, f64::min);
             let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -580,7 +580,7 @@ mod tests {
             None,
         )
         .expect("default open B-spline");
-        let internal = heuristic_knots_for_column(t.view());
+        let internal = pilot_internal_knots_for_column(t.view());
         assert_eq!(open.kind, PositionBasisKind::BSpline);
         assert_eq!(open.display_kind, "bspline");
         assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
@@ -597,7 +597,7 @@ mod tests {
             Some(1.0),
         )
         .expect("default cyclic B-spline");
-        let num_basis = default_cyclic_basis_dim(internal, DEFAULT_BSPLINE_DEGREE);
+        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         assert_eq!(cyclic.penalty.nrows(), num_basis);
         let origin = t.iter().copied().fold(f64::INFINITY, f64::min);
@@ -630,7 +630,6 @@ mod tests {
     #[test]
     fn helper_locations_take_the_formula_defaults() {
         let t = positions();
-        let internal = heuristic_knots_for_column(t.view());
         let open = resolve_basis_locations_1d(
             t.view(),
             PositionBasisKind::BSpline,
@@ -653,7 +652,7 @@ mod tests {
             true,
         )
         .expect("default cyclic grid");
-        let num_basis = default_cyclic_basis_dim(internal, DEFAULT_BSPLINE_DEGREE);
+        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         let low = t.iter().copied().fold(f64::INFINITY, f64::min);
         let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);

@@ -504,13 +504,11 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 }
 
 /// Sample-size growth exponent of the production center budget:
-/// [`default_num_centers`] grows as `n^0.4`, and the adaptive pilot grows at the
-/// same rate so the two scale together.
+/// [`default_num_centers`] grows as `n^0.4`.
 const CENTER_GROWTH_EXPONENT: f64 = 0.4;
 
 /// Rows per center below which a center count is not data-supported. The
-/// production budget's `min(K_MIN, n / 8)` floor engages only at this density,
-/// and the adaptive pilot anchors its growth at the same density.
+/// production budget's `min(K_MIN, n / 8)` floor engages only at this density.
 const ROWS_PER_SUPPORTED_CENTER: usize = 8;
 
 /// Conservative center count for a *secondary* (distributional) predictor's
@@ -532,59 +530,141 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
-/// Starting center count for saturation-driven spatial fitting.
+/// Rank of the penalized function space that `n` rows resolve under an
+/// order-`m` roughness penalty in `d` dimensions: the smallest integer
+/// `r >= n^{d/(2m+d)}`.
 ///
-/// The structural minimum (`d + 1` polynomial directions plus one radial
-/// direction) is only enough to make the algebra identifiable. It is not an
-/// adequate pilot function space: structure orthogonal to that single radial
-/// direction is absorbed into the residual, so REML can legitimately shrink
-/// the direction and report EDF below its ceiling even when the surface is
-/// badly under-resolved (#1689). The pilot therefore starts from the low-rank
-/// resolution `k0 = 10 * 3^(d - 1)` while the sample holds at most eight rows
-/// per pilot center (`n <= 8 * k0`, the density at which the production
-/// budget's floor engages), and beyond that grows at the production budget's
-/// own `n^0.4` rate: `ceil(k0 * (n / (8 * k0))^0.4)`.
+/// This is the rate at which the effective dimension of an order-`m`
+/// penalized smoother on `d` covariates grows at its REML/GCV-optimal
+/// smoothing parameter: the eigenvalues of an order-`m` roughness penalty over
+/// a `d`-dimensional domain grow as `j^{2m/d}`, so the count of directions the
+/// optimally smoothed fit keeps grows as `n^{d/(2m+d)}` (Wahba, Utreras;
+/// Claeskens, Krivobokova & Opsomer 2009 for penalized splines). A basis whose
+/// penalized span holds fewer directions biases the fit before λ is chosen; one
+/// holding more is harmless because the penalty shrinks what the data do not
+/// support. It is therefore the smallest data-derived basis resolution — the
+/// *pilot* — and the adequacy loop grows past it only on the fit's own evidence.
 ///
-/// A constant pilot cannot track the resolution more data supports, and the
-/// growth loop cannot always see what a pilot misses. On the #1561 2-D
-/// default-rank Duchon fixture at n=1500 a 30-center pilot reaches truth rmse
-/// 0.0214 against 0.0137–0.0142 for 49–187 centers, while its EDF sits 1.25
-/// below capacity, the REML resolution of that EDF is 0.31, and the #2774
-/// lack-of-fit test reads p = 0.156: no evidence the fit keeps says "grow". The
-/// grown pilot is 63 centers there, and 37 at the fixture's n=400 arm, between
-/// the 30- and 60-center fits that both already beat mgcv.
-///
-/// Capped by [`default_num_centers`] so the pilot never exceeds the validated
-/// production basis.
-pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    let low_rank_resolution = 10usize
-        .saturating_mul(3usize.saturating_pow(d.saturating_sub(1).min(u32::MAX as usize) as u32));
-    let supported_rows = low_rank_resolution.saturating_mul(ROWS_PER_SUPPORTED_CENTER);
-    let pilot = if n > supported_rows {
-        let density_ratio = n as f64 / supported_rows as f64;
-        (low_rank_resolution as f64 * density_ratio.powf(CENTER_GROWTH_EXPONENT)).ceil() as usize
-    } else {
-        low_rank_resolution
-    };
-    pilot.min(default_num_centers(n, d)).min(n).max(1)
+/// Computed exactly in integers wherever the powers fit in `u128`, so a sample
+/// size that is a perfect power (`n = 10^5`, `m = 2`, `d = 1`) is not bumped
+/// past its exact rank by floating-point rounding.
+pub fn penalized_resolution_rank(n: usize, d: usize, m: usize) -> usize {
+    let d = d.max(1) as u32;
+    let q = 2u32.saturating_mul(m.max(1) as u32).saturating_add(d);
+    least_root_bound(n, d, q)
 }
 
-/// Next evidence-backed center count for a saturated spatial basis, bounded by
-/// the already validated production-default resolution.
-///
-/// Growth is geometric so the number of certified refits is logarithmic. The
-/// ceiling is supplied by the owning workflow because it depends on the
-/// spatial family/dimension and resource plan; the standard formula workflow
-/// uses [`default_num_centers`]. Adaptive resolution may therefore avoid work
-/// below the previous default, but can never turn an ordinary fit into an
-/// unvalidated row-rank dense basis. `None` means the validated function-space
-/// ceiling has been reached.
-pub fn expanded_num_centers(current: usize, ceiling: usize) -> Option<usize> {
-    if current >= ceiling {
-        return None;
+/// Per-axis share of [`penalized_resolution_rank`] for a `d`-margin tensor
+/// product: the least integer `r` with `r^d >= n^{d/(2m+d)}`, i.e.
+/// `r^{2m+d} >= n`, so the product of `d` equal margins holds the joint rank.
+pub fn per_axis_resolution_rank(n: usize, d: usize, m: usize) -> usize {
+    let d = d.max(1) as u32;
+    let q = 2u32.saturating_mul(m.max(1) as u32).saturating_add(d);
+    least_root_bound(n, 1, q)
+}
+
+/// The least integer `r >= 1` with `r^den >= n^num` (`n` itself for `n <= 1`),
+/// exact in integers wherever the powers fit in `u128`.
+fn least_root_bound(n: usize, num: u32, den: u32) -> usize {
+    if n <= 1 {
+        return n;
     }
-    let expanded = current.saturating_mul(2).min(ceiling);
-    (expanded > current).then_some(expanded)
+    let g = greatest_common_divisor(num, den);
+    let (num, den) = (num / g, den / g);
+    let resolves = |r: usize| -> bool {
+        match ((r as u128).checked_pow(den), (n as u128).checked_pow(num)) {
+            (Some(lhs), Some(rhs)) => lhs >= rhs,
+            _ => f64::from(den) * (r as f64).ln() >= f64::from(num) * (n as f64).ln(),
+        }
+    };
+    let estimate = (n as f64).powf(f64::from(num) / f64::from(den));
+    let mut rank = (estimate.floor() as usize).max(1);
+    while rank > 1 && resolves(rank - 1) {
+        rank -= 1;
+    }
+    while !resolves(rank) {
+        rank += 1;
+    }
+    rank
+}
+
+fn greatest_common_divisor(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+/// The least derivative order `m` whose roughness penalty is a reproducing
+/// kernel norm on `d`-dimensional space: `2m > d`, i.e. `m = ⌊d/2⌋ + 1`.
+///
+/// A radial smooth's penalty must at least embed its function space in the
+/// continuous functions (Duchon's condition), so this is the smoothness a
+/// radial basis can be assumed to carry without reading its kernel options.
+/// It is the most demanding admissible order for the pilot's rank, since a
+/// rougher order leaves more directions for the fit to resolve.
+pub const fn minimal_embedding_order(d: usize) -> usize {
+    d / 2 + 1
+}
+
+/// Starting center count for evidence-driven spatial fitting.
+///
+/// The term's unpenalized polynomial null space (`nullspace_dim` columns) plus
+/// the [`penalized_resolution_rank`] of its minimal-embedding-order penalty:
+/// the smallest basis whose penalized span holds every direction an optimally
+/// smoothed fit on `n` rows keeps. It grows with `n` without bound other than
+/// the validated production basis [`default_num_centers`] and the row count;
+/// the adequacy loop refines it further only when the converged fit's own
+/// evidence says the surface is under-resolved (#1689).
+pub fn starting_num_centers(n: usize, d: usize, nullspace_dim: usize) -> usize {
+    let rank = penalized_resolution_rank(n, d, minimal_embedding_order(d));
+    nullspace_dim
+        .saturating_add(rank)
+        .min(default_num_centers(n, d))
+        .min(n)
+        .max(1)
+}
+
+/// One level of uniform nested refinement of a knot grid: every one of the
+/// `internal_knots + 1` intervals is split at its midpoint, giving
+/// `2 * internal_knots + 1` internal knots.
+///
+/// Nesting is what makes the refined fit comparable to the current one: the
+/// old spline space is a subspace of the new, so the refined REML fit can only
+/// resolve *more*, and the evidence comparison in the adequacy loop decides
+/// whether it did. Splitting each interval once is the least refinement that
+/// is both nested and uniform — an integer refinement ratio is required for
+/// nesting and one split per interval is the smallest integer ratio above one.
+pub const fn refined_internal_knots(internal_knots: usize) -> usize {
+    internal_knots.saturating_mul(2).saturating_add(1)
+}
+
+/// One level of uniform nested refinement of a periodic knot grid: each of the
+/// `num_basis` intervals around the loop is split once (see
+/// [`refined_internal_knots`]).
+pub const fn refined_periodic_basis(num_basis: usize) -> usize {
+    num_basis.saturating_mul(2)
+}
+
+/// One level of refinement of a radial center set: every existing center's
+/// cell receives one new center, the radial analogue of splitting every knot
+/// interval once. The old centers are kept, so the new span contains the old.
+pub const fn refined_num_centers(centers: usize) -> usize {
+    centers.saturating_mul(2)
+}
+
+/// One level of refinement of a spherical-harmonic basis of maximum degree
+/// `max_degree`: the least degree whose non-constant harmonic span
+/// `L(L + 2)` at least matches one refinement of the current span (every
+/// existing direction paired with one new one), mirroring
+/// [`refined_num_centers`] for the harmonic chart.
+pub fn refined_harmonic_degree(max_degree: usize) -> usize {
+    let target = refined_num_centers(max_degree.saturating_mul(max_degree.saturating_add(2)));
+    let mut degree = max_degree.saturating_add(1);
+    while degree.saturating_mul(degree.saturating_add(2)) < target {
+        degree += 1;
+    }
+    degree
 }
 
 /// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
@@ -3234,34 +3314,101 @@ mod saturation_escalation_tests {
     use super::*;
 
     #[test]
-    fn starting_count_is_a_supported_low_rank_pilot_capped_by_default() {
-        // Up to eight rows per pilot center the pilot is the low-rank resolution.
-        assert_eq!(starting_num_centers(240, 2), 30);
-        assert_eq!(starting_num_centers(80, 1), 10);
-        // Beyond that density it grows at the production budget's n^0.4 rate,
-        // ceil(30 * (n / 240)^0.4) in 2-D (#1561).
-        assert_eq!(starting_num_centers(400, 2), 37);
-        assert_eq!(starting_num_centers(800, 2), 49);
-        assert_eq!(starting_num_centers(1500, 2), 63);
-        assert_eq!(starting_num_centers(100_000, 1), 174);
-        assert!(starting_num_centers(100_000, 1) <= default_num_centers(100_000, 1));
-        // The generic conditioning ceiling is `n / 4` and therefore reports
-        // zero below four rows; the pilot retains the basis-wide one-center
-        // degenerate minimum, which materialization subsequently raises to the
-        // exact polynomial floor for the requested family.
-        assert_eq!(starting_num_centers(3, 5), 1);
-        assert_eq!(starting_num_centers(1, 2), 1);
+    fn resolution_rank_is_the_exact_penalized_rate() {
+        // Cubic-spline penalty (m = 2) on one axis: ceil(n^{1/5}).
+        assert_eq!(penalized_resolution_rank(100, 1, 2), 3);
+        assert_eq!(penalized_resolution_rank(1_000, 1, 2), 4);
+        assert_eq!(penalized_resolution_rank(10_000, 1, 2), 7);
+        // n = 10^5 is an exact fifth power: the rank is exactly 10, not the
+        // 11 a floating-point `ceil(10.000000000000002)` would give.
+        assert_eq!(penalized_resolution_rank(100_000, 1, 2), 10);
+        assert_eq!(penalized_resolution_rank(100_001, 1, 2), 11);
+        // Thin-plate order in 2-D (m = 2): ceil(n^{1/3}); 1000 is a cube.
+        assert_eq!(penalized_resolution_rank(1_000, 2, 2), 10);
+        assert_eq!(penalized_resolution_rank(1_001, 2, 2), 11);
+        assert_eq!(penalized_resolution_rank(0, 2, 2), 0);
+        assert_eq!(penalized_resolution_rank(1, 2, 2), 1);
+        // Growth is unbounded in n: no constant ceiling.
+        let mut previous = 0;
+        for exponent in 2..=9 {
+            let rank = penalized_resolution_rank(10usize.pow(exponent), 1, 2);
+            assert!(rank >= previous);
+            previous = rank;
+        }
+        assert!(penalized_resolution_rank(1_000_000_000, 1, 2) >= 63);
+        // Very high dimensions fall back to the log comparison without
+        // overflow and still satisfy r^den >= n^num.
+        let rank = penalized_resolution_rank(1_000_000, 16, 9);
+        assert!((rank as f64).ln() * 34.0 >= 16.0 * (1.0e6f64).ln() - 1e-9);
+        assert!(((rank - 1) as f64).ln() * 34.0 < 16.0 * (1.0e6f64).ln());
     }
 
     #[test]
-    fn saturated_expansion_doubles_then_pins_at_validated_ceiling() {
-        assert_eq!(expanded_num_centers(30, 157), Some(60));
-        assert_eq!(expanded_num_centers(120, 157), Some(157));
-        assert_eq!(expanded_num_centers(157, 157), None);
-        assert_eq!(
-            expanded_num_centers(usize::MAX - 1, usize::MAX),
-            Some(usize::MAX)
-        );
+    fn per_axis_rank_splits_the_joint_tensor_rate() {
+        // Two cubic-penalty margins (m = 2, d = 2): least r with r^6 >= n.
+        assert_eq!(per_axis_resolution_rank(100, 2, 2), 3);
+        assert_eq!(per_axis_resolution_rank(10_000, 2, 2), 5);
+        assert_eq!(per_axis_resolution_rank(15_625, 2, 2), 5);
+        assert_eq!(per_axis_resolution_rank(15_626, 2, 2), 6);
+        // The product of the per-axis ranks holds the joint rank.
+        for n in [50usize, 999, 12_345, 400_000] {
+            for d in 2..=4 {
+                let r = per_axis_resolution_rank(n, d, 2);
+                assert!(r.pow(d as u32) >= penalized_resolution_rank(n, d, 2));
+                assert!((r - 1).pow(d as u32) < penalized_resolution_rank(n, d, 2));
+            }
+        }
+    }
+
+    #[test]
+    fn minimal_embedding_order_is_the_least_rkhs_order() {
+        assert_eq!(minimal_embedding_order(1), 1);
+        assert_eq!(minimal_embedding_order(2), 2);
+        assert_eq!(minimal_embedding_order(3), 2);
+        assert_eq!(minimal_embedding_order(4), 3);
+        for d in 1..20 {
+            assert!(2 * minimal_embedding_order(d) > d);
+            assert!(2 * (minimal_embedding_order(d) - 1) <= d);
+        }
+    }
+
+    #[test]
+    fn starting_count_is_nullspace_plus_resolution_rank() {
+        // 2-D thin plate: 3 null directions + ceil(n^{1/3}).
+        assert_eq!(starting_num_centers(400, 2, 3), 3 + 8);
+        assert_eq!(starting_num_centers(1_500, 2, 3), 3 + 12);
+        assert_eq!(starting_num_centers(100_000, 2, 3), 3 + 47);
+        // No constant low-rank resolution: the pilot tracks n in every
+        // dimension, where `10 * 3^(d-1)` pinned it.
+        assert!(starting_num_centers(100_000, 2, 3) > starting_num_centers(10_000, 2, 3));
+        assert!(starting_num_centers(10_000, 2, 3) > starting_num_centers(1_000, 2, 3));
+        // Capped by the validated production basis and the row count.
+        for (n, d) in [(20, 2), (100, 4), (100_000, 1), (5_000, 16)] {
+            assert!(starting_num_centers(n, d, d + 1) <= default_num_centers(n, d).max(1));
+        }
+        assert_eq!(starting_num_centers(3, 5, 6), 1);
+        assert_eq!(starting_num_centers(1, 2, 3), 1);
+    }
+
+    #[test]
+    fn refinement_is_one_nested_uniform_split() {
+        // K internal knots bound K + 1 intervals; splitting each once leaves
+        // 2(K + 1) intervals, i.e. 2K + 1 internal knots, and every old knot
+        // is still a knot.
+        assert_eq!(refined_internal_knots(0), 1);
+        assert_eq!(refined_internal_knots(4), 9);
+        assert_eq!(refined_periodic_basis(6), 12);
+        assert_eq!(refined_num_centers(15), 30);
+        // Harmonic degree: L(L+2) non-constant directions; 3 -> 15 directions,
+        // the refined degree is the least with at least 30.
+        assert_eq!(refined_harmonic_degree(3), 5);
+        assert_eq!(refined_harmonic_degree(0), 1);
+        for l in 1..30usize {
+            let refined = refined_harmonic_degree(l);
+            assert!(refined * (refined + 2) >= 2 * l * (l + 2));
+            assert!((refined - 1) * (refined + 1) < 2 * l * (l + 2) || refined == l + 1);
+        }
+        assert_eq!(refined_internal_knots(usize::MAX), usize::MAX);
     }
 
     #[test]

@@ -93,9 +93,8 @@ fn apply_adaptive_spatial_center_counts(
             }
             continue;
         }
-        let structural_minimum = gam_terms::smooth::spatial_term_min_center_count(term)
-            .saturating_add(1)
-            .min(n);
+        let nullspace_dim = gam_terms::smooth::spatial_term_min_center_count(term);
+        let structural_minimum = nullspace_dim.saturating_add(1).min(n);
         let Some((strategy, feature_cols)) = spatial_center_strategy_mut(&mut term.basis) else {
             continue;
         };
@@ -112,7 +111,7 @@ fn apply_adaptive_spatial_center_counts(
                 if d == 1 {
                     strategy.planned_num_centers(d)
                 } else {
-                    starting_num_centers(n, d)
+                    starting_num_centers(n, d, nullspace_dim)
                 }
             })
             .max(structural_minimum)

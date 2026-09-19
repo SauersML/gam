@@ -1900,10 +1900,13 @@ fn adaptive_center_decision(
     if !saturated && !lacks_fit {
         return AdaptiveCenterDecision::Certified;
     }
-    match gam_terms::basis::expanded_num_centers(current_centers, ceiling_centers) {
-        Some(proposed) => AdaptiveCenterDecision::Expand(proposed),
-        None if saturated => AdaptiveCenterDecision::Exhausted,
-        None => AdaptiveCenterDecision::Certified,
+    let proposed = gam_terms::basis::refined_num_centers(current_centers).min(ceiling_centers);
+    if proposed > current_centers {
+        AdaptiveCenterDecision::Expand(proposed)
+    } else if saturated {
+        AdaptiveCenterDecision::Exhausted
+    } else {
+        AdaptiveCenterDecision::Certified
     }
 }
 
