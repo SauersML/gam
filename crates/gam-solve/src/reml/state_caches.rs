@@ -1557,10 +1557,19 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     ///   `Σ_i W_i s_i²`, compensated sums of terms formed in one and two
     ///   roundings.
     /// - the three subtractions that combine those four sums.
-    /// - the design product `s = X_t V_b t`, whose entries round within
-    ///   `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`. That moves the displaced surface by at most
-    ///   `|ψ'(η̂_i + s_i)|` times it, the linear term by `|ψ'(η̂_i)|` times it and
-    ///   the quadratic by `|W_i|·|s_i|` times it.
+    /// - the design product `s = X_t (V_b t)`, whose entries round within
+    ///   `γ_{p+m}·(|X_t|·|V_b|·|t|)_i` (Higham, *ASNA* 2nd ed., §3.5, for the two
+    ///   products in turn). The same computed `s` enters the displaced surface,
+    ///   the linear term and the quadratic, so a move `ε_i` in `s_i` moves the
+    ///   excess by `∂ΔF/∂s_i = ψ'(η̂_i + s_i) − ψ'(η̂_i) − W_i s_i` times it, to
+    ///   first order in `ε_i`. The three pieces cancel to `O(s_i²)` near the mode;
+    ///   the computed sensitivity carries the row oracle's rounding of
+    ///   `ψ'(η̂_i + s_i)` and the three operations that combine the pieces.
+    ///   Bounding the three moves apart, at `|ψ'(η̂_i + s_i)| + |ψ'(η̂_i)| +
+    ///   |W_i s_i|` against `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`, made this term 99.7% of
+    ///   the composite rule's rounding floor on the log-capital-gain axis of the
+    ///   adult census fit (p = 96): a floor of 2.5e-7 against a paired error of
+    ///   5.4e-9 and a target of 1.5e-9, so the rule refused.
     ///
     /// A row surface that does not evaluate returns `+∞`, which no bar passes.
     fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
@@ -1609,9 +1618,10 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         let curvature_band = gam_linalg::roundoff::compensated_band(2, curvature_absolute);
         let combination_band = gam_linalg::roundoff::accumulation_growth(3)
             * (absolute_half_deviance + linear_absolute + 0.5 * curvature_absolute);
-        let delta_max = delta.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        let design_growth =
-            gam_linalg::roundoff::accumulation_growth(p * (self.block_lambdas.len() + 1));
+        let absolute_delta = self.block_vecs.mapv(f64::abs).dot(&t.mapv(f64::abs));
+        let design_growth = gam_linalg::roundoff::accumulation_growth(p + t.len());
+        let sensitivity_growth =
+            gam_linalg::roundoff::accumulation_growth(ROW_ORACLE_FORMATION_ROUNDINGS + 3);
         let mut design_band = 0.0_f64;
         for ((((design_row, row), base_score), weight), value) in self
             .x_transformed
@@ -1622,10 +1632,17 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .zip(self.weights_obs.iter())
             .zip(s.iter())
         {
-            let row_absolute: f64 = design_row.iter().map(|entry| entry.abs()).sum();
-            let entry_band = design_growth * row_absolute * delta_max;
-            design_band += (row.eta_score.abs() + base_score.abs() + weight.abs() * value.abs())
-                * entry_band;
+            let entry_band = design_growth
+                * design_row
+                    .iter()
+                    .zip(absolute_delta.iter())
+                    .map(|(entry, delta)| entry.abs() * delta)
+                    .sum::<f64>();
+            let curvature_move = weight * value;
+            let sensitivity = (row.eta_score - base_score - curvature_move).abs()
+                + sensitivity_growth
+                    * (row.eta_score.abs() + base_score.abs() + curvature_move.abs());
+            design_band += sensitivity * entry_band;
         }
         deviance_band + argument_band + linear_band + 0.5 * curvature_band + combination_band
             + design_band
@@ -1936,6 +1953,57 @@ mod exact_deviance_state_cache_tests {
                 (excess_many - r * excess_one).abs() <= band_many + r * band_one,
                 "ΔF {excess_many:.17e} of the repeated rows against {copies} × {excess_one:.17e} \
                  lies outside the two bands {band_many:.3e} + {copies} × {band_one:.3e}"
+            );
+        }
+    }
+
+    /// Design columns the block direction leaves at zero add exact zeros to
+    /// `s = X_t (V_b t)`, so they move neither `ΔF` nor its rounding beyond the
+    /// longer products' growth `γ_{p+m}`. Banding the product by
+    /// `Σ_j |x_ij|·‖δ‖∞` charged every column at the largest coefficient move; on
+    /// the adult fit (p = 96, one axis) that design term was 99.7% of a 2.5e-7
+    /// floor under an axis that had to resolve to 1.5e-9.
+    #[test]
+    fn excess_rounding_band_ignores_design_columns_the_block_does_not_move_784() {
+        let (x_narrow, eta_hat, weights_obs, y) = replicated_logit_rows(1);
+        let extra = 5;
+        let (n, p_narrow) = x_narrow.dim();
+        let x_wide = Array2::from_shape_fn((n, p_narrow + extra), |(i, j)| {
+            if j < p_narrow {
+                x_narrow[(i, j)]
+            } else {
+                1.0e4 * ((i * (j + 1)) as f64).sin()
+            }
+        });
+        let narrow_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let wide_vecs = Array2::from_shape_fn((p_narrow + extra, 2), |(j, r)| {
+            if j < p_narrow { narrow_vecs[(j, r)] } else { 0.0 }
+        });
+        let logit = || {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ))
+        };
+        let narrow = target(
+            &x_narrow,
+            narrow_vecs,
+            eta_hat.clone(),
+            weights_obs.clone(),
+            y.clone(),
+            logit(),
+        );
+        let wide = target(&x_wide, wide_vecs, eta_hat, weights_obs, y, logit());
+        let growth = (p_narrow + extra + 2) as f64 / (p_narrow + 2) as f64;
+        for t in [array![0.4, -0.7], array![-1.1, 0.3], array![2.0, 1.5]] {
+            let band_narrow = narrow.excess_rounding_band(&t);
+            let band_wide = wide.excess_rounding_band(&t);
+            assert!(band_narrow.is_finite() && band_narrow > 0.0, "band {band_narrow:e} at t = {t}");
+            assert!(
+                band_wide <= growth * band_narrow,
+                "{extra} unmoved columns of magnitude 1e4 moved the band from {band_narrow:.3e} to \
+                 {band_wide:.3e}, {:.1} times the {growth:.2} of the longer products (t = {t})",
+                band_wide / band_narrow
             );
         }
     }
