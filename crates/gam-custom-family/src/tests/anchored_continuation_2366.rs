@@ -405,7 +405,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         inner_tol: 1e-10,
         outer_max_iter: 50,
         outer_tol: 1e-8,
-        outer_tol_is_caller_set: false,
         outer_rel_cost_tol: None,
         rho_lower_bound: Some(-10.0),
         ridge_floor: 1e-8,
@@ -802,5 +801,71 @@ fn the_kept_anchor_mode_answers_only_its_own_anchor_2928() {
             .at(&array![-0.0])
             .is_none(),
         "a zero of the other sign is a different anchor"
+    );
+}
+
+/// gam#2661: the rule that selected a fit's coefficient mode is recorded on the
+/// fit, so a caller reads it rather than a log line. A certified anchored
+/// continuation records itself. A nonconvex fit with no smoothing parameter has
+/// no anchor, so it records that the caller's seed selected its mode. A declined
+/// continuation records its refusal, which `require_rule_selected` names.
+#[test]
+fn the_fit_records_which_rule_selected_its_mode_2661() {
+    use gam_solve::model_types::CoefficientModeSelection;
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let options = double_well_options();
+
+    let certified =
+        fit_custom_family(&family, &[double_well_spec(2.0)], &options).expect("double-well fit");
+    let selection = &certified.artifacts.coefficient_mode_selection;
+    assert!(
+        matches!(
+            selection,
+            CoefficientModeSelection::AnchoredContinuation { steps, endpoint_discrepancy }
+                if *steps >= 1 && endpoint_discrepancy.is_finite()
+        ),
+        "a certified continuation recorded {selection:?}"
+    );
+    selection
+        .require_rule_selected("double well")
+        .expect("the anchored continuation selected the mode");
+
+    let mut unpenalized = double_well_spec(2.0);
+    unpenalized.penalties.clear();
+    unpenalized.nullspace_dims.clear();
+    unpenalized.initial_log_lambdas = Array1::zeros(0);
+    let seed_fit =
+        fit_custom_family(&family, &[unpenalized], &options).expect("unpenalized double-well fit");
+    let seed_selection = &seed_fit.artifacts.coefficient_mode_selection;
+    let CoefficientModeSelection::SeedSelected { reason } = seed_selection else {
+        panic!("an unpenalized nonconvex fit recorded {seed_selection:?}");
+    };
+    assert!(reason.contains("no smoothing parameter"), "{reason}");
+    assert!(
+        seed_selection
+            .require_rule_selected("unpenalized double well")
+            .is_err()
+    );
+
+    let refusal = AnchoredContinuationRefusal::EmptySweep { steps: 1 };
+    let declined = crate::fit::declined_continuation_selection(&refusal);
+    assert_eq!(
+        declined,
+        CoefficientModeSelection::SeedSelected {
+            reason: refusal.to_string()
+        }
+    );
+    let refused = declined
+        .require_rule_selected("declined")
+        .expect_err("a seed-selected mode is refused");
+    assert!(
+        refused.contains(&refusal.to_string()),
+        "the refusal is named: {refused}"
+    );
+    assert!(
+        CoefficientModeSelection::NotRecorded
+            .require_rule_selected("old payload")
+            .is_err(),
+        "an unrecorded rule is refused"
     );
 }

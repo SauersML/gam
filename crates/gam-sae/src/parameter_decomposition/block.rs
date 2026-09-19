@@ -382,8 +382,9 @@ impl fmt::Display for BlockError {
 
 impl std::error::Error for BlockError {}
 
-/// Every stage of one executed block. Rows are positions throughout.
-#[derive(Clone, Debug)]
+/// Every stage of one executed block. Rows are positions throughout. It holds its
+/// attention sublayer's memory reservation, so it is not `Clone`.
+#[derive(Debug)]
 pub struct BlockExecution {
     /// `N₁(h)`, the attention sublayer's input.
     pub attention_input: Array2<f64>,
@@ -665,8 +666,9 @@ impl ComponentBlock {
     }
 }
 
-/// Every stage of one executed gated block. Rows are positions throughout.
-#[derive(Clone, Debug)]
+/// Every stage of one executed gated block. Rows are positions throughout. It holds
+/// its attention sublayer's memory reservation, so it is not `Clone`.
+#[derive(Debug)]
 pub struct GatedBlockExecution {
     /// `N₁(h)`, the attention sublayer's input.
     pub attention_input: Array2<f64>,

@@ -301,39 +301,26 @@ pub(crate) fn materialize_standard<'a>(
             // `StandardBinomialWiggleConfig` doc + #320). Magic-by-default:
             // no caller-supplied options are required for the Python /
             // formula-DSL path.
-            refit_options: with_caller_solver_settings(
-                BlockwiseFitOptions {
-                    // The link-wiggle refit is a custom-family solve, and
-                    // `BlockwiseFitOptions::default()` leaves `compute_covariance`
-                    // OFF -- which makes `compute_joint_covariance_required` return
-                    // `Ok(None)` and strands the saved model with no joint
-                    // covariance at all. Every other custom-family consumer whose
-                    // saved model has to serve inference (marginal-slope,
-                    // multinomial, location-scale) turns it on explicitly. A fitted
-                    // link-wiggle model owes external callers its
-                    // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
-                    // it must too (#2299). The posterior mean is the default
-                    // estimand for this curved link, so covariance factorization is
-                    // part of fit assembly: an improper or unfactorizable posterior
-                    // refuses the fit instead of minting a mode-only artifact.
-                    compute_covariance: true,
-                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                    ..BlockwiseFitOptions::default()
-                },
-                config,
-            ),
+            refit_options: BlockwiseFitOptions {
+                // The link-wiggle refit is a custom-family solve, and
+                // `BlockwiseFitOptions::default()` leaves `compute_covariance`
+                // OFF -- which makes `compute_joint_covariance_required` return
+                // `Ok(None)` and strands the saved model with no joint
+                // covariance at all. Every other custom-family consumer whose
+                // saved model has to serve inference (marginal-slope,
+                // multinomial, location-scale) turns it on explicitly. A fitted
+                // link-wiggle model owes external callers its
+                // `[Mean, LinkWiggle]` variance and mean--wiggle cross terms, so
+                // it must too (#2299). The posterior mean is the default
+                // estimand for this curved link, so covariance factorization is
+                // part of fit assembly: an improper or unfactorizable posterior
+                // refuses the fit instead of minting a mode-only artifact.
+                compute_covariance: true,
+                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
+                ..BlockwiseFitOptions::default()
+            },
         })
     });
-    // The standard route's PIRLS takes no caller tolerance; only the link-wiggle
-    // refit, a custom-family solve, can honor `inner_tol`.
-    if config.inner_tol.is_some() && wiggle.is_none() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "inner_tol applies to custom-family fits (marginal-slope, survival, \
-                     transformation-normal, location-scale, link-wiggle); this standard fit \
-                     has no inner tolerance to set"
-                .to_string(),
-        });
-    }
 
     // Borrow the caller's projected matrix for the ordinary path. Latent
     // coordinates create an augmented matrix locally, so move that one owned
