@@ -6821,6 +6821,7 @@ mod tests {
                 criterion_certificate: None,
                 rho_posterior: Default::default(),
                 rho_posterior_escalation: None,
+                rho_posterior_escalation_record: None,
                 rho_covariance: None,
                 joint_log_lambdas: None,
                 firth_bias_reduction: false,

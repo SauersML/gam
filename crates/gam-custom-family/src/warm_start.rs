@@ -1065,6 +1065,7 @@ pub fn blockwise_fit_from_parts(
         smoothing_correction,
         smoothing_correction_method,
         smoothing_correction_absence,
+        smoothing_correction_fallback: None,
         penalized_hessian: geom.penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::model_types::Dispersion::UNIT,

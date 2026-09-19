@@ -565,6 +565,8 @@ fn scan_summary_payload(
 /// would create a second source of truth that could drift from the verdict
 /// that allowed the fit to exist.
 fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryConvergence {
+    use gam_problem::rho_posterior::{RhoPosteriorOutcome, RhoProposalAdequacy};
+    use gam_solve::model_types::SmoothingCorrectionMethod;
     use gam_solve::rho_optimizer::OuterStationarityCertificate;
 
     let evidence = fit.convergence_evidence();
@@ -584,6 +586,15 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         hessian_psd: certificate.hessian_psd(),
         lambdas_railed: certificate.lambdas_railed.clone(),
     });
+    let artifacts = &fit.artifacts;
+    let (rho_posterior_status, adequacy, rho_posterior_reason) = match &artifacts.rho_posterior {
+        RhoPosteriorOutcome::NotApplicable => ("not_applicable", None, None),
+        RhoPosteriorOutcome::NotComputed(reason) => {
+            ("not_computed", None, Some(reason.to_string()))
+        }
+        RhoPosteriorOutcome::Refused(reason) => ("refused", None, Some(reason.to_string())),
+        RhoPosteriorOutcome::Assessed(adequacy) => ("assessed", Some(adequacy), None),
+    };
     SummaryConvergence {
         // No outer coordinate was optimized in the `Fixed` arm, so there is no
         // outer equation that could fail: the converged inner mode is the
@@ -594,6 +605,34 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         inner_iterations: fit.inner_cycles,
         outer,
         estimator: SummaryEstimator::of(fit),
+        covariance_source: fit
+            .display_coefficient_uncertainty()
+            .map(|view| view.definition.as_str().to_string()),
+        covariance_source_reason: fit.coefficient_covariance_source_reason(),
+        smoothing_correction_method: fit.smoothing_correction_method().map(|method| match method {
+            SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. } => {
+                "first_order_identified_subspace"
+            }
+            SmoothingCorrectionMethod::SigmaPointCubature { .. } => "sigma_point_cubature",
+        }),
+        smoothing_correction_fallback: fit.smoothing_correction_fallback().map(|fallback| {
+            SummarySmoothingCorrectionFallback {
+                reason: fallback.reason.clone(),
+                severity: fallback.severity.as_str(),
+            }
+        }),
+        rho_posterior_status,
+        rho_posterior_khat: adequacy.map(|adequacy| adequacy.k_hat),
+        rho_posterior_adequacy: adequacy.map(|adequacy| match adequacy.adequacy {
+            RhoProposalAdequacy::PlugInAdequate => "plug_in_adequate",
+            RhoProposalAdequacy::ImportanceCorrect => "importance_correct",
+            RhoProposalAdequacy::Escalate => "escalate",
+        }),
+        rho_posterior_effective_sample_size: adequacy
+            .map(|adequacy| adequacy.effective_sample_size),
+        rho_posterior_samples: adequacy.map(|adequacy| adequacy.n_samples),
+        rho_posterior_reason,
+        rho_posterior_escalation: artifacts.rho_posterior_escalation_record.clone(),
     }
 }
 
@@ -1157,6 +1196,48 @@ pub struct SummaryConvergence {
     pub outer: Option<SummaryOuterCertificate>,
     /// Which objective the coefficients are the mode of, and why.
     pub estimator: SummaryEstimator,
+    /// The covariance definition the published standard errors come from:
+    /// `"conditional"` or `"smoothing-corrected"`, the same token as the
+    /// payload's `coefficient_se_source`. `None` when the fit carries no
+    /// coefficient standard errors.
+    pub covariance_source: Option<String>,
+    /// Why `covariance_source` is what it is whenever that is not the
+    /// full cubature-upgraded smoothing correction: the typed absence or
+    /// fallback the fit recorded where the correction was attempted. Always
+    /// set when `covariance_source` is `"conditional"`.
+    pub covariance_source_reason: Option<String>,
+    /// `"sigma_point_cubature"` or `"first_order_identified_subspace"`: the
+    /// method behind the retained smoothing correction. `None` when no
+    /// correction was retained.
+    pub smoothing_correction_method: Option<&'static str>,
+    /// Why the cubature upgrade was declined, when it was.
+    pub smoothing_correction_fallback: Option<SummarySmoothingCorrectionFallback>,
+    /// What the Tier-0 rho-posterior adequacy seam concluded: `"assessed"`,
+    /// `"refused"`, `"not_computed"` or `"not_applicable"` (no smoothing
+    /// coordinate).
+    pub rho_posterior_status: &'static str,
+    /// PSIS tail shape `k̂` of the Laplace proposal's importance weights.
+    /// Finite whenever `rho_posterior_status` is `"assessed"`.
+    pub rho_posterior_khat: Option<f64>,
+    /// The grade read off `rho_posterior_khat`: `"plug_in_adequate"`
+    /// (`k̂ < 0.5`), `"importance_correct"` or `"escalate"` (`k̂ > 0.7`).
+    pub rho_posterior_adequacy: Option<&'static str>,
+    /// Kish effective sample size of the `rho_posterior_samples` proposal draws.
+    pub rho_posterior_effective_sample_size: Option<f64>,
+    /// Number of proposal draws the adequacy diagnostic used.
+    pub rho_posterior_samples: Option<usize>,
+    /// Why the diagnostic was refused or not computed.
+    pub rho_posterior_reason: Option<String>,
+    /// The heavier `ρ`-posterior tier an `"escalate"` grade ran, when it ran.
+    pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalationRecord>,
+}
+
+/// Why a fit's smoothing correction is first-order rather than cubature.
+#[derive(Serialize)]
+pub struct SummarySmoothingCorrectionFallback {
+    pub reason: String,
+    /// `"routine"` (a by-design eligibility gate) or `"numerical_failure"`.
+    pub severity: &'static str,
 }
 
 /// The objective a fit optimized, named once in Rust so every surface — the

@@ -841,6 +841,7 @@ pub fn survival_fit_from_parts(
             smoothing_correction: smoothing_correction_matrix.clone(),
             smoothing_correction_method,
             smoothing_correction_absence: smoothing_correction_absence.clone(),
+            smoothing_correction_fallback: None,
             penalized_hessian: geom.penalized_hessian.clone(),
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,
@@ -892,6 +893,7 @@ pub fn survival_fit_from_parts(
                 gam_problem::rho_posterior::RhoPosteriorNotComputed::NotFormedOnThisRoute,
             ),
             rho_posterior_escalation: None,
+            rho_posterior_escalation_record: None,
             rho_covariance: None,
             joint_log_lambdas: None,
             // Survival location-scale fits optimize the plain penalized

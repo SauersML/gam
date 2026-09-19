@@ -3299,6 +3299,7 @@ fn fit_bounded_term_collection_with_design(
                     .as_ref()
                     .map(|(_, method)| *method),
                 smoothing_correction_absence,
+                smoothing_correction_fallback: None,
                 // Boundary adapter: `penalized_hessian` storage is now
                 // `UnscaledPrecision`.
                 penalized_hessian: penalized_hessian.clone().into(),
