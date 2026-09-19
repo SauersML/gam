@@ -459,7 +459,7 @@ impl SmoothBasisSpec {
             Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
             Self::TensorBSpline { spec, .. } => {
                 // A `te(...)` smooth is *penalized*: each margin carries a
-                // difference (wiggliness) penalty and the tensor inherits a
+                // derivative (wiggliness) penalty and the tensor inherits a
                 // Kronecker-sum penalty `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I`. The raw
                 // column count is the *product* of the per-marginal column
                 // counts, but that product is the lower bound for an
@@ -5855,7 +5855,7 @@ pub(crate) fn build_tensor_bspline_basis(
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
-    // marginal difference-penalty construction as standalone smooth terms.
+    // marginal derivative-penalty construction as standalone smooth terms.
     for (dim, (&col, marginalspec)) in feature_cols
         .iter()
         .zip(spec.marginalspecs.iter())

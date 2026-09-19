@@ -44,9 +44,7 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 /// still). The geometrically-correct convexity cone is that the control-polygon
 /// *slopes* `m_i = (θ_{i+1} − θ_i)/(ξ_{i+1} − ξ_i)` are non-decreasing, i.e. the
 /// second *divided* differences `[D²θ]_i = (m_{i+1} − m_i)/(ξ_{i+2} − ξ_i) ≥ 0`.
-/// This is the exact same divided-difference correction the difference-penalty
-/// path applies (see `create_difference_penalty_matrix` /
-/// `penalty_greville_abscissae_for_knots`): a coefficient sequence linear in
+/// This is a constraint cone, not a penalty: a coefficient sequence linear in
 /// `x` (`θ_j = a + b·ξ_j`, the unpenalized affine null space, which must be a
 /// boundary of both the convex and concave cones) has zero second divided
 /// difference but a *non-zero* plain second difference under non-uniform ξ, so
