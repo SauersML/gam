@@ -2080,6 +2080,7 @@ fn certify_installed_state_in_fit_frame(
     // mode. The audit evaluates the exact supplied point once; it runs neither
     // an inner update nor an outer optimization loop.
     let rho_flat = rho.flat_coordinates();
+    let p_beta = term.beta_dim();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         z.clone(),
@@ -2094,6 +2095,8 @@ fn certify_installed_state_in_fit_frame(
     let outer_result = match audit_stationary_point(
         &mut objective,
         rho_flat,
+        z.len(),
+        p_beta,
         "SAE external installed-state audit",
     ) {
         Ok(result) => result,

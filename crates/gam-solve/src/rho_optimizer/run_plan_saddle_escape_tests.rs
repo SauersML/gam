@@ -242,6 +242,12 @@ fn without_ownership_flag_bimodal_terminal_bind_fails() {
 
 // ─── #2357 interior strict-saddle escape ──────────────────────────
 
+/// The observations the audited saddle fixtures declare: `τ_stat = 1/(2n) = 1e-7`,
+/// the criterion resolution their wells and rungs are sized against.
+const SADDLE_FIXTURE_N_OBS: usize = 5_000_000;
+/// The coefficients those fixtures declare, one per smoothing coordinate.
+const SADDLE_FIXTURE_P: usize = 2;
+
 // A 2-D outer objective with a genuine interior saddle at ρ=(0,0) and a pair of
 // PSD minima at ρ=(0,±1):
 //
@@ -292,7 +298,12 @@ fn certify_mints_saddle_escape_reseed_at_interior_saddle() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "saddle-escape #2357")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "saddle-escape #2357")
         .expect_err("an interior strict saddle must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -560,7 +571,12 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "lying-hessian #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "lying-hessian #2612")
         .expect("a global minimum must not be refused on curvature the criterion contradicts");
     let cert = result
         .criterion_certificate
@@ -609,7 +625,8 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
 // exploitable descent one halving further down.
 //
 // The derived ladder runs to `α_min = sqrt(2·objective_resolution/|λ_min|)`,
-// which at the default `1e-7` resolution and `|λ_min| = 0.01` is `4.5e-3`, so
+// which at the fixture's declared `τ_stat = 1e-7` (`n = 5e6`) and
+// `|λ_min| = 0.01` is `4.5e-3`, so
 // it reaches `0.03125` — inside the well — and mints the escape.
 fn narrow_well_cost(rho: &Array1<f64>) -> f64 {
     let r0 = rho[0];
@@ -654,7 +671,12 @@ fn escape_reaches_a_descent_below_the_old_fixed_ladder_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "narrow-well #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "narrow-well #2612")
         .expect_err("a saddle with a real descent must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -848,7 +870,12 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "unresolvable-well #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "unresolvable-well #2612")
         .expect(
             "a point whose only available descent is below the criterion's own resolution must \
              not be refused: no optimizer can reach past it, so the negative direction has no \
@@ -1022,7 +1049,12 @@ fn saddle_escape_expansion_does_not_overshoot_a_genuine_well_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "well-overshoot #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "well-overshoot #2612")
         .expect_err("an interior strict saddle must be refused, not certified");
     let reseed = rejection
         .result

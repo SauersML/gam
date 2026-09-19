@@ -1919,12 +1919,26 @@ impl std::error::Error for OuterStationaryPointRejection {
 /// objective in a frozen evaluation mode before calling this function.
 /// `iterations == 0` in the returned result is structural: no optimization loop
 /// exists on this path.
+///
+/// `n_obs` and `p_coefficients` are the problem size the criterion is summed
+/// over, exactly as [`OuterProblem::with_problem_size`] declares them for a
+/// search: the point is judged against the same statistical resolution
+/// `τ_stat = 1/(2n)` a search of that criterion would stop at.
 pub fn audit_stationary_point(
     obj: &mut dyn OuterObjective,
     rho: Array1<f64>,
+    n_obs: usize,
+    p_coefficients: usize,
     context: &str,
 ) -> Result<OuterResult, OuterStationaryPointRejection> {
-    audit_stationary_point_in(obj, OuterConfig::default(), rho, context)
+    let config = OuterConfig {
+        problem_size: OuterProblemSize {
+            n_obs: Some(n_obs),
+            p_coefficients: Some(p_coefficients),
+        },
+        ..OuterConfig::default()
+    };
+    audit_stationary_point_in(obj, config, rho, context)
 }
 
 /// [`audit_stationary_point`] under a caller's configuration. The point is judged

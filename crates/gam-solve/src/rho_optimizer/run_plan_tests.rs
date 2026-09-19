@@ -825,12 +825,17 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
 /// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
 /// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes
 /// when it is already stationary at iteration 0. The route publishes no gradient
-/// parts, so the raw band is the `1e-12` tolerance.
+/// parts, so the raw band is the `1e-12` tolerance. It declares `n = 5000`
+/// observations, so the criterion resolution is `τ_stat = 1/(2n) = 1e-4`.
 fn audit_interior_with_dense_curvature(
     theta_hat: Array1<f64>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(5_000),
+            p_coefficients: Some(1),
+        },
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -4398,7 +4403,8 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_tolerance(1.0e-10);
+        .with_tolerance(1.0e-10)
+        .with_problem_size(1_000, 1);
     let config = problem.config();
     let mut obj = problem.build_objective_with_eval_order(
         (),

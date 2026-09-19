@@ -21,6 +21,10 @@ use ndarray::array;
 const C_3017: f64 = 100.0;
 const A_MINUS_ONE_3017: f64 = 100_000.0;
 
+/// The observations the whole-run fixture declares, the scale of the
+/// hyperprior's shape: `τ_stat = 1/(2n) = 5e-6`.
+const N_OBS_3017: usize = 100_000;
+
 /// Where the issue's fit started: the Newton step from here, `3.344`, lands at
 /// `ρ = 8.78`, where the criterion is `−2.26e5` against the seed's `−5.208e5`.
 const SEED_3017: f64 = 5.4388;
@@ -58,7 +62,8 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_initial_rho(array![SEED_3017])
-        .with_bounds(array![-30.0], array![30.0]);
+        .with_bounds(array![-30.0], array![30.0])
+        .with_problem_size(N_OBS_3017, 1);
     let mut obj = problem.build_objective(
         State::default(),
         |_: &mut State, theta: &Array1<f64>| Ok(value_3017(theta[0])),
