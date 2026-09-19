@@ -3911,7 +3911,41 @@ impl<'a> RemlState<'a> {
             positive_weight_observation_count_cache: std::sync::OnceLock::new(),
             rho_weight_anchor_cache: std::sync::OnceLock::new(),
             data_root_cache: Default::default(),
+            penalty_unit_spectra: RwLock::new(None),
         })
+    }
+
+    /// The λ-free spectra of `canonical_penalties`, built on first use and
+    /// shared by every evaluation of that list.
+    ///
+    /// The spectra hold the list they were built from, so a list installed
+    /// later by [`Self::reset_surface`] or
+    /// [`Self::refresh_canonical_penalty_surface`] is a different allocation
+    /// and gets fresh spectra here; stale ones can never be read against it.
+    pub(crate) fn penalty_unit_spectra(&self) -> Arc<super::penalty_logdet::PenaltyUnitSpectra> {
+        if let Some(spectra) = self
+            .penalty_unit_spectra
+            .read()
+            .expect("penalty spectra lock poisoned")
+            .as_ref()
+            .filter(|spectra| spectra.serves(&self.canonical_penalties))
+        {
+            return Arc::clone(spectra);
+        }
+        let mut slot = self
+            .penalty_unit_spectra
+            .write()
+            .expect("penalty spectra lock poisoned");
+        match slot.as_ref() {
+            Some(spectra) if spectra.serves(&self.canonical_penalties) => Arc::clone(spectra),
+            _ => {
+                let spectra = Arc::new(super::penalty_logdet::PenaltyUnitSpectra::new(Arc::clone(
+                    &self.canonical_penalties,
+                )));
+                *slot = Some(Arc::clone(&spectra));
+                spectra
+            }
+        }
     }
 
     pub(in crate::estimate) fn reset_surface<X>(
@@ -6348,11 +6382,20 @@ impl<'a> RemlState<'a> {
                 "non-contiguous lambda storage in sparse penalty logdet".to_string(),
             )
         })?;
-        let penalty_logdet = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
-            &applied_penalties,
-            lambdas_slice,
-            self.p,
-        )
+        let spectra = self.penalty_unit_spectra();
+        let penalty_logdet = if spectra.serves(&applied_penalties) {
+            super::penalty_logdet::PenaltyPseudologdet::from_penalty_spectra(
+                &spectra,
+                lambdas_slice,
+                self.p,
+            )
+        } else {
+            super::penalty_logdet::PenaltyPseudologdet::from_penalties(
+                &applied_penalties,
+                lambdas_slice,
+                self.p,
+            )
+        }
         .map_err(EstimationError::InvalidInput)?;
         let penalty_rank = penalty_logdet.rank();
         let logdet_s_pos = penalty_logdet.value();

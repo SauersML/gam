@@ -178,6 +178,34 @@ class Rules(unittest.TestCase):
                          ["gcv_score", "GcvCriterion"])
         self.assertEqual(tokens("gcv", "fn f() -> f64 { mgcv_reference(1.0) + UBRE_WEIGHT }"), ["UBRE_WEIGHT"])
 
+    def test_roundoff(self):
+        self.assertEqual(tokens("roundoff", "fn f() -> f64 { 0.5 * f64::EPSILON }"), ["0.5 * f64::EPSILON"])
+        self.assertEqual(tokens("roundoff", "fn f() -> f64 { f64::EPSILON / 2.0 }"), ["f64::EPSILON / 2.0"])
+        self.assertEqual(tokens("roundoff", "fn f(x: f64) -> f64 { x * f64::EPSILON * 0.5 }"),
+                         ["f64::EPSILON * 0.5"])
+        self.assertEqual(tokens("roundoff", "fn g(n: f64) -> f64 { n * f64::EPSILON / (1.0 - n * f64::EPSILON) }"),
+                         ["EPSILON / (1.0 -"])
+        self.assertEqual(tokens("roundoff", "fn g(n: f64) -> f64 { (n * f64::EPSILON) / (1.0 - n) }"),
+                         ["EPSILON) / (1.0 -"])
+        # a half-log of epsilon, an unrelated multiple, and test code are not copies of `u`
+        self.assertEqual(tokens("roundoff", "fn f() -> f64 { -0.5 * f64::EPSILON.ln() }"), [])
+        self.assertEqual(tokens("roundoff", "fn f() -> f64 { 2.0 * f64::EPSILON + f64::EPSILON / 20.0 }"), [])
+        self.assertEqual(tokens("roundoff", "#[cfg(test)]\nmod t {\n    const U: f64 = 0.5 * f64::EPSILON;\n}\n"), [])
+
+    def test_roundoff_owner_may_define_the_unit_roundoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, {
+                "crates/demo/src/lib.rs": VIOLATING_LIB,
+                ratchet.ROUNDOFF_OWNER: "pub const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;\n",
+                ratchet.LEDGER_REL: LEDGER_LINE,
+            })
+            self.assertEqual(check(root)[0], 0)
+            write(root, {"crates/demo/src/band.rs": "pub fn u() -> f64 { f64::EPSILON / 2.0 }\n"})
+            rc, err = check(root)
+            self.assertEqual(rc, 1)
+            self.assertIn("[roundoff] f64::EPSILON / 2.0 -- new SPEC violation", err)
+
     def test_python_math(self):
         src = textwrap.dedent('''
             """Uses np.linalg.solve in a docstring."""

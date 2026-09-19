@@ -1104,9 +1104,9 @@ pub(crate) fn tk_normalized_score_with_resolution(
     let tk = raw_reml + normalizer;
     // The normalizer is itself a rounded sum of two products; the addition that
     // folds it into `raw_reml` rounds on the magnitude of the result.
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let tk_roundoff = raw_reml_roundoff
-        .map(|bound| bound + unit_roundoff * (3.0 * normalizer.abs() + tk.abs()));
+    let tk_roundoff = raw_reml_roundoff.map(|bound| {
+        bound + gam_linalg::roundoff::UNIT_ROUNDOFF * (3.0 * normalizer.abs() + tk.abs())
+    });
     let scale = match score_scale {
         TopologyScoreScale::PerObservation => {
             if n_obs == 0 {
@@ -1124,7 +1124,8 @@ pub(crate) fn tk_normalized_score_with_resolution(
         }
     };
     let score = tk / scale;
-    let resolution = tk_roundoff.map(|bound| bound / scale + unit_roundoff * score.abs());
+    let resolution =
+        tk_roundoff.map(|bound| bound / scale + gam_linalg::roundoff::UNIT_ROUNDOFF * score.abs());
     Ok((score, resolution))
 }
 

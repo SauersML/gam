@@ -824,15 +824,13 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
 /// Build an interior 1-coordinate objective `½·ρ₀²` (analytic gradient `[ρ₀]`,
 /// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
 /// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes
-/// when it is already stationary at iteration 0. `objective_scale = 80` makes
-/// the arithmetic gradient floor `80·√ε`, mirroring the Gaussian-linear
-/// standard-REML fit's matrix-factorization resolution.
+/// when it is already stationary at iteration 0. The route publishes no gradient
+/// parts, so the raw band is the `1e-12` tolerance.
 fn audit_interior_with_dense_curvature(
     theta_hat: Array1<f64>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
-        objective_scale: Some(80.0),
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -871,13 +869,13 @@ fn audit_interior_with_dense_curvature(
 /// The curvature-scaled widening is NOT gated to a `CostStallFlatValley` exit:
 /// a fit already stationary at iteration 0 (a 2-parameter Gaussian-linear REML
 /// with λ→0) reaches certification with `operator_stop_reason = None`, a
-/// projected gradient above the arithmetic score·√ε floor, and a
+/// projected gradient above the raw band, and a
 /// NEGLIGIBLE Newton decrement. The Newton decrement — not the exit reason — is
 /// the stationarity certificate, so the point must certify.
 #[test]
 fn curvature_widening_certifies_stationary_point_on_any_exit_reason() {
-    let arithmetic_floor = 80.0 * f64::EPSILON.sqrt();
-    // |Pg| = 2e-6 > 80·√ε, but ½·gᵀH⁻¹g = ½·(2e-6)² = 2e-12,
+    let raw_band = 1.0e-12;
+    // |Pg| = 2e-6 > 1e-12, but ½·gᵀH⁻¹g = ½·(2e-6)² = 2e-12,
     // orders of magnitude below any outer objective tolerance: stationary to
     // second order, must certify DESPITE operator_stop_reason = None.
     let cert = audit_interior_with_dense_curvature(array![2.0e-6])
@@ -888,7 +886,7 @@ fn curvature_widening_certifies_stationary_point_on_any_exit_reason() {
         cert.summary(),
     );
     assert!(
-        cert.stationarity.projected_norm() > arithmetic_floor,
+        cert.stationarity.projected_norm() > raw_band,
         "the test must exercise the ABOVE-solver-bound regime (else it proves \
          nothing about the widening): {}",
         cert.summary(),
@@ -1098,15 +1096,62 @@ fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
     assert_eq!(result.final_gradient(), Some(&array![0.0, 37.0]));
 }
 
+/// The #2269 fixture's REML criterion: exactly flat in `ρ`, with an analytic
+/// score formed from two channels of magnitude 80 that cancel, `½λ tr(H⁻¹S) =
+/// ½rank = 80` against `logdet_s = −½rank`. `residual` is the forward-error
+/// remainder of that sum, all of which lands in the KKT channel.
+const SCORE_CHANNEL_2269: f64 = 80.0;
+
+fn problem_size_2269() -> crate::rho_optimizer::OuterProblemSize {
+    crate::rho_optimizer::OuterProblemSize {
+        n_obs: Some(1_000),
+        p_coefficients: Some(10),
+    }
+}
+
+fn score_parts_2269(residual: f64) -> crate::estimate::outer_eval_capture::RhoGradientParts {
+    crate::estimate::outer_eval_capture::RhoGradientParts {
+        index: 0,
+        lambda: 1.0,
+        block_quadratic: 0.0,
+        rank: 160,
+        dim: 160,
+        fixed_beta: 0.0,
+        logdet_h: SCORE_CHANNEL_2269,
+        frozen_logdet_h: SCORE_CHANNEL_2269,
+        mode_response_logdet_h: 0.0,
+        logdet_s: -SCORE_CHANNEL_2269,
+        total: residual,
+    }
+}
+
+/// The caller's tolerance is far below what the score's own arithmetic can
+/// resolve: `τ = 1e-14·(1 + 80)` against a rounding band of `γ_m·160`.
+fn config_2269() -> OuterConfig {
+    OuterConfig {
+        tolerance: 1.0e-14,
+        problem_size: problem_size_2269(),
+        ..OuterConfig::default()
+    }
+}
+
+/// The score's rounding band `ε` (Theorem 9) at a sub-resolution residual.
+fn score_rounding_band_2269() -> f64 {
+    let evidence = crate::estimate::outer_eval_capture::CertificateEvidence {
+        parts: vec![score_parts_2269(0.0)],
+        ..Default::default()
+    };
+    let band = outer_coordinate_bands(&config_2269(), 1, &evidence)
+        .expect("the fixture declares its problem size")[0]
+        .expect("the fixture publishes the score's parts");
+    assert!(band.is_arithmetic_limited(), "the fixture must sit below the score's resolution");
+    band.epsilon
+}
+
 fn audit_gradient_only_roundoff_residual_2269(
     residual: f64,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
-    let objective_scale = 80.0;
-    let config = OuterConfig {
-        tolerance: 1.0e-12,
-        objective_scale: Some(objective_scale),
-        ..OuterConfig::default()
-    };
+    let config = config_2269();
     // The value oracle is exactly flat. `residual` represents the forward-error
     // remainder of its analytic matrix-factorization score: this is the
     // gradient-only case, so no Hessian/decrement or trajectory-noise rescue is
@@ -1116,10 +1161,13 @@ fn audit_gradient_only_roundoff_residual_2269(
         .with_hessian(DeclaredHessianForm::Unavailable)
         .build_objective(
             (),
-            move |_: &mut (), _: &Array1<f64>| Ok(objective_scale),
+            move |_: &mut (), _: &Array1<f64>| Ok(SCORE_CHANNEL_2269),
             move |_: &mut (), _: &Array1<f64>| {
+                crate::estimate::outer_eval_capture::record_certificate_parts(&[
+                    score_parts_2269(residual),
+                ]);
                 Ok(OuterEval {
-                    cost: objective_scale,
+                    cost: SCORE_CHANNEL_2269,
                     gradient: array![residual],
                     hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
@@ -1130,7 +1178,7 @@ fn audit_gradient_only_roundoff_residual_2269(
         );
     let mut result = OuterResult::new(
         array![0.0],
-        objective_scale,
+        SCORE_CHANNEL_2269,
         1,
         true,
         OuterPlan {
@@ -1146,23 +1194,31 @@ fn audit_gradient_only_roundoff_residual_2269(
     )
 }
 
+/// #2269 / #2954 — a gradient-only certificate judges a score at the rounding
+/// resolution of the channels that score was summed from, not at a floor
+/// anchored to the criterion's value (the deleted `|V|·√ε`). The verdict is
+/// labelled arithmetic-limited because the caller asked for less than that
+/// resolution can prove.
 #[test]
-fn gradient_only_certificate_uses_objective_roundoff_resolution_2269() {
-    let scale = 80.0;
-    let arithmetic_floor = scale * f64::EPSILON.sqrt();
-    let residual = 0.5 * arithmetic_floor;
+fn gradient_only_certificate_uses_the_scores_own_rounding_resolution_2269() {
+    let epsilon = score_rounding_band_2269();
+    let residual = 0.5 * epsilon;
 
     let certificate = audit_gradient_only_roundoff_residual_2269(residual)
-        .expect("a flat score's sub-roundoff residual must certify without curvature or probes");
+        .expect("a flat score's sub-rounding residual must certify without curvature or probes");
     assert!(certificate.certifies());
-    assert!(certificate.stationarity.bound() >= arithmetic_floor);
+    // The residual itself enters the KKT channel, so the judged band exceeds
+    // the residual-free `ε` by `γ_m·residual`, below `ε·1e-12`.
+    let bound = certificate.stationarity.bound();
+    assert!(bound >= epsilon && bound - epsilon <= 1.0e-12 * epsilon);
+    assert_eq!(certificate.stationarity.rung().label, "arithmetic-limited");
+    assert!(!certificate.stationarity.rung().derived_standard);
     assert!(certificate.stationarity.projected_norm() <= certificate.stationarity.bound());
 }
 
 #[test]
-fn gradient_only_certificate_rejects_residual_above_roundoff_2269() {
-    let arithmetic_floor = 80.0 * f64::EPSILON.sqrt();
-    assert!(audit_gradient_only_roundoff_residual_2269(2.0 * arithmetic_floor).is_err());
+fn gradient_only_certificate_rejects_residual_above_the_scores_rounding_2269() {
+    assert!(audit_gradient_only_roundoff_residual_2269(3.0 * score_rounding_band_2269()).is_err());
 }
 
 /// Slope reported on the saturated coordinate's gradient (#2299). In the bias
@@ -3016,14 +3072,12 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// negative curvature, and once a PSD improving iterate replaces the saddle as
 /// best, the next filled window certifies THAT point.
 /// A configuration whose certificate band is exactly `band` at every criterion
-/// value: the absolute tolerance with no point-anchored relative widening and no
-/// declared scale. The guard judges a stall's claim by the certificate's band
+/// value: the absolute tolerance with no point-anchored relative widening. The guard judges a stall's claim by the certificate's band
 /// (#2817), so a guard fixture that means "stationary below `band`" builds this.
 fn claim_band_config(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
         rel_cost_tolerance: Some(0.0),
-        objective_scale: None,
         ..OuterConfig::default()
     }
 }
@@ -3981,7 +4035,7 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     // orders of magnitude above the claim band — the inner solve did not converge.
     let stuck_grad = 10.9;
     assert!(
-        stuck_grad > guard.stationarity_band(10.0),
+        stuck_grad > guard.stationarity_band(),
         "test premise: the stuck residual must exceed the certificate band the guard judges by"
     );
     guard.observe_seed(&seed, 10.0, stuck_grad);
@@ -4154,7 +4208,7 @@ fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
     // Just above the band the certificate applies (1e-3 here, at every value).
     let valley_grad = 1.2e-3;
     assert!(
-        valley_grad > guard.stationarity_band(score),
+        valley_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
     guard.observe_seed(&seed, score, valley_grad);
@@ -4206,7 +4260,7 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
     // that used to halt exactly this stall.
     let descending_grad = 2.0;
     assert!(
-        descending_grad > guard.stationarity_band(score),
+        descending_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
     guard.observe_seed(&seed, score, descending_grad);
@@ -4239,7 +4293,7 @@ fn a_stall_inside_its_probe_noise_floor_is_not_claimed_2241() {
     let residual_grad = 0.5;
     let score = 10.0;
     assert!(
-        residual_grad > guard.stationarity_band(score),
+        residual_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
     guard.observe_seed(&array![0.0, 0.0], score, residual_grad);
@@ -4284,7 +4338,7 @@ fn collapsed_probe_radius_leaves_the_claim_band_unchanged_2456() {
         guard.observe(&array![radius, 0.0], score + 8.0e-4, residual_grad, true);
         guard.observe(&array![2.0 * radius, 0.0], score + 4.0e-4, residual_grad, true);
         let verdict = guard.observe(&array![3.0 * radius, 0.0], score + 1.0e-3, residual_grad, true);
-        let band = guard.stationarity_band(score);
+        let band = guard.stationarity_band();
         let claimed = exit.lock().unwrap().as_ref().is_some_and(|published| published.converged);
         (std::mem::discriminant(&verdict), band, claimed)
     };
@@ -4345,8 +4399,7 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_tolerance(1.0e-10)
-        .with_objective_scale(Some(1_200.0));
+        .with_tolerance(1.0e-10);
     let config = problem.config();
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -4383,10 +4436,10 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     );
     result.operator_stop_reason = Some(OperatorTrustRegionStopReason::CostStallFlatValley);
 
-    // The band the certificate will apply, and the rung that produced it. Read
-    // from the helper rather than from the refusal string so this asserts a
-    // value and not a message format.
-    let band = outer_stationarity_band_and_rung_at(&config, score);
+    // The first-order band the ladder starts from, and the rung that produced
+    // it. Read from the helper rather than from the refusal string so this
+    // asserts a value and not a message format.
+    let band = outer_stationarity_band_and_rung(&config);
     assert!(
         matches!(band.source, StationarityBoundSource::SolverBand),
         "the ladder, not the flat-valley constant, must decide this point; got rung {}",
@@ -4411,9 +4464,13 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
         "a constant-gradient objective carrying CostStallFlatValley must be refused, \
          not certified through a score-relative constant",
     );
+    // The declared exact curvature (`H = 0`) lets the ladder widen the solver
+    // band to its curvature-resolvability rung; the residual clears neither, and
+    // the refusal names the derived rung that decided it.
     let message = refusal.to_string();
     assert!(
-        message.contains("rung=solver-band"),
+        message.contains("rung=curvature-resolvability derived_standard=true")
+            && message.contains("NOT STATIONARY"),
         "the refusal must name the rung that decided it (#2688); got: {message}"
     );
 }

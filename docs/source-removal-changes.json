@@ -1590,7 +1590,7 @@
     "evidence": "At base 72d1e93bee each name occurs only in branch_continuation.rs (git grep -w: 3 occurrences each, the declaration and its callers there); at the head tree git grep -w finds none of the three under crates, src or tests. source_removal_guard.py against the parent reports exactly these three identities. gam-custom-family lib 352 of 352 and laml_inner_accuracy_2668 1 of 1 pass, including the new the_ift_predictor_is_the_closed_form_tangent_2973, whose flipped-sign and dropped-tangent mutants both fail."
   },
   {
-    "base": "37cd34ecfdb73f398bebff28922b84f7e2092793",
+    "base": "55c31d230a82e984591dee57701c6b430abfb98c",
     "items": [
       "crates/gam-custom-family/src/blockwise_solve.rs:fn:capped_inner_max_cycles",
       "crates/gam-custom-family/src/blockwise_solve.rs:fn:custom_family_seed_screening_proxy_labeled",

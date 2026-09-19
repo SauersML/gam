@@ -39,7 +39,6 @@ fn run_valley(start: &Array1<f64>) -> Result<OuterResult, EstimationError> {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
-        .with_objective_scale(Some(OFFSET))
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(start.clone());
     let mut obj = problem.build_objective(

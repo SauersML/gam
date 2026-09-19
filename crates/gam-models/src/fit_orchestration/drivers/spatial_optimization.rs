@@ -303,8 +303,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // whether it fires is a question about a trend, and a number a reader can
     // only see on the run that already failed cannot show a trend. Measured on
     // the #2760 ladder: `5.965e-8` relative at `n = 8 000`, i.e. the gap is
-    // itself above the `√ε ≈ 1.49e-8` forward-error scale this file's own
-    // `outer_arithmetic_gradient_floor` calls the resolution of a
+    // itself above the `√ε ≈ 1.49e-8` forward-error scale of a
     // matrix-factorization REML score — so it is not roundoff, and reading it at
     // every `n` is how the residual half of #2671 gets bisected.
     log::debug!(
@@ -5286,26 +5285,11 @@ pub(crate) fn exact_joint_outer_problem(
     // applied to log-λ, where |d|≈5 is the natural quasi-Newton magnitude.
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
-    // `Some((n_obs, p_cols))` calibrates the outer solver to the n-scaled
-    // profiled REML/LAML criterion exactly as the primary REML outer
-    // (`solver/estimate.rs`) does. The profiled criterion is a sum over the n
-    // observations, so its magnitude is O(n) (|f| ~ thousands at n ~ 10³) for
-    // EVERY family — Gaussian, binomial, GP/kriging alike. A scale-blind outer
-    // takes the bare `tolerance` (≈1e-6) as the *absolute* projected-gradient
-    // floor, which is hopelessly tight against an n-scaled gradient: in-basin
-    // iterates (e.g. ‖g‖≈7e-2 at |f|≈17, or single-digit ‖g‖ at |f|≈1.3e3)
-    // never clear it and the fit bails at the iteration cap. Worse, ARC's
-    // trust-region reduction ratios and default initial regularization are
-    // referenced against the wrong curvature magnitude, so the first step can
-    // overshoot and diverge (the ‖g‖≈½|f| blow-ups in #1053/#1066). Threading
-    // the scale (→ absolute floor = max(tol, n·1e-9)) plus a warm ARC
-    // regularization (σ₀ = 0.25) and operator trust radius (4.0) makes the
-    // spatial exact-joint outer converge as robustly as the primary REML outer
-    // across 1-D Matérn (#1053), 2-D binomial geo (#1066), and GP/kriging
-    // (#1069). This is NOT a loosening of the `τ·(1+|f|)` REML acceptance gate
-    // — that relative-to-cost criterion is unchanged; only the nonsensical
-    // scale-free *absolute* floor and the solver's curvature reference are
-    // corrected. `None` preserves the prior scale-free calibration.
+    // `Some((n_obs, p_cols))` declares the profiled REML/LAML criterion's size,
+    // the formation count its certificate charges gradient and objective
+    // rounding at. The stationarity band does not grow with `n` (#2954): the
+    // ρ-gradient is a difference of rank- and penalty-energy-sized terms, not a
+    // sum over rows.
     profiled_objective_size: Option<(usize, usize)>,
 ) -> Result<gam_solve::rho_optimizer::OuterProblem, EstimationError> {
     if rho_dim > theta0.len() {
@@ -5387,13 +5371,7 @@ pub(crate) fn exact_joint_outer_problem(
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_heuristic_log_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
-        // Calibrate to the n-scaled profiled criterion (see the param doc).
-        // This is the scale the spatial exact-joint path was missing relative
-        // to the primary REML outer; without it the iso-κ length-scale fit
-        // stalls as |f| grows with n (#1053 / #1066 / #1069).
-        problem = problem
-            .with_objective_scale(Some(n_obs as f64))
-            .with_problem_size(n_obs, p_cols);
+        problem = problem.with_problem_size(n_obs, p_cols);
     }
     Ok(problem)
 }
