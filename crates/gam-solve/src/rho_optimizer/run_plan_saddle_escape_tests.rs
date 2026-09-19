@@ -242,6 +242,12 @@ fn without_ownership_flag_bimodal_terminal_bind_fails() {
 
 // ─── #2357 interior strict-saddle escape ──────────────────────────
 
+/// The observations the audited saddle fixtures declare: `τ_stat = 1/(2n) = 1e-7`,
+/// the criterion resolution their wells and rungs are sized against.
+const SADDLE_FIXTURE_N_OBS: usize = 5_000_000;
+/// The coefficients those fixtures declare, one per smoothing coordinate.
+const SADDLE_FIXTURE_P: usize = 2;
+
 // A 2-D outer objective with a genuine interior saddle at ρ=(0,0) and a pair of
 // PSD minima at ρ=(0,±1):
 //
@@ -292,7 +298,12 @@ fn certify_mints_saddle_escape_reseed_at_interior_saddle() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "saddle-escape #2357")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "saddle-escape #2357")
         .expect_err("an interior strict saddle must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -560,7 +571,12 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "lying-hessian #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "lying-hessian #2612")
         .expect("a global minimum must not be refused on curvature the criterion contradicts");
     let cert = result
         .criterion_certificate
@@ -609,7 +625,8 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
 // exploitable descent one halving further down.
 //
 // The derived ladder runs to `α_min = sqrt(2·objective_resolution/|λ_min|)`,
-// which at the default `1e-7` resolution and `|λ_min| = 0.01` is `4.5e-3`, so
+// which at the fixture's declared `τ_stat = 1e-7` (`n = 5e6`) and
+// `|λ_min| = 0.01` is `4.5e-3`, so
 // it reaches `0.03125` — inside the well — and mints the escape.
 fn narrow_well_cost(rho: &Array1<f64>) -> f64 {
     let r0 = rho[0];
@@ -654,7 +671,12 @@ fn escape_reaches_a_descent_below_the_old_fixed_ladder_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "narrow-well #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "narrow-well #2612")
         .expect_err("a saddle with a real descent must be refused, not certified");
     let result = &rejection.result;
     let cert = result
@@ -848,7 +870,12 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "unresolvable-well #2612")
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "unresolvable-well #2612")
         .expect(
             "a point whose only available descent is below the criterion's own resolution must \
              not be refused: no optimizer can reach past it, so the negative direction has no \
@@ -1022,7 +1049,12 @@ fn saddle_escape_expansion_does_not_overshoot_a_genuine_well_2612() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let rejection = audit_stationary_point(&mut obj, array![0.0, 0.0], "well-overshoot #2612")
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0, 0.0],
+        SADDLE_FIXTURE_N_OBS,
+        SADDLE_FIXTURE_P,
+        "well-overshoot #2612")
         .expect_err("an interior strict saddle must be refused, not certified");
     let reseed = rejection
         .result
@@ -1217,15 +1249,16 @@ fn outer_search_reaches_a_corner_minimum_that_needs_more_than_one_escape_2612() 
 //
 // #2939 was found under the score-relative band `τ·(1 + V₀)` that #2954
 // removed; the fixture now states that band as its declared tolerance,
-// `VALLEY_BAND = 1e−5·(1 + V₀) ≈ 0.30`, and keeps the criterion resolution at
-// production's default `rel_cost = 1e−7`. That is #2939's regime: a caller's band
+// `VALLEY_BAND = 1e−5·(1 + V₀) ≈ 0.30`, and declares `n = 167` observations,
+// so the criterion resolution is `τ_stat = 1/(2n) = 3.0e−3`, the magnitude the
+// removed `1e−7·(1 + V₀)` resolution had here. That is #2939's regime: a caller's band
 // wide against the curvature the escape follows (λ_min = −4.2e−2), which a caller
 // may still declare, so the latch must still hold there.
 //
 // At ρ = 0 the gradient vanishes and H = diag(A, −1). The escape ray along ρ₁
 // climbs the valley wall, `f(0, t) − V₀ = (A/2 + 1/(4s²))·t⁴ − t²/2`. The ladder's
 // first descending rung is t = ⅛ (−5.86e−3, above the criterion resolution
-// `1e−7·(1 + V₀) = 3.0e−3`), and doubling to ¼ buys nothing (+1.1e−4). At the
+// `τ_stat = 3.0e−3`), and doubling to ¼ buys nothing (+1.1e−4). At the
 // escape point ρ = (0, ⅛), |∇f| = 0.258 is inside the solver band, and
 // H = [[16, −4], [−4, 0.505]] is still indefinite (det −7.9), so a gradient-only
 // restart stops at iteration 0 and the next mint finds another saddle: #2939's
@@ -1236,9 +1269,9 @@ const VALLEY_OFFSET: f64 = 3.0e4;
 /// The stationarity band the fixture declares: production's default tolerance
 /// scaled by `1 + V₀`, the band #2939 ran under before #2954.
 const VALLEY_BAND: f64 = 1.0e-5 * (1.0 + VALLEY_OFFSET);
-/// The criterion's relative cost resolution, production's default `1e−2·τ` at
-/// `τ = 1e−5`, held there while the band is widened.
-const VALLEY_REL_COST: f64 = 1.0e-7;
+/// The observations the fixture declares: the criterion resolution is
+/// `τ_stat = 1/(2n) = 2.99e−3`.
+const VALLEY_N_OBS: usize = 167;
 
 fn valley_cost(rho: &Array1<f64>) -> f64 {
     let u = rho[0] - rho[1] * rho[1];
@@ -1276,14 +1309,14 @@ fn valley_eval(rho: &Array1<f64>) -> OuterEval {
 }
 
 /// The #2898 lifecycle (the exact Hessian declared, gradient-only search
-/// preferred) at the fixture's declared band and production's cost resolution.
+/// preferred) at the fixture's declared band and statistical resolution.
 fn valley_problem(initial_rho: Array1<f64>) -> OuterProblem {
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
         .with_tolerance(VALLEY_BAND)
-        .with_rel_cost_tolerance(Some(VALLEY_REL_COST))
+        .with_problem_size(VALLEY_N_OBS, 2)
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(initial_rho)
 }
