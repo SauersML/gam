@@ -11,7 +11,7 @@ The #2263 closure gate for `structure_certificate` on real activations:
     is a hard failure.
 
   * EXTERNAL arm (#2266): feed externally-trained (torch-lane) arrays into
-    `gamfit.sae_manifold_certify_external(..., run_structure_search=True)` and
+    `gamfit.sae.sae_manifold_certify_external(..., run_structure_search=True)` and
     require a parseable NON-EMPTY structure certificate. A parseable-but-empty
     certificate is not acceptance.
 
@@ -109,7 +109,7 @@ def preflight():
     rng = np.random.default_rng(0)
     x = ring_feature(7, 210, 16, 1.0, 0.05, seed=0)
     try:
-        m = gamfit.sae_manifold_fit(
+        m = gamfit.sae.sae_manifold_fit(
             X=x, K=1, d_atom=2, atom_topology="circle", assignment="softmax",
             n_iter=3, random_state=0, run_structure_search=True)
     except TypeError as exc:
@@ -132,7 +132,7 @@ def fit_native(x, feature, seed, n_iter):
     t0 = time.time()
     outcome, detail, cert = "minted", "", None
     try:
-        m = gamfit.sae_manifold_fit(
+        m = gamfit.sae.sae_manifold_fit(
             X=np.ascontiguousarray(x), K=k, d_atom=2, atom_topology="circle",
             assignment="ordered_beta_bernoulli", n_iter=n_iter, learning_rate=0.04,
             random_state=seed, run_structure_search=True)
@@ -163,7 +163,7 @@ def external_arm(x, seed, n_iter):
     row = {"arm": "external_replay"}
     t0 = time.time()
     try:
-        fit = gamfit.sae_manifold_fit(
+        fit = gamfit.sae.sae_manifold_fit(
             X=np.ascontiguousarray(x), K=2, d_atom=2, atom_topology="circle",
             assignment="ordered_beta_bernoulli", n_iter=n_iter, learning_rate=0.04,
             random_state=seed, run_structure_search=False)
@@ -173,7 +173,7 @@ def external_arm(x, seed, n_iter):
                    detail=str(exc).splitlines()[0][:200], seconds=time.time() - t0)
         return row
     try:
-        report = gamfit.sae_manifold_certify_external(
+        report = gamfit.sae.sae_manifold_certify_external(
             X=x,
             geometry_plans=list(fit.geometry_plans),
             decoder_blocks=[np.asarray(b, dtype=float) for b in fit.decoder_blocks],

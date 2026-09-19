@@ -4,7 +4,7 @@ The BSF paper (Goodfire, 2026-07) answers this for vision (DINOv3/SDXL):
 block stable rank concentrates at 2-4 of a possible 16. This script produces
 the language-side answer on real frontier residual-stream activations
 (default: Kimi-K2.5 layer-40 datasci corpora) using the proven block-sparse
-lane (`gamfit.block_sparse_dictionary_fit`, Grassmann frames ON — the same
+lane (`gamfit.sae.block_sparse_dictionary_fit`, Grassmann frames ON — the same
 featurizer family as their Grassmannian BSF).
 
 Per config it records the full per-block stable-rank vector plus summary
@@ -102,7 +102,7 @@ def main() -> None:
             "pca_ev_fraction": round(ev_frac, 4),
         }
         try:
-            fit = gamfit.block_sparse_dictionary_fit(
+            fit = gamfit.sae.block_sparse_dictionary_fit(
                 proj,
                 cfg["n_blocks"],
                 block_size=cfg["block_size"],

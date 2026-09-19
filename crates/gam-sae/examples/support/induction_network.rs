@@ -17,9 +17,13 @@ use gam_sae::parameter_decomposition::block::{
 use gam_sae::parameter_decomposition::bounds::kl_over_logit_boxes;
 use gam_sae::parameter_decomposition::receipts::evaluation_band;
 use gam_sae::parameter_decomposition::rewrite::ComponentRead;
-use gam_sae::parameter_decomposition::supports::{EvidenceStatus, MaskBox};
+use gam_sae::parameter_decomposition::supports::{
+    BoxDivergence, BoxFamily, BoxOracleError, BoxSeparationOracle, ComponentSet, EvidenceStatus, MaskBox, SeparationOracle,
+};
 use ndarray::Array2;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// The four linear reads of a layer, in the order every per-projection array here uses.
 pub const PROJECTIONS: [AttentionProjection; 4] = [
@@ -279,7 +283,7 @@ impl InductionRows {
     pub fn at(
         &mut self,
         mask: &MaskBox,
-        execute: impl FnMut(usize) -> Result<Rows, String>,
+        execute: impl Fn(usize) -> Result<Rows, String> + Sync,
     ) -> Result<Vec<RowDivergence>, String> {
         if let Some(found) = self.cache.get(mask) {
             return Ok(found.clone());
@@ -293,19 +297,32 @@ impl InductionRows {
 
     /// Every induction row's divergence of the network `execute(sequence)` runs, with no memo: for a network
     /// outside the masks `at` keys, such as another decomposition.
-    pub fn evaluate(&self, mut execute: impl FnMut(usize) -> Result<Rows, String>) -> Result<Vec<RowDivergence>, String> {
-        let mut executed: BTreeMap<usize, Rows> = BTreeMap::new();
+    pub fn evaluate(&self, execute: impl Fn(usize) -> Result<Rows, String> + Sync) -> Result<Vec<RowDivergence>, String> {
+        Ok(self.evaluate_with(|sequence| Ok((execute(sequence)?, ())))?.0)
+    }
+
+    /// [`Self::evaluate`] with what each sequence's execution returns beside its rows, by sequence. The
+    /// sequences execute in parallel, each once; every row's divergence is its own, so the result does not
+    /// depend on the order.
+    pub fn evaluate_with<T: Send>(
+        &self,
+        execute: impl Fn(usize) -> Result<(Rows, T), String> + Sync,
+    ) -> Result<(Vec<RowDivergence>, BTreeMap<usize, T>), String> {
+        let mut sequences: Vec<usize> = self.rows.iter().map(|&(sequence, _)| sequence).collect();
+        sequences.dedup();
+        let executed: BTreeMap<usize, (Rows, T)> = sequences
+            .into_par_iter()
+            .map(|sequence| execute(sequence).map(|executed| (sequence, executed)))
+            .collect::<Result<_, String>>()?;
         let mut divergences = Vec::with_capacity(self.rows.len());
         for &(sequence, position) in &self.rows {
-            if !executed.contains_key(&sequence) {
-                executed.insert(sequence, execute(sequence)?);
-            }
             divergences.push(
-                row_divergence(&self.reference[sequence], &executed[&sequence], position)
+                row_divergence(&self.reference[sequence], &executed[&sequence].0, position)
                     .map_err(|error| format!("row ({sequence}, {position}): {error}"))?,
             );
         }
-        Ok(divergences)
+        let extras = executed.into_iter().map(|(sequence, (_, extra))| (sequence, extra)).collect();
+        Ok((divergences, extras))
     }
 
     /// The largest divergence over `rows`: exact, as the largest center with the largest numerical error, when every
@@ -350,4 +367,52 @@ pub fn flag<'a>(args: &'a [String], name: &str, usage: &str) -> Result<&'a str, 
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].as_str())
         .ok_or_else(|| format!("missing {name}; {usage}"))
+}
+
+/// A box oracle that prints each separation it answers, so a long search's progress is in the run's log.
+pub struct Logged<P: BoxDivergence> {
+    oracle: BoxSeparationOracle<P>,
+    label: String,
+    separations: usize,
+    started: Instant,
+}
+
+impl<P: BoxDivergence> Logged<P> {
+    pub fn new(oracle: BoxSeparationOracle<P>, label: String) -> Self {
+        Self { oracle, label, separations: 0, started: Instant::now() }
+    }
+}
+
+impl<P: BoxDivergence> SeparationOracle for Logged<P> {
+    type Mask = MaskBox;
+    type Domain = BoxFamily<P::Domain>;
+    type Error = BoxOracleError<P::Error>;
+
+    fn components(&self) -> usize {
+        self.oracle.components()
+    }
+
+    fn perturbed_components(&self, mask: &MaskBox) -> Vec<usize> {
+        self.oracle.perturbed_components(mask)
+    }
+
+    fn separate(&mut self, support: &ComponentSet) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+        let status = self.oracle.separate(support)?;
+        self.separations += 1;
+        println!(
+            "[search] {} separation={} kept={} enclosures={} seconds={:.0} lower={:?} upper={:?}",
+            self.label,
+            self.separations,
+            support.len(),
+            self.oracle.enclosures(),
+            self.started.elapsed().as_secs_f64(),
+            status.lower_bound(),
+            status.upper_bound()
+        );
+        Ok(status)
+    }
+
+    fn evaluate(&mut self, mask: &MaskBox) -> Result<EvidenceStatus<MaskBox, Self::Domain>, Self::Error> {
+        self.oracle.evaluate(mask)
+    }
 }

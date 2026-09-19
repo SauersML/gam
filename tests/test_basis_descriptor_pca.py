@@ -1,4 +1,4 @@
-"""Callable-basis contract for :class:`gamfit.Pca`.
+"""Callable-basis contract for :class:`gamfit.smooth.Pca`.
 
 PCA is a fixed linear projection so the Jacobian is the embedding matrix
 and the Hessian is identically zero.
@@ -17,7 +17,7 @@ import gamfit
 def test_evaluate_jacobian_hessian_shapes() -> None:
     rng = np.random.default_rng(0)
     basis = rng.standard_normal((7, 4))
-    spec = gamfit.Pca(basis=basis)
+    spec = gamfit.smooth.Pca(basis=basis)
     B = 5
     x = torch.as_tensor(rng.standard_normal((B, 7)), dtype=torch.float64)
     # Pca uses 7 intrinsic coords -> 7 positional args.

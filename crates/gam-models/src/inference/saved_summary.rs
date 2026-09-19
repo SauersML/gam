@@ -363,6 +363,7 @@ fn summary_smooth_terms(
             ref_df: row.ref_df,
             chi_sq: row.chi_sq,
             p_value: row.pvalue,
+            p_value_unavailable: row.pvalue_unavailable.map(|reason| reason.label()),
         })
         .collect())
 }
@@ -502,6 +503,7 @@ fn scan_summary_payload(
         // as `summary.gam` does for terms whose Wald test is unavailable.
         chi_sq: None,
         p_value: None,
+        p_value_unavailable: None,
     }];
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -590,6 +592,7 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         outer_iterations: evidence.outer_iterations(),
         inner_iterations: fit.inner_cycles,
         outer,
+        estimator: SummaryEstimator::of(fit),
     }
 }
 
@@ -899,6 +902,11 @@ pub struct SummarySmoothTermRow {
     pub chi_sq: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
+    /// Why `p_value` is absent when the term has no valid reference law
+    /// (`"shape_constrained"`); see
+    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p_value_unavailable: Option<&'static str>,
 }
 
 /// The fitted curvature estimate for one `curv(...)` constant-curvature smooth
@@ -1116,6 +1124,53 @@ pub struct SummaryConvergence {
     /// stationarity equation to solve, which is a different statement from a
     /// projected gradient that happened to be zero.
     pub outer: Option<SummaryOuterCertificate>,
+    /// Which objective the coefficients are the mode of, and why.
+    pub estimator: SummaryEstimator,
+}
+
+/// The objective a fit optimized, named once in Rust so every surface — the
+/// Python summary, the model repr and `gam summary` — prints the same words.
+///
+/// A fit whose estimator changed from the one requested (the separation rescue,
+/// the custom-family arming lifecycle) carries the typed evidence that forced
+/// the change; the reason is rendered from that evidence, never inferred from
+/// the coefficients.
+#[derive(Serialize)]
+pub struct SummaryEstimator {
+    /// `"penalized likelihood"` or `"penalized likelihood with Jeffreys prior"`.
+    pub name: String,
+    /// Why the Jeffreys prior is in the objective; `None` when it is not.
+    pub reason: Option<String>,
+    /// `name`, followed by the reason in parentheses when there is one.
+    pub text: String,
+}
+
+impl SummaryEstimator {
+    const PENALIZED_LIKELIHOOD: &'static str = "penalized likelihood";
+    const WITH_JEFFREYS_PRIOR: &'static str = "penalized likelihood with Jeffreys prior";
+
+    fn of(fit: &gam_solve::estimate::UnifiedFitResult) -> Self {
+        let artifacts = &fit.artifacts;
+        let reason = match &artifacts.jeffreys_arming_evidence {
+            Some(evidence) => Some(evidence.reason()),
+            None if artifacts.firth_bias_reduction => Some("requested by the caller".to_string()),
+            None => None,
+        };
+        let name = if reason.is_some() {
+            Self::WITH_JEFFREYS_PRIOR
+        } else {
+            Self::PENALIZED_LIKELIHOOD
+        };
+        let text = match &reason {
+            Some(reason) => format!("{name} ({reason})"),
+            None => name.to_string(),
+        };
+        Self {
+            name: name.to_string(),
+            reason,
+            text,
+        }
+    }
 }
 
 /// The outer (smoothing-parameter) stationarity certificate.

@@ -4,7 +4,7 @@ pyGAM / mgcv users read the fitted coefficients, EDF, smoothing parameters,
 dispersion ``phi_hat``, log-likelihood, deviance, residuals, iteration counts
 and ``n_obs`` straight off the fitted model. ``gamfit`` computes every one of
 them in Rust: the scalars are fields of the one ``SummaryPayload`` that
-``Model.summary()`` and ``gam summary`` both serialize, and residuals are
+``Model.summary()`` and ``gam summary --json`` both serialize, and residuals are
 ``Model.residuals(data, type=...)`` / ``gam residuals`` over the same Rust
 kernel. Before this change the dispersion was never surfaced (the loglik used
 it internally), there were no residuals, and no inner-iteration count.
@@ -245,7 +245,7 @@ def test_cli_summary_and_residuals_match_python(tmp_path: Path) -> None:
         assert proc.returncode == 0, proc.stderr
         return json.loads(proc.stdout)
 
-    cli_summary = run("summary", str(model_path))
+    cli_summary = run("summary", "--json", str(model_path))
     summary = model.summary()
     for key in ("n_obs", "scale", "edf_total", "log_likelihood", "deviance", "lambdas"):
         assert cli_summary[key] == summary[key], key

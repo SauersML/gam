@@ -8,7 +8,7 @@ import pytest
 def test_convex_constraint_is_spanwise_and_sampling_invariant() -> None:
     torch = pytest.importorskip("torch")
 
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch.fit import _build_shape_constraint_inequality
 
     degree = 3
@@ -74,7 +74,7 @@ def test_all_shape_kinds_use_the_rust_continuum_cone(
 ) -> None:
     torch = pytest.importorskip("torch")
 
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch.fit import _build_shape_constraint_inequality
 
     degree = 3
@@ -103,7 +103,7 @@ def test_all_shape_kinds_use_the_rust_continuum_cone(
 def test_affine_linear_spline_has_vacuous_curvature_cone() -> None:
     torch = pytest.importorskip("torch")
 
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch.fit import _build_shape_constraint_inequality
 
     knots = torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.float64)
@@ -119,7 +119,7 @@ def test_affine_linear_spline_has_vacuous_curvature_cone() -> None:
 def test_shape_constraint_rejects_periodic_coefficient_chart() -> None:
     torch = pytest.importorskip("torch")
 
-    from gamfit import BSpline
+    from gamfit.smooth import BSpline
     from gamfit.torch.fit import _build_shape_constraint_inequality
 
     knots = torch.linspace(0.0, 1.0, 9, dtype=torch.float64)

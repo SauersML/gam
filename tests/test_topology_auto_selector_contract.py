@@ -1,7 +1,7 @@
 """The public selector is a real, canonically named multi-fit orchestrator."""
 
 import pytest
-from gamfit import TopologyAutoSelector
+from gamfit.topology import TopologyAutoSelector
 from gamfit._select_topology import _normalize_topology_name
 
 

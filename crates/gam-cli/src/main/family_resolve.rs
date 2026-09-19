@@ -13,6 +13,7 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
         FamilyArg::GammaLog => Some("gamma"),
         FamilyArg::Tweedie => Some("tweedie"),
         FamilyArg::Beta => Some("beta"),
+        FamilyArg::StudentT => Some("student-t"),
         FamilyArg::RoystonParmar => Some("royston-parmar"),
         FamilyArg::Expectile => Some("expectile"),
         // Dispatched by `run_fit` before the canonical family resolver (the

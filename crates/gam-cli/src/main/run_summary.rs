@@ -1,18 +1,5 @@
 use super::*;
 use gam::families::inference::saved_residuals::saved_model_residuals;
-use gam::families::inference::saved_summary::saved_model_summary;
-
-/// `gam summary MODEL`: the saved model's summary payload as JSON, the same
-/// document `gamfit`'s `Model.summary()` reads.
-pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
-    reject_multinomial_model(&args.model, "summary")?;
-    let model = SavedModel::load_from_path(&args.model)?;
-    let summary = saved_model_summary(&model)?;
-    let text = serde_json::to_string_pretty(&summary)
-        .map_err(|err| format!("failed to serialize summary: {err}"))?;
-    cli_out!("{text}");
-    Ok(())
-}
 
 /// `gam residuals MODEL DATA --type TYPE`: the per-row residuals of the saved
 /// model on `DATA` as JSON, the same values `gamfit`'s
