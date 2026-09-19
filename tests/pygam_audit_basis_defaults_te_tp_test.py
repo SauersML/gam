@@ -11,8 +11,9 @@ Each case is one the audit measured gamfit losing at the formula defaults:
   capped per margin by the covariate's distinct values; the REML penalty, not
   the basis size, sets the smoothness.
 * ``te(season, hour)`` on the bike-sharing torus data. ``hour`` has 24 distinct
-  values but the default margin used 6 of them (held-out MSE ~0.17); the
-  4-level ``season`` margin now hands its unused share to ``hour``.
+  values but the default margin used 6 of them (held-out MSE ~0.17): each
+  margin was capped at its 1-D internal-knot count (#3181). Margins are now
+  capped by their distinct values, and the row-count budget gives both 13.
 * ``s(x, bs='tp')`` with one x = 1e6 among 300 rows on [0, 1). The isotropic
   standardization put the whole bulk inside ~2e-5 of standardized space, where
   the r^3 kernel differences are ~1e-15 of the outlier's: every bulk bending
@@ -108,3 +109,25 @@ def test_thin_plate_smooth_on_the_same_bulk_without_the_outlier_still_bends() ->
     grid = np.linspace(0.05, 0.95, 19)
     pred = np.asarray(model.predict({"x": grid}), float).ravel()
     assert float(np.mean((pred - np.sin(2 * np.pi * grid)) ** 2)) < 0.01
+
+
+@pytest.mark.parametrize("formula", ["y ~ s(b) + te(b, c)", "y ~ s(b) + te(b, c, k=[14, 14])"])
+def test_tensor_sharing_a_margin_with_a_smooth_predicts_from_its_frozen_basis(formula: str) -> None:
+    # A te whose margin also carries its own s() is whitened against the design
+    # Gram, so its frozen chart is not orthonormal. Its null-function ridge was
+    # classified by a spectral rank test in that chart, which over-counted the
+    # joint null and made the rebuilt prediction design disagree with the fit.
+    n = 1000
+    rng = np.random.default_rng(zlib.crc32(formula.encode()))
+    b = rng.uniform(0.0, 1.0, n)
+    c = rng.uniform(0.0, 1.0, n)
+    mu = np.sin(3 * b) + b * c
+    y = mu + rng.normal(0.0, 0.1, n)
+    train, test = _holdout_split(n)
+    cols = {"b": b, "c": c}
+    model = gamfit.fit({**_subset(cols, train), "y": y[train]}, formula)
+    pred = np.asarray(model.predict(_subset(cols, test)), float).ravel()
+    fitted = np.asarray(model.predict(_subset(cols, train)), float).ravel()
+    assert np.all(np.isfinite(pred))
+    assert float(np.mean((fitted - mu[train]) ** 2)) < 0.005
+    assert float(np.mean((pred - mu[test]) ** 2)) < 0.005

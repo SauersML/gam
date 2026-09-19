@@ -5304,3 +5304,50 @@ fn categorical_column_in_a_numeric_axis_term_is_rejected() {
             .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
     }
 }
+
+/// `s(b) + te(b, c)` puts the tensor in a collection gauge whose coefficient
+/// transform whitens the design Gram. The frozen spec rebuilds the tensor in
+/// the composite chart at predict time, and its null-function block ridges
+/// must find the chart's null as the preimage of `⊗ null(S_j)`: a spectral
+/// rank test on the whitened primary counted weakly penalized bending
+/// directions as null ("tensor null blocks span 4 of the chart's 27 null
+/// directions") and the fitted model could not predict.
+#[test]
+fn a_tensor_sharing_a_margin_with_a_smooth_rebuilds_from_its_frozen_spec() {
+    let n = 1000usize;
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let rows = (0..n)
+        .map(|_| {
+            let b = uniform();
+            let c = uniform();
+            vec![(3.0 * b).sin() + b * c, b, c]
+        })
+        .collect();
+    let ds = continuous_dataset(&["y", "b", "c"], rows);
+    for formula in ["y ~ s(b) + te(b, c)", "y ~ s(b) + te(b, c, k=[14,14])"] {
+        let spec = build_formula(formula, &ds);
+        let fitted = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` fit-time design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let rebuilt = crate::smooth::build_term_collection_design(ds.values.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` rebuild from the frozen spec: {err}"));
+        let fitted_rows = fitted.design.to_dense();
+        let rebuilt_rows = rebuilt.design.to_dense();
+        assert_eq!(rebuilt_rows.dim(), fitted_rows.dim(), "`{formula}`");
+        let scale = fitted_rows.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let drift = (&rebuilt_rows - &fitted_rows)
+            .iter()
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            drift <= 1e-9 * scale,
+            "`{formula}`: the rebuilt design drifts {drift:.3e} (scale {scale:.3e})"
+        );
+    }
+}
