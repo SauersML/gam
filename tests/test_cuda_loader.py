@@ -55,6 +55,7 @@ def test_assert_no_cuda_library_conflicts_warns_not_raises(
         }
 
     monkeypatch.setattr(_cuda, "cuda_diagnostics", fake_diagnostics)
+    monkeypatch.setattr(_cuda, "_mapped_cuda_libraries", lambda: dict(fake_conflicts))
     # Reset the de-dup cache so the warning actually fires in this test.
     monkeypatch.setattr(_cuda, "_CUDA_CONFLICT_WARNED", set())
 
@@ -69,6 +70,25 @@ def test_assert_no_cuda_library_conflicts_warns_not_raises(
     _cuda.assert_no_cuda_library_conflicts("test context")
     captured = capsys.readouterr()
     assert captured.err == ""
+
+
+def test_conflict_check_without_conflicts_reads_only_the_process_maps(monkeypatch) -> None:
+    """The clean-process check must not scan the disk for CUDA stacks.
+
+    ``import gamfit`` runs this check four times. Whether two stacks are
+    mapped is decided by ``/proc/self/maps`` alone; the full diagnostics
+    snapshot (packaged and system stacks, globbed from disk) only feeds
+    the warning text, so a process with no conflict must never build it.
+    """
+
+    mapped = {"libcuda": ["/usr/lib/x86_64-linux-gnu/libcuda.so.1"]}
+    monkeypatch.setattr(_cuda, "_mapped_cuda_libraries", lambda: dict(mapped))
+
+    def disk_scan() -> dict[str, object]:
+        raise AssertionError("conflict check built the full diagnostics without a conflict")
+
+    monkeypatch.setattr(_cuda, "cuda_diagnostics", disk_scan)
+    _cuda.assert_no_cuda_library_conflicts("test context")
 
 
 def test_cuda_candidates_preload_driver_before_userspace_stack(
