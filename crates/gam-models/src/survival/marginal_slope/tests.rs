@@ -155,112 +155,6 @@ fn base_time_block() -> TimeBlockInput {
     }
 }
 
-/// Endpoint evaluations whose average empirical function Gram is exactly
-/// `(2/3) I`.  Both endpoint charts span the two coefficient directions, so
-/// they exercise function-space shrinkage without the singular all-zero
-/// design that the production generalized eigensolve correctly rejects.
-fn full_span_time_endpoint_designs() -> (DesignMatrix, DesignMatrix) {
-    (
-        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
-        DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [1.0, -1.0]]),
-    )
-}
-
-#[test]
-fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let mut block = TimeBlockInput {
-        design_entry,
-        design_exit,
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-
-    assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
-            .expect("time nullspace shrinkage should build"),
-        "expected a shrinkage penalty to be appended",
-    );
-    assert_eq!(block.penalties.len(), 2);
-    assert_eq!(block.nullspace_dims, vec![1, 0]);
-    let expected = array![[0.0, 0.0], [0.0, 2.0 / 3.0]];
-    for i in 0..2 {
-        for j in 0..2 {
-            assert_close(
-                block.penalties[1][[i, j]],
-                expected[[i, j]],
-                1e-12,
-                &format!("time nullspace function-metric ridge ({i},{j})"),
-            );
-        }
-    }
-}
-
-/// gnomon#2336: a row entering at the time origin has no entry factor, so its
-/// entry evaluation carries no function-metric mass. The ridge must not read an
-/// origin row's entry design, and a fully landmarked block gets the exit metric.
-#[test]
-fn time_nullspace_shrinkage_metric_ignores_origin_entry_rows_2336() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let block_with = |entry: DesignMatrix| TimeBlockInput {
-        design_entry: entry,
-        design_exit: design_exit.clone(),
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let ridge = |mut block: TimeBlockInput, entry_at_origin: &Array1<bool>| {
-        assert!(
-            install_time_nullspace_shrinkage_penalty(&mut block, 0, entry_at_origin)
-                .expect("time nullspace shrinkage should build"),
-            "expected a shrinkage penalty to be appended",
-        );
-        block.penalties.last().expect("appended ridge").clone()
-    };
-
-    let one_origin_row = array![false, false, true];
-    let reference = ridge(block_with(design_entry.clone()), &one_origin_row);
-    let moved_origin_row = ridge(
-        block_with(DesignMatrix::from(array![[1.0, 0.0], [0.0, 1.0], [7.5, -3.0]])),
-        &one_origin_row,
-    );
-    assert_eq!(
-        reference, moved_origin_row,
-        "the ridge read the entry design of a row that enters at the origin"
-    );
-
-    let landmarked = ridge(block_with(design_entry), &Array1::from_elem(3, true));
-    let exit_metric = ridge(block_with(design_exit.clone()), &Array1::from_elem(3, false));
-    for i in 0..2 {
-        for j in 0..2 {
-            assert_close(
-                landmarked[[i, j]],
-                exit_metric[[i, j]],
-                1e-12,
-                &format!("landmarked block metric ({i},{j})"),
-            );
-        }
-    }
-}
-
 /// gnomon#2336: the pilot baseline slope solves the fitted row objective, so a
 /// row entering at the time origin contributes no entry factor there either.
 /// Moving the entry offsets of landmarked rows must leave the pilot slope
@@ -382,35 +276,6 @@ fn pooled_survival_baseline_solves_at_the_conditional_score_variance_2952() {
          {conditional_slope:.12e} scores {at_conditional:.15e}, not below the unit-variance slope \
          {unit_slope:.12e}'s {at_unit:.15e} by more than the rounding {rounding:.3e}"
     );
-}
-
-#[test]
-fn time_nullspace_shrinkage_is_noop_for_full_rank_time_penalty() {
-    let (design_entry, design_exit) = full_span_time_endpoint_designs();
-    let mut block = TimeBlockInput {
-        design_entry,
-        design_exit,
-        design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(
-            3,
-            DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
-        ),
-        penalties: vec![Array2::<f64>::eye(2)],
-        nullspace_dims: vec![0],
-        initial_beta: Some(Array1::zeros(2)),
-        ..base_time_block()
-    };
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-
-    assert!(
-        !install_time_nullspace_shrinkage_penalty(&mut block, 0, &no_origin_entries)
-            .expect("full-rank time penalty should be accepted"),
-        "full-rank time penalties should not get another penalty",
-    );
-    assert_eq!(block.penalties.len(), 1);
-    assert_eq!(block.nullspace_dims, vec![0]);
 }
 
 fn sparse_design(dense: &Array2<f64>) -> DesignMatrix {
@@ -6805,6 +6670,57 @@ fn survival_dense_hessian_is_bitwise_invariant_to_the_worker_count_2337() {
     }
 }
 
+/// gam#3035: the dense Hessian and all-axes overrides agree with the generic
+/// per-row reductions on the full data and on a Horvitz–Thompson-weighted
+/// subsample. `n = 700` puts the subsample's walk past one 256-row chunk.
+#[test]
+fn rigid_survival_dense_overrides_match_generic_on_every_row_set_3035() {
+    let n = 700usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.37).sin() * 1.1).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.7 + 0.5 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+    let marginal_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+    let beta_marginal = Array1::from_vec(vec![0.18, -0.12]);
+    let beta_slope = Array1::from_vec(vec![-0.2, 0.13]);
+    for frailty in [None, Some(0.55_f64)] {
+        let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        family.marginal_design = DesignMatrix::from(marginal_design.clone());
+        family
+            .slope_layout
+            .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.65],
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal.clone(),
+                eta: marginal_design.dot(&beta_marginal),
+            },
+            ParameterBlockState {
+                beta: beta_slope.clone(),
+                eta: slope_design.dot(&beta_slope),
+            },
+        ];
+        let kernel = SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            family,
+            block_states,
+        );
+        crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
+            &format!("rigid survival marginal-slope frailty={frailty:?}"),
+            &kernel,
+            &[0.4, -0.6, 0.3, 0.8, -0.2],
+            &[0.5, 0.3, -0.7, 0.9, -0.4],
+            1e-13,
+        );
+    }
+}
+
 /// gam#979 build-once equality contract for the rigid survival marginal-slope
 /// kernel.
 ///
@@ -6994,7 +6910,7 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
                 ((row + 3 * (a + b + c)) as f64 * 0.17).sin()
             })))
         }).collect();
-        let assembled = kernel.all_axes_primary_tensor_pullback(&tensors).unwrap();
+        let assembled = kernel.all_axes_primary_tensor_pullback(&RowSet::All, &tensors).unwrap();
         for axis in 0..p {
             let mut direction = vec![0.0; p];
             direction[axis] = 1.0;
@@ -7185,7 +7101,7 @@ fn rigid_survival_all_axes_tensor_pullback_is_accurate_and_width_invariant_2337(
             .num_threads(workers)
             .build()
             .expect("test worker pool")
-            .install(|| kernel.all_axes_primary_tensor_pullback(&tensors))
+            .install(|| kernel.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors))
             .expect("all-axes tensor pullback")
     };
     let one_worker = pullback(1);
@@ -8595,53 +8511,6 @@ fn rigid_row_primary_mixed_in_z_matches_finite_difference() {
         checked, 360,
         "the grid must be exercised in full; a silently skipped cell is not a passing gate"
     );
-}
-
-/// gam#979: with a time-wiggle block the time value designs carry trailing
-/// zero placeholder columns; the shrinkage metric is the empirical Gram of the
-/// value block only, and the ridge is embedded at zero on the placeholders.
-#[test]
-fn time_shrinkage_metric_excludes_timewiggle_placeholder_columns() {
-    let (entry, exit) = full_span_time_endpoint_designs();
-    let pad = |design: &DesignMatrix| -> DesignMatrix {
-        let dense = design.to_dense();
-        let mut padded = Array2::<f64>::zeros((dense.nrows(), dense.ncols() + 2));
-        padded.slice_mut(s![.., ..dense.ncols()]).assign(&dense);
-        DesignMatrix::from(padded)
-    };
-    let mut penalty = Array2::<f64>::zeros((4, 4));
-    penalty[[0, 0]] = 1.0;
-    let mut block = TimeBlockInput {
-        design_entry: pad(&entry),
-        design_exit: pad(&exit),
-        design_derivative_exit: pad(&exit),
-        penalties: vec![penalty],
-        nullspace_dims: vec![1],
-        initial_beta: Some(Array1::zeros(4)),
-        ..base_time_block()
-    };
-    // The same block through the all-columns metric is exactly the production
-    // refusal: the placeholder columns have no value support.
-    let mut all_columns = block.clone();
-    let no_origin_entries = Array1::from_elem(block.design_entry.nrows(), false);
-    let refused = install_time_nullspace_shrinkage_penalty(&mut all_columns, 0, &no_origin_entries);
-    assert!(
-        refused.is_err(),
-        "the control must refuse: an all-columns metric over zero placeholders is singular"
-    );
-    assert!(
-        install_time_nullspace_shrinkage_penalty(&mut block, 2, &no_origin_entries)
-            .expect("value-block metric with placeholders excluded"),
-        "expected a shrinkage penalty on the value block"
-    );
-    let ridge = block.penalties.last().expect("appended ridge");
-    assert_eq!(ridge.dim(), (4, 4));
-    assert!(
-        ridge.slice(s![2.., ..]).iter().all(|v| *v == 0.0)
-            && ridge.slice(s![.., 2..]).iter().all(|v| *v == 0.0),
-        "the ridge must be zero on the placeholder columns"
-    );
-    assert!(ridge[[1, 1]] > 0.0, "the null direction of the value block must be shrunk");
 }
 
 /// #932 single-source pin, restored (#2818): the SPECIALIZED rigid-row

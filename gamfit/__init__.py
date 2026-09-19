@@ -11,7 +11,7 @@ The top level holds the fit / load entry points and the fitted-model
 classes. Everything else lives in a public submodule, loaded on first
 attribute access:
 
-- ``gamfit.errors`` -- the exception hierarchy (``gamfit.errors.GamError``, ...)
+- ``gamfit.errors`` -- the exception hierarchy (``gamfit.errors.GamfitError``, ...)
 - ``gamfit.results`` -- result, prediction, and posterior-sample types
 - ``gamfit.plot`` -- matplotlib plotting (optional ``gamfit[plot]`` extra)
 - ``gamfit.smooth`` / ``gamfit.basis`` / ``gamfit.penalties`` -- term
@@ -153,12 +153,11 @@ def __getattr__(name: str) -> _ModuleType | str:
         # Read from the installed distribution on first access, not at import:
         # ``importlib.metadata`` is the largest single cost of ``import gamfit``
         # after numpy, and a fit never needs it.
+        # A gamfit that is not an installed distribution has no version to
+        # report, so the lookup raises instead of inventing one (gam#3157).
         from importlib import metadata
 
-        try:
-            version = metadata.version("gamfit")
-        except metadata.PackageNotFoundError:
-            version = "0.0.0+unknown"
+        version = metadata.version("gamfit")
         globals()["__version__"] = version
         return version
     if name in _SUBMODULES:

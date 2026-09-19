@@ -1,0 +1,14 @@
+[package]
+name = "gam-build-identity"
+version = "0.3.157"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+description = "The git commit and dirty state a gam engine binary was built from"
+license = "AGPL-3.0-or-later"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+warnings = "deny"

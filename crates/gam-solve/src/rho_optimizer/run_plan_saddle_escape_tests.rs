@@ -1605,3 +1605,135 @@ fn a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939() {
         "with no certified saddle the search must keep the gradient-only plan"
     );
 }
+
+// ─── #3036 a curvature the criterion cannot resolve at any adjudication step ───
+//
+// gam#3036's instance, reduced to one coordinate. The declared curvature is the instance's
+// `λ = −1.294787e-6`: negative beyond the arithmetic shift `√ε`, so the raw verdict is
+// `hessian_psd=NO`. The planted point has no data, so its row count is chosen from the
+// regime the two pins must sit in, at the criterion's resolution `τ_stat = 1/(2n)` and the
+// ladder's largest step `α = 1`:
+// - unresolvable here: `½|λ| ≤ 1/(2n)`, i.e. `n ≤ 1/|λ| ≈ 7.72e5`;
+// - resolvable in the control (`λ = −1e-4`): `½·1e-4 > 1/(2n)`, i.e. `n > 10 000`.
+// `n = 100 000` sits well inside both. `τ_stat = 5e-6`, so this claim predicts
+// `½|λ| = 6.47e-7`, 7.7× under the resolution, and the control predicts `5e-5`, 10× over
+// it. Every trial point off ρ = 0 fails to evaluate, as the instance's probes did when
+// their inner solves stalled.
+const UNRESOLVABLE_VALUE_3036: f64 = -121.8631;
+const UNRESOLVABLE_N_OBS_3036: usize = 100_000;
+const UNRESOLVABLE_P_3036: usize = 1;
+
+fn stationary_point_with_refused_trials_3036(
+    curvature: f64,
+    off_point_evaluations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl OuterObjective {
+    // No search runs here (`audit_stationary_point` judges the one point), so the
+    // problem declares only its derivatives.
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense);
+    let refused = |rho: &Array1<f64>| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "the planted #3036 trial point rho={:?} has no converged inner solve",
+            rho.to_vec()
+        ))
+    };
+    let cost_counter = std::sync::Arc::clone(&off_point_evaluations);
+    let eval_counter = off_point_evaluations;
+    problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| {
+            if rho.iter().all(|value| *value == 0.0) {
+                Ok(UNRESOLVABLE_VALUE_3036)
+            } else {
+                cost_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(refused(rho))
+            }
+        },
+        move |_: &mut (), rho: &Array1<f64>| {
+            if rho.iter().all(|value| *value == 0.0) {
+                Ok(OuterEval {
+                    cost: UNRESOLVABLE_VALUE_3036,
+                    gradient: array![0.0],
+                    hessian: HessianValue::Dense(array![[curvature]]),
+                    inner_beta_hint: None,
+                })
+            } else {
+                eval_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(refused(rho))
+            }
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    )
+}
+
+#[test]
+fn a_curvature_the_criterion_cannot_resolve_certifies_when_no_trial_evaluates_3036() {
+    let off_point = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut obj =
+        stationary_point_with_refused_trials_3036(-1.294787e-6, std::sync::Arc::clone(&off_point));
+    let result = audit_stationary_point(
+        &mut obj,
+        array![0.0],
+        UNRESOLVABLE_N_OBS_3036,
+        UNRESOLVABLE_P_3036,
+        "planted gam#3036 curvature",
+    )
+    .expect(
+        "a stationary point whose negative curvature the criterion cannot resolve at any \
+             adjudication step must not be refused on the matrix's word",
+    );
+    let cert = result
+        .criterion_certificate
+        .as_ref()
+        .expect("a certified point carries its certificate");
+    assert!(
+        cert.certifies(),
+        "the certificate must accept: {}",
+        cert.summary()
+    );
+    assert_eq!(
+        cert.curvature,
+        CurvatureEvidence::CriterionUnresolvable,
+        "the withdrawn verdict is recorded as unresolvable, not as a PSD claim: {}",
+        cert.summary()
+    );
+    assert_eq!(
+        cert.hessian_psd(),
+        None,
+        "an unresolvable verdict is not a PSD claim"
+    );
+    assert_eq!(
+        off_point.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "resolvability is decided from the eigenvalue and the resolution, before any trial"
+    );
+}
+
+// The control: the same stationary point with a curvature the criterion CAN resolve,
+// `½·1e-4 = 5e-5` against `τ_stat = 5e-6`, whose probes likewise fail to evaluate. The
+// adjudication declines, and the certificate refuses on the curvature it could not test.
+#[test]
+fn a_resolvable_curvature_whose_trials_cannot_be_evaluated_still_refuses_3036() {
+    let off_point = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut obj =
+        stationary_point_with_refused_trials_3036(-1.0e-4, std::sync::Arc::clone(&off_point));
+    let rejection = audit_stationary_point(
+        &mut obj,
+        array![0.0],
+        UNRESOLVABLE_N_OBS_3036,
+        UNRESOLVABLE_P_3036,
+        "planted gam#3036 control",
+    )
+    .expect_err("a resolvable negative curvature that no trial could test must still refuse");
+    assert!(
+        off_point.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the resolvable claim went to the probes: {}",
+        rejection
+    );
+    assert!(
+        rejection.to_string().contains("hessian_psd=NO"),
+        "the refusal is the curvature verdict's: {rejection}"
+    );
+}

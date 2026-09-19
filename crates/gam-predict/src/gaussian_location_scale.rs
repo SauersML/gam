@@ -5,7 +5,9 @@ use super::*;
 /// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
 /// `sigma = response_scale · sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
 ///
-/// `sigma_floor` is the standardized-response σ floor (`LOGB_SIGMA_FLOOR`) and
+/// `sigma_floor` is the standardized-response σ floor saved with the fit (the
+/// response's recording-grid bound `δ/√12`, see
+/// `gam_model_kernels::sigma_link::gaussian_resolution_sigma_floor`) and
 /// `response_scale` maps it back to raw response units. The `exp(η)` term is
 /// already in raw units (the persisted log-σ intercept is shifted by
 /// `+ln(response_scale)` at fit time), so only the floor is scaled here — see
@@ -62,7 +64,7 @@ impl GaussianLocationScalePredictor {
         let eta_noise = self.eta_noise(design_noise, offset_noise)?;
         let scaled_floor = self.response_scale * self.sigma_floor;
         Ok(eta_noise.mapv(|eta| {
-            gam_model_kernels::sigma_link::logb_sigma_from_eta_with_floor_scalar(scaled_floor, eta)
+            gam_model_kernels::sigma_link::logb_sigma_from_eta_scalar(scaled_floor, eta)
         }))
     }
 

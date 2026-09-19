@@ -35,25 +35,25 @@ pub struct DesignRows<'a> {
     pub col_map: &'a HashMap<String, usize>,
 }
 
-/// Exact full-conformal prediction columns at the fitted smoothing parameters.
+/// Full-conformal prediction columns for a Gaussian-identity fit.
 ///
-/// Reads the frozen penalty `Sλ` persisted at fit time (only for
-/// Gaussian-identity, unit-weight, offset-free models without a link wiggle),
-/// rebuilds the design of the `labeled` rows and of the `test` rows from the
-/// saved `resolved_termspec`, and calls `substrate.interval(x_*, alpha)` per
-/// test row — one Cholesky each, zero refits. The saved model persists no
-/// training rows, so the caller supplies the labeled rows the set is built on:
-/// the training table gives the frozen-λ full-conformal set of the fit.
+/// Reads the frozen penalty `Sλ` and its smoothing-parameter count persisted at
+/// fit time (only for Gaussian-identity, unit-weight, offset-free models without
+/// a link wiggle), rebuilds the design of the `labeled` rows and of the `test`
+/// rows from the saved `resolved_termspec`, and calls
+/// `substrate.interval(x_*, alpha)` per test row. The saved model persists no
+/// training rows, so the caller supplies the labeled rows the set is built on.
 ///
-/// The set is exact *given the frozen penalty*. On the training rows the fitted
-/// λ̂ was selected from all training responses, so the frozen-λ score
-/// construction is not permutation symmetric in the n+1 augmented points and
-/// the distribution-free finite-sample coverage theorem applies only where the
-/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, on the
-/// REML branch through the augmented optimum); a 0.0 row is the frozen-λ
-/// approximation with no finite-sample guarantee. The exact set is a union of
-/// intervals; `posterior_mean_lower` / `posterior_mean_upper` are its outer
-/// envelope (a superset).
+/// Each row's set is that of the fitting map which re-selects the smoothing
+/// strength by REML on the augmented rows, so the finite-sample coverage
+/// theorem holds for it. The `conformal_certificate` column says what each row
+/// carries: `0` exact_frozen (no strength to re-select), `1` honest_refit, and a
+/// negative code for a typed refusal (`-1` multi_penalty, `-2`
+/// unknown_penalty_structure, `-3` augmented_gram_singular, `-4` reml_undefined,
+/// `-5` refit_outside_tube, `-6` refit_failed), where the row gets the frozen-ρ
+/// set with no finite-sample guarantee. The set is a union of intervals;
+/// `posterior_mean_lower` / `posterior_mean_upper` are its outer envelope (a
+/// superset).
 ///
 /// `alpha = 1 − conformal_level`: the full-conformal set `C_α` has marginal
 /// coverage `≥ 1 − α`, with no factor of two.
@@ -141,7 +141,7 @@ pub fn full_conformal_prediction_columns(
     let mut mean_vec = Vec::with_capacity(n_test);
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
-    let mut certified_vec = Vec::with_capacity(n_test);
+    let mut certificate_vec = Vec::with_capacity(n_test);
     for i in 0..n_test {
         let x_star = x_test.row(i).to_owned();
         let iv = substrate
@@ -153,7 +153,7 @@ pub fn full_conformal_prediction_columns(
         mean_vec.push(x_star.dot(&fit.beta));
         lower_vec.push(iv.lo);
         upper_vec.push(iv.hi);
-        certified_vec.push(if iv.frozen_rho_certified { 1.0 } else { 0.0 });
+        certificate_vec.push(f64::from(iv.certificate.code()));
     }
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     columns.insert("linear_predictor_plugin".to_string(), mean_vec.clone());
@@ -161,7 +161,7 @@ pub fn full_conformal_prediction_columns(
     columns.insert("posterior_mean".to_string(), mean_vec);
     columns.insert("posterior_mean_lower".to_string(), lower_vec);
     columns.insert("posterior_mean_upper".to_string(), upper_vec);
-    columns.insert("frozen_rho_certified".to_string(), certified_vec);
+    columns.insert("conformal_certificate".to_string(), certificate_vec);
     Ok(columns)
 }
 

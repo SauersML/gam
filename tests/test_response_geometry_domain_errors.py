@@ -2,7 +2,7 @@
 
 Every FFI call routed through `gamfit._response_geometry._ffi` currently funnels
 its exceptions through `gamfit._exceptions.map_exception`, which defaults to
-`GamError` for anything not classified as formula/schema_mismatch/prediction.
+`GamfitError` for anything not classified as formula/schema_mismatch/prediction.
 Domain errors (antipodal sphere points, non-positive compositions, bad ALR
 reference index, dimension mismatches against a base point) are Pythonic
 ValueError cases — they describe a caller-supplied numerical/shape violation,
