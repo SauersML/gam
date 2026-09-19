@@ -150,22 +150,14 @@ def test_a_factor_term_gives_one_labelled_effect_per_level():
     np.testing.assert_allclose(effect.fit, fit, atol=1e-12)
     np.testing.assert_allclose(effect.se, se, atol=1e-12)
 
+    # A factor main effect is a penalized block with one column per level, so
+    # only its contrasts are identified; they recover the simulated shifts.
     by_label = dict(zip(labels, effect.fit))
     for level in ("b", "c"):
         contrast = by_label[level] - by_label["a"]
         assert contrast == pytest.approx(effects[level] - effects["a"], abs=0.15)
-    # The treatment level carries no column, so its effect is exactly zero.
-    reference = labels.index("a")
-    assert effect.fit[reference] == 0.0 and effect.se[reference] == 0.0
-    for i, label in enumerate(labels):
-        if i == reference:
-            continue
-        truth = effects[label] - effects["a"]
-        assert effect.lower[i] < truth < effect.upper[i]
-        assert (
-            effect.simultaneous_upper[i] - effect.simultaneous_lower[i]
-            > effect.upper[i] - effect.lower[i]
-        )
+    assert np.all(effect.simultaneous_upper - effect.simultaneous_lower > effect.upper - effect.lower)
+    _assert_band_ordering(effect)
 
 
 def test_a_tensor_term_gives_a_surface_on_its_product_grid():
@@ -210,12 +202,17 @@ def test_a_tensor_term_gives_a_surface_on_its_product_grid():
 
 def test_plot_terms_draws_every_kind_of_term():
     frame, _ = _factor_frame(seed=13, n=300)
-    frame["z"] = np.random.default_rng(14).uniform(-1.0, 1.0, len(frame))
-    model = gamfit.fit(frame, "y ~ s(x) + g + te(x, z)")
+    other = np.random.default_rng(14)
+    frame["z"] = other.uniform(-1.0, 1.0, len(frame))
+    frame["w"] = other.uniform(0.0, 1.0, len(frame))
+    model = gamfit.fit(frame, "y ~ s(x) + g + te(z, w)")
 
     axes = model.plot_terms(n_points=15)
-    assert [ax.get_title() for ax in axes] == ["s(x)", "g", "te(x, z)"]
-    curve, levels, surface = axes
+    names = [b.name for b in model.term_blocks if b.kind != "intercept"]
+    assert sorted(names) == ["g", "s(x)", "te(z, w)"]
+    assert [ax.get_title() for ax in axes] == names
+    by_title = {ax.get_title(): ax for ax in axes}
+    curve, levels, surface = by_title["s(x)"], by_title["g"], by_title["te(z, w)"]
     assert len(curve.lines) >= 1 and len(curve.collections) >= 2
     assert [tick.get_text() for tick in levels.get_xticklabels()] == model.partial_dependence(
         "g"
