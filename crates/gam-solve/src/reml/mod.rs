@@ -17,6 +17,8 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+#[cfg(test)]
+mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
 // #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
