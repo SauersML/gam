@@ -1142,6 +1142,19 @@ pub enum CurvatureEvidence {
     /// reason: the four are acceptance-identical, and the adjudication is a
     /// statement about a run, not a property of a stored model.
     CriterionContradicted,
+    /// A Hessian was measured and reported a negative direction whose claim
+    /// the criterion **cannot resolve at any step the adjudication may take**
+    /// (#3036): even the largest step predicts a decrease `½|λ_min|·α_max²`
+    /// under the criterion's resolution, so no trial could confirm or falsify
+    /// it and none was evaluated.
+    ///
+    /// Like [`Self::CriterionContradicted`] this withdraws the matrix's verdict
+    /// without inverting it, and it is admissible: a negative direction below
+    /// the instrument's own resolution is exactly what
+    /// [`CurvatureAdmissibility::Admissible`] already admits through the
+    /// gradient-residue floor. Serializes as `null` and reloads as
+    /// [`Self::NotAvailable`], for the reason recorded on that variant.
+    CriterionUnresolvable,
 }
 
 impl CurvatureEvidence {
@@ -1153,7 +1166,20 @@ impl CurvatureEvidence {
             Self::NotSpent
             | Self::NotAvailable
             | Self::NoEstimand
-            | Self::CriterionContradicted => None,
+            | Self::CriterionContradicted
+            | Self::CriterionUnresolvable => None,
+        }
+    }
+
+    /// Whether the criterion's adjudication withdrew a measured negative
+    /// direction: it contradicted the claim over its falsifiable range
+    /// (#2612), or that range is empty (#3036). Either way the matrix is wrong
+    /// along that direction by at least `|λ_min|` at the criterion's
+    /// resolution.
+    pub fn withdrawn_by_criterion(self) -> bool {
+        match self {
+            Self::CriterionContradicted | Self::CriterionUnresolvable => true,
+            Self::Measured { .. } | Self::NotSpent | Self::NotAvailable | Self::NoEstimand => false,
         }
     }
 
@@ -1192,6 +1218,7 @@ impl std::fmt::Display for CurvatureEvidence {
             Self::NotAvailable => "n/a",
             Self::NoEstimand => "no-estimand",
             Self::CriterionContradicted => "criterion-contradicted",
+            Self::CriterionUnresolvable => "criterion-unresolvable",
         })
     }
 }
@@ -1283,21 +1310,26 @@ pub struct OuterCriterionCertificate {
 /// The mint's Newton-decrement verdict is stricter than any search stop, so the
 /// point a search hands over can still buy a decrease the arithmetic resolves.
 /// The mint takes Newton steps on the free coordinates while each lowers the
-/// criterion by more than its band, within the step budget quadratic
-/// convergence allows, and judges the point they reach. A coordinate whose
-/// Newton steps stop short of the box bound they head to is railed there when
-/// that lowers the criterion by more than its band (projected Newton), and the
-/// coordinates left free are polished on a budget of their own.
+/// criterion by more than its band and the decrement contracts, and judges the
+/// point they reach. Where only the decrease left is resolvable, not a step's,
+/// the last step is a settling step whose point must certify. A coordinate
+/// whose Newton steps contract slower than Newton's quadratic rate toward the
+/// box bound they head to is railed there when that lowers the criterion by
+/// more than its band (projected Newton), and the coordinates left free are
+/// polished on their own face.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewtonPolishRecord {
     /// `λ̂²` at the point the search handed over.
     pub lambda_sq_before: f64,
     /// `λ̂²` at the point this certificate judged.
     pub lambda_sq_after: f64,
-    /// The criterion decrease each accepted step bought, in order.
+    /// The criterion decrease each accepted step bought, in order. A settling
+    /// step's is within the band and may be negative.
     pub decreases: Vec<f64>,
-    /// The step budget quadratic convergence allowed on the current face.
-    pub step_budget: usize,
+    /// Whether the last step was a settling step (#3012): the decrease left to
+    /// the minimum was resolvable, the full step's own model decrease was not.
+    #[serde(default)]
+    pub settled: bool,
     /// The coordinates the polish railed, in order. `#[serde(default)]` so a
     /// record stored before this field existed still deserializes.
     #[serde(default)]
@@ -1379,6 +1411,7 @@ impl OuterCriterionCertificate {
             CurvatureEvidence::CriterionContradicted => {
                 CurvatureAdmissibility::CriterionContradicted
             }
+            CurvatureEvidence::CriterionUnresolvable => CurvatureAdmissibility::Admissible,
             evidence @ (CurvatureEvidence::NotSpent
             | CurvatureEvidence::NotAvailable
             | CurvatureEvidence::NoEstimand) => CurvatureAdmissibility::Unevaluated { evidence },
@@ -1586,6 +1619,7 @@ impl OuterCriterionCertificate {
             // keeps the source honest while `hessian_psd=criterion-contradicted`
             // beside it carries what happened to it.
             CurvatureEvidence::CriterionContradicted => "terminal-analytic-contradicted",
+            CurvatureEvidence::CriterionUnresolvable => "terminal-analytic-unresolvable",
         };
         let verdict = match self.refusal() {
             None => "stationary".to_string(),
@@ -2641,6 +2675,16 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
+    /// The variance-component score test of every random-effect term, computed
+    /// once on the training fit's own IRLS row state
+    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
+    /// rows read their p-value (or its typed absence) from here, so the CLI,
+    /// Rust and persisted-model surfaces report the same number. Empty on a
+    /// model with no random-effect term and on a payload written before the
+    /// test existed; a summary treats a term missing from it as not recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub random_effect_tests:
+        Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
 }
 
 /// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
@@ -2794,6 +2838,7 @@ impl std::fmt::Debug for FitArtifacts {
                     .as_ref()
                     .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
+            .field("random_effect_tests", &self.random_effect_tests)
             .finish()
     }
 }
@@ -4014,7 +4059,7 @@ mod assembly_inner_status_gate_tests {
                 lambda_sq_before: 1.0e-4,
                 lambda_sq_after: 0.0,
                 decreases: vec![6.3e-5],
-                step_budget: 2,
+                settled: false,
                 rails: vec![NewtonPolishRail {
                     index: 0,
                     from: 17.0,
@@ -4090,7 +4135,7 @@ mod assembly_inner_status_gate_tests {
             lambda_sq_before: 1.0e-4,
             lambda_sq_after: 0.0,
             decreases: vec![1.0e-6],
-            step_budget: 1,
+            settled: false,
             rails: Vec::new(),
             entry: vec![-17.05, 2.49],
         });
@@ -6230,6 +6275,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             (CurvatureEvidence::NotSpent, "null"),
             (CurvatureEvidence::NoEstimand, "null"),
             (CurvatureEvidence::CriterionContradicted, "null"),
+            (CurvatureEvidence::CriterionUnresolvable, "null"),
         ] {
             let wire = serde_json::to_string(&evidence).expect("evidence serializes");
             assert_eq!(
@@ -6266,6 +6312,7 @@ mod curvature_evidence_serialized_contract_2561_tests {
             CurvatureEvidence::NotSpent,
             CurvatureEvidence::NoEstimand,
             CurvatureEvidence::CriterionContradicted,
+            CurvatureEvidence::CriterionUnresolvable,
         ] {
             let wire = serde_json::to_string(&lossy).expect("serializes");
             let back: CurvatureEvidence = serde_json::from_str(&wire).expect("reloads");

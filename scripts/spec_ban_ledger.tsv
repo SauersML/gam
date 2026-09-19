@@ -56,13 +56,10 @@ grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/Sauer
 grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/SauersML/gam/issues/2902
 grid	crates/gam-solve/src/seeding.rs	let nu_grid	https://github.com/SauersML/gam/issues/2902
 jitter	crates/gam-inference/src/hmc_io.rs	const MASS_MATRIX_JITTER	https://github.com/SauersML/gam/issues/3090
-jitter	crates/gam-models/src/survival/location_scale/family_solver.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/fit_drivers.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/minimal_seed.rs	const RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	const SAE_RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
-jitter	crates/gam-solve/src/gaussian_reml.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
-jitter	crates/gam-solve/src/gaussian_reml.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 magic	crates/gam-custom-family/src/covariance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-custom-family/src/inner_blockwise_fit.rs	< 1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-custom-family/src/joint_newton.rs	<= 1e-3	https://github.com/SauersML/gam/issues/2469
@@ -149,4 +146,3 @@ unconverged	crates/gam-custom-family/src/inner_blockwise_fit/exact_joint_fit.rs	
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
-unconverged	crates/gam-terms/src/basis/duchon_radial_profile.rs	Ok(PanelEstimate{converged:false})	https://github.com/SauersML/gam/issues/2902

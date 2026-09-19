@@ -128,7 +128,6 @@ fn gamma_log_coefficient_se_matches_statsmodels_no_double_count() {
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

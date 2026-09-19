@@ -10,13 +10,23 @@
 //! the deep one on the way back (census Slurm 1334963, `branch_walk_probe_2973`).
 //!
 //! [`continue_branch`] applies the rule inside one evaluation. From an accepted certified mode at
-//! `ρ_A` it follows `ρ(t) = ρ_A + t (ρ − ρ_A)`, `t: 0 → 1`. Each sub-step predicts the mode from
-//! the IFT tangent `dβ̂/dρ_k = −v_k` of the last certified mode and corrects it with the inner
-//! solver. A sub-step is kept only when [`newton_region_contraction`] shows the predictor inside
-//! the Newton region of the root the corrector returns; a failed sub-step is halved. Halving has
-//! no count: it ends on a certified sub-step or where a sub-step no longer moves `ρ(t)` in
-//! floating point. There the branch ends, at a fold, and the evaluation is refused as
-//! [`BranchContinuationRefusal::FoldReached`], which the outer search takes as a rejected trial.
+//! `ρ_A` it follows `ρ(t) = ρ_A + t (ρ − ρ_A)`, `t: 0 → 1`. Each sub-step predicts the mode along
+//! the IFT tangent `dβ̂/dρ_k = −(H + S_λ)⁻¹ λ_k S_k β̂` of the last certified mode and corrects it
+//! with the inner solver. A sub-step is kept only when [`newton_region_contraction`] shows the
+//! predictor inside the Newton region of the root the corrector returns; a failed sub-step is
+//! halved. Halving has no count: it ends on a certified sub-step or where a sub-step no longer
+//! moves `ρ(t)` in floating point. There the branch ends, at a fold, and the evaluation is
+//! refused as [`BranchContinuationRefusal::FoldReached`], which the outer search takes as a
+//! rejected trial.
+//!
+//! Each sub-step costs one inner solve and no pricing. The tangent is formed from the exact-Newton
+//! curvature the certified mode's own solve ended on ([`single_block_ift_predictor`]), so a mode
+//! needs no derivative-bearing evaluation to be continued from. The corrector solves to the
+//! criterion's own accuracy ([`criterion_inner_solve_options`]), and only the endpoint is priced,
+//! in the caller's evaluation mode, from the corrected mode as it is. Taking the tangent from the
+//! evaluator's mode responses instead cost two derivative-bearing pricings per value probe on the
+//! tilted double well: one to re-derive a seed's tangent (a value-only or screening seed files
+//! none) and one per interior sub-step.
 //!
 //! The test's corrections are Deuflhard's: the Newton correction at the predictor, then the
 //! simplified correction at its image with the curvature frozen at the predictor. This slice
@@ -173,13 +183,9 @@ pub(crate) enum BranchContinuationRefusal {
         last_certified_rho: Array1<f64>,
         target_rho: Array1<f64>,
         attempts: usize,
-        /// Sub-steps whose corrected mode passed the test but whose tangent evaluation refused
-        /// the point, so they were halved and never published.
-        tangent_refusals: usize,
         last_failure: Option<String>,
     },
-    /// The accepted mode's derivative-bearing evaluation formed no IFT tangent of the shape the
-    /// continuation needs.
+    /// The certified mode carries no exact-Newton curvature to form its IFT tangent from.
     TangentUnavailable { rho: Array1<f64>, reason: String },
     /// An evaluation the continuation needs failed.
     Evaluation(CustomFamilyError),
@@ -199,14 +205,12 @@ impl std::fmt::Display for BranchContinuationRefusal {
                 last_certified_rho,
                 target_rho,
                 attempts,
-                tangent_refusals,
                 last_failure,
             } => write!(
                 f,
                 "the inner mode's branch ends past rho=[{}] toward rho=[{}]: every sub-step that \
                  still moves rho failed the Newton-region contraction test (a fold, gam#2973; \
-                 {attempts} sub-step attempts, {tangent_refusals} halved for a refused tangent; \
-                 last: {})",
+                 {attempts} sub-step attempts; last: {})",
                 join_rho(last_certified_rho),
                 join_rho(target_rho),
                 last_failure.as_deref().unwrap_or("none"),
@@ -248,114 +252,45 @@ fn same_point(left: &Array1<f64>, right: &Array1<f64>) -> bool {
             .all(|(a, b)| a.to_bits() == b.to_bits())
 }
 
-fn carried_tangent(mode: &ConstrainedWarmStart) -> Option<Arc<Array2<f64>>> {
-    mode.cached_inner
-        .as_ref()
-        .and_then(|cached| cached.rho_mode_responses.clone())
-}
-
-/// The certified mode with its IFT tangent. A mode filed by a derivative-bearing evaluation
-/// carries the tangent that evaluation formed. Any other certified mode gets one from a
-/// derivative-bearing evaluation at its own ρ.
-fn tangent_at<F: CustomFamily + Clone + Send + Sync + 'static>(
+/// The IFT predictor at the labeled `rho_trial` from the certified mode `certified`, formed from
+/// the exact-Newton curvature the mode's own solve ended on ([`single_block_ift_predictor`]).
+fn branch_predictor<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     layout: &PenaltyLabelLayout,
-    rho_prior: &gam_problem::RhoPrior,
-    mode: &ConstrainedWarmStart,
-) -> Result<(ConstrainedWarmStart, Arc<Array2<f64>>), BranchContinuationRefusal> {
-    if let Some(tangent) = carried_tangent(mode) {
-        return Ok((mode.clone(), tangent));
-    }
-    let eval = outerobjectivegradienthessian_labeled(
+    certified: &ConstrainedWarmStart,
+    rho_trial: &Array1<f64>,
+) -> Result<ConstrainedWarmStart, BranchContinuationRefusal> {
+    let curvature = certified
+        .cached_inner
+        .as_ref()
+        .and_then(|cached| cached.terminal_working_sets.as_deref())
+        .and_then(|sets| sets.first())
+        .filter(|set| matches!(set, BlockWorkingSet::ExactNewton { .. }))
+        .ok_or_else(|| BranchContinuationRefusal::TangentUnavailable {
+            rho: certified.rho.clone(),
+            reason: "the certified mode carries no exact-Newton terminal curvature".to_string(),
+        })?;
+    let per_block = |rho: &Array1<f64>| {
+        expand_labeled_log_lambdas(rho, layout)
+            .and_then(|physical| split_log_lambdas(&physical, &layout.penalty_counts))
+    };
+    let from = per_block(&certified.rho).map_err(BranchContinuationRefusal::Evaluation)?;
+    let to = per_block(rho_trial).map_err(BranchContinuationRefusal::Evaluation)?;
+    let labeled_options = labeled_options_for_rho(options, specs, layout, &certified.rho)
+        .map_err(BranchContinuationRefusal::Evaluation)?;
+    let block_beta = single_block_ift_predictor(
         family,
         specs,
-        options,
-        layout,
-        &mode.rho,
-        Some(mode),
-        rho_prior,
-        EvalMode::ValueAndGradient,
+        &from,
+        &to,
+        labeled_options.as_ref(),
+        &certified.block_beta,
+        curvature,
+        certified.active_sets.first().and_then(|set| set.as_deref()),
     )
     .map_err(BranchContinuationRefusal::Evaluation)?;
-    if !eval.inner_converged {
-        return Err(BranchContinuationRefusal::Evaluation(
-            CustomFamilyError::trial_point(format!(
-                "branch continuation: the certified mode at rho=[{}] did not re-converge for its \
-                 tangent",
-                join_rho(&mode.rho)
-            )),
-        ));
-    }
-    let tangent = carried_tangent(&eval.warm_start).ok_or_else(|| {
-        BranchContinuationRefusal::TangentUnavailable {
-            rho: mode.rho.clone(),
-            reason: "its derivative-bearing evaluation formed no rho mode responses".to_string(),
-        }
-    })?;
-    Ok((eval.warm_start, tangent))
-}
-
-/// The penalty coordinates the evaluator's mode responses are indexed by: the per-block log-λ's
-/// the labeled `rho` expands to, then the joint penalties' (gam#1587).
-fn penalty_coordinates(
-    rho: &Array1<f64>,
-    layout: &PenaltyLabelLayout,
-) -> Result<Array1<f64>, CustomFamilyError> {
-    let physical = expand_labeled_log_lambdas(rho, layout)?;
-    Ok(physical
-        .iter()
-        .copied()
-        .chain(layout.joint_log_lambdas(rho))
-        .collect())
-}
-
-/// The IFT predictor at `rho_trial`: `β̂ − Σ_k Δρ_k v_k`, since `dβ̂/dρ_k = −v_k`.
-fn branch_predictor(
-    certified: &ConstrainedWarmStart,
-    tangent: &Array2<f64>,
-    rho_trial: &Array1<f64>,
-    layout: &PenaltyLabelLayout,
-) -> Result<ConstrainedWarmStart, BranchContinuationRefusal> {
-    let from = penalty_coordinates(&certified.rho, layout)
-        .map_err(BranchContinuationRefusal::Evaluation)?;
-    let to =
-        penalty_coordinates(rho_trial, layout).map_err(BranchContinuationRefusal::Evaluation)?;
-    let total: usize = certified.block_beta.iter().map(|block| block.len()).sum();
-    if tangent.nrows() != total || tangent.ncols() != from.len() {
-        return Err(BranchContinuationRefusal::TangentUnavailable {
-            rho: certified.rho.clone(),
-            reason: format!(
-                "its mode responses are {}x{}, and the continuation needs {total}x{}",
-                tangent.nrows(),
-                tangent.ncols(),
-                from.len()
-            ),
-        });
-    }
-    let mut beta = Array1::from_iter(
-        certified
-            .block_beta
-            .iter()
-            .flat_map(|block| block.iter().copied()),
-    );
-    for (coordinate, (start, end)) in from.iter().zip(to.iter()).enumerate() {
-        let delta = end - start;
-        if delta != 0.0 {
-            beta.scaled_add(-delta, &tangent.column(coordinate));
-        }
-    }
-    let mut offset = 0;
-    let block_beta = certified
-        .block_beta
-        .iter()
-        .map(|block| {
-            let piece = beta.slice(ndarray::s![offset..offset + block.len()]).to_owned();
-            offset += block.len();
-            piece
-        })
-        .collect();
     Ok(ConstrainedWarmStart {
         rho: rho_trial.clone(),
         block_beta,
@@ -366,6 +301,9 @@ fn branch_predictor(
 
 enum SubStep {
     Certified {
+        /// The corrector's solve, which an endpoint's evaluation prices as it is.
+        inner: BlockwiseInnerResult,
+        /// The corrected mode, which an interior sub-step's successor predicts from.
         mode: ConstrainedWarmStart,
         contraction: f64,
     },
@@ -374,13 +312,20 @@ enum SubStep {
 
 /// Correct one sub-step's predictor, and keep the result only when the predictor passes the
 /// Newton-region contraction test and the corrected mode lies inside its root radius.
+///
+/// `corrector_options` are the criterion's own ([`criterion_inner_solve_options`]), so the
+/// endpoint's evaluation prices the corrected mode without solving it again. The endpoint's
+/// corrector also forms the determinant artifacts, since its mode is the one the evaluation
+/// publishes as the next seed; an interior corrector's mode only seeds the next sub-step.
 fn correct_sub_step<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
+    corrector_options: &BlockwiseFitOptions,
     layout: &PenaltyLabelLayout,
     rho_trial: &Array1<f64>,
     predictor: &ConstrainedWarmStart,
+    endpoint: bool,
 ) -> SubStep {
     let test = match newton_region_contraction(family, specs, options, layout, rho_trial, predictor)
     {
@@ -402,19 +347,28 @@ fn correct_sub_step<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map_or_else(|| "unmeasured".to_string(), |theta| format!("{theta:.3e}")),
         ));
     };
-    let mode = match correct_labeled_coefficient_mode(
+    let corrector = if endpoint {
+        correct_labeled_laplace_mode
+    } else {
+        correct_labeled_coefficient_mode
+    };
+    let (inner, mode) = match corrector(
         family,
         specs,
-        options,
+        corrector_options,
         layout,
         rho_trial,
         Some(&test.state),
     ) {
-        Ok((_, mode)) => mode,
+        Ok(corrected) => corrected,
         Err(error) => return SubStep::Failed(format!("the corrector refused: {error}")),
     };
     match coefficient_distance(&predictor.block_beta, &mode.block_beta) {
-        Ok(distance) if distance <= radius => SubStep::Certified { mode, contraction },
+        Ok(distance) if distance <= radius => SubStep::Certified {
+            inner,
+            mode,
+            contraction,
+        },
         Ok(distance) => SubStep::Failed(format!(
             "the corrected mode lies {distance:.3e} from the predictor, outside the root radius \
              {radius:.3e} at rho=[{}]",
@@ -465,17 +419,18 @@ pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
         });
     }
     let rho_start = start.rho.clone();
-    let (mut certified, mut tangent) =
-        tangent_at(family, specs, options, layout, rho_prior, start)?;
+    let criterion_options = criterion_inner_solve_options(family, options, 0);
+    let corrector_options = criterion_options.as_ref().unwrap_or(options);
+    let mut certified = start.clone();
     let mut t_certified = 0.0_f64;
     let mut sub_step = 1.0_f64;
     let mut attempts = 0_usize;
-    let mut tangent_refusals = 0_usize;
     let mut contractions = Vec::new();
     let mut last_failure: Option<String> = None;
     loop {
         let t_trial = (t_certified + sub_step).min(1.0);
-        let rho_trial = if t_trial >= 1.0 {
+        let endpoint = t_trial >= 1.0;
+        let rho_trial = if endpoint {
             rho_target.clone()
         } else {
             &rho_start + &((rho_target - &rho_start) * t_trial)
@@ -485,44 +440,43 @@ pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
                 last_certified_rho: certified.rho.clone(),
                 target_rho: rho_target.clone(),
                 attempts,
-                tangent_refusals,
                 last_failure,
             });
         }
         attempts += 1;
-        let predictor = branch_predictor(&certified, &tangent, &rho_trial, layout)?;
-        match correct_sub_step(family, specs, options, layout, &rho_trial, &predictor) {
-            SubStep::Certified { mode, contraction } => {
-                if t_trial >= 1.0 {
-                    contractions.push(contraction);
-                    certified = mode;
-                    break;
+        let predictor = branch_predictor(family, specs, options, layout, &certified, &rho_trial)?;
+        match correct_sub_step(
+            family,
+            specs,
+            options,
+            corrector_options,
+            layout,
+            &rho_trial,
+            &predictor,
+            endpoint,
+        ) {
+            SubStep::Certified {
+                inner,
+                mode,
+                contraction,
+            } => {
+                contractions.push(contraction);
+                if endpoint {
+                    // The corrected mode is priced as it is, in the caller's evaluation mode.
+                    let eval = outerobjective_from_coefficient_mode_labeled(
+                        family, specs, options, layout, &rho_trial, rho_prior, inner, eval_mode,
+                    )
+                    .map_err(BranchContinuationRefusal::Evaluation)?;
+                    return Ok(BranchContinuation {
+                        eval,
+                        attempts,
+                        contractions,
+                    });
                 }
-                // The next sub-step predicts from this mode's IFT tangent. A tangent evaluation
-                // that refuses the point (the envelope-gradient tripwire near a fold, where the
-                // mode response is unresolved) leaves no prediction to continue from, so this
-                // sub-step fails like any other and is halved from the last certified mode; it is
-                // never published. A tangent of the wrong shape is a contract failure, not a
-                // step-size question, and is returned.
-                match tangent_at(family, specs, options, layout, rho_prior, &mode) {
-                    Ok((next, next_tangent)) => {
-                        contractions.push(contraction);
-                        t_certified = t_trial;
-                        certified = next;
-                        tangent = next_tangent;
-                    }
-                    Err(BranchContinuationRefusal::Evaluation(error))
-                        if error.is_trial_point_infeasible() =>
-                    {
-                        tangent_refusals += 1;
-                        last_failure = Some(format!(
-                            "the certified mode at rho=[{}] refused its tangent evaluation: {error}",
-                            join_rho(&rho_trial)
-                        ));
-                        sub_step *= 0.5;
-                    }
-                    Err(refusal) => return Err(refusal),
-                }
+                // An interior mode seeds the next predictor from the curvature its own solve
+                // ended on; nothing prices it.
+                t_certified = t_trial;
+                certified = mode;
             }
             SubStep::Failed(reason) => {
                 last_failure = Some(reason);
@@ -531,33 +485,40 @@ pub(crate) fn continue_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
         }
     }
-    let eval = outerobjectivegradienthessian_labeled(
-        family,
-        specs,
-        options,
-        layout,
-        rho_target,
-        Some(&certified),
-        rho_prior,
-        eval_mode,
-    )
-    .map_err(BranchContinuationRefusal::Evaluation)?;
-    Ok(BranchContinuation {
-        eval,
-        attempts,
-        contractions,
+}
+
+/// Whether the continuation covers a family's inner solve: its inner objective may have more than
+/// one mode (the predicate the #2366 anchor uses: a β-dependent Hessian, not declared globally
+/// convex), and the Newton-region test covers its solve (a single block with exact-Newton
+/// curvature, no joint penalty, no Jeffreys term, no Hessian-vector workspace). A joint-Newton
+/// family keeps its per-evaluation rule until that path's frozen-curvature re-solve lands
+/// (gam#2973's second slice).
+fn continuation_covers<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+) -> bool {
+    family.exact_newton_joint_hessian_beta_dependent()
+        && !family.inner_coefficient_objective_is_globally_convex()
+        && single_block_newton_region_probe_applies(family, specs, options)
+        && layout.joint_specs.is_empty()
+}
+
+/// Whether `seed` is a certified exact-Newton mode a continuation can start from.
+fn certified_exact_newton_mode(seed: &ConstrainedWarmStart) -> bool {
+    seed.cached_inner.as_ref().is_some_and(|cached| {
+        cached.converged
+            && cached
+                .terminal_working_sets
+                .as_deref()
+                .is_some_and(|sets| matches!(sets, [BlockWorkingSet::ExactNewton { .. }]))
     })
 }
 
-/// Whether an evaluation at `rho` from `seed` continues the seed's branch.
-///
-/// The family's inner objective may have more than one mode (the predicate the #2366 anchor
-/// uses: a β-dependent Hessian, not declared globally convex); its solve is one the
-/// Newton-region test covers (a single block with exact-Newton curvature, no joint penalty, no
-/// Jeffreys term, no Hessian-vector workspace); the seed is a certified mode at another θ; and no
-/// screening cap truncates the inner solve (a capped probe certifies no mode, so it continues
-/// none). A joint-Newton family keeps its per-evaluation rule until that path's frozen-curvature
-/// re-solve lands (gam#2973's second slice).
+/// Whether an evaluation at `rho` from `seed` continues the seed's branch: the continuation
+/// covers the family's solve, the seed is a certified mode at another θ, and no screening cap
+/// truncates the inner solve (a capped probe certifies no mode, so it continues none).
 fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -570,21 +531,9 @@ fn continues_its_branch<F: CustomFamily + Clone + Send + Sync + 'static>(
         .screening_max_inner_iterations
         .as_ref()
         .is_some_and(|cap| cap.load(Ordering::Relaxed) > 0);
-    let exact_newton_block = seed
-        .cached_inner
-        .as_ref()
-        .and_then(|cached| cached.terminal_working_sets.as_deref())
-        .is_some_and(|sets| matches!(sets, [BlockWorkingSet::ExactNewton { .. }]));
-    family.exact_newton_joint_hessian_beta_dependent()
-        && !family.inner_coefficient_objective_is_globally_convex()
-        && single_block_newton_region_probe_applies(family, specs, options)
-        && layout.joint_specs.is_empty()
-        && exact_newton_block
+    continuation_covers(family, specs, options, layout)
+        && certified_exact_newton_mode(seed)
         && !screening_capped
-        && seed
-            .cached_inner
-            .as_ref()
-            .is_some_and(|cached| cached.converged)
         && seed.rho.len() == rho.len()
         && !same_point(&seed.rho, rho)
 }

@@ -141,12 +141,16 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// resolve, so a failure past it is reported, not halved again.
 const REFERENCE_MAX_BISECTIONS: u32 = 6;
 
-/// One tanh–sinh panel's estimate and the numbers its convergence test saw.
-struct PanelEstimate {
-    values: [f64; CHANNELS],
-    abs_sums: [f64; CHANNELS],
-    last_delta: [f64; CHANNELS],
-    converged: bool,
+/// One tanh–sinh panel's outcome. Only a converged panel carries values a
+/// caller may use; an unresolved one carries the numbers its convergence test
+/// saw, which the caller bisects on or reports.
+enum PanelEstimate {
+    Converged([f64; CHANNELS]),
+    Unresolved {
+        values: [f64; CHANNELS],
+        abs_sums: [f64; CHANNELS],
+        last_delta: [f64; CHANNELS],
+    },
 }
 
 /// Ceiling on the last two Chebyshev coefficients relative to the largest: the
@@ -665,21 +669,15 @@ impl ProfileShape {
                         / abs_sums[m].max(scale_floor[m]).max(f64::MIN_POSITIVE);
                 }
                 if (0..channels).all(|m| last_delta[m] <= REFERENCE_RTOL) {
-                    return Ok(PanelEstimate {
-                        values: current,
-                        abs_sums,
-                        last_delta,
-                        converged: true,
-                    });
+                    return Ok(PanelEstimate::Converged(current));
                 }
             }
             previous = Some(current);
         }
-        Ok(PanelEstimate {
+        Ok(PanelEstimate::Unresolved {
             values: std::array::from_fn(|m| sums[m].sum()),
             abs_sums,
             last_delta,
-            converged: false,
         })
     }
 
@@ -699,16 +697,19 @@ impl ProfileShape {
         scale_floor: &[f64; CHANNELS],
         depth: u32,
     ) -> Result<[f64; CHANNELS], BasisError> {
-        let estimate = self.integrate_panel(rho, a, b, channels, scale_floor)?;
-        if estimate.converged {
-            return Ok(estimate.values);
-        }
+        let (values, abs_sums, last_delta) =
+            match self.integrate_panel(rho, a, b, channels, scale_floor)? {
+                PanelEstimate::Converged(values) => return Ok(values),
+                PanelEstimate::Unresolved { values, abs_sums, last_delta } => {
+                    (values, abs_sums, last_delta)
+                }
+            };
         if depth >= REFERENCE_MAX_BISECTIONS {
             let report: Vec<String> = (0..channels)
                 .map(|m| {
                     format!(
                         "m={m}: |Δ|/scale={:.2e} at the last level (value {:e}, Σ|terms| {:e})",
-                        estimate.last_delta[m], estimate.values[m], estimate.abs_sums[m]
+                        last_delta[m], values[m], abs_sums[m]
                     )
                 })
                 .collect();
@@ -723,7 +724,7 @@ impl ProfileShape {
             );
         }
         let floor: [f64; CHANNELS] =
-            std::array::from_fn(|m| scale_floor[m].max(estimate.abs_sums[m]));
+            std::array::from_fn(|m| scale_floor[m].max(abs_sums[m]));
         let mid = 0.5 * (a + b);
         let left = self.integrate_adaptive(rho, a, mid, channels, &floor, depth + 1)?;
         let right = self.integrate_adaptive(rho, mid, b, channels, &floor, depth + 1)?;

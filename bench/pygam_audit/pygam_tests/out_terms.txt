@@ -1,0 +1,185 @@
+.F...FF......F...F                                                       [100%]
+=================================== FAILURES ===================================
+___________________________ test_block_width_factor ____________________________
+test_pg_terms.py:25: in test_block_width_factor
+    assert w == nlev - 1, m.term_blocks
+E   AssertionError: (TermBlock(name='intercept', kind='intercept', start=0, end=1), TermBlock(name='edu', kind='random_effect', start=1, end=6))
+E   assert 5 == (5 - 1)
+_________________ test_no_intercept_formula[y ~ 0 + linear(x)] _________________
+test_pg_terms.py:54: in test_no_intercept_formula
+    m = gamfit.fit({"x": x, "y": y}, formula)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:693: in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1294: in fit
+    raise map_exception(exc) from exc
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1291: in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+E   gamfit._rust.FormulaError: workflow formula materialization: formula terms '0'/'-1' (intercept removal) are not supported yet
+_________________ test_no_intercept_formula[y ~ linear(x) - 1] _________________
+test_pg_terms.py:54: in test_no_intercept_formula
+    m = gamfit.fit({"x": x, "y": y}, formula)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:693: in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1294: in fit
+    raise map_exception(exc) from exc
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1291: in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+E   gamfit._rust.FormulaError: workflow formula materialization: unsupported top-level RHS term: linear(x) - 1
+_____________________ test_tensor_margin_shape_constraint ______________________
+test_pg_terms.py:119: in test_tensor_margin_shape_constraint
+    m = gamfit.fit(d, "y ~ te(tmpd, o3, shape=[monotone_increasing, none])", family="poisson")
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:693: in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1294: in fit
+    raise map_exception(exc) from exc
+../../bvenv/lib/python3.11/site-packages/gamfit/_api.py:1291: in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+E   gamfit._rust.InvalidConfigurationError: unknown shape constraint "[monotone_increasing, none]"; expected one of "none", "monotone_increasing", "monotone_decreasing", "convex", "concave"
+_____________________ test_smooth_of_string_column_raises ______________________
+test_pg_terms.py:156: in test_smooth_of_string_column_raises
+    with pytest.raises(Exception):
+E   Failed: DID NOT RAISE Exception
+----------------------------- Captured stderr call -----------------------------
+[1m 06s] [HGB] target_mse below mandatory floors; target_mse=2.085e-12 floors=3.000e-12
+[1m 06s] [HGB] target_mse below mandatory floors; target_mse=1.392e-12 floors=3.000e-12
+[1m 06s] [thin-plate] requested 75 distinct knots but the data contain only 7 geometrically distinct selectable points; reducing the basis to 7 knots
+==================================== PASSES ====================================
+___________________________ test_block_width_tensor ____________________________
+----------------------------- Captured stderr call -----------------------------
+[2s] [INDEF-HESS] rho=[23.208784660342424, 8.89291387672585, 7.148036198013535]
+[2s] [INDEF-HESS] eigenvalues=[0.0017981033756387054, 0.11236255730976792, 0.9329255306042973]
+[2s] [INDEF-HESS] active_rank=2/3 structural_zero=0 unresolvable_curvature=0 below_gradient_floor=1 curvature_resolution=7.014e-10
+[2s] [INDEF-HESS] classifications=["G", "A", "A"] (A=active; Z=certified null of the penalty map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a saturation null, excused by the CHAIN RULE)
+[2s] [INDEF-HESS] min_eigenvalue=1.7981e-3 min_eigenvector=[-0.9999978797202226, -0.0009740450612979251, 0.0018143294292355021]
+[2s] [INDEF-HESS] outer_gradient=[-0.001805658033131107, -0.07186948573096814, -0.01017276013134874]
+[2s] [INDEF-HESS] reparam_split sigma=[0.0017981033756387054, 0.11236255730976792, 0.9329255306042973] reparam=sum_k g_k v_k^2=[-0.0018057520499069229, -0.01188540911442904, -0.07015674273111205] intrinsic=sigma-reparam=[0.0036038554255456282, 0.12424796642419696, 1.0030822733354094] gradient_floor=sum_k |g_k| v_k^2=[0.0018057520499069229, 0.01188540911442904, 0.07015674273111205] (a certified-null direction has intrinsic == 0 EXACTLY, so |sigma| == floor and the gate's boundary runs through it; see #2676)
+[2s] [INDEF-HESS] penalty_count=3 ranges=[(0, 20), (0, 20), (0, 20)] ranks=[12, 10, 3]
+[2s] [INDEF-HESS] pair=(0,1) relative_defect=9.754147e-1 best_scale=2.203775e-1 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0642e-1
+[2s] [INDEF-HESS] pair=(0,2) relative_defect=1.000000e0 best_scale=1.756313e-30 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0839e-1
+[2s] [INDEF-HESS] pair=(1,2) relative_defect=1.000000e0 best_scale=7.950467e-31 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-1.9717e-3
+[3s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -9.1568e6). This indicates a numerical instability.
+[4s] P-IRLS could not certify a valid minimum: LM step search exhausted (gradient norm 1.145e8, iter 5 of configured budget 300)
+[5s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.3277e9). This indicates a numerical instability.
+[7s] P-IRLS could not certify a valid minimum: LM step search exhausted (gradient norm 3.286e10, iter 4 of configured budget 300)
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.2646e5). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.3558e5). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0581e8). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1696e6). This indicates a numerical instability.
+[10s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3877e7). This indicates a numerical instability.
+______________ test_by_numeric_close_to_tensor_with_linear_margin ______________
+----------------------------- Captured stderr call -----------------------------
+[48s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=-4.330882e3): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[48s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=-4.345365e3): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[49s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=-1.621255e3): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[49s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=1.235e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=-1.676220e3).
+____________________ test_reml_tensor_explains_interaction _____________________
+----------------------------- Captured stderr call -----------------------------
+[53s] [OUTER] ARC cost-stall window filled at a strict-saddle incumbent (hessian_psd=NO at best-so-far, value=-1.741488e3): refusing to certify the saddle and returning control to cubic regularization to exploit the negative curvature (escape 1).
+[53s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=4.890e0 > escape threshold 1.500e0); refusing to halt-and-ship and continuing the descent (escape 1, value=-1.778630e3).
+[53s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=4.890e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=-1.778630e3).
+[53s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=4.890e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=-1.778630e3).
+[53s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=4.890e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=-1.778630e3).
+[54s] [OUTER] ARC finite cost stall deferred: REML objective improved < 1.000e-7 (relative) over 3 consecutive outer steps but the stored best projected gradient remains above tolerance (|g|=4.890e0 > 1.000e-3). Returning the current finite gradient + Hessian to ARC instead of halting at a stale best point (value=-1.778630e3).
+____________________ test_tensor_k_single_value_broadcasts _____________________
+----------------------------- Captured stderr call -----------------------------
+[59s] [INDEF-HESS] rho=[24.74877219841661, 10.69060130933954, 5.49719606171181]
+[59s] [INDEF-HESS] eigenvalues=[0.0002565577764498283, 0.0993382925327438, 0.6263169418273608]
+[59s] [INDEF-HESS] active_rank=2/3 structural_zero=0 unresolvable_curvature=0 below_gradient_floor=1 curvature_resolution=2.329e-14
+[59s] [INDEF-HESS] classifications=["G", "A", "A"] (A=active; Z=certified null of the penalty map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a saturation null, excused by the CHAIN RULE)
+[59s] [INDEF-HESS] min_eigenvalue=2.5656e-4 min_eigenvector=[-0.9999999962212239, -4.069375234228057e-5, -7.682168091079895e-5]
+[59s] [INDEF-HESS] outer_gradient=[-0.00025672353030419583, 0.0007843782118676215, 0.0006956294815253345]
+[59s] [INDEF-HESS] reparam_split sigma=[0.0002565577764498283, 0.0993382925327438, 0.6263169418273608] reparam=sum_k g_k v_k^2=[-0.00025672352295977205, 0.0007091152369611135, 0.000770892449087419] intrinsic=sigma-reparam=[0.0005132812994096004, 0.09862917729578269, 0.6255460493782733] gradient_floor=sum_k |g_k| v_k^2=[0.0002567235337682167, 0.000709115238507614, 0.0007708924514213213] (a certified-null direction has intrinsic == 0 EXACTLY, so |sigma| == floor and the gate's boundary runs through it; see #2676)
+[59s] [INDEF-HESS] penalty_count=3 ranges=[(0, 25), (0, 25), (0, 25)] ranks=[15, 15, 3]
+[59s] [INDEF-HESS] pair=(0,1) relative_defect=9.742279e-1 best_scale=2.255661e-1 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0708e-1
+[59s] [INDEF-HESS] pair=(0,2) relative_defect=1.000000e0 best_scale=3.030324e-30 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0705e-1
+[59s] [INDEF-HESS] pair=(1,2) relative_defect=1.000000e0 best_scale=8.157533e-31 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=2.5546e-5
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.5163e29). This indicates a numerical instability.
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1370e4). This indicates a numerical instability.
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.8457e38). This indicates a numerical instability.
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1866e4). This indicates a numerical instability.
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 4.172157e11.
+[59s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.4707e36). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.9149e6). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.7869e46). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.4669e9). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.5415e30). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.0531e3). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.3536e24). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.1421e26). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.2863e17). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.6150e3). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.7187e32). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1774e11). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.0421e3). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.9875e3). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.8888e3). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.1473e26). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3945e25). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.8173e12). This indicates a numerical instability.
+[1m 00s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.4573e22). This indicates a numerical instability.
+[1m 01s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.8557e31). This indicates a numerical instability.
+[1m 02s] [INDEF-HESS] rho=[24.74877219841661, 10.69060130933954, 5.49719606171181]
+[1m 02s] [INDEF-HESS] eigenvalues=[0.0002565577764498283, 0.0993382925327438, 0.6263169418273608]
+[1m 02s] [INDEF-HESS] active_rank=2/3 structural_zero=0 unresolvable_curvature=0 below_gradient_floor=1 curvature_resolution=2.329e-14
+[1m 02s] [INDEF-HESS] classifications=["G", "A", "A"] (A=active; Z=certified null of the penalty map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a saturation null, excused by the CHAIN RULE)
+[1m 02s] [INDEF-HESS] min_eigenvalue=2.5656e-4 min_eigenvector=[-0.9999999962212239, -4.069375234228057e-5, -7.682168091079895e-5]
+[1m 02s] [INDEF-HESS] outer_gradient=[-0.00025672353030419583, 0.0007843782118676215, 0.0006956294815253345]
+[1m 02s] [INDEF-HESS] reparam_split sigma=[0.0002565577764498283, 0.0993382925327438, 0.6263169418273608] reparam=sum_k g_k v_k^2=[-0.00025672352295977205, 0.0007091152369611135, 0.000770892449087419] intrinsic=sigma-reparam=[0.0005132812994096004, 0.09862917729578269, 0.6255460493782733] gradient_floor=sum_k |g_k| v_k^2=[0.0002567235337682167, 0.000709115238507614, 0.0007708924514213213] (a certified-null direction has intrinsic == 0 EXACTLY, so |sigma| == floor and the gate's boundary runs through it; see #2676)
+[1m 02s] [INDEF-HESS] penalty_count=3 ranges=[(0, 25), (0, 25), (0, 25)] ranks=[15, 15, 3]
+[1m 02s] [INDEF-HESS] pair=(0,1) relative_defect=9.742279e-1 best_scale=2.255661e-1 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0708e-1
+[1m 02s] [INDEF-HESS] pair=(0,2) relative_defect=1.000000e0 best_scale=3.030324e-30 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=-7.0705e-1
+[1m 02s] [INDEF-HESS] pair=(1,2) relative_defect=1.000000e0 best_scale=8.157533e-31 tr_ii=1.0000e0 tr_jj=1.0000e0 v_neg[i]-v_neg[j]/sqrt2=2.5546e-5
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.5163e29). This indicates a numerical instability.
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1370e4). This indicates a numerical instability.
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.8457e38). This indicates a numerical instability.
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1866e4). This indicates a numerical instability.
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 4.172157e11.
+[1m 03s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.4707e36). This indicates a numerical instability.
+[1m 04s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.9149e6). This indicates a numerical instability.
+[1m 04s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.7869e46). This indicates a numerical instability.
+[1m 04s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.4669e9). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.5415e30). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.0531e3). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.3536e24). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.1421e26). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.2863e17). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.6150e3). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.7187e32). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1774e11). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.0421e3). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.9875e3). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.8888e3). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.1473e26). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3945e25). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.8173e12). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.4573e22). This indicates a numerical instability.
+[1m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.8557e31). This indicates a numerical instability.
+__________________ test_unseen_factor_level_at_predict_raises __________________
+----------------------------- Captured stderr call -----------------------------
+[1m 06s] [thin-plate] requested 132 distinct knots but the data contain only 61 geometrically distinct selectable points; reducing the basis to 61 knots
+=========================== short test summary info ============================
+PASSED test_pg_terms.py::test_block_width_spline
+PASSED test_pg_terms.py::test_block_width_tensor
+PASSED test_pg_terms.py::test_intercept_only_is_mean
+PASSED test_pg_terms.py::test_linear_term_is_ols
+PASSED test_pg_terms.py::test_tensor_invariance_to_covariate_rescaling
+PASSED test_pg_terms.py::test_by_numeric_close_to_tensor_with_linear_margin
+PASSED test_pg_terms.py::test_by_variable_missing_raises
+PASSED test_pg_terms.py::test_reml_tensor_explains_interaction
+PASSED test_pg_terms.py::test_cyclic_is_periodic
+PASSED test_pg_terms.py::test_cyclic_worse_than_free_smooth_on_aperiodic_data
+PASSED test_pg_terms.py::test_save_load_roundtrip
+PASSED test_pg_terms.py::test_tensor_k_single_value_broadcasts
+PASSED test_pg_terms.py::test_unseen_factor_level_at_predict_raises
+FAILED test_pg_terms.py::test_block_width_factor - AssertionError: (TermBlock...
+FAILED test_pg_terms.py::test_no_intercept_formula[y ~ 0 + linear(x)] - gamfi...
+FAILED test_pg_terms.py::test_no_intercept_formula[y ~ linear(x) - 1] - gamfi...
+FAILED test_pg_terms.py::test_tensor_margin_shape_constraint - gamfit._rust.I...
+FAILED test_pg_terms.py::test_smooth_of_string_column_raises - Failed: DID NO...
+5 failed, 13 passed in 66.41s (0:01:06)
