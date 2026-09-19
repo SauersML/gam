@@ -79,13 +79,13 @@ fn sphere_sobolev_predict_continuous_as_lat_approaches_pole() {
 }
 
 #[test]
-fn sphere_pseudo_predict_continuous_as_lat_approaches_pole() {
+fn sphere_harmonic_predict_continuous_as_lat_approaches_pole() {
     init_parallelism();
     let lats = vec![89.0, 89.5, 89.9, 89.99, 89.999, 89.9999, 90.0];
     let lons = vec![0.0; lats.len()];
-    let pred = predict_at("y ~ sphere(lat, lon, k=30, kernel=pseudo)", &lats, &lons);
+    let pred = predict_at("y ~ sphere(lat, lon, k=30, kernel=harmonic)", &lats, &lons);
     assert!(pred.iter().all(|v| v.is_finite()), "non-finite near pole");
-    eprintln!("[near-pole-pse] preds: {pred:?}");
+    eprintln!("[near-pole-harmonic] preds: {pred:?}");
     for i in 1..pred.len() {
         let jump = (pred[i] - pred[i - 1]).abs();
         assert!(
@@ -103,7 +103,7 @@ fn sphere_predict_at_exact_pole_is_lon_independent() {
     init_parallelism();
     let lats = vec![90.0, 90.0, 90.0, 90.0, -90.0, -90.0, -90.0];
     let lons = vec![-180.0, -90.0, 0.0, 90.0, -45.0, 0.0, 135.0];
-    for kernel in ["sobolev", "pseudo"] {
+    for kernel in ["sobolev", "harmonic"] {
         let pred = predict_at(
             &format!("y ~ sphere(lat, lon, k=30, kernel={kernel})"),
             &lats,

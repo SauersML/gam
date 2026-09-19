@@ -1,2 +1,2 @@
 mod sphere_binomial_logit_fit;
-mod sphere_binomial_pseudo_m4;
+mod sphere_binomial_m4;

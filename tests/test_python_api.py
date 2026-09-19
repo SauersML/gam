@@ -1654,7 +1654,7 @@ def test_sphere_torch_fit_smoke_all_kernels() -> None:
     points = torch.as_tensor(points_np, dtype=torch.float64)
     response = torch.as_tensor(y_np, dtype=torch.float64)
 
-    for kernel in ("sobolev", "pseudo", "harmonic"):
+    for kernel in ("sobolev", "harmonic"):
         n_centers = 20 if kernel != "harmonic" else 5  # harmonic: L → 5*(5+2)=35 cols
         spec = Sphere(n_centers=n_centers, penalty_order=2, kernel=kernel, radians=False)
         result = torch_fit(points, response, spec)
@@ -2099,7 +2099,7 @@ def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
     lon = rng.uniform(-180.0, 180.0, size=n)
     points = np.stack([lat, lon], axis=1)
 
-    for kernel in ("sobolev", "pseudo", "harmonic"):
+    for kernel in ("sobolev", "harmonic"):
         n_centers = 10 if kernel != "harmonic" else 4
         design, penalty = gamfit.basis.sphere_basis(
             points,
@@ -2124,17 +2124,6 @@ def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
             assert k == n_centers * (n_centers + 2), (
                 f"kernel={kernel}: design cols {k} != {n_centers * (n_centers + 2)}"
             )
-        else:
-            # The pseudodifferential kernel is resolved by the Rust builder to
-            # the harmonic engine (see `harmonic_degree_for_wahba_basis_width`
-            # and the #531/#532 identifiability note in term_design.rs): it
-            # spans a full spherical-harmonic space of some degree L, so the
-            # width is L*(L+2) rather than the literal `n_centers`.
-            harmonic_dims = {ell * (ell + 2) for ell in range(1, 64)}
-            assert k in harmonic_dims, (
-                f"kernel={kernel}: design cols {k} is not a spherical-harmonic "
-                f"dimension L*(L+2)"
-            )
         assert penalty.shape == (k, k), (
             f"kernel={kernel}: penalty shape {penalty.shape} != ({k}, {k})"
         )
@@ -2142,6 +2131,11 @@ def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
             f"kernel={kernel}: NaN/Inf in basis/penalty"
         )
         _assert_symmetric_psd(penalty, f"sphere_basis penalty ({kernel})")
+
+    # The pseudo-spline kernel was removed; its name is refused rather than
+    # silently run as another construction.
+    with pytest.raises(ValueError, match="sobolev', 'harmonic'"):
+        gamfit.basis.sphere_basis(points, n_centers=10, penalty_order=2, kernel="pseudo")
 
 
 def test_periodic_spline_curve_basis_constant_nullspace_and_shapes() -> None:
@@ -2605,7 +2599,7 @@ def test_torch_fit_sphere_each_kernel_basic_fit() -> None:
 
     points = torch.as_tensor(points_np, dtype=torch.float64)
     y = torch.as_tensor(y_np, dtype=torch.float64)
-    for kernel in ("sobolev", "pseudo", "harmonic"):
+    for kernel in ("sobolev", "harmonic"):
         n_centers = 15 if kernel != "harmonic" else 4
         spec = Sphere(
             n_centers=n_centers, penalty_order=2, kernel=kernel, radians=False,

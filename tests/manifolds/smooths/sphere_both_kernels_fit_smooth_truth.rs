@@ -1,6 +1,7 @@
-//! Both Wahba sphere kernels — the canonical Sobolev `H^m(S²)` form and
-//! the mgcv-compatible Wahba 1981 pseudo-spline — must fit a smooth
-//! low-degree truth cleanly for every supported penalty order m ∈ {1..4}.
+//! Both sphere constructions — the Sobolev `H^m(S²)` reproducing kernel and
+//! the spherical-harmonic basis carrying the same Laplace-Beltrami penalty —
+//! must fit a smooth low-degree truth cleanly for every supported penalty
+//! order m ∈ {1..4}.
 //!
 //! Test surface:
 //!     y = 0.5 + 0.6·sin(lat) + 0.3·cos(lat)·cos(lon) + noise (σ=0.05)
@@ -9,9 +10,8 @@
 //! Hard-fail target: rmse ≤ 0.10 for *every* (kernel, m) combination on a
 //! held-out 15×15 lat/lon grid. The truth peak-to-peak is ~1.4, so a
 //! good fit at noise level σ=0.05 hits rmse 0.01–0.02. The 0.10 budget
-//! tolerates the larger boundary bias the pseudo-spline picks up at
-//! high m without admitting the historical m=4 collapse (rmse = 0.43,
-//! predictions = mean).
+//! does not admit the historical m=4 collapse (rmse = 0.43, predictions =
+//! mean).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -105,8 +105,6 @@ fn rmse_budget(m: usize) -> f64 {
 /// builder refuses it (#2475). Stating a spectral resolution is the shipped
 /// remedy, and it is the honest one — a finite m=1 diagonal is a choice of
 /// resolution, so the choice belongs in the formula rather than in a float.
-/// The pseudo-spline arm needs no such thing: its m=1 diagonal is the finite
-/// closed form `1/4π`.
 fn sobolev_formula(m: usize) -> String {
     if m == 1 {
         "y ~ sphere(lat, lon, k=30, m=1, kernel=sobolev, lmax=200)".to_string()
@@ -140,15 +138,15 @@ fn sphere_sobolev_kernel_fits_smooth_truth_for_all_m() {
 }
 
 #[test]
-fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
+fn sphere_harmonic_kernel_fits_smooth_truth_for_all_m() {
     init_parallelism();
     let mut failures = Vec::new();
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=pseudo)");
+        let formula = format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=harmonic)");
         match rmse_against_truth(&formula) {
             Ok(r) => {
                 let budget = rmse_budget(m);
-                eprintln!("[pseudo] m={m}: rmse={r:.4} (budget {budget:.2})");
+                eprintln!("[harmonic] m={m}: rmse={r:.4} (budget {budget:.2})");
                 if r > budget {
                     failures.push(format!("m={m}: rmse={r:.4} > {budget:.2}"));
                 }
@@ -158,33 +156,36 @@ fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
     }
     assert!(
         failures.is_empty(),
-        "Pseudo-spline kernel failures:\n  - {}\n\nIf m=4 fails this is the historical mgcv \
-         pseudo-spline collapse — the cure is the REML scale-invariance fix in the solver.",
+        "harmonic kernel failures:\n  - {}",
         failures.join("\n  - "),
     );
 }
 
+/// `kernel=` and `method=` each accept exactly one spelling per construction.
+/// The pseudo-spline spellings (`pseudo`, `mgcv`, `sos`, `wahba_pseudo`) are
+/// refused with a removal error: they once parsed and then silently fit the
+/// harmonic basis instead of the kernel they named.
 #[test]
-fn sphere_method_aliases_route_to_correct_kernel() {
+fn sphere_kernel_spellings_are_one_per_construction() {
     init_parallelism();
-    // method=wahba_sobolev / wahba_pseudo / sobolev / pseudo / mgcv / sos
-    // should all parse without erroring at fit time.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let data = make_dataset(200);
-    for method in [
-        "wahba", // default → sobolev
-        "wahba_sobolev",
-        "wahba_pseudo",
-        "sobolev",
-        "pseudo",
-        "mgcv",
-        "sos",
-    ] {
-        let formula = format!("y ~ sphere(lat, lon, k=10, m=2, method={method})");
-        fit_from_formula(&formula, &data, &cfg)
-            .unwrap_or_else(|e| panic!("method=`{method}` failed: {e}"));
+    for key in ["kernel", "method"] {
+        for kept in ["sobolev", "harmonic"] {
+            let formula = format!("y ~ sphere(lat, lon, k=10, m=2, {key}={kept})");
+            fit_from_formula(&formula, &data, &cfg)
+                .unwrap_or_else(|e| panic!("{formula} failed: {e}"));
+        }
+        for removed in ["pseudo", "mgcv", "sos", "wahba_pseudo"] {
+            let formula = format!("y ~ sphere(lat, lon, k=10, m=2, {key}={removed})");
+            let err = match fit_from_formula(&formula, &data, &cfg) {
+                Ok(_) => panic!("{formula} must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("has been removed"), "{formula}: {err}");
+        }
     }
 }

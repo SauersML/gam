@@ -61,7 +61,7 @@ def test_bspline_basis_derivative_gradgradcheck_open() -> None:
 # --------------------------------------------------------------------------- #
 # Item C: sphere_basis (grad through points)
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("kernel", ["sobolev", "pseudo", "harmonic"])
+@pytest.mark.parametrize("kernel", ["sobolev", "harmonic"])
 def test_sphere_basis_gradcheck_points(kernel: str) -> None:
     n_centers = 4 if kernel != "harmonic" else 3
     # (lat, lon) in degrees, kept well inside the valid range.

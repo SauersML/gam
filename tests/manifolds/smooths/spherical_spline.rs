@@ -144,7 +144,7 @@ fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
 #[test]
 fn sphere_m4_wahba_formula_enforces_stable_center_floor_only_for_m4() {
     let parsed = parse_formula(
-        "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo) + sphere(lat, lon, k=25, m=2, kernel=pseudo)",
+        "y ~ sphere(lat, lon, k=25, m=4, kernel=sobolev) + sphere(lat, lon, k=25, m=2, kernel=sobolev)",
     )
     .expect("formula parses");
     let values = array![

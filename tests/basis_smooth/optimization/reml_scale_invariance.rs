@@ -4,20 +4,12 @@
 //! operation in the optimizer pipeline that breaks this invariance is a
 //! bug.
 //!
-//! We test it indirectly via the Sobolev / pseudo-spline Wahba sphere
-//! kernels: both define valid PSD reproducing kernels at every supported
-//! `m`, but their Gram matrices differ in Frobenius scale by factors of
-//! 8 – 60 (see `sphere_wahba_kernels_are_distinct.rs` for the numbers).
-//! If REML is scale-invariant, both kernels should reach near-equivalent
-//! fit quality on the same data — they should not produce one fit that
-//! collapses and another that fits cleanly purely on account of the
-//! kernel scale.
-//!
-//! At HEAD: pseudo-spline `m=4` historically collapsed (rmse 0.43,
-//! predictions = response mean) while Sobolev `m=4` fits to rmse 0.0045.
-//! After the agent's REML rho-adjoint fix, both kernels now reach
-//! rmse ≈ 0.005 on the same data — confirming REML is at least *broadly*
-//! scale-invariant on this test case.
+//! We test it indirectly via the two sphere constructions: the Sobolev
+//! Wahba reproducing kernel and the spherical-harmonic basis carry the same
+//! Laplace-Beltrami penalty order `m` but their penalty matrices sit on very
+//! different numerical scales. If REML is scale-invariant, both reach
+//! near-equivalent fit quality on the same data — neither collapses to the
+//! response mean purely on account of its penalty scale.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -103,41 +95,40 @@ fn rmse(pred: &[f64]) -> f64 {
 }
 
 #[test]
-fn reml_pseudo_and_sobolev_m4_both_recover_smooth_truth() {
-    // The smoking-gun pair: pseudo-spline m=4 was the historical collapse
-    // case (kernel values ~3e-4, REML pushed smooth to ~0). Sobolev m=4
-    // has kernel values ~5× larger. If REML weren't scale-invariant the
-    // two fits would differ wildly. They should produce essentially the
-    // same predictions (different λ in the original kernel units, same
-    // effective smoother).
+fn reml_harmonic_and_sobolev_m4_both_recover_smooth_truth() {
+    // m=4 is the high-order case where a scale-sensitive pipeline pushes one
+    // construction's smooth to ~0. If REML weren't scale-invariant the two
+    // fits would differ wildly. They should produce essentially the same
+    // predictions (different λ in each construction's units, same effective
+    // smoother).
     init_parallelism();
     let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let pred_pse = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=pseudo)");
+    let pred_har = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=harmonic)");
     let rmse_sob = rmse(&pred_sob);
-    let rmse_pse = rmse(&pred_pse);
-    eprintln!("[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_pse={rmse_pse:.4}");
+    let rmse_har = rmse(&pred_har);
+    eprintln!("[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_har={rmse_har:.4}");
     assert!(
         rmse_sob < 0.10,
         "Sobolev m=4 collapsed: rmse={rmse_sob:.4} (historical 0.0045 expected)",
     );
     assert!(
-        rmse_pse < 0.10,
-        "Pseudo m=4 collapsed: rmse={rmse_pse:.4} — this is the historical mgcv-pseudo \
-         m=4 collapse; the REML pipeline needs to be scale-invariant for this case to work",
+        rmse_har < 0.10,
+        "harmonic m=4 collapsed: rmse={rmse_har:.4}; the REML pipeline needs to be \
+         scale-invariant for this case to work",
     );
     // Pointwise the two fits should agree within a generous tolerance,
     // not byte-for-byte (they're different RKHS) but qualitatively
     // (REML chooses near-equivalent smoothers).
     let max_abs_diff: f64 = pred_sob
         .iter()
-        .zip(pred_pse.iter())
+        .zip(pred_har.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f64::max);
     eprintln!("[reml-scale] m=4: max |Δ pred| = {max_abs_diff:.4}");
     assert!(
         max_abs_diff < 0.50,
-        "Sobolev m=4 and Pseudo m=4 fits disagree by max {max_abs_diff:.4} \
-         (budget 0.50). Either the kernels are wildly different or REML \
+        "Sobolev m=4 and harmonic m=4 fits disagree by max {max_abs_diff:.4} \
+         (budget 0.50). Either the constructions are wildly different or REML \
          picked very different effective smoothers — likely a scale-invariance issue.",
     );
 }

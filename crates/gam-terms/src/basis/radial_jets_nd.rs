@@ -1933,7 +1933,7 @@ pub(crate) fn spherical_wahba_kernel_jet_with_kind(
 /// factor from [`super::sphere_half_angle`] and [`super::sphere_kernels`]. At a
 /// point that coincides with a center `∂u = 0` exactly and the Hessian is
 /// `K'(0)·∂²u` when `K'(0)` is finite. The kernels whose `K'` diverges there
-/// (Sobolev and pseudo `m ≤ 2`) have no Hessian at a center, and the build is
+/// (Sobolev `m ≤ 2`) have no Hessian at a center, and the build is
 /// refused rather than handed a value.
 pub(crate) fn spherical_wahba_kernel_hessian_with_kind(
     data: ArrayView2<'_, f64>,
@@ -2402,8 +2402,7 @@ pub(crate) fn spherical_harmonic_hessian(
 
 /// How the spherical-spline forward design is built, which its input-location
 /// derivatives mirror column for column: harmonic columns through `max_degree`
-/// (the harmonic method, and the pseudo kernel, whose forward routes through
-/// harmonics), or the Wahba decomposed design over realized centers.
+/// (the harmonic method), or the Wahba decomposed design over realized centers.
 enum SphericalDesignRoute {
     Harmonic {
         max_degree: usize,
@@ -2429,18 +2428,6 @@ fn spherical_design_route(
                 spec.penalty_order
             );
         }
-        return Ok(SphericalDesignRoute::Harmonic { max_degree });
-    }
-    // The Pseudo Wahba kernel forward build routes through the harmonic basis
-    // (see `build_spherical_spline_basis`), so its derivatives mirror that
-    // routing — degree-mapped harmonic columns — rather than the raw Wahba
-    // kernel, or they would have a different column count than the forward
-    // design they differentiate.
-    if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
-        let max_degree = match spec.max_degree {
-            Some(degree) => degree,
-            None => harmonic_degree_for_wahba_basis_width(spec, data.nrows())?,
-        };
         return Ok(SphericalDesignRoute::Harmonic { max_degree });
     }
     validate_lat_lon_matrix(data, &format!("spherical spline {context}"), spec.radians)?;
@@ -2509,7 +2496,7 @@ fn spherical_design_identifiability(
 /// angular units as the raw input.
 ///
 /// - **Harmonic** (`spec.method == Harmonic`): `K = L(L+2)`, no transform.
-/// - **Wahba** (Sobolev/Pseudo/truncated): centers are resolved exactly as the
+/// - **Wahba** (Sobolev/truncated): centers are resolved exactly as the
 ///   forward does, the raw `(N, K_c, 2)` kernel jet is built, then contracted
 ///   with the same identity-or-frozen transform `z` so the result aligns
 ///   column-for-column with `raw_design · z`.
@@ -2679,33 +2666,13 @@ mod spherical_design_hessian_tests {
     }
 
     #[test]
-    fn truncated_pseudo_and_harmonic_design_hessians_match_central_differences_of_the_jet() {
+    fn truncated_and_harmonic_design_hessians_match_central_differences_of_the_jet() {
         assert_hessian_matches_jet(&spec(
             SphereMethod::Wahba,
             SphereWahbaKernel::SobolevTruncated { lmax: 16 },
             2,
         ));
-        assert_hessian_matches_jet(&spec(SphereMethod::Wahba, SphereWahbaKernel::Pseudo, 3));
         assert_hessian_matches_jet(&spec(SphereMethod::Harmonic, SphereWahbaKernel::Sobolev, 2));
-    }
-
-    /// The pseudo kernel routes through harmonics of degree at most 32, which
-    /// cannot carry more than 1088 columns; asking for more is refused instead of
-    /// falling back to a smaller, row-count-dependent basis.
-    #[test]
-    fn pseudo_kernel_beyond_the_harmonic_degree_cap_is_refused() {
-        let wide = Array2::from_shape_fn((1089, 2), |(i, j)| {
-            if j == 0 {
-                -1.4 + 2.8 * (i as f64) / 1088.0
-            } else {
-                -3.0 + 6.0 * (((i * 37) % 1089) as f64) / 1088.0
-            }
-        });
-        let mut pseudo = spec(SphereMethod::Wahba, SphereWahbaKernel::Pseudo, 2);
-        pseudo.center_strategy = CenterStrategy::UserProvided(wide);
-        let error = spherical_spline_design_jet(points().view(), &pseudo)
-            .expect_err("1089 pseudo columns exceed the degree-32 harmonic cap");
-        assert!(error.to_string().contains("cap of 32"), "unexpected refusal: {error}");
     }
 
     /// At a center the m=2 Sobolev kernel's dK/du diverges, so its Hessian does

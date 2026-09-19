@@ -1,30 +1,9 @@
 #![cfg(test)]
-//! Sanity check: the Sobolev and pseudo-spline Wahba kernels must produce
-//! NUMERICALLY DIFFERENT Gram matrices on the same center set. If they
-//! gave identical Gram matrices, the `wahba_kernel` selector would be
-//! a no-op — a real bug.
+//! The Sobolev Wahba kernel matrix builders against the Beatson–zu Castell
+//! closed forms, and the structural `m = 1` refusal.
 
 use crate::basis::{SphereWahbaKernel, spherical_wahba_kernel_matrix_with_kind};
 use ndarray::array;
-
-fn sample_centers() -> ndarray::Array2<f64> {
-    // 12 quasi-uniform points on S² (Fibonacci-ish, lat/lon in degrees).
-    let n = 12_usize;
-    let mut centers = ndarray::Array2::<f64>::zeros((n, 2));
-    let golden = 137.5_f64;
-    for i in 0..n {
-        let z = (2.0 * i as f64 + 1.0) / (n as f64) - 1.0;
-        let lat = z.asin().to_degrees();
-        let mut lon = (i as f64) * golden;
-        lon = lon.rem_euclid(360.0);
-        if lon > 180.0 {
-            lon -= 360.0;
-        }
-        centers[[i, 0]] = lat;
-        centers[[i, 1]] = lon;
-    }
-    centers
-}
 
 /// The untruncated Sobolev kernel at `m = 1` is refused at every public matrix
 /// entry point (#2475): `K_1 = (−ln u − 1)/4π` is log-singular at coincidence,
@@ -47,53 +26,6 @@ fn assert_untruncated_sobolev_m1_refused(result: Result<ndarray::Array2<f64>, im
         "the m=1 refusal must name both the mathematical defect and the \
          explicit-resolution remedy; got: {message}"
     );
-}
-
-#[test]
-fn sobolev_and_pseudo_kernels_differ_substantially() {
-    let centers = sample_centers();
-    assert_untruncated_sobolev_m1_refused(spherical_wahba_kernel_matrix_with_kind(
-        centers.view(),
-        centers.view(),
-        1,
-        false,
-        SphereWahbaKernel::Sobolev,
-    ));
-    for m in 2..=4 {
-        let k_sob = spherical_wahba_kernel_matrix_with_kind(
-            centers.view(),
-            centers.view(),
-            m,
-            false,
-            SphereWahbaKernel::Sobolev,
-        )
-        .expect("Sobolev kernel");
-        let k_pse = spherical_wahba_kernel_matrix_with_kind(
-            centers.view(),
-            centers.view(),
-            m,
-            false,
-            SphereWahbaKernel::Pseudo,
-        )
-        .expect("Pseudo kernel");
-        let max_abs_diff: f64 = k_sob
-            .iter()
-            .zip(k_pse.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let frob_sob: f64 = k_sob.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let frob_pse: f64 = k_pse.iter().map(|v| v * v).sum::<f64>().sqrt();
-        eprintln!(
-            "[kernel-distinct] m={m} ‖K_sob‖_F={frob_sob:.4e} ‖K_pse‖_F={frob_pse:.4e} max|Δ|={max_abs_diff:.4e}"
-        );
-        // Demand at least a 1% relative difference somewhere in the matrix.
-        let rel = max_abs_diff / frob_sob.max(frob_pse).max(1e-30);
-        assert!(
-            rel > 0.01,
-            "m={m}: Sobolev and pseudo-spline kernels match within {rel:.3e} — \
-             the wahba_kernel selector is a no-op",
-        );
-    }
 }
 
 #[test]

@@ -1943,11 +1943,11 @@ def sphere_basis(
     Parameters
     ----------
     points : array-like of shape ``(N, 2)`` — latitude, longitude.
-    n_centers : Wahba center count (``kernel='sobolev' | 'pseudo'``) or
+    n_centers : Wahba center count (``kernel='sobolev'``) or
         truncation degree ``L`` for ``kernel='harmonic'`` (basis dim
         ``L*(L+2)``).
     penalty_order : roughness order ``m ∈ {1,2,3,4}``. Default ``2``.
-    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    kernel : one of ``'sobolev'``, ``'harmonic'``.
     radians : default ``False`` (degrees). True for radians.
 
     Returns
@@ -2001,10 +2001,10 @@ def sphere_basis_jet(
     Parameters
     ----------
     points : array-like of shape ``(N, 2)`` — latitude, longitude.
-    n_centers : Wahba center count (``kernel='sobolev' | 'pseudo'``) or
+    n_centers : Wahba center count (``kernel='sobolev'``) or
         harmonic truncation degree ``L``.
     penalty_order : roughness order ``m ∈ {1,2,3,4}``. Default ``2``.
-    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    kernel : one of ``'sobolev'``, ``'harmonic'``.
     radians : default ``False`` (degrees). True for radians.
 
     Returns

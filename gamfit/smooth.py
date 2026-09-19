@@ -778,12 +778,12 @@ class Sphere(Smooth):
 
     Parameters
     ----------
-    n_centers : number of basis centers when using ``kernel="sobolev"`` or
-        ``"pseudo"`` (Wahba-style). For ``kernel="harmonic"`` (eigen
+    n_centers : number of basis centers when using ``kernel="sobolev"``
+        (Wahba reproducing kernel). For ``kernel="harmonic"`` (eigen
         basis) this is the truncation degree.
     penalty_order : roughness penalty order m ∈ {1, 2, 3, 4}.
         ``m=2`` is the canonical TPS-on-sphere analogue (curvature).
-    kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
+    kernel : one of ``"sobolev"`` (default), ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
     centers : optional explicit ``(K, 2)`` center array (lat, lon) in the
         same angular convention as ``radians``. When provided, ``n_centers``
@@ -824,9 +824,6 @@ class Sphere(Smooth):
           Wahba design, whose width is the center count.
         - ``kernel='harmonic'``: ``K = L * (L + 2)`` where ``L = n_centers``
           is the truncation degree.
-        - ``kernel='pseudo'``: the Rust builder routes through harmonics of the
-          smallest degree ``L`` with ``L * (L + 2) >= n_centers``, and at least
-          8, so ``K = L * (L + 2)``.
         """
         if self.centers is not None:
             import numpy as np
@@ -837,15 +834,6 @@ class Sphere(Smooth):
         kernel = str(self.kernel).lower()
         if kernel == "harmonic":
             return k * (k + 2)
-        if kernel == "pseudo":
-            degree = next((l for l in range(1, 33) if l * (l + 2) >= k), None)
-            if degree is None:
-                raise ValueError(
-                    f"Sphere.basis_size: a pseudo kernel with {k} centers exceeds the "
-                    "degree-32 harmonic cap (1088 columns), which the Rust builder refuses"
-                )
-            degree = max(degree, 8)
-            return degree * (degree + 2)
         return k
 
     def _resolve_centers(self, coords: Any) -> Any:
