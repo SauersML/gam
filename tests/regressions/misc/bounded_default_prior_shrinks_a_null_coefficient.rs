@@ -88,6 +88,14 @@ fn dataset(x: &[f64], y: &[f64]) -> EncodedDataset {
     loaded
 }
 
+fn ols_slope(x: &[f64], y: &[f64]) -> f64 {
+    let x_mean = x.iter().sum::<f64>() / x.len() as f64;
+    let y_mean = y.iter().sum::<f64>() / y.len() as f64;
+    let sxy: f64 = x.iter().zip(y).map(|(a, b)| (a - x_mean) * (b - y_mean)).sum();
+    let sxx: f64 = x.iter().map(|a| (a - x_mean) * (a - x_mean)).sum();
+    sxy / sxx
+}
+
 fn bounded_slope(formula: &str, data: &EncodedDataset) -> f64 {
     match fit_from_formula(formula, data, &FitConfig::default()) {
         Ok(FitResult::Standard(fit)) => fit.fit.beta[1],
@@ -132,7 +140,11 @@ fn bounded_shrinkage_prior_centres_at_the_midpoint_when_zero_is_outside_the_box(
     let (x, y) = fixture();
     let data = dataset(&x, &y);
     let slope = bounded_slope("y ~ bounded(x, min=1, max=3)", &data);
-    let unpenalised = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
+    // The unpenalised fit is the box-constrained least-squares slope. With the
+    // intercept profiled out the Gaussian objective is a convex quadratic in
+    // the slope with its minimum at the OLS slope, so the constrained optimum
+    // is that slope clamped to the box: here the rail `min = 1`.
+    let unpenalised = ols_slope(&x, &y).clamp(1.0, 3.0);
     assert!(
         (1.0..=3.0).contains(&slope),
         "the shrunk slope must honour the box, got {slope}"
