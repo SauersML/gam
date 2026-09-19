@@ -78,12 +78,12 @@ cuda = [
 ]
 pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]
-sklearn = ["scikit-learn>=1.4"]
+sklearn = ["scikit-learn>=1.6"]
 all = [
   "pandas>=2.0",
   "pyarrow>=14",
   "matplotlib>=3.8",
-  "scikit-learn>=1.4",
+  "scikit-learn>=1.6",
 ]
 
 # Contributor tooling (PEP 735): resolved by `uv sync --group ...`, never
@@ -94,7 +94,7 @@ test = [
   "pandas>=2.0",
   "pyarrow>=14",
   "matplotlib>=3.8",
-  "scikit-learn>=1.4",
+  "scikit-learn>=1.6",
 ]
 type = [
   "mypy>=1.18",
@@ -103,7 +103,7 @@ type = [
   "pyarrow>=14",
   "polars>=1",
   "matplotlib>=3.8",
-  "scikit-learn>=1.4",
+  "scikit-learn>=1.6",
   "scikit-learn-stubs",
   "scipy-stubs",
   "pytest>=8",

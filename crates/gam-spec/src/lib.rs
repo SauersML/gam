@@ -1117,7 +1117,8 @@ impl ResponseDegeneracy {
     pub fn message_for(&self, response_name: &str) -> String {
         match self.kind {
             ResponseDegeneracyKind::BinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: all values are 0 (no events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 0, no events). \
                  The maximum-likelihood logit is −∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -1126,7 +1127,8 @@ impl ResponseDegeneracy {
                 name = response_name,
             ),
             ResponseDegeneracyKind::BinomialAllOnes => format!(
-                "{family} response '{name}' is degenerate: all values are 1 (no non-events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 1, no non-events). \
                  The maximum-likelihood logit is +∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \

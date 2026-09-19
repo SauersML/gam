@@ -173,7 +173,7 @@ pub(crate) fn materialize_survival<'a>(
     // builders — free to materialize models on censored fixtures (which the
     // engine's structural unit tests rely on) without losing the user-facing
     // safety on real fits.
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let weighted_event_mass: f64 = event_codes
         .iter()
         .zip(weights.iter())

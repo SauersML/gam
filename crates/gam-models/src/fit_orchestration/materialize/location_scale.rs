@@ -74,7 +74,7 @@ pub(crate) fn materialize_location_scale<'a>(
     check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
     check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
     let kappa_options = config.spatial_optimization.clone();

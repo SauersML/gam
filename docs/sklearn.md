@@ -32,13 +32,13 @@ GAMRegressor(
     formula: str,
     family: str = "auto",
     offset: str | None = None,
-    weights: str | None = None,
     config: dict[str, Any] | None = None,
 )
 ```
 
-All five arguments are surfaced as `get_params()` keys, so they work with
-`GridSearchCV` and related utilities.
+All four arguments are surfaced as `get_params()` keys, so they work with
+`GridSearchCV` and related utilities. Per-row weights are data, not a
+hyperparameter: pass them as `fit(X, y, sample_weight=w)`.
 
 ### Binding the response
 
@@ -63,7 +63,7 @@ response-column name, and gamfit prepends `<target> ~`.
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `fit(X, y=None)` | `self` | Sets `model_`, `formula_`, `feature_names_in_`, `n_features_in_`. |
+| `fit(X, y=None, sample_weight=None)` | `self` | Sets `model_`, `formula_`, `n_features_in_`, and `feature_names_in_` when `X` names its columns. `sample_weight` becomes the likelihood's prior weights. |
 | `predict(X)` | `ndarray (n,)` | Predicted mean. |
 | `score(X, y, sample_weight=None)` | `float` | `r2_score`. |
 | `summary()` | `Summary` | Delegates to `model_.summary()`. |
@@ -90,7 +90,7 @@ est.fit(X, y)
 
 probs = est.predict_proba(X)   # (n, 2): [P(classes_[0]), P(classes_[1])]
 hard  = est.predict(X)         # (n,), highest-probability class label
-auc   = est.score(X, y)        # ROC AUC
+acc   = est.score(X, y)        # accuracy
 ```
 
 `classes_` is the sorted pair of labels observed at fit time. The wrapper
@@ -100,10 +100,12 @@ the positive-class probability to `[0, 1]` and stacks
 `[P(classes_[0]), P(classes_[1])]`. `predict()` returns
 `classes_[argmax(predict_proba(X), axis=1)]`.
 
-`score(X, y, sample_weight=None)` returns AUC, not accuracy. If
-`sample_weight` is supplied, rows with weight `<= 0` are dropped before
-computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
-`brier`, `logloss`, `nagelkerke_r2`, and `ece`.
+`score(X, y, sample_weight=None)` is accuracy, as for every scikit-learn
+classifier; use `scoring="roc_auc"` in `cross_val_score` / `GridSearchCV`
+for AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
+`brier`, `logloss`, `nagelkerke_r2`, and `ece`. Only binary targets are
+supported: the estimator declares `classifier_tags.multi_class = False`
+and rejects a multiclass `y` with a `ValueError`.
 
 Like `GAMRegressor`, `GAMClassifier` also inherits the pass-through helpers
 `summary()`, `check(X)`, and `report(path)` from the shared base estimator,
@@ -128,6 +130,32 @@ The GAM step accepts a `pandas.DataFrame`, `polars.DataFrame`,
 `pyarrow.Table`, numpy array, dict of columns, list of records, or 2-D row
 sequence. Numpy arrays and 2-D row sequences use generated feature names
 `x0`, `x1`, ...
+
+## Input validation
+
+The estimators follow the scikit-learn estimator contract and pass
+`sklearn.utils.estimator_checks.check_estimator`:
+
+- Named inputs (DataFrames, Arrow tables, dicts, records) set
+  `feature_names_in_`; at `predict` the columns must match those names in
+  the same order (a response column carried over from fit is ignored).
+- Unnamed inputs are validated with `sklearn.utils.check_array` (numeric,
+  finite, dense, 2-D) and must have `n_features_in_` columns at `predict`.
+  Sparse matrices and arrays are refused with a `TypeError` naming sparse
+  input.
+- A formula that reads a column `X` does not have (for example `x0 + x1`
+  against a one-column array) is a `ValueError` naming the column and the
+  features `X` has.
+- `sample_weight` must be non-negative, one weight per row, and contain at
+  least one non-zero weight.
+- A column-vector `y` of shape `(n, 1)` is ravelled with a
+  `DataConversionWarning`; methods called before `fit` raise
+  `NotFittedError`.
+
+`GAMRegressor` sets `regressor_tags.poor_score = True`. The formula fixes
+which columns the model reads, so scikit-learn's fixed scoring dataset (ten
+columns, one of them informative) cannot be scored against a formula written
+for other data; every other check runs unchanged.
 
 ## Cross-validation
 

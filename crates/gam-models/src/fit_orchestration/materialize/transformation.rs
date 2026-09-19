@@ -46,7 +46,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
         None,
     )?;
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
 
     Ok(MaterializedModel {

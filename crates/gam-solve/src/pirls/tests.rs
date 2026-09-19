@@ -4713,6 +4713,43 @@ mod reporting_loglikelihood_tests {
         );
     }
 
+    // A fractional binomial prior weight (a scikit-learn `sample_weight` on 0/1
+    // labels) is a weighted Bernoulli log-mass, w·[y ln μ + (1−y) ln(1−μ)]:
+    // the continuous `ln C(w, wy)` normalizer vanishes for a 0/1 response, and
+    // for a proportion it is the lnΓ continuation of the integer coefficient.
+    #[test]
+    fn binomial_full_loglik_accepts_fractional_prior_weights() {
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.4];
+        let mu = array![0.3, 0.8, 0.55, 0.1, 0.35];
+        let w = array![0.5, 2.25, 1.0, 3.7, 2.5];
+        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
+        let pw = evaluation.pointwise();
+        for row in 0..y.len() {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let log_coefficient = ln_gamma(wi + 1.0)
+                - ln_gamma(wi * yi + 1.0)
+                - ln_gamma(wi * (1.0 - yi) + 1.0);
+            let expected =
+                log_coefficient + wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - expected).abs() < 1e-10,
+                "row {row} (w={wi}, y={yi}): {} vs {expected}",
+                pw[row]
+            );
+        }
+        let bernoulli_rows = [0, 1, 2, 3];
+        for row in bernoulli_rows {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let weighted_log_mass = wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - weighted_log_mass).abs() < 1e-12,
+                "row {row}: a 0/1 response carries no normalizer at w={wi}"
+            );
+        }
+    }
+
     // ---- #1582: Poisson and NB(θ→∞) report the SAME log-likelihood on the same
     // count data (NB → Poisson as Var = μ + μ²/θ → μ), so AIC/elpd are
     // comparable across the two families.

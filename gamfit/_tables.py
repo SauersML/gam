@@ -616,28 +616,94 @@ def coerce_numeric_vector(values: Sequence[Any], *, label: str) -> list[float]:
     return numeric
 
 
-def attach_target(
-    data: Any,
-    y: Any,
-    *,
-    target_name: str = "y",
-) -> tuple[dict[str, list[Any]], str]:
-    columns, kind = table_columns(data)
-    if target_name in columns:
-        raise ValueError(
-            f"target column '{target_name}' already exists in the feature table"
-        )
-    if isinstance(y, str):
-        raise TypeError("string targets must refer to an existing column on the input table")
-    target_values = vector_values(y)
-    if columns:
-        expected = len(next(iter(columns.values())))
-        if len(target_values) != expected:
+def table_column_names(data: Any) -> list[str] | None:
+    """Column names of a named table, or ``None`` for a positional input.
+
+    Mappings, record lists, and pandas/polars/pyarrow frames name their
+    columns. A pandas frame whose column labels are not all strings (the
+    ``RangeIndex`` of ``pd.DataFrame(array)``) is positional, matching
+    scikit-learn's rule for ``feature_names_in_``.
+    """
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        labels = list(data.columns)
+        if not labels or not all(isinstance(label, str) for label in labels):
+            return None
+        return labels
+    if kind == "polars":
+        return [str(name) for name in data.columns]
+    if kind == "pyarrow":
+        return [str(name) for name in data.column_names]
+    if isinstance(data, Mapping):
+        return list(mapping_table_columns(data))
+    if (
+        isinstance(data, Sequence)
+        and not isinstance(data, (str, bytes, bytearray))
+        and len(data) > 0
+        and isinstance(data[0], Mapping)
+    ):
+        return collect_record_headers(cast("list[Mapping[str, Any]]", list(data)))[0]
+    return None
+
+
+def table_row_count(data: Any) -> int:
+    columns, _kind = _table_column_views(data)
+    if not columns:
+        return 0
+    return len(next(iter(columns.values())))
+
+
+def with_columns(data: Any, extra: Mapping[str, Any]) -> Any:
+    """Return ``data`` with the ``extra`` columns set, keeping its table library.
+
+    Columns of the same name are replaced. pandas, polars, and pyarrow tables
+    stay typed so their declared dtypes (categoricals, strings) reach the fit
+    unchanged; every other carrier becomes a mapping of column views.
+    """
+    rows = table_row_count(data)
+    for name, values in extra.items():
+        if len(values) != rows:
             raise ValueError(
-                f"target vector has length {len(target_values)} but expected {expected}"
+                f"column '{name}' has {len(values)} rows but the table has {rows}"
             )
-    columns[target_name] = target_values
-    return columns, kind
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        out = data.copy(deep=False)
+        for name, values in extra.items():
+            out[name] = values
+        return out
+    if kind == "polars":
+        import polars as pl
+
+        return data.with_columns(
+            [pl.Series(name, values) for name, values in extra.items()]
+        )
+    if kind == "pyarrow":
+        import pyarrow as pa
+
+        out = data
+        for name, values in extra.items():
+            array = pa.array(values)
+            if name in out.column_names:
+                out = out.set_column(out.column_names.index(name), name, array)
+            else:
+                out = out.append_column(name, array)
+        return out
+    columns, _kind = _table_column_views(data)
+    return {**columns, **extra}
+
+
+def drop_columns(data: Any, names: Sequence[str]) -> Any:
+    """Return ``data`` without the named columns, keeping its table library."""
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        return data.drop(columns=[label for label in data.columns if str(label) in names])
+    if kind == "polars":
+        return data.drop([label for label in data.columns if label in names])
+    if kind == "pyarrow":
+        return data.drop_columns([label for label in data.column_names if label in names])
+    columns, _kind = _table_column_views(data)
+    return {name: values for name, values in columns.items() if name not in names}
 
 
 def vector_values(values: Any) -> list[Any]:
