@@ -2447,5 +2447,20 @@
     ],
     "reason": "#3176: FixedPointProgress judges each evaluation on its own (a resolved improvement of the incumbent, charged each value's own rounding gamma_1*|V|, or a contraction of the step) instead of filling COST_STALL_WINDOW-evaluation windows, so a limit-cycling walk stops at its first unprogressing evaluation, not its second window. The pin restating the second-window stop is replaced by a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
     "evidence": "At base 801ff9f60d source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
+  },
+  {
+    "base": "a3c531e53c2d6c97ad9d1fbc56989edb95f4cb3b",
+    "items": [
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_KS_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_KURT_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_MAX_ABS",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_SKEW_TOL",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_FLOOR_INNER",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_FLOOR_OUTER",
+      "crates/gam-models/src/bms/mod.rs:const:AUTO_Z_NORMAL_TAIL_MASS_SLACK",
+      "tests/regressions/misc/bms_estimated_latent_law_2926.rs:const:ADEQUACY_SKEW_BOUND"
+    ],
+    "reason": "gam#2926 (017ee5ce8c, acknowledged here after it landed, since the guard's CI is disabled and it was pushed without this entry): the standard-normal adequacy screen's fixed bounds are replaced by the null quantiles of its own statistics at the sample's Kish effective size. AUTO_Z_NORMAL_SKEW_TOL (0.10), AUTO_Z_NORMAL_KURT_TOL (0.25), AUTO_Z_NORMAL_KS_TOL (0.025), AUTO_Z_NORMAL_MAX_ABS (8), AUTO_Z_NORMAL_TAIL_MASS_SLACK (2) and the tail floors AUTO_Z_NORMAL_TAIL_FLOOR_INNER (1e-5) and AUTO_Z_NORMAL_TAIL_FLOOR_OUTER (1e-8) were those fixed bounds; normal_screen_bounds derives each from AUTO_Z_NORMAL_SCREEN_ALPHA split over the eight clauses (two-sided normal quantiles over the exact normal-sample moments of the mean, sd, skewness and kurtosis, Kolmogorov's critical value in Stephens' form, the Poisson upper quantile of each tail count, and the level n draws exceed for max |z|). The regression fixture's ADEQUACY_SKEW_BOUND named the fixed 0.10 it aimed under; adequacy_skew_bound() now computes the derived bound at the fixture's n.",
+    "evidence": "At a3c531e53c the guard reports the seven constants public with production_occurrences 0, used only in latent_z_normal_adequacy's two return paths in crates/gam-models/src/bms/mod.rs, and ADEQUACY_SKEW_BOUND test_scoped with production_occurrences 0, used once in just_inside_fixture. In 017ee5ce8c git grep -w finds none of the eight names. Gate at 65cf920ce6 with the same bms/mod.rs (gateB1r, gateB1r4 on acl42): screen pins 4/4, bms and latent-law lib 342/342, root latent-law regressions 9/9, survival acceptance 8/8 and joint_latent_law_2929 6/6; at a3c531e53c, cargo check --workspace --all-targets RC 0."
   }
 ]
