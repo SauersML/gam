@@ -119,12 +119,13 @@ impl StudentTScale {
     pub(crate) fn new(sigma: f64, nu: f64) -> Result<Self, EstimationError> {
         let a = student_t_kernel_scale(sigma, nu)?;
         let log_normalizer = student_t_log_normalizer_at(nu, a);
-        let half_digamma_gap = 0.5
-            * (gam_math::special::digamma(0.5 * (nu + 1.0))
-                - gam_math::special::digamma(0.5 * nu));
-        let quarter_trigamma_gap = 0.25
-            * (gam_math::special::trigamma(0.5 * (nu + 1.0))
-                - gam_math::special::trigamma(0.5 * nu));
+        // The half-shift gaps are formed in closed form: as `ν → ∞` each is
+        // `O(ν^{−k−1})` against polygammas of size `ln ν` or `ν^{−k}`, and their
+        // direct difference keeps only seven digits of the ν-score at `ν ≈ 5·10⁷`.
+        let [digamma_gap, trigamma_gap, ..] =
+            gam_math::special::polygamma_half_shift_gap_stack(0.5 * nu, 2);
+        let half_digamma_gap = 0.5 * digamma_gap;
+        let quarter_trigamma_gap = 0.25 * trigamma_gap;
         let scale = Self {
             nu,
             a,
@@ -199,9 +200,11 @@ impl StudentTScale {
         let (d, r, s, t) = (geometry.d, geometry.r, geometry.s, geometry.t);
 
         let log_likelihood = ScaledPartials {
-            a: 0.5 * (nu - nu1 * s),
+            // `ν − (ν+1)s = (ν+1)t − 1` and `(ν+1)s² − ν = 1 − (ν+1)t(1+s)`,
+            // written without the `O(ν)` cancellation of the left-hand sides.
+            a: 0.5 * (nu1 * t - 1.0),
             nu: self.half_digamma_gap - 0.5 * geometry.log1p_q,
-            aa: 0.5 * (nu1 * s * s - nu),
+            aa: 0.5 * (1.0 - nu1 * t * (1.0 + s)),
             a_nu: 0.5 * t,
             nu_nu: self.quarter_trigamma_gap,
         };
@@ -272,9 +275,11 @@ fn student_t_kernel_scale(sigma: f64, nu: f64) -> Result<f64, EstimationError> {
     }
 }
 
-/// `lgΓ((ν+1)/2) − lgΓ(ν/2) − ½ ln(πA)`.
+/// `lgΓ((ν+1)/2) − lgΓ(ν/2) − ½ ln(πA)`, with the gamma ratio in its Stirling
+/// difference form: two `lgΓ` of size `ν ln ν` would leave an absolute error of
+/// `ε·ν ln ν` per row.
 fn student_t_log_normalizer_at(nu: f64, a: f64) -> f64 {
-    ln_gamma(0.5 * (nu + 1.0)) - ln_gamma(0.5 * nu) - 0.5 * (std::f64::consts::PI * a).ln()
+    log_gamma_large_ratio(0.5 * nu, 0.5) - 0.5 * (std::f64::consts::PI * a).ln()
 }
 
 /// The Student-t row log-likelihood at `r = 0`, the part of `ℓ` the
@@ -751,6 +756,38 @@ mod tests {
             let (wm, _, cm, _) = weights_at(&minus);
             assert_close("EM c", c[i], (wp[i] - wm[i]) / (2.0 * h));
             assert_close("EM d", d[i], (cp[i] - cm[i]) / (2.0 * h));
+        }
+    }
+
+    /// Deep in the Gaussian limit, at the `ln ν = 17.70` where the Gaussian-data
+    /// fit stalled, the row log-likelihood and its θ-partials match 80-digit
+    /// `mpmath` values of the closed form (differentiated there) to rounding.
+    /// The ν-score is `O(1/ν) = 8·10⁻⁹` here; differencing two digammas of size
+    /// `ln ν` left it a `7·10⁻⁸` bias per row, and two `lgΓ` of size `ν ln ν`
+    /// left the value a `10⁻⁷` error.
+    #[test]
+    fn student_t_row_jet_is_exact_in_the_gaussian_limit() {
+        let (y, eta, log_sigma, log_nu) = (1.3, 0.4, -0.35, 17.700267812895927);
+        let tol = 1e-14;
+        let value = loglik(y, eta, log_sigma, log_nu);
+        let reference_value = -1.384508387959885914128259;
+        assert!(
+            (value - reference_value).abs() <= tol,
+            "log-likelihood {value:+.17e} against {reference_value:+.17e}"
+        );
+        let jet = jet(y, eta, log_sigma, log_nu);
+        let checks = [
+            ("dl/dln_sigma", jet.log_likelihood[0], 0.6311396718924339480361508),
+            ("dl/dln_nu", jet.log_likelihood[1], 8.229670179425737530035979e-9),
+            ("d2l/dln_sigma2", jet.log_likelihood2[0][0], -3.262279234418535433308766),
+            ("d2l/dln_sigma dln_nu", jet.log_likelihood2[0][1], 2.115865133319476116838475e-8),
+            ("d2l/dln_nu2", jet.log_likelihood2[1][1], -8.229670228554728920032822e-9),
+        ];
+        for (label, analytic, reference) in checks {
+            assert!(
+                (analytic - reference).abs() <= tol,
+                "{label}: {analytic:+.17e} against {reference:+.17e}"
+            );
         }
     }
 
