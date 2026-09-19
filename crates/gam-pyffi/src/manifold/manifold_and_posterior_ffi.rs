@@ -706,11 +706,11 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         serde_json::from_str(request_json)
             .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let selected_covariance = gam::inference::effects::select_covariance(
-        &fit,
-        gam::inference::effects::CovarianceSource::SmoothingCorrected,
-    )
-    .map_err(|error| error.to_string())?;
+    // The band prices its SEs off the covariance the fit publishes, as
+    // `summary()` and `partial_dependence` do (#2779); a fit whose correction
+    // is typed unavailable reports the conditional band under that label.
+    let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
+        .map_err(|error| error.to_string())?;
     let payload = model.payload();
     let schema = payload
         .data_schema
@@ -1006,36 +1006,59 @@ struct CurvatureInferencePayload {
 
 /// One penalized smooth term's #1063 per-term LR significance report,
 /// JSON-serialized for the Python surface.
-#[derive(Serialize)]
+///
+/// Every tested smooth gets a row with the same keys. A term whose test ran
+/// carries `p_value` or `p_value_upper_bound` (exactly one) and the inference
+/// fields; a term whose test could not run carries `unavailable_reason` (a
+/// stable label) and `unavailable_message`, with every inference field `None`.
+/// A shape-constrained term, which the test does not apply to, is in the
+/// payload's `unavailable` list instead.
+#[derive(Default, Serialize)]
 struct SmoothTermLrRow {
     name: String,
     term_idx: usize,
-    /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null) ≥ 0`.
-    statistic_lr: f64,
+    /// `p_value_corrected` when the reference resolves it — the point value is
+    /// larger than its certified accuracy `p_value_bound`.
+    p_value: Option<f64>,
+    /// An explicit ceiling `p ≤ p_value_upper_bound` in place of `p_value` when
+    /// the certified accuracy does not separate the tail from zero.
+    p_value_upper_bound: Option<f64>,
+    /// Why this term has no LR p-value, when it has none:
+    /// `"empty_coefficient_block"`, `"degenerate_reference"`, `"full_refit_failed"`,
+    /// `"null_fit_not_converged"`, `"null_fit_unsupported"`,
+    /// `"null_log_likelihood_not_finite"`, or `"tail_not_computable"`.
+    unavailable_reason: Option<&'static str>,
+    /// The human-readable form of `unavailable_reason`, carrying the solver's
+    /// own message for the full-refit and reduced-fit reasons.
+    unavailable_message: Option<String>,
+    /// Uncorrected likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)`: `≥ 0`
+    /// at a known scale, and supported on `[reference_deterministic_offset, ∞)`
+    /// (which starts below zero) when the scale is profiled.
+    statistic_lr: Option<f64>,
     /// The statistic's first-order null mean `Σ_j w_j = 2·tr(F_jj) − tr(F_jj²)`
     /// (Wood's `edf1`), which is the `d` the Bartlett factor `c = 1 + Δε/d` is
     /// denominated in — NOT a chi-square degrees of freedom. See
     /// `reference_chi_square_df` / `reference_scale` for the reference itself.
-    ref_df: f64,
+    ref_df: Option<f64>,
     /// The null spectrum itself, `w_j ∈ [0, 1]` sorted descending: the p-values
     /// are `P(Σ_j w_j χ²_1 > W)`, so this is the whole reference and not a
     /// summary of it. Empty when the fit could not supply the spectrum, which is
     /// exactly when `reference_source` is not `"null_spectrum"` and the
     /// `(ν, g)` pair below is what was used instead.
-    reference_weights: Vec<f64>,
+    reference_weights: Option<Vec<f64>>,
     /// Which lane supplied the reference: `"null_spectrum"` (exact),
     /// `"spectral_moment_match"` (the two-moment summary `g·χ²_ν`), or
     /// `"unit_weight_fallback"` (`χ²_{max(edf, null_dim, 1)}`). The three are
     /// not interchangeable and their errors have different signs and sizes.
-    reference_source: &'static str,
+    reference_source: Option<&'static str>,
     /// Shape of the two-moment summary, `ν = (Σw)²/Σw²`. It is the reference
     /// only on the two non-exact lanes; on the exact lane it is a published
     /// descriptor of the spectrum's shape.
-    reference_chi_square_df: f64,
+    reference_chi_square_df: Option<f64>,
     /// Scale of that summary: `g = Σw²/Σw`. It is exactly `1.0` for an
     /// unpenalized block (`w ≡ 1`), which is what makes the penalized test
     /// degenerate to the classical `χ²_q` rather than resemble it.
-    reference_scale: f64,
+    reference_scale: Option<f64>,
     /// Measured agreement between the two independent routes to the spectrum
     /// (`[H⁻¹]_jj S_jj` and the influence block's trace identities), when the fit
     /// supplied both. It is an algebraic identity, so this is a number that
@@ -1063,28 +1086,28 @@ struct SmoothTermLrRow {
     /// alone reports, before the λ̂-selection replay moves it.
     /// `p_value_corrected − p_value_conditional` is what treating `λ̂` as chosen
     /// rather than given is worth on this fit.
-    p_value_conditional: f64,
+    p_value_conditional: Option<f64>,
     /// Certified absolute accuracy of the two p-values below: the tail
     /// quadrature's truncation bound plus twice the selection replay's own
     /// Monte-Carlo standard error. `0.0` on the closed-form lanes.
-    p_value_bound: f64,
+    p_value_bound: Option<f64>,
     /// Lawley LR Bartlett factor `c = 1 + Δε/d`, the fixed-λ scale of the
     /// reference (1.0 when uncorrected).
-    bartlett_factor: f64,
+    bartlett_factor: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
-    statistic_corrected: f64,
+    statistic_corrected: Option<f64>,
     /// Uncorrected p-value `P(χ²_d > W)`.
-    p_value_uncorrected: f64,
+    p_value_uncorrected: Option<f64>,
     /// Corrected p-value `P(χ²_d > W*)` — the magic-by-default reported value.
-    p_value_corrected: f64,
+    p_value_corrected: Option<f64>,
     /// `true` when the correction is **material** (#939 deliverable 4): it moves
     /// the Bartlett factor or the p-value by more than 10% — the diagnostic that
     /// `n` is too small for first-order inference on this term. `false` when no
     /// correction was applied.
-    material: bool,
+    material: Option<bool>,
     /// `"lawley_lr_fixed_lambda"` when the Lawley factor was applied, else
     /// `"none"`.
-    correction_provenance: &'static str,
+    correction_provenance: Option<&'static str>,
 }
 
 /// A smooth term the per-term LR test does not report, with its typed reason.
@@ -1218,7 +1241,8 @@ fn curvature_inference_dataset_json_impl(
 /// in a fitted model, Bartlett-corrected by default. The summary table reports
 /// Wood's rank-truncated **Wald** statistic, which the Lawley LR factor would
 /// correct wrongly under penalization; this entry computes a genuine LR
-/// statistic by a constrained refit (the smooth dropped) and corrects *that*.
+/// statistic by a constrained fit (the smooth's block fixed at zero, every
+/// other smoothing parameter held at the full fit's `λ̂`) and corrects *that*.
 ///
 /// Like `curvature_inference_json`, the honest LR needs the model's training
 /// data: we materialize a Standard fit request from the model's training formula
@@ -1273,40 +1297,52 @@ fn smooth_term_lr_inference_dataset_json_impl(
     )
     .map_err(|e| format!("smooth_term_lr_inference: {e}"))?;
 
+    use gam::families::fit_orchestration::drivers::SmoothLrReferenceSource;
     let smooth_terms = reports
         .into_iter()
-        .map(|r| SmoothTermLrRow {
-            name: r.name,
-            term_idx: r.term_idx,
-            statistic_lr: r.statistic_lr,
-            ref_df: r.ref_df,
-            reference_weights: r.ref_df_provenance.weights.clone(),
-            reference_source: match r.ref_df_provenance.source {
-                gam::families::fit_orchestration::drivers::SmoothLrReferenceSource::NullSpectrum => "null_spectrum",
-                gam::families::fit_orchestration::drivers::SmoothLrReferenceSource::SpectralMomentMatch => {
-                    "spectral_moment_match"
-                }
-                gam::families::fit_orchestration::drivers::SmoothLrReferenceSource::UnitWeightFallback => "unit_weight_fallback",
+        .map(|report| match report.outcome {
+            Err(reason) => SmoothTermLrRow {
+                name: report.name,
+                term_idx: report.term_idx,
+                unavailable_reason: Some(reason.label()),
+                unavailable_message: Some(reason.to_string()),
+                ..SmoothTermLrRow::default()
             },
-            reference_chi_square_df: r.ref_df_provenance.chi_square_df,
-            reference_scale: r.ref_df_provenance.scale,
-            reference_moment_residual: r.ref_df_provenance.moment_residual,
-            reference_residual_df: r.ref_df_provenance.profiled_scale.as_ref().map(|scale| {
-                scale.residual_weights.iter().sum::<f64>() + scale.residual_unit_dimension
-            }),
-            reference_deterministic_offset: r
-                .ref_df_provenance
-                .profiled_scale
-                .as_ref()
-                .map(|scale| scale.deterministic_offset),
-            p_value_conditional: r.p_value_conditional,
-            p_value_bound: r.p_value_bound,
-            bartlett_factor: r.bartlett_factor,
-            statistic_corrected: r.statistic_corrected,
-            p_value_uncorrected: r.p_value_uncorrected,
-            p_value_corrected: r.p_value_corrected,
-            material: r.material,
-            correction_provenance: r.correction.label(),
+            Ok(r) => SmoothTermLrRow {
+                name: r.name,
+                term_idx: r.term_idx,
+                p_value: r.p_value.value(),
+                p_value_upper_bound: r.p_value.upper_bound(),
+                unavailable_reason: None,
+                unavailable_message: None,
+                statistic_lr: Some(r.statistic_lr),
+                ref_df: Some(r.ref_df),
+                reference_weights: Some(r.ref_df_provenance.weights.clone()),
+                reference_source: Some(match r.ref_df_provenance.source {
+                    SmoothLrReferenceSource::NullSpectrum => "null_spectrum",
+                    SmoothLrReferenceSource::SpectralMomentMatch => "spectral_moment_match",
+                    SmoothLrReferenceSource::UnitWeightFallback => "unit_weight_fallback",
+                }),
+                reference_chi_square_df: Some(r.ref_df_provenance.chi_square_df),
+                reference_scale: Some(r.ref_df_provenance.scale),
+                reference_moment_residual: r.ref_df_provenance.moment_residual,
+                reference_residual_df: r.ref_df_provenance.profiled_scale.as_ref().map(|scale| {
+                    scale.residual_weights.iter().sum::<f64>() + scale.residual_unit_dimension
+                }),
+                reference_deterministic_offset: r
+                    .ref_df_provenance
+                    .profiled_scale
+                    .as_ref()
+                    .map(|scale| scale.deterministic_offset),
+                p_value_conditional: Some(r.p_value_conditional),
+                p_value_bound: Some(r.p_value_bound),
+                bartlett_factor: Some(r.bartlett_factor),
+                statistic_corrected: Some(r.statistic_corrected),
+                p_value_uncorrected: Some(r.p_value_uncorrected),
+                p_value_corrected: Some(r.p_value_corrected),
+                material: Some(r.material),
+                correction_provenance: Some(r.correction.label()),
+            },
         })
         .collect::<Vec<_>>();
 
@@ -1398,6 +1434,13 @@ fn basis_adequacy_dataset_json_impl(
         }
     };
     let family = model.likelihood();
+    // The refit below is a plain standard fit at the frozen spec — no link
+    // wiggle and no latent-coordinate estimation — so its row law is the
+    // canonical family's whenever the likelihood is.
+    let canonical_family =
+        gam::families::fit_orchestration::drivers::basis_adequacy_canonical_family(
+            &family, false, false,
+        );
     let fitted = gam::families::fit_orchestration::drivers::fit_term_collection_forspec(
         standard.data.view(),
         standard.y.view(),
@@ -1414,6 +1457,11 @@ fn basis_adequacy_dataset_json_impl(
         &fitted.design,
         &spec,
         &fitted.fit,
+        &gam::families::fit_orchestration::drivers::BasisAdequacyResponse {
+            y: standard.y.view(),
+            prior_weights: standard.weights.view(),
+            canonical_family,
+        },
     );
     let payload = BasisAdequacyPayload {
         level: gam::families::fit_orchestration::drivers::BASIS_ADEQUACY_NOTE_LEVEL,
@@ -3194,46 +3242,36 @@ mod batch_tests {
         // columns plus `noise_scale`; the ordered schema must interleave it
         // right after `mean_upper` (the last preferred mean column) and keep any
         // non-preferred extras behind the preferred block.
-        let columns_json = r#"{
-            "mean_upper": [2.0],
-            "noise_scale": [0.7],
-            "linear_predictor": [1.0],
-            "row_id": [42.0],
-            "mean": [1.1],
-            "std_error": [0.2],
-            "mean_lower": [0.1]
-        }"#;
-        let ordered_json = ordered_prediction_columns(columns_json).expect("ordering must succeed");
-        // `ordered_prediction_columns` serialises keys in emission order via the
-        // manual `ordered_json_object_string` writer, so the textual byte order
-        // of the `"key":` tokens is the authoritative column order (round-trip
-        // through serde_json::Value would re-sort and lose it).
-        let expected = [
-            "linear_predictor",
-            "mean",
-            "std_error",
-            "mean_lower",
-            "mean_upper",
-            "noise_scale",
-            "row_id",
-        ];
-        let positions: Vec<usize> = expected
-            .iter()
-            .map(|key| {
-                ordered_json
-                    .find(&format!("\"{key}\":"))
-                    .unwrap_or_else(|| {
-                        panic!("emitted JSON must contain key {key}: {ordered_json}")
-                    })
-            })
+        let columns: BTreeMap<String, Vec<f64>> = [
+            ("mean_upper", 2.0),
+            ("noise_scale", 0.7),
+            ("linear_predictor", 1.0),
+            ("row_id", 42.0),
+            ("mean", 1.1),
+            ("std_error", 0.2),
+            ("mean_lower", 0.1),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), vec![value]))
+        .collect();
+        let ordered: Vec<String> = ordered_prediction_column_entries(columns)
+            .into_iter()
+            .map(|(key, _)| key)
             .collect();
-        for w in positions.windows(2) {
-            assert!(
-                w[0] < w[1],
-                "noise_scale must be ordered immediately after the mean columns and \
-                 before non-preferred extras; got JSON {ordered_json}"
-            );
-        }
+        assert_eq!(
+            ordered,
+            [
+                "linear_predictor",
+                "mean",
+                "std_error",
+                "mean_lower",
+                "mean_upper",
+                "noise_scale",
+                "row_id",
+            ],
+            "noise_scale must be ordered immediately after the mean columns and \
+             before non-preferred extras"
+        );
     }
 
     #[test]
@@ -3768,17 +3806,18 @@ fn predict_table_survival(
     model: &FittedModel,
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<String, String> {
+) -> Result<TablePrediction, String> {
     if model
         .payload()
         .survival_cause_count
         .is_some_and(|cause_count| cause_count > 1)
     {
         let result = predict_competing_risks_survival_result(model, dataset, options)?;
-        return serialize_competing_risks_prediction_payload(result, options.interval);
+        return serialize_competing_risks_prediction_payload(result, options.interval)
+            .map(TablePrediction::CompetingRisks);
     }
     let result = predict_survival_result(model, dataset, options)?;
-    serialize_survival_prediction_payload(model, result)
+    serialize_survival_prediction_payload(model, result).map(TablePrediction::Survival)
 }
 
 fn predict_competing_risks_survival_result(

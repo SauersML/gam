@@ -359,12 +359,12 @@ pub(crate) fn trace_logdet_hessian_cross_dense_drift(
 
 pub(crate) fn trace_logdet_hessian_crosses_dense_spectral_drifts(
     dense_hop: &DenseSpectralOperator,
-    dense_drifts: &[Array2<f64>],
+    dense_drifts: &[&Array2<f64>],
     ext_drifts: &[DriftDerivResult],
 ) -> Array2<f64> {
     let total = dense_drifts.len() + ext_drifts.len();
     let mut rotated = Vec::with_capacity(total);
-    for matrix in dense_drifts {
+    for &matrix in dense_drifts {
         rotated.push(dense_hop.rotate_to_eigenbasis(matrix));
     }
 
@@ -398,15 +398,5 @@ pub(crate) fn trace_logdet_hessian_crosses_dense_spectral_drifts(
         rotated.push(r.expect("every ext drift contributes a rotation"));
     }
 
-    let mut out = Array2::<f64>::zeros((total, total));
-    for i in 0..total {
-        for j in i..total {
-            let value = dense_hop.trace_logdet_hessian_cross_rotated(&rotated[i], &rotated[j]);
-            out[[i, j]] = value;
-            if i != j {
-                out[[j, i]] = value;
-            }
-        }
-    }
-    out
+    dense_hop.trace_logdet_hessian_crosses_rotated(&rotated)
 }

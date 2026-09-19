@@ -455,6 +455,90 @@ pub fn student_t_two_sided_probability(t: f64, degrees_of_freedom: f64) -> f64 {
     regularized_beta_lower_from_logs(log_x, log_one_minus_x, half_df, 0.5)
 }
 
+/// Student-t density `f_ν(t) = (1 + t²/ν)^{-(ν+1)/2} / (√ν · B(ν/2, 1/2))`.
+///
+/// Invalid degrees of freedom or a NaN statistic produce `NaN`.
+pub fn student_t_pdf(t: f64, degrees_of_freedom: f64) -> f64 {
+    let half_df = 0.5 * degrees_of_freedom;
+    if t.is_nan() || !(degrees_of_freedom.is_finite() && degrees_of_freedom > 0.0 && half_df > 0.0)
+    {
+        return f64::NAN;
+    }
+    if t.is_infinite() {
+        return 0.0;
+    }
+    let log_kernel = -(half_df + 0.5) * (t * t / degrees_of_freedom).ln_1p();
+    (log_kernel - 0.5 * degrees_of_freedom.ln() - ln_beta(half_df, 0.5)).exp()
+}
+
+/// Student-t quantile `F_ν⁻¹(p)`: the `t` with `P(T_ν ≤ t) = p`.
+///
+/// The two-sided identity `P(|T_ν| ≥ |t|) = I_x(ν/2, 1/2)`, `x = ν/(ν+t²)`,
+/// inverts through the regularized-beta quantile: with the two-sided mass
+/// `α = 2·min(p, 1−p)`, `x = I⁻¹_α(ν/2, 1/2)` and `t² = ν(1−x)/x`. When `α`
+/// exceeds one half, `x` is near one and `1 − x` is taken from the mirrored
+/// quantile `I⁻¹_{1−α}(1/2, ν/2)` instead of formed as a difference.
+///
+/// The beta inversion converges on an absolute tolerance in `x`, so the
+/// seed is then polished by Newton's method on the exact two-sided tail,
+/// whose derivative is the analytic `−2 f_ν(t)`. Newton converges
+/// quadratically from that seed; iteration stops as soon as a step no longer
+/// shrinks, which is the point where the tail's own rounding dominates.
+///
+/// `p` must lie in `(0, 1)` and `ν` must be finite and positive.
+pub fn student_t_quantile(p: f64, degrees_of_freedom: f64) -> Result<f64, String> {
+    if !(p.is_finite() && p > 0.0 && p < 1.0) {
+        return Err(format!("student-t quantile requires p in (0,1), got {p}"));
+    }
+    if !(degrees_of_freedom.is_finite() && degrees_of_freedom > 0.0) {
+        return Err(format!(
+            "student-t quantile requires finite positive degrees of freedom, got {degrees_of_freedom}"
+        ));
+    }
+    if p == 0.5 {
+        return Ok(0.0);
+    }
+    let upper = p > 0.5;
+    let tail = if upper { 1.0 - p } else { p };
+    let two_sided = 2.0 * tail;
+    let half_df = 0.5 * degrees_of_freedom;
+    let (x, one_minus_x) = if two_sided <= 0.5 {
+        let x = beta_quantile(two_sided, half_df, 0.5);
+        (x, 1.0 - x)
+    } else {
+        let one_minus_x = beta_quantile(1.0 - two_sided, 0.5, half_df);
+        (1.0 - one_minus_x, one_minus_x)
+    };
+    let mut magnitude = if x > 0.0 {
+        (degrees_of_freedom * one_minus_x / x).sqrt()
+    } else {
+        f64::INFINITY
+    };
+    if !magnitude.is_finite() {
+        return Err(format!(
+            "student-t quantile at p={p}, nu={degrees_of_freedom} is not representable"
+        ));
+    }
+    let mut previous_step = f64::INFINITY;
+    loop {
+        let density = student_t_pdf(magnitude, degrees_of_freedom);
+        if !(density > 0.0) {
+            break;
+        }
+        let residual = student_t_two_sided_probability(magnitude, degrees_of_freedom) - two_sided;
+        let step = residual / (2.0 * density);
+        if !(step.abs() < previous_step) {
+            break;
+        }
+        magnitude += step;
+        previous_step = step.abs();
+        if step.abs() <= UNIT_ROUNDOFF * magnitude {
+            break;
+        }
+    }
+    Ok(if upper { magnitude } else { -magnitude })
+}
+
 /// Chi-squared survival probability `P(X_ν > statistic)`.
 ///
 /// Uses the regularized upper incomplete gamma directly instead of
@@ -1844,6 +1928,61 @@ mod tests {
     }
 
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn student_t_quantile_matches_high_precision_reference() {
+        // (p, ν, F_ν⁻¹(p)) from a 300-step bisection at 40 digits on
+        // `I_{ν/(ν+t²)}(ν/2, 1/2)/2 = min(p, 1−p)`. ν = 1 is the Cauchy
+        // quantile tan(π(p − 1/2)); ν = 2 has the closed form
+        // `(2p − 1)·√(2 / (4p(1−p)))`.
+        const CASES: [(f64, f64, f64); 10] = [
+            (0.975, 1.0, 12.706_204_736_174_704),
+            (0.975, 2.0, 4.302_652_729_749_463_9),
+            (0.975, 10.0, 2.228_138_851_986_274_7),
+            (0.975, 54.3, 2.004_625_638_209_194_7),
+            (0.025, 54.3, -2.004_625_638_209_194_7),
+            (0.995, 3.5, 5.085_702_223_091_258_4),
+            (0.9999, 7.0, 7.063_432_828_157_514),
+            (0.6, 4.0, 0.270_722_294_707_597_42),
+            (0.975, 10_000.0, 1.960_201_239_890_626_3),
+            (1.0e-10, 5.0, -156.825_592_708_894_32),
+        ];
+        for (p, nu, want) in CASES {
+            let got = student_t_quantile(p, nu).expect("valid t quantile");
+            let relative = ((got - want) / want).abs();
+            // The quantile is exactly as accurate as the tail it inverts. Off
+            // the ascending-series branch (ν = 10⁴ here) the tail is the
+            // canonical `beta_reg`, whose normalizer `lnΓ(ν/2) + lnΓ(½) −
+            // lnΓ((ν+1)/2)` cancels `ε·(|lnΓ(ν/2)| + |lnΓ((ν+1)/2)|)` in
+            // relative tail mass. The quantile's relative condition number
+            // with respect to that mass is `α / (2 f_ν(t) |t|)`.
+            let alpha = 2.0 * p.min(1.0 - p);
+            let condition = alpha / (2.0 * student_t_pdf(want, nu) * want.abs());
+            let normalizer_cancellation = f64::EPSILON
+                * (statrs::function::gamma::ln_gamma(0.5 * nu).abs()
+                    + statrs::function::gamma::ln_gamma(0.5 * (nu + 1.0)).abs());
+            let tolerance = (condition * normalizer_cancellation).max(1.0e-13);
+            assert!(
+                relative <= tolerance,
+                "student_t_quantile({p}, {nu}) = {got}, want {want}, relative {relative:e} \
+                 > {tolerance:e}"
+            );
+        }
+        let cauchy = (std::f64::consts::PI * (0.975 - 0.5)).tan();
+        assert!(rel_err(student_t_quantile(0.975, 1.0).unwrap(), cauchy) <= 1.0e-13);
+        assert_eq!(student_t_quantile(0.5, 3.0).unwrap(), 0.0);
+        // The quantile inverts the tail it is defined by.
+        for (p, nu) in [(0.975, 57.0), (0.9, 3.25), (0.01, 12.0)] {
+            let t = student_t_quantile(p, nu).unwrap();
+            let lower_tail = 0.5 * student_t_two_sided_probability(t, nu);
+            let expected = if p > 0.5 { 1.0 - p } else { p };
+            assert!(rel_err(lower_tail, expected) <= 1.0e-12);
+        }
+        assert!(student_t_quantile(0.0, 5.0).is_err());
+        assert!(student_t_quantile(1.0, 5.0).is_err());
+        assert!(student_t_quantile(0.975, 0.0).is_err());
+        assert!(student_t_quantile(0.975, f64::INFINITY).is_err());
+    }
 
     #[test]
     fn inverse_gaussian_cdf_matches_high_precision_reference() {

@@ -18,7 +18,7 @@ use crate::basis::{
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
-    default_spatial_center_strategy, default_spherical_harmonic_degree,
+    default_spatial_center_strategy, default_spherical_harmonic_degree, low_rank_center_resolution,
     select_r_uniform_subsample_centers, thin_plate_penalty_order,
 };
 use crate::fit_notes::FitNoteSink;
@@ -200,6 +200,9 @@ impl From<DataError> for TermBuilderError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
@@ -433,15 +436,15 @@ pub fn build_termspec(
             _ => 0,
         })
         .sum::<usize>();
-    // Intercept removal (`0 + …`, `… - 1`) hands the constant to one term (see
-    // `ModelLevel` and docs/formulas.md "Removing the intercept"). The first
-    // fixed factor block already spans it with its full level set, and becomes
-    // unpenalized so the level is not shrunk toward zero (the cell-means
-    // model); otherwise the first pure-indicator interaction keeps its
-    // reference cell (unpenalized), and failing that the first B-spline smooth
-    // keeps its constant with its null-space ridge dropped. A genuine random
-    // effect (`group(g)`, `re(g)`) never carries the level: its levels are
-    // deviations with mean zero.
+    // Intercept removal (`0 + …`, `… - 1`) removes the constant only when no
+    // term spans it (see `ModelLevel` and docs/formulas.md "Removing the
+    // intercept"). A fixed factor block, a pure-indicator interaction over the
+    // full level cross, or a B-spline smooth whose own gauge would keep the
+    // constant all span it, and then the model keeps its intercept: the column
+    // space is the one the formula asked for, the constant is the one free
+    // direction, and every other direction keeps its default penalty. A
+    // genuine random effect (`group(g)`, `re(g)`) never spans it: its levels
+    // are deviations with mean zero.
     let no_intercept = terms.iter().any(|t| matches!(t, ParsedTerm::NoIntercept));
     let is_categorical = |name: &str| {
         col_map
@@ -455,24 +458,25 @@ pub fn build_termspec(
         })
     };
     // Every term matched here lowers to a `RandomEffectTermSpec` with
-    // `lenient_unseen: false` (a fixed factor); see the resolution after the loop.
-    let factor_block_present = terms.iter().any(|t| match t {
-        ParsedTerm::RandomEffect { lenient_unseen, .. } => !*lenient_unseen,
+    // `lenient_unseen: false` (a fixed factor) coded over its full level set.
+    // The first term found to span the constant is named in the inference
+    // note that keeps the intercept.
+    let mut constant_spanning_term: Option<String> = terms.iter().find_map(|t| match t {
+        ParsedTerm::RandomEffect {
+            name,
+            lenient_unseen: false,
+        } => Some(format!("factor `{name}`")),
         ParsedTerm::Linear {
             name,
             explicit: false,
             ..
-        } => is_categorical(name),
+        } if is_categorical(name) => Some(format!("factor `{name}`")),
         ParsedTerm::Smooth { options, .. } => options
             .get("by")
-            .is_some_and(|by| is_categorical(by) && !genuine_random_effect(by)),
-        _ => false,
+            .filter(|by| is_categorical(by) && !genuine_random_effect(by))
+            .map(|by| format!("factor `{by}` (the main effect of its `by=` smooth)")),
+        _ => None,
     });
-    let mut level_carried = !no_intercept || factor_block_present;
-    // Index of the first smooth eligible to carry the level, and whether an
-    // explicit `double_penalty=true` asks to keep its null-space ridge.
-    let mut level_smooth_candidate: Option<(usize, bool)> = None;
-    let mut explicit_level_smooth: Option<(usize, bool)> = None;
 
     for t in terms {
         match t {
@@ -799,20 +803,16 @@ pub fn build_termspec(
                         }
                     }
                 } else {
-                    // An explicit gauge is the user's choice: one that keeps the
-                    // constant is the preferred carrier, and a default-centred
-                    // smooth is the fallback.
-                    let keep_null_ridge = option_bool(options, "double_penalty")? == Some(true);
-                    if options.contains_key("identifiability") {
-                        if explicit_level_smooth.is_none()
-                            && crate::smooth::bspline_smooth_spans_constant(&inner_basis)
-                        {
-                            explicit_level_smooth = Some((smooth_terms.len(), keep_null_ridge));
-                        }
-                    } else if level_smooth_candidate.is_none()
-                        && crate::smooth::bspline_smooth_is_default_centred(&inner_basis)
-                    {
-                        level_smooth_candidate = Some((smooth_terms.len(), keep_null_ridge));
+                    // A B-spline smooth spans the constant before its default
+                    // centring removes it, and keeps it under an explicit
+                    // `identifiability=none`.
+                    let spans_constant = if options.contains_key("identifiability") {
+                        crate::smooth::bspline_smooth_spans_constant(&inner_basis)
+                    } else {
+                        crate::smooth::bspline_smooth_is_default_centred(&inner_basis)
+                    };
+                    if spans_constant && constant_spanning_term.is_none() {
+                        constant_spanning_term = Some(format!("smooth `{label}`"));
                     }
                     smooth_terms.push(SmoothTermSpec {
                         frozen_parametric_residualization: None,
@@ -981,14 +981,18 @@ pub fn build_termspec(
                     let any_dummy_coded = categorical_factors
                         .iter()
                         .any(|(_, _, _, treatment_coded)| !*treatment_coded);
-                    // Without an intercept (and no factor block spanning the
-                    // constant) the first such cell set is the level carrier:
-                    // every cell is kept, the saturated cell-means model.
-                    let cells_carry_level = numeric_cols.is_empty() && !level_carried;
-                    if cells_carry_level {
-                        level_carried = true;
+                    // Pure indicators over the full cross of every operand's
+                    // levels sum to the all-ones column: they span the
+                    // constant, which the intercept then carries.
+                    if numeric_cols.is_empty()
+                        && constant_spanning_term.is_none()
+                        && categorical_factors.iter().all(|(_, col, levels, _)| {
+                            levels.len() == encoded_levels_for_column(ds, ColIdx::new(*col)).len()
+                        })
+                    {
+                        constant_spanning_term = Some(format!("interaction `{label}`"));
                     }
-                    if numeric_cols.is_empty() && any_dummy_coded && !cells_carry_level {
+                    if numeric_cols.is_empty() && any_dummy_coded {
                         // The reference cell pairs each factor's column with the
                         // bits of its lexicographically-first (index 0) level.
                         let reference_cell: Vec<(usize, u64)> = categorical_factors
@@ -1029,9 +1033,7 @@ pub fn build_termspec(
                             feature_col,
                             feature_cols: numeric_cols.clone(),
                             categorical_levels,
-                            // Cells that carry the level hold it unpenalized:
-                            // a ridge on them would pull the level toward zero.
-                            double_penalty: *double_penalty && !cells_carry_level,
+                            double_penalty: *double_penalty,
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
@@ -1055,25 +1057,21 @@ pub fn build_termspec(
         }
     }
 
-    let level = if no_intercept {
-        if factor_block_present
-            && let Some(carrier) = random_terms.iter_mut().find(|rt| !rt.lenient_unseen)
-        {
-            carrier.penalized = false;
+    // Freeing the constant any other way would leave a penalty on it or strip
+    // one from a direction that is not the constant: the intercept is exactly
+    // the constant, unpenalized, and a full-level ridge beside it profiles to
+    // the ridge on the level contrasts alone.
+    let level = match (no_intercept, constant_spanning_term) {
+        (true, None) => ModelLevel::NoIntercept,
+        (true, Some(term)) => {
+            inference_notes.inform(format!(
+                "kept the intercept although the formula removes it: {term} spans the \
+                 constant, so the constant stays in the model as its one unpenalized \
+                 direction and every other direction keeps its penalty"
+            ));
+            ModelLevel::Intercept
         }
-        let level_smooth = match explicit_level_smooth.or(level_smooth_candidate) {
-            Some((idx, keep_null_ridge)) if !level_carried => {
-                crate::smooth::release_model_centring_for_level(
-                    &mut smooth_terms[idx].basis,
-                    keep_null_ridge,
-                );
-                Some(idx)
-            }
-            _ => None,
-        };
-        ModelLevel::NoIntercept { level_smooth }
-    } else {
-        ModelLevel::Intercept
+        (false, _) => ModelLevel::Intercept,
     };
     let spec = TermCollectionSpec {
         linear_terms,
@@ -3201,7 +3199,7 @@ pub(crate) fn build_smooth_basis(
                 cap_default_spatial_centers(options, default_centers)?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3438,7 +3436,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("curvature smooth requires at least 2 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3506,7 +3504,7 @@ pub(crate) fn build_smooth_basis(
                 return Err("measurejet smooth requires at least 3 centers".to_string());
             }
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3573,7 +3571,7 @@ pub(crate) fn build_smooth_basis(
                 )?,
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                spatial_center_strategy_for_dimension(centers, cols.len())
+                default_spatial_center_strategy(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
             };
@@ -3890,7 +3888,7 @@ pub(crate) fn build_smooth_basis(
                 CenterStrategy::UserProvided(sampled)
             } else if is_periodic {
                 if centers_explicit {
-                    spatial_center_strategy_for_dimension(centers, cols.len())
+                    default_spatial_center_strategy(centers, cols.len())
                 } else {
                     auto_spatial_center_strategy(centers, cols.len())
                 }
@@ -4511,23 +4509,6 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
 // Data-aware helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn spatial_center_strategy_for_dimension(
-    num_centers: usize,
-    d: usize,
-) -> CenterStrategy {
-    if d <= 3 {
-        // In low-dimensional spatial smooths, an explicit `k` is a resolution
-        // request rather than a request for marginal quantile-midpoint centers.
-        // Use deterministic maximin geometry so Matérn/GP and Duchon REML see a
-        // well-resolved native kernel block with small fill distance instead of
-        // compensating for holes or endpoint under-resolution by over-smoothing
-        // low-noise signals (#504).
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    }
-}
-
 /// Center geometry for a non-periodic Duchon smooth.
 ///
 /// In one dimension the represented domain is the interval between the observed
@@ -4543,13 +4524,17 @@ pub(crate) fn spatial_center_strategy_for_dimension(
 /// equal-mass strategies, where there is no canonical coordinate-aligned grid.
 /// The `Auto` wrapper is retained for inferred 1-D counts so adaptive resolution
 /// can still resize the interval grid before freezing its realized centers.
-fn duchon_center_strategy(num_centers: usize, d: usize, automatic: bool) -> CenterStrategy {
+pub(crate) fn duchon_center_strategy(
+    num_centers: usize,
+    d: usize,
+    automatic: bool,
+) -> CenterStrategy {
     let realized = if d == 1 {
         CenterStrategy::UniformGrid {
             points_per_dim: num_centers,
         }
     } else {
-        spatial_center_strategy_for_dimension(num_centers, d)
+        default_spatial_center_strategy(num_centers, d)
     };
     if automatic {
         CenterStrategy::Auto(Box::new(realized))
@@ -5276,7 +5261,7 @@ fn resolve_nonperiodic_bspline_knotspec(
                 .map_err(|e| e.to_string())?;
         }
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n_knots),
+            num_internal_knots: n_knots,
             placement,
             adaptive: true,
         });
@@ -5774,7 +5759,7 @@ pub(crate) fn default_duchon_center_count(
     // implicit low-rank cap while preserving the user's explicit `centers=`/`k=`
     // request above.  The polynomial null space must still fit, so tiny
     // high-order bases are raised to the smallest admissible count.
-    let mgcv_default = 10usize.saturating_mul(3usize.saturating_pow(d.saturating_sub(1) as u32));
+    let mgcv_default = low_rank_center_resolution(d);
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
     // `default_num_centers` starves `planned_count` below the univariate spline
@@ -6136,7 +6121,7 @@ fn quantile_bspline_knotspec(
         .map_err(|e| e.to_string())?;
     let Some(domain) = domain else {
         return Ok(BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: BSplineKnotPlacement::Quantile,
             adaptive: false,
         });

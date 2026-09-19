@@ -860,8 +860,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
-        screening_max_inner_iterations: None,
-        seed_screening: false,
         early_exit_threshold: None,
         outer_score_subsample: None,
         auto_outer_subsample: false,
@@ -870,7 +868,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        screen_initial_rho: true,
     };
     let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
     let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)

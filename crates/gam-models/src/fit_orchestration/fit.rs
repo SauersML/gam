@@ -1923,7 +1923,7 @@ fn optimize_survival_transformation_smoothing(
             // response, so the verdict must be per-trial-point, not per-problem
             // (#2531/#2590): minting `InvalidInput` here graded the refusal
             // Fatal (`is_trial_point_infeasible` is false for it) and killed the
-            // whole seed cascade instead of retreating from one rho.
+            // whole outer search instead of retreating from one rho.
             //
             // `set_penalty_lambdas`'s length-mismatch arm is structurally
             // unreachable from this call site: the proposal has one coordinate
@@ -2133,6 +2133,7 @@ fn optimize_survival_transformation_smoothing(
     // non-convergence, not an invitation to rebuild BFGS with an arbitrary
     // caller-owned retry budget.
     let problem = OuterProblem::new(num_smoothing)
+        .with_problem_size(model.n_observations(), beta0.len())
         .with_gradient(Derivative::Analytic)
         // The analytic LAML ρ-Hessian is declared under #2359's
         // optimize-3/certify-4 lifecycle: the search stays on BFGS over the
@@ -2143,12 +2144,7 @@ fn optimize_survival_transformation_smoothing(
         .with_hessian(gam_problem::DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
         .with_bounds(lower.clone(), upper.clone())
-        .with_initial_rho(seed_rho.clone())
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(seed_rho.clone());
     let mut obj = problem.build_objective_with_eval_order(
         (),
         |_: &mut (), rho: &Array1<f64>| {

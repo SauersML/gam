@@ -163,7 +163,13 @@ fn run_one(
         &req.options,
     )
     .map_err(|error| error.to_string())?;
-    Ok(reports.into_iter().find(|r| r.name.contains('z')))
+    // A term the driver could not test carries its typed reason; it is a
+    // refusal exactly like a full-fit refusal and is counted the same way.
+    reports
+        .into_iter()
+        .find(|r| r.name.contains('z'))
+        .map(|r| r.outcome.map_err(|reason| reason.to_string()))
+        .transpose()
 }
 
 /// Empirical-size accumulators for one grid cell, across the three lanes.

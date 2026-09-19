@@ -3466,8 +3466,10 @@ fn curvature_inference_json(
 
 /// #1063 per-term LR significance report for every penalized smooth term:
 /// `statistic_lr`, `ref_df`, `bartlett_factor`, `statistic_corrected`,
-/// `p_value_uncorrected`, `p_value_corrected`, and `correction_provenance`
-/// (`"lawley_lr_fixed_lambda"` | `"none"`).
+/// `p_value_uncorrected`, `p_value_corrected`, `correction_provenance`
+/// (`"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
+/// Every row carries every key.
 ///
 /// Unlike `summary_json` (Wood rank-truncated **Wald** χ²), this computes a
 /// genuine **likelihood-ratio** statistic by a constrained refit dropping each
@@ -4437,20 +4439,6 @@ fn diagnostics_from_predictions(
 fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
     gam::inference::diagnostics::auc_from_predictions(&observed, &predicted_mean)
         .map_err(py_value_error)
-}
-
-#[pyfunction]
-fn weighted_auc_from_predictions(
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    weights: Vec<f64>,
-) -> PyResult<f64> {
-    gam::inference::diagnostics::weighted_auc_from_predictions(
-        &observed,
-        &predicted_mean,
-        Some(&weights),
-    )
-    .map_err(py_value_error)
 }
 
 #[pyfunction]

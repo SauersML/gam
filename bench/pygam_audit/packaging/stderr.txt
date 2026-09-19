@@ -1,0 +1,9 @@
+BEFORE
+[0s] [HGB] target_mse below mandatory floors; target_mse=5.868e-13 floors=3.000e-12
+[0s] [OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 3 outer steps but the projected gradient is FAR above the certified-stationary band (|g|=5.579e-1 > escape threshold 9.477e-2); refusing to halt-and-ship and continuing the descent (escape 1, value=6.218184e1).
+[0s] [HGB] target_mse below mandatory floors; target_mse=1.109e-12 floors=3.000e-12
+/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/bvenv/lib/python3.11/site-packages/gamfit/_api.py:693: GamInferenceWarning: Automatically set 8 internal knots for smooth 'x' from 300 unique values (rule: clamp(unique/4, 4..8) = 8; basis dimension = internal knots + degree + 1). Override with knots=... or k=....
+  return fn(*args, **kwargs)
+/tmp/claude-0/-home-user-gam/02aeec89-32a7-52a0-8d71-90f383516996/scratchpad/bvenv/lib/python3.11/site-packages/gamfit/_api.py:693: GamInferenceWarning: Automatically set 8 internal knots for smooth 'z' from 300 unique values (rule: clamp(unique/4, 4..8) = 8; basis dimension = internal knots + degree + 1). Override with knots=... or k=....
+  return fn(*args, **kwargs)
+AFTER

@@ -14,7 +14,9 @@ an mgcv-style link argument, e.g. gamma(inverse)";
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
 ///
-/// `Categorical` carries the source-string levels through so the
+/// `Categorical` carries the source-string levels through so a two-level
+/// column can be coded as a binary outcome
+/// ([`code_two_level_label_response`]) and any other level count's
 /// auto-inference refusal can echo them; `Binary` short-circuits the
 /// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
 /// maps to `Numeric` and the family layer scans `y` itself to decide
@@ -34,6 +36,50 @@ pub fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind 
     }
 }
 
+/// Code a two-level label response to the `0`/`1` outcome a Binomial family
+/// models, in canonical sorted level order.
+///
+/// A string or categorical response arrives as level indices whose order is
+/// the ingestion path's (encounter order for an Arrow string column, the
+/// declared categories for a pandas categorical, sorted for a CSV). The event
+/// must not depend on which of those carried the data, so the two levels are
+/// ranked by [`gam_data::natural_level_cmp`]: the first is coded `0`, the
+/// second `1`, and the fit models `P(y = second level)`. `{"no", "yes"}` models
+/// `P(yes)`; `{"0", "1"}` models `P(1)`. The coding is recorded as an
+/// informational fit note so the summary states which level is the event.
+///
+/// A no-op unless `family` is Binomial and `y_kind` is a two-level categorical
+/// column; every other response is already on its family's scale.
+pub(crate) fn code_two_level_label_response(
+    family: &LikelihoodSpec,
+    y_kind: &ResponseColumnKind,
+    y: &mut Array1<f64>,
+    response_name: &str,
+    notes: &mut FitNotes,
+) {
+    let ResponseColumnKind::Categorical { levels } = y_kind else {
+        return;
+    };
+    if !matches!(family.response, ResponseFamily::Binomial) || levels.len() != 2 {
+        return;
+    }
+    let event_code = match gam_data::natural_level_cmp(&levels[0], &levels[1]) {
+        std::cmp::Ordering::Greater => 0.0,
+        _ => 1.0,
+    };
+    let (reference, event) = if event_code == 1.0 {
+        (&levels[0], &levels[1])
+    } else {
+        (&levels[1], &levels[0])
+    };
+    y.mapv_inplace(|code| if code == event_code { 1.0 } else { 0.0 });
+    notes.inform(format!(
+        "response '{response_name}' has two levels, coded in sorted order as \
+         '{reference}' = 0 and '{event}' = 1; the binomial fit models \
+         P({response_name} = '{event}')"
+    ));
+}
+
 /// Reject a `(response family, link)` pairing the likelihood legality table
 /// ([`LikelihoodSpec::is_legal_cell`]) does not admit.
 ///
@@ -50,10 +96,13 @@ fn require_legal_link(response: &ResponseFamily, link: LinkFunction) -> Result<(
     }
     Err(WorkflowError::InvalidConfig {
         reason: format!(
-            "link `{}` is not supported for family `{}`; {}",
+            "link `{}` is not supported for family `{}`; {}{}",
             link.name(),
             response.name(),
-            LikelihoodSpec::legal_links_clause(response)
+            LikelihoodSpec::legal_links_clause(response),
+            LikelihoodSpec::illegal_cell_hint(response, link)
+                .map(|hint| format!("; {hint}"))
+                .unwrap_or_default()
         ),
     }
     .into())
@@ -573,10 +622,11 @@ pub fn scalar_family_from_name(
 /// `Numeric`). It is consulted only on the auto-detect path — explicit
 /// `family=...` always wins — but is required there because the same numeric
 /// `y = [0.0, 1.0, ...]` payload may come from a real binary outcome or from
-/// a categorical column whose two levels happened to encode to those indices.
-/// Routing the kind through [`ResponseFamily::infer_from_response`] is what
-/// stops the auto-detector from silently inferring Binomial off encoded
-/// strings (see `tests/issues/issue_304`).
+/// a categorical column whose levels happened to encode to those indices.
+/// Routing the kind through [`ResponseFamily::infer_from_response`] keeps the
+/// auto-detector from reading level indices as values: a two-level label
+/// column is a binary outcome (Binomial, coded by
+/// [`code_two_level_label_response`]), and any other label column is refused.
 pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,
@@ -630,22 +680,34 @@ pub fn resolve_family(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                // `log` (Poisson, Gamma, Tweedie, NB, Inverse-Gaussian) and
-                // `1/μ` (Gaussian, Gamma) are each legal for several families,
-                // and nothing in the link distinguishes them: a variance
-                // function is a modelling choice, not something to read off
-                // whether `y` happens to be integer-valued. The caller names
-                // the family. With an explicit family only `from_link.link`
-                // is carried below, so the response here is immaterial.
+                // `log`, `sqrt`, `1/μ` and `1/μ²` are each legal for several
+                // families (the generic variance × link cells carry the
+                // non-canonical ones), and nothing in the link distinguishes
+                // them: a variance function is a modelling choice, not
+                // something to read off whether `y` happens to be
+                // integer-valued. The caller names the family. With an
+                // explicit family only `from_link.link` is carried below, so
+                // the response here is immaterial.
                 LinkFunction::Log if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Log),
+                ),
+                LinkFunction::Sqrt if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Sqrt),
                 ),
                 LinkFunction::Inverse if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Inverse),
                 ),
-                link @ (LinkFunction::Log | LinkFunction::Inverse) => {
+                LinkFunction::InverseSquared if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::InverseSquared),
+                ),
+                link @ (LinkFunction::Log
+                | LinkFunction::Sqrt
+                | LinkFunction::Inverse
+                | LinkFunction::InverseSquared) => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!(
                             "link '{}' does not determine a response family; name one \
@@ -656,12 +718,6 @@ pub fn resolve_family(
                     }
                     .into());
                 }
-                // `1/μ²` is the canonical Inverse-Gaussian link and legal for
-                // no other family.
-                LinkFunction::InverseSquared => LikelihoodSpec::new(
-                    ResponseFamily::InverseGaussian,
-                    InverseLink::Standard(StandardLink::InverseSquared),
-                ),
                 LinkFunction::Logit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::Logit),
@@ -913,9 +969,13 @@ mod tweedie_power_tests {
         for (link, admitting) in [
             (
                 LinkFunction::Log,
-                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+                "gaussian|binomial|poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
             ),
-            (LinkFunction::Inverse, "gaussian|gamma"),
+            (
+                LinkFunction::Inverse,
+                "gaussian|poisson|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Sqrt, "gaussian|poisson|gamma|inverse-gaussian"),
         ] {
             let choice = LinkChoice {
                 mode: LinkMode::Strict,

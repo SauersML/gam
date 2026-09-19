@@ -207,6 +207,9 @@ struct ConstantCurvatureProfile<'a> {
     eta_bracket: (f64, f64),
     /// `η` seed — the auto rule's realized `ℓ_ref`, in logs.
     eta_seed: f64,
+    /// Coefficients of the profiled REML fit, `[1 | X]`: one representer per
+    /// realized center plus the intercept. Sizes the outer engine's resolution.
+    p_coefficients: usize,
     cache: std::cell::RefCell<std::collections::HashMap<(u64, u64), ProfiledRemlPsiJet>>,
     /// Value-only cache for the bracketing scan: `(V, ρ̂ railed)`; see
     /// [`Self::evaluate_value`].
@@ -483,6 +486,7 @@ impl<'a> ConstantCurvatureProfile<'a> {
             eta_bounds,
             eta_bracket: (span_lo.ln(), span_hi.ln()),
             eta_seed,
+            p_coefficients: centers.nrows() + 1,
             cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             value_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
@@ -607,6 +611,7 @@ impl<'a> ConstantCurvatureProfile<'a> {
             reason: error.to_string(),
         };
         let problem = OuterProblem::new(1)
+            .with_problem_size(self.response.len(), self.p_coefficients)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lo]), Array1::from_vec(vec![hi]))
@@ -848,14 +853,9 @@ fn constant_curvature_kappa_profile_optimum(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.max_seeds = 1;
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
-    seed_config.num_auxiliary_trailing = 1;
-    seed_config.over_smoothing_probe_rho = None;
     let initial_kappa = profile.spec.kappa.clamp(kappa_min, kappa_max);
     let problem = gam_solve::rho_optimizer::OuterProblem::new(1)
+        .with_problem_size(y.len(), profile.p_coefficients)
         .with_gradient(gam_problem::Derivative::Analytic)
         // #2458: the κ profile supplies an EXACT d²V_p/dκ², so this route runs
         // the same curvature-denominated stationarity certificate every other
@@ -879,8 +879,7 @@ fn constant_curvature_kappa_profile_optimum(
             Array1::from_vec(vec![kappa_min]),
             Array1::from_vec(vec![kappa_max]),
         )
-        .with_initial_rho(Array1::from_vec(vec![initial_kappa]))
-        .with_seed_config(seed_config);
+        .with_initial_rho(Array1::from_vec(vec![initial_kappa]));
     let mut objective = problem.build_objective(
         profile,
         |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {
