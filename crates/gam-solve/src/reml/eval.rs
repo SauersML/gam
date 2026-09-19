@@ -1046,8 +1046,11 @@ impl<'a> RemlState<'a> {
     /// mass. Such a draw is valued by the criterion's affine continuation from
     /// the face ([`CriterionContinuation`]), so the inner solve is only ever
     /// asked for `ρ` inside the box, where P-IRLS has a resolvable minimum to
-    /// report. Past a literal face `ρ` is not a model, so the Tier-0 proposal
-    /// is truncated there and no draw reaches one.
+    /// report. Past a literal face the criterion has no value (past the
+    /// representable log-strength cut `ρ` is not a model; past the precision
+    /// box of a term without penalty geometry it is not computed), so the
+    /// Tier-0 proposal is truncated there, its target is `π(ρ|y)` restricted
+    /// to that support, and no draw reaches one.
     ///
     /// `railed_rho` names the coordinates the certificate railed. The Tier-0
     /// proposal holds them, and every coordinate with `ρ̂` on a face of the box,

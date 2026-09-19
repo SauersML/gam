@@ -316,9 +316,10 @@ pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
     /// `−log π(ρ|y)` at any `ρ`, or says why it cannot; a draw it cannot value
     /// refuses the diagnostic, since dropping it would drop its mass. `support`
-    /// is the `(lower, upper)` box of `π(ρ|y)`: finite only at a literal face,
-    /// past which `ρ` is not a model, and infinite at a saturated face, past
-    /// which the criterion continues. `held` names the coordinates the outer
+    /// is the `(lower, upper)` box on which the criterion has a value: finite
+    /// only at a literal face, past which it has none, and infinite at a
+    /// saturated face, past which it continues. The diagnostic's target is
+    /// `π(ρ|y)` restricted to it. `held` names the coordinates the outer
     /// certificate railed or found on a face; they stay at `ρ̂`, and the rest
     /// are drawn from the Laplace approximation conditioned on them and
     /// truncated to `support` (#3010). Returns `Ok(None)` when there is nothing

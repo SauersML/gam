@@ -568,9 +568,9 @@ fn truncated_standard_normal(a: f64, b: f64, log_mass: f64, u: f64) -> f64 {
 
 /// The Laplace proposal of `π(ρ|y)` restricted to its support (#3010).
 ///
-/// The support is a box that is finite only at a literal face, past which `ρ`
-/// is not a model; past a saturated face the criterion continues, so that side
-/// is unbounded. A held coordinate (railed by the certificate or found on a
+/// The support is the box on which the criterion has a value. It is finite
+/// only at a literal face, past which the criterion has none; past a saturated
+/// face the criterion continues, so that side is unbounded. A held coordinate (railed by the certificate or found on a
 /// face, and any with `ρ̂` on a finite face of the support) is the face-reduced
 /// model's, not a direction to sample, so it stays at `ρ̂`. The free coordinates
 /// `f` are drawn from the Laplace approximation conditioned on the held ones at

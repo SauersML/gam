@@ -539,10 +539,14 @@ pub(crate) struct CriterionContinuation {
 }
 
 impl CriterionContinuation {
-    /// The support of `π(ρ|y)` as a `(lower, upper)` box: the domain with each
-    /// saturated face opened to `∓∞`, since the criterion continues past it,
-    /// and each literal face kept, since past it `ρ` is not a model. A draw
-    /// confined to it is one [`Self::value`] can value (#3010).
+    /// The region on which the criterion has a value, as a `(lower, upper)`
+    /// box: the domain with each saturated face opened to `∓∞`, since the
+    /// criterion continues past it, and each literal face kept. Past the
+    /// representable log-strength cut `ρ` is not a model. Past the precision
+    /// box of a term without penalty geometry it is one, but the criterion
+    /// carries no value there, so a posterior drawn on this region is
+    /// `π(ρ|y)` restricted to it. A draw confined to it is one [`Self::value`]
+    /// can value (#3010).
     pub(crate) fn posterior_support(&self) -> (Array1<f64>, Array1<f64>) {
         let open = |faces: &Array1<f64>, saturated: &[bool], infinity: f64| {
             Array1::from_iter(faces.iter().enumerate().map(|(k, &face)| {
