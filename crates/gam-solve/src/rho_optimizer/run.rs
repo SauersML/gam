@@ -181,20 +181,6 @@ impl OuterProblemSize {
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
     pub(crate) tolerance: f64,
-    /// Optional override for the *relative-cost-decrease* convergence stop,
-    /// decoupled from `tolerance`. `outer_gradient_tolerance` normally derives
-    /// BOTH the absolute projected-gradient band (`tolerance`)
-    /// AND the relative-cost stop (`rel_cost = tolerance`) from the single
-    /// `tolerance`. That conflation forces a caller who needs a *tight absolute
-    /// band* (to resolve λ to the genuine REML optimum) to also accept a *tight rel-cost stop*,
-    /// which on a flat REML ridge never trips and grinds the optimizer to `max_iter` —
-    /// dozens of surplus O(D·p³) Laplace-derivative outer iterations (the #1082
-    /// multinomial smooth-by-factor wall-clock blow-up). When `Some(r)`, the
-    /// rel-cost stop uses `r` while the absolute band keeps using `tolerance`,
-    /// so accuracy (absolute floor) and perf (loose
-    /// rel-cost) are selected independently. `None` preserves the legacy coupling
-    /// (`rel_cost = tolerance`) for every existing path byte-for-byte.
-    pub(crate) rel_cost_tolerance: Option<f64>,
     pub(crate) max_iter: usize,
     /// The model's canonical feasible outer domain. Every stationarity
     /// certificate and rail report reasons against this box.
@@ -420,7 +406,6 @@ impl Default for OuterConfig {
     fn default() -> Self {
         Self {
             tolerance: 1e-5,
-            rel_cost_tolerance: None,
             required_projected_gradient_norm: None,
             require_measured_psd: false,
             max_iter: UNBOUNDED_OUTER_ITERATIONS,
@@ -472,7 +457,6 @@ pub struct OuterProblem {
     psi_dim: usize,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
-    rel_cost_tolerance: Option<f64>,
     /// See [`OuterConfig::required_projected_gradient_norm`] (#2568).
     required_projected_gradient_norm: Option<f64>,
     require_measured_psd: bool,
@@ -518,7 +502,6 @@ impl OuterProblem {
             psi_dim: 0,
             barrier_config: None,
             tolerance: 1e-5,
-            rel_cost_tolerance: None,
             required_projected_gradient_norm: None,
             require_measured_psd: false,
             max_iter: UNBOUNDED_OUTER_ITERATIONS,
@@ -744,19 +727,6 @@ impl OuterProblem {
         })
     }
 
-    /// Decouple the *relative-cost-decrease* convergence stop from the
-    /// absolute projected-gradient floor. By default both are derived from the
-    /// single `with_tolerance` value (`abs = max(tol, scale·√ε_machine)`,
-    /// `rel_cost = tol`). Supplying `Some(r)` here makes the rel-cost stop use
-    /// `r` while the absolute floor keeps using `tolerance` (so a caller can
-    /// keep a tight absolute floor for accuracy at large `n` AND a loose
-    /// rel-cost stop for perf on a flat REML ridge — see #1082). `None` keeps
-    /// the legacy coupling.
-    pub fn with_rel_cost_tolerance(mut self, rel_cost: Option<f64>) -> Self {
-        self.rel_cost_tolerance = rel_cost.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
     /// Require the returned fit's projected outer gradient norm to satisfy
     /// `|Pg| <= requirement`, and make the SEARCH pursue it (#2568).
     ///
@@ -876,7 +846,6 @@ impl OuterProblem {
     pub(crate) fn config(&self) -> OuterConfig {
         OuterConfig {
             tolerance: self.tolerance,
-            rel_cost_tolerance: self.rel_cost_tolerance,
             required_projected_gradient_norm: self.required_projected_gradient_norm,
             require_measured_psd: self.require_measured_psd,
             max_iter: self.max_iter,
@@ -1950,12 +1919,26 @@ impl std::error::Error for OuterStationaryPointRejection {
 /// objective in a frozen evaluation mode before calling this function.
 /// `iterations == 0` in the returned result is structural: no optimization loop
 /// exists on this path.
+///
+/// `n_obs` and `p_coefficients` are the problem size the criterion is summed
+/// over, exactly as [`OuterProblem::with_problem_size`] declares them for a
+/// search: the point is judged against the same statistical resolution
+/// `τ_stat = 1/(2n)` a search of that criterion would stop at.
 pub fn audit_stationary_point(
     obj: &mut dyn OuterObjective,
     rho: Array1<f64>,
+    n_obs: usize,
+    p_coefficients: usize,
     context: &str,
 ) -> Result<OuterResult, OuterStationaryPointRejection> {
-    audit_stationary_point_in(obj, OuterConfig::default(), rho, context)
+    let config = OuterConfig {
+        problem_size: OuterProblemSize {
+            n_obs: Some(n_obs),
+            p_coefficients: Some(p_coefficients),
+        },
+        ..OuterConfig::default()
+    };
+    audit_stationary_point_in(obj, config, rho, context)
 }
 
 /// [`audit_stationary_point`] under a caller's configuration. The point is judged
@@ -2672,8 +2655,8 @@ pub(crate) fn adjudicate_negative_curvature(
     // ```
     //
     // is therefore the exact end of the claim's FALSIFIABLE RANGE — derived
-    // from the eigenvalue in dispute and the same `rel_cost_tolerance`-anchored
-    // resolution the rail and cost-stall machinery already use, with no
+    // from the eigenvalue in dispute and the same criterion resolution
+    // (`outer_criterion_resolution`) the rail and cost-stall machinery already use, with no
     // constant chosen here. Probing from `1` down to it and finding no descent
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
@@ -4525,15 +4508,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && let Some(predicted_decrease) = newton_predicted_decrease_at_resolution(
             hessian,
             &projected_gradient,
-            criterion_curvature_resolution(outer_rel_cost_floor(config), evaluation.cost),
+            criterion_curvature_resolution(outer_criterion_resolution(config)),
         )
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
     {
-        // The SAME relative cost floor the cost-stall guard used to declare the
-        // criterion stalled (run_plan.rs), so certification asserts nothing
-        // tighter than the loop already proved about this surface.
-        let objective_tol = outer_rel_cost_floor(config) * (1.0 + evaluation.cost.abs());
+        // The criterion's resolution, the SAME one the cost-stall guard declares
+        // the criterion stalled at (run_plan.rs), so certification asserts
+        // nothing tighter than the loop already proved about this surface.
+        let objective_tol = outer_criterion_resolution(config);
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
@@ -4631,11 +4614,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && prior.value().is_finite()
     {
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = outer_criterion_resolution(config);
         let cost_drift = (prior.value() - evaluation.cost).abs();
         let prior_projected = project_gradient_vector(
             &result.rho,
@@ -4742,11 +4721,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
-    let asymptote_objective_tol = config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
-        * (1.0 + evaluation.cost.abs());
+    let asymptote_objective_tol = outer_criterion_resolution(config);
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
             Some(try_certify_asymptote_rail(
@@ -4879,14 +4854,10 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // magnitude, floored at 1 exactly as the PSD/Newton shift is.
         let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
         let null_curvature_threshold = f64::EPSILON.sqrt() * max_diag.max(1.0);
-        // The SAME relative cost floor the cost-stall guard and both widenings
+        // The SAME criterion resolution the cost-stall guard and both widenings
         // above use: certification asserts nothing tighter about this surface's
         // macroscopic flatness than the loop already proved.
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = outer_criterion_resolution(config);
         // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
         // in λ, a macroscopic move across which no genuine descent slope can hide.
         const LARGE_STEP_DELTA: f64 = 1.0;
@@ -8401,6 +8372,7 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
+        outer_criterion_resolution(config),
     );
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
@@ -8560,32 +8532,47 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
     f64::EPSILON.sqrt() * (n_params.max(1) as f64).sqrt() * (1.0 + box_scale)
 }
 
-/// The relative cost floor shared by the cost-stall guard, the curvature-scaled
-/// flat-valley certificate, and the certify-last resume progress gate: nothing
-/// tighter than what the in-loop stall detector already proved about the
-/// surface. `rel_cost_tolerance` when set, else a small fraction of the absolute
-/// tolerance, never below `COST_STALL_REL_TOL_FLOOR`.
-pub(crate) fn outer_rel_cost_floor(config: &OuterConfig) -> f64 {
+/// The criterion's resolution in its own absolute units: the statistical
+/// resolution `τ_stat = 1/(2n)` over the declared observations
+/// ([`OuterProblemSize::statistical_resolution`], C3).
+///
+/// Every judgement of "the criterion cannot tell these apart" reads this one
+/// number: the cost-stall guard's no-improvement test where the evaluations
+/// carry no objective band, the ARC online stop and the matrix-free model
+/// decrement, the curvature-resolvability and gradient-reproducibility rungs,
+/// the asymptote-rail and large-step flatness certificates, and the
+/// negative-curvature adjudication's falsifiable range. A decrease below
+/// `τ_stat` moves no reported quantity by more than the `n^{-1/2}` sampling
+/// error the inference built on the optimum already carries; it does not move
+/// with the units of `y` or with an additive constant in `V`, which the
+/// `rel·(1 + |V|)` floor it replaces did, and it shrinks as `n` grows (#2954).
+///
+/// `0.0` when the route declares no observation count: such a criterion has no
+/// statistical resolution, so nothing is waived as unresolvable — a tolerance
+/// test `x ≤ 0` passes only on exact equality and the rung it gates does not
+/// fire.
+pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
     config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
+        .problem_size
+        .statistical_resolution()
+        .filter(|tau| tau.is_finite() && *tau > 0.0)
+        .unwrap_or(0.0)
 }
 
-/// The criterion's curvature resolution at a point of cost `cost`:
-/// `2·rel_cost_floor·(1 + |V|)` (#1082, #2817).
+/// The criterion's curvature resolution `2·τ` over its objective resolution
+/// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
 /// adjudication takes is one e-fold of `log λ` (`α = 1`), so a direction with
-/// `½|λ| ≤ rel_cost_floor·(1 + |V|)` predicts nothing the criterion can represent
-/// anywhere in the range that could falsify it. The bridge's definiteness
-/// verdict, the seed's verdict, and the decrement that both the in-loop stop and
-/// the certificate's curvature rung take all read this one number. `0.0` (the
-/// arithmetic shift alone) when the floor is unusable or the cost is not finite.
-pub(crate) fn criterion_curvature_resolution(rel_cost_floor: f64, cost: f64) -> f64 {
-    if rel_cost_floor.is_finite() && rel_cost_floor > 0.0 && cost.is_finite() {
-        2.0 * rel_cost_floor * (1.0 + cost.abs())
+/// `½|λ| ≤ τ` predicts nothing the criterion resolves anywhere in the range
+/// that could falsify it. The bridge's definiteness verdict, the seed's
+/// verdict, and the decrement that both the in-loop stop and the certificate's
+/// curvature rung take all read this one number. `0.0` (the arithmetic shift
+/// alone) when the resolution is zero or unusable.
+pub(crate) fn criterion_curvature_resolution(objective_resolution: f64) -> f64 {
+    if objective_resolution.is_finite() && objective_resolution > 0.0 {
+        2.0 * objective_resolution
     } else {
         0.0
     }
@@ -9158,15 +9145,9 @@ pub(crate) fn run_fixed_point_outer_solver(
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
-        // The same resolution floor the gradient routes' cost-stall guard uses,
-        // and its first-order window.
-        progress: FixedPointProgress::new(
-            config
-                .rel_cost_tolerance
-                .unwrap_or(config.tolerance * 1.0e-2)
-                .max(COST_STALL_REL_TOL_FLOOR),
-            COST_STALL_WINDOW,
-        ),
+        // The same criterion resolution the gradient routes' cost-stall guard
+        // uses, and its first-order window.
+        progress: FixedPointProgress::new(outer_criterion_resolution(config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {

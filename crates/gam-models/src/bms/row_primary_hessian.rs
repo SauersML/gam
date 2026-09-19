@@ -550,12 +550,11 @@ impl BernoulliMarginalSlopeFamily {
 
         Ok((a, abs_deriv, false))
     }
-    pub(super) fn build_row_exact_context_with_stats_and_cell_cache(
+    pub(super) fn build_row_exact_context(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
         stats: Option<&BernoulliInterceptSolveStats>,
-        cache_degree9_cells: bool,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         let marginal = self.marginal_link_map(marginal_eta)?;
@@ -580,56 +579,10 @@ impl BernoulliMarginalSlopeFamily {
             };
             (intercept, f64::NAN, false)
         };
-        // Cache degree-9 cell moments at the converged intercept so the
-        // many gradient/diagonal/matvec passes that run *after* this point
-        // for the same (row, β) don't re-evaluate `evaluate_cell_moments` /
-        // `bivariate_normal_cdf` on identical inputs. This matters for the
-        // FLEX path (linkwiggle + score-warp), where each per-row Hessian
-        // build runs the cell-moment kernel once per cell per closure call.
-        let degree9_cells = if cache_degree9_cells
-            && self.effective_flex_active(block_states)?
-            && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
-        {
-            let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
-            // Per-row dedup: within ONE row's denested-partition output, the
-            // score-warp and link-wiggle bases occasionally produce cells
-            // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
-            // moments once and cloning the result into the other slots is
-            // numerically identical to evaluating each cell independently
-            // (`evaluate_cell_moments_lru` is a pure function of the cell), and
-            // skips redundant work. The dedup is purely intra-row, so it is
-            // orthogonal to the per-family LRU (which is keyed across rows)
-            // and the affine tail-cell memo (a separate mechanism).
-            let mut dedup: HashMap<
-                exact_kernel::CellFingerprint,
-                exact_kernel::CellDerivativeMomentState,
-            > = HashMap::new();
-            let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
-            for partition_cell in cells.into_iter() {
-                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                let state: exact_kernel::CellDerivativeMomentState =
-                    if let Some(existing) = dedup.get(&key) {
-                        existing.clone()
-                    } else {
-                        let computed =
-                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                        dedup.insert(key, computed.clone());
-                        computed
-                    };
-                out.push(CachedDenestedCellMoments {
-                    partition_cell,
-                    state,
-                });
-            }
-            Some(out)
-        } else {
-            None
-        };
         Ok(BernoulliMarginalSlopeRowExactContext {
             intercept,
             m_a,
             intercept_fast_path,
-            degree9_cells,
         })
     }
 
@@ -725,17 +678,6 @@ impl BernoulliMarginalSlopeFamily {
         }
         let stats = BernoulliInterceptSolveStats::default();
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        // Suppress per-row `degree9_cells` caching during the parallel context
-        // build: when flex is active *and* the latent measure is StandardNormal
-        // (i.e. exactly when `degree9_cells` would be populated), the top-of-
-        // cycle `build_row_cell_moments_bundle` invocation below also calls
-        // `denested_partition_cells` for every row. Suppressing the per-row
-        // cache here avoids the duplicate partition computation and the
-        // unused degree-9 moment evaluations whenever the bundle succeeds.
-        // When the bundle returns `None` (budget exceeded), the per-row
-        // `degree9_cells` cache is reconstructed below so the row-evaluation
-        // fast path that consults `row_ctx.degree9_cells` still has its
-        // cache. Numerical results are unchanged either way.
         let context_started = std::time::Instant::now();
         let progress_step = (context_row_count / 10).max(1);
         let completed_rows = AtomicUsize::new(0);
@@ -744,12 +686,7 @@ impl BernoulliMarginalSlopeFamily {
                 .par_iter()
                 .copied()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
@@ -769,7 +706,6 @@ impl BernoulliMarginalSlopeFamily {
                     intercept: f64::NAN,
                     m_a: f64::NAN,
                     intercept_fast_path: false,
-                    degree9_cells: None,
                 };
                 n
             ];
@@ -781,12 +717,7 @@ impl BernoulliMarginalSlopeFamily {
             (0..n)
                 .into_par_iter()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
@@ -1022,9 +953,9 @@ impl BernoulliMarginalSlopeFamily {
     /// `max_degree`. Returns `None` when the FLEX path is inactive, when an
     /// empirical latent grid is in effect (the row kernel takes a non-cell
     /// path), or when the estimated resident bytes exceed the active
-    /// resource-policy budget. Numerical equivalence with the legacy per-row
-    /// path is unconditional: callers always fall back to
-    /// `degree9_cells`/on-demand cell evaluation when the bundle is absent.
+    /// resource-policy budget. Numerical equivalence with the per-row path is
+    /// unconditional: callers fall back to on-demand cell evaluation when the
+    /// bundle is absent.
     pub(super) fn build_row_cell_moments_bundle(
         &self,
         block_states: &[ParameterBlockState],
@@ -3188,16 +3119,6 @@ impl BernoulliMarginalSlopeFamily {
                     !cached.is_empty(),
                     "row cell moments bundle was selected but row {row} has no cells"
                 );
-                cached
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state),
-                        )
-                    })
-                    .collect()
-            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
                 cached
                     .iter()
                     .map(|entry| {

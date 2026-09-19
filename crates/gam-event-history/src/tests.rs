@@ -5301,6 +5301,53 @@ fn the_reference_grid_is_the_first_whose_tail_certifies_2986() {
     assert_eq!(read.iter().map(|step| step.value).collect::<Vec<_>>(), steps.to_vec());
 }
 
+/// A grid whose own steps do not contract is charged its step and certified by
+/// the finer grid's tail, not refitted (#2986, seed 4: grid-2 steps 2.40e-4
+/// and 2.45e-4 posterior sd have no tail, and grid 3's certifies grid 2 two
+/// hundred times inside the tolerance). With steps `1/64, 1/64, 1/128` grid
+/// 3's tail is `1/64 + (1/128)/(1/2)`, and grid 2 is certified at `3/64`.
+/// With steps `1/32, 1/32, 1/128` the charge `1/32` takes grid 2 past the
+/// tolerance, and the coarsest grid certified is grid 3, at its own tail.
+#[test]
+fn a_grid_whose_steps_do_not_contract_is_charged_its_step_2986() {
+    use super::family::{Shift, reference_tail, select_reference_grid};
+    let tolerance = 0.05;
+    let select = |steps: [f64; 3]| {
+        let mut asked = Vec::new();
+        let selected = select_reference_grid(2, tolerance, |level| {
+            asked.push(level);
+            steps
+                .get(level - 2)
+                .map(|&value| Shift { value, band: 0.0 })
+                .ok_or_else(|| super::cohort::EventHistoryError::NumericalFailure {
+                    reason: format!("grid {level} was asked past the fixture's steps"),
+                })
+        })
+        .expect("a grid certifies within the fixture's steps");
+        emit(&format!("[2986 charged] steps {steps:?}: chose grid {} at {:e}; asked {asked:?}", selected.0, selected.1));
+        (selected.0, selected.1, asked)
+    };
+    let tail_of = |first: f64, second: f64| {
+        reference_tail(Shift { value: first, band: 0.0 }, Shift { value: second, band: 0.0 })
+            .expect("a resolved first step")
+            .expect("contracting steps")
+    };
+    let flat = [1.0 / 64.0, 1.0 / 64.0, 1.0 / 128.0];
+    assert_eq!(
+        reference_tail(Shift { value: flat[0], band: 0.0 }, Shift { value: flat[1], band: 0.0 }).expect("resolved"),
+        None,
+        "grid 2's own steps do not contract"
+    );
+    let (chosen, certificate, asked) = select(flat);
+    assert_eq!(chosen, 2, "the fitted grid is certified through grid 3's tail, not refitted at grid 3");
+    assert_eq!(certificate, 3.0 / 64.0, "grid 2 is charged its step plus grid 3's tail");
+    assert_eq!(asked, vec![2, 3, 4], "no step past the one after the grid whose tail certifies");
+    let steep = [1.0 / 32.0, 1.0 / 32.0, 1.0 / 128.0];
+    let (chosen, certificate, _) = select(steep);
+    assert_eq!(chosen, 3, "a charge past the tolerance leaves the coarsest certified grid, grid 3");
+    assert_eq!(certificate, tail_of(steep[1], steep[2]), "grid 3 is certified at its own tail");
+}
+
 /// A refinement's coefficient move is `max_q |(V (g′ − g))_q| / sd_q` with its
 /// rounding band `γ_{p+3} max_q Σ_r |V_qr| |g′_r − g_r| / sd_q`, on a 2×2
 /// posterior whose arithmetic is exact (#2986). A gradient that is not finite
