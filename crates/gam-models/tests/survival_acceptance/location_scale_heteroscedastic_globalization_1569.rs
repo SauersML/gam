@@ -10,9 +10,17 @@
 
 use gam_data::encode_recordswith_inferred_schema;
 use gam_linalg::matrix::LinearOperator;
-use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
+use gam_math::probability::standard_normal_quantile;
+use gam_models::fit_orchestration::FitConfig;
+use gam_models::inference::model::FittedModel;
+use gam_models::inference::model_payload_builders::fit_formula_to_payload;
+use gam_models::survival::{
+    SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+    predict_survival,
+};
 use gam_terms::smooth::build_term_collection_design;
 use ndarray::Array2;
+use std::collections::HashMap;
 
 /// Numerical-Recipes 64-bit LCG → deterministic uniforms in [0,1).
 struct Lcg {
@@ -109,16 +117,101 @@ fn fit_heteroscedastic(
         noise_formula: Some(format!("s(x, k={k_scale})")),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        &format!("Surv(entry, exit, event) ~ s(x, k={k_loc})"),
+    let payload = fit_formula_to_payload(
+        format!("Surv(entry, exit, event) ~ s(x, k={k_loc})"),
         &ds,
         &cfg,
     )
     .expect("gam hetero survival location-scale fit");
-    let FitResult::SurvivalLocationScale(fit) = result else {
-        panic!("expected a survival location-scale fit result");
+    let unified = payload
+        .unified
+        .clone()
+        .expect("a survival location-scale payload carries its unified fit");
+    let thresholdspec = payload
+        .resolved_termspec
+        .clone()
+        .expect("a survival location-scale payload carries its location spec");
+    let log_sigmaspec = payload
+        .resolved_termspec_noise
+        .clone()
+        .expect("a survival location-scale payload carries its log-scale spec");
+    let model = FittedModel::from_payload(payload);
+
+    let center = |v: &[f64]| -> Vec<f64> {
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        v.iter().map(|&z| z - m).collect()
     };
-    let unified = &fit.fit.fit;
+    let rmse = |a: &[f64], b: &[f64]| -> f64 {
+        (a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum::<f64>() / a.len() as f64).sqrt()
+    };
+
+    // The standardized index `u = (h(t) − η_t(x))/σ(x)` is invariant under
+    // `(h, η_t, σ) → (c·h + b, c·η_t + b, c·σ)`, so only gauge-invariant
+    // quantities are scored against the log-time truth. The fitted warp is
+    // recovered at every training row from the model's own survival,
+    // `h_i = η_t(x_i) + σ(x_i)·Φ⁻¹(1 − S(t_i | x_i))`, and its least-squares slope
+    // `ā` on `log t_i` converts the location to log-time units: `μ̃ = η_t/ā` and
+    // `log σ̃ = η_σ − log ā`. Centering on the grid removes the additive `b`.
+    let col_map: HashMap<String, usize> = ds
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let zeros = ndarray::Array1::<f64>::zeros(n);
+    let predicted = predict_survival(
+        SurvivalPredictRequest {
+            model: &model,
+            data: ds.values.view(),
+            col_map: &col_map,
+            training_headers: Some(&ds.headers),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: None,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .expect("gam hetero survival location-scale prediction at the training rows");
+    let train_loc = build_term_collection_design(ds.values.view(), &thresholdspec)
+        .unwrap()
+        .design
+        .apply(&unified.beta_threshold())
+        .to_vec();
+    let train_lsig = build_term_collection_design(ds.values.view(), &log_sigmaspec)
+        .unwrap()
+        .design
+        .apply(&unified.beta_log_sigma())
+        .to_vec();
+    let warp: Vec<f64> = (0..n)
+        .map(|row| {
+            let survival = predicted.survival[[row, 0]];
+            let cumulative_hazard = predicted.cumulative_hazard[[row, 0]];
+            // `Φ⁻¹(1 − S) = −Φ⁻¹(S)`; the failure mass `1 − S = −expm1(−H)` keeps
+            // full precision where `S` rounds to one.
+            let standardized = if survival < 0.5 {
+                -standard_normal_quantile(survival).expect("survival in (0, 1)")
+            } else {
+                standard_normal_quantile(-(-cumulative_hazard).exp_m1())
+                    .expect("failure mass in (0, 1)")
+            };
+            train_loc[row] + train_lsig[row].exp() * standardized
+        })
+        .collect();
+    let log_exit: Vec<f64> = exit.iter().map(|t| t.ln()).collect();
+    let log_exit_centered = center(&log_exit);
+    let warp_centered = center(&warp);
+    let warp_slope = warp_centered
+        .iter()
+        .zip(&log_exit_centered)
+        .map(|(h, l)| h * l)
+        .sum::<f64>()
+        / log_exit_centered.iter().map(|l| l * l).sum::<f64>();
+    assert!(
+        warp_slope.is_finite() && warp_slope > 0.0,
+        "the fitted warp must increase with log time: slope {warp_slope}"
+    );
 
     let grid_n = 20usize;
     let (x_lo, x_hi) = (-1.9_f64, 1.9_f64);
@@ -129,29 +222,37 @@ fn fit_heteroscedastic(
     for (i, &t) in grid_x.iter().enumerate() {
         grid[[i, x_idx]] = t;
     }
-    let center = |v: &[f64]| -> Vec<f64> {
-        let m = v.iter().sum::<f64>() / v.len() as f64;
-        v.iter().map(|&z| z - m).collect()
-    };
-    let rmse = |a: &[f64], b: &[f64]| -> f64 {
-        (a.iter().zip(b).map(|(p, q)| (p - q) * (p - q)).sum::<f64>() / a.len() as f64).sqrt()
-    };
 
     let (rmse_loc, rmse_logsig) = if unified.beta_threshold().iter().all(|v| v.is_finite())
         && unified.beta_log_sigma().iter().all(|v| v.is_finite())
     {
-        let loc_design =
-            build_term_collection_design(grid.view(), &fit.fit.resolved_thresholdspec).unwrap();
-        let ls_design =
-            build_term_collection_design(grid.view(), &fit.fit.resolved_log_sigmaspec).unwrap();
-        let gam_loc = center(&loc_design.design.apply(&unified.beta_threshold()).to_vec());
-        let gam_lsig = center(&ls_design.design.apply(&unified.beta_log_sigma()).to_vec());
+        let loc_design = build_term_collection_design(grid.view(), &thresholdspec).unwrap();
+        let ls_design = build_term_collection_design(grid.view(), &log_sigmaspec).unwrap();
+        let gam_loc = center(
+            &loc_design
+                .design
+                .apply(&unified.beta_threshold())
+                .iter()
+                .map(|eta| eta / warp_slope)
+                .collect::<Vec<_>>(),
+        );
+        let gam_lsig = center(
+            &ls_design
+                .design
+                .apply(&unified.beta_log_sigma())
+                .iter()
+                .map(|eta| eta - warp_slope.ln())
+                .collect::<Vec<_>>(),
+        );
         let truth_loc = center(&grid_x.iter().map(|&xi| mu(xi)).collect::<Vec<_>>());
         let truth_lsig = center(&grid_x.iter().map(|&xi| log_sigma(xi)).collect::<Vec<_>>());
         (rmse(&gam_loc, &truth_loc), rmse(&gam_lsig, &truth_lsig))
     } else {
         (f64::NAN, f64::NAN)
     };
+    eprintln!(
+        "#1569 gauge: warp slope on log t ā={warp_slope:.6e}, rmse_loc={rmse_loc:.4}, rmse_logsig={rmse_logsig:.4}"
+    );
 
     HeteroFit {
         outer_iterations: unified.outer_iterations,
@@ -239,7 +340,9 @@ fn heteroscedastic_records(
 /// are the same model on its rows.
 #[test]
 fn a_pre_2695_heteroscedastic_payload_is_refused_and_a_constant_scale_one_loads_2695() {
-    use gam_models::inference::model::{FittedModel, FittedModelPayload, WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION};
+    use gam_models::inference::model::{
+        FittedModel, FittedModelPayload, WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
+    };
     use gam_models::inference::model_payload_builders::fit_formula_to_payload;
     use gam_problem::BlockRole;
 
@@ -253,8 +356,12 @@ fn a_pre_2695_heteroscedastic_payload_is_refused_and_a_constant_scale_one_loads_
             noise_formula: noise_formula.map(str::to_string),
             ..FitConfig::default()
         };
-        fit_formula_to_payload("Surv(entry, exit, event) ~ s(x, k=8)".to_string(), &data, &cfg)
-            .expect("#2695: survival location-scale fit")
+        fit_formula_to_payload(
+            "Surv(entry, exit, event) ~ s(x, k=8)".to_string(),
+            &data,
+            &cfg,
+        )
+        .expect("#2695: survival location-scale fit")
     };
     let block_can_move = |payload: &FittedModelPayload, role: BlockRole| {
         payload
@@ -298,7 +405,11 @@ fn a_pre_2695_heteroscedastic_payload_is_refused_and_a_constant_scale_one_loads_
         .into_iter()
         .flatten()
     {
-        for block in saved.blocks.iter_mut().filter(|block| block.role == BlockRole::Scale) {
+        for block in saved
+            .blocks
+            .iter_mut()
+            .filter(|block| block.role == BlockRole::Scale)
+        {
             block.beta.fill(0.0);
         }
     }
@@ -381,9 +492,12 @@ fn a_saved_model_predicts_the_log_likelihood_it_was_fit_at_2695() {
             noise_formula: Some("s(x, k=8)".to_string()),
             ..FitConfig::default()
         };
-        let payload =
-            fit_formula_to_payload("Surv(entry, exit, event) ~ s(x, k=8)".to_string(), &data, &cfg)
-                .unwrap_or_else(|error| panic!("#2695 {label}: survival location-scale fit: {error}"));
+        let payload = fit_formula_to_payload(
+            "Surv(entry, exit, event) ~ s(x, k=8)".to_string(),
+            &data,
+            &cfg,
+        )
+        .unwrap_or_else(|error| panic!("#2695 {label}: survival location-scale fit: {error}"));
         assert!(
             payload
                 .survival_location_scale_structure

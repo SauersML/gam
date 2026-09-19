@@ -74,7 +74,15 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
-use ndarray::Array2;
+use gam_math::probability::standard_normal_quantile;
+use gam_models::inference::model::FittedModel;
+use gam_models::inference::model_payload_builders::fit_formula_to_payload;
+use gam_models::survival::predict::{
+    SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+    predict_survival,
+};
+use ndarray::{Array1, Array2};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[test]
@@ -155,12 +163,25 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
         noise_formula: Some("s(x, k=4)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(entry, exit, event) ~ s(x, k=6)", &ds, &cfg)
-        .expect("gam survival location-scale fit");
-    let FitResult::SurvivalLocationScale(fit) = result else {
-        panic!("expected a survival location-scale fit result");
-    };
-    let unified = &fit.fit.fit;
+    let payload = fit_formula_to_payload(
+        "Surv(entry, exit, event) ~ s(x, k=6)".to_string(),
+        &ds,
+        &cfg,
+    )
+    .expect("gam survival location-scale fit");
+    let unified = payload
+        .unified
+        .clone()
+        .expect("a survival location-scale payload carries its unified fit");
+    let thresholdspec = payload
+        .resolved_termspec
+        .clone()
+        .expect("a survival location-scale payload carries its location spec");
+    let log_sigmaspec = payload
+        .resolved_termspec_noise
+        .clone()
+        .expect("a survival location-scale payload carries its log-scale spec");
+    let model = FittedModel::from_payload(payload);
     // Fit existence is the sealed convergence proof (SPEC 20).
 
     let beta_location = unified.beta_threshold();
@@ -171,6 +192,30 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
             .chain(beta_log_sigma.iter())
             .all(|v| v.is_finite()),
         "non-finite gam location / log-sigma coefficients"
+    );
+
+    // ---- put gam's channels in log-time units (gauge-invariant scoring) ----
+    // The standardized index `u = (h(t) − η_t(x))/σ(x)` is invariant under
+    // `(h, η_t, σ) → (c·h + b, c·η_t + b, c·σ)`, so a raw `η_t` is in the
+    // units of the learned warp `h`, not of `log t`. The fitted warp is
+    // recovered at every training row from the model's own survival,
+    // `h_i = η_t(x_i) + σ(x_i)·Φ⁻¹(1 − S(t_i | x_i))`, and its least-squares
+    // slope `ā` on `log t_i` converts the channels to log-time units:
+    // `μ̃ = η_t/ā` and `log σ̃ = η_σ − log ā`. Grid centering removes `b`.
+    let warp_slope = fitted_warp_slope_on_log_time(
+        &model,
+        &ds,
+        &exit,
+        &build_term_collection_design(ds.values.view(), &thresholdspec)
+            .expect("rebuild location design at the training rows")
+            .design
+            .apply(&beta_location)
+            .to_vec(),
+        &build_term_collection_design(ds.values.view(), &log_sigmaspec)
+            .expect("rebuild log-sigma design at the training rows")
+            .design
+            .apply(&beta_log_sigma)
+            .to_vec(),
     );
 
     // ---- evaluate gam's location & log-scale smooths on a 20-point grid ----
@@ -188,12 +233,22 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     // Rebuild the SAME frozen location / log-sigma designs at the grid and apply
     // each channel's converged coefficients. eta_t(x) is the AFT location;
     // sigma(x) = exp(eta_ls(x)) is the AFT scale (pure exp_sigma link).
-    let loc_design = build_term_collection_design(grid.view(), &fit.fit.resolved_thresholdspec)
+    let loc_design = build_term_collection_design(grid.view(), &thresholdspec)
         .expect("rebuild location (threshold) design at grid");
-    let ls_design = build_term_collection_design(grid.view(), &fit.fit.resolved_log_sigmaspec)
+    let ls_design = build_term_collection_design(grid.view(), &log_sigmaspec)
         .expect("rebuild log-sigma design at grid");
-    let gam_location: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
-    let gam_log_sigma: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
+    let gam_location: Vec<f64> = loc_design
+        .design
+        .apply(&beta_location)
+        .iter()
+        .map(|eta| eta / warp_slope)
+        .collect();
+    let gam_log_sigma: Vec<f64> = ls_design
+        .design
+        .apply(&beta_log_sigma)
+        .iter()
+        .map(|eta| eta - warp_slope.ln())
+        .collect();
     assert_eq!(gam_location.len(), grid_n);
     assert_eq!(gam_log_sigma.len(), grid_n);
 
@@ -279,6 +334,7 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
 
     eprintln!(
         "survival location-scale truth recovery: n={n} grid={grid_n} \
+         warp slope on log t={warp_slope:.6e} \
          rmse_loc(gam)={gam_err_loc:.4} rmse_loc(gamlss)={ref_err_loc:.4} \
          rmse_logsig(gam)={gam_err_lsig:.4} rmse_logsig(gamlss)={ref_err_lsig:.4} \
          [context rel_l2(loc vs gamlss)={rel_loc_vs_ref:.4} \
@@ -354,6 +410,69 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
         "gam log-scale recovery worse than gamlss baseline: \
          rmse(gam)={gam_err_lsig:.4} > 1.10 * rmse(gamlss)={ref_err_lsig:.4}"
     );
+}
+
+/// Least-squares slope of the fitted time warp on `log t` over the training
+/// rows. Each row's warp value is read off the model's own survival at its
+/// exit, `h_i = η_t(x_i) + σ(x_i)·Φ⁻¹(1 − S(t_i | x_i))`, with the failure mass
+/// `1 − S = −expm1(−H)` keeping full precision where `S` rounds to one.
+fn fitted_warp_slope_on_log_time(
+    model: &FittedModel,
+    ds: &gam_data::EncodedDataset,
+    exit: &[f64],
+    train_location: &[f64],
+    train_log_sigma: &[f64],
+) -> f64 {
+    let n = exit.len();
+    let col_map: HashMap<String, usize> = ds
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    let zeros = Array1::<f64>::zeros(n);
+    let predicted = predict_survival(
+        SurvivalPredictRequest {
+            model,
+            data: ds.values.view(),
+            col_map: &col_map,
+            training_headers: Some(&ds.headers),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: None,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .expect("gam survival location-scale prediction at the training rows");
+    let warp: Vec<f64> = (0..n)
+        .map(|row| {
+            let survival = predicted.survival[[row, 0]];
+            let cumulative_hazard = predicted.cumulative_hazard[[row, 0]];
+            let standardized = if survival < 0.5 {
+                -standard_normal_quantile(survival).expect("survival in (0, 1)")
+            } else {
+                standard_normal_quantile(-(-cumulative_hazard).exp_m1())
+                    .expect("failure mass in (0, 1)")
+            };
+            train_location[row] + train_log_sigma[row].exp() * standardized
+        })
+        .collect();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let log_exit: Vec<f64> = exit.iter().map(|t| t.ln()).collect();
+    let (warp_mean, log_mean) = (mean(&warp), mean(&log_exit));
+    let slope = warp
+        .iter()
+        .zip(&log_exit)
+        .map(|(h, l)| (h - warp_mean) * (l - log_mean))
+        .sum::<f64>()
+        / log_exit.iter().map(|l| (l - log_mean).powi(2)).sum::<f64>();
+    assert!(
+        slope.is_finite() && slope > 0.0,
+        "the fitted warp must increase with log time: slope {slope}"
+    );
+    slope
 }
 
 /// Harrell's concordance index (C-index) for a *higher-is-longer-survival*
