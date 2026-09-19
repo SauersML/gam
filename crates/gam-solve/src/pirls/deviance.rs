@@ -2390,6 +2390,7 @@ pub(crate) fn unit_measure_deviance_and_log_kernel_from_eta(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_row,
         )?;
         Ok((deviance_row.half_deviance, log_likelihood))
