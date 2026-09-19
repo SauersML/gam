@@ -13,7 +13,7 @@ use super::{
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
-    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs,
+    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs, log_level_for_verbosity,
     run_fit, run_predict, run_sample, write_model_json,
 };
 use crate::config_resolve::{
@@ -1158,25 +1158,21 @@ fn cli_predict_has_no_point_estimand_switch_2670() {
 }
 
 #[test]
-fn cli_log_level_is_typed_and_rejects_unknown_values_2670() {
-    let parsed = Cli::try_parse_from(["gam", "--log-level", "debug", "report", "model.json"])
-        .expect("a canonical log level must parse");
-    assert_eq!(parsed.log_level, Some(log::LevelFilter::Debug));
-
-    let error = Cli::try_parse_from([
-        "gam",
-        "--log-level",
-        "verbose",
-        "report",
-        "model.json",
-    ])
-    .expect_err("an unknown log level must be rejected rather than guessed as info");
-    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("accepted values: off, error, warn, info, debug, trace"),
-        "the parser error must enumerate the canonical levels: {rendered}"
-    );
+fn cli_verbose_flag_counts_up_from_silent_diagnostics() {
+    // Library diagnostics are debug/trace records: the unflagged CLI shows none,
+    // `-v` shows the debug trace and `-vv` adds trace records.
+    for (argv, expected) in [
+        (vec!["gam", "report", "model.json"], log::LevelFilter::Warn),
+        (vec!["gam", "-v", "report", "model.json"], log::LevelFilter::Debug),
+        (vec!["gam", "report", "model.json", "--verbose"], log::LevelFilter::Debug),
+        (vec!["gam", "-vv", "report", "model.json"], log::LevelFilter::Trace),
+    ] {
+        let parsed = Cli::try_parse_from(argv.iter().copied()).expect("verbosity flags must parse");
+        assert_eq!(log_level_for_verbosity(parsed.verbose), expected, "{argv:?}");
+    }
+    let error = Cli::try_parse_from(["gam", "--log-level", "debug", "report", "model.json"])
+        .expect_err("the retired --log-level flag must not parse");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
 #[test]

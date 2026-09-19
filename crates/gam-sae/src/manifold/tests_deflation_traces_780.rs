@@ -36,7 +36,7 @@ pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     // and NO gam-sae test installs a logger, so without this line the diagnostic
     // is present and silent. Install it at `Debug` so the number reaches the
     // failure output.
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Trace);
     // The ARD log-precision stays at the fixture default; lifting it off the floor
     // pushes the inner solve into a non-PD basin. The ARD curvature block is small
     // but live, and its log-α derivative is exactly what the trace and the FD

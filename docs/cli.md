@@ -23,8 +23,10 @@ gam --help
 | `gam crosscoder --anchor L=F --block L=F --atoms N --harmonics N --out REPORT.json` | Fit a row-aligned manifold crosscoder across activation matrices and write a GAM-SAE report. |
 | `gam transformation-score MODEL DATA [--out scores.csv]` | Evaluate a fitted conditional transformation model at observed responses. |
 
-Every subcommand also accepts `--log-level off|error|warn|info|debug|trace`
-(default `warn`).
+Every subcommand also accepts `-v/--verbose`: `-v` shows the solver's
+diagnostic trace (`[OUTER …]`, `[PIRLS …]`, …) on stderr, `-vv` adds the finer
+trace-level records. Without it a run writes only its results, its fit
+advisories and its errors.
 
 ## Fit
 

@@ -371,7 +371,7 @@ impl PenaltySubspaceTrace {
         // NumPy/LAPACK convention and exactly what Codex flagged as
         // necessary in the math review.
         let (evals, evecs) = m.eigh(faer::Side::Lower).unwrap_or_else(|err| {
-            log::debug!(
+            log::trace!(
                 "penalty coordinate: {k_active}x{k_active} eigendecomposition failed ({err}); \
                      falling back to a zero spectrum in the identity basis"
             );
@@ -395,7 +395,7 @@ impl PenaltySubspaceTrace {
             }
         }
         if dropped > 0 {
-            log::debug!(
+            log::trace!(
                 "[constrained-subspace kernel] dropped {} of {} active-constraint directions \
                  (rank-deficient on range(S₊)); pseudo-inverse threshold = {:.3e}",
                 dropped,
@@ -610,7 +610,7 @@ impl<'s> ThetaModeResponseKernel<'s> {
                 .map(|(a, x)| (a * x).abs())
                 .sum();
             if r.abs() > THETA_MODE_RESPONSE_TANGENCY_GATE * (scale + f64::EPSILON) {
-                log::warn!(
+                log::debug!(
                     "[CERTIFICATE warning] atom \"theta_mode_response\": constrained IFT \
                      mode response left ker(A_act) — active row {row} residual {:.3e} \
                      exceeds gate {:.1e}·{:.3e}; the lifted kernel K_T and its emission \
@@ -654,7 +654,7 @@ impl InvertedSpan {
             }),
             Ok(_) => None,
             Err(err) => {
-                log::warn!(
+                log::debug!(
                     "[inner-mode fold] the mode-response operator's dense form does not decompose \
                      ({err}); this mode is not graded for a fold"
                 );
@@ -673,7 +673,7 @@ impl InvertedSpan {
             }),
             Ok(_) => None,
             Err(err) => {
-                log::warn!(
+                log::debug!(
                     "[inner-mode fold] the reduced kernel does not decompose ({err}); this mode is \
                      not graded for a fold"
                 );

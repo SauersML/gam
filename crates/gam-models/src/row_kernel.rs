@@ -785,7 +785,7 @@ pub fn build_row_kernel_cache<const K: usize>(
                         let mut chunk = Vec::with_capacity(end - start);
                         let mut block_progress = progress_ticker.as_ref().map(|ticker| {
                             ticker.chunk(|progress, elapsed| {
-                                log::info!(
+                                log::debug!(
                                     "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
                                     progress.min(n),
                                     n,
@@ -830,7 +830,7 @@ pub fn build_row_kernel_cache<const K: usize>(
                     let mut chunk = Vec::with_capacity(row_chunk.len());
                     let mut block_progress = progress_ticker.as_ref().map(|ticker| {
                         ticker.chunk(|progress, elapsed| {
-                            log::info!(
+                            log::debug!(
                                 "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
                                 progress.min(total),
                                 total,

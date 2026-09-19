@@ -566,7 +566,7 @@ impl PenaltyMapInvariance {
         // was decided against. Without this line a redundancy warning and a
         // `structural_zero = 0` classification sit in the same log with nothing
         // connecting them, which is exactly the state #2748 was found in.
-        log::debug!(
+        log::trace!(
             "[PENALTY-INVARIANCE] k={k} rank={rank} certified_nullity={} \
              defect_floor={operator_error:.6e} pivot_defects={:?} gram_diagonal={:?} \
              (a column is certified dependent when its residual defect sqrt(d_j) — the norm of \

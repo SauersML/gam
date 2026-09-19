@@ -1633,7 +1633,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                                     operator.raw_spectrum().iter().copied().fold(f64::INFINITY, f64::min),
                                 ),
                                 Err(error) => {
-                                    log::info!("[979-FACE-LOGDET] spectrum unavailable: {error}");
+                                    log::debug!("[979-FACE-LOGDET] spectrum unavailable: {error}");
                                     None
                                 }
                             }
@@ -1645,7 +1645,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                                     smallest_eigenvalue(&z.t().dot(&matrix).dot(&z)),
                                 ),
                                 Err(error) => {
-                                    log::info!(
+                                    log::debug!(
                                         "[979-FACE-LOGDET] log-determinant operator has no dense \
                                          assembly: {error}"
                                     );
@@ -1654,7 +1654,7 @@ pub(crate) fn try_tangent_projected_evaluate(
                             };
                         let true_min = smallest_eigenvalue(&response_full);
                         let true_tangent_min = smallest_eigenvalue(&z.t().dot(&response_full).dot(&z));
-                        log::info!(
+                        log::debug!(
                             "[979-FACE-LOGDET] kept_rank={rank}/{} tangent_dim={} \
                              sigma_min_kept={:.6e} normal_fraction={:.3e} \
                              value_min={value_min:?} value_tangent_min={value_tangent_min:?} \

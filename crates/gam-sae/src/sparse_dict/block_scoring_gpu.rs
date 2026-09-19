@@ -798,7 +798,7 @@ mod device {
         // terminal synchronize, as a single unattributed block with no telemetry
         // for the whole high-`G` route. Synchronise on a cadence derived from the
         // tile count so the async backlog is bounded and each fault is attributed
-        // to its tile window; the heartbeat is `log::debug!` so an ordinary
+        // to its tile window; the heartbeat is `log::trace!` so an ordinary
         // (info-level) per-minibatch run is not flooded.
         let tile_count = n_blocks.div_ceil(tile_blocks.max(1));
         let checkpoint_stride = tile_count
@@ -902,7 +902,7 @@ mod device {
                         "sparse_dict block-gate route progress checkpoint (tiles {checkpoint_lo}..{tiles_done} of {tile_count}, blocks 0..{g0} of {n_blocks}): {err}"
                     )
                 })?;
-                log::debug!(
+                log::trace!(
                     "[SAE block route] tiles {tiles_done}/{tile_count} blocks {g0}/{n_blocks} \
                      elapsed {:.2}s",
                     route_started.elapsed().as_secs_f64(),

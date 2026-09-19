@@ -797,7 +797,7 @@ fn audit_identifiability_impl(
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
     }
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability audit: per-block QR complete blocks={} elapsed={:.3}s",
         specs.len(),
         block_phase_started.elapsed().as_secs_f64(),
@@ -835,7 +835,7 @@ fn audit_identifiability_impl(
                 )
             })
             .collect();
-        log::info!(
+        log::debug!(
             "[STAGE] identifiability audit: block layout p_total={} | {}",
             p_total,
             layout.join(" | "),
@@ -873,7 +873,7 @@ fn audit_identifiability_impl(
                 .try_to_dense_arc("identifiability::audit stacked_design rank geometry")
                 .map(|arc| std::borrow::Cow::Owned(arc.as_ref().clone()))
                 .unwrap_or_else(|error| {
-                    log::debug!(
+                    log::trace!(
                         "identifiability audit: block {idx} stacked design would not \
                          densify ({error}); using the plain block's rank geometry"
                     );
@@ -1042,7 +1042,7 @@ fn audit_identifiability_impl(
         .iter()
         .map(|s| format!("{}={}", s.name, s.gauge_priority))
         .collect();
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability audit: joint priority-tiered RRQR start n={} p_total={} \
          blocks=[{}]",
         n,
@@ -1070,7 +1070,7 @@ fn audit_identifiability_impl(
             alpha,
         );
     }
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability audit: joint priority-tiered RRQR end rank={}/{} elapsed={:.3}s",
         tiered.rank,
         p_total,
@@ -1105,7 +1105,7 @@ fn audit_identifiability_impl(
     // doc-comments on `compute_leverage_s2`, `pair_report_threshold`,
     // and `pair_halt_threshold` for the underlying finite-sample identity.
     let pairwise_started = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability audit: pairwise overlap scan start n={} p_total={} blocks={}",
         n,
         p_total,
@@ -1229,13 +1229,13 @@ fn audit_identifiability_impl(
                 }
             }
             pairwise_block_progress_ticker.tick(1, |done, secs| {
-                log::info!(
+                log::debug!(
                     "[STAGE] identifiability audit: pairwise overlap progress {done}/{n_block_pairs} block pairs in {secs:.1}s",
                 );
             });
         }
     }
-    log::info!(
+    log::debug!(
         "[STAGE] identifiability audit: pairwise overlap scan done in {:.3}s ({} aliased pairs)",
         pairwise_started.elapsed().as_secs_f64(),
         aliased_pairs.len(),
@@ -3111,7 +3111,7 @@ pub fn audit_verdict_drift(
         } else {
             recovered.join(", ")
         };
-        log::info!(
+        log::debug!(
             "[AUDIT-DRIFT] pilot_rank={} current_rank={} pilot_fatal={} current_fatal={} \
              beta_relative_change={:.4} outer_iter={} \
              newly_dropped=[{}] recovered=[{}]",
@@ -3154,7 +3154,7 @@ pub fn audit_verdict_drift(
                         gam_linalg::decision::RankTransport::Transported { .. }
                     );
                     if !transported {
-                        log::info!(
+                        log::debug!(
                             "[AUDIT-TRANSPORT] pilot rank certificate VOID at the current \
                              operating point: excursion lower bound {excursion:.3e} exceeds the \
                              pilot transport radius {radius:.3e} (outer_iter={outer_iter}); the \
@@ -3475,7 +3475,7 @@ pub fn check_map_uniqueness(
         Err(e) => {
             // Eigendecomposition failure: skip the check rather than
             // producing a spurious failure — log and return Ok.
-            log::warn!(
+            log::debug!(
                 "[MAP-UNIQUE] check_map_uniqueness: eigendecomposition of J^T W J failed \
                  ({e:?}); skipping MAP uniqueness check",
             );

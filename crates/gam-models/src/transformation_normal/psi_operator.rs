@@ -1421,7 +1421,7 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
                 Arc::clone(&entry.row_h_prime),
             ),
         );
-        log::info!(
+        log::debug!(
             "[STAGE] CTN psi-psi workspace pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
             psi_j,

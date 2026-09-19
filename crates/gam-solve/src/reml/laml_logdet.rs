@@ -167,7 +167,7 @@ pub(crate) fn root_scale_hessian_operator(
     ) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] declined: {reason}");
+            log::trace!("[2644-logdet] declined: {reason}");
             None
         }
     }
@@ -199,7 +199,7 @@ pub(crate) fn root_scale_hessian_operator_for_refused_assembly(
     match root_scale_hessian_operator_inner(inputs, h_assembled, None, mode) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] refused assembly stands: {reason}");
+            log::trace!("[2644-logdet] refused assembly stands: {reason}");
             None
         }
     }
@@ -403,13 +403,13 @@ fn root_scale_hessian_operator_inner(
                 (logdet - assembled_logdet).abs(),
             ));
         }
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed: {logdet:.12e} (assembled {assembled_logdet:.12e}, \
              correction {:.3e}, assembled error bound {bound:.3e})",
             logdet - assembled_logdet,
         );
     } else {
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed over a refused assembly: {logdet:.12e} (root rounding band \
              {root_band:.3e})"
         );

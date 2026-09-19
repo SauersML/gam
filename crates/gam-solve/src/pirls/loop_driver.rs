@@ -211,7 +211,7 @@ pub(super) fn default_beta_guess_external(
                         standard_normal_quantile(prevalence).unwrap_or_else(|err| {
                             // `prevalence` lies inside (0, 1); this fallback is
                             // only for defensive robustness under non-finite upstream inputs.
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS init] probit intercept seed: Φ⁻¹({prevalence:.6}) \
                                  failed ({err}); using the logit transform instead"
                             );
@@ -229,7 +229,7 @@ pub(super) fn default_beta_guess_external(
                     )
                     .unwrap_or_else(|| {
                         standard_normal_quantile(prevalence).unwrap_or_else(|err| {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS init] intercept seed: Φ⁻¹({prevalence:.6}) failed \
                                  ({err}); using the logit transform instead"
                             );
@@ -244,7 +244,7 @@ pub(super) fn default_beta_guess_external(
                     )
                     .unwrap_or_else(|| {
                         standard_normal_quantile(prevalence).unwrap_or_else(|err| {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS init] intercept seed: Φ⁻¹({prevalence:.6}) failed \
                                  ({err}); using the logit transform instead"
                             );
@@ -1511,7 +1511,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
-        log::debug!(
+        log::trace!(
             "[PIRLS] iter {:>3} | deviance {:.6e} | |grad| {:.3e} | step {:.3e} (halving {})",
             info.iteration,
             info.deviance,
