@@ -69,6 +69,7 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
         ],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
     let groups = vec![
         CoefficientGroupSpec {
@@ -126,6 +127,7 @@ fn joint_design_build_freeze_keeps_spec_order_stable() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
     let s2 = TermCollectionSpec {
         linear_terms: vec![LinearTermSpec {
@@ -141,6 +143,7 @@ fn joint_design_build_freeze_keeps_spec_order_stable() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
 
     let designs = build_term_collection_designs_joint(data.view(), &[s1.clone(), s2.clone()])

@@ -440,10 +440,12 @@ class Model:
             # the 1-D response-scale prediction vector, not the engine's
             # full estimand-explicit column matrix. The FFI returns the lone
             # response-scale `posterior_mean` column as `(n, 1)`; drop the
-            # trailing axis.
+            # trailing axis. A joint expectile fit's point is its `(n, K)`
+            # level curves, returned as is.
             import numpy as np
 
-            return np.asarray(result).reshape(-1)
+            result = np.asarray(result)
+            return result.reshape(-1) if result.shape[1] == 1 else result
         return result
 
     def summary(self) -> Summary:
@@ -583,9 +585,17 @@ class Model:
         null refit converged, else ``"none"`` (the uncorrected reference stands,
         never weakened).
 
+        A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
+        :math:`f = 0` is the apex of the constraint cone and the fitted
+        coefficients are a truncated posterior mean, so no :math:`\\chi^2`,
+        spectral or chi-bar-square reference is calibrated. Such a term appears
+        as a row with only ``name``, ``term_idx``, ``p_value_unavailable``
+        (``"shape_constrained"``) and ``explanation``; every tested row carries
+        no ``p_value_unavailable`` key.
+
         Needs the training ``data`` for the per-term null refits, exactly as
-        :meth:`curvature` does. Returns an empty list when the model has no
-        penalized smooth term.
+        :meth:`curvature` does. Rows are in term order. Returns an empty list
+        when the model has no penalized smooth term.
         """
         headers, rows, _ = normalize_table(data)
         try:
@@ -595,7 +605,8 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         payload = json.loads(raw)
-        return list(payload.get("smooth_terms", []))
+        terms = list(payload["smooth_terms"]) + list(payload["unavailable"])
+        return sorted(terms, key=lambda row: row["term_idx"])
 
     def basis_check(self, data: Any) -> list[dict[str, Any]]:
         r"""Per-smooth basis-adequacy report: is each smooth's basis big enough (#2774)?
@@ -1334,11 +1345,16 @@ class Model:
         return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
+        summary = self.summary()
         parts = [
             f"formula={self.formula!r}",
-            f"family_name={self.family_name!r}",
+            f"family_name={summary.family_name!r}",
             f"training_table_kind={self._training_table_kind!r}",
         ]
+        # The objective's name is rendered in Rust (`SummaryEstimator`), so the
+        # repr, `print(model)` and `gam summary` print the same words.
+        if summary.convergence is not None:
+            parts.append(f"estimator={summary.convergence['estimator']['text']!r}")
         return f"Model({', '.join(parts)})"
 
     def __str__(self) -> str:

@@ -21,6 +21,20 @@
   smooth-term LR driver drops `SmoothLrReferenceDf::statistic_resolution` and its
   tolerance floor and ceiling. `p_value_bound` is now the inversion's own bound.
 
+- **Several expectile levels fit jointly and never cross** (pyGAM audit F5b). A list of
+  levels (`expectile_tau=[0.1, 0.5, 0.9]` in Python, `--expectile-tau 0.1,0.5,0.9` on the
+  CLI, a list `expectile_tau` in a fit request document) could not be requested, and
+  levels fitted one at a time can cross, most visibly where the spread is small or past
+  the data. A multi-level request now fits ONE Gaussian location-scale GAM `(μ, σ)`, with
+  REML/LAML smoothing on both surfaces, and reports the level-`τ` curve as
+  `μ(x) + c_τ·E[σ(x)]`, where `c_τ` is the closed-form weighted `τ`-expectile of the
+  standardized residuals. `c_τ` increases strictly with `τ` and `σ > 0`, so the curves are
+  ordered at every `x`, including under extrapolation; nothing is sorted afterwards.
+  Python `predict` returns an `(n, K)` array (one column per level), and the CLI and the
+  prediction table add one `expectile_{τ}` column per level. A single level, as a scalar
+  or a one-element list, is still the single-level LAWS fit. Saved joint models refuse
+  estimator metadata whose levels or standardized expectiles are not strictly increasing.
+  They do not sample (no observation law is claimed) and do not take conformal intervals.
 - **Model comparison ranks on the smoothing-corrected AIC, in one Rust function** (pyGAM
   audit d11). `gamfit.compare_models`, `Model.evidence_ratio_vs` and the new `gam compare`
   used to rank on an uncorrected `−2·loglik + 2·edf` that the Python FFI assembled from
@@ -46,7 +60,6 @@
   `criterion = "aic_corrected"`; `criterion_gap` is now `log_evidence_ratio`. The pyffi
   bindings `model_conditional_aic` and `compare_reml_fits` and the helper
   `ranking_score_from_summary_payload` are deleted.
-
 - **Fitted models pickle, copy and cross process boundaries** (pyGAM audit api F1 / PKG-02).
   `pickle.dumps`, `copy.deepcopy`, `joblib.dump` and `joblib.Parallel` refused a fitted
   `Model`, `MultinomialModel` or sklearn `GAMRegressor`/`GAMClassifier` with

@@ -412,6 +412,7 @@ fn clean_fit_invariance_survival_lognormal() {
         let variant_dbg = match &result {
             FitResult::Standard(_) => "Standard",
             FitResult::GaussianLocationScale(_) => "GaussianLocationScale",
+            FitResult::ExpectileLocationScale(_) => "ExpectileLocationScale",
             FitResult::BinomialLocationScale(_) => "BinomialLocationScale",
             FitResult::DispersionLocationScale(_) => "DispersionLocationScale",
             FitResult::SurvivalLocationScale(_) => "SurvivalLocationScale",
