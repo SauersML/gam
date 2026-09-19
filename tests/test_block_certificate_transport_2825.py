@@ -24,7 +24,7 @@ def _float32_resolution(values):
 
 def test_stream_certificate_reaches_the_artifact_and_its_routed_sample_2825():
     rows = _rows()
-    stream = gamfit.BlockSparseDictStream(
+    stream = gamfit.sae.BlockSparseDictStream(
         rows, 1, block_size=2, block_topk=1, max_epochs=16,
         minibatch=2, block_tile=1, aux_k=0, tolerance=1e-10)
     terminal = None
@@ -38,7 +38,7 @@ def test_stream_certificate_reaches_the_artifact_and_its_routed_sample_2825():
     payload = dict(stream._handle.finalize())
     artifact = stream.finalize()
     assert asdict(artifact.convergence) == dict(payload["convergence"])
-    assert isinstance(artifact.convergence, gamfit.BlockSparseStreamConvergence)
+    assert isinstance(artifact.convergence, gamfit.sae.BlockSparseStreamConvergence)
     assert artifact.convergence.corpus_rows == rows.shape[0]
     assert artifact.convergence.epoch == terminal["epoch"]
     assert artifact.convergence.gamma_residual == terminal["gamma_residual"]
@@ -72,7 +72,7 @@ def test_batch_certificate_retains_every_native_channel_2825():
         tolerance=1e-10))
     batch = _block_sparse_fit_from_payload(payload)
     assert asdict(batch.convergence) == dict(payload["convergence"])
-    assert isinstance(batch.convergence, gamfit.BlockSparseDictionaryConvergence)
+    assert isinstance(batch.convergence, gamfit.sae.BlockSparseDictionaryConvergence)
     assert batch.convergence.accepted_births == batch.convergence.polar_failures == 0
     error = float(np.max(np.abs(batch.fitted - rows)))
     assert error <= _float32_resolution(rows), error

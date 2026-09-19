@@ -4507,7 +4507,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // the classes here makes them addressable as `gam._rust.GamError`,
     // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
     // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
+    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)`
     // and constructed by `RemlConvergenceError::new_err(...)` on the
     // Rust side is exactly the same object.
     module.add("GamError", module.py().get_type::<GamError>())?;
@@ -4749,7 +4749,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyEncodedTable>()?;
     module.add_function(wrap_pyfunction!(sae_observe_atlas_topology, module)?)?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(
         predict_multinomial_formula_pyfunc,
         module
@@ -4816,6 +4815,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_predict_class_name, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
@@ -4903,8 +4903,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sphere_basis_jet_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_hessian, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
-    module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_basis_locations_1d, module)?)?;
     module.add_function(wrap_pyfunction!(_block_diag, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
@@ -5116,7 +5115,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
-    module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
@@ -7187,6 +7185,21 @@ fn predict_array_impl(
     // `posterior_mean` (#2785); the remaining classes retain their
     // class-specific point column. `PredictModelClass::point_column` owns
     // that choice, together with `predict_columns` below.
+    if let Some(curve_columns) = model.expectile_curve_columns() {
+        // A joint expectile fit's point is one curve per level: `(n, K)` in
+        // increasing level order, with or without an interval request.
+        let n = columns
+            .get(model_class.point_column())
+            .map_or(0, Vec::len);
+        let mut out = Array2::<f64>::zeros((n, curve_columns.len()));
+        for (k, name) in curve_columns.iter().enumerate() {
+            let curve = columns
+                .get(name)
+                .ok_or_else(|| format!("predict_array: expectile curve `{name}` missing"))?;
+            out.column_mut(k).assign(&ndarray::ArrayView1::from(curve.as_slice()));
+        }
+        return Ok(out);
+    }
     if options.interval.is_none() {
         let point_column = model_class.point_column();
         let mean = columns
@@ -7212,7 +7225,8 @@ fn predict_dataset_with_options_impl(
         columns,
         model_class: prediction_model_class_label(model),
         point_column: model_class.point_column(),
-        point_shape: model_class.point_shape(),
+        point_shape: model.prediction_point_shape(),
+        point_columns: model.expectile_curve_columns(),
         family: family_link_kind(&model_likelihood_spec(model)).to_string(),
         // The plain dataset predict path returns the model-based credible /
         // predictive band (or no interval at all); a conformal provenance tag
@@ -7529,6 +7543,15 @@ fn predict_columns(
     {
         columns.insert("noise_scale".to_string(), noise_scale.to_vec());
     }
+    // A joint expectile fit publishes its level curves `E[μ] + c_k·E[σ]`.
+    if let Some(curves) =
+        gam_predict::joint_expectile_curves(model, &*predictor, &predict_input, &posterior_mean)
+            .map_err(|err| format!("expectile curve prediction failed: {err}"))?
+    {
+        for (name, curve) in curves {
+            columns.insert(name, curve.to_vec());
+        }
+    }
 
     Ok((columns, provenance))
 }
@@ -7579,6 +7602,7 @@ fn predict_encoded_table_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(
             "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
@@ -7613,6 +7637,7 @@ fn predict_encoded_table_full_conformal_impl(
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
+        point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
             "full-conformal at frozen smoothing parameters (exact set given Sλ; the \

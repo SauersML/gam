@@ -25,7 +25,7 @@ def main() -> None:
         data,
         "y ~ s(t, type='duchon', centers=32)",
         latents={
-            "t": gamfit.LatentCoord(
+            "t": gamfit.smooth.LatentCoord(
                 n=len(data),
                 d=2,
                 init="pca",

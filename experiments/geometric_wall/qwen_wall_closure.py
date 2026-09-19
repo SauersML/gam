@@ -224,7 +224,7 @@ def main() -> None:
     }
     payload = {
         "experiment": "qwen_wall_closure_real_block_chart_post_pos0_peel",
-        "engine": "gamfit.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
+        "engine": "gamfit.sae.block_sparse_dictionary_fit + BlockSparseDictionaryFit.compose_block_charts",
         "nuisance_peel": "OLS nuisance atlas design [intercept, position0_indicator]",
         "settings": settings,
         "layers": layers,

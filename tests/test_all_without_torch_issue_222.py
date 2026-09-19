@@ -1,14 +1,12 @@
-"""RED tests for issue #222: torch-only names in __all__ break hasattr / star-import
-without torch installed.
+"""Issue #222: torch-only names break hasattr / star-import without torch.
 
 These tests simulate a torch-less environment by shimming ``sys.modules['torch']``
 to ``None`` so any ``import torch`` raises ``ModuleNotFoundError``. In that state,
-``hasattr(gamfit, name)`` must return True/False and never propagate the import
+``hasattr(gamfit, "torch")`` must return a bool and never propagate the import
 error, and ``from gamfit import *`` must succeed.
 
-Currently FAILING: ``gamfit.__getattr__`` lazily imports torch for names like
-``PoincareAtoms``, ``InterchangeSwapDecoder``, and ``Crosscoder``,
-all of which appear in ``gamfit.__all__``.
+The torch integration lives only in the ``gamfit.torch`` submodule, which
+``gamfit.__getattr__`` imports lazily; submodules are not part of ``__all__``.
 """
 
 from __future__ import annotations
@@ -18,13 +16,6 @@ import sys
 import pytest
 
 import gamfit
-
-
-TORCH_LAZY_NAMES = [
-    "PoincareAtoms",
-    "InterchangeSwapDecoder",
-    "Crosscoder",
-]
 
 
 @pytest.fixture
@@ -41,18 +32,26 @@ def no_torch(monkeypatch):
     yield
 
 
-@pytest.mark.parametrize("name", TORCH_LAZY_NAMES)
-def test_hasattr_returns_bool_without_torch(no_torch, name):
+def test_hasattr_torch_submodule_returns_bool_without_torch(no_torch, monkeypatch):
     """hasattr must not propagate ModuleNotFoundError from the lazy torch import."""
+    # An earlier test may have bound the submodule on the package already.
+    monkeypatch.delattr(gamfit, "torch", raising=False)
     try:
-        result = hasattr(gamfit, name)
+        result = hasattr(gamfit, "torch")
     except ModuleNotFoundError as exc:
         pytest.fail(
-            f"hasattr(gamfit, {name!r}) raised ModuleNotFoundError instead of "
+            f"hasattr(gamfit, 'torch') raised ModuleNotFoundError instead of "
             f"returning a bool: {exc}. __getattr__ must convert the missing "
             f"optional torch dep into AttributeError."
         )
-    assert isinstance(result, bool)
+    assert result is False
+
+
+def test_torch_submodule_names_the_missing_dependency(no_torch, monkeypatch):
+    monkeypatch.delattr(gamfit, "torch", raising=False)
+    with pytest.raises(AttributeError, match="optional dependency 'torch'") as info:
+        gamfit.torch  # noqa: B018
+    assert isinstance(info.value.__cause__, ModuleNotFoundError)
 
 
 def test_star_import_without_torch_does_not_raise(no_torch):

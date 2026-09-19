@@ -11,7 +11,7 @@ held-out split, measuring HELD-OUT reconstruction explained variance (EV):
 
   A) gam manifold-SAE (curved circle + degree-2 quadratic "euclidean" patch —
      NOT a linear atom, #1201), K small, via the
-     production engine `gamfit.sae_manifold_fit` + `ManifoldSAE.reconstruct`.
+     production engine `gamfit.sae.sae_manifold_fit` + `ManifoldSAE.reconstruct`.
      This is the matched-K, same-solver, geometry-only-differs comparison.
 
   B) a REAL overcomplete linear SGD SAE (`tests/sae/torch_sgd_sae.py`), trained
@@ -70,7 +70,7 @@ def _ev(target: np.ndarray, fitted: np.ndarray) -> float:
 
 
 def _manifold_ev(z_tr, z_te, k, topology, seed, n_iter):
-    from gamfit import sae_manifold_fit
+    from gamfit.sae import sae_manifold_fit
 
     t0 = time.perf_counter()
     m = sae_manifold_fit(

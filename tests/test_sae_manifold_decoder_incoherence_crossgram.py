@@ -31,7 +31,7 @@ def _fit(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            fit = gamfit.sae_manifold_fit(
+            fit = gamfit.sae.sae_manifold_fit(
                 X=z,
                 K=2,
                 d_atom=2,

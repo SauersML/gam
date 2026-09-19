@@ -8,6 +8,7 @@ mod mega_batch_j;
 mod mega_batch_k;
 mod quality_expectile_band_coverage_heteroscedastic;
 mod quality_expectile_gam_heteroscedastic_truth;
+mod quality_expectile_joint_noncrossing;
 mod quality_llm_weekday_circle;
 mod quality_re_random_slope_partial_pools_to_population;
 mod quality_ti_anova_scattered_recovers_truth;

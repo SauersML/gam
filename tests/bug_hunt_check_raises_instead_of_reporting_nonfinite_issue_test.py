@@ -115,7 +115,7 @@ def test_documented_safe_predict_guard_raises_valueerror_not_gamerror() -> None:
     with pytest.raises(ValueError) as caught:
         safe_predict(model, _holed(np.nan))
 
-    assert not isinstance(caught.value, gamfit.GamError), (
+    assert not isinstance(caught.value, gamfit.errors.GamError), (
         "the engine error escaped from inside check(), so the guard never ran: "
         f"{type(caught.value).__name__}: {caught.value}"
     )
@@ -125,7 +125,7 @@ def test_predict_still_rejects_a_nonfinite_modeled_covariate() -> None:
     """Only ``check`` is non-raising; prediction must never consume the hole."""
     model = _fitted()
 
-    with pytest.raises(gamfit.GamError, match="non-finite.*column 'x'"):
+    with pytest.raises(gamfit.errors.GamError, match="non-finite.*column 'x'"):
         model.predict(_holed(np.nan))
 
 
@@ -142,5 +142,5 @@ def test_arrow_null_in_a_modeled_covariate_is_a_structured_nonfinite_issue() -> 
     assert any(
         issue.kind == "non_finite" and issue.column == "x" for issue in issues
     ), [(issue.kind, issue.column, issue.message) for issue in issues]
-    with pytest.raises(gamfit.GamError, match="non-finite.*column 'x'"):
+    with pytest.raises(gamfit.errors.GamError, match="non-finite.*column 'x'"):
         model.predict(frame)
