@@ -75,7 +75,8 @@
 //! the Cholesky refusal in `augmented_mode` is a numerical exit only. Each Newton
 //! iteration is `O(n·M²·P²)` for the curvature (as `M(M+1)/2` GEMMs) and
 //! `O(d³)` for the factorisation, so the whole predictive is
-//! `O(R·K·iters·(n M² P² + d³))`.
+//! `O(R·K·iters·(n M² P² + d³))`. The `R` prediction rows are independent and
+//! run in parallel.
 //!
 //! On the fixture this exists for that is a large improvement, not a cost: the
 //! Smolyak integrator it replaces spent ~930 s on one penguins prediction
@@ -90,6 +91,7 @@
 use crate::model_types::EstimationError;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
+use rayon::prelude::*;
 
 /// The training data and penalty a saved multinomial model needs in order to
 /// evaluate its own log-posterior away from the mode.
@@ -427,11 +429,36 @@ impl<'a> MultinomialPredictiveModel<'a> {
         anchor: &[f64],
         tilt: &[f64],
     ) -> (Array1<f64>, Array2<f64>) {
+        let training = self.training_state(theta);
+        self.finish_state(theta, extra, anchor, tilt, training)
+    }
+
+    /// The `θ`-dependent part of [`Self::gradient_and_precision`] that does not
+    /// involve the extra rows: the training rows' gradient and `Q + XᵀW(θ)X`.
+    /// It is the `O(n·M²·P²)` part, and every augmented solve starts at the same
+    /// base mode, so it is computed there once and handed to each solve's first
+    /// iteration rather than rebuilt per (row, class).
+    fn training_state(&self, theta: &[f64]) -> (Array1<f64>, Array2<f64>) {
+        let mut precision = self.joint_penalty.to_owned();
+        let gradient = self.add_training_rows(theta, &mut precision);
+        (gradient, precision)
+    }
+
+    /// Completes a [`Self::training_state`] at the same `θ` with the extra rows,
+    /// the quadratic's gradient and the tilt, in the order the full assembly
+    /// always used, so a cached training state gives a bit-identical result.
+    fn finish_state(
+        &self,
+        theta: &[f64],
+        extra: &[ExtraRow<'_>],
+        anchor: &[f64],
+        tilt: &[f64],
+        training: (Array1<f64>, Array2<f64>),
+    ) -> (Array1<f64>, Array2<f64>) {
         let p = self.training_design.ncols();
         let m = self.active_classes();
         let d = p * m;
-        let mut precision = self.joint_penalty.to_owned();
-        let mut gradient = self.add_training_rows(theta, &mut precision);
+        let (mut gradient, mut precision) = training;
         let mut eta = vec![0.0_f64; m];
         let mut probs = vec![0.0_f64; self.n_classes];
 
@@ -600,6 +627,9 @@ impl<'a> MultinomialPredictiveModel<'a> {
     /// the precision at that point — the three quantities a Laplace ratio needs
     /// from one side of it.
     ///
+    /// `start_training`, when given, is [`Self::training_state`] at `start`; the
+    /// first iteration then only adds the extra rows to it.
+    ///
     /// Both exits are derived rather than budgeted: the Newton decrement falls
     /// inside the objective's rounding band, or no representable step along the
     /// Newton direction gains more than that band. Every step that continues
@@ -608,6 +638,7 @@ impl<'a> MultinomialPredictiveModel<'a> {
     fn augmented_mode(
         &self,
         start: &[f64],
+        start_training: Option<&(Array1<f64>, Array2<f64>)>,
         extra: &[ExtraRow<'_>],
         anchor: &[f64],
         tilt: &[f64],
@@ -615,8 +646,12 @@ impl<'a> MultinomialPredictiveModel<'a> {
         let d = self.coefficient_dim();
         let mut theta = start.to_vec();
         let mut value = self.log_posterior(&theta, extra, anchor, tilt);
+        let mut cached_training = start_training;
         loop {
-            let (gradient, precision) = self.gradient_and_precision(&theta, extra, anchor, tilt);
+            let (gradient, precision) = match cached_training.take() {
+                Some(training) => self.finish_state(&theta, extra, anchor, tilt, training.clone()),
+                None => self.gradient_and_precision(&theta, extra, anchor, tilt),
+            };
             let factor = precision.cholesky(faer::Side::Lower).map_err(|error| {
                 EstimationError::InvalidInput(format!(
                     "multinomial predictive: augmented posterior precision is not positive \
@@ -768,7 +803,7 @@ impl<'a> MultinomialPredictiveModel<'a> {
         let tilt = model.stationarity_tilt(&base_theta);
         let tilt = tilt.as_slice().expect("owned gradient is contiguous");
         let (base_mode, base_value, base_logdet) =
-            model.augmented_mode(&base_theta, &[], &base_theta, tilt)?;
+            model.augmented_mode(&base_theta, None, &[], &base_theta, tilt)?;
         // ... and with the stationarity tilt in place the polish must be a
         // NO-OP: the tilt was measured so that the supplied coefficients ARE the
         // stationary point of this objective, so the tilted gradient there is only
@@ -799,8 +834,29 @@ impl<'a> MultinomialPredictiveModel<'a> {
             );
         }
 
+        // Every augmented solve is warm-started at `base_mode`, so its first
+        // iteration's training curvature is this one.
+        let base_training = model.training_state(&base_mode);
+        let base = PredictiveBase {
+            mode: &base_mode,
+            training: &base_training,
+            anchor: &base_theta,
+            tilt,
+            value: base_value,
+            logdet: base_logdet,
+        };
+
         let rows = x_new.nrows();
         let k = self.n_classes;
+        // Every prediction row is its own set of augmented solves against the same
+        // base, sharing nothing but read-only views, so the rows run in parallel.
+        // Each row is still computed serially and in the same order, so the result
+        // is bit-identical to a serial sweep; errors are reported for the first
+        // failing row in row order, as the serial sweep would.
+        let per_row: Vec<Result<PredictiveRow, EstimationError>> = (0..rows)
+            .into_par_iter()
+            .map(|row| model.predictive_row(row, x_new.row(row), &base, want_second_moments))
+            .collect();
         let mut class_mean = Array2::<f64>::zeros((rows, k));
         let mut mass_defect = Array1::<f64>::zeros(rows);
         let mut second = if want_second_moments {
@@ -808,65 +864,14 @@ impl<'a> MultinomialPredictiveModel<'a> {
         } else {
             None
         };
-        for row in 0..rows {
-            let design_row = x_new.row(row);
-            let mut raw = vec![0.0_f64; k];
-            for class in 0..k {
-                let extra = [ExtraRow {
-                    design: design_row,
-                    class,
-                }];
-                let (_, value, logdet) =
-                    model.augmented_mode(&base_mode, &extra, &base_theta, tilt)?;
-                raw[class] = (value - base_value + 0.5 * (base_logdet - logdet)).exp();
-            }
-            let total: f64 = raw.iter().sum();
-            if !total.is_finite() || total <= 0.0 {
-                crate::bail_invalid_estim!(
-                    "multinomial predictive: row {row} produced a non-positive total predictive \
-                     mass {total}"
-                );
-            }
-            mass_defect[row] = (total - 1.0).abs();
-            for class in 0..k {
-                class_mean[[row, class]] = raw[class] / total;
-            }
-
-            if let Some(second) = second.as_mut() {
-                let mut raw_second = vec![0.0_f64; k * k];
-                for c in 0..k {
-                    for dd in c..k {
-                        let extra = [
-                            ExtraRow {
-                                design: design_row,
-                                class: c,
-                            },
-                            ExtraRow {
-                                design: design_row,
-                                class: dd,
-                            },
-                        ];
-                        let (_, value, logdet) =
-                            model.augmented_mode(&base_mode, &extra, &base_theta, tilt)?;
-                        let entry = (value - base_value + 0.5 * (base_logdet - logdet)).exp();
-                        raw_second[c * k + dd] = entry;
-                        raw_second[dd * k + c] = entry;
-                    }
-                }
-                let second_total: f64 = raw_second.iter().sum();
-                if !second_total.is_finite() || second_total <= 0.0 {
-                    crate::bail_invalid_estim!(
-                        "multinomial predictive: row {row} produced a non-positive second-moment \
-                         mass {second_total}"
-                    );
-                }
-                // `Σ_{c,d} E[p_c p_d] = E[(Σ_c p_c)²] = 1` is the same exact
-                // identity one order up, so the same normalisation applies.
-                for c in 0..k {
-                    for dd in 0..k {
-                        second[[row, c, dd]] = raw_second[c * k + dd] / second_total;
-                    }
-                }
+        for (row, outcome) in per_row.into_iter().enumerate() {
+            let outcome = outcome?;
+            mass_defect[row] = outcome.mass_defect;
+            class_mean.row_mut(row).assign(&outcome.class_mean);
+            if let (Some(second), Some(row_second)) = (second.as_mut(), outcome.second_moment) {
+                second
+                    .index_axis_mut(ndarray::Axis(0), row)
+                    .assign(&row_second);
             }
         }
 
@@ -876,6 +881,102 @@ impl<'a> MultinomialPredictiveModel<'a> {
             mass_defect,
         })
     }
+
+    /// One prediction row's renormalised class means, mass defect and (when
+    /// requested) renormalised second moments: `K` augmented solves for the
+    /// means and `K(K+1)/2` more for the second moments.
+    fn predictive_row(
+        &self,
+        row: usize,
+        design_row: ArrayView1<'_, f64>,
+        base: &PredictiveBase<'_>,
+        want_second_moments: bool,
+    ) -> Result<PredictiveRow, EstimationError> {
+        let k = self.n_classes;
+        let mut raw = vec![0.0_f64; k];
+        for class in 0..k {
+            let extra = [ExtraRow {
+                design: design_row,
+                class,
+            }];
+            let (_, value, logdet) =
+                self.augmented_mode(base.mode, Some(base.training), &extra, base.anchor, base.tilt)?;
+            raw[class] = (value - base.value + 0.5 * (base.logdet - logdet)).exp();
+        }
+        let total: f64 = raw.iter().sum();
+        if !total.is_finite() || total <= 0.0 {
+            crate::bail_invalid_estim!(
+                "multinomial predictive: row {row} produced a non-positive total predictive \
+                 mass {total}"
+            );
+        }
+        let mass_defect = (total - 1.0).abs();
+        let class_mean = Array1::from_iter(raw.iter().map(|value| value / total));
+
+        let mut second_moment = None;
+        if want_second_moments {
+            let mut second = Array2::<f64>::zeros((k, k));
+            let mut raw_second = vec![0.0_f64; k * k];
+            for c in 0..k {
+                for dd in c..k {
+                    let extra = [
+                        ExtraRow {
+                            design: design_row,
+                            class: c,
+                        },
+                        ExtraRow {
+                            design: design_row,
+                            class: dd,
+                        },
+                    ];
+                    let (_, value, logdet) =
+                        self.augmented_mode(base.mode, Some(base.training), &extra, base.anchor, base.tilt)?;
+                    let entry = (value - base.value + 0.5 * (base.logdet - logdet)).exp();
+                    raw_second[c * k + dd] = entry;
+                    raw_second[dd * k + c] = entry;
+                }
+            }
+            let second_total: f64 = raw_second.iter().sum();
+            if !second_total.is_finite() || second_total <= 0.0 {
+                crate::bail_invalid_estim!(
+                    "multinomial predictive: row {row} produced a non-positive second-moment \
+                     mass {second_total}"
+                );
+            }
+            // `Σ_{c,d} E[p_c p_d] = E[(Σ_c p_c)²] = 1` is the same exact
+            // identity one order up, so the same normalisation applies.
+            for c in 0..k {
+                for dd in 0..k {
+                    second[[c, dd]] = raw_second[c * k + dd] / second_total;
+                }
+            }
+            second_moment = Some(second);
+        }
+        Ok(PredictiveRow {
+            class_mean,
+            mass_defect,
+            second_moment,
+        })
+    }
+}
+
+/// The un-augmented side every ratio shares: the base mode, its cached
+/// [`MultinomialPredictiveModel::training_state`], the expansion anchor and
+/// tilt, and the base objective value and log-determinant.
+struct PredictiveBase<'b> {
+    mode: &'b [f64],
+    training: &'b (Array1<f64>, Array2<f64>),
+    anchor: &'b [f64],
+    tilt: &'b [f64],
+    value: f64,
+    logdet: f64,
+}
+
+/// One prediction row's share of [`MultinomialPredictiveMoments`].
+struct PredictiveRow {
+    class_mean: Array1<f64>,
+    mass_defect: f64,
+    second_moment: Option<Array2<f64>>,
 }
 
 /// Per-class posterior standard deviation of the probability, from the moments

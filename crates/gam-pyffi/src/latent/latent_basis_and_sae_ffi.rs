@@ -603,13 +603,19 @@ fn fit_multinomial_formula_pyfunc<'py>(
     let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
         let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
             .map_err(py_value_error)?;
+        let automatic = gam::families::fit_orchestration::expand_automatic_fit_formula(
+            &formula,
+            &dataset,
+            &fit_config,
+        )
+        .map_err(|err| py_value_error(err.to_string()))?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343). The request
         // carries the same defaults the CLI's `run_fit_multinomial` uses.
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
             &gam::families::multinomial::MultinomialFitRequest::new(
                 &dataset,
-                &formula,
+                &automatic.formula,
                 &fit_config,
             ),
         )
