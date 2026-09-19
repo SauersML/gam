@@ -81,12 +81,25 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
 - gamfit: exposure goes in as an offset (`offset="logE"`); `d07`: rate RMSE 0.0665 vs pyGAM exposure 0.0858.
   Do not copy the y/E-with-weights trick; offsets are the principled parameterisation.
 
-### P8  Smooth-term p-values: naive Wald on full-rank pinv, flagged "KNOWN BUG" by pyGAM itself  — high — pyGAM-slop-to-avoid
+### P8  Smooth-term p-values: ad-hoc Wald on full-rank pinv, flagged "KNOWN BUG" by pyGAM itself  — med — pyGAM-slop-to-avoid
 - `pygam.py:1280–1295`, docstring `1798–1806` ("KNOWN BUG: p-values ... too small"). It (i) centres
   the coefficients by their mean (not an identifiability constraint), (ii) uses a full-rank pseudo-
   inverse of the penalised covariance block, (iii) takes an F/χ² reference with `edof` df and no
   account for λ estimation.
-- Null calibration, `d04_pcal.py` (n=200, y=sin(2πx)+N(0,.5²), test the pure-noise s(z)): RESULT_D04
+- Null calibration, `d04_pcal.py` (n=200, y=sin(2πx)+N(0,.5²), test the pure-noise s(z)), 100 reps:
+
+  | method                         | P(p<.05) | P(p<.01) | median p |
+  |--------------------------------|----------|----------|----------|
+  | pyGAM default λ=0.6            | 0.060    | 0.010    | 0.528    |
+  | pyGAM gridsearch (GCV)         | 0.040    | 0.010    | 0.558    |
+  | gamfit `p_value_corrected`     | 0.060    | 0.000    | 0.439    |
+  | gamfit `p_value_conditional`   | **0.140**| 0.030    | 0.254    |
+
+  Honest result: in this null design pyGAM's test is NOT demonstrably mis-sized (0.06 and 0.04 at the
+  5% level; the Monte Carlo SE is about 0.022). The critique of P8 is therefore methodological, not
+  empirical. The construction has no theory: coefficient mean-centring, a pinv of a rank-deficient
+  block, and ref-df = edof. pyGAM's own docstring admits it is wrong, and it has no power/size guarantees
+  once the basis or penalty changes. Do not copy it, but also do not claim here that it is anti-conservative.
 - gamfit: `smooth_significance` = LR test with null-spectrum weighted-χ² reference plus a
   smoothing-corrected variant (see G4 for the API surface issue).
 
@@ -212,9 +225,12 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
   check it. Fix: add `scale` (φ̂, with its REML definition) to the Rust summary payload and print it.
   Files: gam-inference summary builder, `model_ffi.rs` payload, `_model.py` summary. Size: S.
 
-### G4 `smooth_significance` returns four p-values  — med — gap (SPEC "delete unnecessary options")
+### G4 `smooth_significance` returns four p-values, one of them anti-conservative  — med — gap (SPEC "delete unnecessary options")
 - Fields `p_value_conditional`, `p_value_bound`, `p_value_uncorrected`, `p_value_corrected`. A user must
-  pick; three of the four are not the recommended test. Calibration (d04): RESULT_D04_GF.
+  pick; three of the four are not the recommended test. Calibration (d04, 100 null reps): `p_value_corrected` has size 0.060 at 5% and 0.000 at 1% (fine,
+  slightly conservative at 1%). `p_value_conditional` has size **0.140** at 5% and 0.030 at 1%. That is
+  anti-conservative, about 4 Monte Carlo SE above nominal (binomial P(X≥14 | 100, 0.05) ≈ 5e-4). An
+  exposed field that nearly triples the type-I error is a trap, not an option.
   Fix: return one `p_value` (the calibrated, smoothing-corrected one) plus statistic/ref-df; move the
   others behind a diagnostics object or delete. Files: gam-inference smooth test, pyffi payload,
   `gamfit/_model.py`. Size: S.

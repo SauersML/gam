@@ -73,3 +73,33 @@
  pyGAM gridsearch(GCV)        P(p<.05)=0.040  P(p<.01)=0.013  median p=0.538
  gamfit p_value_corrected     P(p<.05)=0.080  P(p<.01)=0.000  median p=0.438
  gamfit p_value_conditional   P(p<.05)=0.133  P(p<.01)=0.027  median p=0.254
+== after 80 reps, secs 1425
+ pyGAM default lam=0.6        P(p<.05)=0.050  P(p<.01)=0.013  median p=0.508
+ pyGAM gridsearch(GCV)        P(p<.05)=0.037  P(p<.01)=0.013  median p=0.529
+ gamfit p_value_corrected     P(p<.05)=0.075  P(p<.01)=0.000  median p=0.441
+ gamfit p_value_conditional   P(p<.05)=0.138  P(p<.01)=0.025  median p=0.254
+== after 85 reps, secs 1501
+ pyGAM default lam=0.6        P(p<.05)=0.047  P(p<.01)=0.012  median p=0.527
+ pyGAM gridsearch(GCV)        P(p<.05)=0.035  P(p<.01)=0.012  median p=0.538
+ gamfit p_value_corrected     P(p<.05)=0.071  P(p<.01)=0.000  median p=0.442
+ gamfit p_value_conditional   P(p<.05)=0.129  P(p<.01)=0.024  median p=0.255
+== after 90 reps, secs 1593
+ pyGAM default lam=0.6        P(p<.05)=0.044  P(p<.01)=0.011  median p=0.528
+ pyGAM gridsearch(GCV)        P(p<.05)=0.033  P(p<.01)=0.011  median p=0.546
+ gamfit p_value_corrected     P(p<.05)=0.067  P(p<.01)=0.000  median p=0.442
+ gamfit p_value_conditional   P(p<.05)=0.133  P(p<.01)=0.022  median p=0.255
+== after 95 reps, secs 1684
+ pyGAM default lam=0.6        P(p<.05)=0.053  P(p<.01)=0.011  median p=0.528
+ pyGAM gridsearch(GCV)        P(p<.05)=0.042  P(p<.01)=0.011  median p=0.555
+ gamfit p_value_corrected     P(p<.05)=0.063  P(p<.01)=0.000  median p=0.440
+ gamfit p_value_conditional   P(p<.05)=0.137  P(p<.01)=0.032  median p=0.254
+== after 100 reps, secs 1761
+ pyGAM default lam=0.6        P(p<.05)=0.060  P(p<.01)=0.010  median p=0.528
+ pyGAM gridsearch(GCV)        P(p<.05)=0.040  P(p<.01)=0.010  median p=0.558
+ gamfit p_value_corrected     P(p<.05)=0.060  P(p<.01)=0.000  median p=0.439
+ gamfit p_value_conditional   P(p<.05)=0.140  P(p<.01)=0.030  median p=0.254
+ pyGAM default lam=0.6        P(p<.05)=0.060  P(p<.01)=0.010  median p=0.528
+ pyGAM gridsearch(GCV)        P(p<.05)=0.040  P(p<.01)=0.010  median p=0.558
+ gamfit p_value_corrected     P(p<.05)=0.060  P(p<.01)=0.000  median p=0.439
+ gamfit p_value_conditional   P(p<.05)=0.140  P(p<.01)=0.030  median p=0.254
+ reps 100  secs 1760.84934258461
