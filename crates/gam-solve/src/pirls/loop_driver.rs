@@ -809,7 +809,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             path: PirlsLinearSolvePath::DenseTransformed,
             reason: "gaussian_sufficient_statistics",
             p: x_original.ncols(),
-            nnz_x: 0,
+            nnz_x: None,
             nnz_xtwx_symbolic: None,
             nnz_s_lambda: 0,
             nnz_h_est: None,
