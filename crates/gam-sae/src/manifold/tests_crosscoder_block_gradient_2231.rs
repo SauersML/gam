@@ -123,9 +123,12 @@ fn crosscoder_block_gradient_factors_are_derivatives_of_the_criterion_2231() {
             / (2.0 * eps)
     };
 
-    let step = 1.0e-3_f64;
+    // The fixture's joint block turns indefinite by `|log λ| = 4e-3`, and the log-determinant
+    // bends sharply on the way there, so the cost is differenced well inside that radius.
+    let cost_step = 3.125e-5_f64;
     let (partial_fd, partial_spread) =
-        richardson(cost_over_lambda(step), cost_over_lambda(0.5 * step));
+        richardson(cost_over_lambda(cost_step), cost_over_lambda(0.5 * cost_step));
+    let step = 1.0e-3_f64;
     let g_coarse = gradient_over_lambda(step);
     let g_fine = gradient_over_lambda(0.5 * step);
     let response_step = 1.0e-4 / direction_scale;
