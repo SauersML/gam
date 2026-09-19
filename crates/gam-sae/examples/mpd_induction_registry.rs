@@ -855,15 +855,15 @@ fn main() -> Result<(), String> {
                 );
                 // The softmax and the value read at torch's own inputs, taken as exact.
                 let exact = Array3::<f64>::zeros(external_scores.dim());
-                let (weights, weight_radius) = core
+                let pattern = core
                     .weights_at_scores(external_scores.view(), exact.view())
                     .map_err(|error| error.to_string())?;
                 let external_pattern = heads_of(&format!("pattern.{layer}"), index, sequence);
                 tally.pattern.add(
                     sequence,
                     causal_rows(external_pattern.view()).view(),
-                    causal_rows(weights.view()).view(),
-                    Some(causal_rows(weight_radius.view()).view()),
+                    causal_rows(pattern.weights.view()).view(),
+                    Some(causal_rows(pattern.weight_radius.view()).view()),
                 )?;
                 let (mixed, mixed_radius) = core
                     .mix_at_weights(external_pattern.view(), exact.view(), value_rows)
