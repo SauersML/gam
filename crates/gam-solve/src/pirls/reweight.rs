@@ -1066,6 +1066,7 @@ where
         loop {
             lm_bound.tick();
             lm_attempts_done += 1;
+            test_support::record_lm_attempt();
             let attempt_solve_start = std::time::Instant::now();
 
             // 1. Solve (H + λD²)δ = -g
@@ -1291,7 +1292,11 @@ where
             // (Arrow-Schur predicted reduction) needs the same generalisation.
             let predred_start = std::time::Instant::now();
             let lin = state.gradient.dot(direction);
-            let predicted_reduction = {
+            // `step_rayleigh_curvature` = δᵀHδ / δᵀD²δ: the bare model
+            // curvature along the step in the damping metric, which the
+            // rejection update uses to translate Moré's interpolated radius
+            // into a damping value (`RejectEscalator::escalate_from_rejected_trial`).
+            let (predicted_reduction, step_rayleigh_curvature) = {
                 let q_term = if let Some(sparse_reg) = cached_sparse_regularized.as_ref() {
                     sparse_symmetric_upper_matvec_public(sparse_reg, direction)
                 } else {
@@ -1306,10 +1311,12 @@ where
                 let model_curvature_correction =
                     model.objective_hessian_quadratic_correction(direction)?;
                 // Stored curvature plus the model-specific omitted block.
-                let quad = 0.5
-                    * (direction.dot(&q_term) - loop_lambda * d2_weighted_sq
-                        + model_curvature_correction);
-                -(lin + quad)
+                let bare_quadratic = direction.dot(&q_term) - loop_lambda * d2_weighted_sq
+                    + model_curvature_correction;
+                (
+                    -(lin + 0.5 * bare_quadratic),
+                    bare_quadratic / d2_weighted_sq,
+                )
             };
             lm_predred_total += predred_start.elapsed();
 
@@ -1556,7 +1563,12 @@ where
                                 final_state = Some(state);
                                 break 'pirls_loop;
                             }
-                            madsen_escalator.escalate(&mut loop_lambda);
+                            madsen_escalator.escalate_from_rejected_trial(
+                                &mut loop_lambda,
+                                lin,
+                                actual_reduction,
+                                step_rayleigh_curvature,
+                            );
                             continue;
                         }
                         if preferred_curvature == HessianCurvatureKind::Observed
@@ -2041,7 +2053,12 @@ where
                             final_state = Some(state);
                             break 'pirls_loop;
                         }
-                        madsen_escalator.escalate(&mut loop_lambda);
+                        madsen_escalator.escalate_from_rejected_trial(
+                            &mut loop_lambda,
+                            lin,
+                            screening_reduction,
+                            step_rayleigh_curvature,
+                        );
                     }
                 }
                 Err(err) => {
@@ -2859,6 +2876,22 @@ pub(super) mod test_support {
         PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
             if let Some(ref mut buf) = *trace.borrow_mut() {
                 buf.push(value);
+            }
+        });
+    }
+
+    // Same pattern for the LM attempt count (one damped solve + trial
+    // evaluation per attempt), so tests can pin step-control cost in
+    // attempts rather than wall clock.
+    thread_local! {
+        pub(crate) static PIRLS_LM_ATTEMPT_COUNT: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    pub(crate) fn record_lm_attempt() {
+        PIRLS_LM_ATTEMPT_COUNT.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
             }
         });
     }
