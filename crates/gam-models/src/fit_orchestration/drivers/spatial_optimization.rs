@@ -2769,11 +2769,7 @@ fn wrap_local_build_as_realization(
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, String> {
     let p_local = local.dim;
-    let lb_local = if local.box_reparam {
-        shape_lower_bounds_local(termspec.shape, p_local)
-    } else {
-        None
-    };
+    let lb_local = local.shape_lower_bounds.take();
 
     // Stage-2 joint-null absorption rotation, same logic as the main
     // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:

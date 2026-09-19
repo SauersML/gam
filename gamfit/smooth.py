@@ -102,22 +102,20 @@ class Smooth(_BasisDescriptor):
         One of ``None`` / ``"none"`` (unconstrained, the default),
         ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
         ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
-        or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
-        the inner solver as joint linear inequalities ``A·β ≥ b`` on the
-        coefficient vector (the constraint matrix ``A`` is generated from
-        the basis on a dense 1D grid spanning the data range, so the
-        inequality at the grid points implies the constraint on the
-        smooth function under standard B-spline / radial-basis density
-        arguments). The solver is an active-set / interior-point method;
-        when the constraint is active at the cert exit the outer REML
-        score uses the tangent-projected LAML formulation so the smoothing
-        parameter is selected over the working subspace. This mirrors
-        mgcv's ``scop=...`` argument and the ``scam`` R library's shape-
-        constrained smooths. Currently restricted to univariate 1D smooths
-        (B-splines and thin-plate / Duchon with a single feature axis);
-        a multivariate spec on a constrained smooth will be rejected with
-        a clear error from the Rust core. Spherical-harmonic and tensor
-        smooths reject all non-``None`` shape constraints.
+        or ``"concave"`` (f''(x) ≤ 0). The constraint is imposed exactly on
+        the B-spline control polygon: the coefficients are reparameterized
+        as ``β = C·δ`` where ``δ`` holds successive coefficient differences
+        (monotone) or knot-scaled slope differences (convex / concave) and
+        carries a lower bound ``δ ≥ 0``. A non-negative control-polygon
+        difference certifies the shape everywhere on the knot range, not
+        only at sample points. The term is centred like an unconstrained
+        smooth (weighted sum-to-zero over the training rows), so the model
+        intercept carries the level. Only open 1-D B-spline smooths
+        (``s(x)`` with the default basis) accept a shape constraint;
+        periodic, cubic-regression (``cr`` / ``cs``) and endpoint
+        boundary-condition bases, thin-plate / Duchon, spherical-harmonic
+        and tensor smooths reject every non-``None`` value with an error
+        from the Rust core.
     """
 
     name: str | None = None
