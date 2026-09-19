@@ -27,12 +27,16 @@ def test_integer_poisson_weights_equal_row_duplication() -> None:
     x = rng.uniform(0.0, 1.0, n)
     y = rng.poisson(np.exp(1.0 + np.sin(6.0 * x))).astype(float)
     w = rng.integers(1, 4, n).astype(float)
+    # The identity is between likelihoods on one basis. The unsized default
+    # s(x) resolves its basis from the row count, and a prior weight is not a
+    # row count (it may be a precision), so the basis size is pinned here.
+    formula = "y ~ s(x, k=20)"
     weighted = gamfit.fit(
-        {"x": x, "y": y, "w": w}, "y ~ s(x)", family="poisson", weights="w"
+        {"x": x, "y": y, "w": w}, formula, family="poisson", weights="w"
     )
     reps = w.astype(int)
     expanded = gamfit.fit(
-        {"x": np.repeat(x, reps), "y": np.repeat(y, reps)}, "y ~ s(x)", family="poisson"
+        {"x": np.repeat(x, reps), "y": np.repeat(y, reps)}, formula, family="poisson"
     )
     grid = {"x": np.linspace(0.02, 0.98, 40)}
     np.testing.assert_allclose(
