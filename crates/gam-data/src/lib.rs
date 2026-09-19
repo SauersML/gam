@@ -652,26 +652,29 @@ impl EncodedDataset {
         // each column's working set hot, lets rayon parallelize across
         // columns, and avoids the previous outer-col/inner-row pattern that
         // re-streamed all rows per column with stride `p`.
-        self.values
-            .axis_iter(Axis(1))
-            .into_par_iter()
-            .map(|col| {
-                let (lo, hi) =
-                    col.iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+        gam_runtime::parallel::install(|| {
+            self.values
+                .axis_iter(Axis(1))
+                .into_par_iter()
+                .map(|col| {
+                    let (lo, hi) = col.iter().fold(
+                        (f64::INFINITY, f64::NEG_INFINITY),
+                        |(lo, hi), &v| {
                             if v.is_finite() {
                                 (lo.min(v), hi.max(v))
                             } else {
                                 (lo, hi)
                             }
-                        });
-                if !lo.is_finite() || !hi.is_finite() {
-                    (0.0, 0.0)
-                } else {
-                    (lo, hi)
-                }
-            })
-            .collect()
+                        },
+                    );
+                    if !lo.is_finite() || !hi.is_finite() {
+                        (0.0, 0.0)
+                    } else {
+                        (lo, hi)
+                    }
+                })
+                .collect()
+        })
     }
 }
 
@@ -2179,26 +2182,28 @@ pub fn encode_arrow_record_batch_reader_with_inferred_schema(
             reason: format!("failed to shape Arrow batch output: {error}"),
         })?;
 
-        let decoded_columns = batch_output
-            .axis_iter_mut(Axis(1))
-            .into_par_iter()
-            .zip(categorical_encoders.par_iter_mut())
-            .zip(all_binary.par_iter_mut())
-            .zip(saw_numeric.par_iter_mut())
-            .enumerate()
-            .map(|(j, (((output, encoder), column_all_binary), column_saw_numeric))| {
-                decode_arrow_batch_column_into(
-                    batch.column(j).as_ref(),
-                    rows_seen,
-                    &headers[j],
-                    is_string_col[j],
-                    output,
-                    encoder.as_mut(),
-                    column_all_binary,
-                    column_saw_numeric,
-                )
-            })
-            .collect::<Vec<_>>();
+        let decoded_columns = gam_runtime::parallel::install(|| {
+            batch_output
+                .axis_iter_mut(Axis(1))
+                .into_par_iter()
+                .zip(categorical_encoders.par_iter_mut())
+                .zip(all_binary.par_iter_mut())
+                .zip(saw_numeric.par_iter_mut())
+                .enumerate()
+                .map(|(j, (((output, encoder), column_all_binary), column_saw_numeric))| {
+                    decode_arrow_batch_column_into(
+                        batch.column(j).as_ref(),
+                        rows_seen,
+                        &headers[j],
+                        is_string_col[j],
+                        output,
+                        encoder.as_mut(),
+                        column_all_binary,
+                        column_saw_numeric,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         for decoded in decoded_columns {
             decoded?;
         }
@@ -2351,27 +2356,29 @@ fn load_parquet_inferred(
             });
         }
 
-        let decoded_columns = values
-            .slice_mut(s![rows_seen..rows_seen + n_rows, ..])
-            .axis_iter_mut(Axis(1))
-            .into_par_iter()
-            .zip(categorical_encoders.par_iter_mut())
-            .zip(all_binary.par_iter_mut())
-            .zip(saw_numeric.par_iter_mut())
-            .enumerate()
-            .map(|(j, (((output, encoder), column_all_binary), column_saw_numeric))| {
-                decode_arrow_batch_column_into(
-                    batch.column(j).as_ref(),
-                    rows_seen,
-                    &headers[j],
-                    is_string_col[j],
-                    output,
-                    encoder.as_mut(),
-                    column_all_binary,
-                    column_saw_numeric,
-                )
-            })
-            .collect::<Vec<_>>();
+        let decoded_columns = gam_runtime::parallel::install(|| {
+            values
+                .slice_mut(s![rows_seen..rows_seen + n_rows, ..])
+                .axis_iter_mut(Axis(1))
+                .into_par_iter()
+                .zip(categorical_encoders.par_iter_mut())
+                .zip(all_binary.par_iter_mut())
+                .zip(saw_numeric.par_iter_mut())
+                .enumerate()
+                .map(|(j, (((output, encoder), column_all_binary), column_saw_numeric))| {
+                    decode_arrow_batch_column_into(
+                        batch.column(j).as_ref(),
+                        rows_seen,
+                        &headers[j],
+                        is_string_col[j],
+                        output,
+                        encoder.as_mut(),
+                        column_all_binary,
+                        column_saw_numeric,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
 
         // Rayon preserves indexed collection order, so checking the compact
         // per-column result vector from left to right retains the loader's
@@ -2620,11 +2627,13 @@ pub fn encode_recordswith_inferred_schema(
     // rows) the serial outer loop dominated ingest time, so fan the per-column
     // inference passes out over rayon. Order is preserved because `map` over an
     // indexed parallel iterator collects back in column order.
-    let schema_cols = headers
-        .par_iter()
-        .enumerate()
-        .map(|(j, name)| infer_schema_column(name, &records, j).map_err(String::from))
-        .collect::<Result<Vec<SchemaColumn>, String>>()?;
+    let schema_cols = gam_runtime::parallel::install(|| {
+        headers
+            .par_iter()
+            .enumerate()
+            .map(|(j, name)| infer_schema_column(name, &records, j).map_err(String::from))
+            .collect::<Result<Vec<SchemaColumn>, String>>()
+    })?;
     let schema = DataSchema {
         columns: schema_cols,
     };
@@ -2681,22 +2690,24 @@ pub fn encode_recordswith_schema(
     // never contend on a shared output cell). Each task returns its dense
     // `(kind, Vec<f64>)`; we then assemble the row-major `Array2` from the
     // collected columns. For wide frames this is the dominant ingest cost.
-    let encoded_columns = headers
-        .par_iter()
-        .enumerate()
-        .map(|(j, name)| {
-            let inferred_for_extra;
-            let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
-                *s
-            } else {
-                inferred_for_extra =
-                    infer_schema_column(name, &records, j).map_err(String::from)?;
-                &inferred_for_extra
-            };
-            let column = encode_one_column(name, &records, j, col_schema, &unseen_policy)?;
-            Ok::<(ColumnKindTag, Vec<f64>), String>((col_schema.kind, column))
-        })
-        .collect::<Result<Vec<(ColumnKindTag, Vec<f64>)>, String>>()?;
+    let encoded_columns = gam_runtime::parallel::install(|| {
+        headers
+            .par_iter()
+            .enumerate()
+            .map(|(j, name)| {
+                let inferred_for_extra;
+                let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
+                    *s
+                } else {
+                    inferred_for_extra =
+                        infer_schema_column(name, &records, j).map_err(String::from)?;
+                    &inferred_for_extra
+                };
+                let column = encode_one_column(name, &records, j, col_schema, &unseen_policy)?;
+                Ok::<(ColumnKindTag, Vec<f64>), String>((col_schema.kind, column))
+            })
+            .collect::<Result<Vec<(ColumnKindTag, Vec<f64>)>, String>>()
+    })?;
 
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(p);
     let mut values = Array2::<f64>::zeros((n, p));

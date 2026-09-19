@@ -216,22 +216,24 @@ pub(crate) fn isa_eigen_parts(residual: ArrayView2<'_, f64>) -> Result<Option<Is
     // absorbs — the same determinism contract `scaled_second_moment` in the
     // structured-residual estimator (#974) already established for exactly this
     // shape of matrix. Engaged only above a row threshold (the serial path stays
-    // exact on small inputs and avoids rayon overhead) and only when NOT already
-    // inside a rayon worker (nested calls keep the outer region's cores).
+    // exact on small inputs and avoids rayon overhead) and only at top level,
+    // not inside a parallel region (nested calls keep the outer region's cores).
     let mut s = {
         use rayon::prelude::*;
         const PARALLEL_ROW_MIN: usize = 8192;
         const CHUNK_ROWS: usize = 2048;
-        if n >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
+        if n >= PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level() {
             let n_chunks = n.div_ceil(CHUNK_ROWS);
-            let partials: Vec<Array2<f64>> = (0..n_chunks)
-                .into_par_iter()
-                .map(|c| {
-                    let lo = c * CHUNK_ROWS;
-                    let hi = ((c + 1) * CHUNK_ROWS).min(n);
-                    centered_second_moment_chunk(residual, &mean, lo, hi)
-                })
-                .collect();
+            let partials: Vec<Array2<f64>> = gam_runtime::parallel::fan_out(|| {
+                (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let lo = c * CHUNK_ROWS;
+                        let hi = ((c + 1) * CHUNK_ROWS).min(n);
+                        centered_second_moment_chunk(residual, &mean, lo, hi)
+                    })
+                    .collect()
+            });
             let mut acc = Array2::<f64>::zeros((p, p));
             for part in &partials {
                 acc += part;
@@ -904,8 +906,8 @@ fn joint_jacobi_basis(
     // behavior) bit-for-bit: no arithmetic moved, only which core ran it. This
     // was the other serial wall of the ISA harvest besides the second-moment
     // pass — `n_inits` (default 6) full Jacobi ascents back to back. Engaged
-    // only when not already inside a rayon worker (nested calls keep the outer
-    // region's cores), matching the estimator-wide nesting discipline.
+    // only at top level, not inside a parallel region (nested calls keep the
+    // outer region's cores), matching the estimator-wide nesting discipline.
     let candidates: Vec<(f64, Array2<f64>, Array2<f64>)> = {
         use rayon::prelude::*;
         let run_init = |init: usize| -> (f64, Array2<f64>, Array2<f64>) {
@@ -914,8 +916,10 @@ fn joint_jacobi_basis(
             let contrast = total_contrast(&y, n_planes);
             (contrast, q, y)
         };
-        if n_inits > 1 && rayon::current_thread_index().is_none() {
-            (0..n_inits).into_par_iter().map(run_init).collect()
+        if n_inits > 1 && gam_runtime::parallel::at_top_level() {
+            gam_runtime::parallel::fan_out(|| {
+                (0..n_inits).into_par_iter().map(run_init).collect()
+            })
         } else {
             (0..n_inits).map(run_init).collect()
         }

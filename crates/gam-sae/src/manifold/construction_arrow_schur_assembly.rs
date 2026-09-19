@@ -200,13 +200,15 @@ impl SaeManifoldTerm {
     /// order-preserving `collect` reproduces the serial push order bit-for-bit
     /// (deterministic — each row computed exactly once, no cross-row reduction).
     pub(crate) fn assignments_all_parallel(&self, n: usize) -> Result<Vec<Array1<f64>>, String> {
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         if parallel {
             use rayon::prelude::*;
-            (0..n)
-                .into_par_iter()
-                .map(|row| self.assignment.try_assignments_row(row))
-                .collect::<Result<Vec<_>, String>>()
+            gam_runtime::parallel::fan_out(|| {
+                (0..n)
+                    .into_par_iter()
+                    .map(|row| self.assignment.try_assignments_row(row))
+                    .collect::<Result<Vec<_>, String>>()
+            })
         } else {
             let mut assignments_all = Vec::with_capacity(n);
             for row in 0..n {
@@ -1728,16 +1730,18 @@ impl SaeManifoldTerm {
                             row.htt.assign(&htt);
                         };
                         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN
-                            && rayon::current_thread_index().is_none();
+                            && gam_runtime::parallel::at_top_level();
                         if parallel {
                             use rayon::prelude::*;
                             // #1557 — pin the projector's faer GEMM to Par::Seq.
-                            sys.rows
-                                .par_iter_mut()
-                                .enumerate()
-                                .for_each(|(row_idx, row)| {
-                                    with_nested_parallel(|| project_fixed_row(row_idx, row));
-                                });
+                            gam_runtime::parallel::fan_out(|| {
+                                sys.rows
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .for_each(|(row_idx, row)| {
+                                        with_nested_parallel(|| project_fixed_row(row_idx, row));
+                                    })
+                            });
                         } else {
                             for row_idx in 0..n {
                                 let row = &mut sys.rows[row_idx];
@@ -1830,20 +1834,22 @@ impl SaeManifoldTerm {
                             }
                         };
                     let parallel =
-                        n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                        n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
                     if parallel {
                         use rayon::prelude::*;
                         // #1557 — pin the projector's faer GEMM to Par::Seq.
-                        kron_jac
-                            .par_iter_mut()
-                            .enumerate()
-                            .for_each(|(row_idx, jac_flat)| {
-                                with_nested_parallel(|| {
-                                    let mut t_buf = vec![0.0_f64; q];
-                                    let mut col_buf = Array1::<f64>::zeros(q);
-                                    project_row(row_idx, jac_flat, &mut t_buf, &mut col_buf);
-                                });
-                            });
+                        gam_runtime::parallel::fan_out(|| {
+                            kron_jac
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(row_idx, jac_flat)| {
+                                    with_nested_parallel(|| {
+                                        let mut t_buf = vec![0.0_f64; q];
+                                        let mut col_buf = Array1::<f64>::zeros(q);
+                                        project_row(row_idx, jac_flat, &mut t_buf, &mut col_buf);
+                                    });
+                                })
+                        });
                     } else {
                         let mut t_buf = vec![0.0_f64; q];
                         let mut col_buf = Array1::<f64>::zeros(q);
@@ -1897,7 +1903,7 @@ impl SaeManifoldTerm {
                     // the two arms parallelize over exactly the live Vec(s).
                     let this = &*self;
                     let parallel =
-                        n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                        n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
                     // gt / htt projection shared by both arms, exactly as
                     // `apply_riemannian_latent_geometry` does for dense uniform-q rows.
                     // Returns the row's `(manifold_i, point_i, gt_e)` so the caller can
@@ -1959,12 +1965,14 @@ impl SaeManifoldTerm {
                         if parallel {
                             use rayon::prelude::*;
                             // #1557 — pin the projector's faer GEMM to Par::Seq.
-                            sys.rows
-                                .par_iter_mut()
-                                .enumerate()
-                                .for_each(|(row_idx, row)| {
-                                    with_nested_parallel(|| frames_row(row_idx, row));
-                                });
+                            gam_runtime::parallel::fan_out(|| {
+                                sys.rows
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .for_each(|(row_idx, row)| {
+                                        with_nested_parallel(|| frames_row(row_idx, row));
+                                    })
+                            });
                         } else {
                             for row_idx in 0..n {
                                 frames_row(row_idx, &mut sys.rows[row_idx]);
@@ -1975,13 +1983,15 @@ impl SaeManifoldTerm {
                         // Disjoint per-row writes to BOTH `sys.rows` and `kron_jac`;
                         // zip the two indexed parallel iterators so each worker owns one
                         // aligned `(row, jac_flat)` pair. #1557 GEMM guard as above.
-                        sys.rows
-                            .par_iter_mut()
-                            .zip(kron_jac.par_iter_mut())
-                            .enumerate()
-                            .for_each(|(row_idx, (row, jac_flat))| {
-                                with_nested_parallel(|| matrix_free_row(row_idx, row, jac_flat));
-                            });
+                        gam_runtime::parallel::fan_out(|| {
+                            sys.rows
+                                .par_iter_mut()
+                                .zip(kron_jac.par_iter_mut())
+                                .enumerate()
+                                .for_each(|(row_idx, (row, jac_flat))| {
+                                    with_nested_parallel(|| matrix_free_row(row_idx, row, jac_flat));
+                                })
+                        });
                     } else {
                         for row_idx in 0..n {
                             matrix_free_row(

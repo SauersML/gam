@@ -845,7 +845,7 @@ impl DeviceResidentArrowWorkspace {
         // so the `cross_beta` reduction order is identical on every host and at every
         // thread count.
         let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(d * p, n);
-        let parallel = n >= OPERATOR_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= OPERATOR_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
 
         let mut cross_t = vec![0.0_f64; n * d];
         let mut cross_beta = vec![0.0_f64; p];
@@ -871,17 +871,19 @@ impl DeviceResidentArrowWorkspace {
 
         if parallel {
             use rayon::prelude::*;
-            let partials: Vec<Vec<f64>> = cross_t
-                .par_chunks_mut(chunk_rows * d)
-                .enumerate()
-                .map(|(chunk_idx, cross_t_chunk)| {
-                    let start = chunk_idx * chunk_rows;
-                    let end = (start + chunk_rows).min(n);
-                    let mut partial = vec![0.0_f64; p];
-                    row_chunk(start..end, cross_t_chunk, &mut partial);
-                    partial
-                })
-                .collect();
+            let partials: Vec<Vec<f64>> = gam_runtime::parallel::fan_out(|| {
+                cross_t
+                    .par_chunks_mut(chunk_rows * d)
+                    .enumerate()
+                    .map(|(chunk_idx, cross_t_chunk)| {
+                        let start = chunk_idx * chunk_rows;
+                        let end = (start + chunk_rows).min(n);
+                        let mut partial = vec![0.0_f64; p];
+                        row_chunk(start..end, cross_t_chunk, &mut partial);
+                        partial
+                    })
+                    .collect()
+            });
             // Fold in chunk order: bit-identical to the sequential arm's chunk
             // sequence regardless of how the chunks were scheduled.
             for partial in &partials {
@@ -913,7 +915,7 @@ impl DeviceResidentArrowWorkspace {
         };
         let border_beta: Vec<f64> = if parallel {
             use rayon::prelude::*;
-            (0..p).into_par_iter().map(border_row).collect()
+            gam_runtime::parallel::fan_out(|| (0..p).into_par_iter().map(border_row).collect())
         } else {
             (0..p).map(border_row).collect()
         };

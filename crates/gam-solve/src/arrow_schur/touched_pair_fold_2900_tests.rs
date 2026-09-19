@@ -116,7 +116,7 @@ fn touched_pair_fold_matches_the_dense_chunk_partials_up_to_zero_sign_2900() {
     .expect("row factors")
     .factors;
     assert!(
-        n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none(),
+        n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level(),
         "the parallel chunk fold must be the route under test"
     );
 
@@ -231,7 +231,7 @@ fn assert_touched_pair_fold_words(k: usize) {
     .expect("row factors")
     .factors;
     assert!(
-        n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none(),
+        n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level(),
         "the parallel chunk fold must be the route under test"
     );
 

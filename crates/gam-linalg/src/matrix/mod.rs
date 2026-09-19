@@ -551,7 +551,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
     let p = matrix.ncols();
     let n = matrix.nrows();
     let large = (n as u64) * (p as u64) >= DENSE_ROW_PARALLEL_MIN_NP;
-    let parallel = large && rayon::current_thread_index().is_none();
+    let parallel = large && gam_runtime::parallel::at_top_level();
     // Fast path: if the matrix is row-major contiguous, read each row as a
     // slice and avoid n*p bounds-checked indexing.
     if matrix.is_standard_layout()
@@ -561,29 +561,31 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
             // Deterministic parallel row reduction: length-only pairwise tree
             // so the accumulated float result never depends on thread count or
             // rayon's demand-driven fold/reduce grouping (#2228).
-            return crate::pairwise_reduce::par_deterministic_block_fold(
-                n,
-                |range: core::ops::Range<usize>| {
-                    let mut acc = vec![0.0_f64; p];
-                    for i in range {
-                        let wi = w[i];
-                        if wi != 0.0 {
-                            let row = &x[i * p..i * p + p];
-                            for j in 0..p {
-                                let xij = row[j];
-                                acc[j] += wi * xij * xij;
+            return gam_runtime::parallel::fan_out(|| {
+                crate::pairwise_reduce::par_deterministic_block_fold(
+                    n,
+                    |range: core::ops::Range<usize>| {
+                        let mut acc = vec![0.0_f64; p];
+                        for i in range {
+                            let wi = w[i];
+                            if wi != 0.0 {
+                                let row = &x[i * p..i * p + p];
+                                for j in 0..p {
+                                    let xij = row[j];
+                                    acc[j] += wi * xij * xij;
+                                }
                             }
                         }
-                    }
-                    acc
-                },
-                |mut a, b| {
-                    for (av, bv) in a.iter_mut().zip(b) {
-                        *av += bv;
-                    }
-                    a
-                },
-            )
+                        acc
+                    },
+                    |mut a, b| {
+                        for (av, bv) in a.iter_mut().zip(b) {
+                            *av += bv;
+                        }
+                        a
+                    },
+                )
+            })
             .unwrap_or_else(|| vec![0.0_f64; p])
             .into();
         }

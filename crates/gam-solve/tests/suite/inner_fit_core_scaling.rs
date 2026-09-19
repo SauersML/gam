@@ -104,8 +104,8 @@ fn inner_fit_core_scaling() {
         .unwrap();
     let t_nested = pool.install(|| {
         assert!(
-            rayon::current_thread_index().is_some(),
-            "nested timing must run inside a Rayon worker"
+            !gam_runtime::parallel::at_top_level(),
+            "nested timing must run nested inside a Rayon worker"
         );
         time_solve(&sys, &opts, reps)
     });

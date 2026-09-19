@@ -257,7 +257,7 @@ fn gaussian_reml_optimize_latent<'py>(
     };
 
     let (best_t, best_value, best_start_grad_norm) = py
-        .detach(|| -> Result<(Array1<f64>, f64, f64), String> {
+        .detach_on_pool(|| -> Result<(Array1<f64>, f64, f64), String> {
             let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
             // Every manifold accepted by `build_latent_outer_manifold` carries the
             // induced ambient metric. Its Riemannian gradient is therefore the
@@ -5597,13 +5597,9 @@ mod latent_analytic_penalty_gradient_tests {
 
 // #1388/#2138 — SAE joint-fit worker driver (used by `sae_manifold_fit_inner` in
 // the sibling `latent_basis_and_sae_ffi.rs` fragment; both are `include!`d into
-// the same crate module, so this item is visible there). 512 MiB stack: the
-// outer-ρ per-row jet loop's multi-megabyte `Tower4<16>` frames overflow Python's
-// calling-thread stack → SIGSEGV; mirror the native CLI (`CLI_WORKER_STACK_SIZE`
-// in `src/main.rs`).
-const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
+// the same crate module, so this item is visible there).
 
-/// Run an owned SAE fit closure on a 512 MiB worker thread with the GIL RELEASED
+/// Run an owned SAE fit closure on the process worker pool with the GIL RELEASED
 /// (#2138), so a multi-minute Rust solve no longer holds the interpreter lock for
 /// its whole duration. The calling thread waits on the result slot in short
 /// GIL-dropped windows and, between them, reacquires the GIL to run any pending
@@ -5629,11 +5625,13 @@ where
     let slot: std::sync::Arc<(std::sync::Mutex<Option<T>>, std::sync::Condvar)> =
         std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
     let worker_slot = std::sync::Arc::clone(&slot);
+    // The spawned thread only hands `f` to the pool and parks: the fit itself
+    // runs on a pool worker, whose stack (`gam::parallel::WORKER_STACK_SIZE`)
+    // holds the outer-ρ per-row jet loop's multi-megabyte `Tower4<16>` frames.
     std::thread::Builder::new()
         .name(thread_name.to_string())
-        .stack_size(SAE_FIT_WORKER_STACK_SIZE)
         .spawn(move || {
-            let out = f();
+            let out = gam_runtime::parallel::install(f);
             let (lock, cvar) = &*worker_slot;
             let mut guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             *guard = Some(out);

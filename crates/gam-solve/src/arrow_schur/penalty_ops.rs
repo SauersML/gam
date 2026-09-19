@@ -1921,11 +1921,11 @@ impl BetaPenaltyOp for CompositePenaltyOp {
         // prefix operator and all prefix work happens-before the serial tail,
         // each output index accumulates in the SAME order as the fully-serial
         // loop — the result is BIT-IDENTICAL, not merely deterministic. Stay
-        // serial when already inside a rayon worker (the topology race / nested
+        // serial when nested (the topology race / nested
         // matvec) to avoid oversubscription — the same guard the row loop uses.
         let mut prefix_len = 0usize;
         let mut prev_end = 0usize;
-        if rayon::current_thread_index().is_none() {
+        if gam_runtime::parallel::at_top_level() {
             for op in &self.ops {
                 match op.output_range() {
                     Some(r) if r.start >= prev_end && r.end > r.start && r.end <= y.len() => {
@@ -1957,10 +1957,12 @@ impl BetaPenaltyOp for CompositePenaltyOp {
                     consumed = r.end;
                 }
             }
-            self.ops[..prefix_len]
-                .par_iter()
-                .zip(subslices.par_iter_mut())
-                .for_each(|(op, y_local)| op.matvec_local(x, y_local));
+            gam_runtime::parallel::fan_out(|| {
+                self.ops[..prefix_len]
+                    .par_iter()
+                    .zip(subslices.par_iter_mut())
+                    .for_each(|(op, y_local)| op.matvec_local(x, y_local))
+            });
             for op in &self.ops[prefix_len..] {
                 op.matvec(x, y);
             }

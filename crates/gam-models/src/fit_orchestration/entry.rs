@@ -129,8 +129,14 @@ fn residual_cascade_failure(error: gam_solve::residual_cascade::ResidualCascadeE
     raised_fit_failure(category, error.to_string())
 }
 
+/// Fit a materialized request on the process worker pool
+/// ([`gam_runtime::parallel::install`]), so every parallel operation of the fit
+/// runs on the pool that belongs to this process.
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
-    let request = request;
+    gam_runtime::parallel::install(move || fit_model_on_pool(request))
+}
+
+fn fit_model_on_pool(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // Every arm hands back the helper's `FitFailure` whole. This boundary used
     // to wrap each helper's text as `IntegrationFailed`, so every solver
     // failure reached Python as `IntegrationError` whatever had failed (#2937).
@@ -1726,6 +1732,14 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    gam_runtime::parallel::install(|| fit_from_formula_with_notes_on_pool(formula, data, config))
+}
+
+fn fit_from_formula_with_notes_on_pool(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
     let automatic = expand_automatic_fit_formula(formula, data, config)?;
     if automatic.notes.is_empty() {
         return fit_expanded_formula_with_notes(formula, data, config);
@@ -3235,7 +3249,7 @@ pub fn materialize<'a>(
         return Err(WorkflowError::InvalidConfig { reason:
             "CTN composition requires fit_from_formula or fit_formula_to_payload".into() });
     }
-    materialize_impl(formula, data, config, false)
+    gam_runtime::parallel::install(|| materialize_impl(formula, data, config, false))
 }
 
 /// Structural-only materialization for `validate_formula`: builds the same
@@ -3246,7 +3260,7 @@ pub fn materialize_structural<'a>(
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    materialize_impl(formula, data, config, true)
+    gam_runtime::parallel::install(|| materialize_impl(formula, data, config, true))
 }
 
 fn materialize_impl<'a>(
@@ -3606,13 +3620,15 @@ pub fn fit_residual_cascade_from_formula(
         return Ok(None);
     };
     let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-    gam_solve::residual_cascade::fit_residual_cascade(
-        &coord_refs,
-        &inputs.y,
-        &inputs.w,
-        &inputs.metric,
-        inputs.sobolev_s,
-    )
+    gam_runtime::parallel::install(|| {
+        gam_solve::residual_cascade::fit_residual_cascade(
+            &coord_refs,
+            &inputs.y,
+            &inputs.w,
+            &inputs.metric,
+            inputs.sobolev_s,
+        )
+    })
     .map(Some)
     .map_err(residual_cascade_failure)
 }
@@ -3647,7 +3663,9 @@ pub fn fit_spline_scan_from_formula(
     let Some(inputs) = spline_scan_fast_path(&request) else {
         return Ok(None);
     };
-    gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
-        .map(Some)
-        .map_err(spline_scan_failure)
+    gam_runtime::parallel::install(|| {
+        gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
+    })
+    .map(Some)
+    .map_err(spline_scan_failure)
 }

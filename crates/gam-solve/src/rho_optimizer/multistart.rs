@@ -63,59 +63,133 @@ impl<R> MultistartOutcome<R> {
     }
 }
 
-/// A seed run's stack: gam's Rayon worker stack (`RAYON_WORKER_STACK_SIZE` in
-/// gam's `src/lib.rs`), since a seed run executes the outer search a fit
-/// otherwise runs on such a worker.
-const SEED_RUN_STACK_BYTES: usize = 64 << 20;
-
 /// Admission of seed runs against the memory governor: a run starts only once the
-/// governor has granted its predicted working set. A refused run waits for a live
-/// run to finish; with no run live it starts anyway, since it is then the serial
-/// run. It never fails and never takes a smaller working set.
+/// governor has granted its predicted working set, and with no run live it starts
+/// anyway, since it is then the serial run. It never fails and never takes a
+/// smaller working set.
+///
+/// Admission never blocks. The lanes are pool tasks, and a worker that waits on a
+/// live run can be the very worker running that run beneath it (it stole the
+/// waiting lane while joining inside the run). A lane refused while a run is live
+/// therefore retires instead, and the next run to finish respawns every retired
+/// lane.
 struct LaneAdmission<'a> {
     governor: &'a gam_runtime::resource::MemoryGovernor,
     working_set_bytes: usize,
     serial_available_bytes: u64,
-    live: std::sync::Mutex<usize>,
-    released: std::sync::Condvar,
+    lanes: std::sync::Mutex<LaneCount>,
     /// The most runs that were live at once.
     most_live: AtomicUsize,
 }
 
+#[derive(Default)]
+struct LaneCount {
+    live: usize,
+    retired: usize,
+}
+
 impl LaneAdmission<'_> {
-    fn admit(&self, context: &str) -> std::sync::Arc<gam_runtime::resource::SearchLaneBudget> {
-        let mut live = self
-            .live
+    fn lanes(&self) -> std::sync::MutexGuard<'_, LaneCount> {
+        self.lanes
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let grant = loop {
-            match self.governor.try_reserve(self.working_set_bytes, context) {
-                Ok(grant) => break Some(grant),
-                Err(_) if *live == 0 => break None,
-                Err(_) => {
-                    live = self
-                        .released
-                        .wait(live)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The lane budget of an admitted run, or `None` when the lane retires.
+    fn admit(
+        &self,
+        context: &str,
+    ) -> Option<std::sync::Arc<gam_runtime::resource::SearchLaneBudget>> {
+        let mut lanes = self.lanes();
+        let grant = match self.governor.try_reserve(self.working_set_bytes, context) {
+            Ok(grant) => Some(grant),
+            Err(_) if lanes.live == 0 => None,
+            Err(_) => {
+                lanes.retired += 1;
+                return None;
             }
         };
-        *live += 1;
-        self.most_live.fetch_max(*live, Ordering::Relaxed);
-        std::sync::Arc::new(gam_runtime::resource::SearchLaneBudget::new(
-            self.serial_available_bytes,
-            grant,
+        lanes.live += 1;
+        self.most_live.fetch_max(lanes.live, Ordering::Relaxed);
+        Some(std::sync::Arc::new(
+            gam_runtime::resource::SearchLaneBudget::new(self.serial_available_bytes, grant),
         ))
     }
 
-    fn release(&self, lane: &gam_runtime::resource::SearchLaneBudget) {
+    /// Retire an admitted run; returns how many retired lanes to respawn.
+    fn release(&self, lane: &gam_runtime::resource::SearchLaneBudget) -> usize {
+        let mut lanes = self.lanes();
         lane.release_grant();
-        let mut live = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *live -= 1;
-        self.released.notify_all();
+        lanes.live -= 1;
+        std::mem::take(&mut lanes.retired)
+    }
+}
+
+/// One seed run's outcome, its payload and its wall time, or its panic.
+type SeedSlot<R> = std::sync::Mutex<
+    Option<std::thread::Result<(Result<CertifiedOuterResult, EstimationError>, R, f64)>>,
+>;
+
+/// The shared state of one multistart's lanes.
+struct SeedLanes<'a, R, Run> {
+    context: &'a str,
+    admission: LaneAdmission<'a>,
+    problems: Vec<std::sync::Mutex<Option<OuterProblem>>>,
+    slots: Vec<SeedSlot<R>>,
+    next_seed: AtomicUsize,
+    run_seed: &'a Run,
+    /// Whether the multistart's caller stood at top level: every seed run stands
+    /// where it did, so it parallelises exactly as a lone search there would.
+    top_level: bool,
+}
+
+impl<R, Run> SeedLanes<'_, R, Run>
+where
+    R: Send,
+    Run: Fn(
+            usize,
+            OuterProblem,
+            std::sync::Arc<gam_runtime::resource::SearchLaneBudget>,
+        ) -> (Result<CertifiedOuterResult, EstimationError>, R)
+        + Sync,
+{
+    /// A lane: runs seeds one after another, each once the governor has admitted
+    /// it, until none is left or admission retires the lane.
+    fn run<'s>(&'s self, scope: &rayon::Scope<'s>) {
+        while self.next_seed.load(Ordering::Relaxed) < self.problems.len() {
+            let Some(budget) = self.admission.admit(self.context) else {
+                return;
+            };
+            let index = self.next_seed.fetch_add(1, Ordering::Relaxed);
+            let problem = self.problems.get(index).and_then(|slot| {
+                slot.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+            });
+            let ran = problem.is_some();
+            if let Some(problem) = problem {
+                let seed_started = std::time::Instant::now();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gam_runtime::parallel::with_top_level(self.top_level, || {
+                        gam_linalg::faer_ndarray::with_faer_sequential(|| {
+                            (self.run_seed)(index, problem, std::sync::Arc::clone(&budget))
+                        })
+                    })
+                }))
+                .map(|(outcome, payload)| {
+                    (outcome, payload, seed_started.elapsed().as_secs_f64())
+                });
+                *self.slots[index]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+            }
+            for _ in 0..self.admission.release(&budget) {
+                scope.spawn(move |scope| self.run(scope));
+            }
+            if !ran {
+                return;
+            }
+        }
     }
 }
 
@@ -296,83 +370,51 @@ impl OuterProblem {
             ) -> (Result<CertifiedOuterResult, EstimationError>, R)
             + Sync,
     {
-        // No more lanes than the pool that would run a single search has workers,
-        // so the multistart never runs more threads than the caller gave it.
-        let concurrency = seeds.len().min(rayon::current_num_threads().max(1));
-        let admission = LaneAdmission {
-            governor,
-            working_set_bytes,
-            serial_available_bytes,
-            live: std::sync::Mutex::new(0),
-            released: std::sync::Condvar::new(),
-            most_live: AtomicUsize::new(0),
+        let top_level = gam_runtime::parallel::at_top_level();
+        let lanes = SeedLanes {
+            context,
+            admission: LaneAdmission {
+                governor,
+                working_set_bytes,
+                serial_available_bytes,
+                lanes: std::sync::Mutex::new(LaneCount::default()),
+                most_live: AtomicUsize::new(0),
+            },
+            problems: problems
+                .into_iter()
+                .map(|problem| std::sync::Mutex::new(Some(problem)))
+                .collect(),
+            slots: seeds.iter().map(|_| std::sync::Mutex::new(None)).collect(),
+            next_seed: AtomicUsize::new(0),
+            run_seed,
+            top_level,
         };
-        log::debug!(
-            "[OUTER] {context}: multistart searches all {} generated seeds on {concurrency} lanes \
-             ({working_set_bytes} bytes predicted per search, {} remaining in the memory budget, \
-             {} bytes available before launch)",
-            seeds.len(),
-            governor.remaining_bytes(),
-            admission.serial_available_bytes,
-        );
+        // The lanes are tasks of the pool the caller runs on: the process pool, or a
+        // caller's own pool (gnomon's calibrate pool, for one), whose workers and
+        // stacks then run every seed. No more lanes than that pool has workers, so
+        // the multistart never runs more threads than the caller gave it.
         let started = std::time::Instant::now();
-        let problems: Vec<std::sync::Mutex<Option<OuterProblem>>> = problems
-            .into_iter()
-            .map(|problem| std::sync::Mutex::new(Some(problem)))
-            .collect();
-        let slots: Vec<std::sync::Mutex<Option<std::thread::Result<_>>>> =
-            seeds.iter().map(|_| std::sync::Mutex::new(None)).collect();
-        let next_seed = AtomicUsize::new(0);
-        // A lane runs seeds one after another until none is left, each once the
-        // governor has admitted it.
-        let lane = || loop {
-            let index = next_seed.fetch_add(1, Ordering::Relaxed);
-            let Some(problem) = problems.get(index).and_then(|slot| {
-                slot.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-            }) else {
-                break;
-            };
-            let budget = admission.admit(context);
-            let seed_started = std::time::Instant::now();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                gam_linalg::faer_ndarray::with_faer_sequential(|| {
-                    run_seed(index, problem, std::sync::Arc::clone(&budget))
-                })
-            }))
-            .map(|(outcome, payload)| (outcome, payload, seed_started.elapsed().as_secs_f64()));
-            admission.release(&budget);
-            *slots[index]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
-        };
-        // From inside a pool (gnomon's calibrate pool, for one) the lanes are tasks
-        // of that pool: its workers and their stacks run every seed. From outside
-        // one, each lane is its own OS thread submitting to the global pool, as the
-        // topology race's concurrent fits do (#2274).
-        if rayon::current_thread_index().is_some() {
-            rayon::scope(|scope| {
-                for _ in 0..concurrency {
-                    scope.spawn(|_| lane());
-                }
+        let concurrency = gam_runtime::parallel::install(|| {
+            let concurrency = seeds.len().min(rayon::current_num_threads().max(1));
+            log::debug!(
+                "[OUTER] {context}: multistart searches all {} generated seeds on {concurrency} \
+                 lanes ({working_set_bytes} bytes predicted per search, {} remaining in the \
+                 memory budget, {serial_available_bytes} bytes available before launch)",
+                seeds.len(),
+                governor.remaining_bytes(),
+            );
+            gam_runtime::parallel::fan_out(|| {
+                rayon::scope(|scope| {
+                    for _ in 0..concurrency {
+                        scope.spawn(|scope| lanes.run(scope));
+                    }
+                });
             });
-        } else {
-            std::thread::scope(|scope| {
-                for worker in 0..concurrency {
-                    std::thread::Builder::new()
-                        .name(format!("gam-multistart-{worker}"))
-                        .stack_size(SEED_RUN_STACK_BYTES)
-                        .spawn_scoped(scope, &lane)
-                        .map_err(|error| {
-                            EstimationError::RemlOptimizationFailed(format!(
-                                "{context}: could not start multistart worker {worker}: {error}"
-                            ))
-                        })?;
-                }
-                Ok::<(), EstimationError>(())
-            })?;
-        }
+            concurrency
+        });
+        let SeedLanes {
+            admission, slots, ..
+        } = lanes;
         let most_live = admission.most_live.load(Ordering::Relaxed);
         let mut runs = Vec::with_capacity(seeds.len());
         for (index, slot) in slots.into_iter().enumerate() {

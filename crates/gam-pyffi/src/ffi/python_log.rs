@@ -181,9 +181,17 @@ pub(crate) fn install() {
 /// Match the engine's log filter to the `gamfit` logger's effective level and
 /// deliver any queued records. The Python wrapper calls this before every
 /// engine call with `logging.getLogger("gamfit").getEffectiveLevel()`.
+///
+/// The process monitor writes only `debug!` heartbeats, so it starts the first
+/// time the level reaches `DEBUG` and never before: importing `gamfit` starts
+/// no thread.
 #[pyfunction]
 pub(crate) fn sync_log_level_from_python(py: Python<'_>, effective_level: i32) {
-    log::set_max_level(level_filter_for_python(effective_level));
+    let filter = level_filter_for_python(effective_level);
+    log::set_max_level(filter);
+    if filter >= LevelFilter::Debug {
+        gam_runtime::process_monitor::start();
+    }
     drain_pending(py, &PENDING);
 }
 

@@ -2029,26 +2029,28 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         // shared — and it is transcendental-heavy (per-row digamma/trigamma
         // derivative stacks), so the per-row evaluation is embarrassingly
         // row-parallel. Materialize the per-row kernels (in parallel for large
-        // `n` when not already on a rayon worker; mirrors the
+        // `n` when at top level; mirrors the
         // `row_coeff_operator` guard), then reduce SERIALLY in index order so
         // the log-likelihood sum is bit-identical to the old serial loop — no
         // float reassociation. The reduction touches no transcendentals, so the
         // parallel kernel map captures essentially all the savings.
         let kernels: Vec<DispersionRowKernel> =
-            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+            if gam_runtime::parallel::at_top_level() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        dispersion_row_kernel(
-                            self.kind,
-                            self.y[i],
-                            eta_mu[i],
-                            eta_d[i],
-                            self.weights[i],
-                        )
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            dispersion_row_kernel(
+                                self.kind,
+                                self.y[i],
+                                eta_mu[i],
+                                eta_d[i],
+                                self.weights[i],
+                            )
+                        })
+                        .collect()
+                })
             } else {
                 (0..n)
                     .map(|i| {
@@ -2126,24 +2128,26 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         // `dispersion_row_kernel(..).loglik`), skipping every gradient/Hessian
         // and digamma/trigamma derivative-stack evaluation. That value-only map
         // is still a pure, row-independent per-row `ln_gamma` evaluation, so it
-        // is row-parallel; fan it out (large `n`, off a rayon worker) into a
+        // is row-parallel; fan it out (large `n`, at top level) into a
         // per-row buffer, then sum SERIALLY in index order to keep the objective
         // bit-identical to the serial loop (no float reassociation).
         let per_row: Vec<f64> =
-            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+            if gam_runtime::parallel::at_top_level() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        dispersion_row_loglik(
-                            self.kind,
-                            self.y[i],
-                            eta_mu[i],
-                            eta_d[i],
-                            self.weights[i],
-                        )
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            dispersion_row_loglik(
+                                self.kind,
+                                self.y[i],
+                                eta_mu[i],
+                                eta_d[i],
+                                self.weights[i],
+                            )
+                        })
+                        .collect()
+                })
             } else {
                 (0..n)
                     .map(|i| {
@@ -2246,23 +2250,25 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
 
         // Per-row observed `(∂²/∂η_μ², ∂²/∂η_μ∂η_d, ∂²/∂η_d²)` weights, one
         // row-program second-order evaluation each. Row-independent, so fan it
-        // out for large `n` (off a rayon worker) into a per-row buffer —
+        // out for large `n` (at top level) into a per-row buffer —
         // index-ordered, no reduction, so byte-identical to the serial map.
         let observed: Vec<(f64, f64, f64)> =
-            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+            if gam_runtime::parallel::at_top_level() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        dispersion_row_observed_hessian_weights(
-                            self.kind,
-                            self.y[i],
-                            eta_mu[i],
-                            eta_d[i],
-                            self.weights[i],
-                        )
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            dispersion_row_observed_hessian_weights(
+                                self.kind,
+                                self.y[i],
+                                eta_mu[i],
+                                eta_d[i],
+                                self.weights[i],
+                            )
+                        })
+                        .collect()
+                })
             } else {
                 (0..n)
                     .map(|i| {
@@ -2416,22 +2422,24 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         let du_mu = mean_spec.design.apply(&u_mu);
         let du_d = disp_spec.design.apply(&u_d);
         let directional: Vec<(f64, f64, f64)> =
-            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+            if gam_runtime::parallel::at_top_level() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        dispersion_row_observed_hessian_directional(
-                            self.kind,
-                            self.y[i],
-                            eta_mu[i],
-                            eta_d[i],
-                            self.weights[i],
-                            du_mu[i],
-                            du_d[i],
-                        )
-                    })
-                    .collect()
+                gam_runtime::parallel::fan_out(|| {
+                    (0..n)
+                        .into_par_iter()
+                        .map(|i| {
+                            dispersion_row_observed_hessian_directional(
+                                self.kind,
+                                self.y[i],
+                                eta_mu[i],
+                                eta_d[i],
+                                self.weights[i],
+                                du_mu[i],
+                                du_d[i],
+                            )
+                        })
+                        .collect()
+                })
             } else {
                 (0..n)
                     .map(|i| {

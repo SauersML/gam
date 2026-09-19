@@ -1669,18 +1669,20 @@ impl BlockPenaltyLogdetGeometry {
             })
         };
 
-        let block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
+        let block_results: Vec<BlockResult> = if !gam_runtime::parallel::at_top_level() {
             self.blocks
                 .iter()
                 .enumerate()
                 .map(evaluate_block)
                 .collect::<Result<Vec<_>, String>>()?
         } else {
-            self.blocks
-                .par_iter()
-                .enumerate()
-                .map(evaluate_block)
-                .collect::<Result<Vec<_>, String>>()?
+            gam_runtime::parallel::fan_out(|| {
+                self.blocks
+                    .par_iter()
+                    .enumerate()
+                    .map(evaluate_block)
+                    .collect::<Result<Vec<_>, String>>()
+            })?
         };
 
         let total_coordinates: usize = self.blocks.iter().map(|block| block.coordinate_count).sum();

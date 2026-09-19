@@ -857,7 +857,7 @@ impl SaeManifoldTerm {
     pub(crate) fn refresh_basis_from_current_coords(&mut self) -> Result<(), String> {
         let parallel = self.n_obs() >= SAE_LOSS_PARALLEL_ROW_MIN
             && self.k_atoms() > 1
-            && rayon::current_thread_index().is_none();
+            && gam_runtime::parallel::at_top_level();
         self.refresh_basis_from_current_coords_with_parallelism(parallel)
     }
 
@@ -882,17 +882,18 @@ impl SaeManifoldTerm {
         }
         if parallel {
             use rayon::prelude::*;
-            let outcomes: Vec<Result<(), String>> = self
-                .atoms
-                .par_iter_mut()
-                .zip(self.assignment.coords.par_iter())
-                .map(|(atom, coord)| {
-                    with_nested_parallel(|| {
-                        let coords = coord.as_matrix();
-                        atom.refresh_basis(coords.view())
+            let outcomes: Vec<Result<(), String>> = gam_runtime::parallel::fan_out(|| {
+                self.atoms
+                    .par_iter_mut()
+                    .zip(self.assignment.coords.par_iter())
+                    .map(|(atom, coord)| {
+                        with_nested_parallel(|| {
+                            let coords = coord.as_matrix();
+                            atom.refresh_basis(coords.view())
+                        })
                     })
-                })
-                .collect();
+                    .collect()
+            });
             for outcome in outcomes {
                 outcome?;
             }
@@ -964,13 +965,14 @@ impl SaeManifoldTerm {
 
         if parallel {
             use rayon::prelude::*;
-            let outcomes: Vec<Result<(), String>> = self
-                .atoms
-                .par_iter_mut()
-                .zip(self.assignment.coords.par_iter_mut())
-                .enumerate()
-                .map(|(atom_idx, (atom, coord))| update_atom(atom_idx, atom, coord, true))
-                .collect();
+            let outcomes: Vec<Result<(), String>> = gam_runtime::parallel::fan_out(|| {
+                self.atoms
+                    .par_iter_mut()
+                    .zip(self.assignment.coords.par_iter_mut())
+                    .enumerate()
+                    .map(|(atom_idx, (atom, coord))| update_atom(atom_idx, atom, coord, true))
+                    .collect()
+            });
             for outcome in outcomes {
                 outcome?;
             }
@@ -1019,10 +1021,12 @@ impl SaeManifoldTerm {
         };
         if parallel {
             use rayon::prelude::*;
-            self.atoms
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(atom_idx, atom)| update_atom(atom_idx, atom));
+            gam_runtime::parallel::fan_out(|| {
+                self.atoms
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(atom_idx, atom)| update_atom(atom_idx, atom))
+            });
         } else {
             for (atom_idx, atom) in self.atoms.iter_mut().enumerate() {
                 update_atom(atom_idx, atom);
@@ -4692,13 +4696,15 @@ impl SaeManifoldTerm {
                 let energy: f64 = fit.iter().map(|v| v * v).sum();
                 Ok((atom, energy, beta))
             };
-            let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+            let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
             let scored: Vec<(usize, f64, Array2<f64>)> = if parallel {
                 use rayon::prelude::*;
-                remaining
-                    .par_iter()
-                    .map(|&atom| score_candidate(atom))
-                    .collect::<Result<Vec<_>, String>>()?
+                gam_runtime::parallel::fan_out(|| {
+                    remaining
+                        .par_iter()
+                        .map(|&atom| score_candidate(atom))
+                        .collect::<Result<Vec<_>, String>>()
+                })?
             } else {
                 remaining
                     .iter()
@@ -5011,10 +5017,12 @@ impl SaeManifoldTerm {
             };
             (contribution_cos > contribution_bar).then_some((j, kk, contribution_cos, contribution_bar))
         };
-        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
         let collapsed: Vec<(usize, usize, f64, f64)> = if parallel {
             use rayon::prelude::*;
-            candidates.into_par_iter().filter_map(score_pair).collect()
+            gam_runtime::parallel::fan_out(|| {
+                candidates.into_par_iter().filter_map(score_pair).collect()
+            })
         } else {
             candidates.into_iter().filter_map(score_pair).collect()
         };
@@ -5484,7 +5492,7 @@ impl SaeManifoldTerm {
         let q = self.assignment.row_block_dim();
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
-        let at_top_level = rayon::current_thread_index().is_none();
+        let at_top_level = gam_runtime::parallel::at_top_level();
         let parallel_rows =
             forced_parallelism.unwrap_or(n >= SAE_LOSS_PARALLEL_ROW_MIN && at_top_level);
         let parallel_atoms = forced_parallelism
@@ -5534,17 +5542,19 @@ impl SaeManifoldTerm {
             let mut full_delta = vec![0.0_f64; n * q];
             if parallel_rows && q > 0 {
                 use rayon::prelude::*;
-                full_delta
-                    .par_chunks_mut(q)
-                    .enumerate()
-                    .for_each(|(row, full_row)| {
-                        let compact_row: Vec<f64> = delta_ext_coord
-                            .slice(ndarray::s![compact_offsets[row]..compact_offsets[row + 1]])
-                            .iter()
-                            .copied()
-                            .collect();
-                        layout.expand_row(row, &compact_row, full_row);
-                    });
+                gam_runtime::parallel::fan_out(|| {
+                    full_delta
+                        .par_chunks_mut(q)
+                        .enumerate()
+                        .for_each(|(row, full_row)| {
+                            let compact_row: Vec<f64> = delta_ext_coord
+                                .slice(ndarray::s![compact_offsets[row]..compact_offsets[row + 1]])
+                                .iter()
+                                .copied()
+                                .collect();
+                            layout.expand_row(row, &compact_row, full_row);
+                        })
+                });
             } else {
                 for row in 0..n {
                     let compact_row: Vec<f64> = delta_ext_coord
@@ -5561,23 +5571,25 @@ impl SaeManifoldTerm {
                 SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             if parallel_rows {
                 use rayon::prelude::*;
-                self.assignment
-                    .logits
-                    .axis_iter_mut(ndarray::Axis(0))
-                    .into_par_iter()
-                    .enumerate()
-                    .for_each(|(row, mut logits)| {
-                        let row_base = row * q;
-                        for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
-                        }
-                        if softmax {
-                            canonicalize_softmax_logit_row(
-                                logits.as_slice_mut().expect("contiguous logit row"),
-                            );
-                        }
-                    });
+                gam_runtime::parallel::fan_out(|| {
+                    self.assignment
+                        .logits
+                        .axis_iter_mut(ndarray::Axis(0))
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each(|(row, mut logits)| {
+                            let row_base = row * q;
+                            for atom_idx in 0..assignment_dim {
+                                logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
+                                    .clamp(-logit_step_cap, logit_step_cap);
+                            }
+                            if softmax {
+                                canonicalize_softmax_logit_row(
+                                    logits.as_slice_mut().expect("contiguous logit row"),
+                                );
+                            }
+                        })
+                });
             } else {
                 for row in 0..n {
                     let row_base = row * q;
@@ -5619,23 +5631,25 @@ impl SaeManifoldTerm {
                 SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             if parallel_rows {
                 use rayon::prelude::*;
-                self.assignment
-                    .logits
-                    .axis_iter_mut(ndarray::Axis(0))
-                    .into_par_iter()
-                    .enumerate()
-                    .for_each(|(row, mut logits)| {
-                        let row_base = row * q;
-                        for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
-                        }
-                        if softmax {
-                            canonicalize_softmax_logit_row(
-                                logits.as_slice_mut().expect("contiguous logit row"),
-                            );
-                        }
-                    });
+                gam_runtime::parallel::fan_out(|| {
+                    self.assignment
+                        .logits
+                        .axis_iter_mut(ndarray::Axis(0))
+                        .into_par_iter()
+                        .enumerate()
+                        .for_each(|(row, mut logits)| {
+                            let row_base = row * q;
+                            for atom_idx in 0..assignment_dim {
+                                logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
+                                    .clamp(-logit_step_cap, logit_step_cap);
+                            }
+                            if softmax {
+                                canonicalize_softmax_logit_row(
+                                    logits.as_slice_mut().expect("contiguous logit row"),
+                                );
+                            }
+                        })
+                });
             } else {
                 for row in 0..n {
                     let row_base = row * q;
@@ -5910,13 +5924,15 @@ impl SaeManifoldTerm {
                         })
                 };
                 let parallel =
-                    n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                    n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
                 let solved: Vec<(usize, f64)> = if parallel {
                     use rayon::prelude::*;
-                    visit_order
-                        .par_iter()
-                        .map(|&row| solve_row(row).map(|coordinate| (row, coordinate)))
-                        .collect::<Result<Vec<_>, String>>()?
+                    gam_runtime::parallel::fan_out(|| {
+                        visit_order
+                            .par_iter()
+                            .map(|&row| solve_row(row).map(|coordinate| (row, coordinate)))
+                            .collect::<Result<Vec<_>, String>>()
+                    })?
                 } else {
                     visit_order
                         .iter()
@@ -6167,13 +6183,15 @@ impl SaeManifoldTerm {
                     };
                 let n_atoms = atoms.len();
                 let parallel =
-                    n_atoms >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                    n_atoms >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
                 if parallel {
                     use rayon::prelude::*;
-                    (0..n_atoms)
-                        .into_par_iter()
-                        .map(|atom_idx| with_nested_parallel(|| compute_plan(atom_idx)))
-                        .collect()
+                    gam_runtime::parallel::fan_out(|| {
+                        (0..n_atoms)
+                            .into_par_iter()
+                            .map(|atom_idx| with_nested_parallel(|| compute_plan(atom_idx)))
+                            .collect()
+                    })
                 } else {
                     (0..n_atoms).map(compute_plan).collect()
                 }
@@ -6587,20 +6605,22 @@ impl SaeManifoldTerm {
             }
             Ok(())
         };
-        if n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
-            sys.rows
-                .par_iter_mut()
-                .enumerate()
-                .map(|(row, block)| -> Result<Vec<Array1<f64>>, String> {
-                    with_nested_parallel(|| {
-                        let nulls = row_sub_floor_null_directions(block.htt.view());
-                        if let Some(curvature) = row_curvature(row, row_dims[row])? {
-                            add_positive_part(curvature, &nulls, &mut block.htt)?;
-                        }
-                        Ok(nulls)
+        if n >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level() {
+            gam_runtime::parallel::fan_out(|| {
+                sys.rows
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(row, block)| -> Result<Vec<Array1<f64>>, String> {
+                        with_nested_parallel(|| {
+                            let nulls = row_sub_floor_null_directions(block.htt.view());
+                            if let Some(curvature) = row_curvature(row, row_dims[row])? {
+                                add_positive_part(curvature, &nulls, &mut block.htt)?;
+                            }
+                            Ok(nulls)
+                        })
                     })
-                })
-                .collect()
+                    .collect()
+            })
         } else {
             let mut step_row_nulls = Vec::with_capacity(n);
             for (row, block) in sys.rows.iter_mut().enumerate() {
@@ -7066,17 +7086,18 @@ impl SaeManifoldTerm {
                 setup_report.push_str(&format!(" {name}={:.2}s", at - previous_mark));
                 previous_mark = *at;
             }
-            // Whether this joint fit runs inside a Rayon worker: every row-parallel
-            // pass in this crate declines to nest (`rayon::current_thread_index()
-            // .is_none()`), so a criterion evaluated from inside the pool runs
-            // its passes serially — the `cpu=1.5/128` shape of #2731.
+            // Whether this joint fit runs nested inside a parallel region: every
+            // row-parallel pass in this crate fans out only at top level
+            // (`gam_runtime::parallel::at_top_level()`), so a criterion evaluated
+            // from nested pool work runs its passes serially — the `cpu=1.5/128`
+            // shape of #2731.
             log::debug!(
                 "[SAE/inner] setup before the first iteration: {:.2}s (max_iter={max_iter}) \
-                 phases:{setup_report} entry_sweep={:.2}s in_rayon_worker={} \
+                 phases:{setup_report} entry_sweep={:.2}s nested={} \
                  rayon_threads={}",
                 joint_fit_entered.elapsed().as_secs_f64(),
                 joint_fit_entered.elapsed().as_secs_f64() - previous_mark,
-                rayon::current_thread_index().is_some(),
+                !gam_runtime::parallel::at_top_level(),
                 rayon::current_num_threads(),
             );
         }
@@ -7204,7 +7225,7 @@ impl SaeManifoldTerm {
             // run-to-run drift — bit-identical to the serial sweep.
             let n_rows = sys.rows.len();
             let parallel =
-                n_rows >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                n_rows >= SAE_LOSS_PARALLEL_ROW_MIN && gam_runtime::parallel::at_top_level();
             if parallel {
                 use rayon::prelude::*;
                 const CHUNK: usize = 64;
@@ -7231,28 +7252,30 @@ impl SaeManifoldTerm {
                     segments.push((start, seg));
                     prev_end = row_offsets[end];
                 }
-                segments.into_par_iter().for_each(|(start, seg)| {
-                    let end = (start + CHUNK).min(n_rows);
-                    let mut local = 0usize;
-                    for row_idx in start..end {
-                        let di = sys.row_dims[row_idx];
-                        // #1557 — the null-direction eigendecomp (`sym.eigh`) issues a
-                        // faer GEMM; pin it to `Par::Seq` inside this row worker so it
-                        // does not re-fan the outer pool (bit-identical result).
-                        for dir in &step_row_nulls[row_idx] {
-                            if dir.len() != di {
-                                continue;
+                gam_runtime::parallel::fan_out(|| {
+                    segments.into_par_iter().for_each(|(start, seg)| {
+                        let end = (start + CHUNK).min(n_rows);
+                        let mut local = 0usize;
+                        for row_idx in start..end {
+                            let di = sys.row_dims[row_idx];
+                            // #1557 — the null-direction eigendecomp (`sym.eigh`) issues a
+                            // faer GEMM; pin it to `Par::Seq` inside this row worker so it
+                            // does not re-fan the outer pool (bit-identical result).
+                            for dir in &step_row_nulls[row_idx] {
+                                if dir.len() != di {
+                                    continue;
+                                }
+                                let mut dot = 0.0;
+                                for a in 0..di {
+                                    dot += dir[a] * seg[local + a];
+                                }
+                                for a in 0..di {
+                                    seg[local + a] -= dot * dir[a];
+                                }
                             }
-                            let mut dot = 0.0;
-                            for a in 0..di {
-                                dot += dir[a] * seg[local + a];
-                            }
-                            for a in 0..di {
-                                seg[local + a] -= dot * dir[a];
-                            }
+                            local += di;
                         }
-                        local += di;
-                    }
+                    })
                 });
             } else {
                 for row_idx in 0..n_rows {

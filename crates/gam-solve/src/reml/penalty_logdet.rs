@@ -482,16 +482,18 @@ impl PenaltyPseudologdet {
                 nullity,
             })
         };
-        let block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
+        let block_results: Vec<BlockResult> = if !gam_runtime::parallel::at_top_level() {
             blocks
                 .iter()
                 .map(process_block)
                 .collect::<Result<Vec<_>, String>>()?
         } else {
-            blocks
-                .par_iter()
-                .map(process_block)
-                .collect::<Result<Vec<_>, String>>()?
+            gam_runtime::parallel::fan_out(|| {
+                blocks
+                    .par_iter()
+                    .map(process_block)
+                    .collect::<Result<Vec<_>, String>>()
+            })?
         };
 
         // Also add uncovered dimensions as trivial "block results".
@@ -1342,10 +1344,10 @@ impl PenaltyPseudologdet {
             let root = psd_component_root(s.view())?;
             Ok(Self::reduced_from_root(&root.dot(&self.w_factor)))
         };
-        let y_k: Result<Vec<Array2<f64>>, String> = if rayon::current_thread_index().is_some() {
+        let y_k: Result<Vec<Array2<f64>>, String> = if !gam_runtime::parallel::at_top_level() {
             s_k_matrices.iter().map(project).collect()
         } else {
-            s_k_matrices.par_iter().map(project).collect()
+            gam_runtime::parallel::fan_out(|| s_k_matrices.par_iter().map(project).collect())
         };
         // A unit penalty component whose own eigendecomposition fails is a
         // malformed input, not a numerical regime: fall back to the direct
@@ -1376,7 +1378,7 @@ impl PenaltyPseudologdet {
         // Second derivatives: ∂²_ρk ρl L = δ_{kl} ∂_ρk L − λ_k λ_l tr(Y_k Y_l).
         // Y_k is symmetric (W^T S_k W with S_k symmetric), so tr(Y_k Y_l) = tr(Y_k Y_l^T).
         let pairs = (0..k).flat_map(|ki| (0..=ki).map(move |li| (ki, li)));
-        let pair_vals: Vec<(usize, usize, f64)> = if rayon::current_thread_index().is_some() {
+        let pair_vals: Vec<(usize, usize, f64)> = if !gam_runtime::parallel::at_top_level() {
             pairs
                 .map(|(ki, li)| {
                     let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
@@ -1388,17 +1390,19 @@ impl PenaltyPseudologdet {
                 })
                 .collect()
         } else {
-            pairs
-                .par_bridge()
-                .map(|(ki, li)| {
-                    let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
-                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                    if ki == li {
-                        val += det1[ki];
-                    }
-                    (ki, li, val)
-                })
-                .collect()
+            gam_runtime::parallel::fan_out(|| {
+                pairs
+                    .par_bridge()
+                    .map(|(ki, li)| {
+                        let tr_ab = Self::trace_dense_product(&y_k[ki], &y_k[li]);
+                        let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                        if ki == li {
+                            val += det1[ki];
+                        }
+                        (ki, li, val)
+                    })
+                    .collect()
+            })
         };
         let mut det2 = Array2::<f64>::zeros((k, k));
         for (ki, li, val) in pair_vals {
@@ -1473,10 +1477,10 @@ impl PenaltyPseudologdet {
             }
         };
 
-        let y_k: Vec<ReducedPenalty> = if rayon::current_thread_index().is_some() {
+        let y_k: Vec<ReducedPenalty> = if !gam_runtime::parallel::at_top_level() {
             penalties.iter().map(project).collect()
         } else {
-            penalties.par_iter().map(project).collect()
+            gam_runtime::parallel::fan_out(|| penalties.par_iter().map(project).collect())
         };
 
         let mut det1 = Array1::<f64>::zeros(k);
@@ -1486,7 +1490,7 @@ impl PenaltyPseudologdet {
         }
 
         let pairs = (0..k).flat_map(|ki| (0..=ki).map(move |li| (ki, li)));
-        let pair_vals: Vec<(usize, usize, f64)> = if rayon::current_thread_index().is_some() {
+        let pair_vals: Vec<(usize, usize, f64)> = if !gam_runtime::parallel::at_top_level() {
             pairs
                 .map(|(ki, li)| {
                     let same_span = match (y_k[ki].span, y_k[li].span) {
@@ -1506,25 +1510,27 @@ impl PenaltyPseudologdet {
                 })
                 .collect()
         } else {
-            pairs
-                .par_bridge()
-                .map(|(ki, li)| {
-                    let same_span = match (y_k[ki].span, y_k[li].span) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    };
-                    let tr_ab = if same_span {
-                        Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
-                    } else {
-                        0.0
-                    };
-                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                    if ki == li {
-                        val += det1[ki];
-                    }
-                    (ki, li, val)
-                })
-                .collect()
+            gam_runtime::parallel::fan_out(|| {
+                pairs
+                    .par_bridge()
+                    .map(|(ki, li)| {
+                        let same_span = match (y_k[ki].span, y_k[li].span) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => true,
+                        };
+                        let tr_ab = if same_span {
+                            Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
+                        } else {
+                            0.0
+                        };
+                        let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+                        if ki == li {
+                            val += det1[ki];
+                        }
+                        (ki, li, val)
+                    })
+                    .collect()
+            })
         };
         let mut det2 = Array2::<f64>::zeros((k, k));
         for (ki, li, val) in pair_vals {

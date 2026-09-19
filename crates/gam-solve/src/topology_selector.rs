@@ -730,29 +730,18 @@ impl TopologyRaceThreadPlan {
     }
 }
 
-/// Run independent topology-race candidates concurrently on plain OS threads
-/// (never nested Rayon pools).
+/// Run independent topology-race candidates concurrently as tasks of the pool
+/// the caller runs on.
 ///
-/// Each candidate's fit runs on its own `std::thread`, NOT inside a per-candidate
-/// `rayon::ThreadPool` (see the `#2274` follow-up note on
-/// `run_one_topology_race_candidate` for why: a nested Rayon pool makes every
-/// row-fan gate downstream — `SaeManifoldTerm::loss_scaled`,
-/// `CpuBatchedBlockSolver::factor_blocks`, the reduced-Schur row loops — read
-/// `rayon::current_thread_index().is_some()` and silently fall back to a fully
-/// sequential per-row loop, discarding whatever thread budget the nested pool
-/// was given). A plain OS thread is not a Rayon worker of anything, so those
-/// gates see `None` and fan into the process's one shared global Rayon pool
-/// exactly as they would for an ordinary top-level call; when multiple
-/// candidates race concurrently they each submit to that same global pool,
-/// which is precisely the many-producer-threads-one-pool pattern Rayon's
-/// work-stealing scheduler is built to host (and it can rebalance dynamically
-/// as candidates finish at different times, which a static per-candidate
-/// thread slice could not). For multi-candidate races the runner still batches
-/// candidates (via `TopologyRaceThreadPlan::for_budget`'s `concurrent_fits`) so
-/// the number of simultaneously-live candidate threads stays bounded by
-/// `std::thread::available_parallelism()`; `per_fit_threads` is retained purely
-/// as reporting metadata on the returned rows (existing callers/tests read it)
-/// and no longer sizes a real pool.
+/// Each candidate is a whole fit, so it runs as a root computation of its own
+/// ([`gam_runtime::parallel::as_root`]): every row-fan gate inside it
+/// (`SaeManifoldTerm::loss_scaled`, `CpuBatchedBlockSolver::factor_blocks`, the
+/// reduced-Schur row loops) sees top level and fans out over the same pool, as
+/// it would for a lone fit, and the pool's work stealing rebalances as
+/// candidates finish at different times (#2274). Candidates run in batches of
+/// `TopologyRaceThreadPlan::for_budget`'s `concurrent_fits`, bounded by the
+/// pool's width; `per_fit_threads` is reporting metadata on the returned rows
+/// and sizes no pool.
 ///
 /// The return vector is in input order and keeps each closure output intact; use
 /// `FitResult = Result<T, E>` to collect per-candidate failures with wall times.
@@ -765,9 +754,7 @@ where
     FitResult: Send,
     FitOne: Fn(Candidate) -> FitResult + Sync,
 {
-    let max_total_threads = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let max_total_threads = gam_runtime::parallel::install(rayon::current_num_threads);
     run_topology_race_parallel_with_budget(candidates, fit_one, max_total_threads)
 }
 
@@ -792,60 +779,42 @@ where
         (0..candidate_count).map(|_| Mutex::new(None)).collect();
     let pool_error: Mutex<Option<String>> = Mutex::new(None);
 
-    if plan.concurrent_fits <= 1 {
-        for idx in 0..candidate_count {
-            let candidate = candidates[idx]
-                .take()
-                .expect("topology race candidate must be present");
-            run_one_topology_race_candidate(
-                idx,
-                candidate,
-                &fit_one,
-                plan.per_fit_threads,
-                &slots[idx],
-                &pool_error,
-            );
-            if let Some(err) = pool_error.lock().expect("pool_error mutex poisoned").take() {
-                return Err(err);
-            }
-        }
-    } else {
-        // #2274 follow-up — batch concurrent candidates over plain OS threads
-        // (`std::thread::scope`), NOT a `rayon::ThreadPool` "coordinator" pool.
-        // The coordinator pool previously existed only to host `scope.spawn`
-        // for each candidate; a scoped OS thread does the same job (bounded
-        // concurrency within a batch, borrow-checked access to `candidates`/
-        // `slots`/`pool_error`) without making the candidates' OWN internal
-        // Rayon work nested under it. See `run_one_topology_race_candidate`
-        // for why that nesting was the root cause of the row-fan collapse.
-        let mut batch_start = 0usize;
-        while batch_start < candidate_count {
-            let batch_end = (batch_start + plan.concurrent_fits).min(candidate_count);
-            std::thread::scope(|scope| {
-                for idx in batch_start..batch_end {
-                    let candidate = candidates[idx]
-                        .take()
-                        .expect("topology race candidate must be present");
-                    let slot = &slots[idx];
-                    let pool_error = &pool_error;
-                    let fit_one = &fit_one;
-                    scope.spawn(move || {
-                        run_one_topology_race_candidate(
-                            idx,
-                            candidate,
-                            fit_one,
-                            plan.per_fit_threads,
-                            slot,
-                            pool_error,
-                        );
-                    });
-                }
+    let mut batch_start = 0usize;
+    while batch_start < candidate_count {
+        let batch_end = (batch_start + plan.concurrent_fits.max(1)).min(candidate_count);
+        let batch: Vec<(usize, Candidate)> = (batch_start..batch_end)
+            .map(|idx| {
+                let candidate = candidates[idx]
+                    .take()
+                    .expect("topology race candidate must be present");
+                (idx, candidate)
+            })
+            .collect();
+        gam_runtime::parallel::install(|| {
+            gam_runtime::parallel::fan_out(|| {
+                rayon::scope(|scope| {
+                    for (idx, candidate) in batch {
+                        let slot = &slots[idx];
+                        let pool_error = &pool_error;
+                        let fit_one = &fit_one;
+                        scope.spawn(move |_| {
+                            run_one_topology_race_candidate(
+                                idx,
+                                candidate,
+                                fit_one,
+                                plan.per_fit_threads,
+                                slot,
+                                pool_error,
+                            );
+                        });
+                    }
+                });
             });
-            if let Some(err) = pool_error.lock().expect("pool_error mutex poisoned").take() {
-                return Err(err);
-            }
-            batch_start = batch_end;
+        });
+        if let Some(err) = pool_error.lock().expect("pool_error mutex poisoned").take() {
+            return Err(err);
         }
+        batch_start = batch_end;
     }
 
     let mut out = Vec::with_capacity(candidate_count);
@@ -872,53 +841,15 @@ fn run_one_topology_race_candidate<Candidate, FitResult, FitOne>(
     FitOne: Fn(Candidate) -> FitResult + Sync,
 {
     let started = Instant::now();
-    // #2274 follow-up (root cause of the E1 SAE inner solve's 2/30-core
-    // ceiling: `crates/gam-sae/src/manifold/stagewise.rs`'s birth race had the
-    // SAME disease one layer up — a `seeds.par_iter()` fan running each
-    // candidate's ENTIRE inner solve nested inside a Rayon worker, which
-    // silently disabled every downstream CPU row-fan gate). This function had
-    // the identical bug: `rayon::ThreadPoolBuilder::new().num_threads(per_fit_threads)`
-    // + `pool.install(|| ...)` unconditionally makes the executing frame
-    // report `rayon::current_thread_index() == Some(_)` (relative to that
-    // fresh pool) for the ENTIRE nested call into `fit_one` — regardless of
-    // how many threads the pool was built with. Every row-fan gate downstream
-    // (`SaeManifoldTerm::loss_scaled`, `CpuBatchedBlockSolver::factor_blocks`,
-    // the reduced-Schur row loops in reduced_solve.rs/system.rs/newton_step.rs)
-    // reads exactly that condition to decide "am I nested, fall back to
-    // sequential" — so `per_fit_threads` was NEVER actually available to those
-    // gates; they always took the single-threaded fallback.
-    //
-    // Fix: run `fit_one` on a plain, non-Rayon OS thread instead. A
-    // `std::thread` is not a worker of any Rayon pool, so
-    // `current_thread_index()` reports `None` inside it, exactly like an
-    // ordinary top-level (non-raced) call — every downstream row-fan gate
-    // takes its real parallel branch, fanning into the process's one shared
-    // global Rayon pool (the pool those gates were written assuming). When
-    // several candidates race concurrently (the `concurrent_fits > 1` caller),
-    // each gets its own OS thread and independently submits parallel work to
-    // that SAME global pool: Rayon's work-stealing scheduler is explicitly
-    // built to host many concurrent producer threads against one pool and
-    // fairly interleaves their submissions, rebalancing dynamically as each
-    // candidate's row-fan finishes at a different wall-clock time — something
-    // a static per-candidate thread slice could never do. `per_fit_threads` is
-    // kept as reporting/diagnostic metadata on the returned row (existing
-    // callers/tests read it); it no longer sizes a real pool.
-    //
-    // Cannot deadlock: no nested Rayon pool is created here anymore, so the
-    // #2074 class this function's old comment warned about (faer's `spindle`
-    // barrier waiting on pool slots an outer fan-out already holds) cannot
-    // occur — `with_faer_sequential` below still pins faer's own internal
-    // solvers to `Par::Seq` for defense in depth, but there is no longer any
-    // Rayon-in-Rayon nesting for that barrier to even be reached through. Nor
-    // does this touch the OnceLock×Rayon deadlock class: a plain `std::thread`
-    // does no lazy static init of its own, and the GPU-resident caller
-    // (`run_resident_fits_multiplexed_with`) already documents that its
-    // `OnceLock`s are warmed BEFORE any candidate here runs.
-    let outcome = std::thread::scope(|scope| {
-        scope
-            .spawn(move || gam_linalg::faer_ndarray::with_faer_sequential(|| fit_one(candidate)))
-            .join()
-    });
+    // A panicking candidate becomes the race's error instead of unwinding
+    // through the scope. `with_faer_sequential` pins faer's own solvers to
+    // `Par::Seq` inside the candidate, so faer never waits on pool slots the
+    // race's other candidates hold (#2074).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        gam_runtime::parallel::as_root(|| {
+            gam_linalg::faer_ndarray::with_faer_sequential(|| fit_one(candidate))
+        })
+    }));
     let wall_time = started.elapsed();
     match outcome {
         Ok(result) => {

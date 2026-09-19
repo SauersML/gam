@@ -4236,7 +4236,7 @@ fn stack_topologies_gaussian(
         )));
     }
     let solved = py
-        .detach(|| {
+        .detach_on_pool(|| {
             gam::solver::topology_stack_gaussian::stack_topologies_gaussian(
                 &y,
                 &means,
@@ -4552,7 +4552,7 @@ fn gaussian_weighted_ridge_batch_backward<'py>(
     let coef_owned = coef.as_array().to_owned();
     let row_counts_owned = row_counts.map(|counts| counts.as_array().to_owned());
     let (grad_x, grad_y, grad_penalty, grad_weights) = py
-        .detach(move || {
+        .detach_on_pool(move || {
             gam::linalg::gaussian_weighted_ridge_backward::gaussian_weighted_ridge_batch_backward(
                 grad_coef_owned.view(),
                 grad_fitted_owned.view(),

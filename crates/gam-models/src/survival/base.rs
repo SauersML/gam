@@ -3597,17 +3597,19 @@ pub fn assemble_competing_risks_cif_from_endpoints(
         Ok((cif_flat, surv_row))
     };
 
-    // Nesting guard (`rayon::current_thread_index().is_none()`) keeps us from
-    // oversubscribing when this routine is itself called from inside a rayon
-    // worker, and the row-count gate keeps small inputs on the serial path.
+    // Nesting guard (`gam_runtime::parallel::at_top_level()`) keeps us from
+    // oversubscribing when this routine is itself called from inside a
+    // parallel region, and the row-count gate keeps small inputs on the serial path.
     let rows: Vec<(Vec<f64>, Vec<f64>)> = if n_rows >= COMPETING_RISKS_CIF_PARALLEL_ROW_MIN
-        && rayon::current_thread_index().is_none()
+        && gam_runtime::parallel::at_top_level()
     {
         use rayon::prelude::*;
-        (0..n_rows)
-            .into_par_iter()
-            .map(assemble_row)
-            .collect::<Result<_, _>>()?
+        gam_runtime::parallel::fan_out(|| {
+            (0..n_rows)
+                .into_par_iter()
+                .map(assemble_row)
+                .collect::<Result<_, _>>()
+        })?
     } else {
         (0..n_rows).map(assemble_row).collect::<Result<_, _>>()?
     };
