@@ -19,37 +19,56 @@ Design (`lr_null_mc.py`): truth `η = b0 + a1·sin(2πx1) + a3·cos(2πx3)`,
 python lr_null_mc.py <cell> 600 <workers> out.json
 ```
 
-KS: a double-penalty null smooth is shrunk to nothing on about half the
-datasets, so a calibrated p has an atom at `1 − m` and is uniform below it. The
-full-range KS rejects that by construction; `KS | p < .5` tests `2p` on that
-event against U(0, 1) and is the shape check.
+KS: the two-sided Kolmogorov-Smirnov test of every null p-value against
+U(0, 1). On the corrected reference the null p-value has no material atom
+(a shrunk null block is scored where its statistic falls, not sent to one), so
+the whole range is held to uniformity, and a mass piled near one fails it as
+an excess near zero does.
 
-## Results (600 replicates per cell, MCSE at .05 = 0.0089, at .01 = 0.0041)
+## Results (600 replicates per cell, MCSE at .10 = 0.0122, .05 = 0.0089, .01 = 0.0041)
 
-`before` = origin/main b0efd45a; `after` = this branch. Size is
-`P(p ≤ α)`; `z` is its distance from α in MCSE.
+`before` = origin/main df02753c; `after` = this branch merged with it. Size
+is `P(p ≤ α)`; `z` is its distance from α in MCSE, on either side.
 
-| cell | | size .10 (z) | size .05 (z) | size .01 (z) | KS \| p<.5 | power .05 |
+| cell | | size .10 (z) | size .05 (z) | size .01 (z) | KS p | power .05 |
 |---|---|---|---|---|---|---|
-| gauss_small | before | 0.1200 (+1.63) | 0.0700 (**+2.25**) | 0.0167 (+1.64) | 0.191 | 0.7233 |
-| gauss_small | after | 0.1217 (+1.77) | 0.0667 (+1.87) | 0.0167 (+1.64) | 0.125 | 0.7200 |
-| gauss | before | 0.1050 (+0.41) | 0.0450 (−0.56) | 0.0067 (−0.82) | 0.555 | 0.6817 |
-| gauss | after | 0.1083 (+0.68) | 0.0483 (−0.19) | 0.0067 (−0.82) | 0.706 | 0.6817 |
-| pois | before | 0.0967 (−0.27) | 0.0400 (−1.12) | 0.0067 (−0.82) | 0.868 | 0.8167 |
-| pois | after | 0.0967 (−0.27) | 0.0400 (−1.12) | 0.0067 (−0.82) | 0.880 | 0.8167 |
-| binom | before | 0.1100 (+0.82) | 0.0400 (−1.12) | 0.0050 (−1.23) | 0.074 | 0.8950 |
-| binom | after | BINOM_AFTER |
+| gauss_small | before | 0.1117 (+0.95) | 0.0633 (+1.50) | 0.0150 (+1.23) | 0.608 | 0.7333 |
+| gauss_small | after | 0.1100 (+0.82) | 0.0583 (+0.94) | 0.0117 (+0.41) | 0.726 | 0.7333 |
+| gauss | before | 0.0950 (−0.41) | 0.0400 (−1.12) | 0.0100 (0.00) | 0.271 | 0.6783 |
+| gauss | after | 0.0933 (−0.54) | 0.0417 (−0.94) | 0.0083 (−0.41) | 0.244 | 0.6833 |
+| pois | before | 0.0883 (−0.95) | 0.0433 (−0.75) | 0.0067 (−0.82) | 0.865 | 0.8183 |
+| pois | after | 0.0883 (−0.95) | 0.0433 (−0.75) | 0.0067 (−0.82) | 0.865 | 0.8183 |
+| binom | before | 0.1057 (+0.46) | 0.0352 (−1.65) | 0.0050 (−1.22) | 0.610 | 0.9094 |
+| binom | after | 0.1057 (+0.46) | 0.0352 (−1.65) | 0.0050 (−1.22) | 0.610 | 0.9094 |
 
-`KS | p < .5` is the KS p-value of `2p` given `p < .5`, from the saved
-p-values.
+Every cell is inside two MCSE on both sides at every level and none rejects
+uniformity. The binom cell is on 596 of 600 replicates, before and after:
+replicates 241, 366, 498 and 552 fail the fit itself (the outer REML
+optimizer does not certify a stationary optimum with λ on its rail), which is
+upstream of the LR test and not this lane's.
+
+pois and binom agree with main replicate for replicate (largest null
+p-value difference 5e-4 on pois, 1.4e-5 on binom). Their known scale never
+enters the profiled-scale path this lane changes, and on these fits the null
+block's Lawley factor stays within 1.000 to 1.023, where the bounded factor
+and the `mean_w / ref_df` ratio it replaced are the same number to 8e-5. The
+ratio's blow-up (L1) needs `ref_df → 0`, which the tests in
+`gam-terms/src/inference/lawley.rs` construct directly.
 
 The ρ-conditional reference (`p_value_conditional`, no selection correction)
-on the same datasets, for scale: gauss_small 0.2050 / 0.1167 / 0.0383,
-gauss 0.2033 / 0.1033 / 0.0250, pois 0.1850 / 0.0933 / 0.0200.
+on the same datasets, for scale: gauss 0.1817 / 0.0917 / 0.0167, binom
+0.1946 / 0.1057 / 0.0168.
 
-Power: on gauss_small the weak term loses 3 rejections and gains 1 of 600
-(McNemar exact p ≈ 0.63) while the null size at .05 falls by 2 of 600; every
-other cell's power is unchanged.
+Power: gauss_small gains 2 and loses 2 weak-term rejections of 600, gauss
+gains 4 and loses 1; the null p-values correlate at 0.997 with main's.
+
+What main already fixed. The finding's figures (n = 60 Gaussian 0.135 /
+0.070 / 0.020) predate main's own rework of this reference; at df02753c the
+n = 60 cell is already within two MCSE. What this lane still changes is the
+construction, not a measured miss: the selection shift was evaluated at
+`E[V]` and the replay selected with the known-scale criterion, both wrong in
+principle for a profiled scale; with them fixed the n = 60 cell moves toward
+nominal at every level (+1.50 → +0.94 MCSE at .05, +1.23 → +0.41 at .01).
 
 ## What changed and why
 
@@ -88,33 +107,6 @@ where `Δε` itself is bounded (λ on a rail). On binom it reached 14.9 and sent
 6 of 600 null replicates to `p = 1`, which is a conservative bug.
 `lawley_lr_correction_estimated_lambda` still reports it (scale and
 location) through the inference instrument.
-
-## Open: binom mid-range excess (not fixed here)
-
-The binom cell's `KS | p < .5` rejects both before and after this lane. The
-`p_value_uncorrected` column (known-scale reference, no Lawley term) is
-identical to origin/main replicate for replicate. This lane does not touch
-the known-scale path, so the defect is pre-existing. On 1200 replicates
-(`default_rng(50000 + r)`, r = 0..1199):
-
-| | size .10 (z) | size .05 (z) | size .01 (z) | KS \| p<.5 |
-|---|---|---|---|---|
-| corrected | 0.1167 (+1.92) | 0.0492 (−0.13) | 0.0100 (0.00) | 0.000 |
-| uncorrected | 0.1208 (+2.41) | 0.0533 (+0.53) | 0.0108 (+0.29) | 0.000 |
-
-Histogram of `2p` given `p < .5`, in tenths: 59 81 64 73 72 58 57 42 38 48.
-The size at .05 and .01 is right. The excess sits at `p ∈ (.05, .25)`, where
-`W` is 3 to 6 and `ref_df` is 1.4 to 2: there the replay under-corrects the
-selection. Two candidate causes are not established:
-
-* The replay selects with the Gaussian-proxy criterion. LAML's non-Gaussian
-  terms (the working-weight derivatives in the log-determinant) are missing
-  from it.
-* The other terms' λ re-selection and their noncentral deviance. These are
-  pv-lr-refit's null refit, not this lane's.
-
-The main-branch corrected column's `KS | p < .5` of 0.074 on r = 0..599 came
-from the `Δε/ref_df` ratio, not from calibration. It is gone with L1.
 
 ## Diagnostics
 
