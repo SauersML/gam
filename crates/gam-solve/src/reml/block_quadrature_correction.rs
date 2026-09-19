@@ -80,9 +80,10 @@ impl<'a> RemlState<'a> {
     /// So the admission is now a property of the MODEL, latched on first
     /// admission and held for the fit
     /// ([`RemlState::block_correction_admission`]), and the block is the
-    /// `m` largest-`|γ_r|` positive-curvature directions at each ρ rather than
-    /// a set defined by a threshold crossing. The spliced objective is a
-    /// function of ρ again, and the spliced gradient stays exact: the four
+    /// directions at the spectral positions the admission integrated
+    /// ([`BlockQuadratureLatch::block_positions`]) at each ρ rather than a set
+    /// re-selected by a threshold crossing or a `|γ_r|` ranking. The spliced
+    /// objective is a function of ρ again, and the spliced gradient stays exact: the four
     /// channels differentiate `Δ_b` at a fixed block, and a ρ-dependent
     /// admission would contribute a term they do not carry — the same
     /// objective↔gradient desync this site already declines the splice over for
@@ -376,39 +377,63 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
-        // Build the block subspace V_b. Under a latched admission the block is
-        // the `m` largest-|γ_r| positive-curvature directions, NOT the set that
-        // happens to clear `τ` at this ρ: a set defined by a threshold crossing
-        // changes cardinality as ρ moves, and every change is a jump of a whole
-        // direction's contribution to `Δ_b`. Ranking is the continuous
-        // extension of the same rule — it agrees with it exactly wherever the
-        // flagged set has the latched size, which is every ρ the pre-#2748 fit
-        // was already stable on.
+        // Build the block subspace V_b. At admission the block is the flagged
+        // set, the positive-curvature directions whose |γ_r| clears `τ`. Under
+        // a latched admission it is the directions at the SPECTRAL POSITIONS
+        // the admission integrated, NOT a set re-selected at this ρ.
+        //
+        // A set defined by a threshold crossing changes cardinality as ρ moves,
+        // and every change is a jump of a whole direction's contribution to
+        // `Δ_b` (#2748). Re-ranking by |γ_r| at every ρ keeps the cardinality
+        // but still jumps: the set changes wherever two directions' |γ| cross,
+        // a codimension-one surface in ρ, and each change swaps one axis's
+        // whole contribution for another's, with the latched orders silently
+        // reassigned to directions they were never certified on. Measured on
+        // the convergence fuzzer's `case0/binomial/n1000` (m = 5, axis split):
+        // `Δ_b` took exactly two values, 4.660e-2 and 5.797e-2, across the
+        // BFGS polish's trial points at |g| = 1.4e-4, so the line search could
+        // not pass sufficient decrease and the fit ended `line_search_failed`.
+        // The eigenvector at a fixed position is a continuous function of ρ
+        // away from an eigenvalue coincidence, which a path through ρ avoids
+        // generically, so the latched block is too, and the frame-rotation
+        // channel (c) below differentiates exactly that motion.
         let sym_h = (h_total + &h_total.t()) * 0.5;
         let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
             EstimationError::InvalidInput(format!(
                 "#784 block-local fallback eigendecomposition failed: {e}"
             ))
         })?;
-        let mut admissible: Vec<usize> = (0..evals.len().min(directional.len()))
-            .filter(|&r| evals[r] > 0.0 && directional[r].is_finite())
-            .collect();
-        let block_cols: Vec<usize> = match latched_block_dim {
-            Some(m) => {
-                // Descending |γ_r|, ties broken by index so the selection is a
-                // deterministic function of (H, γ) and not of sort stability.
-                admissible.sort_by(|&a, &b| {
-                    directional[b]
-                        .abs()
-                        .partial_cmp(&directional[a].abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.cmp(&b))
-                });
-                admissible.truncate(m);
-                admissible.sort_unstable();
-                admissible
+        let latched_quadrature = self
+            .block_correction_axis_orders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .filter(|latch| Some(latch.block_positions.len()) == latched_block_dim);
+        let block_cols: Vec<usize> = match (&latched_quadrature, latched_block_dim) {
+            (Some(latch), _) => {
+                if let Some(&r) = latch
+                    .block_positions
+                    .iter()
+                    .find(|&&r| r >= evals.len() || evals[r] <= 0.0)
+                {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "#784 latched block direction at spectral position {r} has no positive \
+                         curvature at this rho (eigenvalue {:?}); the block the admission \
+                         integrated does not exist here",
+                        evals.get(r)
+                    )));
+                }
+                latch.block_positions.clone()
             }
-            None => verdict
+            // The admission and its block are latched together below, so an
+            // admission without its block is a broken latch, not a model.
+            (None, Some(m)) => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "#784 block correction latched with block dimension {m} but without the \
+                     block it integrated"
+                )));
+            }
+            (None, None) => verdict
                 .untrustworthy_directions
                 .iter()
                 .copied()
@@ -543,12 +568,6 @@ impl<'a> RemlState<'a> {
             f64::INFINITY
         };
         let next_order_remainder = laplace_floor * laplace_floor;
-        let latched_quadrature = self
-            .block_correction_axis_orders
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-            .filter(|latch| latch.axis_orders.len() == m);
 
         // ── Axis by axis, or one tensor rule ─────────────────────────────
         //
@@ -761,6 +780,7 @@ impl<'a> RemlState<'a> {
                 .block_correction_axis_orders
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
+                block_positions: block_cols.clone(),
                 axis_orders: axis_orders.clone(),
                 axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
@@ -772,9 +792,9 @@ impl<'a> RemlState<'a> {
             drop(decision);
             log::debug!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m}, \
-                 axis split={axis_split} and axis orders {:?} are now the model's, and the \
-                 tau={:.3} activation no longer switches the criterion on and off along the \
-                 outer search (#2748, #2623)",
+                 spectral positions {block_cols:?}, axis split={axis_split} and axis orders \
+                 {:?} are now the model's, and the tau={:.3} activation no longer switches \
+                 the criterion on and off along the outer search (#2748, #2623)",
                 axis_orders,
                 verdict.threshold,
             );

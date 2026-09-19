@@ -5590,8 +5590,16 @@ pub(crate) enum BlockCorrectionDecision {
 /// at that admission: the certificate every later evaluation at those orders
 /// carries, since the paired error no longer switches anything once the
 /// orders are latched (#2748).
+///
+/// The block itself is latched as its SPECTRAL POSITIONS: the indices, in the
+/// ascending eigen-order of the penalized Hessian, of the directions the
+/// admission integrated. Each later ρ takes the eigenvectors at those
+/// positions, so axis `r`'s order stays attached to the direction it was
+/// certified on, and the block moves with ρ as continuously as the
+/// eigenvectors do.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
+    pub(crate) block_positions: Vec<usize>,
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,

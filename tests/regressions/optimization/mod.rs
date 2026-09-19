@@ -1,5 +1,6 @@
 mod bc_clamped_startup_kkt_abort;
 mod beta_regression_reml_nonfinite;
+mod block_correction_latched_spectral_positions;
 mod exact_fit_has_no_reml_criterion_2595;
 mod gamlss_linesearch_failure;
 mod large_scale_convergence_regression;
