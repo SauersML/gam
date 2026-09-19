@@ -2238,7 +2238,6 @@ pub(crate) fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
         // convergence criterion to be reached deterministically.
         inner_max_cycles: 48,
         inner_tol: 1e-4,
-        outer_max_iter: 3,
         outer_tol: 1e-4,
         ..BlockwiseFitOptions::default()
     }
