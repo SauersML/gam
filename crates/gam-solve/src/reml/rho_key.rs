@@ -44,17 +44,19 @@ pub(super) fn sanitized_eval_state_key(rho: &Array1<f64>, outer_cap: usize) -> O
 /// solve approximates, so answering from it is at least as accurate and keeps
 /// value and gradient on one beta.  The converse
 /// never holds (#2309): a capped entry is a partial solve and must not stand in
-/// for the uncapped mode.  Screening keys have no stand-in, since a screening
-/// solve carries its own cache and KKT semantics.
+/// for the uncapped mode.
+///
+/// `key` is a [`sanitized_eval_state_key`]: the rho bits followed by the outer
+/// cap.
 pub(super) fn uncapped_stand_in_key(key: &[u64]) -> Option<Vec<u64>> {
-    let [rho @ .., screening_cap, outer_cap] = key else {
+    let [rho @ .., outer_cap] = key else {
         return None;
     };
-    if *screening_cap != 0 || *outer_cap == 0 {
+    if *outer_cap == 0 {
         return None;
     }
     let mut uncapped = rho.to_vec();
-    uncapped.extend([0, 0]);
+    uncapped.push(0);
     Some(uncapped)
 }
 
@@ -76,14 +78,10 @@ mod tests {
     #[test]
     fn only_an_outer_capped_key_has_an_uncapped_stand_in() {
         let rho = array![0.25, -1.5];
-        let capped = sanitized_eval_state_key(&rho, 0, 3).expect("finite capped key");
-        let finalized = sanitized_eval_state_key(&rho, 0, 0).expect("finite terminal key");
-        let screened = sanitized_eval_state_key(&rho, 3, 0).expect("finite screening key");
-        let screened_capped = sanitized_eval_state_key(&rho, 3, 5).expect("finite key");
+        let capped = sanitized_eval_state_key(&rho, 3).expect("finite capped key");
+        let finalized = sanitized_eval_state_key(&rho, 0).expect("finite terminal key");
 
         assert_eq!(uncapped_stand_in_key(&capped), Some(finalized.clone()));
         assert_eq!(uncapped_stand_in_key(&finalized), None);
-        assert_eq!(uncapped_stand_in_key(&screened), None);
-        assert_eq!(uncapped_stand_in_key(&screened_capped), None);
     }
 }
