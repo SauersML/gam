@@ -4514,5 +4514,16 @@
     },
     "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
     "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "removed": {
+      "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_format_float": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_normalize_exponent": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_trim_float": 1
+    },
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary has one owner. build_model_summary was the CLI's second summary builder (the gam_solve ModelSummary Display path); `gam summary` now renders saved_model_summary's payload through gam_models::inference::summary_text::render_summary_text, the same function gamfit's Model.summary() prints. The three pyffi float helpers were a private %g re-implementation; floats now go through gam_report::format_significant. The conditional and corrected AIC the report prints come from main's gam_solve::inference::information_criteria through SummaryInformationCriteria, so nothing moved into this change.",
+    "evidence": "public_api_census.py with base e110c67a94 and head the merge commit refused exactly these four identities (13420 -> 13421 public function declarations). After this change git grep -w finds build_model_summary only in a historical doc sentence in saved_summary.rs, and summary_format_float, summary_normalize_exponent and summary_trim_float have no references."
   }
 ]
