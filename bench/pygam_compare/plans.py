@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .worker import BINOMIAL_FAMILIES, FAMILIES, LIBS
 from .worker import DESIGNS as ALL_DESIGNS
-from .worker import FAMILIES, LIBS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
 SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
@@ -39,11 +39,20 @@ class Plan:
     libs: tuple[str, ...] = field(default=LIBS)
 
 
-def _grid(ns: tuple[int, ...], designs: tuple[str, ...]) -> tuple[Cell, ...]:
+# The binomial sweep (audit lane sweep-binomial): prevalence 0.5 / 0.1 / 0.01
+# and a grouped binomial with 1..20 trials per row.
+BINOMIAL_SWEEP: tuple[str, ...] = ("binomial", *BINOMIAL_FAMILIES)
+
+
+def _grid(
+    ns: tuple[int, ...],
+    designs: tuple[str, ...],
+    families: tuple[str, ...] = FAMILIES,
+) -> tuple[Cell, ...]:
     # Ordered by n ascending so a timeout at small n can mark the larger n of
     # the same (lib, family, design) as not run instead of burning the net on
     # each one in turn.
-    return tuple(Cell(f, n, d) for n in ns for f in FAMILIES for d in designs)
+    return tuple(Cell(f, n, d) for n in ns for f in families for d in designs)
 
 
 PLANS: dict[str, Plan] = {
@@ -104,6 +113,36 @@ PLANS: dict[str, Plan] = {
             description="n in {1e3, 1e4, 1e5}, every family x every design, 3 reps",
             cells=_grid((1_000, 10_000, 100_000), ALL_DESIGNS),
             reps=3,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="binomial_small",
+            description=(
+                "n in {1e2, 1e3}, binomial at prevalence 0.5 / 0.1 / 0.01 and"
+                " with trials x every design, 3 reps"
+            ),
+            cells=_grid((100, 1_000), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="binomial_1e4",
+            description=(
+                "n=1e4, binomial at prevalence 0.5 / 0.1 / 0.01 and with trials"
+                " x every design, 2 reps"
+            ),
+            cells=_grid((10_000,), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=2,
+            timeout_s=1_800.0,
+        ),
+        Plan(
+            name="binomial_1e5",
+            description=(
+                "n=1e5, binomial at prevalence 0.5 / 0.1 / 0.01 and with trials"
+                " x every design, 1 rep"
+            ),
+            cells=_grid((100_000,), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=1,
             timeout_s=3_600.0,
         ),
     )
