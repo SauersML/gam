@@ -526,10 +526,10 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
     // formula RHS and the covariates, never of the LHS values, so any well-posed
     // continuous response yields the identical basis. We deliberately do NOT
     // regress the integer ordinal class labels {0,1,2} here: on a short (~22-row)
-    // real split a 3-valued response can land near-constant after the every-4th
-    // hold-out, which trips gam's Gaussian near-constant guard ("response 'y' is
-    // effectively constant (sample sd ≈ 0)") and aborts the design harvest before
-    // the multinomial solver ever runs. Instead feed a strictly-varying continuous
+    // real split a 3-valued response can land constant after the every-4th
+    // hold-out, which routes the throwaway fit through the exact zero-dispersion
+    // Gaussian path instead of the ordinary design harvest before the
+    // multinomial solver ever runs. Instead feed a strictly-varying continuous
     // proxy `dy` (a smooth, monotone-in-row probe with guaranteed sample sd > 0)
     // as the design-harvest response. The ordinal labels still drive the real
     // claim via the one-hot multinomial fit further below; only the basis-builder

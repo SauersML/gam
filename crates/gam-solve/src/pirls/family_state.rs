@@ -429,27 +429,18 @@ pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
 }
 
-/// The row-level count-response contract: finite, non-negative, and an exact
-/// integer.
-///
-/// The integrality test is EXACT (`y == y.round()`), and that is a derivation
-/// rather than a strictness preference. Every count `k` with `|k| < 2^53` is
-/// exactly representable in `f64`, so a genuine count read from data satisfies
-/// `y == y.round()` with no slack to allocate -- there is no rounding step
-/// between "the datum is an integer" and "the bits say so". A tolerance band
-/// would therefore admit only values that are NOT counts, and the Poisson /
-/// negative-binomial log-likelihood is defined (through `ln_gamma`) at
-/// non-integer `y`, so such a value does not fail loudly downstream: it
-/// silently evaluates a different likelihood.
+/// The row-level count-response contract, [`gam_spec::is_count_value`].
 ///
 /// This is `pub` on purpose. `gam-inference` needs the same contract for the
 /// HMC entry points, and while it was unreachable that crate carried a private
 /// copy whose predicate was `(y - y.round()).abs() <= 1e-9` under a
 /// byte-identical error message -- so `3.0 + 5e-10` was a valid count for joint
-/// HMC and an invalid one for P-IRLS on the same data and family.
+/// HMC and an invalid one for P-IRLS on the same data and family. The
+/// predicate itself lives in `gam-spec` so the fit-boundary support check uses
+/// the same definition.
 #[inline]
 pub fn valid_count_response(y: f64) -> bool {
-    y.is_finite() && y >= 0.0 && y == y.round()
+    gam_spec::is_count_value(y)
 }
 
 /// Certify a whole count response against [`valid_count_response`], reporting

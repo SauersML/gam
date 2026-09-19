@@ -28,19 +28,10 @@ pub(crate) fn materialize_location_scale<'a>(
         &parsed.response,
     )?;
 
-    // Per-family response-support validation, owned by the family type.
-    // See `ResponseFamily::validate_response_support`.
-    family
-        .response
-        .validate_response_support(y.view())
-        .map_err(|violation| violation.message_for(&parsed.response))?;
-
-    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli),
-    // owned by the family type.
-    family
-        .response
-        .validate_response_degeneracy(y.view())
-        .map_err(|deg| deg.message_for(&parsed.response))?;
+    // Prior weights first: a zero weight excludes its row from the family's
+    // support and degeneracy rules (see `validate_response_against_family`).
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    validate_response_against_family(&family, y.view(), weights.view(), &parsed.response)?;
 
     // An explicit `linkwiggle(...)` term is only wired into the fit below for a
     // binomial family; reject it for a non-binomial response rather than drop
@@ -74,7 +65,6 @@ pub(crate) fn materialize_location_scale<'a>(
     check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
     check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(data, col_map, config.noise_offset_column.as_deref())?;
     let kappa_options = config.spatial_optimization.clone();

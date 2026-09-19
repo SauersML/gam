@@ -37,25 +37,19 @@ pub(crate) fn materialize_standard<'a>(
         &parsed.response,
     )?;
 
-    // Per-family response-support validation (#335 Gamma requires y > 0;
-    // #337 Poisson/NegativeBinomial require y ≥ 0; mirrors the Beta
-    // (0,1)-support check in the external-design GLM path). The family
-    // itself owns the check — see `ResponseFamily::validate_response_support`
-    // — so adding a new family that constrains its support is a single edit
-    // on the type, not a coordinated update across every materializer.
-    family
-        .response
-        .validate_response_support(y.view())
-        .map_err(|violation| violation.message_for(&parsed.response))?;
+    // Prior weights are validated (finite, non-negative, not all zero) before
+    // the response is judged, because a zero weight excludes its row from the
+    // likelihood and so from the family's support and degeneracy rules.
+    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
 
-    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli).
-    // Symmetric to validate_response_support —
-    // each `ResponseFamily` variant owns its own degeneracy classifier, the
-    // workflow only forwards the column name.
-    family
-        .response
-        .validate_response_degeneracy(y.view())
-        .map_err(|deg| deg.message_for(&parsed.response))?;
+    // Per-family response-support validation (#335 Gamma requires y > 0;
+    // #337 Poisson/NegativeBinomial require non-negative integer counts;
+    // mirrors the Beta (0,1)-support check in the external-design GLM path).
+    // The family itself owns the check — see
+    // `ResponseFamily::validate_response_support` — so adding a new family
+    // that constrains its support is a single edit on the type, not a
+    // coordinated update across every materializer.
+    validate_response_against_family(&family, y.view(), weights.view(), &parsed.response)?;
 
     // An explicit `linkwiggle(...)` term is only wired into the fit below for a
     // binomial family; reject it for a non-binomial response rather than drop
@@ -123,7 +117,6 @@ pub(crate) fn materialize_standard<'a>(
         }
     }
 
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let latent_cloglog = if family.is_latent_cloglog() {
         let sigma = match config.frailty.clone() {

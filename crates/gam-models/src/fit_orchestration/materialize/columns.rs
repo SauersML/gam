@@ -101,10 +101,9 @@ pub(crate) fn resolve_continuous_column(
             // Row index is reported 1-based to match the rest of gam's data
             // validators (gam-data ingestion, gamfit `_tables.py`).
             let row = row_idx + 1;
-            return Err(WorkflowError::SchemaMismatch {
-                reason: format!(
-                    "{role} column '{column_name}' contains non-finite value at row {row}: {value}"
-                ),
+            return Err(WorkflowError::InvalidData {
+                column: column_name.to_string(),
+                problem: format!("is the {role} column and has non-finite value {value} at row {row}"),
             });
         }
     }
@@ -162,12 +161,12 @@ mod weight_row_index_tests {
         let nan = weight_dataset(&[1.0, 1.0, f64::NAN, 1.0, 1.0]);
 
         let neg_msg = match resolve_weight_column(&neg, &neg.column_map(), Some("w")) {
-            Err(WorkflowError::SchemaMismatch { reason }) => reason,
-            other => panic!("expected SchemaMismatch for negative weight, got {other:?}"),
+            Err(WorkflowError::InvalidData { column, problem }) if column == "w" => problem,
+            other => panic!("expected InvalidData for negative weight, got {other:?}"),
         };
         let nan_msg = match resolve_weight_column(&nan, &nan.column_map(), Some("w")) {
-            Err(WorkflowError::SchemaMismatch { reason }) => reason,
-            other => panic!("expected SchemaMismatch for non-finite weight, got {other:?}"),
+            Err(WorkflowError::InvalidData { column, problem }) if column == "w" => problem,
+            other => panic!("expected InvalidData for non-finite weight, got {other:?}"),
         };
 
         let neg_row = parsed_row(&neg_msg);
@@ -188,6 +187,23 @@ mod weight_row_index_tests {
             "negative and non-finite weight checks must agree on the row number: \
              {neg_msg} vs {nan_msg}"
         );
+    }
+
+    /// Every row carrying zero weight leaves nothing in the likelihood; that
+    /// is a data error at the weight column, not a deep solver failure.
+    #[test]
+    fn all_zero_weights_are_rejected_as_invalid_data() {
+        let zeros = weight_dataset(&[0.0, 0.0, 0.0]);
+        match resolve_weight_column(&zeros, &zeros.column_map(), Some("w")) {
+            Err(WorkflowError::InvalidData { column, problem }) => {
+                assert_eq!(column, "w");
+                assert!(problem.contains("no positive weight"), "{problem}");
+            }
+            other => panic!("expected InvalidData for all-zero weights, got {other:?}"),
+        }
+        let some = weight_dataset(&[0.0, 2.0, 0.0]);
+        resolve_weight_column(&some, &some.column_map(), Some("w"))
+            .expect("zero weights alongside a positive weight are valid exclusions");
     }
 }
 
@@ -211,17 +227,26 @@ pub fn resolve_weight_column(
         return Ok(Array1::ones(data.values.nrows()));
     };
     let values = resolve_continuous_column(data, col_map, column_name, "weights")?;
-    for (row_idx, value) in values.iter().enumerate() {
-        if *value < 0.0 {
-            // Row index is reported 1-based to match the rest of gam's data
-            // validators (gam-data ingestion, gamfit `_tables.py`).
-            let row = row_idx + 1;
-            return Err(WorkflowError::SchemaMismatch {
-                reason: format!(
-                    "weights column '{column_name}' must be non-negative; found {value} at row {row}"
-                ),
-            });
-        }
+    // A prior weight scales its row's log-likelihood contribution, so it must
+    // be non-negative; a zero weight excludes the row. Non-finite weights are
+    // rejected by `resolve_continuous_column` / the gam-data fit boundary.
+    // Row indices are 1-based to match the rest of gam's data validators.
+    if let Some((row_idx, value)) = values.iter().enumerate().find(|(_, v)| **v < 0.0) {
+        return Err(WorkflowError::InvalidData {
+            column: column_name.to_string(),
+            problem: format!(
+                "is a prior-weight column and must be non-negative; found {value} at row {}",
+                row_idx + 1
+            ),
+        });
+    }
+    if !values.iter().any(|v| *v > 0.0) {
+        return Err(WorkflowError::InvalidData {
+            column: column_name.to_string(),
+            problem: "is a prior-weight column with no positive weight; a zero weight \
+                      excludes its row, so every row would be excluded from the likelihood"
+                .to_string(),
+        });
     }
     Ok(values)
 }
