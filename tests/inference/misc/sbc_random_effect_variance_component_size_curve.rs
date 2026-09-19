@@ -16,8 +16,11 @@
 //! family. The p-value read is the production summary row — the shared
 //! `smooth_term_summary_rows` walk the CLI and Python summaries use. At
 //! `α ∈ {0.10, 0.05, 0.01}` the empirical size must stay within
-//! `α ± 2·MCSE(α)`, `MCSE(α) = √(α(1 − α)/m)`: the test is exact, so an
-//! undersized test is as much a defect as an oversized one. The 500-rep
+//! `α ± 2·MCSE(α)`, `MCSE(α) = √(α(1 − α)/m)`, and the whole null p-value
+//! sample must pass a two-sided Kolmogorov–Smirnov test against `U(0, 1)` at
+//! level 0.01: the reference law is exact and continuous (no atom at `p = 1`),
+//! so an undersized or conservative test is as much a defect as an oversized
+//! one. The 500-rep
 //! acceptance run over 5/20/200 levels, balanced and unbalanced, is the bench
 //! in `bench/pvalue_calibration/pv-random-effects/`; this is its CI-sized gate.
 //!
@@ -39,6 +42,8 @@ const N_OBS: usize = 200;
 const N_LEVELS: usize = 20;
 const N_REPLICATIONS: u64 = 200;
 const ALPHAS: [f64; 3] = [0.10, 0.05, 0.01];
+/// Level of the two-sided Kolmogorov–Smirnov uniformity test.
+const KS_LEVEL: f64 = 0.01;
 const SEED: u64 = 0x2E_5EED_0000;
 const FORMULA: &str = "y ~ s(x1) + group(g)";
 const GROUP_TERM: &str = "g";
@@ -150,6 +155,35 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
     p_value
 }
 
+/// Two-sided one-sample Kolmogorov–Smirnov test of `values` against `U(0, 1)`:
+/// the distance `D = sup |F_m − F|` and its asymptotic p-value
+/// `Q(√m·D)`, `Q(λ) = 2 Σ_{k≥1} (−1)^{k−1} e^{−2k²λ²}`.
+fn ks_uniform(values: &[f64]) -> (f64, f64) {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let m = sorted.len() as f64;
+    let distance = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| ((i as f64 + 1.0) / m - p).max(p - i as f64 / m))
+        .fold(0.0_f64, f64::max);
+    let lambda = m.sqrt() * distance;
+    // The alternating series converges geometrically; stop once a term no
+    // longer changes the sum in double precision.
+    let mut sum = 0.0;
+    let mut k = 1.0_f64;
+    loop {
+        let term = (-2.0 * k * k * lambda * lambda).exp();
+        let signed = if (k as u64) % 2 == 1 { term } else { -term };
+        if sum + signed == sum {
+            break;
+        }
+        sum += signed;
+        k += 1.0;
+    }
+    (distance, (2.0 * sum).clamp(0.0, 1.0))
+}
+
 fn assert_null_size_within_monte_carlo_error(family: Family) {
     init_parallelism();
     let p_values: Vec<f64> = (0..N_REPLICATIONS)
@@ -170,6 +204,14 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
                 p_values.len()
             ));
         }
+    }
+    let (ks_distance, ks_p_value) = ks_uniform(&p_values);
+    report.push(format!("KS D {ks_distance:.4}, p {ks_p_value:.4}"));
+    if ks_p_value < KS_LEVEL {
+        miscalibrated.push(format!(
+            "null p-values are not U(0, 1): two-sided KS D = {ks_distance:.4}, \
+             p = {ks_p_value:.4} < {KS_LEVEL}"
+        ));
     }
     eprintln!("{family:?}: {}", report.join("; "));
     assert!(
