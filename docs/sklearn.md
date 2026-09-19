@@ -37,8 +37,8 @@ GAMRegressor(
 )
 ```
 
-All five arguments are surfaced as `get_params()` keys, so they work with
-`GridSearchCV` and related utilities.
+All five arguments are surfaced as `get_params()` keys, so the estimator
+works with `sklearn.base.clone`, `cross_val_score` and pipelines.
 
 ### Binding the response
 
@@ -100,6 +100,31 @@ the positive-class probability to `[0, 1]` and stacks
 `[P(classes_[0]), P(classes_[1])]`. `predict()` returns
 `classes_[argmax(predict_proba(X), axis=1)]`.
 
+The modelled event is therefore the label that sorts last: with labels
+`"no"` and `"yes"`, `classes_` is `["no", "yes"]` and the second column of
+`predict_proba` is `P(y == "yes")`. `gamfit.fit` follows the same rule for
+a string response, which needs an explicit `family="binomial"` there:
+
+```python
+import numpy as np
+import pandas as pd
+import gamfit
+from gamfit.sklearn import GAMClassifier
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": np.linspace(0, 10, 200)})
+labels = np.where(X["x"] + rng.normal(0, 2, len(X)) > 5, "yes", "no")
+
+est = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, labels)
+model = gamfit.fit(X.assign(y=labels), "y ~ s(x)", family="binomial")
+
+print(est.classes_)                                   # ['no' 'yes']
+print(np.allclose(est.predict_proba(X)[:, 1], model.predict(X), atol=1e-6))
+```
+
+If the event you care about sorts first (for example `"case"` against
+`"control"`), recode the labels to `1`/`0` before fitting.
+
 `score(X, y, sample_weight=None)` returns AUC, not accuracy. If
 `sample_weight` is supplied, rows with weight `<= 0` are dropped before
 computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
@@ -141,21 +166,32 @@ scores = cross_val_score(
 )
 ```
 
-## Grid search
+## Choosing between formulas
+
+The estimator has no hyperparameters to tune: REML chooses every
+smoothing parameter inside `fit`, and `k` is only an upper bound on each
+smooth's flexibility. To choose between structurally different formulas,
+fit each one and rank the underlying models with `gamfit.compare_models`,
+which scores them by conditional AIC:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
 from gamfit.sklearn import GAMRegressor
-from sklearn.model_selection import GridSearchCV
 
-grid = GridSearchCV(
-    GAMRegressor(formula="y ~ s(x)"),
-    param_grid={
-        "formula": ["y ~ s(x)", "y ~ s(x, k=10)", "y ~ s(x, k=20)"],
-    },
-    cv=5,
-)
-grid.fit(X, y)
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 1, 300), "z": rng.uniform(0, 1, 300)})
+y = np.sin(2 * np.pi * X["x"]) + 4 * (X["z"] - 0.5) ** 2 + rng.normal(0, 0.3, len(X))
+
+formulas = ["y ~ s(x)", "y ~ s(x) + z", "y ~ s(x) + s(z)"]
+estimators = [GAMRegressor(formula=formula).fit(X, y) for formula in formulas]
+comparison = gamfit.compare_models([est.model_ for est in estimators], names=formulas)
+print("winner:", comparison["winner"])
 ```
+
+`cross_val_score` (above) still works when you want an out-of-sample
+check of the winner.
 
 ## No survival wrapper
 

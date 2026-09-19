@@ -341,21 +341,53 @@ scores = cross_val_score(
 )
 ```
 
-## sklearn grid search over formulas
+## Choose between formulas
+
+Fit each candidate and rank the fits with `gamfit.compare_models`, which
+scores them by conditional AIC. There is nothing to grid-search: REML
+already chose every smoothing parameter inside each fit, so the candidates
+differ only in structure.
 
 ```python
-from sklearn.model_selection import GridSearchCV
-from gamfit.sklearn import GAMRegressor
+import numpy as np
+import pandas as pd
+import gamfit
 
-gs = GridSearchCV(
-    GAMRegressor(formula="y ~ s(x)"),
-    param_grid={
-        "formula": ["y ~ s(x)", "y ~ s(x, k=10)", "y ~ s(x, k=20)"],
-    },
-    cv=5,
-)
-gs.fit(X, y)
+rng = np.random.default_rng(0)
+data = pd.DataFrame({"x": rng.uniform(0, 1, 400), "z": rng.uniform(0, 1, 400)})
+data["y"] = np.sin(2 * np.pi * data["x"]) + 4 * (data["z"] - 0.5) ** 2 + rng.normal(0, 0.3, 400)
+
+candidates = ["y ~ s(x)", "y ~ s(x) + z", "y ~ s(x) + s(z)"]
+fits = [gamfit.fit(data, formula) for formula in candidates]
+comparison = gamfit.compare_models(fits, names=candidates)
+
+print("winner:", comparison["winner"])
+for name, score, delta, evidence_ratio, edf in comparison["ranking"]:
+    print(f"{name:18s} delta={delta:7.2f}  edf={edf:.2f}")
 ```
+
+Here `z` bends symmetrically around 0.5, so a straight line in `z`
+explains nothing: a bare numeric term is a penalized linear effect, REML
+shrinks its slope to zero, and `y ~ s(x) + z` ties with `y ~ s(x)`. Only
+`s(z)` captures the bend, and it wins by a wide margin.
+
+The candidates must share a family; `compare_models` refuses to rank, say,
+a Poisson fit against a negative binomial one. Basis size is not a
+candidate either: `k` is an upper bound, so check it with
+`model.basis_check(data)` instead of comparing `k=10` against `k=20` (see
+[Choosing `k`](formulas.md#choosing-k)).
+
+## Per-group trajectories (factor by smooth)
+
+`y ~ fac + s(time, by=fac)` fits separate time trajectories by level; include the main `fac` effect for level offsets.
+
+## Hierarchical / partial-pooling smooths (`bs="fs"`)
+
+`y ~ s(time) + s(time, subject, bs="fs")` models a population curve plus shrinkage-stabilized subject-specific departures.
+
+## Treatment vs control difference smooth (`bs="sz"`)
+
+`y ~ s(time) + s(time, treatment, bs="sz")` estimates a population time effect and sum-to-zero treatment deviations.
 
 ## HTML report
 
@@ -377,14 +409,3 @@ Focused demos live under `examples/`:
 
 Performance-oriented Rust examples live under `examples/perf/`.
 
-## Per-group trajectories (factor by smooth)
-
-`y ~ fac + s(time, by=fac)` fits separate time trajectories by level; include the main `fac` effect for level offsets.
-
-## Hierarchical / partial-pooling smooths (`bs="fs"`)
-
-`y ~ s(time) + s(time, subject, bs="fs")` models a population curve plus shrinkage-stabilized subject-specific departures.
-
-## Treatment vs control difference smooth (`bs="sz"`)
-
-`y ~ s(time) + s(time, treatment, bs="sz")` estimates a population time effect and sum-to-zero treatment deviations.
