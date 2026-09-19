@@ -331,7 +331,7 @@ mod tensor_function_space_runtime_tests {
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
         };
-        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("double-penalty tensor basis");
         assert!(
             built
@@ -341,7 +341,7 @@ mod tensor_function_space_runtime_tests {
         );
 
         spec.double_penalty = false;
-        let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect("single-penalty tensor basis");
         // Each margin block is `S_dim ⊗ G_other / 1ᵀ G_other 1` (#1561, SPEC rule 5).
         let mut margin_blocks = 0usize;
@@ -431,7 +431,7 @@ mod tensor_function_space_runtime_tests {
                 identifiability,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
             };
-            let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+            let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
                 .expect("double-penalty tensor basis");
             let ridges = physical_null_ridges(&built);
             assert_eq!(
@@ -462,6 +462,80 @@ mod tensor_function_space_runtime_tests {
         }
     }
 
+    /// A frozen tensor chart is the basis sum-to-zero chart composed with every
+    /// later collection transform. A term residualized against an owner smooth
+    /// (`s(x) + te(x, z)`) and saved before the collection gauge became
+    /// orthonormal carries a whitener, whose columns span several decades of
+    /// scale. Rebuilding the null-block ridges in that chart once read the
+    /// chart's null space off its badly scaled primary penalty, found spurious
+    /// null directions, and failed every prediction with "tensor null blocks span
+    /// 4 of the chart's 12 null directions". The null space is a property of the
+    /// chart's column span, so each ridge must still measure exactly its own
+    /// block function.
+    #[test]
+    fn tensor_null_ridges_survive_a_badly_scaled_frozen_chart() {
+        let side = 12;
+        let data = Array2::from_shape_fn((side * side, 2), |(row, col)| {
+            let index = if col == 0 { row / side } else { row % side };
+            index as f64 / (side - 1) as f64
+        });
+        let block_functions: [(fn(f64, f64) -> f64, f64); 3] = [
+            (|x, _| x - 0.5, 1.0 / 12.0),
+            (|_, z| z - 0.5, 1.0 / 12.0),
+            (|x, z| (x - 0.5) * (z - 0.5), 1.0 / 144.0),
+        ];
+        let mut spec = TensorBSplineSpec {
+            marginalspecs: vec![cubic_marginal(), cubic_marginal()],
+            periods: Vec::new(),
+            double_penalty: true,
+            identifiability: TensorBSplineIdentifiability::SumToZero,
+            penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+        };
+        let centered = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
+            .expect("sum-to-zero tensor basis");
+        let BasisMetadata::TensorBSpline {
+            identifiability_transform: Some(sum_to_zero),
+            ..
+        } = &centered.metadata
+        else {
+            panic!("a sum-to-zero tensor records its chart");
+        };
+        // A whitener-shaped chart change `H D`: an orthogonal reflection times
+        // column scales spanning six decades.
+        let q = sum_to_zero.ncols();
+        let v = Array1::from_iter((0..q).map(|i| (i + 1) as f64));
+        let reflection = Array2::<f64>::eye(q)
+            - &(v.view().insert_axis(Axis(1)).dot(&v.view().insert_axis(Axis(0)))
+                * (2.0 / v.dot(&v)));
+        let scales = Array1::from_iter(
+            (0..q).map(|j| 10f64.powf(3.0 * (2.0 * j as f64 / (q - 1) as f64 - 1.0))),
+        );
+        let whitener = &reflection * &scales.view().insert_axis(Axis(0));
+        spec.identifiability = TensorBSplineIdentifiability::FrozenTransform {
+            transform: sum_to_zero.dot(&whitener),
+        };
+        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
+            .expect("a frozen chart with badly scaled columns rebuilds");
+        let ridges = physical_null_ridges(&built);
+        assert_eq!(ridges.len(), block_functions.len());
+        // Coefficients are solved in the well-conditioned sum-to-zero chart and
+        // carried into the frozen one exactly: `(H D)⁻¹ = D⁻¹ H`.
+        let design = centered.design.to_dense();
+        for (owner, (function, energy)) in block_functions.iter().enumerate() {
+            let target = Array1::from_iter(data.rows().into_iter().map(|p| function(p[0], p[1])));
+            let beta = &reflection.dot(&least_squares(&design, &target)) / &scales;
+            for (ridge_index, ridge) in ridges.iter().enumerate() {
+                let measured = beta.dot(&ridge.dot(&beta));
+                let expected = if ridge_index == owner { *energy } else { 0.0 };
+                assert!(
+                    (measured - expected).abs() <= 1e-8 * energy,
+                    "ridge {ridge_index} on block {owner} measured {measured:.6e}, \
+                     expected {expected:.6e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tensor_nonzero_anchor_is_rejected_before_its_affine_lift_can_be_dropped() {
         let data = array![[0.0, 0.0], [0.25, 0.75], [0.75, 0.25], [1.0, 1.0]];
@@ -476,7 +550,7 @@ mod tensor_function_space_runtime_tests {
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
         };
 
-        let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+        let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec, true)
             .expect_err("a tensor margin cannot silently discard an inhomogeneous lift");
         let message = error.to_string();
         assert!(message.contains("TensorBSpline margin 0"));
@@ -881,6 +955,7 @@ mod factor_smooth_null_component_tests {
             flavour,
             group_frozen_levels: None,
             frozen_global_orthogonality: None,
+            adaptive: false,
         };
         build_factor_smooth(
             grouped_data(n_levels).view(),
@@ -1142,6 +1217,7 @@ mod factor_smooth_heldout_group_tests {
                     flavour,
                     group_frozen_levels: frozen,
                     frozen_global_orthogonality: None,
+                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),
@@ -1336,6 +1412,7 @@ mod frozen_factor_level_collection_tests {
                             flavour: FactorSmoothFlavour::Fs {},
                             group_frozen_levels: Some(vec![9.0_f64.to_bits(), 8.0_f64.to_bits()]),
                             frozen_global_orthogonality: None,
+                            adaptive: false,
                         },
                     }),
                 }),

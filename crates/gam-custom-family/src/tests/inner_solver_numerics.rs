@@ -1694,7 +1694,7 @@ pub(crate) fn joint_proposal_at_step_floor_suppresses_descent_substitution_near_
 ///     positive quantity `stabilized_joint_solver_diagonal_ridge`
 ///     adds to lift a negative-eigenvalue joint Hessian above the
 ///     SPD floor.
-///   * **TRIAL OBJECTIVE** path (`total_quadratic_penalty`) uses
+///   * **TRIAL OBJECTIVE** path (`BlockPenaltyRoots::value`) uses
 ///     only `joint_mode_diagonal_ridge` (zero: no ridge enters the
 ///     objective `f`), which does NOT include the stabilizing shift.
 ///

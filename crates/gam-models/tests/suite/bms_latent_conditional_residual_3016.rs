@@ -117,7 +117,7 @@ fn fit(sample: &Sample, latent_measure: &str) -> FittedModel {
 /// materializes it, so the two fits see the same design and the same rows.
 fn fit_time_training_score(sample: &Sample, latent_measure: &str) -> Array1<f64> {
     let mut config = bernoulli_config(latent_measure);
-    config.spatial_center_counts = Some(Vec::new());
+    config.adaptive_resolution = Some(Vec::new());
     let materialized = materialize("y ~ x", &sample.dataset, &config)
         .unwrap_or_else(|e| panic!("materialize the bernoulli marginal-slope request: {e}"));
     match fit_model(materialized.request) {

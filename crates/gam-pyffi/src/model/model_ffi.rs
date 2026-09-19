@@ -3444,6 +3444,7 @@ fn sphere_basis<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3553,6 +3554,7 @@ fn sphere_basis_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
     let penalty = built
@@ -3638,6 +3640,7 @@ fn sphere_basis_jet<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3689,6 +3692,7 @@ fn sphere_basis_jet_with_centers<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let jet = spherical_spline_design_jet(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(jet.into_pyarray(py).unbind())
@@ -3754,6 +3758,7 @@ fn sphere_basis_hessian<'py>(
         max_degree,
         wahba_kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     };
     let hessian = spherical_spline_design_hessian(pts, &spec).map_err(basis_error_to_pyerr)?;
     Ok(hessian.into_pyarray(py).unbind())
@@ -4389,7 +4394,7 @@ fn compare_models(
         serde_json::to_value(comparison)
             .map_err(|err| format!("failed to serialize model comparison: {err}"))
     })?;
-    json_value_to_py(py, comparison)
+    json_value_to_py(py, &comparison)
 }
 
 fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {

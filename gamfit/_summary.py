@@ -12,9 +12,12 @@ from __future__ import annotations
 import operator
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterator, Mapping, overload
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, overload
 
 from ._binding import rust_module
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 #: Columns of :meth:`Summary.smooth_terms_frame`, in the documented order.
@@ -70,8 +73,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "curvature_estimands",
     "basis_checks",
     "covariance_kind",
-    "covariance_n",
-    "covariance_flat",
+    "covariance",
     "coefficient_se_source",
     "group_metadata",
     "deployment_extensions",
@@ -337,12 +339,11 @@ class Summary:
     covariance_kind : str or None
         ``"smoothing-corrected"`` or ``"conditional"`` depending on which
         posterior covariance variant was returned. The kind, the ``std_error``
-        column, and ``covariance_flat`` always come from the SAME covariance
+        column, and ``covariance`` always come from the SAME covariance
         definition (#2296); see ``coefficient_se_source``.
-    covariance_n : int or None
-        Side length of the coefficient covariance matrix.
-    covariance_flat : list of float or None
-        Row-major flat coefficient covariance matrix.
+    covariance : numpy.ndarray or None
+        The ``(p, p)`` float64 coefficient covariance matrix, in coefficient
+        order.
     group_metadata : dict or None
         Saved group-level metadata for grouped fits.
     deployment_extensions : list of dict
@@ -469,8 +470,7 @@ class Summary:
     #: converged on was rich enough.
     basis_checks: list[dict[str, Any]] = field(default_factory=list)
     covariance_kind: str | None = None
-    covariance_n: int | None = None
-    covariance_flat: list[float] | None = None
+    covariance: np.ndarray | None = None
     #: Exact covariance definition behind the coefficient ``std_error`` column
     #: (#2296): ``"conditional"`` or ``"smoothing-corrected"``, recorded from
     #: the definition-consistent pair the engine summary actually consumed.

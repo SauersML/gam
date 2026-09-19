@@ -1415,3 +1415,88 @@ fn collapsed_warp_likelihood_is_invariant_in_the_weibull_target() {
     assert_eq!(threshold_a, threshold_b);
     assert_eq!(log_sigma_a, log_sigma_b);
 }
+
+/// gam#3037: the flexible I-spline time block declares its coordinate cone and
+/// nothing else, because the cone already implies every training row's
+/// derivative guard. The premise is checked on the real survival I-spline
+/// construction: the derivative design is non-negative entrywise and every
+/// column carrying it is bounded, so the least value of `D_i β + o_i` over the
+/// cone is `o_i`, which is the guard under the default linear baseline. Before
+/// the fix, the block declared `p + n` rows for this `p`-row set. That gave a
+/// degenerate vertex wherever a guard row bound, and a constrained Laplace
+/// normalizer priced over every row.
+#[test]
+fn flexible_time_block_declares_its_coordinate_cone_once_3037() {
+    let n = 80;
+    let age_entry = Array1::from_shape_fn(n, |i| 18.0 + 0.5 * i as f64);
+    let age_exit = Array1::from_shape_fn(n, |i| age_entry[i] + 1.0 + 2.5 * (i % 7) as f64);
+    let build = crate::survival::build_survival_time_basis(
+        &age_entry,
+        &age_exit,
+        crate::survival::SurvivalTimeBasisConfig::ISpline {
+            degree: 3,
+            knots: Array1::zeros(0),
+            keep_cols: Vec::new(),
+        },
+        Some(4),
+    )
+    .expect("build the survival I-spline time basis");
+    let guard = crate::survival::survival_derivative_guard_for_likelihood(
+        crate::survival::SurvivalLikelihoodMode::LocationScale,
+    );
+    let time_block = TimeBlockInput {
+        design_entry: build.x_entry_time.clone(),
+        design_exit: build.x_exit_time.clone(),
+        design_derivative_exit: build.x_derivative_time.clone(),
+        offset_entry: Array1::zeros(n),
+        offset_exit: Array1::zeros(n),
+        // The linear baseline has no derivative of its own: each offset is the guard.
+        derivative_offset_exit: Array1::from_elem(n, guard),
+        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+        penalties: build.penalties.clone(),
+        nullspace_dims: build.nullspace_dims.clone(),
+        initial_log_lambdas: None,
+        initial_beta: None,
+    };
+    let prepared = prepare_identified_time_block(
+        &time_block,
+        guard,
+        0,
+        false,
+        age_entry.mapv(f64::ln).view(),
+        age_exit.mapv(f64::ln).view(),
+    )
+    .expect("prepare the flexible time block");
+
+    let bounds = prepared
+        .coefficient_lower_bounds
+        .as_ref()
+        .expect("the flexible block carries its cone bounds");
+    let declared = prepared
+        .linear_constraints
+        .as_ref()
+        .expect("the flexible block declares constraints");
+    let cone = lower_bound_constraints(bounds).expect("the cone has rows");
+    assert_eq!(declared.a, cone.a, "declared rows must be the cone rows");
+    assert_eq!(declared.b, cone.b, "declared bounds must be the cone bounds");
+    let bounded = bounds.iter().filter(|lower| lower.is_finite()).count();
+    assert!(bounded > 0);
+    assert_eq!(
+        declared.a.nrows(),
+        bounded,
+        "one row per bounded coefficient, none per training row"
+    );
+
+    for ((row, col), &value) in prepared.design_derivative_exit.indexed_iter() {
+        assert!(
+            value >= 0.0,
+            "derivative design entry ({row}, {col}) = {value:e} is negative"
+        );
+        if value != 0.0 {
+            assert_eq!(
+                bounds[col], 0.0,
+                "column {col} carries derivative {value:e} at row {row} but is not bounded"
+            );
+        }
+    }
+}
