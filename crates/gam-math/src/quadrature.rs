@@ -284,24 +284,34 @@ pub fn standard_normal_gauss_hermite_rule(
         .collect())
 }
 
-/// The largest order whose [`standard_normal_gauss_hermite_rule`] builds with every weight
-/// positive, where every lower order does too (#784). A block quadrature refuses the next
-/// order, so an order search that raises one order at a time stops exactly here.
+/// Whether [`standard_normal_gauss_hermite_rule`] of `order` builds with every weight
+/// positive (#784). A block quadrature refuses an order this rejects, so an order search
+/// that raises one order at a time asks this of the next order before it raises.
 ///
-/// Measured once per process from this arithmetic and this rule builder, so no order
-/// ceiling is chosen. The scan ends because the extreme weight of an `n`-node rule decays
-/// like `e^{−2n}` and underflows at a few hundred nodes.
+/// One rule build, the same one the block quadrature performs at that order, so asking it
+/// costs no more than the step it guards.
+pub fn standard_normal_gauss_hermite_order_is_representable(order: usize) -> bool {
+    standard_normal_gauss_hermite_rule(order)
+        .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
+}
+
+/// The largest order whose [`standard_normal_gauss_hermite_rule`] builds with every weight
+/// positive, where every lower order does too (#784): the order at which a search that
+/// raises one order at a time and asks
+/// [`standard_normal_gauss_hermite_order_is_representable`] of the next order stops.
+///
+/// Measured by scanning every order from one, so no order ceiling is chosen. The scan ends
+/// because the extreme weight of an `n`-node rule decays like `e^{−2n}` and underflows at a
+/// few hundred nodes. The scan builds every rule up to that order, which costs most of a
+/// second, so no fit calls it: it is the reference an order search's stop is checked
+/// against.
 pub fn max_representable_standard_normal_gauss_hermite_order() -> usize {
     static MAX_REPRESENTABLE_ORDER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX_REPRESENTABLE_ORDER.get_or_init(|| {
-        let representable = |order: usize| {
-            standard_normal_gauss_hermite_rule(order)
-                .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
-        };
         let mut order = 1usize;
         while order
             .checked_add(1)
-            .is_some_and(|next| representable(next))
+            .is_some_and(standard_normal_gauss_hermite_order_is_representable)
         {
             order += 1;
         }
@@ -571,6 +581,14 @@ mod tests {
                 .map_or(true, |rule| rule.iter().any(|&(_, weight)| !(weight > 0.0))),
             "the order-{} rule must carry a non-positive weight or fail to build",
             ceiling + 1
+        );
+        assert!(
+            (1..=ceiling).all(standard_normal_gauss_hermite_order_is_representable),
+            "every order through the ceiling {ceiling} must be representable"
+        );
+        assert!(
+            !standard_normal_gauss_hermite_order_is_representable(ceiling + 1),
+            "the order past the ceiling {ceiling} must not be representable"
         );
     }
 

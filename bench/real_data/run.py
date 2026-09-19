@@ -6,7 +6,7 @@
 
 Fetches every dataset into the cache (checksums verified, see
 ``datasets.py``), then runs every (dataset, fold, lib) as its own worker
-subprocess under ``bench.pygam_compare``'s supervisor: the same pinned
+subprocess under ``bench.pygam_compare``'s ``run_isolated``: the same pinned
 single-thread environment, process-tree RSS polling and safety net. Within a
 fold the libraries are interleaved so drift in host load hits them alike.
 
@@ -33,7 +33,7 @@ from typing import Any
 
 import psutil
 
-from bench.pygam_compare.run import THREAD_ENV, git_sha, supervise
+from bench.pygam_compare.run import THREAD_ENV, git_sha, run_isolated
 
 from . import datasets, report
 from .worker import FOLDS, LIBS, SPLIT_SEED
@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                         rec = {**base, "status": f"not_run_after_{stopped[(lib, name)]}"}
                     else:
                         cmd = [sys.executable, str(WORKER), lib, name, str(fold)]
-                        rec = {**supervise(cmd, args.timeout, args.memcap_mb, cwd), **base}
+                        rec = {**run_isolated(cmd, cwd, args.timeout, args.memcap_mb), **base}
                         if rec["status"] in ("timeout", "memcap"):
                             stopped[(lib, name)] = rec["status"]
                     records.append(rec)

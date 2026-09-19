@@ -46,7 +46,7 @@ where pyGAM's documentation sets one (`chicago_docs`: `s(time, n_splines=200)`).
   folds are stratified on the response so rare-event data keeps its events in
   every training set.
 * **Isolation.** Every (dataset, fold, lib) is its own subprocess, run by
-  `bench.pygam_compare`'s supervisor with every BLAS / OpenMP / Rayon pool at
+  `bench.pygam_compare`'s `run_isolated` with every BLAS / OpenMP / Rayon pool at
   one thread. The supervisor polls the process tree's RSS (peak MB) and
   enforces a timeout and memory cap that are a harness safety net, not a
   solver budget: a rep that trips one is recorded as `timeout` / `memcap`
