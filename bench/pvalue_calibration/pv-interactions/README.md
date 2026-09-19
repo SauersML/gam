@@ -79,7 +79,7 @@ come from p-values on the conservative side.
 | cell | term | amplitude | m (failed) | median edf | power .10 | power .05 | power .01 |
 |---|---|---|---|---|---|---|---|
 | ti_gauss_200_power | `ti(x1, x2)` | 0.6 | 500 (0) | 3.65 | 0.990 | 0.974 | 0.894 |
-| ti_binom_1000_power | `ti(x1, x2)` | 0.8 | TI_BINOM_POWER |
+| ti_binom_1000_power | `ti(x1, x2)` | 0.8 | 500 (0) | 3.76 | 0.986 | 0.968 | 0.908 |
 | te_gauss_300_power | `te(x1, x2)` | 0.5 | 500 (0) | 3.71 | 0.988 | 0.986 | 0.948 |
 | iso_gauss_300_power | `s(x1, x2)` | 0.5 | 500 (0) | 3.96 | 0.980 | 0.954 | 0.846 |
 | vc_gauss_300_power | `s(x, by=z)` | 0.4 | 500 (0) | 1.91 | 1.000 | 0.998 | 0.988 |
