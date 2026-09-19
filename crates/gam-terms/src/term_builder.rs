@@ -2755,6 +2755,7 @@ pub(crate) fn build_smooth_basis(
             None,
             effective_degree,
             n_knots,
+            false,
         )?;
         let marginal = BSplineBasisSpec {
             degree: effective_degree,
@@ -2990,54 +2991,16 @@ pub(crate) fn build_smooth_basis(
                 ))
                 .to_string());
             }
-            let heuristic_knots = n_knots;
             if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 n_knots = n_knots.min(1);
             }
             let unique = unique_count_column(ds.values.column(c));
-            let knots_before_support_cap = n_knots;
             let degree_before_support_cap = effective_degree;
             if inferred && !periodic_axes[0] && unique >= 2 {
                 let (capped_knots, capped_degree) =
                     support_capped_bspline_dimension(n_knots, effective_degree, unique);
                 n_knots = capped_knots;
                 effective_degree = capped_degree;
-            }
-            if inferred {
-                // State the rule the engine actually applied
-                // (`heuristic_knots_for_column`: `clamp(unique/4, 4..8)`), and
-                // the small-data reduction when it fired. The note used to
-                // announce a `max(20, cbrt(unique))` ceiling that no code path
-                // computed, so for every column with 36 or more unique values
-                // it printed a rule whose own arithmetic disagreed with the
-                // count beside it.
-                let mut note = format!(
-                    "Automatically set {} internal knots for smooth '{}' from {} unique values (rule: clamp(unique/4, 4..{}) = {}; basis dimension = internal knots + degree + 1).",
-                    n_knots,
-                    vars.join(","),
-                    unique,
-                    MAX_DEFAULT_INTERNAL_KNOTS,
-                    heuristic_knots,
-                );
-                if knots_before_support_cap != heuristic_knots {
-                    note.push_str(&format!(
-                        " Reduced to {} because the fit has only {} rows and {} smooth coordinates.",
-                        knots_before_support_cap,
-                        ds.values.nrows(),
-                        smooth_coordinate_count,
-                    ));
-                }
-                if n_knots != knots_before_support_cap || effective_degree != degree {
-                    note.push_str(&format!(
-                        " Capped to {} internal knots at degree {} (basis dimension {}) because the covariate has only {} unique values.",
-                        n_knots,
-                        effective_degree,
-                        n_knots + effective_degree + 1,
-                        unique,
-                    ));
-                }
-                note.push_str(" Override with knots=... or k=....");
-                inference_notes.inform(note);
             }
             let boundary_conditions =
                 if periodic_axes[0] && bspline_boundary_declares_periodic_axis(options) {
@@ -3137,6 +3100,7 @@ pub(crate) fn build_smooth_basis(
                         domain,
                         effective_degree,
                         n_knots,
+                        false,
                     )?,
                 };
                 (knotspec, parse_cyclic_boundary(options, minv, maxv)?)
@@ -3149,6 +3113,7 @@ pub(crate) fn build_smooth_basis(
                         domain,
                         effective_degree,
                         n_knots,
+                        inferred,
                     )?,
                     parse_cyclic_boundary(options, minv, maxv)?,
                 )
@@ -4684,43 +4649,36 @@ fn min_per_group_unique_count(
         .max(1)
 }
 
-/// Cap on the automatically inferred internal-knot count of a 1-D smooth.
-/// Default cubic basis ≈ `MAX_DEFAULT_INTERNAL_KNOTS + degree + 1` = 12
-/// functions, matching mgcv's lean univariate default. Named at module level
-/// so the inference note reports the ceiling the engine applies rather than
-/// one of its own.
-pub(crate) const MAX_DEFAULT_INTERNAL_KNOTS: usize = 8;
+/// Internal-knot count of the lean default univariate B-spline basis:
+/// `DEFAULT_PILOT_INTERNAL_KNOTS + degree + 1` = 12 cubic functions, close to
+/// mgcv's univariate default (`k = 10`).
+///
+/// For the formula default `s(x)` this is only the *starting* resolution, not a
+/// ceiling: the standard formula workflow refits with a doubled knot count
+/// whenever the converged fit's own adequacy evidence (EDF saturation, or the
+/// #2774 residual lack-of-fit score test) says the basis is too small, up to
+/// the covariate's distinct-value support and the design's rank (see
+/// `finish_adaptive_spatial_fit`). Starting lean is what lets a null or linear
+/// truth finish on a small, cheap basis. Bases that loop does not own (cyclic,
+/// factor-smooth and tensor margins, radial floors that copy this spline's
+/// size) take this count as their fixed default.
+pub(crate) const DEFAULT_PILOT_INTERNAL_KNOTS: usize = 8;
 
-/// Default internal-knot count for an *additive* univariate smooth, derived
-/// from the column's unique-value count.
+/// Default (pilot) internal-knot count for a univariate smooth, derived from
+/// the column's unique-value count: `unique/4`, floored at 4 knots so a
+/// non-trivial smooth is representable at all and capped at
+/// [`DEFAULT_PILOT_INTERNAL_KNOTS`] so the pilot fit is lean.
 ///
-/// The basis dimension is `internal_knots + degree + 1`, so the cap below maps
-/// to a default cubic basis of ~12 functions — deliberately close to mgcv's
-/// univariate default (`k = 10`). A penalized smooth controls its wiggliness
-/// through the *penalty*, not the basis size: REML/LAML shrinks a too-rich
-/// basis toward the null, but it cannot do so cleanly when the basis is so
-/// over-sized that the design becomes weakly identified. Growing the basis with
-/// `n` (the old `n^(1/3)`-ceilinged `unique/4` rule, which pinned to 20 internal
-/// knots ⇒ a 24-function basis for any column with ≥80 unique values) therefore
-/// *hurts* recovery on finite, weak-signal fits: a 4-smooth additive model on
-/// n=120 asks for ~92 coefficients, the outer optimizer stalls on the resulting
-/// flat two-penalty (range + null-space) REML surface, and the truth leaks into
-/// surplus columns the penalty can't shrink away (gam#1680; the same defect was
-/// documented for thin-plate fields in gam#1074). A k-sweep on the #1680 design
-/// confirms a basis of ~10–15 recovers truth at RMSE ≈ 0.12 while the old
-/// 24-function default lands at ≈ 0.39 (~3× worse) — *whether or not* the
-/// covariates are collinear, so this is basis over-richness, not collinearity.
-///
-/// The cap is flat in `n`: a user who genuinely needs a wigglier fit raises `k`
-/// explicitly (mgcv's contract — opt *in* to more flexibility), and the SPEC
-/// requires the default to allow recovering the null rather than forcing the
-/// user to opt out of overfitting. The 4-knot floor stays put because we still
-/// need enough basis functions to fit a non-trivial smooth at all, and the
-/// `unique/4` growth below the cap keeps small/sparse columns (n ≤ 32, where
-/// `unique/4 ≤ 8`) on exactly their previous knot count.
+/// A penalized smooth controls its wiggliness through the *penalty*, not the
+/// basis size, so the pilot deliberately stays small: REML/LAML then only has
+/// to shrink what the data do not support, and the adaptive formula loop adds
+/// resolution only where the fit itself shows the pilot is too coarse. (Before
+/// that loop existed this count was the final basis of every default `s(x)`,
+/// so a strongly wiggly truth plateaued at the 12-function bias floor no
+/// matter how much data arrived.)
 pub(crate) fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
-    (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
+    (unique / 4).clamp(4, DEFAULT_PILOT_INTERNAL_KNOTS)
 }
 
 /// Cap a default open B-spline `(internal_knots, degree)` so its basis
@@ -5200,34 +5158,7 @@ const CR_MARGIN_DEGREE: usize = 3;
 /// interpolating cubic.
 const CR_MARGIN_PENALTY_ORDER: usize = 2;
 
-fn parse_knot_placement(
-    options: &BTreeMap<String, String>,
-) -> Result<crate::basis::BSplineKnotPlacement, String> {
-    use crate::basis::BSplineKnotPlacement;
-    match options
-        .get("knot_placement")
-        .or_else(|| options.get("knot-placement"))
-        .or_else(|| options.get("knotplacement"))
-    {
-        None => Ok(BSplineKnotPlacement::Uniform),
-        Some(raw) => match raw
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "uniform" | "even" | "equal" => Ok(BSplineKnotPlacement::Uniform),
-            "quantile" | "quantiles" | "data" | "empirical" => Ok(BSplineKnotPlacement::Quantile),
-            other => Err(TermBuilderError::invalid_option(format!(
-                "knot_placement={other} is not recognised; expected \"uniform\" or \"quantile\""
-            ))
-            .to_string()),
-        },
-    }
-}
-
-/// Like [`parse_knot_placement`] but distinguishes "unset" from an explicit
+/// The declared `knot_placement=`, distinguishing "unset" from an explicit
 /// `knot_placement=uniform`.
 ///
 /// The two are not the same request on a tensor margin: unset means "give me
@@ -5239,26 +5170,49 @@ fn parse_knot_placement(
 fn explicit_knot_placement(
     options: &BTreeMap<String, String>,
 ) -> Result<Option<crate::basis::BSplineKnotPlacement>, String> {
-    let declared = ["knot_placement", "knot-placement", "knotplacement"]
-        .iter()
-        .any(|key| options.contains_key(*key));
-    if !declared {
-        return Ok(None);
+    use crate::basis::BSplineKnotPlacement;
+    match options
+        .get("knot_placement")
+        .or_else(|| options.get("knot-placement"))
+        .or_else(|| options.get("knotplacement"))
+    {
+        None => Ok(None),
+        Some(raw) => match raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "uniform" | "even" | "equal" => Ok(Some(BSplineKnotPlacement::Uniform)),
+            "quantile" | "quantiles" | "data" | "empirical" => {
+                Ok(Some(BSplineKnotPlacement::Quantile))
+            }
+            other => Err(TermBuilderError::invalid_option(format!(
+                "knot_placement={other} is not recognised; expected \"uniform\" or \"quantile\""
+            ))
+            .to_string()),
+        },
     }
-    parse_knot_placement(options).map(Some)
 }
 
 /// Build the non-periodic 1D B-spline knot spec for the `ps`/`bspline` and
 /// factor-smooth marginal paths, honoring (in priority order):
 ///   1. `knots=[...]` explicit internal positions  → [`BSplineKnotSpec::Provided`]
-///   2. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
-///   3. uniform generation                          → [`BSplineKnotSpec::Generate`]
+///   2. an adaptive formula default                → [`BSplineKnotSpec::Automatic`]`{ adaptive: true }`
+///   3. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
+///   4. uniform generation                          → [`BSplineKnotSpec::Generate`]
 ///
 /// `data` is the covariate column (used to drive quantile placement);
 /// `data_range` is its observed range and `domain` the declared `domain=`
 /// interval, which when present replaces the data range as the span of the
 /// clamped boundary knots. `n_knots` is the resolved internal-knot count from
-/// [`parse_ps_internal_knots`] used for the automatic strategies.
+/// [`parse_ps_internal_knots`] used for the automatic strategies. `adaptive`
+/// marks the formula default `s(x)`: nobody chose the count, so it is only the
+/// starting resolution that the standard formula workflow refines from the
+/// converged fit's own adequacy evidence. A declared `domain=` pins the knot
+/// span the adaptive spec cannot carry, so it keeps the count fixed. Undeclared
+/// placement is uniform either way.
 fn resolve_nonperiodic_bspline_knotspec(
     options: &BTreeMap<String, String>,
     data: ArrayView1<'_, f64>,
@@ -5266,6 +5220,7 @@ fn resolve_nonperiodic_bspline_knotspec(
     domain: Option<(f64, f64)>,
     degree: usize,
     n_knots: usize,
+    adaptive: bool,
 ) -> Result<BSplineKnotSpec, String> {
     use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
     let knot_range = domain.unwrap_or(data_range);
@@ -5282,7 +5237,22 @@ fn resolve_nonperiodic_bspline_knotspec(
             .map_err(|e| e.to_string())?;
         return Ok(BSplineKnotSpec::Provided(knots));
     }
-    match parse_knot_placement(options)? {
+    let placement = explicit_knot_placement(options)?.unwrap_or(BSplineKnotPlacement::Uniform);
+    if adaptive && domain.is_none() {
+        if placement == BSplineKnotPlacement::Quantile {
+            // Validate the column up-front so an unfittable request surfaces a
+            // user-correctable error at parse time rather than deep in basis
+            // construction. The same data drives the eventual quantile knots.
+            crate::basis::auto_knot_vector_1d_quantile(data, n_knots, degree)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(n_knots),
+            placement,
+            adaptive: true,
+        });
+    }
+    match placement {
         BSplineKnotPlacement::Uniform => Ok(BSplineKnotSpec::Generate {
             data_range: knot_range,
             num_internal_knots: n_knots,
@@ -6139,6 +6109,7 @@ fn quantile_bspline_knotspec(
         return Ok(BSplineKnotSpec::Automatic {
             num_internal_knots: Some(num_internal_knots),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         });
     };
     if auto.shrunk {
