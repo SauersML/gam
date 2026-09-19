@@ -269,8 +269,10 @@ class Duchon(Smooth):
     def basis_size(self) -> int:
         """``K`` (the number of centers)."""
         if self.centers is None:
-            from ._api import _DEFAULT_BASIS_K
-            return int(_DEFAULT_BASIS_K)
+            raise ValueError(
+                "Duchon.basis_size: centers=None takes the formula default center count, "
+                "which depends on the data; pass an int or explicit centers to fix K"
+            )
         if isinstance(self.centers, int):
             return int(self.centers)
         import numpy as np
