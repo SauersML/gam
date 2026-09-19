@@ -147,4 +147,3 @@ unconverged	crates/gam-custom-family/src/inner_blockwise_fit/exact_joint_fit.rs	
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
 unconverged	crates/gam-solve/src/rho_optimizer/bridges.rs	Some(CostStallExit{converged:false})	https://github.com/SauersML/gam/issues/2902
-unconverged	crates/gam-terms/src/basis/duchon_radial_profile.rs	Ok(PanelEstimate{converged:false})	https://github.com/SauersML/gam/issues/2902
