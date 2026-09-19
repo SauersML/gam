@@ -151,6 +151,36 @@ pub(crate) struct OuterProblemSize {
     pub(crate) p_coefficients: Option<usize>,
 }
 
+impl OuterProblemSize {
+    /// The criterion's statistical resolution `τ_stat = η²/2 = 1/(2n)`, in the
+    /// criterion's own absolute units, over the declared `n` observations.
+    ///
+    /// A point whose remaining decrease `G` to the exact optimum satisfies
+    /// `½(θ − θ̂)ᵀH(θ − θ̂) ≤ G` has every linear functional `Lᵀθ` within
+    /// `√(2G)·se(Lᵀθ̂)` of its value at the optimum (Cauchy–Schwarz in the
+    /// `H` inner product), and by the delta method so does every smooth
+    /// functional of the hyperparameters: edf, fitted values, AIC. The
+    /// criterion is itself a first-order object — LAML is a Laplace
+    /// approximation with `O(1/n)` absolute error at fixed dimension (Tierney &
+    /// Kadane 1986), and Wald/edf inference built on `λ̂` carries `O(n^{-1/2})`
+    /// error — so resolving the optimum to `η = n^{-1/2}` sampling SDs puts the
+    /// optimization error below the intrinsic error of the inference built on
+    /// it. A decrease below `τ_stat` changes no reported quantity by more than
+    /// that. It is invariant to the units of `y` and to any additive constant
+    /// in `V` (a Poisson `Σ log y!`), which `rel·(1 + |V|)` was not.
+    ///
+    /// `η² = 1/n` is the first-order choice. For Gaussian REML, whose criterion
+    /// carries no Laplace error, `1/edf` or `1/(n − p)` could be argued instead;
+    /// the choice moves `τ_stat` by a constant factor only (#3192).
+    ///
+    /// `None` when the route declares no observation count.
+    pub(crate) fn statistical_resolution(&self) -> Option<f64> {
+        self.n_obs
+            .filter(|&n| n > 0)
+            .map(|n| 0.5 / n as f64)
+    }
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
@@ -3296,10 +3326,11 @@ pub(crate) enum StationarityBoundSource {
     /// certified this and the caller would not" -- a distinction that matters
     /// because the second is not a defect in the fit.
     CallerRequirement,
-    /// `|Pg|·√((band_f − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict
-    /// on rounding bands only, rendered as a gradient bound along the measured
-    /// direction. It certifies iff `λ̂² + band_λ² ≤ band_f`, so no caller
-    /// tolerance and no scale anchor enters, and it may TIGHTEN every rung above.
+    /// `|Pg|·√((tol − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict,
+    /// rendered as a gradient bound along the measured direction. It certifies
+    /// iff `λ̂² + band_λ² ≤ tol = max(τ_stat − band_f, band_f)` with `τ_stat =
+    /// 1/(2n)` (C3), so no caller tolerance and no scale anchor enters, and it
+    /// may TIGHTEN every rung above.
     NewtonDecrement,
     /// The decrement verdict was taken and could not certify anything: its own
     /// rounding reached the objective band, a flat direction carried gradient,
@@ -4613,10 +4644,14 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     if let Some((decision, (bound, source))) = decrement_decided.as_ref() {
         let verdict = &decision.verdict;
         log::debug!(
-            "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (band_f = channels \
-             {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released {:?}; bound \
-             {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
+            "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (tolerance \
+             {:.3e} = max(τ_stat {:.3e} − band_f, band_f), arithmetic-limited {}; band_f = \
+             channels {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released \
+             {:?}; bound {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
              |Pg|={projected_grad_norm:.3e} (#2954)",
+            decision.tolerance.value(),
+            decision.tolerance.tau_stat,
+            decision.tolerance.arithmetic_limited(),
             decision.objective_band.channels,
             decision.objective_band.factor,
             decision.objective_band.inner_residual,
