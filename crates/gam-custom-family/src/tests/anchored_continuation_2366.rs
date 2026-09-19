@@ -405,7 +405,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         inner_tol: 1e-10,
         outer_max_iter: 50,
         outer_tol: 1e-8,
-        outer_tol_is_caller_set: false,
         outer_rel_cost_tol: None,
         rho_lower_bound: Some(-10.0),
         ridge_floor: 1e-8,
