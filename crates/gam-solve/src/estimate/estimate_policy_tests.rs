@@ -18,7 +18,7 @@ use super::penalty::REML_SEED_SCREENING_RHO_CAP;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
-    reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_unidentifiable_unpenalized_space, reject_prefit_unpenalized_rank_deficiency,
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;
@@ -2408,4 +2408,116 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         "a warm cache changed WHERE the fit landed, not just how fast it got there:\n{}",
         failures.join("\n")
     );
+}
+
+/// A 10-column second-difference penalty block at `start..start + 10` of a
+/// `p`-column model, plus (double penalty) the projector onto its linear null
+/// space `span{1, t}`, as canonical penalties.
+fn wide_smooth_block_penalties(
+    start: usize,
+    p: usize,
+    double_penalty: bool,
+) -> Vec<gam_terms::construction::CanonicalPenalty> {
+    let k = 10;
+    let mut d = Array2::<f64>::zeros((k - 2, k));
+    for row in 0..k - 2 {
+        d[[row, row]] = 1.0;
+        d[[row, row + 1]] = -2.0;
+        d[[row, row + 2]] = 1.0;
+    }
+    let mut specs = vec![PenaltySpec::Block {
+        local: d.t().dot(&d),
+        col_range: start..start + k,
+        prior_mean: gam_problem::CoefficientPriorMean::Zero,
+        structure_hint: None,
+        op: None,
+    }];
+    if double_penalty {
+        let ones = Array1::<f64>::from_elem(k, 1.0 / (k as f64).sqrt());
+        let mut t = Array1::from_iter((0..k).map(|i| i as f64));
+        t -= t.mean().expect("nonempty");
+        t /= t.dot(&t).sqrt();
+        let mut null_projector = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..k {
+                null_projector[[i, j]] = ones[i] * ones[j] + t[i] * t[j];
+            }
+        }
+        specs.push(PenaltySpec::Block {
+            local: null_projector,
+            col_range: start..start + k,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        });
+    }
+    let nullspace_dims = vec![0; specs.len()];
+    gam_terms::construction::canonicalize_penalty_specs(
+        &specs,
+        &nullspace_dims,
+        p,
+        "sample-size identifiability",
+    )
+    .expect("canonicalize the smooth block penalties")
+    .0
+}
+
+#[test]
+fn prefit_sample_size_gate_counts_the_unpenalized_space_not_the_columns() {
+    // Intercept + one parametric slope (unpenalized) and two 10-column smooths:
+    // p = 22 columns. Double-penalized, the only unpenalized directions are the
+    // two parametric ones, so M_p = 2 and n = 3 rows already identify the fit
+    // even though p = 22 > n.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, true);
+    penalties.extend(wide_smooth_block_penalties(12, p, true));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(3).view(), p, &penalties)
+        .expect("n = 3 > M_p = 2 is identified at p = 22");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(2).view(), p, &penalties)
+            .expect_err("n = 2 = M_p leaves no residual contrast for REML");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            unpenalized_dim: 2,
+            total_columns: 22,
+        }
+    ));
+    // Zero-weight rows carry no information and do not count toward n.
+    let err = reject_prefit_unidentifiable_unpenalized_space(
+        array![1.0, 0.0, 1.0, 0.0].view(),
+        p,
+        &penalties,
+    )
+    .expect_err("two positive-weight rows are n = 2 whatever the row count");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefit_sample_size_gate_adds_single_penalty_null_spaces() {
+    // Singly penalized, each smooth leaves its linear trend {1, t} unpenalized:
+    // M_p = 2 parametric + 2 + 2 = 6.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, false);
+    penalties.extend(wide_smooth_block_penalties(12, p, false));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(7).view(), p, &penalties)
+        .expect("n = 7 > M_p = 6 is identified");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(6).view(), p, &penalties)
+            .expect_err("n = 6 = M_p is not identified");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 6,
+            unpenalized_dim: 6,
+            total_columns: 22,
+        }
+    ));
 }

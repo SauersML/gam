@@ -236,6 +236,53 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     Ok(None)
 }
 
+/// Sample-size identifiability of a penalized fit.
+///
+/// Write `p` for the coefficient count and `M_p = p − rank(Σ_k S_k)` for the
+/// dimension of the penalty null space: the coefficient directions no penalty
+/// touches (intercept, parametric columns, the polynomial trend of a singly
+/// penalized smooth — zero for a double-penalized smooth, whose second penalty
+/// covers that trend). REML and LAML integrate those `M_p` directions out under
+/// a flat prior, so the criterion is the density of the `n − M_p` error
+/// contrasts orthogonal to the unpenalized column space: the Gaussian profiled
+/// scale is `φ̂ = (‖y − Xβ̂‖² + β̂ᵀSβ̂)/(n − M_p)`, and for any family the
+/// Laplace criterion's `λ`-dependence comes only from the residual the
+/// unpenalized directions cannot absorb. With `n ≤ M_p` there are no such
+/// contrasts: the unpenalized directions alone reproduce the data, and the
+/// criterion carries no information about `λ` (nor `φ`), so no smoothing
+/// parameter optimum exists to converge to. With `n > M_p` the fit is
+/// identified however large `p` is, because every penalized direction is pinned
+/// by its penalty rather than by the data; the total column count is not a
+/// constraint. (Whether the data identify the unpenalized directions — the rank
+/// of the unpenalized design — is the separate check
+/// [`reject_prefit_unpenalized_rank_deficiency`].)
+///
+/// `n` counts positive-weight rows, the same count the REML objective uses, and
+/// the rank is the balanced structural rank the reparameterization and the
+/// criterion's `log|S|₊` use, so this gate and the criterion agree on `M_p`.
+pub(crate) fn reject_prefit_unidentifiable_unpenalized_space(
+    w: ArrayView1<'_, f64>,
+    p: usize,
+    penalties: &[CanonicalPenalty],
+) -> Result<(), EstimationError> {
+    let n_observations = w.iter().filter(|&&weight| weight > 0.0).count();
+    let penalty_rank = gam_terms::construction::balanced_penalty_structural_rank(
+        penalties
+            .iter()
+            .map(|penalty| (penalty.local_ref().view(), penalty.col_range.clone())),
+        p,
+    )?;
+    let unpenalized_dim = p.saturating_sub(penalty_rank);
+    if n_observations > unpenalized_dim {
+        return Ok(());
+    }
+    Err(EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations,
+        unpenalized_dim,
+        total_columns: p,
+    })
+}
+
 pub(crate) fn reject_prefit_unpenalized_rank_deficiency(
     w: ArrayView1<'_, f64>,
     x_fit: &DesignMatrix,

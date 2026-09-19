@@ -613,6 +613,21 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Not enough observations to identify the model: {n_observations} positive-weight rows but \
+        {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
+        penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
+        parameters from the n − {unpenalized_dim} residual contrasts the unpenalized directions \
+        cannot absorb, so n must exceed {unpenalized_dim}; the total column count need not be below n. \
+        Add observations, drop parametric terms, or penalize the unpenalized directions \
+        (double-penalty smooths contribute none)."
+    )]
+    PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations: usize,
+        unpenalized_dim: usize,
+        total_columns: usize,
+    },
+
+    #[error(
         "Pre-fit rank deficiency detected in the realized unpenalized design: rank {rank} < {num_unpenalized_columns} \
         unpenalized columns (min eigenvalue {min_eigenvalue:.3e}, tolerance {tolerance:.3e}, columns {column_indices:?}). \
         Remove/reparameterize the aliased columns or add an explicit penalty/constraint before fitting."
@@ -1178,6 +1193,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
@@ -1367,6 +1383,7 @@ impl EstimationError {
             | Self::PerfectSeparationDetected { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
@@ -1431,6 +1448,9 @@ impl EstimationError {
             }
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
+            }
+            Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
+                "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
             }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"

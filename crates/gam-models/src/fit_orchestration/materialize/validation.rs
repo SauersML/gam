@@ -222,53 +222,6 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     y.iter().all(|&v| v == 0.0 || v == 1.0)
 }
 
-/// Verify that the dataset has at least as many rows as the smooth terms in
-/// `spec` need for their bases to be well-posed.
-///
-/// Each [`SmoothBasisSpec`] owns its own `min_sample_rows` lower bound — the
-/// B-spline knot count, the *penalized* tensor-product floor (the sum of the
-/// per-marginal column counts, not their Kronecker product, because a `te()`
-/// is regularized and its effective dof is a small fraction of the column
-/// count), the PCA matrix width — so this helper is a thin sum-and-compare:
-/// the workflow has no per-basis-kind knowledge. Adding a new smooth kind
-/// extends the basis `match` in `min_sample_rows`, not this gate.
-///
-/// Catches the README-quickstart failure mode (#309) where `n=4` against
-/// `y ~ s(x)` would otherwise surface as an opaque `cached inner beta has
-/// length 8` message from the inner-state seeding hook.
-pub(super) fn check_smooth_capacity(
-    spec: &gam_terms::smooth::TermCollectionSpec,
-    n_rows: usize,
-    response_name: &str,
-) -> Result<(), WorkflowError> {
-    // Intercept + 1 dof for the smoothing-parameter optimizer.
-    let mut required: usize = 2;
-    let mut per_term: Vec<(String, usize)> = Vec::new();
-    for term in &spec.smooth_terms {
-        let need = term.basis.min_sample_rows();
-        required = required.saturating_add(need);
-        per_term.push((term.name.clone(), need));
-    }
-    if per_term.is_empty() || n_rows >= required {
-        return Ok(());
-    }
-    let breakdown = per_term
-        .iter()
-        .map(|(name, k)| format!("{name}≥{k}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(WorkflowError::InvalidConfig {
-        reason: format!(
-            "not enough observations to fit the requested formula: dataset has n={n_rows} \
-             rows but the smooth terms on response '{response_name}' need at least \
-             {required} rows total ({breakdown}, plus intercept + smoothing-parameter dof) \
-             before REML estimation is well-posed. \
-             Fix: add more training rows, replace `s(x)` with a linear term, or pass a \
-             smaller basis via `s(x, k=3)`."
-        ),
-    })
-}
-
 #[cfg(test)]
 mod binary_response_tests {
     use super::is_binary_response;

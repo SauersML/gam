@@ -86,7 +86,8 @@ create_exception!(
 // `gam::solver::estimate::EstimationError`. Catching the specific subclass lets
 // callers branch on the exact failure mode (e.g. retry with looser
 // tolerances on `RemlConvergenceError`, suggest more data on
-// `ModelOverparameterizedError`, which `PrefitRankDeficientDesignDetected` raises).
+// `ModelOverparameterizedError`, which `PrefitRankDeficientDesignDetected` and
+// `PrefitUnpenalizedSpaceExceedsObservations` raise).
 
 create_exception!(
     _rust,
@@ -714,7 +715,8 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         }
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
-        EstimationError::PrefitRankDeficientDesignDetected { .. } => {
+        EstimationError::PrefitRankDeficientDesignDetected { .. }
+        | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
         EstimationError::PrefitNearDegenerateDesignDetected { .. } => {
