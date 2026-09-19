@@ -104,7 +104,7 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
 
 /// Largest `K` for which the Tier-1 Gauss-Hermite product grid is affordable
 /// (3–5 nodes per axis ⇒ at most 81–125 criterion evaluations).
-pub(crate) const TIER1_MAX_DIM: usize = gam_problem::rho_posterior::RHO_QUADRATURE_MAX_DIM;
+pub(crate) const TIER1_MAX_DIM: usize = 4;
 /// Largest `K` for which the Tier-2 NUTS escalation runs; beyond this the fit
 /// honestly reports that escalation is unavailable.
 pub(crate) const TIER2_MAX_DIM: usize = 16;

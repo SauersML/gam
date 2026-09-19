@@ -3899,14 +3899,13 @@ where
         // The Tier-0 diagnostic is CHEAP (a handful of outer-criterion
         // evaluations) so it is emitted regardless of `skip_rho_posterior_inference`
         // whenever it is available (#1810) — the standard formula/CLI fit surfaces
-        // its ρ-posterior adequacy grade by default. A grade of `Escalate` with
-        // K ≤ RHO_QUADRATURE_MAX_DIM runs the deterministic Tier-1 quadrature,
-        // whose cost is fixed by K. Only the Tier-2 NUTS sampler is gated by the
-        // flag: interactive formula/CLI fits keep `skip_rho_posterior_inference =
-        // true` so a fit whose plug-in grades `Escalate` never turns into a
-        // sampler benchmark, while lower-level callers that opt in (`skip =
-        // false`) get NUTS over ρ for K≤16 (honest Unavailable beyond) at this
-        // same live seam.
+        // its ρ-posterior adequacy grade by default. Only the EXPENSIVE escalation
+        // tiers (Tier-1 quadrature / Tier-2 NUTS over ρ) are gated by the flag:
+        // interactive formula/CLI fits keep `skip_rho_posterior_inference = true`
+        // so a fit whose plug-in grades `Escalate` never turns into a sampler
+        // benchmark, while lower-level callers that opt in (`skip = false`) get
+        // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
+        // K≤16, honest Unavailable beyond) at this same live seam.
         (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
             &final_rho,
             // The searched and certified box is the posterior's support.

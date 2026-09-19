@@ -278,12 +278,6 @@ pub enum RhoPosteriorEscalation {
     Unavailable { n_params: usize, reason: String },
 }
 
-/// Largest `K` for which the Tier-1 Gauss-Hermite product grid runs (3–5 nodes
-/// per axis ⇒ at most 125 criterion evaluations). The grid is deterministic and
-/// its cost is fixed by `K` alone, so an `Escalate` grade at or below this
-/// dimension runs it on every fit; only the Tier-2 NUTS sampler is opt-in.
-pub const RHO_QUADRATURE_MAX_DIM: usize = 4;
-
 /// What a fit's `ρ`-posterior escalation concluded, in the form a saved model
 /// carries.
 ///

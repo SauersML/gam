@@ -1092,10 +1092,9 @@ impl<'a> RemlState<'a> {
     /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
     /// rebuild recipe; running at the live seam avoids that entirely. When
-    /// `allow_escalation` is `false` only the deterministic Tier-1 grid runs
-    /// (`K ≤ RHO_QUADRATURE_MAX_DIM`), so ordinary interactive formula/CLI fits
-    /// emit the cheap diagnostic WITHOUT ever turning into a NUTS-over-ρ sampler
-    /// benchmark.
+    /// `allow_escalation` is `false` no tier runs, so ordinary interactive
+    /// formula/CLI fits emit the cheap diagnostic WITHOUT ever turning into a
+    /// sampler benchmark.
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     ///
@@ -1219,17 +1218,12 @@ impl<'a> RemlState<'a> {
             }
         };
         let escalation = match &outcome {
-            // The diagnostic grades the plug-in `Escalate`. For at most
-            // RHO_QUADRATURE_MAX_DIM graded directions the escalation is the
-            // Tier-1 Gauss-Hermite grid: deterministic, with a cost fixed by
-            // the dimension, so it runs whenever the grade asks for it. Beyond
-            // that the tier is NUTS over ρ, which only runs when the caller
-            // opts in: interactive formula/CLI fits pass `allow_escalation =
-            // false`, so they never launch the sampler.
+            // The diagnostic grades the plug-in `Escalate`. The escalation
+            // only runs when the caller opts in: interactive formula/CLI fits
+            // pass `allow_escalation = false`, so they publish the grade and
+            // never launch a sampler.
             RhoPosteriorOutcome::Assessed(adequacy)
-                if adequacy.adequacy == RhoProposalAdequacy::Escalate
-                    && (allow_escalation
-                        || centre.len() <= gam_problem::rho_posterior::RHO_QUADRATURE_MAX_DIM) =>
+                if allow_escalation && adequacy.adequacy == RhoProposalAdequacy::Escalate =>
             {
                 // #2450 — THE SAMPLER TARGETS A DISTRIBUTION; THE CRITERION DOES NOT.
                 //
