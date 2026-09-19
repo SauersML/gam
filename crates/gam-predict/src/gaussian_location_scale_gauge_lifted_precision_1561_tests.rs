@@ -104,7 +104,7 @@ fn gauge_lifted_precision_predicts_the_dense_covariance_bands_on_a_dropped_colum
             .expect("scale block")
             .beta
             .clone(),
-        sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+        sigma_floor: 0.01,
         response_scale: fitted.response_scale,
         covariance: None,
         link_wiggle: None,

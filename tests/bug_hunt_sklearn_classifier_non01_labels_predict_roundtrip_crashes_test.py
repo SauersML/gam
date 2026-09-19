@@ -7,14 +7,14 @@ model records that column in its schema as binary {0, 1}. At inference,
 straight through — the response column still holds its un-encoded labels
 (strings, {1, 2}, {-1, +1}). Those labels are validated against the {0, 1}
 schema and rejected by the Rust `predict_table`, so the round-trip crashes with
-a `GamError` for any non-{0, 1} label space. The response column is never
+a `GamfitError` for any non-{0, 1} label space. The response column is never
 needed to predict.
 
 This test fits `y ~ s(x)` via the column-name form on several label spaces and
 asserts the sklearn serving round-trip on the training frame succeeds:
 `predict` returns labels drawn from `classes_`, `predict_proba` rows sum to 1,
 and `score` returns a float in [0, 1]. Pre-fix the three non-{0,1} cases raise
-`GamError`; the {0, 1} case is a control that must pass on both sides of the
+`GamfitError`; the {0, 1} case is a control that must pass on both sides of the
 fix.
 """
 

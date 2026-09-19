@@ -106,13 +106,7 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
             Array1::from_elem(1, -WRONG_RAIL_FACE),
             Array1::from_elem(1, WRONG_RAIL_FACE),
         )
-        .with_initial_rho(reseed)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(reseed);
     let mut recovery_obj = recovery_problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
@@ -777,6 +771,9 @@ fn certificate_band_never_undercuts_a_resolvable_solver_band_2954() {
 
 // ─── #2458 the derived standard, and the typed inability to reach it ─────────
 
+/// The observations the #2458 fixture declares.
+const N_OBS_2458: usize = 5_000;
+
 /// One second-order-stationary point, certified twice: once by a route that
 /// declares a Dense analytic Hessian, once by a route that declares none.
 ///
@@ -786,6 +783,9 @@ fn certificate_band_never_undercuts_a_resolvable_solver_band_2954() {
 /// outer objective tolerance, i.e. the point is stationary to second order and
 /// the curvature-resolvability rung is exactly what exists to say so.
 ///
+/// The fixture declares `n = 5000` observations, so the criterion resolution
+/// is `τ_stat = 1/(2n) = 1e-4`.
+///
 /// `declares_hessian` is the ONLY difference between the two calls.
 fn certify_quadratic_at_declared_curvature_2458(
     declares_hessian: bool,
@@ -794,6 +794,10 @@ fn certify_quadratic_at_declared_curvature_2458(
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(N_OBS_2458),
+            p_coefficients: Some(1),
+        },
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -912,9 +916,9 @@ fn exact_curvature_reaches_the_derived_standard_and_its_absence_is_recorded_2458
 /// lands orders BELOW the gradient it is judging. Widening is not rescuing.
 #[test]
 fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
-    // |Pg| = 1 against a unit Hessian gives Δpred = 0.5 against
-    // τ = 1e-7·(1+0.5) = 1.5e-7, so the bound is √(3e-7) = 5.477e-4: the widest
-    // rung on the ladder, and 1826x below the gradient.
+    // |Pg| = 1 against a unit Hessian gives Δpred = 0.5 against the declared
+    // τ_stat = 1/(2·5000) = 1e-4, so the bound is √(1e-4/0.5) = 1.414e-2: the
+    // widest rung on the ladder, and 71x below the gradient.
     let refusal = certify_quadratic_at_declared_curvature_2458(true, 1.0, 1)
         .expect_err("a point with a half-unit predicted decrease is not stationary");
     let message = refusal.to_string();
@@ -923,13 +927,13 @@ fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
         "the refusal must be the ordinary non-stationarity one: {message}",
     );
     assert!(
-        message.contains("bound=5.477e-4"),
+        message.contains("bound=1.414e-2"),
         "the widened bound must be the decrement test's own answer, not a rescue: {message}",
     );
-    // The point of the assertion: three orders of margin between the widest
+    // The point of the assertion: nearly two orders of margin between the widest
     // bound the ladder can produce here and the gradient it is judging.
     assert!(
-        message.contains("|Pg|=1.000e0 > bound=5.477e-4"),
+        message.contains("|Pg|=1.000e0 > bound=1.414e-2"),
         "the refusal must compare the two directly: {message}",
     );
 }

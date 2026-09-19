@@ -113,6 +113,9 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Lower bound b on σ in the units of `y` for σ = b + exp(η); see
+    /// `GaussianLocationScaleFamily::sigma_floor`.
+    pub sigma_floor: f64,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
     /// Resource policy threaded into PsiDesignMap construction (and any other
@@ -192,6 +195,7 @@ impl GaussianLocationScaleWiggleFamily {
             q,
             eta_ls,
             &self.weights,
+            self.sigma_floor,
         )?))
     }
 
@@ -1896,24 +1900,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         true
     }
 
-    /// Non-spatial location-scale seeding classification — see
-    /// `GaussianLocationScaleFamily::outer_seed_config` for the full rationale.
-    /// The wiggle variant has the identical non-profiled log-σ predictor, so it
-    /// needs the same `GaussianLocationScale` classification (flexible Gaussian
-    /// seed grid + lowest-cost keep-best + interior-extreme promotion) on the
-    /// rho-only path; without it the log-σ block over-smooths exactly as the
-    /// non-wiggle family does.
-    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
-        if n_params == 0 {
-            return crate::seeding::SeedConfig::default();
-        }
-        let mut config = crate::seeding::SeedConfig::default();
-        config.risk_profile = crate::seeding::SeedRiskProfile::GaussianLocationScale;
-        config.max_seeds = 4;
-        config.seed_budget = 2;
-        config
-    }
-
     fn block_linear_constraints(
         &self,
         block_states: &[ParameterBlockState],
@@ -2046,6 +2032,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                         q,
                         eta_ls[i],
                         self.weights[i],
+                        self.sigma_floor,
                         ln2pi,
                     )?,
                     z_mu,
@@ -2104,7 +2091,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut ll = 0.0;
         for i in 0..self.y.len() {
             let q = eta_mu[i] + etaw[i];
-            ll += gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+            ll += gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], self.sigma_floor, ln2pi)?
                 .log_likelihood;
             if !ll.is_finite() {
                 return Err(GamlssError::row_geometry_unrepresentable(i, "Gaussian wiggle cumulative log likelihood", eta_ls[i], ll));
@@ -2152,7 +2139,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             let i = sampled.index;
             let q = eta_mu[i] + etaw[i];
             let row_ll =
-                gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+                gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], self.sigma_floor, ln2pi)?
                     .log_likelihood;
             let contribution = scaled_signed_product3(sampled.weight, row_ll, 1.0);
             ll += contribution;
@@ -2786,7 +2773,9 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let n = eta_mu.len();
         let mean = gamlss_rowwise_map(n, |i| eta_mu[i] + eta_wiggle[i]);
-        let sigma = gamlss_rowwise_map(n, |i| logb_sigma_from_eta_scalar(eta_log_sigma[i]));
+        let sigma = gamlss_rowwise_map(n, |i| {
+            logb_sigma_from_eta_scalar(self.sigma_floor, eta_log_sigma[i])
+        });
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gaussian { sigma },

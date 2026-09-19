@@ -1632,6 +1632,17 @@ fn adaptive_simpson_refine(
         + adaptive_simpson_refine(g, m, b, fm, fb, frm, right, 0.5 * tol, depth - 1)
 }
 
+/// Standardized half-width of the adaptive Gaussian window: `φ(15)/φ(0) =
+/// e^{-112.5}`, far below f64 resolution of any integral it bounds.
+const NORMAL_ADAPTIVE_HALF_WIDTH: f64 = 15.0;
+/// Initial panel count of the adaptive Gaussian window, fine enough that a
+/// transition cannot fall entirely between sampled points.
+const NORMAL_ADAPTIVE_INITIAL_PANELS: usize = 24;
+/// Adaptive-Simpson acceptance tolerance on the (peak-normalized) integrand.
+const NORMAL_ADAPTIVE_TOL: f64 = 1e-12;
+/// Adaptive-Simpson bisection depth limit.
+const NORMAL_ADAPTIVE_MAX_DEPTH: i32 = 40;
+
 /// Accurate Gaussian expectation `E[f(mu + sigma·Z)]`, `Z ~ N(0,1)`, via
 /// panelized adaptive Simpson over the standardized window `u ∈ [-K, K]`.
 ///
@@ -1653,10 +1664,10 @@ fn integrate_normal_adaptive(mu: f64, sigma: f64, f: impl Fn(f64) -> f64) -> f64
     if !(sigma.is_finite()) || sigma <= 0.0 {
         return f(mu);
     }
-    const K: f64 = 15.0;
-    const INITIAL_PANELS: usize = 24;
-    const TOL: f64 = 1e-12;
-    const MAX_DEPTH: i32 = 40;
+    const K: f64 = NORMAL_ADAPTIVE_HALF_WIDTH;
+    const INITIAL_PANELS: usize = NORMAL_ADAPTIVE_INITIAL_PANELS;
+    const TOL: f64 = NORMAL_ADAPTIVE_TOL;
+    const MAX_DEPTH: i32 = NORMAL_ADAPTIVE_MAX_DEPTH;
     let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
     // Integrand in standardized coordinates: f(mu + sigma·u) · φ(u). A coarse
     // initial panel grid guarantees the transition cannot fall entirely
@@ -1958,6 +1969,14 @@ pub fn integrated_inverse_link_mean_and_derivative(
             dmean_dmu: 1.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => {
+            let jet = sqrt_link_posterior_jet(mu, sigma)?;
+            Ok(IntegratedMeanDerivative {
+                mean: jet.mean,
+                dmean_dmu: jet.d1,
+                mode: jet.mode,
+            })
+        }
         LinkFunction::Inverse | LinkFunction::InverseSquared => {
             let jet = reciprocal_link_posterior_jet(link, mu, sigma)?;
             Ok(IntegratedMeanDerivative {
@@ -1967,6 +1986,30 @@ pub fn integrated_inverse_link_mean_and_derivative(
             })
         }
     }
+}
+
+/// Posterior mean of the square-root link's inverse `μ = η²` under
+/// `η ~ N(mu, sigma²)`, with its `mu`-derivatives: `E[η²] = mu² + sigma²`,
+/// exactly, so the jet is `(mu² + sigma², 2 mu, 2, 0)`.
+///
+/// The linear predictor itself must lie in the link's domain `η > 0`: the
+/// square-root link is the branch `η = √μ`, and a posterior centred on or
+/// below zero describes no mean on that branch.
+fn sqrt_link_posterior_jet(mu: f64, sigma: f64) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && sigma.is_finite() && sigma >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean requires a finite linear predictor inside its domain eta > 0 \
+             and a finite nonnegative standard error; got eta = {mu}, se = {sigma}",
+            LinkFunction::Sqrt.name()
+        )));
+    }
+    Ok(IntegratedInverseLinkJet {
+        mean: mu.mul_add(mu, sigma * sigma),
+        d1: 2.0 * mu,
+        d2: 2.0,
+        d3: 0.0,
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    })
 }
 
 /// Posterior mean of a reciprocal-power inverse link, `μ = η^{-1}` or
@@ -2169,6 +2212,7 @@ pub(crate) fn integrated_inverse_link_jet(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => sqrt_link_posterior_jet(mu, sigma),
         LinkFunction::Inverse | LinkFunction::InverseSquared => {
             reciprocal_link_posterior_jet(link, mu, sigma)
         }
@@ -3423,26 +3467,212 @@ pub(crate) fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     gam_math::probability::normal_cdf(eta / denom)
 }
 
-#[inline]
-pub fn logit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let (m1, m2) = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = sigmoid(x);
-        (p, p * p)
-    });
-    let m1 = m1.clamp(0.0, 1.0);
-    let m2 = m2.clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+/// Integral `∫_{t ≥ 0} exp(log_h(t)) dt / √(2π)` of one lobe of a Gaussian
+/// central-moment integrand over the half-line, where `log_h` is strongly
+/// concave with curvature `≤ −1` (it carries the standard-normal kernel
+/// `−t²/2` plus a concave log-gap) and rises to `+∞` slope as `t → 0⁺`.
+///
+/// `jet(t)` returns `(log_h, log_h′, log_h″)` at `t > 0`.
+///
+/// Strong log-concavity makes the integral a well-conditioned target: the lobe
+/// is unimodal with peak `t̂`, and `h(t) ≤ h(t̂)·exp(−(t − t̂)²/2)`, so the
+/// window `[max(0, t̂ − K), t̂ + K]` holds all of its mass to `exp(−K²/2)`
+/// relative. The integrand is normalized by its peak before integration, so
+/// the result keeps full relative precision however far below the f64 floor
+/// the lobe's absolute magnitude sits once exponentiated at the end — the log
+/// of the result is returned so callers can combine lobes before leaving the
+/// log domain.
+fn strongly_log_concave_half_line_log_integral(
+    start: f64,
+    jet: impl Fn(f64) -> (f64, f64, f64),
+) -> f64 {
+    // Peak: Newton on `log_h′ = 0` with the analytic curvature, kept inside a
+    // bracket `(a, b)` on which `log_h′` changes sign. `log_h′ → +∞` at `0⁺`
+    // gives `a = 0`; wherever `log_h′(t) > 0`, curvature `≤ −1` gives
+    // `t̂ ≤ t + log_h′(t)`, and wherever `log_h′(t) < 0`, `t̂ < t`. A Newton
+    // iterate outside the bracket is replaced by its midpoint, so the bracket
+    // shrinks every step and the iteration ends at f64 resolution of `t̂`.
+    let (mut a, mut b) = (0.0_f64, f64::INFINITY);
+    let mut t = start;
+    let (log_peak, curvature) = loop {
+        let (lh, d1, d2) = jet(t);
+        if !(lh.is_finite() && d1.is_finite() && d2.is_finite()) {
+            // `mu ± sigma·t` rounds to `mu`: the lobe sits below the f64
+            // resolution of the linear predictor and carries no mass there.
+            return f64::NEG_INFINITY;
+        }
+        if d1 > 0.0 {
+            a = t;
+            b = b.min(t + d1);
+        } else if d1 < 0.0 {
+            b = t;
+        } else {
+            break (lh, d2);
+        }
+        let newton = t - d1 / d2;
+        let next = if newton > a && newton <= b { newton } else { 0.5 * (a + b) };
+        if (next - t).abs() <= f64::EPSILON * t {
+            break (lh, d2);
+        }
+        t = next;
+    };
+    let t_hat = t;
+    let lh = |t: f64| jet(t).0;
+    let g = |t: f64| (lh(t) - log_peak).exp();
+    let lo = (t_hat - NORMAL_ADAPTIVE_HALF_WIDTH).max(0.0);
+    let hi = t_hat + NORMAL_ADAPTIVE_HALF_WIDTH;
+    // The peak-normalized lobe has Laplace mass `√(2π/|log_h″(t̂)|)`; scaling
+    // the tolerance by it makes the acceptance test relative, so a lobe
+    // sharper than the kernel is resolved as tightly as a wide one.
+    let tol = NORMAL_ADAPTIVE_TOL * (2.0 * std::f64::consts::PI / -curvature).sqrt();
+    // Split the window at the peak so the maximum is a panel node and each
+    // side is monotone.
+    let half_panels = NORMAL_ADAPTIVE_INITIAL_PANELS / 2;
+    let mut normalized = 0.0;
+    for (left, right) in [(lo, t_hat), (t_hat, hi)] {
+        if right <= left {
+            continue;
+        }
+        let panel = (right - left) / half_panels as f64;
+        for p in 0..half_panels {
+            let pa = left + p as f64 * panel;
+            let pb = if p + 1 == half_panels { right } else { pa + panel };
+            let (fa, fb, fm) = (g(pa), g(pb), g(0.5 * (pa + pb)));
+            let whole = (pb - pa) / 6.0 * (fa + 4.0 * fm + fb);
+            normalized += adaptive_simpson_refine(
+                &g,
+                pa,
+                pb,
+                fa,
+                fb,
+                fm,
+                whole,
+                tol,
+                NORMAL_ADAPTIVE_MAX_DEPTH,
+            );
+        }
+    }
+    log_peak + normalized.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln()
 }
 
+/// Log-domain local jet of an increasing inverse link `p` about the centre
+/// `mu`, at the offset `u = x − mu ≠ 0`: `(ln|p(x) − p(mu)|, ln p′(x),
+/// p″(x)/p′(x))`.
+type LinkGapJet = (f64, f64, f64);
+
+/// `Var[p(η)]` for `η ~ N(mu, sigma²)` and an increasing inverse link `p`
+/// whose values `p` and `1 − p` are both log-concave (logit and probit).
+///
+/// The raw-moment form `E[p²] − E[p]²` cancels catastrophically once the
+/// posterior SD of `p` falls below `√ε` of its mean — exactly the saturated
+/// regime (separation, `|η| ≫ 1`) where a response-scale SD matters most.
+/// Instead the moments are taken about `p(mu)`: with `d(x) = p(x) − p(mu)`,
+/// `Var[p] = E[d²] − E[d]²`, and Cauchy–Schwarz on each half-line gives
+/// `E[d]² ≤ E[d²]/2`, so the subtraction loses at most one bit.
+///
+/// Splitting at `x = mu` gives two lobes in standardized coordinates
+/// `x = mu + s·sigma·t`, `s = ±1`, `t ≥ 0`, with log-integrand
+/// `−t²/2 + k·ln|d|`. On each side `ln|d|` is concave (`ln(p(x) − p(mu))` for
+/// `x > mu` by log-concavity of `p`, `ln(p(mu) − p(x))` for `x < mu` by
+/// log-concavity of `1 − p`), so every lobe is strongly log-concave and is
+/// integrated in the log domain by
+/// [`strongly_log_concave_half_line_log_integral`]. With `q = p′(x)/|d(x)|`
+/// and `ℓ = p″(x)/p′(x)`, the lobe's derivatives in `t` are
+/// `−t + k·sigma·q` and `−1 + k·sigma·q·(s·sigma·ℓ − sigma·q)`; concavity of
+/// `ln|d|` is exactly `s·ℓ·q − q² ≤ 0`. `gap_jet(u)` returns the [`LinkGapJet`] at
+/// `x = mu + u`, evaluated without forming either probability so the gap keeps
+/// full relative precision in the tails.
+fn log_concave_link_posterior_variance(
+    sigma: f64,
+    gap_jet: impl Fn(f64) -> LinkGapJet,
+) -> f64 {
+    if !(sigma.is_finite()) || sigma <= 0.0 {
+        return 0.0;
+    }
+    let lobe = |side: f64, k: f64| {
+        // As `sigma → 0` the gap is `p′(mu)·sigma·t` and the lobe is
+        // `t^k·e^{−t²/2}`, whose peak `√k` starts the peak iteration.
+        strongly_log_concave_half_line_log_integral(k.sqrt(), |t: f64| {
+            let (log_gap, log_density, density_log_slope) = gap_jet(side * sigma * t);
+            // `sigma·q ~ 1/t` near the centre, so it is formed in the log
+            // domain rather than as a product with the unbounded `q`.
+            let sq = (sigma.ln() + log_density - log_gap).exp();
+            (
+                -0.5 * t * t + k * log_gap,
+                -t + k * sq,
+                -1.0 + k * sq * (side * sigma * density_log_slope - sq),
+            )
+        })
+    };
+    let (log_r1, log_l1) = (lobe(1.0, 1.0), lobe(-1.0, 1.0));
+    let (log_r2, log_l2) = (lobe(1.0, 2.0), lobe(-1.0, 2.0));
+    let first = log_r1.exp() - log_l1.exp();
+    let second = log_r2.exp() + log_l2.exp();
+    // `first² ≤ second/2`, so the difference is at least half of `second`.
+    second - first * first
+}
+
+/// [`LinkGapJet`] of the logistic `σ` about `mu`, from
+/// `σ(x) − σ(mu) = σ(x)σ(mu)(e^{−mu} − e^{−x})` with every factor kept in the
+/// log domain (`ln σ(z) = −softplus(−z)`), `σ′ = σ(x)σ(−x)` and
+/// `σ″/σ′ = 1 − 2σ(x) = −tanh(x/2)`.
 #[inline]
-pub fn probit_posterior_meanvariance(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> (f64, f64) {
-    let m1 = probit_posterior_mean(eta, se_eta);
-    let m2 = integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| {
-        let p = gam_math::probability::normal_cdf(x);
-        p * p
-    })
-    .clamp(0.0, 1.0);
-    (m1, (m2 - m1 * m1).max(0.0))
+fn logit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
+    use gam_math::special::softplus;
+    let x = mu + u;
+    let log_gap = if u > 0.0 {
+        -softplus(-x) - softplus(mu) + (-(-u).exp_m1()).ln()
+    } else if u < 0.0 {
+        -softplus(-mu) - softplus(x) + (-(u).exp_m1()).ln()
+    } else {
+        f64::NEG_INFINITY
+    };
+    (log_gap, -softplus(-x) - softplus(x), -(0.5 * x).tanh())
+}
+
+/// [`LinkGapJet`] of `Φ` about `mu`, taking the difference on whichever tail
+/// keeps both probabilities away from `1` so it retains full relative
+/// precision; `Φ′ = φ` and `φ′/φ = −x`.
+#[inline]
+fn probit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
+    use gam_math::probability::{normal_cdf, normal_logcdf};
+    let x = mu + u;
+    let (lo, hi) = if x < mu { (x, mu) } else { (mu, x) };
+    let log_gap = if !(hi > lo) {
+        f64::NEG_INFINITY
+    } else if hi <= 0.0 {
+        let l_hi = normal_logcdf(hi);
+        l_hi + (-(normal_logcdf(lo) - l_hi).exp_m1()).ln()
+    } else if lo >= 0.0 {
+        let l_lo = normal_logcdf(-lo);
+        l_lo + (-(normal_logcdf(-hi) - l_lo).exp_m1()).ln()
+    } else {
+        (-(normal_cdf(lo) + normal_cdf(-hi))).ln_1p()
+    };
+    let log_density = -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    (log_gap, log_density, -x)
+}
+
+/// Posterior mean and variance of `σ(η)`, `η ~ N(eta, se_eta²)`.
+///
+/// The mean is the integral used for the posterior-mean prediction itself,
+/// so the two agree; the variance is the central-moment lobe integral of
+/// [`log_concave_link_posterior_variance`].
+pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64), EstimationError> {
+    let (mean, _) = logit_posterior_meanwith_deriv(eta, se_eta)?;
+    let var = log_concave_link_posterior_variance(se_eta, |u| logit_gap_jet(eta, u));
+    // `E[σ(η)]` averages values in `[0, 1]`; projecting the ~1e-12-accurate
+    // integral onto that support can only move it toward the true value.
+    Ok((mean.clamp(0.0, 1.0), var))
+}
+
+/// Posterior mean and variance of `Φ(η)`, `η ~ N(eta, se_eta²)`: the exact
+/// closed-form mean and the central-moment lobe variance of
+/// [`log_concave_link_posterior_variance`].
+pub fn probit_posterior_meanvariance(eta: f64, se_eta: f64) -> (f64, f64) {
+    let mean = probit_posterior_mean(eta, se_eta);
+    let var = log_concave_link_posterior_variance(se_eta, |u| probit_gap_jet(eta, u));
+    (mean, var)
 }
 
 #[inline]
@@ -3696,6 +3926,103 @@ mod tests {
                 expected,
                 err
             );
+        }
+    }
+
+    /// Direct raw-moment reference `Var[p(mu + sigma·Z)]` by fine composite
+    /// Simpson over `|z| ≤ 40`. Only valid where the coefficient of variation is
+    /// not tiny (so `E[p²] − E[p]²` does not cancel) and `p` itself carries full
+    /// relative precision, i.e. at `mu ≤ 0`.
+    fn raw_moment_reference_variance(mu: f64, sigma: f64, p: impl Fn(f64) -> f64) -> f64 {
+        let panels = 400_000_usize;
+        let (lo, hi) = (-40.0_f64, 40.0_f64);
+        let h = (hi - lo) / panels as f64;
+        let (mut m1, mut m2) = (0.0_f64, 0.0_f64);
+        for i in 0..=panels {
+            let z = lo + h * i as f64;
+            let w = if i == 0 || i == panels {
+                1.0
+            } else if i % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            let density = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
+            let v = p(mu + sigma * z);
+            m1 += w * density * v;
+            m2 += w * density * v * v;
+        }
+        m1 *= h / 3.0;
+        m2 *= h / 3.0;
+        m2 - m1 * m1
+    }
+
+    fn logistic(x: f64) -> f64 {
+        (-gam_math::special::softplus(-x)).exp()
+    }
+
+    /// The response-scale posterior variance must be the variance of the same
+    /// law whose mean is reported, in every regime — including separation,
+    /// saturation and vanishing σ, where the delta method (and the raw-moment
+    /// `E[p²] − E[p]²` of a fixed Gauss–Hermite rule) collapse.
+    #[test]
+    fn logit_and_probit_posterior_variance_match_reference_in_every_regime() {
+        // Moderate-CV cases, where a fine raw-moment integral is a trustworthy
+        // reference: separation-scale SE, ordinary, tail, and very wide.
+        for &(mu, sigma) in &[(-30.0, 12.0), (0.4, 1.3), (-6.0, 0.8), (-2.0, 25.0)] {
+            let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+            let reference = raw_moment_reference_variance(mu, sigma, logistic);
+            assert_relative_eq!(var, reference, max_relative = 1e-8);
+            // Var[p] = Var[1 − p]: the upper tail is the mirror image.
+            let (_, mirrored) = logit_posterior_meanvariance(-mu, sigma).expect("logit moments");
+            assert_relative_eq!(mirrored, var, max_relative = 1e-10);
+        }
+        for &(mu, sigma) in &[(-4.0, 3.0), (0.4, 1.3), (-8.0, 0.5), (-2.0, 25.0)] {
+            let (_, var) = probit_posterior_meanvariance(mu, sigma);
+            let reference =
+                raw_moment_reference_variance(mu, sigma, gam_math::probability::normal_cdf);
+            assert_relative_eq!(var, reference, max_relative = 1e-8);
+            let (_, mirrored) = probit_posterior_meanvariance(-mu, sigma);
+            assert_relative_eq!(mirrored, var, max_relative = 1e-10);
+        }
+        // Saturation: 1 − σ(η) = e^{−η}(1 + O(e^{−η})), so for μ = 100 the
+        // variance is the lognormal variance of e^{−η} to relative e^{−90}.
+        for &(mu, sigma) in &[(100.0, 2.0), (-100.0, 2.0), (100.0, 0.3)] {
+            let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+            let s2 = sigma * sigma;
+            let lognormal = (-2.0 * f64::abs(mu)).exp() * ((2.0 * s2).exp() - s2.exp());
+            assert_relative_eq!(var, lognormal, max_relative = 1e-9);
+        }
+        // Vanishing σ: the variance tends to the delta-method (p'(μ)σ)² with
+        // relative error O(σ²), where raw moments would cancel to noise.
+        let (mu, sigma) = (0.3_f64, 1e-5_f64);
+        let (_, var) = logit_posterior_meanvariance(mu, sigma).expect("logit moments");
+        let slope = logistic(mu) * logistic(-mu);
+        assert_relative_eq!(var, (slope * sigma).powi(2), max_relative = 1e-8);
+        let (_, var) = probit_posterior_meanvariance(mu, sigma);
+        let density = (-0.5 * mu * mu).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        assert_relative_eq!(var, (density * sigma).powi(2), max_relative = 1e-8);
+        // Degenerate σ is a point mass.
+        assert_eq!(logit_posterior_meanvariance(0.7, 0.0).expect("logit moments").1, 0.0);
+        assert_eq!(probit_posterior_meanvariance(0.7, 0.0).1, 0.0);
+    }
+
+    /// `E[σ(η)]` is an average of values in `[0, 1]`; the reported mean may
+    /// never leave that interval however saturated the predictor is.
+    #[test]
+    fn logit_posterior_meanvariance_mean_stays_in_unit_interval_under_saturation() {
+        for &mu in &[10.0, 30.0, 60.0, 100.0, 300.0, 780.0] {
+            for &sigma in &[0.0, 1e-3, 0.5, 3.0, 20.0, 50.0] {
+                for signed in [mu, -mu] {
+                    let (mean, var) =
+                        logit_posterior_meanvariance(signed, sigma).expect("logit moments");
+                    assert!(
+                        (0.0..=1.0).contains(&mean),
+                        "E[sigmoid(eta)] at mu={signed}, sigma={sigma} left [0, 1]: {mean:e}"
+                    );
+                    assert!(var >= 0.0 && var <= 0.25, "Var at mu={signed}, sigma={sigma}: {var:e}");
+                }
+            }
         }
     }
 

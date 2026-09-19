@@ -2310,6 +2310,11 @@ impl WorkingModelSurvival {
         Ok(())
     }
 
+    /// The number of survival records the likelihood sums over.
+    pub fn n_observations(&self) -> usize {
+        self.age_exit.len()
+    }
+
     /// The λ-selection domain of the active penalty blocks (#2812): per block,
     /// the resolvability interval of the block's penalty against the exit
     /// design's Gram on the block's columns. Below the lower edge the block is
@@ -3035,14 +3040,11 @@ impl WorkingModelSurvival {
             array1_l2_norm(&projected)
         };
         // Accept exactly what the inner solver certified. `certifies_kkt` is the
-        // producer's own convergence predicate: it accepts under EITHER the
-        // dimension bound `tol·√(n·p)` or the natural-scale bound
-        // `tol·(1+‖g‖_scale)`. Re-deriving only the natural-scale half here made
-        // this gate strictly stronger than the contract PIRLS was run under, so
-        // every mode that converged via the dimension branch — the binding one
-        // whenever √(n·p) > 1+scale, i.e. the normal case for these baselines —
-        // was certified by the solver and then refused here, fatally. Same
-        // tolerance, same rule, one owner.
+        // producer's own convergence predicate on the dimensionless residual
+        // `‖g‖/‖g‖_scale`. Re-deriving a different bound here would make this
+        // gate disagree with the contract PIRLS was run under, so a mode the
+        // solver certified would be refused here, fatally. Same tolerance,
+        // same rule, one owner.
         // The residual's own rounding band: the penalty gradient `Σ_k λ_k S_k β_k`
         // accumulated over n rows (it equals the data score at the mode, up to
         // the residual) plus each block's `|λ_k S_k|·|β_k|` over its `p_k + 1`

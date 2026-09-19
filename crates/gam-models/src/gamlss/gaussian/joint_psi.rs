@@ -1114,6 +1114,7 @@ pub(crate) fn gaussian_jointrow_scalars(
     etamu: &Array1<f64>,
     eta_ls: &Array1<f64>,
     weights: &Array1<f64>,
+    sigma_floor: f64,
 ) -> Result<GaussianJointRowScalars, String> {
     let nobs = y.len();
     if etamu.len() != nobs || eta_ls.len() != nobs || weights.len() != nobs {
@@ -1132,7 +1133,9 @@ pub(crate) fn gaussian_jointrow_scalars(
     // row deterministically and publishes no partially initialized scalar set.
     let certified: Vec<Result<GaussianDiagonalRowKernel, String>> = (0..nobs)
         .into_par_iter()
-        .map(|i| gaussian_diagonal_row_kernel(i, y[i], etamu[i], eta_ls[i], weights[i], ln2pi))
+        .map(|i| {
+            gaussian_diagonal_row_kernel(i, y[i], etamu[i], eta_ls[i], weights[i], sigma_floor, ln2pi)
+        })
         .collect();
     for (i, row) in certified.into_iter().enumerate() {
         let row = row?;
@@ -1734,11 +1737,16 @@ mod observed_single_source_oracle_tests {
     use super::*;
     use ndarray::array;
 
+    /// The σ floor b these oracles evaluate the link at. The identities they
+    /// check hold for every b > 0; a fixed fixture value keeps κ = e^η/(b+e^η)
+    /// below 1 so the link's curvature terms are exercised.
+    const ORACLE_SIGMA_FLOOR: f64 = 0.01;
+
     /// Row negative log-likelihood from the production kernel (likelihood only,
     /// no curvature coefficients involved).
     fn row_nll(y: f64, mu: f64, eta_ls: f64, a: f64) -> f64 {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        -gaussian_diagonal_row_kernel(0, y, mu, eta_ls, a, ln2pi)
+        -gaussian_diagonal_row_kernel(0, y, mu, eta_ls, a, ORACLE_SIGMA_FLOOR, ln2pi)
             .expect("representable Gaussian oracle row")
             .log_likelihood
     }
@@ -1937,7 +1945,7 @@ mod observed_single_source_oracle_tests {
 
     /// Production observed joint-Hessian coefficients for a single row.
     fn production_observed_row(y: f64, mu: f64, eta_ls: f64, a: f64) -> (f64, f64, f64) {
-        let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+        let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a], ORACLE_SIGMA_FLOOR)
             .expect("row scalars");
         let (mm, ml, ll) = gaussian_locscale_observed_joint_row_coeffs(&rows);
         (mm[0], ml[0], ll[0])
@@ -1950,7 +1958,7 @@ mod observed_single_source_oracle_tests {
         };
 
         let rows =
-            gaussian_jointrow_scalars(&array![0.55], &array![0.3], &array![-0.4], &array![1.7])
+            gaussian_jointrow_scalars(&array![0.55], &array![0.3], &array![-0.4], &array![1.7], ORACLE_SIGMA_FLOOR)
                 .expect("row scalars");
         let program = GaussianJointRowProgram::new(&rows);
         let direction_a = [0.5, -0.7];
@@ -2152,6 +2160,7 @@ mod observed_single_source_oracle_tests {
             &array![base[0]],
             &array![base[1]],
             &array![weight],
+            ORACLE_SIGMA_FLOOR,
         )
         .expect("row scalars");
         let program = GaussianJointRowProgram::new(&rows);
@@ -2429,7 +2438,7 @@ mod observed_single_source_oracle_tests {
         let t = 1e-6;
         for &(mu, eta_ls, a, xi_mu, xi_ls, y) in &cases {
             let rows =
-                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a], ORACLE_SIGMA_FLOOR)
                     .expect("row scalars");
             let (w_u, c_u, d_u) =
                 gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
@@ -2472,7 +2481,7 @@ mod observed_single_source_oracle_tests {
         let t = 1e-5;
         for &(mu, eta_ls, a, xi_mu_u, xi_ls_u, xi_mu_v, xi_ls_v, y) in &cases {
             let rows =
-                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a], ORACLE_SIGMA_FLOOR)
                     .expect("row scalars");
             let (w_uv, c_uv, d_uv) = gaussian_jointsecond_directionalweights(
                 &rows,
@@ -2482,7 +2491,7 @@ mod observed_single_source_oracle_tests {
                 &array![xi_ls_v],
             );
             let first_at = |m: f64, e: f64| -> (f64, f64, f64) {
-                let r = gaussian_jointrow_scalars(&array![y], &array![m], &array![e], &array![a])
+                let r = gaussian_jointrow_scalars(&array![y], &array![m], &array![e], &array![a], ORACLE_SIGMA_FLOOR)
                     .expect("row scalars");
                 let (w_u, c_u, d_u) =
                     gaussian_joint_first_directionalweights(&r, &array![xi_mu_u], &array![xi_ls_u]);
@@ -2543,7 +2552,7 @@ mod observed_single_source_oracle_tests {
             ];
             for &(mu, eta_ls, a, xi_mu, xi_ls, y) in &cases {
                 let rows =
-                    gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                    gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a], ORACLE_SIGMA_FLOOR)
                         .expect("row scalars");
                 let (w_u, c_u, d_u) =
                     gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
@@ -2571,7 +2580,7 @@ mod observed_single_source_oracle_tests {
             ];
             for &(mu, eta_ls, a, xi_mu_u, xi_ls_u, xi_mu_v, xi_ls_v, y) in &cases {
                 let rows =
-                    gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                    gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a], ORACLE_SIGMA_FLOOR)
                         .expect("row scalars");
                 let (w_uv, c_uv, d_uv) = gaussian_jointsecond_directionalweights(
                     &rows,
@@ -2632,7 +2641,7 @@ mod observed_single_source_oracle_tests {
                 let f = i as f64;
                 0.6 + 0.4 * (f * 0.19 + 1.0).sin().abs()
             });
-            let rows = gaussian_jointrow_scalars(&y, &mu, &eta_ls, &weight)
+            let rows = gaussian_jointrow_scalars(&y, &mu, &eta_ls, &weight, ORACLE_SIGMA_FLOOR)
                 .expect("certified release-measure Gaussian joint rows");
             let program = crate::gamlss::GaussianJointRowProgram::new(&rows);
             let dir_u: Vec<[f64; 2]> = (0..ROWS)

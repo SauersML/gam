@@ -595,6 +595,13 @@ fn survival_prediction_posterior_factor(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<(Array1<f64>, Array2<f64>, Vec<usize>), SurvivalPredictError> {
     let fit = fit_result_from_saved_model_for_prediction(model)?;
+    // A fit saved as its constrained mode under a typed posterior-moment
+    // decline has no posterior to integrate; refuse by the decline's own
+    // reason rather than by the covariance it therefore lacks (gam#3008).
+    fit.require_posterior_mean("survival posterior-mean prediction")
+        .map_err(|error| SurvivalPredictError::PosteriorCovariance {
+            reason: error.to_string(),
+        })?;
     let inactive_tail = if require_saved_survival_likelihood_mode(model)?
         == SurvivalLikelihoodMode::MarginalSlope
     {

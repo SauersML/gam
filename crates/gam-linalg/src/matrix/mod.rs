@@ -4990,6 +4990,27 @@ impl DesignMatrix {
         <Self as DenseDesignOperator>::row_chunk_into(self, rows, out)
     }
 
+    /// Gather the listed rows, in the listed order, into a dense
+    /// `(rows.len(), ncols())` array. Each maximal run of consecutive indices
+    /// is materialized with one [`Self::try_row_chunk`], so a contiguous list
+    /// costs exactly one row-chunk read and an operator-backed design never
+    /// materializes rows outside the list.
+    pub fn try_row_gather(&self, rows: &[usize]) -> Result<Array2<f64>, MatrixMaterializationError> {
+        let mut out = Array2::<f64>::zeros((rows.len(), self.ncols()));
+        let mut run_start = 0;
+        while run_start < rows.len() {
+            let mut run_end = run_start + 1;
+            while run_end < rows.len() && rows[run_end] == rows[run_end - 1] + 1 {
+                run_end += 1;
+            }
+            let first = rows[run_start];
+            let chunk = self.try_row_chunk(first..first + (run_end - run_start))?;
+            out.slice_mut(s![run_start..run_end, ..]).assign(&chunk);
+            run_start = run_end;
+        }
+        Ok(out)
+    }
+
     /// `rows · rhs` for a row range, written into `out`; see
     /// [`DenseDesignOperator::row_chunk_matmul_into`]. An operator-backed
     /// design keeps its own association.

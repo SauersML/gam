@@ -8,7 +8,7 @@ use super::asymptote_certificate::{
     MIN_TAIL_SAMPLES, assess_coordinate,
 };
 use super::rail_face::{
-    RailFaceLimit, RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
+    RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
 };
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
@@ -58,10 +58,6 @@ pub(crate) fn resume_config(
 ) -> OuterConfig {
     let mut resume = config.clone();
     resume.initial_rho = Some(warm_start.theta.clone());
-    resume.initial_rho_candidates.clear();
-    resume.sole_seed = true;
-    resume.screen_initial_rho = false;
-    resume.screening_cap = None;
     resume.initial_inner_seed = Some(BoundInnerSeed {
         theta: warm_start.theta.clone(),
         beta: warm_start.beta.clone(),
@@ -151,24 +147,40 @@ pub(crate) struct OuterProblemSize {
     pub(crate) p_coefficients: Option<usize>,
 }
 
+impl OuterProblemSize {
+    /// The criterion's statistical resolution `τ_stat = η²/2 = 1/(2n)`, in the
+    /// criterion's own absolute units, over the declared `n` observations.
+    ///
+    /// A point whose remaining decrease `G` to the exact optimum satisfies
+    /// `½(θ − θ̂)ᵀH(θ − θ̂) ≤ G` has every linear functional `Lᵀθ` within
+    /// `√(2G)·se(Lᵀθ̂)` of its value at the optimum (Cauchy–Schwarz in the
+    /// `H` inner product), and by the delta method so does every smooth
+    /// functional of the hyperparameters: edf, fitted values, AIC. The
+    /// criterion is itself a first-order object — LAML is a Laplace
+    /// approximation with `O(1/n)` absolute error at fixed dimension (Tierney &
+    /// Kadane 1986), and Wald/edf inference built on `λ̂` carries `O(n^{-1/2})`
+    /// error — so resolving the optimum to `η = n^{-1/2}` sampling SDs puts the
+    /// optimization error below the intrinsic error of the inference built on
+    /// it. A decrease below `τ_stat` changes no reported quantity by more than
+    /// that. It is invariant to the units of `y` and to any additive constant
+    /// in `V` (a Poisson `Σ log y!`), which `rel·(1 + |V|)` was not.
+    ///
+    /// `η² = 1/n` is the first-order choice. For Gaussian REML, whose criterion
+    /// carries no Laplace error, `1/edf` or `1/(n − p)` could be argued instead;
+    /// the choice moves `τ_stat` by a constant factor only (#3192).
+    ///
+    /// `None` when the route declares no observation count.
+    pub(crate) fn statistical_resolution(&self) -> Option<f64> {
+        self.n_obs
+            .filter(|&n| n > 0)
+            .map(|n| 0.5 / n as f64)
+    }
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
     pub(crate) tolerance: f64,
-    /// Optional override for the *relative-cost-decrease* convergence stop,
-    /// decoupled from `tolerance`. `outer_gradient_tolerance` normally derives
-    /// BOTH the absolute projected-gradient band (`tolerance`)
-    /// AND the relative-cost stop (`rel_cost = tolerance`) from the single
-    /// `tolerance`. That conflation forces a caller who needs a *tight absolute
-    /// band* (to resolve λ to the genuine REML optimum) to also accept a *tight rel-cost stop*,
-    /// which on a flat REML ridge never trips and grinds the optimizer to `max_iter` —
-    /// dozens of surplus O(D·p³) Laplace-derivative outer iterations (the #1082
-    /// multinomial smooth-by-factor wall-clock blow-up). When `Some(r)`, the
-    /// rel-cost stop uses `r` while the absolute band keeps using `tolerance`,
-    /// so accuracy (absolute floor) and perf (loose
-    /// rel-cost) are selected independently. `None` preserves the legacy coupling
-    /// (`rel_cost = tolerance`) for every existing path byte-for-byte.
-    pub(crate) rel_cost_tolerance: Option<f64>,
     pub(crate) max_iter: usize,
     /// The model's canonical feasible outer domain. Every stationarity
     /// certificate and rail report reasons against this box.
@@ -185,35 +197,22 @@ pub(crate) struct OuterConfig {
     /// It may narrow the model domain but never changes the feasible cone that
     /// screening or mint is allowed to certify.
     pub(crate) search_bounds_override: Option<(Array1<f64>, Array1<f64>)>,
-    pub(crate) seed_config: gam_problem::SeedConfig,
+    /// Model-derived log-smoothing-parameter start (one entry per outer
+    /// coordinate). Used as the single outer start when `initial_rho` is
+    /// absent; see [`crate::rho_optimizer::run_plan::outer_start_point`].
     pub(crate) heuristic_log_lambdas: Option<Vec<f64>>,
     pub(crate) initial_rho: Option<Array1<f64>>,
-    /// Additional explicit, model-derived starts. Unlike the generic seed
-    /// lattice these are supplied by the objective owner and survive the
-    /// `max_seeds` truncation; the certified keep-best loop optimizes each one.
-    pub(crate) initial_rho_candidates: Vec<Array1<f64>>,
-    /// Seed points an EARLIER round of this same [`run_outer`] call already
-    /// started and either refused at certification (#2569) or ran to exhaustion
-    /// (#2817).
+    /// The lowest state an earlier search of this criterion evaluated: its resume checkpoint
+    /// (#2953).
     ///
-    /// Set by the certify-resume loop, from [`OuterResult::refused_seed_points`].
-    /// The plan runner drops these from
-    /// its cascade (never the caller's own `initial_rho`, which is the reseed
-    /// point the resume exists to explore), because re-running them from the
-    /// reset state they were refused in reproduces the recorded verdict digit
-    /// for digit — the same argument #2080 makes for replaying a recorded
-    /// cold-entry-leg refusal. Empty on every non-resume path, so the ordinary
-    /// cascade is unchanged.
-    pub(crate) previously_refused_seed_points: Vec<Array1<f64>>,
-    /// The lowest state an earlier plan attempt of this search evaluated: that attempt's
-    /// resume checkpoint (#2953).
-    ///
-    /// Set only by the plan loop, which hands its best checkpoint to the next attempt with its
-    /// iteration count zeroed (the loop has already counted that work). The plan runner starts
-    /// from it as its own lowest evaluated state, so a candidate the next attempt certifies is
-    /// judged against it before it publishes (#2596, #2627), exactly as a state of its own search
-    /// would be. It is in the runner's own coordinate order, since the plan loop runs inside
-    /// the canonical frame. `None` on the first attempt and on every path outside the plan loop.
+    /// The plan loop hands its best checkpoint to the next attempt with its iteration count
+    /// zeroed (the loop has already counted that work), and starts its own best checkpoint from
+    /// the one its caller carries. The plan runner starts from it as its own lowest evaluated
+    /// state, so a candidate the search certifies is judged against it before it publishes
+    /// (#2596, #2627), exactly as a state of its own search would be. With a single start per
+    /// search, a carried state is the only other state a certified candidate can be judged
+    /// against. It is in native order on entry to [`run_outer`], which permutes it with the rest
+    /// of the configuration into the canonical frame the plan loop runs in.
     pub(crate) carried_checkpoint: Option<OuterResult>,
     pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
     /// The exact analytic Hessian of the criterion a continuation search
@@ -227,8 +226,6 @@ pub(crate) struct OuterConfig {
     /// under any SPD initial metric.
     pub(crate) initial_curvature: Option<BoundOuterCurvature>,
     pub(crate) fallback_policy: FallbackPolicy,
-    pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
-    pub(crate) screen_initial_rho: bool,
     /// `initial_rho` came from a PRIOR FIT'S TERMINAL CERTIFICATE, not from a
     /// heuristic, a mid-run checkpoint, or a caller's guess.
     ///
@@ -243,13 +240,12 @@ pub(crate) struct OuterConfig {
     /// otherwise declines with an error. It never searches
     /// (`resume_prior_certificate`).
     pub(crate) resume_value: Option<f64>,
-    /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
+    /// Outer-aware inner-PIRLS iteration cap.
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
     /// (when ρ is far from converged) and lift it back to full as
-    /// convergence approaches. Distinct from `screening_cap` in that it
-    /// does NOT suppress cache writes / warm-start updates / KKT
-    /// enforcement; it is purely a budget. See
+    /// convergence approaches. It does NOT suppress cache writes /
+    /// warm-start updates / KKT enforcement; it is purely a budget. See
     /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
     pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
@@ -387,11 +383,6 @@ pub(crate) struct OuterConfig {
     /// solve, so the search route does not flip back to BFGS once a saddle is on
     /// record.
     pub(crate) curvature_search_latched: bool,
-    /// The search starts from `initial_rho` and from nothing else: no generated
-    /// seed, no candidate, and no fall-through to another seed whatever this
-    /// one's outcome. Each run of a parallel multistart
-    /// ([`OuterProblem::run_certified_multistart`]) searches one seed this way.
-    pub(crate) sole_seed: bool,
 }
 
 /// The outer search's iteration count when a caller declares none: no count.
@@ -415,23 +406,17 @@ impl Default for OuterConfig {
     fn default() -> Self {
         Self {
             tolerance: 1e-5,
-            rel_cost_tolerance: None,
             required_projected_gradient_norm: None,
             require_measured_psd: false,
             max_iter: UNBOUNDED_OUTER_ITERATIONS,
             model_domain_bounds: None,
             model_domain_limit_faces: None,
             search_bounds_override: None,
-            seed_config: gam_problem::SeedConfig::default(),
             heuristic_log_lambdas: None,
             initial_rho: None,
-            initial_rho_candidates: Vec::new(),
-            previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
             initial_inner_seed: None,
             fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: None,
-            screen_initial_rho: false,
             initial_rho_is_prior_terminal_certificate: false,
             resume_value: None,
             outer_inner_cap: None,
@@ -447,7 +432,6 @@ impl Default for OuterConfig {
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
-            sole_seed: false,
         }
     }
 }
@@ -473,21 +457,16 @@ pub struct OuterProblem {
     psi_dim: usize,
     barrier_config: Option<BarrierConfig>,
     tolerance: f64,
-    rel_cost_tolerance: Option<f64>,
     /// See [`OuterConfig::required_projected_gradient_norm`] (#2568).
     required_projected_gradient_norm: Option<f64>,
     require_measured_psd: bool,
     max_iter: usize,
     bounds: Option<(Array1<f64>, Array1<f64>)>,
     limit_faces: Option<(Vec<bool>, Vec<bool>)>,
-    seed_config: gam_problem::SeedConfig,
     heuristic_log_lambdas: Option<Vec<f64>>,
     initial_rho: Option<Array1<f64>>,
-    initial_rho_candidates: Vec<Array1<f64>>,
     initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
-    screening_cap: Option<Arc<AtomicUsize>>,
-    screen_initial_rho: bool,
     outer_inner_cap: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
@@ -497,7 +476,6 @@ pub struct OuterProblem {
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     problem_size: OuterProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
-    sole_seed: bool,
     /// The inner mode at one joined multistart seed: installed only at that
     /// exact point (`install_matching_initial_inner_seed`).
     warm_start: Option<BoundInnerSeed>,
@@ -524,20 +502,15 @@ impl OuterProblem {
             psi_dim: 0,
             barrier_config: None,
             tolerance: 1e-5,
-            rel_cost_tolerance: None,
             required_projected_gradient_norm: None,
             require_measured_psd: false,
             max_iter: UNBOUNDED_OUTER_ITERATIONS,
             bounds: None,
             limit_faces: None,
-            seed_config: gam_problem::SeedConfig::default(),
             heuristic_log_lambdas: None,
             initial_rho: None,
-            initial_rho_candidates: Vec::new(),
             initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: None,
-            screen_initial_rho: false,
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
@@ -547,7 +520,6 @@ impl OuterProblem {
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
             rho_canonical_keys: None,
-            sole_seed: false,
             warm_start: None,
             warm_start_source: None,
             resume_only: false,
@@ -622,6 +594,10 @@ impl OuterProblem {
         self.tolerance = tol;
         self
     }
+    /// The absolute stationarity tolerance this problem declares.
+    pub fn tolerance(&self) -> f64 {
+        self.tolerance
+    }
     pub fn with_max_iter(mut self, n: usize) -> Self {
         self.max_iter = n;
         self
@@ -634,10 +610,6 @@ impl OuterProblem {
     /// then upper, one flag per coordinate.
     pub fn with_limit_faces(mut self, lower: Vec<bool>, upper: Vec<bool>) -> Self {
         self.limit_faces = Some((lower, upper));
-        self
-    }
-    pub fn with_seed_config(mut self, sc: gam_problem::SeedConfig) -> Self {
-        self.seed_config = sc;
         self
     }
     pub fn with_heuristic_log_lambdas(mut self, h: Vec<f64>) -> Self {
@@ -654,36 +626,6 @@ impl OuterProblem {
         self.initial_curvature = Some(BoundOuterCurvature { theta, hessian });
         self
     }
-    pub(crate) fn with_initial_rho_candidates(mut self, candidates: Vec<Array1<f64>>) -> Self {
-        self.initial_rho_candidates = candidates;
-        self
-    }
-    pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
-        self.screening_cap = Some(screening_cap);
-        self
-    }
-    /// Allow seed screening to rank the explicit initial rho against generated
-    /// candidates even when the effective seed budget is one. The default keeps
-    /// a user-provided initial point authoritative and avoids a separate
-    /// screening pass.
-    ///
-    /// "Authoritative" governs where the cascade starts, not whose refusal is
-    /// reported: a refused seed falls through to the generated seeds
-    /// (`should_start_next_seed`), and the cascade reports its lowest-value
-    /// refused checkpoint (`retain_best_outer_checkpoint`).
-    pub fn with_screen_initial_rho(mut self, screen_initial_rho: bool) -> Self {
-        self.screen_initial_rho = screen_initial_rho;
-        self
-    }
-    /// Search from `rho` and from nothing else: no generated seed, no candidate,
-    /// and no fall-through to another seed whatever this one's outcome
-    /// (`OuterConfig::sole_seed`).
-    pub fn with_sole_seed(mut self, rho: Array1<f64>) -> Self {
-        self.initial_rho = Some(rho);
-        self.initial_rho_candidates.clear();
-        self.sole_seed = true;
-        self
-    }
     /// Offer this search a prior fit's certified outer point (gam#3002). Every
     /// warm-start source reaches every outer search through this one rule, and
     /// [`Self::run`] and [`Self::run_certified_multistart`] derive from it what
@@ -694,8 +636,8 @@ impl OuterProblem {
     ///   certified for this search's criterion (`resume_prior_certificate`), and
     ///   otherwise runs exactly as it runs cold, from a reset objective;
     /// - on other inputs the independent multistart adds it as one more seed, so
-    ///   its argmin is taken over a superset of the cold seeds; the cascade,
-    ///   which certifies its first certifiable seed, runs cold and records why.
+    ///   its argmin is taken over a superset of the cold seeds; a single search,
+    ///   which certifies from its one derived start, runs cold and records why.
     /// A point of another outer dimension belongs to another search: this one
     /// runs cold.
     pub fn with_warm_start(mut self, warm_start: &gam_model_api::WarmStart) -> Self {
@@ -727,7 +669,7 @@ impl OuterProblem {
     /// The outer bridge writes a coarsened iteration cap into
     /// `feedback.cap` on every accepted gradient/Hessian eval; the inner
     /// solver writes back into `feedback.last_iters` /
-    /// `feedback.last_converged` after each non-screening solve so the
+    /// `feedback.last_converged` after each inner solve so the
     /// next outer iter's schedule can adapt to the inner solver's
     /// actual convergence behavior. Typical caller passes
     /// `InnerProgressFeedback {
@@ -787,19 +729,6 @@ impl OuterProblem {
             accept_rho: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
             force_cold: signal,
         })
-    }
-
-    /// Decouple the *relative-cost-decrease* convergence stop from the
-    /// absolute projected-gradient floor. By default both are derived from the
-    /// single `with_tolerance` value (`abs = max(tol, scale·√ε_machine)`,
-    /// `rel_cost = tol`). Supplying `Some(r)` here makes the rel-cost stop use
-    /// `r` while the absolute floor keeps using `tolerance` (so a caller can
-    /// keep a tight absolute floor for accuracy at large `n` AND a loose
-    /// rel-cost stop for perf on a flat REML ridge — see #1082). `None` keeps
-    /// the legacy coupling.
-    pub fn with_rel_cost_tolerance(mut self, rel_cost: Option<f64>) -> Self {
-        self.rel_cost_tolerance = rel_cost.filter(|v| v.is_finite() && *v > 0.0);
-        self
     }
 
     /// Require the returned fit's projected outer gradient norm to satisfy
@@ -921,23 +850,17 @@ impl OuterProblem {
     pub(crate) fn config(&self) -> OuterConfig {
         OuterConfig {
             tolerance: self.tolerance,
-            rel_cost_tolerance: self.rel_cost_tolerance,
             required_projected_gradient_norm: self.required_projected_gradient_norm,
             require_measured_psd: self.require_measured_psd,
             max_iter: self.max_iter,
             model_domain_bounds: self.bounds.clone(),
             model_domain_limit_faces: self.limit_faces.clone(),
             search_bounds_override: None,
-            seed_config: self.seed_config,
             heuristic_log_lambdas: self.heuristic_log_lambdas.clone(),
             initial_rho: self.initial_rho.clone(),
-            initial_rho_candidates: self.initial_rho_candidates.clone(),
-            previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
             initial_inner_seed: self.warm_start.clone(),
             fallback_policy: self.fallback_policy,
-            screening_cap: self.screening_cap.clone(),
-            screen_initial_rho: self.screen_initial_rho,
             // Only a prior fit's certified point can establish these: the resume
             // attempt `Self::run` derives from a warm start, and the cache's final
             // hit, which says so where it sets `initial_rho`.
@@ -960,7 +883,6 @@ impl OuterProblem {
             native_coordinate_order: None,
             // Latched only by the certify-last reseed loop (#2939).
             curvature_search_latched: false,
-            sole_seed: self.sole_seed,
         }
     }
 
@@ -1002,7 +924,6 @@ impl OuterProblem {
             rail_face_limit_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
-            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }
@@ -1043,50 +964,6 @@ impl OuterProblem {
             rail_face_limit_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
-            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
-            terminal_eval_order: None,
-        }
-    }
-
-    /// Construct a [`ClosureObjective`] with both an order-aware evaluation
-    /// hook and a custom seed-screening ranking proxy. The proxy fires only
-    /// when the cascade in `rank_seeds_with_screening` calls it; outside
-    /// screening the regular cost path is unaffected.
-    pub fn build_objective_with_screening_proxy<S, Fc, Fe, Feo, Fr, Fefs, Fsp>(
-        &self,
-        state: S,
-        cost_fn: Fc,
-        eval_fn: Fe,
-        eval_order_fn: Feo,
-        reset_fn: Option<Fr>,
-        efs_fn: Option<Fefs>,
-        screening_proxy_fn: Fsp,
-    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
-    where
-        Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-        Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
-        Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
-        Fr: FnMut(&mut S),
-        Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
-        Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-    {
-        let mut cap = self.capability();
-        cap.fixed_point_available = efs_fn.is_some();
-        ClosureObjective {
-            state,
-            cap,
-            cost_fn,
-            eval_fn,
-            eval_order_fn: Some(eval_order_fn),
-            reset_fn,
-            efs_fn,
-            fixed_point_certificate_fn: None,
-            exact_polish_fn: None,
-            rail_face_limit_fn: None,
-            criterion_invariance_fn: None,
-            criterion_rank_fn: None,
-            screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }
@@ -1106,8 +983,8 @@ impl OuterProblem {
         }
         // A warm start (`with_warm_start`): on the parent's inputs the point is
         // offered as a prior certificate, and a decline leaves this search to run
-        // exactly as it runs cold; on other inputs this cascade, which certifies
-        // its first certifiable seed, runs cold. One warm-start source per
+        // exactly as it runs cold; on other inputs this search, which certifies
+        // from its one derived start, runs cold. One warm-start source per
         // search, so the cold run takes no cache session either.
         if self.warm_start_source.is_some() {
             if let Some(warm_start) = self.warm_start_for_this_search() {
@@ -1130,9 +1007,8 @@ impl OuterProblem {
                     }
                 } else {
                     warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
-                        "the fit's inputs differ from the parent's, and this search certifies its \
-                         first certifiable seed, so a new first seed would change the point it \
-                         reports",
+                        "the fit's inputs differ from the parent's, and this search certifies from \
+                         its one derived start, so a new start would change the point it reports",
                     ));
                 }
             }
@@ -1162,7 +1038,6 @@ impl OuterProblem {
                         iterations,
                     );
                     config.initial_rho = Some(rho.clone());
-                    config.screen_initial_rho = false;
                     config.initial_rho_is_prior_terminal_certificate = true;
                     if !beta.is_empty() {
                         cached_inner_seed = Some(BoundInnerSeed {
@@ -1215,7 +1090,6 @@ impl OuterProblem {
                             iteration,
                         );
                         config.initial_rho = Some(rho.clone());
-                        config.screen_initial_rho = false;
                         had_hit = true;
                     } else {
                         log::debug!(
@@ -1368,9 +1242,11 @@ impl OuterProblem {
 pub(crate) enum PlanRunOutcome {
     Converged(OuterResult),
     Exhausted(OuterResult),
-    DominatedPlateau(DominatedPlateau),
     FirstOrderFallbackRequested(FirstOrderFallbackRequest),
     FixedPointContinuationRequested(FixedPointContinuationRequest),
+    /// A certified candidate an evaluated state beat (#2596, #2627); see
+    /// [`DominatedPlateau`].
+    DominatedPlateau(DominatedPlateau),
 }
 
 /// A certified candidate that an evaluated but uncertified state of the same
@@ -1820,26 +1696,6 @@ pub struct OuterResult {
     pub rank_boundary_stall: Option<RankBoundaryStall>,
     /// Which lane produced this result. See [`OuterResultOrigin`].
     pub origin: OuterResultOrigin,
-    /// Seed start points this plan run STARTED and whose mandatory analytic
-    /// certificate then REFUSED (#2569).
-    ///
-    /// The certify-resume loop in `run_outer` re-runs the outer search seeded
-    /// at the refused checkpoint, and the seed cascade it re-enters is allowed
-    /// to fall through its `seed_budget` while nothing has certified
-    /// (`should_start_next_seed`). The fall-through lands on the SAME generated
-    /// lattice seed every round — a point that does not depend on the
-    /// checkpoint, reached from a state `obj.reset()` has restored — so the
-    /// cascade re-derives a verdict it already recorded. Measured on the #2569
-    /// grouped-binomial design: one cold seed re-run 17 times per fit, each
-    /// repetition terminating at the identical `|g|` after the identical outer
-    /// iteration count, for 18-48% of the fit's wall clock.
-    ///
-    /// Carrying the points forward lets the next resume skip exactly those
-    /// seeds, on the same grounds #2080's `cold_entry_leg_refusal` replays a
-    /// recorded cold-entry verdict: re-running them would reproduce the
-    /// recorded refusal digit for digit. A seed that has NOT been started and
-    /// refused is never suppressed, so no rescue path is closed.
-    pub refused_seed_points: Vec<Array1<f64>>,
     /// The lowest certified optimum a plan attempt of this search declined because an
     /// evaluated state beat it (#2596, #2627), or `None`. When the terminal certificate
     /// refuses this result and nothing continues it to a certified point, the refusal is
@@ -1904,7 +1760,6 @@ impl OuterResult {
             cost_stall_probe_scale: None,
             rank_boundary_stall: None,
             origin: OuterResultOrigin::Solver,
-            refused_seed_points: Vec::new(),
             dominated_plateau: None,
         }
     }
@@ -2068,12 +1923,26 @@ impl std::error::Error for OuterStationaryPointRejection {
 /// objective in a frozen evaluation mode before calling this function.
 /// `iterations == 0` in the returned result is structural: no optimization loop
 /// exists on this path.
+///
+/// `n_obs` and `p_coefficients` are the problem size the criterion is summed
+/// over, exactly as [`OuterProblem::with_problem_size`] declares them for a
+/// search: the point is judged against the same statistical resolution
+/// `τ_stat = 1/(2n)` a search of that criterion would stop at.
 pub fn audit_stationary_point(
     obj: &mut dyn OuterObjective,
     rho: Array1<f64>,
+    n_obs: usize,
+    p_coefficients: usize,
     context: &str,
 ) -> Result<OuterResult, OuterStationaryPointRejection> {
-    audit_stationary_point_in(obj, OuterConfig::default(), rho, context)
+    let config = OuterConfig {
+        problem_size: OuterProblemSize {
+            n_obs: Some(n_obs),
+            p_coefficients: Some(p_coefficients),
+        },
+        ..OuterConfig::default()
+    };
+    audit_stationary_point_in(obj, config, rho, context)
 }
 
 /// [`audit_stationary_point`] under a caller's configuration. The point is judged
@@ -2141,9 +2010,9 @@ pub(crate) fn audit_stationary_point_in(
 // travel together, so the smoothing correction re-judges a direction at the certificate's shift
 // rather than at its own eigensolver's backward error.
 pub(crate) use opt::{
-    certificate_curvature_shift,
+    NegativeCurvatureClaim, certificate_curvature_shift,
     hessian_is_psd_at_resolution as certificate_hessian_is_psd_at_resolution,
-    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+    negative_curvature_claim, newton_predicted_decrease, newton_predicted_decrease_at_resolution,
 };
 
 /// PSD verdict of the outer Hessian restricted to its UN-RAILED coordinates
@@ -2488,53 +2357,6 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
-/// Whether a negative-curvature claim is falsifiable by any step the
-/// adjudication may take (#3036).
-///
-/// At a stationary point the claim `vᵀHv = λ_min < 0` predicts
-/// `V(ρ ± αv) − V(ρ) ≈ ½λ_min α²` for every step `α ≤ α_max`. It is falsifiable
-/// iff the largest step predicts a decrease the criterion can represent,
-/// `½|λ_min|·α_max² > objective_resolution`; its falsifiable range is then
-/// `[α_min, α_max]` with `α_min = sqrt(2·objective_resolution/|λ_min|)`.
-/// Otherwise no allowed step can produce a decrease the criterion resolves, and
-/// no probe outcome — a decrease under the resolution, a rise, or a failed
-/// evaluation — can confirm or falsify the claim.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum NegativeCurvatureClaim {
-    /// The claim can be falsified by steps from `α_max` down to `alpha_min`.
-    Resolvable { alpha_min: f64 },
-    /// Even the largest step predicts only `predicted_at_largest`, which the
-    /// criterion's resolution does not exceed.
-    Unresolvable { predicted_at_largest: f64 },
-}
-
-/// Classify a negative-curvature claim against the criterion's resolution
-/// ([`NegativeCurvatureClaim`]). `None` when the inputs carry no claim to judge:
-/// `λ_min` not a finite negative number, `α_max` not a finite positive step, or
-/// no finite positive resolution.
-pub(crate) fn negative_curvature_claim(
-    lambda_min: f64,
-    alpha_max: f64,
-    objective_resolution: f64,
-) -> Option<NegativeCurvatureClaim> {
-    if !(lambda_min.is_finite() && lambda_min < 0.0)
-        || !(alpha_max.is_finite() && alpha_max > 0.0)
-        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
-    {
-        return None;
-    }
-    let predicted_at_largest = 0.5 * lambda_min.abs() * alpha_max * alpha_max;
-    Some(if predicted_at_largest > objective_resolution {
-        NegativeCurvatureClaim::Resolvable {
-            alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
-        }
-    } else {
-        NegativeCurvatureClaim::Unresolvable {
-            predicted_at_largest,
-        }
-    })
-}
-
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2790,8 +2612,8 @@ pub(crate) fn adjudicate_negative_curvature(
     // ```
     //
     // is therefore the exact end of the claim's FALSIFIABLE RANGE — derived
-    // from the eigenvalue in dispute and the same `rel_cost_tolerance`-anchored
-    // resolution the rail and cost-stall machinery already use, with no
+    // from the eigenvalue in dispute and the same criterion resolution
+    // (`outer_criterion_resolution`) the rail and cost-stall machinery already use, with no
     // constant chosen here. Probing from `1` down to it and finding no descent
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
@@ -2805,7 +2627,7 @@ pub(crate) fn adjudicate_negative_curvature(
     // when they evaluate and "decline" when they fail, and the declined exit
     // refused the point on a curvature its criterion cannot resolve.
     let lambda_min = eigenvalues[min_idx];
-    let alpha_max = 1.0_f64;
+    let alpha_max = NEGATIVE_CURVATURE_LADDER_LARGEST_STEP;
     let alpha_min = match negative_curvature_claim(lambda_min, alpha_max, objective_resolution) {
         Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
         Some(NegativeCurvatureClaim::Unresolvable {
@@ -3296,10 +3118,11 @@ pub(crate) enum StationarityBoundSource {
     /// certified this and the caller would not" -- a distinction that matters
     /// because the second is not a defect in the fit.
     CallerRequirement,
-    /// `|Pg|·√((band_f − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict
-    /// on rounding bands only, rendered as a gradient bound along the measured
-    /// direction. It certifies iff `λ̂² + band_λ² ≤ band_f`, so no caller
-    /// tolerance and no scale anchor enters, and it may TIGHTEN every rung above.
+    /// `|Pg|·√((tol − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict,
+    /// rendered as a gradient bound along the measured direction. It certifies
+    /// iff `λ̂² + band_λ² ≤ tol = max(τ_stat − band_f, band_f)` with `τ_stat =
+    /// 1/(2n)` (C3), so no caller tolerance and no scale anchor enters, and it
+    /// may TIGHTEN every rung above.
     NewtonDecrement,
     /// The decrement verdict was taken and could not certify anything: its own
     /// rounding reached the objective band, a flat direction carried gradient,
@@ -3895,15 +3718,15 @@ fn certify_fixed_point_optimality(
 ///
 /// #2359: the generic REML/LAML Hessian consumes the row-family derivative
 /// ladder through order FOUR while its analytic gradient stops at order three,
-/// so order four is a mint-time cost, not a per-candidate one. A multi-start
-/// screens every seed it starts — that screening is a first-order gate
+/// so order four is a mint-time cost, not a per-candidate one. The outer search
+/// screens every candidate stop it reaches — that screening is a first-order gate
 /// (stationarity, KKT projection, rail facts), and `curvature_admissible()`
 /// reads `hessian_psd != Some(false)`, so a `None` curvature verdict certifies
 /// on stationarity alone. The one order-four evaluation belongs to the winner,
 /// once, and its verdict is the one that mints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CertificationFidelity {
-    /// Per-candidate multi-start gate. Never spends order four.
+    /// Per-candidate stop gate. Never spends order four.
     Screening,
     /// The single terminal mint audit. Spends order four when the objective
     /// declares an analytic Hessian.
@@ -4613,10 +4436,14 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     if let Some((decision, (bound, source))) = decrement_decided.as_ref() {
         let verdict = &decision.verdict;
         log::debug!(
-            "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (band_f = channels \
-             {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released {:?}; bound \
-             {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
+            "[CERTIFICATE] {context}: Newton-decrement verdict {verdict:?} (tolerance \
+             {:.3e} = max(τ_stat {:.3e} − band_f, band_f), arithmetic-limited {}; band_f = \
+             channels {:.3e} + factor {:.3e} + inner residual {:.3e}); face {:?}, released \
+             {:?}; bound {bound:.3e} (rung {}) replaces {stationarity_bound:.3e} (rung {}) at \
              |Pg|={projected_grad_norm:.3e} (#2954)",
+            decision.tolerance.value(),
+            decision.tolerance.tau_stat,
+            decision.tolerance.arithmetic_limited(),
             decision.objective_band.channels,
             decision.objective_band.factor,
             decision.objective_band.inner_residual,
@@ -4638,15 +4465,15 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && let Some(predicted_decrease) = newton_predicted_decrease_at_resolution(
             hessian,
             &projected_gradient,
-            criterion_curvature_resolution(outer_rel_cost_floor(config), evaluation.cost),
+            criterion_curvature_resolution(outer_criterion_resolution(config)),
         )
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
     {
-        // The SAME relative cost floor the cost-stall guard used to declare the
-        // criterion stalled (run_plan.rs), so certification asserts nothing
-        // tighter than the loop already proved about this surface.
-        let objective_tol = outer_rel_cost_floor(config) * (1.0 + evaluation.cost.abs());
+        // The criterion's resolution, the SAME one the cost-stall guard declares
+        // the criterion stalled at (run_plan.rs), so certification asserts
+        // nothing tighter than the loop already proved about this surface.
+        let objective_tol = outer_criterion_resolution(config);
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
@@ -4744,11 +4571,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         && prior.value().is_finite()
     {
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = outer_criterion_resolution(config);
         let cost_drift = (prior.value() - evaluation.cost).abs();
         let prior_projected = project_gradient_vector(
             &result.rho,
@@ -4855,11 +4678,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
-    let asymptote_objective_tol = config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
-        * (1.0 + evaluation.cost.abs());
+    let asymptote_objective_tol = outer_criterion_resolution(config);
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
             Some(try_certify_asymptote_rail(
@@ -4992,14 +4811,10 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         // magnitude, floored at 1 exactly as the PSD/Newton shift is.
         let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
         let null_curvature_threshold = f64::EPSILON.sqrt() * max_diag.max(1.0);
-        // The SAME relative cost floor the cost-stall guard and both widenings
+        // The SAME criterion resolution the cost-stall guard and both widenings
         // above use: certification asserts nothing tighter about this surface's
         // macroscopic flatness than the loop already proved.
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = outer_criterion_resolution(config);
         // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
         // in λ, a macroscopic move across which no genuine descent slope can hide.
         const LARGE_STEP_DELTA: f64 = 1.0;
@@ -6019,20 +5834,25 @@ fn try_certify_asymptote_rail(
     // information exactly where its logdet pair cancels; and even when it
     // succeeds it speaks for ONE coordinate along ONE ray. The analytic route
     // forms the λ=∞ limit itself — the null-space-restricted fit, and the
-    // exact first-order form of the logdet and trace terms there — and its
-    // positive definiteness proves the whole face against every way of coming
-    // off it. When the objective cannot form that limit, or the proof does not
-    // hold, the measured-tail path below is unchanged.
+    // exact first-order form of the logdet and trace terms there — and proves
+    // the whole face against every way of coming off it: by that form's
+    // positive definiteness, or, when the released penalty ranges are
+    // independent (Σ rank A_j = q, every single-penalty face), by the exact
+    // KKT test c_j > τ_j on the linear first-order law, or, when they overlap,
+    // by a sound lower bound on that law over the whole release simplex. When
+    // the objective cannot form that limit, or the proof does not hold, the
+    // measured-tail path below is unchanged.
     match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
         Ok((rails, proof)) => {
             log::debug!(
-                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s): λ_min(C)={:.6e} \
-                 > margin {:.3e}, joint pencil ĉ={:.6e}, remaining value gap {:.3e}, estimand \
-                 travel {:.3e}",
+                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
+                 statistic {:.6e} > band {:.3e}, joint pencil ĉ={:.6e}, remaining value gap \
+                 {:.3e}, estimand travel {:.3e}",
                 inputs.context,
                 rails.len(),
-                proof.min_curvature,
-                proof.curvature_margin,
+                proof.route,
+                proof.statistic,
+                proof.band,
                 proof.joint_tail_constant,
                 proof.value_gap,
                 proof.estimand_travel,
@@ -6114,36 +5934,14 @@ fn try_certify_asymptote_rail(
     )))
 }
 
-/// The analytic face law is falsified against production criterion VALUES, so
-/// the admissible discrepancy is exactly the error sources the comparison is
-/// made of: the run's own cost resolution (absolute, once per evaluation), the
-/// law's `O(e^{−ρ})` second-order remainder (relative), and the digits the
-/// Gram/Schur assembly loses. `FACE_LAW_ERROR_SLACK` widens that budget by the
-/// factor a two-point difference accumulates — each evaluation carries its own
-/// resolution error and the remainder enters both the predicted and the
-/// measured side — so a CORRECT law is never refused by its own error bars,
-/// while a wrong one (which misses by orders of magnitude, not by slack) still
-/// is. The falsification only runs where the budget leaves a discriminating
-/// band; where it does not, the analytic route declines rather than minting
-/// unfalsifiable evidence.
-const FACE_LAW_ERROR_SLACK: f64 = 4.0;
-
-/// Floor on the falsification band.
-///
-/// The derived numerical budget can land many orders below the honest fidelity
-/// of a closed form that deliberately does not model the criterion's
-/// stabilization ridge or its reparameterization; holding the law to that
-/// budget would reject a CORRECT law over a difference that changes no
-/// decision. What the falsification exists to catch is a structurally wrong law
-/// — a missing Schur term, the wrong dispersion convention, a sign error — and
-/// those miss by orders of magnitude, not by slack (measured on a fixture whose
-/// released directions genuinely earned their cost: 100%). Half the predicted
-/// drop is the coarsest band that still separates those two worlds.
-const FACE_LAW_ORDER_BAND: f64 = 0.5;
-
 /// Prove the rail face analytically (#2348 Inc 5): ask the objective for the
-/// exact λ→∞ limit, test the first-order form, and falsify the resulting law
-/// against the production criterion before minting anything from it.
+/// exact λ→∞ limit, test the first-order form, and mint the rails from it.
+///
+/// The proof spends no criterion evaluation. Whether each objective's closed
+/// form expands the criterion it actually minimizes is a property of that
+/// code, pinned by the value- and gradient-domain tests beside
+/// `RemlState::rail_face_limit`. It is not re-measured here by differencing
+/// two criterion values against a slack.
 ///
 /// Returns the minted rail coordinates plus the proof, or a human-readable
 /// decline that the caller logs before falling back to the measured tail.
@@ -6197,9 +5995,6 @@ fn try_certify_face_analytically(
             proof.estimand_travel
         )));
     }
-    if let Err(reason) = falsify_face_law(obj, inputs, &limit, &proof)? {
-        return Ok(Err(reason));
-    }
     let rails: Vec<RailCoordinate> = limit
         .face
         .iter()
@@ -6215,112 +6010,17 @@ fn try_certify_face_analytically(
             // move the criterion at all.
             value_gap: tail_constant * (-rho_k).exp(),
             estimand_travel_bound: proof.estimand_travel,
-            // The face was PROVEN, so the standard it cleared is the form's own
-            // eigen-backward-error margin — not a finite-difference floor, and
-            // not a quantity comparable with one.
+            // The face was PROVEN, so the standard it cleared is the route's
+            // own rounding band on the assembled form — not a finite-difference
+            // floor, and not a quantity comparable with one.
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: proof.min_curvature,
-                curvature_margin: proof.curvature_margin,
+                route: proof.route,
+                statistic: proof.statistic,
+                band: proof.band,
             },
         })
         .collect();
     Ok(Ok((rails, proof)))
-}
-
-/// Falsify the analytic face law against the production criterion.
-///
-/// The law predicts `V(ρ) − V_∞ = ½tr((Σλ_kQᵀS_kQ)⁻¹C)`, so pulling every face
-/// coordinate back by `Δ` must raise the criterion by exactly
-/// `gap·(e^{Δ} − 1)`. That is a VALUE comparison — no derivative, no
-/// cancellation — and it costs two evaluations instead of a probe ladder.
-///
-/// `Δ` is not a knob: the measurement error is `resolution/(gap·(e^Δ−1))` and
-/// the law's own remainder is `O(e^{Δ−ρ})`, so their sum is minimized at
-/// `Δ* = ½(ln(resolution/gap) + ρ)`, where both equal `√(resolution·e^{−ρ}/gap)`.
-fn falsify_face_law(
-    obj: &mut dyn OuterObjective,
-    inputs: &AsymptoteRailInputs<'_>,
-    limit: &RailFaceLimit,
-    proof: &RailFaceProof,
-) -> Result<Result<(), String>, EstimationError> {
-    const FACE_LAW_DOMAIN_MARGIN: f64 = 1.0e-6;
-    let rho = inputs.rho;
-    let (lower, _) = inputs.bounds;
-    let gap = proof.value_gap;
-    let resolution = inputs.objective_tol;
-    if !(gap > 0.0) || !(resolution > 0.0) {
-        return Ok(Err(format!(
-            "the face law carries no resolvable value gap: gap={gap:.3e}, cost resolution \
-             {resolution:.3e}"
-        )));
-    }
-    let deepest = limit
-        .face_rho
-        .iter()
-        .fold(f64::INFINITY, |acc, v| acc.min(*v));
-    let ideal = 0.5 * ((resolution / gap).ln() + deepest);
-    let room = limit
-        .face
-        .iter()
-        .zip(limit.face_rho.iter())
-        .map(|(&k, &rho_k)| rho_k - lower[k] - FACE_LAW_DOMAIN_MARGIN)
-        .fold(f64::INFINITY, f64::min);
-    let delta = ideal.min(room);
-    // One e-fold is the natural unit of the law being tested; below that the
-    // predicted change is not a statement about a tail.
-    if !(delta >= 1.0) || !delta.is_finite() {
-        return Ok(Err(format!(
-            "no room inside the box to falsify the face law: Δ={delta:.3e} e-folds"
-        )));
-    }
-    let predicted = gap * (delta.exp() - 1.0);
-    let measurement_error = resolution / predicted;
-    let remainder_error = (delta - deepest).exp();
-    let assembly_error = f64::EPSILON.sqrt() * limit.form_conditioning.sqrt();
-    let budget = measurement_error + remainder_error + assembly_error;
-    let admissible = (FACE_LAW_ERROR_SLACK * budget).max(FACE_LAW_ORDER_BAND);
-    if !(admissible < 1.0) {
-        return Ok(Err(format!(
-            "the face law cannot be falsified here: error budget {budget:.3e} (measurement \
-             {measurement_error:.3e}, remainder {remainder_error:.3e}, assembly \
-             {assembly_error:.3e}) leaves no discriminating band"
-        )));
-    }
-    let baseline = obj.eval_cost(rho)?;
-    let mut pulled_back = rho.clone();
-    for &k in limit.face.iter() {
-        pulled_back[k] -= delta;
-    }
-    let pulled = obj.eval_cost(&pulled_back);
-    // Every exit below ships the certified point, so restore it before judging.
-    obj.eval_cost(rho)?;
-    let pulled_value = match pulled {
-        Ok(value) => value,
-        // A refused pulled-back point is a statement about that point: the face
-        // law cannot be tested there, so the falsification declines instead of
-        // ending the fit (#2735).
-        Err(error) if error.is_trial_point_infeasible() => {
-            return Ok(Err(format!(
-                "the criterion refuses the pulled-back falsification point: {error}"
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    if !baseline.is_finite() || !pulled_value.is_finite() {
-        return Ok(Err(
-            "the criterion is not finite at the falsification points".to_string()
-        ));
-    }
-    let measured = pulled_value - baseline;
-    let discrepancy = (predicted - measured).abs() / predicted;
-    if discrepancy > admissible {
-        return Ok(Err(format!(
-            "the analytic face law does not reproduce the criterion: pulling the face back \
-             {delta:.2} e-folds should raise V by {predicted:.6e}, measured {measured:.6e} \
-             (relative {discrepancy:.3e} > admissible {admissible:.3e})"
-        )));
-    }
-    Ok(Ok(()))
 }
 
 /// The coordinates a stationarity residual must still account for.
@@ -7655,9 +7355,9 @@ pub(crate) fn run_outer(
         let mut exact_config = config.clone();
         exact_config.initial_rho = Some(result.rho.clone());
         exact_config.heuristic_log_lambdas = None;
-        exact_config.seed_config.max_seeds = 1;
-        exact_config.seed_config.seed_budget = 1;
-        exact_config.screen_initial_rho = false;
+        // The pilot's checkpoint is the lowest state evaluated so far, and the polish starts
+        // at it.
+        exact_config.carried_checkpoint = None;
         exact_config.operator_initial_trust_radius = result.operator_trust_radius;
         exact_config.warm_start_outer_hessian = result.final_hessian.clone();
         log::debug!(
@@ -7781,15 +7481,6 @@ pub(crate) fn run_outer(
     // refusal. A re-run whose warm solver value improved but whose certified value
     // did not (#2155/#2363) returns the refusal instead of taking another reseed.
     let mut last_refused_certified_value: Option<f64> = None;
-    // #2569 — seed points this loop has already started and already had refused.
-    // A resume changes `initial_rho` and nothing else the cascade reads, and it
-    // runs from a reset objective, so a NON-initial seed re-entered on a later
-    // round terminates exactly where it terminated before. Measured on the
-    // grouped-binomial design of #2569: 17 rounds re-ran one cold lattice seed
-    // to the identical `|g|` after the identical 42 outer iterations, 1628 s of
-    // a 9016 s fit. Accumulated across rounds and handed to the retry so the
-    // cascade replays the recorded verdict instead of re-deriving it.
-    let mut refused_seed_points: Vec<Array1<f64>> = Vec::new();
     // #2939 — once a mint has certified a strict saddle, every later run in this
     // solve searches on the declared curvature (`OuterConfig::curvature_search_latched`).
     let mut curvature_search_latched = config.curvature_search_latched;
@@ -7860,23 +7551,12 @@ pub(crate) fn run_outer(
                     retry_cfg.search_bounds_override = Some(frozen_bounds);
                 }
                 retry_cfg.heuristic_log_lambdas = None;
-                retry_cfg.seed_config.max_seeds = 1;
-                retry_cfg.seed_config.seed_budget = 1;
-                retry_cfg.screen_initial_rho = false;
-                // `seed_budget = 1` above is NOT binding: `should_start_next_seed`
-                // lets the cascade continue past it while nothing has certified,
-                // and on a resume the reseeded slot-0 candidate is exactly what
-                // failed certification, so `best` is `None` and the fall-through
-                // fires every round on the same regenerated lattice seed (#2569).
-                // Suppress only seeds this loop has ALREADY started and had
-                // refused; a seed that has never run is still reachable, so the
-                // fall-through keeps its rescue role.
-                for point in result.refused_seed_points.iter() {
-                    if !refused_seed_points.contains(point) {
-                        refused_seed_points.push(point.clone());
-                    }
-                }
-                retry_cfg.previously_refused_seed_points = refused_seed_points.clone();
+                // The reseed starts strictly below the refused checkpoint, which is already
+                // below every state an earlier search carried in, so nothing the re-run
+                // certifies can be dominated by a carried state. Carrying one would only let a
+                // re-run whose start is refused hand that older state back as its own stop
+                // (#2953).
+                retry_cfg.carried_checkpoint = None;
                 // Every reseed lands at a genuinely different point, so the refused
                 // checkpoint's metric (trust radius, outer Hessian) must not be
                 // transferred into the restart.
@@ -7968,16 +7648,6 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
     if let Some(initial) = config.initial_rho.as_ref() {
         canonical.initial_rho = Some(permute_arr(initial));
     }
-    canonical.previously_refused_seed_points = config
-        .previously_refused_seed_points
-        .iter()
-        .map(permute_arr)
-        .collect();
-    canonical.initial_rho_candidates = config
-        .initial_rho_candidates
-        .iter()
-        .map(permute_arr)
-        .collect();
     if let Some(bound) = config.initial_inner_seed.as_ref() {
         canonical.initial_inner_seed = Some(BoundInnerSeed {
             theta: permute_arr(&bound.theta),
@@ -8018,6 +7688,15 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
         }
         canonical.warm_start_outer_hessian = Some(hc);
     }
+    // A carried checkpoint is in native order. Mapping a result to native order under the
+    // inverse permutation maps it to canonical order.
+    if let Some(checkpoint) = config.carried_checkpoint.as_ref() {
+        let mut inverse = vec![0usize; perm.len()];
+        for (c, &i) in perm.iter().enumerate() {
+            inverse[i] = c;
+        }
+        canonical.carried_checkpoint = Some(outer_result_to_native(checkpoint.clone(), &inverse));
+    }
     if let Some(bound) = config.initial_curvature.as_ref()
         && bound.hessian.nrows() == perm.len()
         && bound.hessian.ncols() == perm.len()
@@ -8044,7 +7723,7 @@ pub(crate) fn run_outer_uncertified(
     // Every downstream stage — the per-atom EFS path below and
     // `run_outer_with_plan` — projects seeds against these bounds with
     // `f64::clamp`, whose `min > max` (or NaN) precondition panics *inside the
-    // Rust boundary* and surfaces as an opaque `GamError: ... panicked` across
+    // Rust boundary* and surfaces as an opaque `GamfitError: ... panicked` across
     // the FFI, violating the fail-loudly contract. The configured box can invert
     // whenever an independently-derived upper bound drifts below the lower wall
     // (e.g. the custom-family effective-df ceiling vs. `rho_lower_bound`).
@@ -8173,7 +7852,12 @@ pub(crate) fn run_outer_uncertified(
     }
 
     let mut last_error: Option<EstimationError> = None;
-    let mut best_checkpoint: Option<OuterResult> = None;
+    // A state an earlier search evaluated is this ladder's first checkpoint, so its first
+    // attempt judges what it certifies against it as every later attempt does (#2953).
+    let mut best_checkpoint: Option<OuterResult> = config
+        .carried_checkpoint
+        .as_ref()
+        .map(carried_checkpoint_of);
     // #2953 — the lowest certified optimum an attempt declined because an evaluated
     // state beat it. It rides on the result this loop returns, so a terminal refusal
     // reports it instead of losing it.
@@ -8220,7 +7904,6 @@ pub(crate) fn run_outer_uncertified(
             }
             attempt_config.initial_rho = Some(checkpoint.point.clone());
             attempt_config.initial_inner_seed = checkpoint.inner_seed.clone();
-            attempt_config.screen_initial_rho = false;
             // This is a mid-run finite incumbent, not a terminal certificate
             // imported from a prior fit.  Leaving the original config's cache
             // provenance set could let the zero-iteration resume path accept
@@ -8231,16 +7914,7 @@ pub(crate) fn run_outer_uncertified(
             // from gradients at the continued point instead of combining two
             // different checkpoints.
             attempt_config.warm_start_outer_hessian = None;
-            // The finite incumbent owns the nominal slot: try it first, without
-            // screening or neutral-seed promotion. Preserve the caller's
-            // absolute lattice, though. If this continuation certifies, the
-            // ordinary seed loop stops immediately and no other start runs; if
-            // it is refused or remains nonstationary, `should_start_next_seed`
-            // may advance through the remaining bounded lattice until a fit
-            // certifies. Setting `max_seeds = 1` here used to erase that recovery
-            // authority exactly when the incumbent lay outside the criterion's
-            // finite observed-information domain (#2653).
-            attempt_config.seed_config.seed_budget = 1;
+            // The finite incumbent is the continuation's single start.
             log::debug!(
                 "[OUTER] {context}: resuming {the_plan} first from the last finite {:?} \
                  incumbent after {} iteration(s) of its plan attempt: cost={:.6e}, \
@@ -8264,14 +7938,9 @@ pub(crate) fn run_outer_uncertified(
             }
             attempt_config.initial_rho = Some(checkpoint.rho.clone());
             attempt_config.initial_inner_seed = None;
-            attempt_config.screen_initial_rho = false;
             attempt_config.initial_rho_is_prior_terminal_certificate = false;
             attempt_config.warm_start_outer_hessian = None;
-            // The checkpoint owns the first nominal slot.  Preserve the
-            // caller's absolute recovery lattice: if this continuation still
-            // refuses, `should_start_next_seed` may advance until a candidate
-            // certifies, exactly as for a rho-local EFS trial refusal.
-            attempt_config.seed_config.seed_budget = 1;
+            // The checkpoint is the continuation's single start.
             log::debug!(
                 "[OUTER] {context}: analytic screening refuted the {:?} fixed point; \
                  resuming {the_plan} first from its best finite checkpoint after {} \
@@ -8492,10 +8161,9 @@ pub(crate) fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// / standard-EFS path via [`OuterProblem::run`] / [`run_outer`].
 ///
 /// Builds the same bounded seed and tolerance/budget the standard plan path
-/// uses, picks the seed (initial-ρ if supplied, else the first generated
-/// candidate — the per-atom fixed point is a contraction near the optimum and
-/// does not need the multi-seed cascade the dense path runs for its non-convex
-/// quasi-Newton surface), then drives the per-atom EFS loop. The shared-border
+/// uses, takes the same single derived start (initial-ρ if supplied, else the
+/// commensurate-curvature start — the per-atom fixed point is a contraction
+/// near the optimum), then drives the per-atom EFS loop. The shared-border
 /// topology defaults to disjoint (every atom owns a private penalty block — the
 /// common ARD-per-atom case); callers with a known arrow-border overlap can run
 /// the module's `run_per_atom_efs` directly with a populated
@@ -8523,28 +8191,13 @@ pub(crate) fn run_per_atom_efs_if_frontier(
     );
     let (lower, upper) = outer_search_bounds_template(config, cap.n_params);
 
-    // Seed: cache/explicit initial ρ if present, otherwise the first generated
-    // candidate. The per-atom multiplicative fixed point is locally
-    // contractive, so a single seed suffices; the heavy multi-seed cascade
-    // exists for the dense quasi-Newton's non-convex surface, not for EFS.
-    let seed = match config.initial_rho.as_ref() {
-        Some(initial) if initial.len() == cap.n_params => initial.clone(),
-        _ => {
-            let generated = crate::seeding::generate_rho_candidates(
-                cap.n_params,
-                config.heuristic_log_lambdas.as_deref(),
-                &config.seed_config,
-                gam_problem::OrderedRhoBounds::envelope(
-                    model_domain_bounds.0.iter().copied(),
-                    model_domain_bounds.1.iter().copied(),
-                )?,
-            );
-            match generated.into_iter().next() {
-                Some(first) => first,
-                None => Array1::<f64>::zeros(cap.n_params),
-            }
-        }
-    };
+    // The per-atom multiplicative fixed point is locally contractive, so it
+    // enters from the same single derived start as every other plan.
+    let seed = crate::rho_optimizer::run_plan::outer_start_point(
+        config,
+        cap.n_params,
+        &model_domain_bounds,
+    )?;
 
     log::debug!(
         "[OUTER] {context}: frontier ρ-scaling (rho_dim={rho_dim}) → per-atom decoupled EFS primary"
@@ -8555,6 +8208,7 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
+        outer_criterion_resolution(config),
     );
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
@@ -8714,35 +8368,56 @@ pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize)
     f64::EPSILON.sqrt() * (n_params.max(1) as f64).sqrt() * (1.0 + box_scale)
 }
 
-/// The relative cost floor shared by the cost-stall guard, the curvature-scaled
-/// flat-valley certificate, and the certify-last resume progress gate: nothing
-/// tighter than what the in-loop stall detector already proved about the
-/// surface. `rel_cost_tolerance` when set, else a small fraction of the absolute
-/// tolerance, never below `COST_STALL_REL_TOL_FLOOR`.
-pub(crate) fn outer_rel_cost_floor(config: &OuterConfig) -> f64 {
+/// The criterion's resolution in its own absolute units: the statistical
+/// resolution `τ_stat = 1/(2n)` over the declared observations
+/// ([`OuterProblemSize::statistical_resolution`], C3).
+///
+/// Every judgement of "the criterion cannot tell these apart" reads this one
+/// number: the cost-stall guard's no-improvement test where the evaluations
+/// carry no objective band, the ARC online stop and the matrix-free model
+/// decrement, the curvature-resolvability and gradient-reproducibility rungs,
+/// the asymptote-rail and large-step flatness certificates, and the
+/// negative-curvature adjudication's falsifiable range. A decrease below
+/// `τ_stat` moves no reported quantity by more than the `n^{-1/2}` sampling
+/// error the inference built on the optimum already carries; it does not move
+/// with the units of `y` or with an additive constant in `V`, which the
+/// `rel·(1 + |V|)` floor it replaces did, and it shrinks as `n` grows (#2954).
+///
+/// `0.0` when the route declares no observation count: such a criterion has no
+/// statistical resolution, so nothing is waived as unresolvable — a tolerance
+/// test `x ≤ 0` passes only on exact equality and the rung it gates does not
+/// fire.
+pub(crate) fn outer_criterion_resolution(config: &OuterConfig) -> f64 {
     config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
+        .problem_size
+        .statistical_resolution()
+        .filter(|tau| tau.is_finite() && *tau > 0.0)
+        .unwrap_or(0.0)
 }
 
-/// The criterion's curvature resolution at a point of cost `cost`:
-/// `2·rel_cost_floor·(1 + |V|)` (#1082, #2817).
+/// The largest step the negative-curvature adjudication takes along its eigenvector: one
+/// e-fold of `log λ` ([`adjudicate_negative_curvature`]).
+pub(crate) const NEGATIVE_CURVATURE_LADDER_LARGEST_STEP: f64 = 1.0;
+
+/// The criterion's curvature resolution `2·τ` over its objective resolution
+/// `τ` ([`outer_criterion_resolution`]; #1082, #2817).
 ///
 /// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
 /// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
-/// adjudication takes is one e-fold of `log λ` (`α = 1`), so a direction with
-/// `½|λ| ≤ rel_cost_floor·(1 + |V|)` predicts nothing the criterion can represent
-/// anywhere in the range that could falsify it. The bridge's definiteness
-/// verdict, the seed's verdict, and the decrement that both the in-loop stop and
-/// the certificate's curvature rung take all read this one number. `0.0` (the
-/// arithmetic shift alone) when the floor is unusable or the cost is not finite.
-pub(crate) fn criterion_curvature_resolution(rel_cost_floor: f64, cost: f64) -> f64 {
-    if rel_cost_floor.is_finite() && rel_cost_floor > 0.0 && cost.is_finite() {
-        2.0 * rel_cost_floor * (1.0 + cost.abs())
-    } else {
-        0.0
-    }
+/// adjudication takes is [`NEGATIVE_CURVATURE_LADDER_LARGEST_STEP`], so a direction
+/// with `½|λ|·α_max² ≤ τ` predicts nothing the criterion resolves anywhere in the
+/// range that could falsify it: this is `opt::unresolvable_curvature_magnitude` at
+/// that step and resolution, the number the adjudication's own resolvability verdict
+/// (`opt::negative_curvature_claim`, #3036) reads. The bridge's definiteness verdict,
+/// the seed's verdict, and the decrement that both the in-loop stop and the
+/// certificate's curvature rung take all read it too. `0.0` (the arithmetic shift
+/// alone) when the resolution is zero or unusable.
+pub(crate) fn criterion_curvature_resolution(objective_resolution: f64) -> f64 {
+    opt::unresolvable_curvature_magnitude(
+        NEGATIVE_CURVATURE_LADDER_LARGEST_STEP,
+        objective_resolution,
+    )
+    .unwrap_or(0.0)
 }
 
 /// Whether the certified objective strictly dropped between two refusals of the
@@ -9312,15 +8987,9 @@ pub(crate) fn run_fixed_point_outer_solver(
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
-        // The same resolution floor the gradient routes' cost-stall guard uses,
-        // and its first-order window.
-        progress: FixedPointProgress::new(
-            config
-                .rel_cost_tolerance
-                .unwrap_or(config.tolerance * 1.0e-2)
-                .max(COST_STALL_REL_TOL_FLOOR),
-            COST_STALL_WINDOW,
-        ),
+        // The same criterion resolution the gradient routes' cost-stall guard
+        // uses, and its first-order window.
+        progress: FixedPointProgress::new(outer_criterion_resolution(config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {

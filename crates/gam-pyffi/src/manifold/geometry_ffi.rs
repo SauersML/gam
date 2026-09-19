@@ -4478,219 +4478,51 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam_runtime::process_monitor::start();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    // gamfit exception hierarchy (see the comment block at the
-    // `create_exception!` definitions above and issue #343). Registering
-    // the classes here makes them addressable as `gam._rust.GamError`,
-    // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
-    // re-exports each one under its public `gamfit.*` name so the class
-    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)`
-    // and constructed by `RemlConvergenceError::new_err(...)` on the
-    // Rust side is exactly the same object.
-    module.add("GamError", module.py().get_type::<GamError>())?;
+    // gamfit exception hierarchy (see `ffi/ffi_errors.rs`). Registering the
+    // classes here makes them addressable as `gamfit._rust.GamfitError`,
+    // `gamfit._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
+    // re-exports each one under its public `gamfit.errors.*` name so the class
+    // identity caught by `pytest.raises(gamfit.errors.RemlConvergenceError)` and
+    // constructed by `RemlConvergenceError::new_err(...)` on the Rust side is
+    // exactly the same object.
+    module.add("GamfitError", module.py().get_type::<GamfitError>())?;
     module.add("FormulaError", module.py().get_type::<FormulaError>())?;
-    module.add(
-        "ColumnNotFoundError",
-        module.py().get_type::<ColumnNotFoundError>(),
-    )?;
-    module.add(
-        "SchemaMismatchError",
-        module.py().get_type::<SchemaMismatchError>(),
-    )?;
-    module.add("PredictionError", module.py().get_type::<PredictionError>())?;
-    module.add("BasisError", module.py().get_type::<BasisError>())?;
-    module.add(
-        "LinearSystemSolveError",
-        module.py().get_type::<LinearSystemSolveError>(),
-    )?;
-    module.add(
-        "EigendecompositionError",
-        module.py().get_type::<EigendecompositionError>(),
-    )?;
-    module.add(
-        "PenaltySpectrumError",
-        module.py().get_type::<PenaltySpectrumError>(),
-    )?;
-    module.add(
-        "ParameterConstraintError",
-        module.py().get_type::<ParameterConstraintError>(),
-    )?;
-    module.add(
-        "PirlsConvergenceError",
-        module.py().get_type::<PirlsConvergenceError>(),
-    )?;
-    module.add(
-        "PerfectSeparationError",
-        module.py().get_type::<PerfectSeparationError>(),
-    )?;
-    module.add(
-        "HessianNotPositiveDefiniteError",
-        module.py().get_type::<HessianNotPositiveDefiniteError>(),
-    )?;
-    module.add(
-        "RemlConvergenceError",
-        module.py().get_type::<RemlConvergenceError>(),
-    )?;
-    module.add(
-        "DictionaryConvergenceError",
-        module.py().get_type::<DictionaryConvergenceError>(),
-    )?;
-    module.add(
-        "GradientUnavailableError",
-        module.py().get_type::<GradientUnavailableError>(),
-    )?;
-    module.add("LayoutError", module.py().get_type::<LayoutError>())?;
-    module.add(
-        "ModelOverparameterizedError",
-        module.py().get_type::<ModelOverparameterizedError>(),
-    )?;
-    module.add(
-        "IllConditionedError",
-        module.py().get_type::<IllConditionedError>(),
-    )?;
-    module.add(
-        "InvalidInputError",
-        module.py().get_type::<InvalidInputError>(),
-    )?;
-    module.add(
-        "MonotoneRootError",
-        module.py().get_type::<MonotoneRootError>(),
-    )?;
-    module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
-    module.add(
-        "InvalidSpecificationError",
-        module.py().get_type::<InvalidSpecificationError>(),
-    )?;
-    // Remaining engine error enum subclasses (issue #343 follow-up).
-    module.add("GeometryError", module.py().get_type::<GeometryError>())?;
-    module.add(
-        "MatrixMaterializationError",
-        module.py().get_type::<MatrixMaterializationError>(),
-    )?;
-    module.add("GpuError", module.py().get_type::<GpuError>())?;
-    module.add(
-        "LinearAlgebraError",
-        module.py().get_type::<LinearAlgebraError>(),
-    )?;
-    module.add("MatrixError", module.py().get_type::<MatrixError>())?;
-    module.add("CacheStoreError", module.py().get_type::<CacheStoreError>())?;
-    module.add("SmoothError", module.py().get_type::<SmoothError>())?;
-    module.add("ArrowSchurError", module.py().get_type::<ArrowSchurError>())?;
-    module.add(
-        "OuterStrategyError",
-        module.py().get_type::<OuterStrategyError>(),
-    )?;
-    module.add(
-        "TermBuilderError",
-        module.py().get_type::<TermBuilderError>(),
-    )?;
-    module.add(
-        "CorrectedCovarianceError",
-        module.py().get_type::<CorrectedCovarianceError>(),
-    )?;
-    module.add(
-        "PredictInputError",
-        module.py().get_type::<PredictInputError>(),
-    )?;
-    module.add("HmcError", module.py().get_type::<HmcError>())?;
-    module.add("AloError", module.py().get_type::<AloError>())?;
-    module.add("SurvivalError", module.py().get_type::<SurvivalError>())?;
-    module.add(
-        "CubicCellKernelError",
-        module.py().get_type::<CubicCellKernelError>(),
-    )?;
-    module.add(
-        "SurvivalConstructionError",
-        module.py().get_type::<SurvivalConstructionError>(),
-    )?;
-    module.add(
-        "TransformationNormalError",
-        module.py().get_type::<TransformationNormalError>(),
-    )?;
-    module.add(
-        "CustomFamilyError",
-        module.py().get_type::<CustomFamilyError>(),
-    )?;
-    module.add("GamlssError", module.py().get_type::<GamlssError>())?;
-    module.add(
-        "SurvivalMarginalSlopeError",
-        module.py().get_type::<SurvivalMarginalSlopeError>(),
-    )?;
-    module.add(
-        "LatentSurvivalError",
-        module.py().get_type::<LatentSurvivalError>(),
-    )?;
-    module.add(
-        "SurvivalPredictError",
-        module.py().get_type::<SurvivalPredictError>(),
-    )?;
-    module.add(
-        "DeviationRuntimeError",
-        module.py().get_type::<DeviationRuntimeError>(),
-    )?;
     module.add("DataError", module.py().get_type::<DataError>())?;
-    module.add(
-        "FittedModelError",
-        module.py().get_type::<FittedModelError>(),
-    )?;
-    module.add(
-        "LognormalKernelError",
-        module.py().get_type::<LognormalKernelError>(),
-    )?;
-    module.add(
-        "ScaleDesignError",
-        module.py().get_type::<ScaleDesignError>(),
-    )?;
-    module.add(
-        "IdentifiabilityCompilerError",
-        module.py().get_type::<IdentifiabilityCompilerError>(),
-    )?;
-    module.add(
-        "JointPenaltyError",
-        module.py().get_type::<JointPenaltyError>(),
-    )?;
-    module.add(
-        "SurvivalLocationScaleError",
-        module.py().get_type::<SurvivalLocationScaleError>(),
-    )?;
-    module.add(
-        "MapUniquenessError",
-        module.py().get_type::<MapUniquenessError>(),
-    )?;
-    module.add(
-        "UnsupportedLinkError",
-        module.py().get_type::<UnsupportedLinkError>(),
-    )?;
-    module.add(
-        "InvalidConfigurationError",
-        module.py().get_type::<InvalidConfigurationError>(),
-    )?;
-    module.add(
-        "MissingDependencyError",
-        module.py().get_type::<MissingDependencyError>(),
-    )?;
-    module.add(
-        "IntegrationError",
-        module.py().get_type::<IntegrationError>(),
-    )?;
-    module.add("FitError", module.py().get_type::<FitError>())?;
-    module.add(
-        "FitConvergenceError",
-        module.py().get_type::<FitConvergenceError>(),
-    )?;
-    module.add(
-        "InnerModeConvergenceError",
-        module.py().get_type::<InnerModeConvergenceError>(),
-    )?;
-    module.add("FitSeedError", module.py().get_type::<FitSeedError>())?;
-    module.add(
-        "FitInvariantError",
-        module.py().get_type::<FitInvariantError>(),
-    )?;
+    module.add("ConvergenceError", module.py().get_type::<ConvergenceError>())?;
+    module.add("NotFittedError", module.py().get_type::<NotFittedError>())?;
+    module.add("InternalError", module.py().get_type::<InternalError>())?;
+    module.add("ColumnNotFoundError", module.py().get_type::<ColumnNotFoundError>())?;
+    module.add("InvalidSpecificationError", module.py().get_type::<InvalidSpecificationError>())?;
+    module.add("InvalidConfigurationError", module.py().get_type::<InvalidConfigurationError>())?;
+    module.add("BasisError", module.py().get_type::<BasisError>())?;
+    module.add("MissingDependencyError", module.py().get_type::<MissingDependencyError>())?;
+    module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
+    module.add("PredictionError", module.py().get_type::<PredictionError>())?;
+    module.add("PredictInputError", module.py().get_type::<PredictInputError>())?;
+    module.add("PerfectSeparationError", module.py().get_type::<PerfectSeparationError>())?;
+    module.add("ModelOverparameterizedError", module.py().get_type::<ModelOverparameterizedError>())?;
+    module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
+    module.add("InvalidInputError", module.py().get_type::<InvalidInputError>())?;
+    module.add("GeometryError", module.py().get_type::<GeometryError>())?;
     module.add("FitInputError", module.py().get_type::<FitInputError>())?;
-    module.add(
-        "FitNumericalError",
-        module.py().get_type::<FitNumericalError>(),
-    )?;
+    module.add("FitConvergenceError", module.py().get_type::<FitConvergenceError>())?;
+    module.add("PirlsConvergenceError", module.py().get_type::<PirlsConvergenceError>())?;
+    module.add("RemlConvergenceError", module.py().get_type::<RemlConvergenceError>())?;
+    module.add("InnerModeConvergenceError", module.py().get_type::<InnerModeConvergenceError>())?;
+    module.add("FitSeedError", module.py().get_type::<FitSeedError>())?;
+    module.add("FitNumericalError", module.py().get_type::<FitNumericalError>())?;
+    module.add("LinearSystemSolveError", module.py().get_type::<LinearSystemSolveError>())?;
+    module.add("EigendecompositionError", module.py().get_type::<EigendecompositionError>())?;
+    module.add("PenaltySpectrumError", module.py().get_type::<PenaltySpectrumError>())?;
+    module.add("ParameterConstraintError", module.py().get_type::<ParameterConstraintError>())?;
+    module.add("HessianNotPositiveDefiniteError", module.py().get_type::<HessianNotPositiveDefiniteError>())?;
+    module.add("MonotoneRootError", module.py().get_type::<MonotoneRootError>())?;
+    module.add("IntegrationError", module.py().get_type::<IntegrationError>())?;
+    module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
+    module.add("DictionaryConvergenceError", module.py().get_type::<DictionaryConvergenceError>())?;
+    module.add("FitInvariantError", module.py().get_type::<FitInvariantError>())?;
+    module.add("GradientUnavailableError", module.py().get_type::<GradientUnavailableError>())?;
+    module.add("LayoutError", module.py().get_type::<LayoutError>())?;
 
     // #773: `create_exception!` stamps every gamfit exception with
     // `__module__ = "_rust"`, but the compiled extension is importable only as
@@ -4700,10 +4532,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // `ProcessPoolExecutor` worker is masked by an opaque `PicklingError` that
     // hides the real failure and takes down the whole pool. Repoint each
     // exception class at its true importable module so the type round-trips
-    // through pickle. Walking the module dict for `GamError` subclasses keeps
+    // through pickle. Walking the module dict for `GamfitError` subclasses keeps
     // this correct as exceptions are added — no parallel name list to drift.
     {
-        let gam_error = module.py().get_type::<GamError>();
+        let gam_error = module.py().get_type::<GamfitError>();
         for (_name, value) in module.dict().iter() {
             let Ok(ty) = value.cast::<PyType>() else {
                 continue;
@@ -4808,6 +4640,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(transformation_score_table, module)?)?;
+    module.add_function(wrap_pyfunction!(latent_conditional_residual_table, module)?)?;
     module.add_function(wrap_pyfunction!(residuals_table, module)?)?;
     module.add_function(wrap_pyfunction!(ctn_required_fit_columns, module)?)?;
     module.add_function(wrap_pyfunction!(required_model_columns, module)?)?;
@@ -5058,6 +4891,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_checkpoint_dynamics, module)?)?;
     module.add_class::<PyInterventionCalibrationPlan>()?;
     module.add_function(wrap_pyfunction!(intervention_calibration_plan, module)?)?;
+    module.add_function(wrap_pyfunction!(kl_measurement_floor, module)?)?;
     inference_instruments::register(module)?;
     crate::joint_event_ffi::register(module)?;
     crate::event_history_ffi::register(module)?;
@@ -5665,7 +5499,7 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
     let message = error.to_string();
     match error {
         LinearDictionaryError::InvalidInput { .. } => InvalidInputError::new_err(message),
-        LinearDictionaryError::NumericalFailure { .. } => GamError::new_err(message),
+        LinearDictionaryError::NumericalFailure { .. } => FitNumericalError::new_err(message),
         LinearDictionaryError::NonConvergence {
             iterations,
             explained_variance,
@@ -7304,6 +7138,9 @@ fn predict_columns(
                 columns.insert("observation_lower".to_string(), obs_lower);
                 columns.insert("observation_upper".to_string(), obs_upper);
             }
+            // Identity link: the response IS the linear predictor, so both
+            // scales share one posterior SD.
+            columns.insert("linear_predictor_standard_error".to_string(), se.clone());
             columns.insert("posterior_mean_standard_error".to_string(), se);
             columns.insert("posterior_mean_lower".to_string(), lower);
             columns.insert("posterior_mean_upper".to_string(), upper);
@@ -7457,6 +7294,12 @@ fn predict_columns(
         );
         columns.insert("mean_plugin".to_string(), resolved.mean_plugin.to_vec());
         columns.insert("posterior_mean".to_string(), posterior_mean.to_vec());
+        if let Some(eta_standard_error) = resolved.linear_predictor_standard_error {
+            columns.insert(
+                "linear_predictor_standard_error".to_string(),
+                eta_standard_error.to_vec(),
+            );
+        }
         if let Some(standard_error) = resolved.posterior_mean_standard_error {
             columns.insert(
                 "posterior_mean_standard_error".to_string(),
@@ -7617,10 +7460,10 @@ fn predict_encoded_table_full_conformal_impl(
         point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
-            "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
-             distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
-             ρ-re-selecting fit and is certified per row only where \
-             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
+            "full-conformal with REML re-selection of the smoothing strength on the \
+             augmented rows (finite-sample ≥{:.0}% coverage wherever \
+             conformal_certificate ≥ 0; a negative code is a typed refusal carrying \
+             the frozen-ρ set)",
             conformal_level * 100.0
         )),
         covariance_source: None,
@@ -7629,19 +7472,20 @@ fn predict_encoded_table_full_conformal_impl(
     })
 }
 
-/// Full-conformal prediction intervals at frozen smoothing parameters — no
-/// held-out calibration fold required (#1098 / #942 Layer 1).
+/// Full-conformal prediction intervals — no held-out calibration fold required
+/// (#1098 / #942 Layers 1 and 3).
 ///
 /// Routes `predict(interval='conformal', training_data=...)` to the exact
 /// full-conformal set: the saved model carries only the frozen `p x p` penalty
 /// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
 /// contain the response column — supply the design and responses the set
-/// augments. The set is exact given the frozen `Sλ`; the distribution-free finite-sample
-/// ≥`conformal_level` marginal-coverage theorem additionally requires the
-/// symmetric ρ-re-selecting fit and is certified per row only where the
-/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
-/// REML branch through the augmented optimum). Returns the same column payload
-/// as `predict_table` plus that certificate column.
+/// augments. Each row's set is that of the fit that re-selects the smoothing
+/// strength by REML on the augmented rows, which carries the distribution-free
+/// finite-sample ≥`conformal_level` marginal-coverage theorem. The returned
+/// `conformal_certificate` column is `0` (exact_frozen) or `1` (honest_refit)
+/// for such rows and a negative refusal code otherwise (the frozen-ρ set, no
+/// guarantee). Returns the same column payload as `predict_table` plus that
+/// column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to split conformal.

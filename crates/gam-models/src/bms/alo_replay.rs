@@ -411,6 +411,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),
+        jet_scratch: crate::bms::hessian_paths::new_jet_scratch(),
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
@@ -495,12 +496,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
 
     let mut rows = Vec::with_capacity(n);
     for row in 0..n {
-        let row_context = family.build_row_exact_context_with_stats_and_cell_cache(
-            row,
-            &block_states,
-            None,
-            false,
-        )?;
+        let row_context = family.build_row_exact_context(row, &block_states, None)?;
         let (negative_log_likelihood, nll_score, observed_hessian) = family
             .compute_row_primary_gradient_hessian(row, &block_states, &primary, &row_context)?;
         if nll_score.len() != primary.total

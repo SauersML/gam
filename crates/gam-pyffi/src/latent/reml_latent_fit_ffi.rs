@@ -3,7 +3,7 @@
 /// In particular, a completed-but-nonstationary outer search is not an input
 /// error: it is a typed REML convergence failure whose full `OuterResult`
 /// remains the resume/evidence payload.  Keep that distinction instead of
-/// flattening `SaeFitError` through `Display` into `GamError`.
+/// flattening `SaeFitError` through `Display` into `GamfitError`.
 fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFitError) -> PyErr {
     use gam::terms::sae::manifold::SaeFitError;
 

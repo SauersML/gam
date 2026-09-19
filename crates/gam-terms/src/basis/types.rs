@@ -29,7 +29,7 @@ impl SendPtr {
 /// Re-export of the neutral basis-error contract. #1521: `BasisError` lives
 /// in `gam-problem` so `EstimationError` can wrap it (`#[from]`) without a
 /// back-edge; gam-terms re-exports it to preserve `gam_terms::basis::BasisError`.
-pub use gam_problem::BasisError;
+pub use gam_problem::{BasisError, CovariateSpan};
 
 // ============================================================================
 // Unified Basis Generation API
@@ -231,7 +231,10 @@ pub enum BSplineKnotSpec {
         num_basis: usize,
     },
     Automatic {
-        num_internal_knots: Option<usize>,
+        /// Internal-knot count. Always resolved by the caller (the formula
+        /// default is `heuristic_knots_for_column`); the basis builder has no
+        /// second, row-count-based default of its own.
+        num_internal_knots: usize,
         placement: BSplineKnotPlacement,
         /// `true` when nobody chose `num_internal_knots`: it is the formula
         /// default's starting resolution, which the standard formula workflow
@@ -532,6 +535,16 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
+/// The low-rank thin-plate resolution `k = 10 * 3^(d - 1)` for a `d`-dimensional
+/// spatial smooth (30 centers in 2-D): mgcv's default basis size for thin-plate
+/// and Duchon splines. It is the adaptive pilot's starting size
+/// ([`starting_num_centers`]) and the implicit cap on an inferred Duchon center
+/// count.
+pub fn low_rank_center_resolution(d: usize) -> usize {
+    let exponent = u32::try_from(d.saturating_sub(1)).unwrap_or(u32::MAX);
+    10usize.saturating_mul(3usize.saturating_pow(exponent))
+}
+
 /// Starting center count for saturation-driven spatial fitting.
 ///
 /// The structural minimum (`d + 1` polynomial directions plus one radial
@@ -557,8 +570,7 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
 /// Capped by [`default_num_centers`] so the pilot never exceeds the validated
 /// production basis.
 pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    let low_rank_resolution = 10usize
-        .saturating_mul(3usize.saturating_pow(d.saturating_sub(1).min(u32::MAX as usize) as u32));
+    let low_rank_resolution = low_rank_center_resolution(d);
     let supported_rows = low_rank_resolution.saturating_mul(ROWS_PER_SUPPORTED_CENTER);
     let pilot = if n > supported_rows {
         let density_ratio = n as f64 / supported_rows as f64;
@@ -619,6 +631,15 @@ pub fn basis_is_saturated(
     penalized_edf >= capacity - margin
 }
 
+/// The one center-placement rule for a spatial (radial-kernel) smooth of
+/// dimension `d`.
+///
+/// In low dimensions (`d <= 3`) a center count is a resolution request, so the
+/// centers are deterministic maximin (farthest-point) geometry: kriging and
+/// Duchon accuracy are governed by fill distance, and equal-mass midpoints
+/// leave holes and endpoint under-resolution that REML then compensates for by
+/// over-smoothing low-noise signals (#504). In higher dimensions the centers
+/// are equal-mass covariance representatives.
 pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d <= 3 {
         CenterStrategy::FarthestPoint { num_centers }
@@ -627,22 +648,10 @@ pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> Ce
     }
 }
 
+/// [`default_spatial_center_strategy`] for an inferred center count, wrapped in
+/// `Auto` so adaptive resolution may resize it before the centers are frozen.
 pub(crate) fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
-    let strategy = if d == 1 {
-        // In one dimension, farthest-point selection is the deterministic
-        // maximin grid over the observed domain. Equal-mass midpoints leave the
-        // low-frequency Duchon radial block slightly under-resolved at the
-        // boundaries, and REML then compensates with an over-smooth λ on
-        // low-noise signals (#504). The maximin grid matches the native
-        // reproducing-kernel interpolation geometry. The default strategy below
-        // extends the same space-filling contract to low-dimensional spatial
-        // GP bases, where kriging accuracy is governed by fill distance rather
-        // than marginal quantile balance.
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    };
-    CenterStrategy::Auto(Box::new(strategy))
+    CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
 }
 
 pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
@@ -2655,29 +2664,40 @@ pub(crate) fn design_cross_and_gram(
     Ok((cross, gram))
 }
 
-pub(crate) fn positive_spectral_whitener_from_gram(
+/// The orthonormal coefficient frame of the positive part of `gram`.
+///
+/// Returns the eigenvectors of `gram` whose eigenvalues exceed the relative
+/// rank tolerance `α·ε·n·max_eval`, as an `(n × keep)` matrix with
+/// orthonormal columns. Directions at or below the tolerance are *dropped*:
+/// they carry nothing of the design's column space on the rows `gram` was
+/// formed from, and removing them keeps the post-transform orthogonality
+/// residual at the genuine floating-point limit.
+///
+/// # Why a frame and not a whitener
+///
+/// This used to return `U₊·Λ₊^{-1/2}`, the chart in which the realized
+/// design is orthonormal on the FIT rows. That chart is conditioned on where
+/// the fit rows happen to fall, and nothing downstream is invariant to it:
+///
+/// * a direction with little energy on the fit rows — a basis function whose
+///   support sits in a gap of the data, as every level of a sparse
+///   `s(x, by=factor)` has — is scaled by `1/√λ`, so its column is O(1) on the
+///   fit rows and `‖X_new u‖/√λ` at a new row inside the gap: 2·10⁵ measured
+///   on a nine-row level;
+/// * the penalty is carried by congruence, `TᵀST`, so its spectrum picks up
+///   the same `1/λ` spread (4·10¹⁰ on that level), and every penalty-rank
+///   decision downstream is relative to the largest eigenvalue. Genuinely
+///   penalized directions are read as null, handed to the null-space ridge,
+///   and fitted without their curvature penalty — which is what then
+///   extrapolates across the gap.
+///
+/// An orthonormal `T` is norm-preserving, so `TᵀST` interlaces the spectrum
+/// of `S` and a rank decision made on it is the one made on `S`. The realized
+/// span is the same as the whitener's; only the coordinate chart differs,
+/// and it is the one the local sum-to-zero constraint already uses.
+pub(crate) fn positive_spectral_frame_from_gram(
     gram: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    // Inverse-square-root for the positive part of `gram`. Eigenvalues at or
-    // below the relative rank tolerance `α·ε·n·max_eval` are *dropped*: the
-    // returned whitener has shape `(n × keep)` where `keep` counts strictly
-    // positive eigendirections of `gram`.
-    //
-    // Dropping (rather than ridging) is what makes the result a true
-    // square-root inverse on the column space of `gram`. This whitener is
-    // used by `stabilized_orthogonality_transform_from_gram` to make a
-    // pre-existing transform `K_raw` orthonormal under the W-inner product:
-    // when some columns of `K_raw` map to zero (or near-zero) under `B`, the
-    // constrained Gram `K_raw^T G K_raw` is rank-deficient. Ridging those
-    // tail directions with `1/sqrt(ε)` produced spurious basis columns
-    // whose coefficient norms blew up to `~1/sqrt(ε)` while their image in
-    // `B` was floating-point zero, contaminating downstream linear algebra
-    // (in particular it forced `smooth.rs` to widen the post-transform
-    // orthogonality residual tolerance to absorb a `cond ≈ 1/sqrt(ε)`
-    // rounding floor). Dropping these directions is the right behavior:
-    // they contribute nothing to `B`'s column space, and removing them
-    // tightens the orthogonality residual back down to the genuine
-    // floating-point limit.
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
@@ -2698,7 +2718,7 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
         return Err(BasisError::ConstraintNullspaceCollapsed {
-            site: "positive_spectral_whitener_from_gram",
+            site: "positive_spectral_frame_from_gram",
             cross_rank: 0,
             coeff_dim: gram.nrows(),
             cross_frobenius: gram.iter().map(|v| v * v).sum::<f64>().sqrt(),
@@ -2710,12 +2730,7 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     // `eigh` returns eigenvalues in ascending order, so the largest `keep`
     // eigenvalues live at the tail.
     let eig_start = eigenvalues.len() - keep;
-    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
-    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
-    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
-        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].sqrt();
-    }
-    Ok(fast_ab(&kept_vectors, &inv_sqrt))
+    Ok(eigenvectors.slice(s![.., eig_start..]).to_owned())
 }
 
 pub(crate) fn stabilized_orthogonality_transform_from_gram(
@@ -2726,8 +2741,8 @@ pub(crate) fn stabilized_orthogonality_transform_from_gram(
         let gt = fast_ab(gram, transform);
         fast_atb(transform, &gt)
     };
-    let whitening = positive_spectral_whitener_from_gram(&constrained_gram)?;
-    Ok(fast_ab(transform, &whitening))
+    let frame = positive_spectral_frame_from_gram(&constrained_gram)?;
+    Ok(fast_ab(transform, &frame))
 }
 
 pub(crate) fn orthogonality_transform_from_cross_and_gram(
@@ -2737,7 +2752,7 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
     // Compute null(M^T) directly on M = B^T W C (k × q) via column-pivoted QR.
     // Working in the original k-dim coefficient space rather than first
     // whitening by B^T B avoids a fundamental failure mode: when B is heavily
-    // collinear, `positive_spectral_whitener_from_gram` truncates the design
+    // collinear, `positive_spectral_frame_from_gram` truncates the design
     // column-space to a `keep`-dim subspace, and if `keep <= q` the subsequent
     // nullspace search has no room — even though dim null(M^T) = k - rank(M)
     // ≥ k - q is always positive when k > q. The constraint nullspace is a
@@ -2761,11 +2776,12 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
         });
     }
 
-    // Make the constrained design B*K_raw orthonormal under the W-inner product.
-    // If the constrained Gram K_raw^T G K_raw is rank-deficient (because some
-    // directions in null(M^T) collapse under B), the spectral whitener drops
-    // them — that is the right behavior: a degenerate column never contributes
-    // to B's column space and shouldn't appear in the reparameterized basis.
+    // Restrict K_raw to the directions the design actually spans. If the
+    // constrained Gram K_raw^T G K_raw is rank-deficient (because some
+    // directions in null(M^T) collapse under B), the spectral frame drops
+    // them — a degenerate column never contributes to B's column space and
+    // shouldn't appear in the reparameterized basis. The kept directions stay
+    // orthonormal in coefficient space (see `positive_spectral_frame_from_gram`).
     stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
 }
 
@@ -3005,7 +3021,7 @@ pub struct ParametricResidualization {
 ///
 /// — column operations on a block whose partner is in the model — so it makes
 /// `X̃ᵀWC = 0` exactly while the joint span is untouched. The rank of `X̃` falls
-/// by `dim(col X ∩ col C)` and by nothing else, so the whitener below drops
+/// by `dim(col X ∩ col C)` and by nothing else, so the spectral frame below drops
 /// precisely the directions the deletion is entitled to drop and no others.
 ///
 /// It is also CONTINUOUS in the containment residual, which the delete/don't
@@ -3136,7 +3152,7 @@ pub(crate) fn parametric_residualization_for_design(
             residual_gram[[j, i]] = averaged;
         }
     }
-    let coefficient_transform = positive_spectral_whitener_from_gram(&residual_gram)?;
+    let coefficient_transform = positive_spectral_frame_from_gram(&residual_gram)?;
 
     // Restate the correction against the RAW constraint columns: with
     // `Ĉ = C·diag(1/‖c_j‖)`, `Ĉ·B̂·T = C·(diag(1/‖c_j‖)·B̂·T)`.
@@ -3594,12 +3610,140 @@ mod containment_tests {
             "the residualization's span must be inside the deletion's"
         );
         // And the correction is genuinely inert here: with the constant in the
-        // span, the whitener already produced a block orthogonal to it.
+        // span, the spectral frame already produced a block orthogonal to it.
         let cross = realized.t().dot(&intercept);
         let relative = cross.iter().map(|v| v * v).sum::<f64>().sqrt()
             / (realized.iter().map(|v| v * v).sum::<f64>().sqrt()
                 * intercept.iter().map(|v| v * v).sum::<f64>().sqrt());
         assert!(relative < 1.0e-14, "got {relative:e}");
+    }
+
+    /// Linear hat functions on `knots`, evaluated at `x`: a partition of unity
+    /// with local support, the shape of every B-spline by-level block.
+    fn hat_basis(x: &[f64], knots: &[f64]) -> Array2<f64> {
+        let mut basis = Array2::<f64>::zeros((x.len(), knots.len()));
+        for (row, &xi) in x.iter().enumerate() {
+            for (col, &center) in knots.iter().enumerate() {
+                let left = if col == 0 { center } else { knots[col - 1] };
+                let right = if col + 1 == knots.len() { center } else { knots[col + 1] };
+                let value = if xi <= center && center > left {
+                    (xi - left) / (center - left)
+                } else if xi >= center && right > center {
+                    (right - xi) / (right - center)
+                } else if xi == center {
+                    1.0
+                } else {
+                    0.0
+                };
+                basis[[row, col]] = value.max(0.0);
+            }
+        }
+        basis
+    }
+
+    /// The fz0072 shape: a by-level whose rows leave a gap in the covariate, so
+    /// one basis function barely touches the fit rows. The collection gauge's
+    /// coefficient transform must be an orthonormal frame on BOTH arms:
+    ///
+    /// * the realized row at a new point inside the gap stays the size of the
+    ///   raw basis row, instead of being amplified by `1/√λ` of the starved
+    ///   direction (the whitened chart's failure, measured below as the
+    ///   negative control);
+    /// * the congruence-carried penalty `TᵀST` interlaces the spectrum of `S`,
+    ///   so a rank decision made on it is the one made on `S`.
+    #[test]
+    fn the_collection_gauge_is_an_orthonormal_frame_across_a_data_gap() {
+        let knots: Vec<f64> = (0..11).map(|k| k as f64 / 10.0).collect();
+        // Fit rows on [0, 0.402] ∪ [0.598, 1]: the hat centred at 0.5 is
+        // touched only at its two outermost rows, at height 0.02.
+        let fit_x: Vec<f64> = (0..20)
+            .map(|i| 0.402 * i as f64 / 19.0)
+            .chain((0..20).map(|i| 0.598 + 0.402 * i as f64 / 19.0))
+            .collect();
+        let basis = hat_basis(&fit_x, &knots);
+        let gap_row = hat_basis(&[0.5], &knots);
+        let gap_norm = gap_row.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let intercept = Array2::<f64>::ones((fit_x.len(), 1));
+        // Second-difference penalty on the hat coefficients.
+        let p = knots.len();
+        let mut diff = Array2::<f64>::zeros((p - 2, p));
+        for r in 0..p - 2 {
+            diff[[r, r]] = 1.0;
+            diff[[r, r + 1]] = -2.0;
+            diff[[r, r + 2]] = 1.0;
+        }
+        let penalty = diff.t().dot(&diff);
+        let (penalty_evals, _) = FaerEigh::eigh(&penalty, Side::Lower).expect("penalty");
+        let penalty_top = penalty_evals.iter().cloned().fold(0.0_f64, f64::max);
+
+        let residualized =
+            parametric_residualization_for_design(&dense(basis.clone()), intercept.view(), None)
+                .expect("residualize")
+                .coefficient_transform;
+        let deleted =
+            orthogonality_transform_for_design(&dense(basis.clone()), intercept.view(), None)
+                .expect("delete");
+        for (arm, transform) in [("residualize", &residualized), ("delete", &deleted)] {
+            let m = transform.ncols();
+            assert_eq!(m, p - 1, "{arm}: the hats contain the constant, so one direction goes");
+            let gram = transform.t().dot(transform);
+            let off_identity = (&gram - &Array2::<f64>::eye(m))
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            assert!(
+                off_identity <= (p as f64) * 16.0 * f64::EPSILON,
+                "{arm}: TᵀT must be the identity, off by {off_identity:e}"
+            );
+            let realized_gap = gap_row.dot(transform);
+            let realized_norm = realized_gap.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!(
+                realized_norm <= gap_norm * (1.0 + 1.0e-12),
+                "{arm}: a gap row must not grow under the gauge: {realized_norm} vs {gap_norm}"
+            );
+            // Cauchy interlacing for the compression `TᵀST` of `S`:
+            // λ_k(S) ≤ λ_k(TᵀST) ≤ λ_{k+p−m}(S), ascending.
+            let (compressed, _) =
+                FaerEigh::eigh(&transform.t().dot(&penalty).dot(transform), Side::Lower)
+                    .expect("compressed penalty");
+            let slack = (p as f64) * 64.0 * f64::EPSILON * penalty_top;
+            for k in 0..m {
+                assert!(
+                    compressed[k] >= penalty_evals[k] - slack
+                        && compressed[k] <= penalty_evals[k + p - m] + slack,
+                    "{arm}: eigenvalue {k} of TᵀST ({:e}) left [{:e}, {:e}]",
+                    compressed[k],
+                    penalty_evals[k],
+                    penalty_evals[k + p - m]
+                );
+            }
+        }
+
+        // Negative control: the whitened chart `U₊Λ₊^{-1/2}` this replaced
+        // (on the delete arm the realized Gram in the frame chart IS `Λ₊`, so
+        // re-whitening it reconstructs that chart up to a rotation) amplifies
+        // the gap row by the starved direction's `1/√λ`. Without this the
+        // fixture could pass by having no starved direction at all.
+        let fit_gram = {
+            let realized = basis.dot(&deleted);
+            realized.t().dot(&realized)
+        };
+        let (evals, evecs) = FaerEigh::eigh(&fit_gram, Side::Lower).expect("fit gram");
+        let smallest = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let largest = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let whitened_gap_norm = {
+            let mut whitener = evecs.clone();
+            for (col, &ev) in evals.iter().enumerate() {
+                whitener.column_mut(col).mapv_inplace(|v| v / ev.sqrt());
+            }
+            let row = gap_row.dot(&deleted).dot(&whitener);
+            row.iter().map(|v| v * v).sum::<f64>().sqrt()
+        };
+        assert!(
+            largest / smallest > 1.0e2 && whitened_gap_norm > 10.0 * gap_norm,
+            "the fixture must starve a direction: condition {:e}, whitened gap row {whitened_gap_norm} \
+             vs raw {gap_norm}",
+            largest / smallest
+        );
     }
 }
 

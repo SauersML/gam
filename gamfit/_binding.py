@@ -41,7 +41,7 @@ class RustExtensionUnavailableError(ImportError):
 
 def _normalize_rust_exception_modules(module: ModuleType) -> None:
     """Make Rust-defined exception classes import-addressable for pickle."""
-    gam_error = getattr(module, "GamError", None)
+    gam_error = getattr(module, "GamfitError", None)
     if not isinstance(gam_error, type):
         return
     for value in vars(module).values():

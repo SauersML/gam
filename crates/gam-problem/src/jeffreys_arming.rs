@@ -65,6 +65,18 @@ pub enum JeffreysArmingEvidence {
         lineality_negative: usize,
         copositive_minimum: Option<f64>,
     },
+    /// The fit certified an unconstrained mode whose penalized information is
+    /// singular on `ker(S_λ)`, the `unreached_dim` directions no smoothing
+    /// parameter reaches (#3164): `λ_min` of the reduced information there is at
+    /// or below the Jeffreys plan's own numerical zero `information_floor`. No
+    /// `λ` can bound those directions, so the Laplace posterior is improper and
+    /// the certified mode is a point on a likelihood ray the solve stopped on
+    /// once its decrement fell below the objective's resolution.
+    ImproperPenaltyNullPosterior {
+        unreached_dim: usize,
+        information_min: f64,
+        information_floor: f64,
+    },
     /// The pre-fit certificate found a threshold on one realized design column
     /// that separates the binary outcomes, so the likelihood has no finite
     /// maximizer along that column.
@@ -128,6 +140,11 @@ impl JeffreysArmingEvidence {
             }
             Self::ImproperConePosterior { .. } => {
                 "the constrained posterior without the Jeffreys prior is improper".to_string()
+            }
+            Self::ImproperPenaltyNullPosterior { .. } => {
+                "the posterior without the Jeffreys prior is improper along a direction no \
+                 penalty reaches"
+                    .to_string()
             }
         }
     }

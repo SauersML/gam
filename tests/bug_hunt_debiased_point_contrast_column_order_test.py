@@ -6,7 +6,7 @@ in the training frame (the natural ``DataFrame({"y": ..., "x": ...})`` order).
 ``"contrast"`` (``m(x0) - m(x1)``) as its first two first-class estimands. For a
 plain ``y ~ s(x)`` Gaussian/identity fit they currently raise
 
-    GamError: debiased_functional: x0 design failed: Dimension mismatch:
+    GamfitError: debiased_functional: x0 design failed: Dimension mismatch:
     smooth term 's(x)' feature column 1 out of bounds for 1 columns
 
 whenever the training frame is built response-column-first

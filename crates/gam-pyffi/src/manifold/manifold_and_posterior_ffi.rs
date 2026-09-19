@@ -1427,6 +1427,13 @@ fn basis_adequacy_dataset_json_impl(
         }
     };
     let family = model.likelihood();
+    // The refit below is a plain standard fit at the frozen spec — no link
+    // wiggle and no latent-coordinate estimation — so its row law is the
+    // canonical family's whenever the likelihood is.
+    let canonical_family =
+        gam::families::fit_orchestration::drivers::basis_adequacy_canonical_family(
+            &family, false, false,
+        );
     let fitted = gam::families::fit_orchestration::drivers::fit_term_collection_forspec(
         standard.data.view(),
         standard.y.view(),
@@ -1443,6 +1450,11 @@ fn basis_adequacy_dataset_json_impl(
         &fitted.design,
         &spec,
         &fitted.fit,
+        &gam::families::fit_orchestration::drivers::BasisAdequacyResponse {
+            y: standard.y.view(),
+            prior_weights: standard.weights.view(),
+            canonical_family,
+        },
     );
     let payload = BasisAdequacyPayload {
         level: gam::families::fit_orchestration::drivers::BASIS_ADEQUACY_NOTE_LEVEL,

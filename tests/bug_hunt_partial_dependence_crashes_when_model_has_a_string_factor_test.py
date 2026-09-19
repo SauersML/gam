@@ -4,7 +4,7 @@ in as if it were a user-facing level.
 
     y ~ s(x) + factor(b)          # b in {"b0", "b1", "b2"}
     model.partial_dependence("s(x)", data)
-    -> gamfit._rust.GamError: unseen level '\\x00b0' in categorical column 'b' at row 1
+    -> gamfit._rust.GamfitError: unseen level '\\x00b0' in categorical column 'b' at row 1
 
 ``y ~ s(x) + b`` (bare string column) fails identically. Drop the factor and the
 same call succeeds, so nothing about the smooth is at fault -- the mgcv
@@ -36,7 +36,7 @@ has never seen. The persisted schema is not a workaround either: its levels come
 back quoted (``["'b0'", "'b1'", "'b2'"]``), so the ``levels[0]`` fallback a few
 lines below would inject ``"'b0'"``.
 
-Observed: ``GamError: unseen level '\\x00...'`` for every model with a
+Observed: ``GamfitError: unseen level '\\x00...'`` for every model with a
 categorical term.
 
 Expected: ``partial_dependence`` returns the term's partial effect. Because the
