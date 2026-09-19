@@ -592,7 +592,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Python objects and then reparsing their string representations. This class
 /// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
 /// requested row for the few metadata helpers that still consume text.
-#[pyclass(name = "_EncodedTable", frozen, skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "_EncodedTable", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncodedTable {
     dataset: EncodedDataset,
