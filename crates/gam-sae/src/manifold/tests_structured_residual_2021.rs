@@ -98,14 +98,13 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
     // per-output heteroscedastic idiosyncratic noise ⇒ Σ_n is genuinely anisotropic
     // (D non-uniform), so whitening cannot collapse to a scalar rescale (which would
     // leave the loss ratio-invariant). The dominant off-diagonal correlation makes a
-    // rank-1 factor MATHEMATICALLY JUSTIFIED, not marginal: the evidence ladder's
-    // ½·p·log n Occam penalty is cleared with room to spare at the fixture's `n`
-    // (see the caller's n rationale), so `fit` selects rank 1 rather than the
-    // pure-diagonal model. (The prior loadings — |λ| ≤ 1 with d_scale up to 0.95 —
-    // were a marginal factor whose BIC advantage was swamped by the penalty at small
-    // n: the ladder correctly picked rank 0 there, vacuously skipping the whitening
-    // asserts below. That is a fixture regime bug, #2107 — rank selection itself is
-    // sound, as the at-scale `evidence_ladder_prefers_planted_rank_one` /
+    // rank-1 factor MATHEMATICALLY JUSTIFIED, not marginal: its Laplace evidence
+    // clears the pure-diagonal model's with room to spare at the fixture's `n`
+    // (see the caller's n rationale), so `fit` selects rank 1. (The prior loadings
+    // — |λ| ≤ 1 with d_scale up to 0.95 — were a marginal factor the selection
+    // correctly rejected at small n, vacuously skipping the whitening asserts
+    // below. That is a fixture regime bug, #2107 — rank selection itself is sound,
+    // as the at-scale `evidence_prefers_planted_rank_one` /
     // `factor_recovers_planted_interference_subspace` tests in `residual_factor.rs`
     // confirm — so the fix is to plant a genuinely-justified factor, not to touch
     // the estimator.)
@@ -146,15 +145,13 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
 /// untouched.
 #[test]
 fn structured_residual_metric_whitens_loss_and_gradient_2021() {
-    // n=48 sits on the verified stable rank-1 plateau for the strong planted factor
-    // (`fit_structured_metric` selects rank 1 at n = 48, 96, 192, 384; #2107). It is
-    // comfortably past the small-sample regime where BIC's ½·p·log n Occam penalty
-    // legitimately dominates a weak factor (the original n=6 fixture selected rank 0
-    // — a correct BIC verdict for THAT weak factor, which vacuously skipped the
-    // whitening asserts). With the strong factor a rank-1 structure is justified with
-    // margin here, so `fit` genuinely emits a whitening (anisotropic) metric and the
-    // assertions below actually execute. n is kept modest so the O(n) loss/gradient
-    // assembly stays a cheap unit test.
+    // n=48 sits past the small-sample regime where the evidence legitimately
+    // prefers the pure-diagonal model for a weak factor (the original n=6 fixture
+    // selected rank 0 — a correct verdict for THAT weak factor, which vacuously
+    // skipped the whitening asserts; #2107). With the strong factor a rank-1
+    // structure is justified with margin here, so `fit` genuinely emits a
+    // whitening (anisotropic) metric and the assertions below actually execute.
+    // n is kept modest so the O(n) loss/gradient assembly stays a cheap unit test.
     let (n, p, k) = (48usize, 3usize, 3usize);
     let mut term = build_term(n, p, k);
     let target = Array2::<f64>::from_shape_fn((n, p), |(r, c)| {

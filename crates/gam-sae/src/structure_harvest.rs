@@ -7589,10 +7589,10 @@ fn build_residual_factor_births(
     let activity: Array1<f64> = (0..n).map(|r| assignments.row(r).sum()).collect();
     let max_rank = params.max_births.min(p.saturating_sub(1));
     // Propagate a genuine fit failure instead of degrading to "no births".
-    // The evidence ladder already includes the rank-0 rung, so a true "no
-    // structure to harvest" outcome returns `Ok` (an empty/zero-rank factor);
-    // an `Err` here signals a numerical/degenerate failure (non-finite inputs,
-    // an empty ladder, a broken alternation), and swallowing it into
+    // The rank search always scores rank 0, so a true "no structure to
+    // harvest" outcome returns `Ok` (an empty/zero-rank factor); an `Err` here
+    // signals a numerical/degenerate failure (non-finite inputs, a rank whose
+    // posterior mode could not be certified), and swallowing it into
     // `Ok(Vec::new())` would silently paper over that non-convergence
     // (the #2069/#2070 accept-on-failure genus). Surface it.
     let model = StructuredResidualModel::fit(ResidualFactorInput {
