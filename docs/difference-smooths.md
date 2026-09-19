@@ -13,6 +13,8 @@ Difference smooths compare trajectories between groups without asking users to d
 
 `model.difference_smooth(data=data, group="group", view="x")` builds two design matrices on a grid, forms `X_B - X_A`, and computes the contrast standard error from the joint coefficient covariance. If `group` is omitted, the implementation uses the first categorical schema column other than `view`. `simultaneous=True` uses posterior simulation of the maximum standardized deviation over the grid to return a simultaneous band for regional claims.
 
+The contrast is formed on the linear-predictor scale for every family, so the band is Gaussian by construction; its standard errors and the correlation between grid rows both come from `C V Cᵀ`, where `V` is the covariance the fit *publishes* — the same matrix `summary()` prices its standard errors from: smoothing-corrected whenever the fit carries it, conditional when the correction is typed unavailable (a smoothing parameter certified at its infinite rail, for example). Each row names the choice in `covariance_kind` / `covariance_corrected`. The critical value is the `level` quantile of `max_i |Z_i|` over `n_sim` (default 10 000) seeded draws of the standardized curve (`seed`, default 12 345), which makes the band reproducible.
+
 By default `difference_smooth` marginalises saved random-effect blocks (`marginalise_random=True`). When `group_means=True` (the default), the compared factor's own main-effect columns are retained even though other random-effect blocks are zeroed, so categorical `by=` contrasts include the group offset. Set `group_means=False` to zero that saved group main-effect block and return the smooth-shape contrast without the offset.
 
 ## Choosing among them

@@ -369,8 +369,8 @@ mod tests {
             | LinkFunction::Sas
             | LinkFunction::BetaLogistic
             | LinkFunction::Log => 1.0,
-            LinkFunction::Inverse | LinkFunction::InverseSquared => {
-                panic!("calculate_scale has no residual scale for the reciprocal links")
+            LinkFunction::Inverse | LinkFunction::InverseSquared | LinkFunction::Sqrt => {
+                panic!("calculate_scale has no residual scale for the reciprocal and sqrt links")
             }
             LinkFunction::Identity => {
                 let mut fitted = x.dot(beta);
@@ -940,7 +940,7 @@ mod tests {
         };
         let beta = array![1.0, 2.0];
         let grad = array![0.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert!(diag.primal_feasibility <= 1e-12);
         assert!(diag.dual_feasibility <= 1e-12);
         assert!(diag.complementarity <= 1e-12);
@@ -955,7 +955,7 @@ mod tests {
         };
         let beta = array![0.0, 1.5];
         let grad = array![2.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert_eq!(diag.n_constraints, 2);
         assert_eq!(diag.n_active, 1);
         assert!(diag.primal_feasibility <= 1e-12);
@@ -1004,7 +1004,7 @@ mod tests {
         let lambda_true = array![1.0, 0.5, 2.0];
         let grad = constraints.a.t().dot(&lambda_true);
 
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
 
         assert_eq!(diag.n_constraints, 3);
         assert_eq!(
@@ -1108,7 +1108,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
-            default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
+            default_beta_guess_external(3, &ResponseFamily::Binomial, LinkFunction::Logit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let expected = (prevalence / (1.0 - prevalence)).ln();
         assert!((beta[0] - expected).abs() < 1e-12);
@@ -1121,7 +1121,7 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 1.0];
         let w = Array1::ones(4);
         let beta =
-            default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view(), None, None);
+            default_beta_guess_external(3, &ResponseFamily::Binomial, LinkFunction::Probit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
         let log_odds = (prevalence / (1.0 - prevalence)).ln();
         let expected =
@@ -1143,6 +1143,9 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
+        // The dense route never counts the design's nonzeros, and says so.
+        assert_eq!(decision.nnz_x, None);
+        assert!(decision.format_fields(decision.path_str()).contains("nnz_x=na"));
     }
 
     #[test]
@@ -1166,7 +1169,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 300);
+        assert_eq!(decision.nnz_x, Some(300));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
         assert_eq!(decision.nnz_h_est, Some(300));
         assert!(decision.density_h_est.expect("density") < 0.01);
@@ -1183,7 +1186,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 64);
+        assert_eq!(decision.nnz_x, Some(64));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(64));
         assert_eq!(decision.nnz_h_est, Some(64));
         assert!(decision.density_h_est.expect("density") < 0.05);
@@ -2704,7 +2707,12 @@ mod tests {
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
         let profiled_shape =
-            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view())
+            super::estimate_gamma_shape_from_eta(
+                &result.likelihood.spec.link,
+                y.view(),
+                &result.final_eta.to_owned(),
+                w.view(),
+            )
                 .expect("converged Gamma shape must be representable");
 
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
@@ -2714,6 +2722,88 @@ mod tests {
             epsilon = 1e-10,
             max_relative = 1e-10
         );
+    }
+
+    /// Identity-Poisson with a group whose counts are all zero: the likelihood
+    /// increases without bound as that group's mean falls to zero, so the
+    /// maximum sits on the boundary `eta = 0` of the identity link's
+    /// feasibility set. Fisher curvature `1/mu` diverges there, so the Newton
+    /// decrement collapses while the gradient does not; P-IRLS must return the
+    /// typed boundary error instead of certifying the edge as converged.
+    #[test]
+    fn identity_poisson_boundary_optimum_is_a_typed_error() {
+        let n = 40;
+        let mut x = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            x[[i, 0]] = 1.0;
+            if i >= n / 2 {
+                x[[i, 1]] = 1.0;
+                y[i] = [3.0, 5.0, 6.0, 4.0, 7.0][i % 5];
+            }
+        }
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let root = array![[0.0, 0.0]];
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
+            col_range: 0..2,
+            total_dim: 2,
+            nullity: 2,
+            prior_mean: Array1::zeros(2),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let link = InverseLink::Standard(StandardLink::Identity);
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                link.clone(),
+            )),
+            link_kind: link,
+            max_iterations: 200,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+
+        let err = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
+            PirlsProblem {
+                x: x.view(),
+                offset: offset.view(),
+                y: y.view(),
+                priorweights: w.view(),
+                covariate_se: None,
+                gaussian_fixed_cache: None,
+                glm_first_step_gram: None,
+            },
+            PenaltyConfig {
+                canonical_penalties: &canonical,
+                reparam_invariant: None,
+                p: 2,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: None,
+            },
+            &config,
+            None,
+        )
+        .map(|_| ())
+        .expect_err("a boundary optimum has no interior fit to report");
+        assert!(
+            matches!(
+                err,
+                EstimationError::LinkFeasibilityBoundaryOptimum {
+                    link: "identity",
+                    ..
+                }
+            ),
+            "expected the typed boundary error, got {err:?}"
+        );
+        assert!(err.is_trial_point_infeasible());
     }
 
     #[test]
@@ -4404,6 +4494,143 @@ mod root_cause_tests {
             });
             assert_deviance_monotone(&trace, &format!("Logistic(seed={})", seed));
         }
+    }
+
+    pub(crate) fn capture_pirls_lm_attempts<F, R>(run: F) -> (R, usize)
+    where
+        F: FnOnce() -> R,
+    {
+        super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT.with(|count| count.set(Some(0)));
+        let result = run();
+        let attempts = super::reweight::test_support::PIRLS_LM_ATTEMPT_COUNT
+            .with(|count| count.take())
+            .unwrap();
+        (result, attempts)
+    }
+
+    /// Rare-event logistic cold start (pyGAM audit F18). A ~3%-prevalence
+    /// response whose log-odds rise steeply with a skewed covariate (the
+    /// credit-default shape: logit p = −10.65 + 0.0055·balance) makes the
+    /// undamped Newton step from the prevalence-intercept seed overshoot by
+    /// orders of magnitude: it drives η to ≈ +11 on the high-balance rows.
+    /// The Levenberg–Marquardt damping must climb from `u ≈ 1e-16` to O(1)
+    /// before a trial is accepted. The geometric reject schedule alone
+    /// (×2, ×4, ×8, …) needs ~11 trials to cross those 16 decades, each
+    /// re-solving a step the tiny damping leaves unchanged. Moré's
+    /// interpolated rejection update takes the damping to the radius the
+    /// rejected trial indicates in one or two trials. This pins the cost in
+    /// LM attempts (damped solves plus trial evaluations), not wall clock.
+    #[test]
+    pub(crate) fn rare_event_logistic_cold_start_reaches_damping_in_few_trials() {
+        let n = 4000;
+        let n_basis = 10;
+        let mut rng_state: u64 = 0x5EED_F18_0000_0001;
+        let mut uniform = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((rng_state >> 11) as f64) + 0.5) / ((1u64 << 53) as f64)
+        };
+        let mut balance = Vec::with_capacity(n);
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            // Box–Muller N(835, 480), truncated at zero like a card balance.
+            let (u1, u2) = (uniform(), uniform());
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let b = (835.0 + 480.0 * z).max(0.0);
+            let p = 1.0 / (1.0 + (10.65 - 0.0055 * b).exp());
+            y[i] = if uniform() < p { 1.0 } else { 0.0 };
+            balance.push(b);
+        }
+        let positives: f64 = y.sum();
+        assert!(
+            positives > 0.01 * n as f64 && positives < 0.08 * n as f64,
+            "fixture must be rare-event, got {positives} positives of {n}"
+        );
+        // Intercept plus a hat-function (linear B-spline) basis on the
+        // covariate range, with a second-difference penalty on the hats.
+        let (lo, hi) = balance
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+                (lo.min(b), hi.max(b))
+            });
+        let h = (hi - lo) / (n_basis - 1) as f64;
+        let p = n_basis + 1;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for (i, &b) in balance.iter().enumerate() {
+            x[[i, 0]] = 1.0;
+            for k in 0..n_basis {
+                let knot = lo + k as f64 * h;
+                x[[i, k + 1]] = (1.0 - ((b - knot) / h).abs()).max(0.0);
+            }
+        }
+        let mut root = Array2::<f64>::zeros((n_basis - 2, p));
+        for r in 0..n_basis - 2 {
+            root[[r, r + 1]] = 1.0;
+            root[[r, r + 2]] = -2.0;
+            root[[r, r + 3]] = 1.0;
+        }
+        let canonical = vec![gam_terms::construction::CanonicalPenalty {
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 0,
+            prior_mean: Array1::zeros(p),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            max_iterations: 100,
+            convergence_tolerance: 1e-8,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+        let w = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let rho = array![0.0];
+        let (result, attempts) = capture_pirls_lm_attempts(|| {
+            fit_model_for_fixed_rho(
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
+                PirlsProblem {
+                    x: x.view(),
+                    offset: offset.view(),
+                    y: y.view(),
+                    priorweights: w.view(),
+                    covariate_se: None,
+                    gaussian_fixed_cache: None,
+                    glm_first_step_gram: None,
+                },
+                PenaltyConfig {
+                    canonical_penalties: &canonical,
+                    reparam_invariant: None,
+                    p,
+                    coefficient_lower_bounds: None,
+                    linear_constraints_original: None,
+                },
+                &config,
+                None,
+            )
+        });
+        let (_, working) = result.expect("rare-event logistic P-IRLS fit should succeed");
+        assert_eq!(working.status, PirlsStatus::Converged);
+        // Every attempt beyond one per iteration is a rejected trial. The
+        // geometric schedule alone spent 10 rejections (21 attempts over 11
+        // iterations) climbing from `u` to the accepted damping; the
+        // interpolated update needs 2.
+        let rejected = attempts.saturating_sub(working.iterations);
+        assert!(
+            rejected <= 3,
+            "rare-event cold start spent {rejected} rejected LM trials \
+             ({attempts} attempts over {} iterations)",
+            working.iterations
+        );
     }
 
     #[test]

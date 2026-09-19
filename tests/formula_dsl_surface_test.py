@@ -13,7 +13,9 @@ Pins the user-visible contract of:
 * strict option parsing: a malformed value, an unknown option, or
   ``penalty_order`` above the spline degree raises ``gamfit.errors.FormulaError``
   naming the term and the option;
-* a scalar ``bs=`` on ``te()`` applying to every margin.
+* a scalar ``bs=`` on ``te()`` applying to every margin;
+* a formula that does not parse (unbalanced parentheses, no ``~``) raising
+  ``gamfit.errors.FormulaError``, not a configuration error.
 """
 
 from __future__ import annotations
@@ -202,3 +204,13 @@ def test_scalar_bs_on_te_applies_to_every_margin():
     assert np.all(np.isfinite(_predict(model, {"x": x, "z": z})))
     with pytest.raises(gamfit.errors.FormulaError, match="not a supported penalized-spline margin"):
         gamfit.fit({"y": y, "x": x, "z": z}, "y ~ te(x, z, bs=re)", family="gaussian")
+
+
+@pytest.mark.parametrize(
+    "formula",
+    ["y ~ s(x, k=10", "y ~ s(x))", "y s(x)"],
+)
+def test_formula_syntax_error_raises_formula_error(formula):
+    x, y = _linear_data()
+    with pytest.raises(gamfit.errors.FormulaError, match="invalid formula syntax"):
+        gamfit.fit({"y": y, "x": x}, formula, family="gaussian")
