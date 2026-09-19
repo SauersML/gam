@@ -6,15 +6,16 @@ from typing import Any, TypeVar
 import numpy as np
 from scipy.sparse import issparse
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.exceptions import NotFittedError as SklearnNotFittedError
 from sklearn.utils.multiclass import check_classification_targets, type_of_target
 from sklearn.utils.validation import (
     check_array,
     check_consistent_length,
-    check_is_fitted,
     column_or_1d,
 )
 
 from ._binding import rust_module
+from ._exceptions import NotFittedError
 from ._api import fit as fit_model
 from ._api import is_multinomial_family
 from ._model import Model, MultinomialModel
@@ -61,6 +62,25 @@ def _input_column_names(X: Any) -> list[str] | None:
     if issparse(X):
         return None
     return table_column_names(X)
+
+
+class _EstimatorNotFittedError(NotFittedError, SklearnNotFittedError):
+    """An unfitted estimator: :class:`gamfit.errors.NotFittedError` that is also
+    scikit-learn's ``NotFittedError``, which scikit-learn's estimator checks
+    require."""
+
+
+def _require_fitted(estimator: BaseEstimator) -> None:
+    """Raise :class:`gamfit.errors.NotFittedError` unless ``fit`` has run.
+
+    The raised class also subclasses ``sklearn.exceptions.NotFittedError``, so
+    handlers written for either catch it.
+    """
+    if not hasattr(estimator, "model_"):
+        raise _EstimatorNotFittedError(
+            f"This {type(estimator).__name__} instance is not fitted yet. "
+            "Call 'fit' with appropriate arguments before using this estimator."
+        )
 
 
 class _BaseGAMEstimator(BaseEstimator):
@@ -159,7 +179,7 @@ class _BaseGAMEstimator(BaseEstimator):
         dropped first because it is never needed to predict. Unnamed inputs
         must have ``n_features_in_`` columns and bind positionally.
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         estimator = type(self).__name__
         names = _input_column_names(X)
         if names is not None and self._response_column in names:
@@ -200,11 +220,11 @@ class _BaseGAMEstimator(BaseEstimator):
         return np.asarray(predicted["posterior_mean"], dtype=float)
 
     def summary(self) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         return self.model_.summary()
 
     def report(self, path: str) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         if not isinstance(self.model_, Model):
             raise TypeError(
                 "report() is only supported for scalar GAM models; "
@@ -213,7 +233,7 @@ class _BaseGAMEstimator(BaseEstimator):
         return self.model_.report(path)
 
     def check(self, X: Any) -> Any:
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         if not isinstance(self.model_, Model):
             raise TypeError(
                 "check() is only supported for scalar GAM models; "
@@ -530,7 +550,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         >>> clf.metrics(X_test, y_test)["auc"]
         0.91
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         if self._multinomial_columns_ is not None:
             raise ValueError(
                 "GAMClassifier.metrics() is the binary classification panel; "
@@ -550,7 +570,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         Labels not present in :attr:`classes_` raise, rather than silently
         scoring against a phantom class.
         """
-        check_is_fitted(self, "model_")
+        _require_fitted(self)
         arr = column_or_1d(y)
         positive = self.classes_[1]
         negative = self.classes_[0]

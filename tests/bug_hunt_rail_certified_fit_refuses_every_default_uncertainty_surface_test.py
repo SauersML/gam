@@ -20,7 +20,7 @@ finite coefficient standard errors and labels their provenance
 that even reports ``covariance_source='conditional'`` in its own output. But
 every DEFAULT uncertainty surface refuses with the same string:
 
-    predict(interval=0.95)                    GamError: ... does not contain smoothing-corrected covariance
+    predict(interval=0.95)                    GamfitError: ... does not contain smoothing-corrected covariance
     predict(interval=0.95, observation_interval=True)   same
     predict(interval="conformal", calibration=...)      same
     diagnose(data)                                      same
@@ -98,6 +98,21 @@ def railed() -> tuple[Any, dict[str, Any]]:
     assert summary.covariance_kind == "smoothing-corrected"
     assert all(np.isfinite(c["std_error"]) for c in summary.coefficients)
     return model, data
+
+
+def test_railed_coordinate_adds_no_smoothing_variance(railed: tuple[Any, dict[str, Any]]) -> None:
+    model, _ = railed
+    corrected = model.predict(_levels(), interval=0.95, return_type="dict")
+    conditional = model.predict(
+        _levels(), interval=0.95, covariance_mode="conditional", return_type="dict"
+    )
+    assert corrected.covariance_source == "smoothing-corrected"
+    np.testing.assert_allclose(
+        np.asarray(corrected.posterior_mean_standard_error, dtype=float),
+        np.asarray(conditional.posterior_mean_standard_error, dtype=float),
+        rtol=1e-12,
+        atol=0.0,
+    )
 
 
 def _levels() -> dict[str, Any]:

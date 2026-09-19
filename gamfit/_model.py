@@ -176,7 +176,9 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -276,8 +278,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -439,6 +443,48 @@ class Model:
         if return_type is None and id_column is None:
             return scores
         columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
         if id_column is not None:
             columns = {id_column: list(row_ids or []), **columns}
         return restore_output_table(
