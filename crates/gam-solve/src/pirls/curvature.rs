@@ -332,6 +332,7 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
         InverseLink::Standard(StandardLink::Identity)
         | InverseLink::Standard(StandardLink::Inverse)
         | InverseLink::Standard(StandardLink::InverseSquared)
+        | InverseLink::Standard(StandardLink::Sqrt)
         | InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -350,6 +351,12 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     inverse_link: &InverseLink,
 ) -> bool {
     let spec = &likelihood.spec;
+    // A generic variance × link cell is non-canonical (its observed
+    // information carries the residual term) and its score program yields
+    // the observed tower exactly.
+    if GenericEdmCell::classify(&spec.response, inverse_link).is_some() {
+        return true;
+    }
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
@@ -434,6 +441,18 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         );
     }
 
+    if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
+        let phi = fixed_glm_dispersion(likelihood)?;
+        let certified: Vec<(f64, f64, f64)> = super::par_certified_rows(n, |i| {
+            generic_edm_observed_weight_jet(cell, phi, i, y[i], eta[i], priorweights[i])
+        })?;
+        for (i, &(w, c, d)) in certified.iter().enumerate() {
+            hessian_weights[i] = w;
+            hessian_c[i] = c;
+            hessian_d[i] = d;
+        }
+        return Ok(());
+    }
     if matches!(likelihood.spec.response, ResponseFamily::StudentT { .. }) {
         let scale = StudentTScale::from_likelihood(likelihood)?;
         let certified: Vec<(f64, f64, f64)> = (0..n)

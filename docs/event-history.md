@@ -83,7 +83,8 @@ The normaliser and risk masses exported with a fit are evaluated at the returned
 coefficient state using that fit's reference grid. Forecasting reads those
 values and uses the same interpolation. `reference_refinements` records, for
 each grid the fit ran on, the move the next grid makes at its fitted
-coefficients; `reference_certificate` records the accepted grid's tail estimate.
+coefficients; `reference_certificate` records the accepted grid's certificate: its steps to
+the first finer grid whose steps contract, plus that grid's tail estimate.
 Both are in posterior standard deviations.
 
 The reference interval is the cohort's overall follow-up interval. A reference
@@ -173,6 +174,7 @@ events before termination.
 ```python
 import numpy as np
 import pandas as pd
+import gamfit
 
 rng = np.random.default_rng(0)
 n = 200

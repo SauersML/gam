@@ -8,29 +8,46 @@
 use super::{
     ActiveSetReseed, CERTIFY_RESUME_PROGRESS_REL, CertifyReseedKind, HessianSource, OuterConfig,
     OuterPlan, OuterResult, Solver, certify_reseed_admitted, certify_resume_made_progress,
-    outer_rel_cost_floor, take_certify_reseed,
+    OuterProblemSize, outer_criterion_resolution, take_certify_reseed,
 };
 use ndarray::array;
 
-fn config_with_rel_cost(rel_cost: Option<f64>, tolerance: f64) -> OuterConfig {
+fn config_with_size(n_obs: Option<usize>, tolerance: f64) -> OuterConfig {
     OuterConfig {
         tolerance,
-        rel_cost_tolerance: rel_cost,
+        problem_size: OuterProblemSize {
+            n_obs,
+            p_coefficients: n_obs.map(|_| 3),
+        },
         ..OuterConfig::default()
     }
 }
 
+/// The criterion resolution is the statistical one, `τ_stat = 1/(2n)`, in the
+/// criterion's own units: it depends on the declared observation count alone,
+/// never on the stationarity tolerance, and a route that declares no size
+/// resolves nothing (0), so no resolution-based stop can fire there. Before
+/// C3 it was `max(rel, 1e-2·tolerance, 1e-12)·(1 + |V|)`, which grew with the
+/// criterion's magnitude and therefore with `n` (#2954).
 #[test]
-fn rel_cost_floor_prefers_explicit_then_scaled_tolerance_never_below_hard_floor() {
-    // Explicit relative tolerance wins verbatim.
-    let explicit = config_with_rel_cost(Some(1.0e-3), 1.0e-5);
-    assert_eq!(outer_rel_cost_floor(&explicit), 1.0e-3);
-    // Absent, it derives from a small fraction of the absolute tolerance.
-    let derived = config_with_rel_cost(None, 1.0e-2);
-    assert!((outer_rel_cost_floor(&derived) - 1.0e-4).abs() <= 1.0e-16);
-    // But never below the shared hard floor, however tight the tolerances.
-    let tiny = config_with_rel_cost(Some(1.0e-30), 1.0e-30);
-    assert_eq!(outer_rel_cost_floor(&tiny), super::COST_STALL_REL_TOL_FLOOR);
+fn criterion_resolution_is_one_over_two_n_and_independent_of_tolerance() {
+    for &n in &[1usize, 50, 5_000, 1_000_000] {
+        let expected = 1.0 / (2.0 * n as f64);
+        for &tolerance in &[1.0e-12, 1.0e-5, 1.0e-2, 10.0] {
+            let resolution = outer_criterion_resolution(&config_with_size(Some(n), tolerance));
+            assert_eq!(
+                resolution, expected,
+                "n = {n}, tolerance = {tolerance}: the resolution must be 1/(2n)"
+            );
+        }
+    }
+    for &tolerance in &[1.0e-12, 1.0e-5, 1.0e-2] {
+        assert_eq!(
+            outer_criterion_resolution(&config_with_size(None, tolerance)),
+            0.0,
+            "an undeclared size must resolve nothing, not fall back to a relative band"
+        );
+    }
 }
 
 // ── Helper math (arbitrary floor) ────────────────────────────────────

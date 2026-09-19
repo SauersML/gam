@@ -26,7 +26,7 @@
 use crate::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, fast_ab, fast_ata_into, fast_atv, fast_av, fast_av_into,
+    FaerCholesky, fast_ab, fast_ata_into, fast_atv, fast_av, fast_av_into,
 };
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
@@ -1125,7 +1125,7 @@ mod tests {
         }
     }
 
-    use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
+    use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use gam_problem::types::{GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, ResponseFamily, StandardLink};
@@ -1138,6 +1138,27 @@ mod tests {
     use gam_solve::model_types::InferenceCovarianceMode;
     use ndarray::{Array1, Array2, Axis, array};
     use std::sync::Arc;
+
+    /// The diagnostic along the eigenpairs of an assembled Hessian.
+    fn laplace_directional_cubic_diagnostic(
+        hessian: &Array2<f64>,
+        design: &DesignMatrix,
+        c_weights: &Array1<f64>,
+        refine_supremum: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let sym_h = (hessian + &hessian.t()) * 0.5;
+        let (evals, evecs) = sym_h
+            .eigh(faer::Side::Lower)
+            .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
+        laplace_directional_cubic_diagnostic_on_eigenpairs(
+            &evals,
+            &evecs,
+            design,
+            c_weights,
+            refine_supremum,
+        )
+    }
 
     #[test]
     fn posterior_interval_uses_shared_linear_quantiles() {
@@ -3524,12 +3545,19 @@ mod tests {
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for RecordingCorrector {
         fn directional_cubic_diagnostic(
             &self,
-            hessian: &Array2<f64>,
+            eigenvalues: &Array1<f64>,
+            eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
             refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
-            laplace_directional_cubic_diagnostic(hessian, design, c_weights, refine_supremum)
+            super::laplace_directional_cubic_diagnostic_on_eigenpairs(
+                eigenvalues,
+                eigenvectors,
+                design,
+                c_weights,
+                refine_supremum,
+            )
         }
         fn block_quadrature_marginal_correction(
             &self,
@@ -3613,16 +3641,18 @@ mod tests {
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for ScriptedCorrector {
         fn directional_cubic_diagnostic(
             &self,
-            hessian: &Array2<f64>,
+            eigenvalues: &Array1<f64>,
+            eigenvectors: &Array2<f64>,
             design: &DesignMatrix,
             c_weights: &Array1<f64>,
             refine_supremum: bool,
         ) -> Result<(f64, Array1<f64>), String> {
             Err(format!(
-                "the scripted corrector has no diagnostic ({}x{} Hessian, {} rows, {} weights, \
-                 refine={refine_supremum})",
-                hessian.nrows(),
-                hessian.ncols(),
+                "the scripted corrector has no diagnostic ({} eigenvalues, {}x{} eigenvectors, \
+                 {} rows, {} weights, refine={refine_supremum})",
+                eigenvalues.len(),
+                eigenvectors.nrows(),
+                eigenvectors.ncols(),
                 design.nrows(),
                 c_weights.len()
             ))
@@ -5541,13 +5571,6 @@ fn run_conjugate_gaussian_sampling(
     })
 }
 
-/// Penalty subtracted from the log-density when the `ρ`-criterion closure
-/// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
-/// (#938). The fallback density is the whitened standard normal shifted down by
-/// this constant, so the sampler sees a smooth, coercive pull back toward the
-/// feasible region around `ρ̂` instead of a `-inf` cliff.
-const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
-
 /// Tier-2 of the marginal-smoothing inference stack (#938): the whitened
 /// `ρ`-criterion Hamiltonian target.
 ///
@@ -5563,9 +5586,16 @@ const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
 /// solve with interior caches), so it is serialized behind a `Mutex`; chains
 /// take turns evaluating, which also keeps the inner warm-start trajectory
 /// coherent.
+///
+/// The criterion is `π(ρ|y)` on all of `ρ`-space, so a position it cannot value
+/// is not a zero-density region: the first such failure is recorded in
+/// `evaluation_failure`, the position is rejected, and the run is failed with
+/// that reason rather than sampled from a density invented for it.
 struct WhitenedRhoCriterionTarget<F> {
-    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`; `None` marks an infeasible point.
+    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, or why it cannot be valued.
     criterion_and_grad: Mutex<F>,
+    /// The first position the criterion could not value, and why.
+    evaluation_failure: Arc<Mutex<Option<String>>>,
     /// `ρ̂`, the converged smoothing parameters (the whitening center).
     mode: Array1<f64>,
     /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
@@ -5578,7 +5608,7 @@ struct WhitenedRhoCriterionTarget<F> {
 
 impl<F> HamiltonianTarget<Array1<f64>> for WhitenedRhoCriterionTarget<F>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
         let rho = &self.mode + &self.chol.dot(position);
@@ -5589,8 +5619,8 @@ where
                 .expect("rho-criterion mutex poisoned");
             (*criterion)(&rho)
         };
-        match eval {
-            Some((cost, g))
+        let failure = match eval {
+            Ok((cost, g))
                 if cost.is_finite()
                     && g.len() == position.len()
                     && g.iter().all(|v| v.is_finite()) =>
@@ -5599,18 +5629,20 @@ where
                 for (gi, &v) in grad.iter_mut().zip(grad_z.iter()) {
                     *gi = -v;
                 }
-                -(cost - self.cost_hat)
+                return -(cost - self.cost_hat);
             }
-            _ => {
-                // Infeasible criterion: smooth coercive fallback toward ρ̂.
-                let mut quad = 0.0;
-                for (gi, &zi) in grad.iter_mut().zip(position.iter()) {
-                    *gi = -zi;
-                    quad += zi * zi;
-                }
-                -0.5 * quad - RHO_NUTS_INFEASIBLE_LOGP_PENALTY
-            }
-        }
+            Ok((cost, g)) => format!(
+                "criterion at rho {rho:?} is {cost} with a {}-entry gradient {g:?}",
+                g.len()
+            ),
+            Err(detail) => format!("criterion unavailable at rho {rho:?}: {detail}"),
+        };
+        self.evaluation_failure
+            .lock()
+            .expect("rho-criterion failure mutex poisoned")
+            .get_or_insert(failure);
+        grad.fill(0.0);
+        f64::NEG_INFINITY
     }
 }
 
@@ -5620,8 +5652,9 @@ where
 /// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
 /// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
 ///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
-/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact; `None`
-///   for infeasible `ρ`. Each call is one warm inner profile solve.
+/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
+///   reason it cannot value `ρ`; any such position fails the run with that
+///   reason. Each call is one warm inner profile solve.
 /// * `config` — sampler configuration; determinism comes from `config.seed`
 ///   through the same splitmix64 chain/transition streams as every other NUTS
 ///   entry point (no clock, no global RNG).
@@ -5635,7 +5668,7 @@ pub(crate) fn run_rho_criterion_nuts<F>(
     config: &NutsConfig,
 ) -> Result<NutsResult, String>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     validate_nuts_config(config).map_err(String::from)?;
     let dim = rho_hat.len();
@@ -5658,17 +5691,22 @@ where
     )?;
 
     let cost_hat = match criterion_and_grad(&mode) {
-        Some((cost, _)) if cost.is_finite() => cost,
-        _ => {
-            return Err(
-                "rho-posterior NUTS: criterion is infeasible at rho_hat itself".to_string(),
-            );
+        Ok((cost, _)) if cost.is_finite() => cost,
+        Ok((cost, _)) => {
+            return Err(format!("rho-posterior NUTS: criterion at rho_hat is {cost}"));
+        }
+        Err(detail) => {
+            return Err(format!(
+                "rho-posterior NUTS: criterion is unavailable at rho_hat itself: {detail}"
+            ));
         }
     };
 
     let chol = whitening.chol;
+    let evaluation_failure = Arc::new(Mutex::new(None));
     let target = WhitenedRhoCriterionTarget {
         criterion_and_grad: Mutex::new(criterion_and_grad),
+        evaluation_failure: Arc::clone(&evaluation_failure),
         mode: mode.clone(),
         chol: chol.clone(),
         chol_t: whitening.chol_t,
@@ -5680,7 +5718,7 @@ where
     // dense metric during warmup would spend expensive profile solves estimating
     // curvature we have already supplied analytically.
     let mass_cfg = NUTSMassMatrixConfig::disabled();
-    let (result, run_stats) = run_whitened_nuts_result(
+    let run = run_whitened_nuts_result(
         target,
         &mode,
         &chol,
@@ -5691,7 +5729,17 @@ where
         0x6B42_E9A1_05D7_C83F,
         "rho-posterior NUTS sampling failed",
         mode.clone(),
-    )?;
+    );
+    // A position the criterion could not value is the run's failure, whether or
+    // not the sampler itself then stopped.
+    if let Some(failure) = evaluation_failure
+        .lock()
+        .expect("rho-criterion failure mutex poisoned")
+        .take()
+    {
+        return Err(format!("rho-posterior NUTS: {failure}"));
+    }
+    let (result, run_stats) = run?;
     log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }
@@ -6130,21 +6178,30 @@ pub fn run_nuts_sampling_flattened_family(
 /// passes `false` and skips Phase 2's multi-probe O(probes·iters·np) refinement
 /// on every inner evaluation. Diagnostic callers that report the true supremum
 /// pass `true`.
-pub(crate) fn laplace_directional_cubic_diagnostic(
-    hessian: &Array2<f64>,
+///
+/// The diagnostic runs along caller-supplied eigenpairs
+/// `(eigenvalues[r], eigenvectors[:, r])`, in any order, so the #784
+/// correction prices it on the criterion's own eigensystem. `γ[r]` is aligned
+/// to pair `r`; a pair without resolved positive curvature carries `γ[r] = 0`.
+pub(crate) fn laplace_directional_cubic_diagnostic_on_eigenpairs(
+    evals: &Array1<f64>,
+    evecs: &Array2<f64>,
     design: &DesignMatrix,
     c_weights: &Array1<f64>,
     refine_supremum: bool,
 ) -> Result<(f64, Array1<f64>), String> {
-    let p = hessian.nrows();
-    if p == 0 || hessian.ncols() != p {
+    let p = evals.len();
+    if p == 0 {
         return Ok((0.0, Array1::zeros(0)));
     }
-
-    let sym_h = (hessian + &hessian.t()) * 0.5;
-    let (evals, evecs) = sym_h
-        .eigh(Side::Lower)
-        .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
+    if evecs.dim() != (p, p) {
+        return Err(format!(
+            "directional cubic diagnostic: {} eigenvalues against a {}x{} eigenvector matrix",
+            p,
+            evecs.nrows(),
+            evecs.ncols()
+        ));
+    }
     let max_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
     // An eigenvalue inside the eigensolver band `p·ε·max|λ|` carries no curvature to
     // standardize by.
@@ -6602,12 +6659,19 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
 {
     fn directional_cubic_diagnostic(
         &self,
-        hessian: &Array2<f64>,
+        eigenvalues: &Array1<f64>,
+        eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
         refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String> {
-        laplace_directional_cubic_diagnostic(hessian, design, c_weights, refine_supremum)
+        laplace_directional_cubic_diagnostic_on_eigenpairs(
+            eigenvalues,
+            eigenvectors,
+            design,
+            c_weights,
+            refine_supremum,
+        )
     }
 
     fn block_quadrature_marginal_correction(

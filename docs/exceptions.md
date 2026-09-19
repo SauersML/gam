@@ -124,6 +124,13 @@ The formula is invalid or unsupported. Common causes:
   `available`, and `similar` when available.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     gamfit.fit(df, "y ~ s(x, k=10")
 except gamfit.errors.FormulaError as e:
@@ -133,15 +140,28 @@ except gamfit.errors.FormulaError as e:
 ### `SchemaMismatchError`
 
 The data passed to `predict()` (or similar) is missing a column the model
-needs, violates the saved schema, or introduces unseen categorical levels.
+needs, or a column's kind disagrees with the saved schema (a categorical
+column where the model was fit on a numeric one, or the reverse). A bad cell
+in a column of the right kind is a `PredictInputError` instead.
 `Model.check(data)` reports missing columns directly and returns schema
 encoder failures as issues without raising:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+train = pd.DataFrame({"x": rng.uniform(0, 10, 300), "site": rng.choice(["A", "B", "C"], 300)})
+train["y"] = np.sin(train.x) + (train.site == "B") + rng.normal(0, 0.3, 300)
+model = gamfit.fit(train, "y ~ s(x) + group(site)")
+test_df = pd.DataFrame({"x": [1.5, 2.5]})   # no "site" column
+
 check = model.check(test_df)
 if not check.ok:
     for issue in check.issues:
         print(issue.kind, issue.column, issue.message)
+# missing_column site missing required column 'site'
 ```
 
 ### `FitError` and its subclasses
@@ -174,6 +194,13 @@ and category after the unchanged engine message:
   that exposes none.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     model = gamfit.fit(df, "y ~ s(x)")
 except gamfit.errors.FitSeedError as e:
@@ -196,12 +223,35 @@ issues, an unsupported prediction mode for the fitted model class, or a
 prediction-time input error. Some prediction families raise subclasses
 such as `PredictInputError` or `SurvivalPredictError`.
 
+`PredictInputError` is raised when a cell of the new data cannot be
+predicted from: a NaN or infinite value in a covariate, a missing label in a
+categorical column, or a level of a fixed factor (`g`, `factor(g)`,
+including a numeric-coded `factor(year)`) that the model never saw. The
+message names the column, the row and, for an unseen level, the level and
+the training levels, and its `help:` line says how to repair the rows. The
+same text is printed by `gam predict`. A random-effect `group(g)` term
+predicts a held-out level instead of raising.
+
+```python no-exec
+try:
+    model.predict(new_df)
+except gamfit.errors.PredictInputError as e:
+    print(e)  # unseen level 'LNEW' in categorical column 'g' at row 2; ...
+```
+
 ### `RustExtensionUnavailableError`
 
 The compiled extension `gamfit._rust` failed to load. Occurs when
 installing from source without a Rust toolchain.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
 try:
     gamfit.fit(df, "y ~ s(x)")
 except gamfit.errors.RustExtensionUnavailableError as e:
@@ -247,6 +297,12 @@ def safe_predict(model, data):
 
 ```python
 import logging
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
 
 log = logging.getLogger("my_app")
 formula = "y ~ s(x)"
