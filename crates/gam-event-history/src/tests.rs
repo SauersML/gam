@@ -1751,7 +1751,7 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     emit(&format!("[four] reference strata present: {}", spec.reference.is_some()));
     assert!(spec.reference.is_none(), "this cohort has no reference population");
     let refit_at = |mesh: usize| {
-        super::family::fit_at_rank(&cohort, &spec, fit.rank(), Some(&start), Some((order, mesh)), mesh, 2)
+        super::family::fit_at_rank(&cohort, &spec, fit.rank(), Some(&start), Some((order, mesh)), None, mesh, 2)
             .unwrap_or_else(|error| panic!("the certified model refitted at mesh refinement {mesh}: {error}"))
     };
     let certified = refit_at(refinement);
@@ -4829,6 +4829,193 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
         }
         assert!(moves, "no log normaliser moves along the {name} by more than its bar, so the agreement is vacuous");
     }
+}
+
+/// Certifying an accepted candidate admits the candidate's converged fit as the
+/// ladder's first rung instead of solving the same objective again (#2627,
+/// #2986). The rank path's certification refit duplicated the candidate: job
+/// 1230177 spent 36.785 s and 36.359 s on the two, both ending at 6.513812e2.
+///
+/// The candidate is a rank-one model with a static frailty, the atom the rank
+/// path accepts on this cohort (job 1264849), pinned at the setting the ladder
+/// starts from, as the rank path fits it. Nothing about the population
+/// surfaces is carried. Its fits take seconds. The same pin on a fitted rate
+/// took 401 s, 272 s of it the order-17 ladder (job 1333087), and pins nothing
+/// more: every clause it reads is the static fixture's. The marks carry free `s(time)` smoothing
+/// strengths, so a ladder that re-solved would walk its own outer path from
+/// the reset strengths, to its own coefficients and solve counts; with none, a
+/// re-solve from the candidate's mode could return it bit for bit, and the pin
+/// could not tell the two apart.
+/// - Where the ladder's checks hold at the candidate's setting, the certified
+///   model is the admitted fit: coefficients, strengths and solve counts.
+/// - A ladder whose atom carries another loading prior, or whose first rung is
+///   another Gauss-Hermite order, defines another objective, so it solves its
+///   own fit there rather than reading the one it is offered: the certified
+///   fit, then that other prior's.
+///
+/// Everything is printed before anything is asserted.
+#[test]
+fn a_certified_rank_is_the_admitted_candidate_2627() {
+    install_test_logger();
+    let loadings = [1.4, 1.1, 1.2];
+    let rate = 0.5;
+    let cohort = simulate_marked_cohort(
+        60,
+        4.0,
+        &[-1.2, -1.8, -0.5],
+        0.4,
+        &loadings,
+        rate,
+        &[MarkKind::Terminal, MarkKind::Once, MarkKind::Recurrent],
+        41,
+    );
+    let mut spec = EventHistorySpec::new(Vec::new());
+    let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
+    spec.covariates = vec![
+        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
+            .expect("baseline formula"),
+    ];
+    let marks = cohort.marks();
+    let setting = (spec.gauss_hermite_order, 0);
+    // The loading prior's variance is the simulated loadings' mean square.
+    let mean_square = loadings.iter().map(|a| a * a).sum::<f64>() / loadings.len() as f64;
+    let start = RankStart::carried(
+        Vec::new(),
+        loadings.to_vec(),
+        vec![f64::NEG_INFINITY],
+        vec![-mean_square.ln()],
+        vec![true],
+    );
+    let carried = |model: &EventHistoryFit| {
+        RankStart::carried(
+            model.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+            model.loadings.iter().copied().collect(),
+            model.log_rates.clone(),
+            model.atom_log_lambdas.clone(),
+            model.rate_held.clone(),
+        )
+    };
+    let solved = |model: &EventHistoryFit| {
+        (
+            model.fit.block_states.iter().map(|s| s.beta.to_vec()).collect::<Vec<_>>(),
+            model.fit.log_lambdas.to_vec(),
+            (
+                model.fit.outer_iterations,
+                model.fit.outer_cost_evals,
+                model.fit.inner_cycles,
+                model.fit.inner_pirls_solves,
+            ),
+        )
+    };
+    let setting_of = |model: &EventHistoryFit| {
+        (model.quadrature.gauss_hermite_order, model.quadrature.mesh_refinement)
+    };
+    let clock = std::time::Instant::now();
+    let candidate =
+        super::family::fit_at_rank(&cohort, &spec, 1, Some(&start), Some(setting), None, setting.1, 2)
+            .expect("the candidate at the ladder's first setting");
+    let candidate_seconds = clock.elapsed().as_secs_f64();
+    let admitted = solved(&candidate);
+    let certify_from = carried(&candidate);
+    let clock = std::time::Instant::now();
+    let certified = super::family::fit_at_rank(
+        &cohort,
+        &spec,
+        1,
+        Some(&certify_from),
+        None,
+        Some(super::family::Admitted::of(candidate)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder from the admitted candidate");
+    let certified_seconds = clock.elapsed().as_secs_f64();
+    let published = solved(&certified);
+    emit(&format!(
+        "[admit] candidate at {setting:?} in {candidate_seconds:.3} s, strengths {:?}, solves (outer iterations, cost evals, inner cycles, pirls) {:?}; certified at {:?} in {certified_seconds:.3} s, strengths {:?}, solves {:?}; shifts GH {:.3e} at {}, mesh {:.3e} at {}",
+        admitted.1,
+        admitted.2,
+        setting_of(&certified),
+        published.1,
+        published.2,
+        certified.quadrature.gauss_hermite.coefficient_shift,
+        certified.quadrature.gauss_hermite.candidate,
+        certified.quadrature.mesh.coefficient_shift,
+        certified.quadrature.mesh.candidate
+    ));
+    let certified_setting = setting_of(&certified);
+    // A ladder whose atom carries another loading prior defines another
+    // objective at the same setting: the prior's precision is doubled.
+    let offered_prior = published.clone();
+    let mut reprior_from = carried(&certified);
+    reprior_from.log_lambdas[0] += 2.0_f64.ln();
+    let clock = std::time::Instant::now();
+    let reprior = super::family::fit_at_rank(
+        &cohort,
+        &spec,
+        1,
+        Some(&reprior_from),
+        None,
+        Some(super::family::Admitted::of(certified)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder under another loading prior");
+    let reprior_seconds = clock.elapsed().as_secs_f64();
+    let solved_reprior = solved(&reprior);
+    emit(&format!(
+        "[admit] ladder under the doubled prior: certified at {:?} in {reprior_seconds:.3} s, strengths {:?}, solves {:?}; offered solves {:?}",
+        setting_of(&reprior),
+        solved_reprior.1,
+        solved_reprior.2,
+        offered_prior.2
+    ));
+    let reprior_setting = setting_of(&reprior);
+    let finer_order = 2 * setting.0 - 1;
+    let mut finer = spec.clone();
+    finer.gauss_hermite_order = finer_order;
+    let offered_order = solved_reprior.clone();
+    let order_from = carried(&reprior);
+    let clock = std::time::Instant::now();
+    let elsewhere = super::family::fit_at_rank(
+        &cohort,
+        &finer,
+        1,
+        Some(&order_from),
+        None,
+        Some(super::family::Admitted::of(reprior)),
+        setting.1,
+        2,
+    )
+    .expect("the ladder from another order");
+    let elsewhere_seconds = clock.elapsed().as_secs_f64();
+    let solved_elsewhere = solved(&elsewhere);
+    emit(&format!(
+        "[admit] ladder from order {finer_order}: certified at {:?} in {elsewhere_seconds:.3} s, strengths {:?}, solves {:?}; offered at {reprior_setting:?}, solves {:?}",
+        setting_of(&elsewhere),
+        solved_elsewhere.1,
+        solved_elsewhere.2,
+        offered_order.2
+    ));
+    assert!(
+        published == admitted,
+        "the certified model must be the admitted candidate: certified at {certified_setting:?}, coefficients {:?} vs {:?}, log strengths {:?} vs {:?}, solves {:?} vs {:?}",
+        published.0,
+        admitted.0,
+        published.1,
+        admitted.1,
+        published.2,
+        admitted.2
+    );
+    assert!(
+        solved_reprior != offered_prior,
+        "a ladder under another loading prior must not read the candidate fitted under its own"
+    );
+    assert!(
+        solved_elsewhere != offered_order,
+        "a ladder starting at order {finer_order} must not read the order-{} candidate as its fit",
+        reprior_setting.0
+    );
 }
 
 /// One latent atom injected into a rank-zero fit: loadings `a_d` per mark and
