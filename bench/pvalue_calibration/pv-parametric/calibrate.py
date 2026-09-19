@@ -10,7 +10,13 @@ Reported per cell and test: rejection rate at 0.10 / 0.05 / 0.01 with its Monte
 Carlo standard error, the Kolmogorov-Smirnov distance of the null p-values from
 U(0, 1) with its asymptotic p-value, and power at 0.05.
 
-    python bench/pvalue_calibration/pv-parametric/calibrate.py --reps 500 \
+For the Gaussian cells each dataset is also tested by the exact oracle: the
+least-squares t / F test of the same hypothesis with the true smooth shape
+`sin(2 pi x2)` as a known covariate. Its p-values are exactly U(0, 1) under the
+null, so its rejection rate on the same datasets is the Monte Carlo baseline the
+engine's rate is compared with, pair by pair.
+
+    python bench/pvalue_calibration/pv-parametric/calibrate.py --reps 1000 \
         --out bench/pvalue_calibration/pv-parametric/results.json
 """
 
@@ -26,6 +32,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 LEVELS = ("a", "b", "c", "d")
 ALPHAS = (0.10, 0.05, 0.01)
@@ -60,6 +67,27 @@ def simulate(cell: str, rep: int, alternative: bool) -> pd.DataFrame:
     return pd.DataFrame({"x1": x1, "x2": x2, "g": g, "y": y})
 
 
+def oracle_pvalues(frame: pd.DataFrame) -> dict:
+    """Exact least-squares t (x1) and F (g) p-values with the true smooth shape known."""
+    codes = frame["g"].cat.codes.to_numpy()
+    dummies = np.eye(len(LEVELS))[codes][:, 1:]
+    x = np.column_stack(
+        [np.ones(len(frame)), frame["x1"], dummies, np.sin(2.0 * np.pi * frame["x2"])]
+    )
+    y = frame["y"].to_numpy()
+    beta = np.linalg.lstsq(x, y, rcond=None)[0]
+    residual = y - x @ beta
+    df = len(y) - x.shape[1]
+    covariance = (residual @ residual / df) * np.linalg.inv(x.T @ x)
+    t = beta[1] / math.sqrt(covariance[1, 1])
+    block = slice(2, 2 + dummies.shape[1])
+    f = beta[block] @ np.linalg.solve(covariance[block, block], beta[block]) / dummies.shape[1]
+    return {
+        "x1": float(2.0 * stats.t.sf(abs(t), df)),
+        "g": float(stats.f.sf(f, dummies.shape[1], df)),
+    }
+
+
 def quiet_worker() -> None:
     """The engine's diagnostic stream (fd 2) is not part of the measurement."""
     os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
@@ -71,8 +99,10 @@ def one_rep(args):
 
     warnings.simplefilter("ignore")
     family = CELLS[cell][0]
+    frame = simulate(cell, rep, alternative)
+    oracle = oracle_pvalues(frame) if family == "gaussian" else {}
     try:
-        summary = gamfit.fit(simulate(cell, rep, alternative), FORMULA, family=family).summary()
+        summary = gamfit.fit(frame, FORMULA, family=family).summary()
     except Exception as error:  # a failed fit is counted, never dropped silently
         return {"error": f"{type(error).__name__}: {error}"[:200]}
     linear = {row["name"]: row for row in summary.parametric_terms}
@@ -81,6 +111,8 @@ def one_rep(args):
         "x1": linear.get("x1", {}).get("p_value"),
         "g": tests.get("g", {}).get("p_value"),
         "g_unavailable": tests.get("g", {}).get("p_value_unavailable"),
+        "oracle_x1": oracle.get("x1"),
+        "oracle_g": oracle.get("g"),
     }
 
 
@@ -119,7 +151,7 @@ def report(null: list[float | None], alternative: list[float | None]) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--reps", type=int, default=500)
+    parser.add_argument("--reps", type=int, default=1000)
     parser.add_argument("--cells", default=",".join(CELLS))
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out", default=None)
@@ -140,6 +172,12 @@ def main() -> int:
                 "x1": report([r.get("x1") for r in null], [r.get("x1") for r in alt]),
                 "g": report([r.get("g") for r in null], [r.get("g") for r in alt]),
             }
+            if CELLS[cell][0] == "gaussian":
+                for term in ("x1", "g"):
+                    key = f"oracle_{term}"
+                    results[cell][key] = report(
+                        [r.get(key) for r in null], [r.get(key) for r in alt]
+                    )
             print(cell, json.dumps(results[cell], indent=1), flush=True)
     if args.out:
         with open(args.out, "w") as handle:
