@@ -35,7 +35,9 @@
 //! [`GatedBlockSource`] binds a [`NativeGatedBlock`]'s own tensors, borrowed. Its projections run
 //! through apply.rs, where the native block runs its owners' kernels, so the two agree stage by
 //! stage within the sum of their rounding bands, and the norm stages bit for bit. A block that
-//! normalizes each head's queries and keys (Qwen3) is refused: no program primitive expresses it.
+//! normalizes each head's queries and keys (Qwen3 `q_norm`, `k_norm`) gets a `HeadRmsNorm` node
+//! after each of those projections' bias, the owner its native attention runs, with the two gains
+//! as formal parameters.
 //!
 //! # Validity domain
 //!
@@ -442,6 +444,10 @@ pub enum GatedBlockParameter {
     Gate,
     Up,
     Down,
+    /// The per-head query norm's gain, declared only by a block that has one.
+    QueryNormGain,
+    /// The per-head key norm's gain, declared only by a block that has one.
+    KeyNormGain,
 }
 
 impl fmt::Display for GatedBlockParameter {
@@ -462,6 +468,8 @@ impl fmt::Display for GatedBlockParameter {
             Self::Gate => "mlp.gate_proj.weight",
             Self::Up => "mlp.up_proj.weight",
             Self::Down => "mlp.down_proj.weight",
+            Self::QueryNormGain => "self_attn.q_norm.weight",
+            Self::KeyNormGain => "self_attn.k_norm.weight",
         })
     }
 }
@@ -471,8 +479,9 @@ impl fmt::Display for GatedBlockParameter {
 pub enum GatedBlockStage {
     /// `N₁(h)`.
     AttentionInput,
-    /// `x W_Qᵀ + b_Q` on the attention input.
+    /// `x W_Qᵀ + b_Q` on the attention input, before a per-head query norm.
     Queries,
+    /// `x W_Kᵀ + b_K`, before a per-head key norm.
     Keys,
     Values,
     /// The head-mixed rows before the output projection.
@@ -545,9 +554,6 @@ impl GatedBlockStage {
 pub enum GatedBlockProgramError {
     /// The program graph was refused.
     Program(ProgramError),
-    /// The block normalizes each head's queries and keys (Qwen3 `q_norm`/`k_norm`), which
-    /// no program primitive expresses.
-    QueryKeyNorm,
     /// A formal parameter the program does not declare.
     Unbound { parameter: ParameterSlot },
     /// A vector parameter read as a matrix.
@@ -573,9 +579,6 @@ impl fmt::Display for GatedBlockProgramError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Program(error) => write!(formatter, "the gated block program was refused: {error}"),
-            Self::QueryKeyNorm => formatter.write_str(
-                "the block normalizes each head's queries and keys, which no program primitive expresses",
-            ),
             Self::Unbound { parameter } => {
                 write!(formatter, "formal parameter {} is not one of the block program's", parameter.0)
             }
@@ -686,9 +689,6 @@ impl GatedBlockProgram {
     /// tensors are bound at execution ([`Self::source`]).
     pub fn new(block: &NativeGatedBlock) -> Result<Self, GatedBlockProgramError> {
         let attention = block.attention();
-        if attention.has_query_key_norm() {
-            return Err(GatedBlockProgramError::QueryKeyNorm);
-        }
         let mut parameters = Vec::new();
         let attention_norm = norm_primitive(
             &mut parameters,
@@ -721,15 +721,31 @@ impl GatedBlockProgram {
         let gate = declare(&mut parameters, GatedBlockParameter::Gate);
         let up = declare(&mut parameters, GatedBlockParameter::Up);
         let down = declare(&mut parameters, GatedBlockParameter::Down);
+        let head_dim = attention.geometry().head_dim;
+        let head_norms = attention.query_key_norm().map(|norm| {
+            let head_norm = |gain| NativePrimitive::HeadRmsNorm {
+                head_dim,
+                epsilon: norm.epsilon(),
+                gain,
+            };
+            (
+                head_norm(declare(&mut parameters, GatedBlockParameter::QueryNormGain)),
+                head_norm(declare(&mut parameters, GatedBlockParameter::KeyNormGain)),
+            )
+        });
 
         let mut nodes = BodyNodes(Vec::new());
         let residual = nodes.push(Node::Input { port: 0 });
         let normalized = nodes.native(attention_norm, vec![residual]);
         let attention_input = nodes.write(GatedBlockStage::AttentionInput, normalized);
         let queries = nodes.affine(query, attention_input);
-        let queries = nodes.write(GatedBlockStage::Queries, queries);
+        let mut queries = nodes.write(GatedBlockStage::Queries, queries);
         let keys = nodes.affine(key, attention_input);
-        let keys = nodes.write(GatedBlockStage::Keys, keys);
+        let mut keys = nodes.write(GatedBlockStage::Keys, keys);
+        if let Some((query_norm, key_norm)) = head_norms {
+            queries = nodes.native(query_norm, vec![queries]);
+            keys = nodes.native(key_norm, vec![keys]);
+        }
         let values = nodes.affine(value, attention_input);
         let values = nodes.write(GatedBlockStage::Values, values);
         let mixed = nodes.native(
@@ -861,7 +877,9 @@ impl ParameterSource for GatedBlockSource<'_> {
             | GatedBlockParameter::ValueBias
             | GatedBlockParameter::OutputBias
             | GatedBlockParameter::MlpNormGain
-            | GatedBlockParameter::MlpNormBias => {
+            | GatedBlockParameter::MlpNormBias
+            | GatedBlockParameter::QueryNormGain
+            | GatedBlockParameter::KeyNormGain => {
                 return Err(GatedBlockProgramError::NotAMatrix { parameter: declared });
             }
         };
@@ -882,6 +900,14 @@ impl ParameterSource for GatedBlockSource<'_> {
             GatedBlockParameter::OutputBias => Ok(attention.output().bias.clone()),
             GatedBlockParameter::MlpNormGain => Ok(norm_gain(self.block.mlp_norm())),
             GatedBlockParameter::MlpNormBias => norm_bias(self.block.mlp_norm()).ok_or(not_a_vector),
+            GatedBlockParameter::QueryNormGain => attention
+                .query_key_norm()
+                .map(|norm| norm.query_gain().to_owned())
+                .ok_or(not_a_vector),
+            GatedBlockParameter::KeyNormGain => attention
+                .query_key_norm()
+                .map(|norm| norm.key_gain().to_owned())
+                .ok_or(not_a_vector),
             GatedBlockParameter::QueryWeight
             | GatedBlockParameter::KeyWeight
             | GatedBlockParameter::ValueWeight
@@ -911,8 +937,8 @@ fn norm_bias(norm: &NativeNorm) -> Option<Array1<f64>> {
 mod tests {
     use super::*;
     use crate::parameter_decomposition::attention::{
-        AffineProjection, AttentionGeometry, NativeAttention, ProjectedRows, RotaryCausalAttention, RotaryEmbedding,
-        RotaryPairing,
+        AffineProjection, AttentionGeometry, NativeAttention, ProjectedRows, QueryKeyNorm, RotaryCausalAttention,
+        RotaryEmbedding, RotaryPairing, head_rms_norm_with_radius,
     };
     use crate::parameter_decomposition::gated_rewrite::{NativeSwiglu, swiglu_hidden};
     use crate::parameter_decomposition::receipts::affine_stage_band;
@@ -1237,7 +1263,15 @@ mod tests {
     /// A gated block on eighths weights with biases, over a residual in thirds of eighths:
     /// Llama-style (RMSNorm, sequential) or parallel with LayerNorm. `shift` moves the query
     /// weight's and the gate weight's first entries, for the positive controls.
-    fn gated_block(layout: ResidualLayout, seed: u64, shift: f64) -> (NativeGatedBlock, Array2<f64>, Vec<i64>) {
+    /// A gated block in eighths. With `head_norm` its attention normalizes each head's queries
+    /// and keys (Qwen3 `q_norm`, `k_norm`) with gains in eighths, drawn after every other
+    /// tensor, so the other tensors match the norm-free block of the same seed.
+    fn gated_block(
+        layout: ResidualLayout,
+        seed: u64,
+        shift: f64,
+        head_norm: bool,
+    ) -> (NativeGatedBlock, Array2<f64>, Vec<i64>) {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut matrix = |rows: usize, cols: usize| eighths(&mut rng, rows, cols);
         let (mut query, key, value, output) =
@@ -1271,6 +1305,17 @@ mod tests {
             },
         )
         .expect("fixture attention tensors match the geometry");
+        let residual = Array2::from_shape_simple_fn((TOKENS, WIDTH), || rng.random_range(-48..=48) as f64 / 24.0);
+        let attention = if head_norm {
+            let head_dim = geometry().head_dim;
+            let mut gain = || Array1::from_shape_simple_fn(head_dim, || rng.random_range(4..=12) as f64 / 8.0);
+            let (query_gain, key_gain) = (gain(), gain());
+            attention
+                .with_query_key_norm(1.0e-6, query_gain, key_gain)
+                .expect("head-width gains")
+        } else {
+            attention
+        };
         let norm = |gain: Array1<f64>, bias: Array1<f64>| match layout {
             ResidualLayout::Sequential => NativeNorm::Rms { epsilon: 1.0e-6, gain },
             ResidualLayout::Parallel => NativeNorm::Layer {
@@ -1286,7 +1331,6 @@ mod tests {
             norm(mlp_gain, mlp_bias),
             NativeSwiglu::new(gate, up, down).expect("fixture SwiGLU shapes compose"),
         );
-        let residual = Array2::from_shape_simple_fn((TOKENS, WIDTH), || rng.random_range(-48..=48) as f64 / 24.0);
         (block, residual, (3..3 + TOKENS as i64).collect())
     }
 
@@ -1324,7 +1368,8 @@ mod tests {
 
     /// The program route's radius at its attention write, against the exact sublayer at the
     /// program's attention input: each projection's band `affine_stage_band` (`Linear` then
-    /// `AddBias`, `d + 1` roundings) enters the attention core as its input radius, and the
+    /// `AddBias`, `d + 1` roundings) enters the attention core as its input radius, through
+    /// the owner's per-head norm radius when the block normalizes queries and keys, and the
     /// output projection adds its own band plus `|W_O|` times the mixed radius.
     fn program_attention_radius(block: &NativeGatedBlock, execution: &Execution, positions: &[i64]) -> Array2<f64> {
         let attention = block.attention();
@@ -1337,14 +1382,32 @@ mod tests {
             (band(attention.query(), input), band(attention.key(), input), band(attention.value(), input));
         let core = RotaryCausalAttention::new(attention.geometry(), attention.rotary().clone(), attention.score_scale())
             .expect("the fixture attention core");
+        let normed = |stage, radius: &Array2<f64>, gain: fn(&QueryKeyNorm) -> ArrayView1<'_, f64>| {
+            let rows = gated_slot(execution, stage);
+            match attention.query_key_norm() {
+                None => (rows.clone(), radius.clone()),
+                Some(norm) => head_rms_norm_with_radius(
+                    ProjectedRows {
+                        values: rows.view(),
+                        radius: radius.view(),
+                    },
+                    attention.geometry().head_dim,
+                    norm.epsilon(),
+                    gain(norm),
+                )
+                .expect("finite head rows"),
+            }
+        };
+        let (queries, query_radius) = normed(GatedBlockStage::Queries, &query_radius, QueryKeyNorm::query_gain);
+        let (keys, key_radius) = normed(GatedBlockStage::Keys, &key_radius, QueryKeyNorm::key_gain);
         let with_radius = core
             .attend_projected(
                 ProjectedRows {
-                    values: gated_slot(execution, GatedBlockStage::Queries).view(),
+                    values: queries.view(),
                     radius: query_radius.view(),
                 },
                 ProjectedRows {
-                    values: gated_slot(execution, GatedBlockStage::Keys).view(),
+                    values: keys.view(),
                     radius: key_radius.view(),
                 },
                 ProjectedRows {
@@ -1369,13 +1432,19 @@ mod tests {
     /// bit for bit (the same `MaskedNorm`); the attention write within the sum of the native
     /// attention's radius and the program route's radius; the gate, up and down projections
     /// within the two routes' affine bands (apply.rs on one side, the native SwiGLU's products on
-    /// the other); the SwiGLU hidden rows and the residual sums bit for bit. Both layouts.
+    /// the other); the SwiGLU hidden rows and the residual sums bit for bit. Both layouts, and a
+    /// Qwen3-style block whose attention normalizes each head's queries and keys, where the
+    /// program's `HeadRmsNorm` nodes run the native attention's own norm owner.
     /// Positive controls: a query weight entry and a gate weight entry moved by 1e-9 each leave
     /// their stage's band.
     #[test]
     fn a_gated_block_program_agrees_with_the_native_block_stage_by_stage() {
-        for (layout, seed) in [(ResidualLayout::Sequential, 3001), (ResidualLayout::Parallel, 3002)] {
-            let (block, residual, positions) = gated_block(layout, seed, 0.0);
+        for (layout, seed, head_norm) in [
+            (ResidualLayout::Sequential, 3001, false),
+            (ResidualLayout::Parallel, 3002, false),
+            (ResidualLayout::Sequential, 3004, true),
+        ] {
+            let (block, residual, positions) = gated_block(layout, seed, 0.0, head_norm);
             let program = GatedBlockProgram::new(&block).expect("the block program is valid");
             let executed = run_gated(&program, &block, &residual, &positions);
             let native = block.execute(residual.view(), &positions).expect("native block");
@@ -1442,7 +1511,7 @@ mod tests {
             );
 
             // Positive controls: the program of a block whose query and gate weights moved by 1e-9.
-            let (moved, residual, positions) = gated_block(layout, seed, 1.0e-9);
+            let (moved, residual, positions) = gated_block(layout, seed, 1.0e-9, head_norm);
             let shifted = run_gated(&program, &moved, &residual, &positions);
             assert!(
                 violations(
@@ -1466,12 +1535,13 @@ mod tests {
         }
     }
 
-    /// Typed refusals beside the accepted binding: a block with a per-head query/key norm has no
-    /// program, and the source refuses an undeclared parameter, a vector read as a matrix, a
-    /// matrix read as a vector, and anchor controls.
+    /// Typed refusals beside the accepted binding: the source refuses an undeclared parameter, a
+    /// vector read as a matrix, a matrix read as a vector, and anchor controls. A block with a
+    /// per-head query/key norm declares the two gains after every other parameter, reads them as
+    /// vectors and refuses them as matrices.
     #[test]
-    fn a_gated_block_program_refuses_what_it_cannot_express_or_bind() {
-        let (block, residual, positions) = gated_block(ResidualLayout::Sequential, 3003, 0.0);
+    fn a_gated_block_program_refuses_what_it_cannot_bind() {
+        let (block, residual, positions) = gated_block(ResidualLayout::Sequential, 3003, 0.0, false);
         let program = GatedBlockProgram::new(&block).expect("the block program is valid");
         assert!(
             program
@@ -1486,21 +1556,45 @@ mod tests {
                 .is_ok(),
             "control: the block binds its own program"
         );
-        let normed = NativeGatedBlock::new(
-            ResidualLayout::Sequential,
-            block.attention_norm().clone(),
-            block
-                .attention()
-                .clone()
-                .with_query_key_norm(1.0e-6, Array1::ones(4), Array1::ones(4))
-                .expect("head-width gains"),
-            block.mlp_norm().clone(),
-            block.mlp().clone(),
+        let (normed, _, _) = gated_block(ResidualLayout::Sequential, 3003, 0.0, true);
+        let normed_program = GatedBlockProgram::new(&normed).expect("a normed block has a program");
+        let declared = normed_program.parameters();
+        assert_eq!(
+            &declared[..program.parameters().len()],
+            program.parameters(),
+            "the norm gains come after every parameter the norm-free block declares"
         );
-        assert!(
-            matches!(GatedBlockProgram::new(&normed), Err(GatedBlockProgramError::QueryKeyNorm)),
-            "a per-head query/key norm has no program primitive and must be refused"
+        assert_eq!(
+            &declared[program.parameters().len()..],
+            [GatedBlockParameter::QueryNormGain, GatedBlockParameter::KeyNormGain],
+            "a normed block declares its query and key norm gains"
         );
+        let normed_source = normed_program.source(&normed);
+        let normed_at = |parameter: GatedBlockParameter| ParameterUse {
+            parameter: ParameterSlot(declared.iter().position(|d| *d == parameter).expect("declared") as u32),
+            body: BodyId(0),
+            node: NodeId(0),
+            invocation: &[],
+            controls: &[],
+        };
+        let query_key_norm = normed.attention().query_key_norm().expect("the normed block's norm");
+        for (parameter, gain) in [
+            (GatedBlockParameter::QueryNormGain, query_key_norm.query_gain()),
+            (GatedBlockParameter::KeyNormGain, query_key_norm.key_gain()),
+        ] {
+            assert_eq!(
+                normed_source.vector(normed_at(parameter)).expect("a gain reads as a vector"),
+                gain,
+                "{parameter} reads the native norm's own gain"
+            );
+            assert!(
+                matches!(
+                    normed_source.apply_linear(normed_at(parameter), TieOrientation::Identity, residual.view()),
+                    Err(GatedBlockProgramError::NotAMatrix { parameter: refused }) if refused == parameter
+                ),
+                "{parameter} read as a matrix must be refused"
+            );
+        }
 
         let source = program.source(&block);
         let slot_of = |parameter: GatedBlockParameter| {

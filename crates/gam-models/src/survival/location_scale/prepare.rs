@@ -1025,6 +1025,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
         penalty_block_trace: fit.penalty_block_trace().to_vec(),
         edf_by_block: fit.edf_by_block().to_vec(),
         edf_rank_bound: fit.edf_rank_bound().to_vec(),
+        coefficient_mode_selection: fit.artifacts.coefficient_mode_selection.clone(),
     })
 }
 
