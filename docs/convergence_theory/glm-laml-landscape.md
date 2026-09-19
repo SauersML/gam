@@ -1,6 +1,6 @@
 # The LAML landscape for non-Gaussian GAMs (binomial logit, Poisson)
 
-Slug: `glm-laml-landscape`. Scripts: `SP/theory/glm-laml-landscape/{replica.py, face_stability.py, leak.py, separation_and_multistart.py}`, where SP is the session scratchpad. They run with `SP/theory/venv/bin/python`.
+Slug: `glm-laml-landscape`. Scripts: `SP/theory/glm-laml-landscape/{replica.py, face_stability.py, leak.py, sep_part_a.py, sep_part_a_hp.py, multistart_part_b.py}`, where SP is the session scratchpad. They run with `SP/theory/venv/bin/python`.
 Failing clusters in scope:
 - **B-rail**: the ebm, sklearn and pymc binomial-logit tests on the prostate data. Examples: `quality_vs_interpretml_ebm_binomial_logit.rs:191` and `quality_vs_sklearn_binomial_logit.rs`.
 - **B-pymc**: `quality_vs_pymc_nuts_binomial_logit.rs` and `quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized.rs`. These fail with |Pg| = 9.6e-6 against a bound of 7.3e-6, unrailed at ρ₂ = 20.73.
@@ -179,7 +179,7 @@ and it is strict if bₖ > 0.
 
 V = ½log(1 + mβ̂) + O(1) = ½log|ρ| + O(1) → +∞, with ∂V/∂ρ ≈ ½ρ⁻¹.
 
-V is coercive but only logarithmically. A ρ-space search sees slopes O(1/|ρ|) and a PIRLS whose W → 0 on the separated rows. The quasi-complete case (ties at the margin) has the same leading order. This is verified in 60-digit arithmetic in §4.
+V is coercive but only logarithmically. A ρ-space search sees slopes O(1/|ρ|) and a PIRLS whose W → 0 on the separated rows. The quasi-complete case, where tied observations sit on the separating hyperplane, has the same leading order. The tied rows have xᵀu = 0, so they add only a constant log 2 per row. This is verified in 40- and 120-digit arithmetic in §4, which also shows that the O(1) term converges slowly, at rate O(log|ρ| / |ρ|), since mβ̂ = |ρ| − log|ρ| + O(1).
 
 (d) **Unsupported direction** (X U_r = 0 and S_rest,rn = 0). β̂_r ≡ 0, and log|H| − log|S_λ|₊ does not depend on ρₖ, so V is exactly constant in ρₖ. Both ∂V/∂ρₖ and ∂²V/∂ρₖ² vanish identically: the ρ-Hessian is singular and aₖ = 0. The coordinate is non-identified and must be quotiented out. It is not a failure of convergence. When X U_r is small but nonzero, aₖ ≈ 0⁺ and the face is nearly degenerate.
 
