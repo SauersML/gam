@@ -18,7 +18,10 @@ its default ``gridsearch``; gamfit uses REML.
 Reported per scenario, averaged over seeds: RMSE of the fitted mean against the
 noiseless truth on a dense grid, and the worst violation of the requested
 shape on that grid (the most negative first/second difference in the
-constrained direction; 0 means the shape holds everywhere on the grid).
+constrained direction; 0 means the shape holds everywhere on the grid). The
+``fits`` column counts the seeds each library returned a fit for: gamfit
+refuses a fit its optimizer did not certify (``RemlConvergenceError``) instead
+of returning one, and the averages are over the fitted seeds.
 
 Run: ``python bench/pygam_audit/shape_te_by_vs_pygam.py [--seeds N]``.
 """
@@ -29,6 +32,7 @@ import argparse
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 import numpy as np
 import pandas as pd
@@ -53,6 +57,9 @@ def te_truth(x: np.ndarray, z: np.ndarray) -> np.ndarray:
     return np.tanh(3.0 * (x - 0.5)) * (1.0 + 0.5 * z) + 0.6 * np.sin(2.0 * np.pi * z)
 
 
+T = TypeVar("T")
+
+
 @dataclass
 class Result:
     rmse: float
@@ -66,12 +73,33 @@ def _violation(values: np.ndarray, axis: int, order: int, sign: float) -> float:
     return float(max(0.0, -d.min()))
 
 
+def _timed_gamfit(fit: Callable[[], T]) -> tuple[T | None, float]:
+    """Run a gamfit fit-and-predict; ``None`` when gamfit refuses the fit.
+
+    A refusal (gamfit raises rather than return a fit its optimizer did not
+    converge to) is counted per scenario, not silently skipped.
+    """
+    t0 = time.perf_counter()
+    try:
+        values = fit()
+    except gamfit.RemlConvergenceError as err:
+        print(f"  gamfit refused: {str(err).splitlines()[0][:160]}")
+        values = None
+    return values, time.perf_counter() - t0
+
+
+def _score_or_refused(
+    score: Callable[[T, float], Result], values: T | None, secs: float
+) -> Result | None:
+    return None if values is None else score(values, secs)
+
+
 # --------------------------------------------------------------------------
-# Scenarios. Each returns (gamfit Result, pyGAM Result).
+# Scenarios. Each returns (gamfit Result or None when refused, pyGAM Result).
 # --------------------------------------------------------------------------
 
 
-def te_monotone(seed: int) -> tuple[Result, Result]:
+def te_monotone(seed: int) -> tuple[Result | None, Result]:
     rng = np.random.default_rng(seed)
     n = 600
     x, z = rng.uniform(0, 1, n), rng.uniform(0, 1, n)
@@ -81,13 +109,14 @@ def te_monotone(seed: int) -> tuple[Result, Result]:
     truth = te_truth(xx, zz)
     grid = pd.DataFrame({"x": xx.ravel(), "z": zz.ravel()})
 
-    t0 = time.perf_counter()
-    m = gamfit.fit(
-        pd.DataFrame({"x": x, "z": z, "y": y}),
-        "y ~ te(x, z, shape=[monotone_increasing, none])",
-    )
-    ours = np.asarray(m.predict(grid)).reshape(xx.shape)
-    t_ours = time.perf_counter() - t0
+    def fit_ours() -> np.ndarray:
+        m = gamfit.fit(
+            pd.DataFrame({"x": x, "z": z, "y": y}),
+            "y ~ te(x, z, shape=[monotone_increasing, none])",
+        )
+        return np.asarray(m.predict(grid)).reshape(xx.shape)
+
+    ours, t_ours = _timed_gamfit(fit_ours)
 
     t0 = time.perf_counter()
     pg = pygam.LinearGAM(pygam.te(0, 1, constraints=["monotonic_inc", None]))
@@ -99,10 +128,10 @@ def te_monotone(seed: int) -> tuple[Result, Result]:
         rmse = float(np.sqrt(np.mean((surf - truth) ** 2)))
         return Result(rmse, _violation(surf, axis=0, order=1, sign=1.0), secs)
 
-    return score(ours, t_ours), score(theirs, t_theirs)
+    return _score_or_refused(score, ours, t_ours), score(theirs, t_theirs)
 
 
-def inc_concave(seed: int) -> tuple[Result, Result]:
+def inc_concave(seed: int) -> tuple[Result | None, Result]:
     rng = np.random.default_rng(seed)
     n = 400
     x = rng.uniform(0, 1, n)
@@ -110,13 +139,14 @@ def inc_concave(seed: int) -> tuple[Result, Result]:
     gx = np.linspace(0, 1, 401)
     truth = np.sqrt(gx)
 
-    t0 = time.perf_counter()
-    m = gamfit.fit(
-        pd.DataFrame({"x": x, "y": y}),
-        "y ~ s(x, shape=[monotone_increasing, concave])",
-    )
-    ours = np.asarray(m.predict(pd.DataFrame({"x": gx})))
-    t_ours = time.perf_counter() - t0
+    def fit_ours() -> np.ndarray:
+        m = gamfit.fit(
+            pd.DataFrame({"x": x, "y": y}),
+            "y ~ s(x, shape=[monotone_increasing, concave])",
+        )
+        return np.asarray(m.predict(pd.DataFrame({"x": gx})))
+
+    ours, t_ours = _timed_gamfit(fit_ours)
 
     t0 = time.perf_counter()
     pg = pygam.LinearGAM(pygam.s(0, constraints=["monotonic_inc", "concave"]))
@@ -128,10 +158,10 @@ def inc_concave(seed: int) -> tuple[Result, Result]:
         worst = max(_violation(f, 0, 1, 1.0), _violation(f, 0, 2, -1.0))
         return Result(float(np.sqrt(np.mean((f - truth) ** 2))), worst, secs)
 
-    return score(ours, t_ours), score(theirs, t_theirs)
+    return _score_or_refused(score, ours, t_ours), score(theirs, t_theirs)
 
 
-def factor_by(seed: int) -> tuple[Result, Result]:
+def factor_by(seed: int) -> tuple[Result | None, Result]:
     rng = np.random.default_rng(seed)
     n_per = 250
     xs, gs, ys = [], [], []
@@ -143,20 +173,21 @@ def factor_by(seed: int) -> tuple[Result, Result]:
     x, g, y = np.concatenate(xs), np.concatenate(gs), np.concatenate(ys)
     gx = np.linspace(0, 1, 301)
 
-    t0 = time.perf_counter()
-    df = pd.DataFrame({"x": x, "g": pd.Categorical(g, categories=LEVELS), "y": y})
-    m = gamfit.fit(df, "y ~ g + s(x, by=g, shape=monotone_increasing)")
-    ours = {
-        level: np.asarray(
-            m.predict(
-                pd.DataFrame(
-                    {"x": gx, "g": pd.Categorical([level] * gx.size, categories=LEVELS)}
+    def fit_ours() -> dict[str, np.ndarray]:
+        df = pd.DataFrame({"x": x, "g": pd.Categorical(g, categories=LEVELS), "y": y})
+        m = gamfit.fit(df, "y ~ g + s(x, by=g, shape=monotone_increasing)")
+        return {
+            level: np.asarray(
+                m.predict(
+                    pd.DataFrame(
+                        {"x": gx, "g": pd.Categorical([level] * gx.size, categories=LEVELS)}
+                    )
                 )
             )
-        )
-        for level in LEVELS
-    }
-    t_ours = time.perf_counter() - t0
+            for level in LEVELS
+        }
+
+    ours, t_ours = _timed_gamfit(fit_ours)
 
     # pyGAM: column 0 = x, column 1 = level code, columns 2.. = indicators.
     codes = np.searchsorted(np.array(LEVELS), g)
@@ -181,10 +212,10 @@ def factor_by(seed: int) -> tuple[Result, Result]:
         worst = max(_violation(curves[lv], 0, 1, 1.0) for lv in LEVELS)
         return Result(float(np.sqrt(np.mean(err**2))), worst, secs)
 
-    return score(ours, t_ours), score(theirs, t_theirs)
+    return _score_or_refused(score, ours, t_ours), score(theirs, t_theirs)
 
 
-def numeric_by(seed: int) -> tuple[Result, Result]:
+def numeric_by(seed: int) -> tuple[Result | None, Result]:
     rng = np.random.default_rng(seed)
     n = 500
     x, w = rng.uniform(0, 1, n), rng.uniform(0.5, 2.0, n)
@@ -192,13 +223,14 @@ def numeric_by(seed: int) -> tuple[Result, Result]:
     gx = np.linspace(0, 1, 301)
     ws = (0.5, 1.0, 2.0)
 
-    t0 = time.perf_counter()
-    m = gamfit.fit(
-        pd.DataFrame({"x": x, "w": w, "y": y}),
-        "y ~ s(x, by=w, shape=monotone_increasing)",
-    )
-    ours = [np.asarray(m.predict(pd.DataFrame({"x": gx, "w": wv}))) for wv in ws]
-    t_ours = time.perf_counter() - t0
+    def fit_ours() -> list[np.ndarray]:
+        m = gamfit.fit(
+            pd.DataFrame({"x": x, "w": w, "y": y}),
+            "y ~ s(x, by=w, shape=monotone_increasing)",
+        )
+        return [np.asarray(m.predict(pd.DataFrame({"x": gx, "w": wv}))) for wv in ws]
+
+    ours, t_ours = _timed_gamfit(fit_ours)
 
     t0 = time.perf_counter()
     pg = pygam.LinearGAM(pygam.s(0, by=1, constraints="monotonic_inc"))
@@ -211,7 +243,7 @@ def numeric_by(seed: int) -> tuple[Result, Result]:
         worst = max(_violation(c, 0, 1, 1.0) for c in curves)
         return Result(float(np.sqrt(np.mean(err**2))), worst, secs)
 
-    return score(ours, t_ours), score(theirs, t_theirs)
+    return _score_or_refused(score, ours, t_ours), score(theirs, t_theirs)
 
 
 SCENARIOS = {
@@ -229,15 +261,18 @@ def main() -> None:
 
     rows = []
     for name, run in SCENARIOS.items():
+        print(name)
         ours, theirs = zip(*(run(seed) for seed in range(args.seeds)))
-        for lib, res in (("gamfit", ours), ("pyGAM", theirs)):
+        for lib, results in (("gamfit", ours), ("pyGAM", theirs)):
+            fitted = [r for r in results if r is not None]
             rows.append(
                 {
                     "scenario": name,
                     "library": lib,
-                    "rmse_vs_truth": np.mean([r.rmse for r in res]),
-                    "worst_shape_violation": np.max([r.violation for r in res]),
-                    "seconds": np.mean([r.seconds for r in res]),
+                    "fits": f"{len(fitted)}/{len(results)}",
+                    "rmse_vs_truth": np.mean([r.rmse for r in fitted]),
+                    "worst_shape_violation": np.max([r.violation for r in fitted]),
+                    "seconds": np.mean([r.seconds for r in fitted]),
                 }
             )
     table = pd.DataFrame(rows)
