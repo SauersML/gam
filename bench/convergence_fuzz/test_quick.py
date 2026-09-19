@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .dgp import FAMILIES, case_spec, draw
-from .run import FIXTURES, PLANS
+from .run import FIXTURES, N_GRID, PLANS
 from .triage import failure_causes
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
@@ -63,9 +63,12 @@ def test_quick_plan_carries_every_fixture() -> None:
 
 def test_full_plan_meets_the_lane_size() -> None:
     reps = PLANS["full"]()
-    assert len(reps) >= 2000
+    # Every rep is two fits: the model and its permuted/rescaled twin.
+    assert 2 * len(reps) >= 2000
     assert {r.family for r in reps} == set(FAMILIES)
-    assert {case_spec(r.case).p for r in reps} == set(range(1, 9))
+    assert {r.n for r in reps} == set(N_GRID)
+    for n in N_GRID:
+        assert {case_spec(r.case).p for r in reps if r.n == n} == set(range(1, 9)), n
 
 
 def test_draw_is_seeded() -> None:

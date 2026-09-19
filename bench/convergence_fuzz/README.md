@@ -37,7 +37,10 @@ linear predictor stays bounded on the training hull (a heavy-tailed covariate
 must not overflow the Poisson mean in the truth itself). Held-out rows see the
 truth held at its boundary value outside the training range.
 
-The `full` plan is 180 cases x 4 `n` x 3 families = **2 160 reps, 4 320 fits**.
+The `full` plan is 180 cases x `n` in {30, 100, 1 000} x 3 families, plus
+the first 24 cases (which draw every `p` from 1 to 8) at `n = 10 000`:
+**1 692 reps, 3 384 fits**. A rep at `n = 10 000` costs one to fifteen
+single-threaded minutes, about a hundred times one at `n = 1 000`.
 `quick` is the seeded fixture of every root cause this fuzzer found and fixed
 (`run.FIXTURES`) plus the first six cases at `n` in {30, 100}.
 

@@ -5,8 +5,10 @@
 Plans:
 
 ``full``
-    cases ``0..FULL_CASES-1`` x ``n in N_GRID`` x every family: 2160 reps,
-    4320 fits (each rep fits the model and its permuted/rescaled twin).
+    cases ``0..FULL_CASES-1`` x every ``n`` of ``N_GRID`` below
+    ``LARGE_N`` x every family, plus cases ``0..LARGE_N_CASES-1`` at
+    ``LARGE_N``: 1692 reps, 3384 fits (each rep fits the model and its
+    permuted/rescaled twin).
 ``quick``
     the seeded fixture of every root cause this fuzzer found and fixed, plus
     the first ``QUICK_CASES`` cases at the small ``n``; the regression test
@@ -49,6 +51,11 @@ SCHEMA_VERSION = 1
 
 N_GRID: tuple[int, ...] = (30, 100, 1_000, 10_000)
 FULL_CASES = 180
+# A rep at n = 10 000 costs one to fifteen single-threaded minutes, a hundred
+# times one at n = 1 000, so the largest n is drawn on fewer cases. It still
+# spans every covariate count (cases 0..23 draw p = 1..8).
+LARGE_N = 10_000
+LARGE_N_CASES = 24
 QUICK_CASES = 6
 QUICK_N: tuple[int, ...] = (30, 100)
 # Safety net only (see module docstring). The slowest certified reps of the
@@ -83,6 +90,7 @@ def _full() -> list[Rep]:
         Rep(case, family, n)
         for case in range(FULL_CASES)
         for n in N_GRID
+        if n < LARGE_N or case < LARGE_N_CASES
         for family in dgp.FAMILIES
     ]
 
