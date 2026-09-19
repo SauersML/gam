@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .worker import DESIGNS as ALL_DESIGNS
-from .worker import FAMILIES, LIBS
+from .worker import FAMILIES, LIBS, POSITIVE_FAMILIES
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
 SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
@@ -39,11 +39,15 @@ class Plan:
     libs: tuple[str, ...] = field(default=LIBS)
 
 
-def _grid(ns: tuple[int, ...], designs: tuple[str, ...]) -> tuple[Cell, ...]:
+def _grid(
+    ns: tuple[int, ...],
+    designs: tuple[str, ...],
+    families: tuple[str, ...] = FAMILIES,
+) -> tuple[Cell, ...]:
     # Ordered by n ascending so a timeout at small n can mark the larger n of
     # the same (lib, family, design) as not run instead of burning the net on
     # each one in turn.
-    return tuple(Cell(f, n, d) for n in ns for f in FAMILIES for d in designs)
+    return tuple(Cell(f, n, d) for n in ns for f in families for d in designs)
 
 
 PLANS: dict[str, Plan] = {
@@ -104,6 +108,34 @@ PLANS: dict[str, Plan] = {
             description="n in {1e3, 1e4, 1e5}, every family x every design, 3 reps",
             cells=_grid((1_000, 10_000, 100_000), ALL_DESIGNS),
             reps=3,
+            timeout_s=3_600.0,
+        ),
+        # The positive-continuous speed/convergence sweep (audit lane
+        # sweep-positive): Gamma on the log and inverse links, Gamma with heavy
+        # right skew and near-zero responses, the inverse Gaussian, a
+        # log-normal response fitted as Gaussian on the log scale and as
+        # Gamma(log) on the raw scale, and the scaled Student-t. pyGAM runs the
+        # Gamma cells only; the others report gamfit's absolute times and
+        # certification.
+        Plan(
+            name="positive_small",
+            description="n in {1e2, 1e3}, every positive family x every design, 3 reps",
+            cells=_grid((100, 1_000), ALL_DESIGNS, POSITIVE_FAMILIES),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="positive_1e4",
+            description="n=1e4, every positive family x every design, 2 reps",
+            cells=_grid((10_000,), ALL_DESIGNS, POSITIVE_FAMILIES),
+            reps=2,
+            timeout_s=1_800.0,
+        ),
+        Plan(
+            name="positive_1e5",
+            description="n=1e5, every positive family x {p1, p5, te}, 1 rep",
+            cells=_grid((100_000,), CORE_DESIGNS, POSITIVE_FAMILIES),
+            reps=1,
             timeout_s=3_600.0,
         ),
     )
