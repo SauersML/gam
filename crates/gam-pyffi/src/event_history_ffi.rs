@@ -19,7 +19,7 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use std::sync::Arc;
 
 /// A fitted event-history model held in memory.
-#[pyclass(name = "_EventHistoryModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_EventHistoryModel", frozen)]
 pub(crate) struct PyEventHistoryModel {
     fit: Arc<EventHistoryFit>,
     cohort: Arc<EventHistoryCohort>,
@@ -129,8 +129,8 @@ impl PyEventHistoryModel {
         self.fit.centring.as_ref().map_or(0, |c| c.masks)
     }
 
-    /// The reference grid's certificate: the geometric-tail estimate of the
-    /// moves finer grids make the fitted coefficients take, in posterior
+    /// The reference grid's certificate: the moves finer grids make the
+    /// fitted coefficients take, closed by a geometric-tail estimate, in posterior
     /// standard deviations.
     fn reference_certificate(&self) -> Option<f64> {
         self.fit.reference_certificate

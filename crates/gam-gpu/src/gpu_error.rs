@@ -40,9 +40,11 @@ pub enum GpuError {
     /// missing transitive dependency, or loader-initializer failure). This is
     /// a broken installation, never ordinary hardware absence.
     DriverLibraryLoadFailed { reason: String },
-    /// The CUDA driver is present, but a mandatory runtime dependency such as
-    /// cuBLAS, cuSOLVER, or cuSPARSE is missing. This is an installation fault,
-    /// not the ordinary "this host has no CUDA device" absence state.
+    /// The CUDA driver is present, and a mandatory runtime dependency such as
+    /// cuBLAS, cuSOLVER, or cuSPARSE has a candidate on this host that does
+    /// not load, or a stack the host carries does not preload. This is a
+    /// fault of a present installation. A dependency with no candidate at all
+    /// is the absence `GpuAbsence::RuntimeLibraryUnavailable` instead.
     RuntimeDependencyUnavailable { reason: String },
     /// A required CUDA / cuBLAS / cuSOLVER / cuSPARSE symbol was missing
     /// from a loaded library (i.e. `libloading::Library::get` returned an

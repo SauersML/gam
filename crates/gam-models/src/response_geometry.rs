@@ -456,6 +456,10 @@ pub fn fit_shared_tangent_reml(
     } else {
         let (rho_lower, rho_upper) = prepared.resolvability_domain();
         let mut problem = OuterProblem::new(n_outer)
+            .with_problem_size(
+                prepared.effective_observations * prepared.n_outputs,
+                prepared.n_coefficients * prepared.n_outputs,
+            )
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_bounds(rho_lower, rho_upper)
@@ -467,13 +471,6 @@ pub fn fit_shared_tangent_reml(
             // exact engine's accuracy requirement before search/certification.
             .with_required_projected_gradient_norm(Some(
                 f64::EPSILON.sqrt() * prepared.n_outputs as f64,
-            ))
-            .with_objective_scale(Some(
-                prepared
-                    .effective_observations
-                    .checked_mul(prepared.n_outputs)
-                    .ok_or_else(|| invalid("effective observation count overflow"))?
-                    as f64,
             ));
         if let Some(initial) = initial_log_lambdas.as_ref() {
             problem = problem.with_initial_rho(Array1::from_iter(

@@ -42,31 +42,79 @@ pub(crate) struct SurvivalRowInputs {
     pub(crate) cov_ones: f64,
 }
 
-/// Whether this batch is admitted to the production CUDA V/G/H path.
+/// The model a rigid survival row-kernel cache build asks the row jet to
+/// evaluate: whether its slope moves along follow-up, and whether its index is
+/// anchored on a declared latent law instead of the Gaussian closed form.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SurvivalRowJetModel {
+    pub(crate) follow_up_varying_slope: bool,
+    pub(crate) anchored_latent_law: bool,
+}
+
+/// What the device row jet computes exactly: the four-primary Gaussian frame,
+/// whose order-2 lowering and pullback it transcribes. It has no
+/// follow-up-varying slope primaries and no anchored (declared-law) lowering.
+pub(crate) struct SurvivalRowJetCapability {
+    pub(crate) follow_up_varying_slope: bool,
+    pub(crate) anchored_latent_law: bool,
+}
+
+pub(crate) const SURVIVAL_ROWJET_CAPABILITY: SurvivalRowJetCapability = SurvivalRowJetCapability {
+    follow_up_varying_slope: false,
+    anchored_latent_law: false,
+};
+
+impl SurvivalRowJetCapability {
+    /// The first capability `model` needs that the row jet does not declare,
+    /// or `None` when it computes `model`'s rows.
+    pub(crate) fn missing_for(&self, model: &SurvivalRowJetModel) -> Option<&'static str> {
+        if model.follow_up_varying_slope && !self.follow_up_varying_slope {
+            return Some("the follow-up-varying slope frame");
+        }
+        if model.anchored_latent_law && !self.anchored_latent_law {
+            return Some("the anchored lowering of a declared latent law");
+        }
+        None
+    }
+}
+
+/// Which kernel evaluates this batch, through the one row-kernel decision.
 ///
 /// The batch runs one independent row program per row with no cross-row
 /// reduction, so the row count is the work, and what the device has to
 /// overcome is probe, transfer and launch latency. That crossover is the
-/// dispatch policy's `fused_kernel_min_n`, which device calibration derives
-/// from the device's measured row crossover; the Pólya-Gamma batch takes the
-/// same admission. A batch below
+/// dispatch policy's `fused_kernel_min_n`; the Pólya-Gamma batch takes the
+/// same threshold. A batch below
 /// `GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N`, which no reachable
-/// policy admits, returns before availability is resolved, so a CPU-sized fit
-/// creates no CUDA context. The row count used to be compared against a local
-/// 100,000-row literal (#2900 row 6.11).
+/// policy admits, is decided under `auto` without probing the device, so a
+/// CPU-sized fit creates no CUDA context, and neither does a model outside
+/// the row jet's declaration. The row count used to be compared against a
+/// local 100,000-row literal (#2900 row 6.11).
 ///
 /// Admission is a capability decision made before execution, not an
 /// operating-system guess. A large CPU-only Linux fit therefore stays on the
 /// ordinary row-kernel schedule; once a real device is admitted, subsequent
 /// compile/launch failures remain errors and are never hidden by a retry.
-#[inline]
-pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> Result<bool, String> {
-    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve_if_fused_batch_exceeds_floor(
+pub(crate) fn survival_rigid_row_vgh_decision(
+    model: &SurvivalRowJetModel,
+    n_rows: usize,
+) -> Result<gam_gpu::GpuDecision, String> {
+    let decision = gam_gpu::decide_row_kernel(
         gam_gpu::global_policy(),
-        n_rows,
+        gam_gpu::RowKernelAdmission {
+            kernel: gam_gpu::GpuKernel::SurvivalMarginalSlopeRows,
+            missing_capability: SURVIVAL_ROWJET_CAPABILITY.missing_for(model),
+            compiled: cfg!(target_os = "linux"),
+            rows: n_rows,
+            floor: gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N,
+            threshold: |device| device.fused_kernel_min_n,
+        },
+        &mut gam_gpu::RuntimeDeviceProbe,
     )
     .map_err(String::from)?;
-    Ok(runtime.is_some_and(|runtime| n_rows >= runtime.policy().fused_kernel_min_n))
+    decision.clone().log();
+    decision.require_supported()?;
+    Ok(decision)
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.

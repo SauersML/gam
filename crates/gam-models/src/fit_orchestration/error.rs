@@ -645,6 +645,27 @@ impl FitFailure {
         }
     }
 
+    /// The Jeffreys arming evidence the custom-family refusal this failure ends
+    /// in carries ([`CustomFamilyError::jeffreys_arming_evidence`]), seen
+    /// through the wrappers that only carry it.
+    #[must_use]
+    pub fn jeffreys_arming_evidence(&self) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
+        match self {
+            Self::Context { source, .. } | Self::Annotated { source, .. } => {
+                source.jeffreys_arming_evidence()
+            }
+            Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
+            Self::Estimation(err) => {
+                Self::custom_family_leaf(err).and_then(CustomFamilyError::jeffreys_arming_evidence)
+            }
+            Self::Workflow(err) => match err.as_ref() {
+                WorkflowError::Fit(failure) => failure.jeffreys_arming_evidence(),
+                _ => None,
+            },
+            Self::SurvivalMarginalSlope(_) | Self::Raised { .. } => None,
+        }
+    }
+
     /// The message chain, outermost first: each layer's context, then the
     /// message of the error that stopped the fit, then the notes appended after
     /// it, innermost first.
@@ -1191,6 +1212,15 @@ impl From<gam_data::DataError> for WorkflowError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            cell @ DataError::InvalidCell {
+                problem: gam_data::CellProblem::NonFinite,
+                ..
+            } => Self::InvalidConfig {
+                reason: cell.to_string(),
+            },
+            cell @ DataError::InvalidCell { .. } => Self::SchemaMismatch {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }

@@ -170,11 +170,20 @@ pub(crate) fn compute_outer_hessian(
     // `None` and the diagonal base term reads `h_k_matrices[idx]` directly. This
     // drops the per-coordinate Aₖ clone (issue #922) in the common no-correction
     // (Gaussian) path.
+    //
+    // A block-local coordinate with no correction keeps `Ḣₖ = Aₖ` as its root
+    // (`h_k_matrices[idx] = None`) when every consumer below can take it that
+    // way: the backend contracts roots in the cross trace, there is no
+    // projected kernel or dense spectral batch to feed, and no ext coordinate
+    // pairs with it. A many-level random effect's `Aₖ` is `p × p` and
+    // diagonal; its root costs `O(levels)`.
+    let keep_block_roots = hop.contracts_block_root_drifts()
+        && solution.penalty_subspace_trace.is_none()
+        && hop.as_exact_dense_spectral().is_none()
+        && ext_dim == 0;
     let mut a_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
-    let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
+    let mut h_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
     for idx in 0..k {
-        let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
-
         let correction: Option<Array2<f64>> = match workspace {
             Some(ws) => match ws.coord_corrections[idx].as_ref() {
                 Some(DriftDerivResult::Dense(matrix)) => Some(matrix.clone()),
@@ -195,14 +204,59 @@ pub(crate) fn compute_outer_hessian(
                 }
             }
         };
+        if correction.is_none()
+            && keep_block_roots
+            && solution.penalty_coords[idx].is_block_local()
+        {
+            a_k_matrices.push(None);
+            h_k_matrices.push(None);
+            continue;
+        }
+        let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
         if let Some(corr) = correction {
             a_k_matrices.push(Some(a_k.clone()));
             a_k += &corr;
         } else {
             a_k_matrices.push(None);
         }
-        h_k_matrices.push(a_k);
+        h_k_matrices.push(Some(a_k));
     }
+    // `Ḣₖ` as its matrix, for consumers that are only reached when every
+    // coordinate kept one (`keep_block_roots` is false on their paths).
+    let dense_h_k = |idx: usize| -> &Array2<f64> {
+        h_k_matrices[idx]
+            .as_ref()
+            .expect("Ḣₖ is materialized off the block-root path")
+    };
+    let root_drift = |idx: usize| -> BlockRootDrift<'_> {
+        let (root, start, end) = solution.penalty_coords[idx]
+            .block_local_root()
+            .expect("every penalty coordinate carries a root");
+        BlockRootDrift {
+            root: root.view(),
+            start,
+            end,
+            scale: curvature_lambdas[idx],
+        }
+    };
+    // `spectral_cross(Ḣᵢ, Ḣⱼ)` for two ρ coordinates, each as its matrix or
+    // its root.
+    let rho_logdet_cross = |ii: usize, jj: usize| -> f64 {
+        match (&h_k_matrices[ii], &h_k_matrices[jj]) {
+            (Some(h_i), Some(h_j)) => hop.trace_logdet_hessian_cross(h_i, h_j),
+            (None, None) => {
+                hop.trace_logdet_hessian_cross_block_roots(root_drift(ii), root_drift(jj))
+            }
+            (Some(h_i), None) => {
+                let h_j = solution.penalty_coords[jj].scaled_dense_matrix(curvature_lambdas[jj]);
+                hop.trace_logdet_hessian_cross(h_i, &h_j)
+            }
+            (None, Some(h_j)) => {
+                let h_i = solution.penalty_coords[ii].scaled_dense_matrix(curvature_lambdas[ii]);
+                hop.trace_logdet_hessian_cross(&h_i, h_j)
+            }
+        }
+    };
 
     // ── Adjoint trick precomputation ──
     //
@@ -323,10 +377,8 @@ pub(crate) fn compute_outer_hessian(
     // pair; per-pair cost is then O(r²) instead of O(p²) per cross.
     let subspace = solution.penalty_subspace_trace.as_deref();
     let reduced_h_drifts: Option<Vec<Array2<f64>>> = subspace.map(|kernel| {
-        let mut drifts = h_k_matrices
-            .iter()
-            .cloned()
-            .map(DriftDerivResult::Dense)
+        let mut drifts = (0..k)
+            .map(|idx| DriftDerivResult::Dense(dense_h_k(idx).clone()))
             .collect::<Vec<_>>();
         drifts.extend(ext_h_drifts.iter().cloned());
         penalty_subspace_reduce_drifts_batched(kernel, &drifts)
@@ -360,9 +412,10 @@ pub(crate) fn compute_outer_hessian(
             }
             Some(out)
         } else if let Some(dense_hop) = hop.as_exact_dense_spectral() {
+            let dense_drifts: Vec<&Array2<f64>> = (0..k).map(dense_h_k).collect();
             Some(trace_logdet_hessian_crosses_dense_spectral_drifts(
                 dense_hop,
-                &h_k_matrices,
+                &dense_drifts,
                 &ext_h_drifts,
             ))
         } else {
@@ -371,17 +424,15 @@ pub(crate) fn compute_outer_hessian(
             for ii in 0..total_coords {
                 for jj in ii..total_coords {
                     let value = match (ii < k, jj < k) {
-                        (true, true) => {
-                            hop.trace_logdet_hessian_cross(&h_k_matrices[ii], &h_k_matrices[jj])
-                        }
+                        (true, true) => rho_logdet_cross(ii, jj),
                         (true, false) => trace_logdet_hessian_cross_dense_drift(
                             hop,
-                            &h_k_matrices[ii],
+                            dense_h_k(ii),
                             &ext_h_drifts[jj - k],
                         ),
                         (false, true) => trace_logdet_hessian_cross_dense_drift(
                             hop,
-                            &h_k_matrices[jj],
+                            dense_h_k(jj),
                             &ext_h_drifts[ii - k],
                         ),
                         (false, false) => ext_h_drifts[ii - k]
@@ -428,7 +479,10 @@ pub(crate) fn compute_outer_hessian(
 
     let mode_rhs_correction = effective_deriv.mode_response_rhs_correction();
     let build_rho_pair_rhs = |kk: usize, ll: usize| -> Result<Array1<f64>, String> {
-        let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+        let mut rhs = match &h_k_matrices[ll] {
+            Some(h_l) => h_l.dot(&v_ks[kk]),
+            None => solution.penalty_coords[ll].scaled_matvec(&v_ks[kk], curvature_lambdas[ll]),
+        };
         rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
         if kk == ll {
             rhs -= &curvature_a_k_betas[kk];
@@ -593,7 +647,7 @@ pub(crate) fn compute_outer_hessian(
                 } else if let Some(ref exact) = exact_logdet_cross_traces {
                     exact[[kk, ll]]
                 } else {
-                    hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
+                    rho_logdet_cross(kk, ll)
                 };
 
                 // Second Hessian drift trace via shared helpers.
@@ -611,15 +665,18 @@ pub(crate) fn compute_outer_hessian(
                 } else if kk == ll {
                     // Pure Aₖ for the diagonal base term: the stored override when
                     // a correction made Aₖ ≠ Ḣₖ, else Ḣₖ itself (they coincide).
-                    let a_kk = a_k_matrices[kk].as_ref().unwrap_or(&h_k_matrices[kk]);
+                    let a_kk = || a_k_matrices[kk].as_ref().unwrap_or_else(|| dense_h_k(kk));
                     if let Some(kernel) = subspace {
-                        kernel.trace_projected_logdet(a_kk)
+                        kernel.trace_projected_logdet(a_kk())
+                    } else if h_k_matrices[kk].is_none() {
+                        let drift = root_drift(kk);
+                        drift.scale * hop.trace_logdet_block_root(drift.root, drift.start, drift.end)
                     } else if solution.penalty_coords[kk].is_block_local() {
                         let (block, start, end) =
                             solution.penalty_coords[kk].scaled_block_local(1.0);
                         hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                     } else {
-                        hop.trace_logdet_gradient(a_kk)
+                        hop.trace_logdet_gradient(a_kk())
                     }
                 } else {
                     0.0
@@ -627,6 +684,11 @@ pub(crate) fn compute_outer_hessian(
 
                 let correction = if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
                     corrections[pair_idx]
+                } else if !effective_deriv.has_corrections() {
+                    // Fixed curvature (Gaussian identity): the second mode
+                    // response has no drift to trace, so the pair RHS is never
+                    // formed.
+                    0.0
                 } else {
                     let rhs = build_rho_pair_rhs(kk, ll)?;
                     compute_ift_correction_trace(
@@ -694,7 +756,7 @@ pub(crate) fn compute_outer_hessian(
                     } else {
                         trace_logdet_hessian_cross_dense_drift(
                             hop,
-                            &h_k_matrices[rho_idx],
+                            dense_h_k(rho_idx),
                             &ext_h_drifts[ext_idx],
                         )
                     };

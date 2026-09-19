@@ -3235,7 +3235,7 @@ mod flex_primary_hessian_oracle_tests {
             panic!("primary coordinate {u} out of range for flex oracle");
         }
         let row_ctx = family
-            .build_row_exact_context_with_stats_and_cell_cache(row, &states, None, false)
+            .build_row_exact_context(row, &states, None)
             .expect("perturbed row context");
         let (_neglog, grad, _hess) = family
             .compute_row_primary_gradient_hessian(row, &states, primary, &row_ctx)
@@ -3260,7 +3260,7 @@ mod flex_primary_hessian_oracle_tests {
         z[row] += delta;
         perturbed.z = Arc::new(z);
         let row_ctx = perturbed
-            .build_row_exact_context_with_stats_and_cell_cache(row, states, None, false)
+            .build_row_exact_context(row, states, None)
             .expect("z-perturbed row context");
         let mut scratch =
             super::super::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
