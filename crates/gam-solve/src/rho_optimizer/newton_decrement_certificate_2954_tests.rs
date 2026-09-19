@@ -539,12 +539,13 @@ fn the_inner_residual_energy_is_charged_to_the_objective_band_2954() {
 
 /// The same exponential tail when the route declares its upper bound `ρ = 20` a
 /// representability literal instead of the term's derived limit model (#2627).
-/// The two Newton steps leave the same resolvable decrement and the step heads
-/// to that bound, but box-KKT certifies nothing about the data at a literal
-/// face: the mint does not rail the coordinate there, and refuses by the
-/// `representability-face` rung with the checkpoint where the polish stopped.
+/// Box-KKT certifies nothing about the data at a literal face, so the mint never
+/// rails the coordinate there. Along the tail, though, `λ̂² = V − V∞` is the whole
+/// decrease left, and past the two steps quadratic convergence allows the polish
+/// keeps following it inside the box while `λ̂²` contracts (#3012). It certifies
+/// on the decrement rung once that decrease is below the band, short of the face.
 #[test]
-fn a_tail_heading_to_a_representability_face_is_refused_by_type_2954() {
+fn a_tail_heading_to_a_representability_face_is_certified_inside_the_box_3012() {
     let (outcome, published) = certify_scripted_2954(
         2_000,
         5.0,
@@ -553,7 +554,51 @@ fn a_tail_heading_to_a_representability_face_is_refused_by_type_2954() {
         TAIL_2954,
         None,
     );
-    let error = outcome.expect_err("a literal face must not certify a rail");
+    let certificate = outcome.expect("the tail is followed inside the box and certified");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    assert!(
+        polish.rails.is_empty(),
+        "never railed at a literal face: {polish:?}"
+    );
+    assert!(
+        polish.decreases.len() > polish.step_budget,
+        "the polish must have continued past its budget: {polish:?}",
+    );
+    assert!(
+        published[0] > 7.0 && published[0] < 20.0,
+        "certified inside the box, past where the budget stopped: {}",
+        published[0],
+    );
+    // Along the tail the decrement is the decrease left to the infimum,
+    // `λ̂² = n·a·e^(−ρ) = V(ρ) − V∞`, at the certified point too.
+    let left = 2_000.0 * (TAIL_2954(published[0])[0] - 0.6);
+    assert!(
+        (polish.lambda_sq_after - left).abs() <= 64.0 * f64::EPSILON * 2_000.0 * 0.6,
+        "λ̂² {:.9e} against the decrease left {left:.9e}",
+        polish.lambda_sq_after,
+    );
+}
+
+/// When the literal face is closer than the band, the tail cannot be followed to
+/// a certifiable point inside the box: every Newton step that would move the
+/// coordinate onto the face, into the rail margin within which the certificate
+/// reads it railed there, is halved (#3012). The halved steps stop buying a
+/// resolvable decrease short of that margin, and the mint refuses by the
+/// `representability-face` rung with the checkpoint inside the box.
+#[test]
+fn a_tail_that_needs_a_representability_face_is_refused_by_type_3012() {
+    let (outcome, published) = certify_scripted_2954(
+        2_000,
+        5.0,
+        (-20.0, 10.0),
+        Some((true, false)),
+        TAIL_2954,
+        None,
+    );
+    let error = outcome.expect_err("a tail that needs the literal face must not certify");
     let message = error.to_string();
     assert!(
         message.contains("Newton-decrement above tolerance after polish")
@@ -571,11 +616,9 @@ fn a_tail_heading_to_a_representability_face_is_refused_by_type_2954() {
         ),
         other => panic!("expected a typed outer refusal, got {other:?}"),
     }
-    // Each Newton step is `−g/H` through a Cholesky factor, one e-fold up to a
-    // few roundings.
     assert!(
-        (published[0] - 7.0).abs() <= 8.0 * f64::EPSILON * 7.0,
-        "the checkpoint is where the two Newton steps stopped, not the literal bound: {}",
+        published[0] > 9.0 && published[0] < 9.5,
+        "the checkpoint stays short of the literal face's rail margin: {}",
         published[0],
     );
 }
@@ -583,10 +626,11 @@ fn a_tail_heading_to_a_representability_face_is_refused_by_type_2954() {
 /// The same tail toward `ρ → −∞`, `V = n·(0.6 + a·e^ρ)` from `ρ = −5`, on a term
 /// whose unpenalized fit its data do not identify, so the route declares the
 /// lower bound a representability face (`rho_domain::unpenalized_fit_is_identified`).
-/// λ → 0 is then no limit model: the mint does not rail there and refuses by the
-/// `representability-face` rung.
+/// λ → 0 is then no limit model, and the mint never rails there; the polish
+/// follows the tail inside the box and certifies it once the decrease left is
+/// below the band (#3012).
 #[test]
-fn a_tail_toward_an_unidentified_unpenalized_fit_is_refused_by_type_2954() {
+fn a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_3012() {
     const LOWER_TAIL_2954: fn(f64) -> [f64; 3] = |rho| {
         let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
         let tail = a * rho.exp();
@@ -600,22 +644,18 @@ fn a_tail_toward_an_unidentified_unpenalized_fit_is_refused_by_type_2954() {
         LOWER_TAIL_2954,
         None,
     );
-    let error = outcome.expect_err("an unidentified unpenalized limit must not certify a rail");
-    let message = error.to_string();
-    match &error {
-        EstimationError::RemlDidNotConverge {
-            stationarity_standard,
-            ..
-        } => assert_eq!(
-            stationarity_standard.rung().map(|rung| rung.label),
-            Some("representability-face"),
-            "{message}",
-        ),
-        other => panic!("expected a typed outer refusal, got {other:?}"),
-    }
+    let certificate = outcome.expect("the tail is followed inside the box and certified");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
     assert!(
-        (published[0] + 7.0).abs() <= 8.0 * f64::EPSILON * 7.0,
-        "the checkpoint is where the two Newton steps stopped: {}",
+        polish.rails.is_empty(),
+        "never railed at a literal face: {polish:?}"
+    );
+    assert!(
+        published[0] < -7.0 && published[0] > -20.0,
+        "certified inside the box: {}",
         published[0],
     );
 }
@@ -1135,15 +1175,24 @@ fn a_polish_step_is_judged_at_the_certificates_own_evaluation_order_2954() {
         let root = (1.0 + rho * rho).sqrt();
         [0.6 + s * root, s * rho / root, s / (root * root * root)]
     };
+    // The full Newton step `−ρ·(1 + ρ²)` overshoots from 1.5 to −3.375 and raises
+    // the full-order criterion, while the value-only route reads it 0.02 lower, a
+    // decrease. Judged at the certificate's order it is not kept: the damped half
+    // step is (#3012), and the walk certifies the minimum.
     let (overshoot, judged) = certify_two_route_2954(1.5, OVERSHOOT_2954, -0.02);
-    let refusal = overshoot.expect_err("a step that raises the judged criterion is never kept");
-    assert!(
-        refusal
-            .to_string()
-            .contains("Newton-decrement above tolerance after polish"),
-        "{refusal}"
+    let certificate =
+        overshoot.expect("the damped walk reaches the minimum and certifies it (#3012)");
+    let polish = certificate
+        .newton_polish
+        .expect("the polish records its steps");
+    let overshoot_full_order = |rho: f64| 2_000.0 * OVERSHOOT_2954(rho)[0];
+    let half = 1.5 - 0.5 * 1.5 * (1.0 + 1.5 * 1.5);
+    assert_eq!(
+        polish.decreases[0],
+        overshoot_full_order(1.5) - overshoot_full_order(half),
+        "the first kept step is the half step, judged at full order: {polish:?}",
     );
-    assert_eq!(judged.rho.to_vec(), vec![1.5], "the judged point stays put");
+    assert!(judged.rho[0].abs() < 1.0e-3, "published {:?}", judged.rho);
 
     const QUADRATIC_2954: fn(f64) -> [f64; 3] = |rho| [0.6 + 0.5 * rho * rho, rho, 1.0];
     let (reaching, reached) = certify_two_route_2954(5.0e-4, QUADRATIC_2954, 1.0);
@@ -1259,4 +1308,167 @@ fn two_walks_at_one_point_certify_from_their_own_evidence_2954() {
         .join()
         .expect("walk B runs on its own thread");
     assert_eq!(after_a, alone);
+}
+
+/// An exponential tail with its minimum inside the box, like the exact-fit
+/// `y ~ s(x)` of #3012: `V = n·(0.6 + a·e^(−ρ) + b·e^(ρ−20))` with `b = a·e^(−6)`,
+/// so `V` is least at `ρ* = 13` and rises again toward the bound.
+const INTERIOR_TAIL_3012: fn(f64) -> [f64; 3] = |rho| {
+    let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+    let b = a * (-6.0_f64).exp();
+    let tail = a * (-rho).exp();
+    let rise = b * (rho - 20.0).exp();
+    [0.6 + tail + rise, rise - tail, tail + rise]
+};
+
+/// From `ρ = 5`, [`INTERIOR_TAIL_3012`] contracts `λ̂²` by about `e^(−1)` per Newton
+/// step, a linear rate, until the rising term takes over near `ρ* = 13`. The two
+/// steps quadratic convergence allows end far above the band, and railing the
+/// coordinate at its bound `ρ = 20` raises the criterion, so the budget alone
+/// refused this point (#3012). The polish continues past its budget while the
+/// decrement contracts and each step lowers the criterion by more than `band_f`,
+/// and certifies the interior minimum on the decrement rung.
+#[test]
+fn a_linearly_converging_polish_certifies_past_its_quadratic_budget_3012() {
+    let (outcome, published) = certify_scripted_2954(
+        2_000,
+        5.0,
+        (-20.0, 20.0),
+        Some((true, true)),
+        INTERIOR_TAIL_3012,
+        None,
+    );
+    let certificate = outcome.expect("the polish reaches the interior minimum and certifies it");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    assert!(
+        polish.decreases.len() > polish.step_budget,
+        "the polish must have continued past its budget: {polish:?}",
+    );
+    assert!(polish.rails.is_empty(), "{polish:?}");
+    // Near `ρ*` the criterion is quadratic with `V''(ρ*) = 2n·a·e^(−13)`, so the
+    // certified point is one Newton step `√(λ̂²/V'')` from the minimum, up to the
+    // curvature's variation over that step (a factor two covers it) and the
+    // rounding of `ρ` itself.
+    let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+    let curvature = 2.0 * 2_000.0 * a * (-13.0_f64).exp();
+    let reach = 2.0 * (polish.lambda_sq_after / curvature).sqrt() + 64.0 * f64::EPSILON * 13.0;
+    assert!(
+        (published[0] - 13.0).abs() <= reach,
+        "published {:.9} against the minimum 13 within {reach:.3e}",
+        published[0],
+    );
+}
+
+/// `V = n·(0.6 + s·ln cosh ρ)` handed over at `ρ = 1.5`, where the full Newton
+/// step `−sinh ρ·cosh ρ` overshoots to `ρ ≈ −3.5` and raises the criterion. The
+/// polish damps it (#3012): the half step lowers the criterion by more than
+/// `band_f`, and the walk then converges to `ρ = 0` and certifies there.
+#[test]
+fn a_full_newton_step_that_raises_the_criterion_is_damped_3012() {
+    const SCALE: f64 = 6.0e-6;
+    let (outcome, published) = certify_scripted_2954(
+        2_000,
+        1.5,
+        (-20.0, 20.0),
+        Some((true, true)),
+        |rho| {
+            [
+                0.6 + SCALE * rho.cosh().ln(),
+                SCALE * rho.tanh(),
+                SCALE / (rho.cosh() * rho.cosh()),
+            ]
+        },
+        None,
+    );
+    let certificate = outcome.expect("the damped walk reaches the minimum and certifies it");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    let half = 1.5 - 0.5 * 1.5_f64.sinh() * 1.5_f64.cosh();
+    let expected = 2_000.0 * SCALE * (1.5_f64.cosh().ln() - half.cosh().ln());
+    let first = polish.decreases[0];
+    assert!(
+        (first - expected).abs() <= 64.0 * f64::EPSILON * 2_000.0 * 0.6,
+        "the first step is the half Newton step: decrease {first:.9e} against {expected:.9e}",
+    );
+    assert!(
+        published[0].abs() < 1.0e-3,
+        "published {:.3e}",
+        published[0]
+    );
+}
+
+/// A scripted criterion whose Newton step lowers it but lands where the
+/// decrement is larger: at `ρ = 1` the gradient and curvature are `c` (so
+/// `λ̂² = n·c`), and at `ρ = 0` the gradient doubles (`λ̂² = 4n·c`). The polish
+/// does not move along a Newton sequence that stopped contracting (#3012): it
+/// refuses by name.
+#[test]
+fn a_decrement_that_stops_contracting_ends_the_polish_3012() {
+    const C: f64 = 1.0e-5;
+    let (outcome, _) = certify_scripted_2954(
+        2_000,
+        1.0,
+        (-20.0, 20.0),
+        None,
+        |rho| {
+            if rho > 0.5 {
+                [0.6 + C * rho, C, C]
+            } else {
+                [0.6 + C * rho, 2.0 * C, C]
+            }
+        },
+        None,
+    );
+    let message = outcome
+        .expect_err("a decrement that grew after the step must not certify")
+        .to_string();
+    assert!(
+        message.contains("Newton-decrement above tolerance after polish")
+            && message.contains("the Newton decrement stopped contracting"),
+        "{message}",
+    );
+}
+
+/// A criterion whose value does not fall along the Newton step its own gradient
+/// and Hessian describe, on a route whose bounds are both limit models: the
+/// backtrack halves the step down to where the quadratic model's own decrease
+/// reaches `band_f` and finds no resolved decrease, no limit face lowers the
+/// criterion either, and the mint refuses by the typed
+/// `newton-backtrack-unresolved` rung (#3012), with the checkpoint where it was
+/// judged.
+#[test]
+fn a_backtrack_without_a_resolved_decrease_is_a_typed_refusal_3012() {
+    let theta = 5.0e-4;
+    let (outcome, published) = certify_scripted_2954(
+        2_000,
+        theta,
+        (-20.0, 20.0),
+        Some((true, true)),
+        |rho| [0.6, rho, 1.0],
+        None,
+    );
+    let error = outcome.expect_err("a decrease the criterion never delivers must not certify");
+    let message = error.to_string();
+    assert!(
+        message.contains("Newton-decrement above tolerance after polish")
+            && message.contains("no step along the Newton step lowers the criterion"),
+        "{message}",
+    );
+    match &error {
+        EstimationError::RemlDidNotConverge {
+            stationarity_standard,
+            ..
+        } => assert_eq!(
+            stationarity_standard.rung().map(|rung| rung.label),
+            Some("newton-backtrack-unresolved"),
+            "{message}",
+        ),
+        other => panic!("expected a typed outer refusal, got {other:?}"),
+    }
+    assert_eq!(published[0].to_bits(), theta.to_bits());
 }
