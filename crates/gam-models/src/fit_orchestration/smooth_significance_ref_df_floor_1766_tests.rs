@@ -77,7 +77,10 @@ fn smooth_lr_report(x: &[f64], y: &[f64]) -> super::drivers::SmoothTermLrInferen
     )
     .expect("smooth-term LR inference");
     assert_eq!(reports.len(), 1, "exactly one smooth term expected");
-    reports.into_iter().next().expect("one smooth term")
+    let report = reports.into_iter().next().expect("one smooth term");
+    report
+        .outcome
+        .unwrap_or_else(|reason| panic!("{}: no LR inference: {reason}", report.name))
 }
 
 #[test]

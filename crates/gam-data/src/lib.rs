@@ -7,7 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
-fn natural_level_cmp(a: &str, b: &str) -> Ordering {
+/// The canonical order of categorical level labels: byte order, except that
+/// runs of ASCII digits compare by numeric value (`"x2" < "x10"`). Every
+/// surface that sorts levels (canonical codes, two-level response coding)
+/// uses this one comparator.
+pub fn natural_level_cmp(a: &str, b: &str) -> Ordering {
     let mut ia = 0;
     let mut ib = 0;
     let ba = a.as_bytes();
@@ -672,6 +676,81 @@ impl EncodedDataset {
                 }
             })
             .collect()
+    }
+
+    /// The table made of the rows `keep` (in that order), encoded exactly as
+    /// that sub-table would have been encoded on its own.
+    ///
+    /// Everything the encoder derives from the rows is re-derived from the kept
+    /// rows: a numeric column's kind is re-inferred (a column that is binary on
+    /// the kept rows is `Binary`), and a categorical column keeps only the
+    /// levels a kept row carries, in canonical order, with its codes remapped.
+    /// A row absent from `keep` therefore leaves no trace in the result.
+    pub fn select_rows(&self, keep: &[usize]) -> Result<EncodedDataset, DataError> {
+        let n = self.values.nrows();
+        if let Some(&row) = keep.iter().find(|&&row| row >= n) {
+            return Err(DataError::InvalidValue {
+                reason: format!("row selection index {row} is outside the table's {n} rows"),
+            });
+        }
+        let mut values = self.values.select(Axis(0), keep);
+        let mut schema = self.schema.clone();
+        let mut column_kinds = self.column_kinds.clone();
+        for (j, mut column) in values.axis_iter_mut(Axis(1)).enumerate() {
+            let kind = column_kinds.get(j).copied().ok_or_else(|| DataError::SchemaMismatch {
+                reason: format!("table column {j} has no kind"),
+            })?;
+            let schema_column =
+                schema.columns.get_mut(j).ok_or_else(|| DataError::SchemaMismatch {
+                    reason: format!("table column {j} has no schema entry"),
+                })?;
+            let kept_kind = match kind {
+                ColumnKindTag::Categorical => {
+                    let n_levels = schema_column.levels.len();
+                    let mut used = vec![false; n_levels];
+                    for &code in column.iter() {
+                        if code.is_nan() {
+                            continue;
+                        }
+                        if code < 0.0 || code.fract() != 0.0 || code >= n_levels as f64 {
+                            return Err(DataError::EncodingFailure {
+                                reason: format!(
+                                    "categorical column '{}' has invalid encoded value {code}",
+                                    schema_column.name
+                                ),
+                            });
+                        }
+                        used[code as usize] = true;
+                    }
+                    let mut remap = vec![f64::NAN; n_levels];
+                    let mut levels = Vec::with_capacity(n_levels);
+                    for (old, level) in schema_column.levels.iter().enumerate() {
+                        if used[old] {
+                            remap[old] = levels.len() as f64;
+                            levels.push(level.clone());
+                        }
+                    }
+                    for code in column.iter_mut() {
+                        if !code.is_nan() {
+                            *code = remap[*code as usize];
+                        }
+                    }
+                    schema_column.levels = levels;
+                    ColumnKindTag::Categorical
+                }
+                ColumnKindTag::Continuous | ColumnKindTag::Binary => {
+                    infer_numeric_column_kind(column.iter().copied())
+                }
+            };
+            schema_column.kind = kept_kind;
+            column_kinds[j] = kept_kind;
+        }
+        Ok(EncodedDataset {
+            headers: self.headers.clone(),
+            values,
+            schema,
+            column_kinds,
+        })
     }
 }
 
@@ -3049,6 +3128,43 @@ mod missing_value_inference_tests {
             err.contains("non-finite"),
             "expected the non-finite guard, got: {err}"
         );
+    }
+
+    /// Selecting rows of an encoded table is the same as encoding just those
+    /// rows: kinds are re-inferred, and factor levels only the dropped rows
+    /// carried disappear with the codes renumbered in canonical order.
+    #[test]
+    fn select_rows_matches_encoding_the_kept_rows_alone() {
+        let headers = || vec!["x".to_string(), "b".to_string(), "g".to_string(), "w".to_string()];
+        let all = [
+            ["0.5", "0", "g2", "1"],
+            ["1.5", "2", "g10", "0"],
+            ["2.5", "1", "g1", "1"],
+            ["3.5", "NA", "g10", "0"],
+            ["4.5", "1", "g10", "1"],
+        ];
+        let record = |r: &[&str; 4]| StringRecord::from(r.to_vec());
+        let full = encode_recordswith_inferred_schema(headers(), all.iter().map(record).collect())
+            .expect("encode full table");
+        let keep = [0usize, 2, 4];
+        let subset = encode_recordswith_inferred_schema(
+            headers(),
+            keep.iter().map(|&i| record(&all[i])).collect(),
+        )
+        .expect("encode kept rows");
+        assert_eq!(full.column_kinds[1], ColumnKindTag::Continuous);
+        assert_eq!(full.schema.columns[2].levels, vec!["g1", "g2", "g10"]);
+        let selected = full.select_rows(&keep).expect("select rows");
+        assert_eq!(selected.headers, subset.headers);
+        assert_eq!(format!("{:?}", selected.schema), format!("{:?}", subset.schema));
+        assert_eq!(selected.column_kinds, subset.column_kinds);
+        assert_eq!(selected.values, subset.values);
+        assert_eq!(selected.column_kinds[1], ColumnKindTag::Binary);
+        assert_eq!(selected.schema.columns[2].levels, vec!["g1", "g2", "g10"]);
+        let without_g1 = full.select_rows(&[0, 1, 4]).expect("select rows");
+        assert_eq!(without_g1.schema.columns[2].levels, vec!["g2", "g10"]);
+        assert_eq!(without_g1.values.column(2).to_vec(), vec![0.0, 1.0, 1.0]);
+        assert!(full.select_rows(&[5]).is_err());
     }
 }
 

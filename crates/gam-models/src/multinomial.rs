@@ -3658,6 +3658,15 @@ fn multinomial_joint_penalty_operator(
 pub fn fit_penalized_multinomial_formula(
     request: &MultinomialFitRequest<'_>,
 ) -> Result<MultinomialSavedModel, EstimationError> {
+    if let std::borrow::Cow::Owned(kept) =
+        crate::fit_orchestration::drop_zero_weight_rows(request.data, request.config)
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+    {
+        return fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            data: &kept,
+            ..*request
+        });
+    }
     let PenalizedMultinomialFormulaParts {
         family,
         blocks,
