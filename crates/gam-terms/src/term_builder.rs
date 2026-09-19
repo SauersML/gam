@@ -585,6 +585,9 @@ pub fn build_termspec(
                     .map(|raw| crate::smooth::parse_shape_expr(&raw))
                     .transpose()
                     .map_err(TermBuilderError::invalid_option)?;
+                if let Some(expr) = &shape_expr {
+                    default_shaped_tensor_margins(*kind, smooth_vars.len(), expr, &mut inner_options);
+                }
                 // A categorical by= expands into per-level blocks below; size
                 // the inner basis's n-scaling defaults from the smallest
                 // level's rows, not the pooled count (see
@@ -2232,6 +2235,40 @@ pub(crate) fn smooth_options_declare_periodic(options: &BTreeMap<String, String>
 /// type and must not be fed through [`canonicalize_smooth_type`] — it has to be
 /// recognized as a tensor request and split into per-margin types. A scalar
 /// selector (`bs="tp"`) is left untouched.
+/// Margin bases for a shaped `te()`/`ti()` whose `bs=` the user left unset.
+///
+/// The unset tensor margin is mgcv's cubic regression spline, whose
+/// coefficients are knot values rather than B-spline control points, so no
+/// coefficient cone certifies its shape. A margin carrying a shape entry is
+/// therefore realized as an open B-spline (`ps`) margin, the chart the exact
+/// cone is written in; unconstrained margins keep the `cr` default. An
+/// explicit `bs=` is left alone, and a list that does not have one entry per
+/// margin is left for `resolve_shape_spec` to refuse.
+fn default_shaped_tensor_margins(
+    kind: SmoothKind,
+    dim: usize,
+    shape: &crate::smooth::ShapeExpr,
+    options: &mut BTreeMap<String, String>,
+) {
+    if !matches!(kind, SmoothKind::Te | SmoothKind::Ti)
+        || options.contains_key("bs")
+        || options.contains_key("type")
+    {
+        return;
+    }
+    let crate::smooth::ShapeExpr::List(entries) = shape else {
+        return;
+    };
+    if entries.len() != dim {
+        return;
+    }
+    let margins: Vec<&str> = entries
+        .iter()
+        .map(|entry| if entry.is_none() { "cr" } else { "ps" })
+        .collect();
+    options.insert("bs".to_string(), format!("[{}]", margins.join(", ")));
+}
+
 pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
     let trimmed = raw.trim();
     let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
