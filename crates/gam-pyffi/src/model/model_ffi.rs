@@ -3336,11 +3336,6 @@ fn duchon_function_norm_penalty<'py>(
 ///   of centers and therefore the basis dimension `K`.
 /// * `"harmonic"` — a truncated spherical-harmonic basis of degree
 ///   `L = n_centers` (basis dim `K = L * (L + 2)`).
-/// * `"pseudo"` — the pseudodifferential kernel is resolved by the builder to
-///   the harmonic engine (its low-degree start avoids the finite-center
-///   constant-collision the Wahba chart hits; see `term_design`). Here
-///   `n_centers` is a *target width* that selects a harmonic degree `L`, so
-///   the basis dimension is `K = L * (L + 2)`, not the literal `n_centers`.
 ///
 /// Returns `(design, penalty)` as numpy arrays, with shapes `(N, K)` and
 /// `(K, K)` respectively, where `K` is the chosen basis dimension after
@@ -3368,7 +3363,6 @@ fn sphere_basis<'py>(
     }
     let (method, wahba_kernel, max_degree) = match kernel.to_ascii_lowercase().as_str() {
         "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev, None),
-        "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo, None),
         "harmonic" => (
             SphereMethod::Harmonic,
             SphereWahbaKernel::Sobolev,
@@ -3376,7 +3370,7 @@ fn sphere_basis<'py>(
         ),
         other => {
             return Err(py_value_error(format!(
-                "sphere_basis kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+                "sphere_basis kernel must be one of 'sobolev', 'harmonic'; got '{other}'"
             )));
         }
     };
@@ -3479,7 +3473,6 @@ fn sphere_basis_with_centers<'py>(
     }
     let (method, wahba_kernel, max_degree) = match kernel.to_ascii_lowercase().as_str() {
         "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev, None),
-        "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo, None),
         "harmonic" => (
             SphereMethod::Harmonic,
             SphereWahbaKernel::Sobolev,
@@ -3487,7 +3480,7 @@ fn sphere_basis_with_centers<'py>(
         ),
         other => {
             return Err(py_value_error(format!(
-                "sphere_basis_with_centers kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+                "sphere_basis_with_centers kernel must be one of 'sobolev', 'harmonic'; got '{other}'"
             )));
         }
     };
@@ -3534,10 +3527,9 @@ fn sphere_kernel_kind_from_str(
 ) -> PyResult<(SphereMethod, SphereWahbaKernel)> {
     match kernel.to_ascii_lowercase().as_str() {
         "sobolev" => Ok((SphereMethod::Wahba, SphereWahbaKernel::Sobolev)),
-        "pseudo" => Ok((SphereMethod::Wahba, SphereWahbaKernel::Pseudo)),
         "harmonic" => Ok((SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)),
         other => Err(py_value_error(format!(
-            "{site} kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+            "{site} kernel must be one of 'sobolev', 'harmonic'; got '{other}'"
         ))),
     }
 }

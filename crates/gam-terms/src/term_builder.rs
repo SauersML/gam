@@ -17,9 +17,9 @@ use crate::basis::{
     MaternLengthScale, MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability,
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
+    auto_spatial_center_strategy, default_num_centers,
     default_spatial_center_strategy, default_spherical_harmonic_degree,
-    select_r_uniform_subsample_centers, thin_plate_penalty_order,
+    thin_plate_penalty_order,
 };
 use crate::fit_notes::FitNoteSink;
 use crate::inference::formula_dsl::{
@@ -3284,25 +3284,26 @@ pub(crate) fn build_smooth_basis(
                     }
                 });
             let (method, wahba_kernel) = match kernel.as_str() {
-                "sobolev" | "wahba" | "wahba_sobolev" | "wahba-sobolev" => {
-                    (SphereMethod::Wahba, SphereWahbaKernel::Sobolev)
-                }
-                "pseudo" | "mgcv" | "sos" | "wahba_pseudo" | "wahba-pseudo" => {
-                    (SphereMethod::Wahba, SphereWahbaKernel::Pseudo)
-                }
-                "harmonic" | "spherical_harmonic" | "spherical-harmonic" => {
-                    (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)
+                "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev),
+                "harmonic" => (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev),
+                removed @ ("pseudo" | "mgcv" | "sos" | "wahba_pseudo" | "wahba-pseudo") => {
+                    return Err(format!(
+                        "sphere kernel '{removed}' has been removed: the Wahba 1981 pseudo-spline \
+                         kernel it named is not provided; use kernel=sobolev (the H^m(S^2) \
+                         reproducing kernel, the default) or kernel=harmonic (spherical \
+                         harmonics with the same Laplace-Beltrami penalty)"
+                    ));
                 }
                 other => {
                     return Err(format!(
-                        "unsupported sphere kernel '{other}'; expected sobolev, pseudo, or harmonic"
+                        "unsupported sphere kernel '{other}'; expected sobolev or harmonic"
                     ));
                 }
             };
             // `lmax=` states a finite spectral resolution for a Wahba kernel,
             // selecting the truncated variant `Σ_{ℓ=1..lmax} c_ℓ P_ℓ(cos γ)`
             // instead of the closed form. This is the only route from the
-            // formula surface to `SobolevTruncated`/`PseudoTruncated`, and it
+            // formula surface to `SobolevTruncated`, and it
             // is what makes `m=1` expressible at all: the untruncated Sobolev
             // `m = 1` kernel is log-singular at coincidence, so it has no Gram
             // diagonal and the basis builder refuses it (#2475). Before this
@@ -3327,15 +3328,7 @@ pub(crate) fn build_smooth_basis(
                             SPHERE_TRUNCATION_LMAX_RANGE.end()
                         ));
                     }
-                    let lmax = lmax as u16;
-                    match wahba_kernel {
-                        SphereWahbaKernel::Sobolev | SphereWahbaKernel::SobolevTruncated { .. } => {
-                            SphereWahbaKernel::SobolevTruncated { lmax }
-                        }
-                        SphereWahbaKernel::Pseudo | SphereWahbaKernel::PseudoTruncated { .. } => {
-                            SphereWahbaKernel::PseudoTruncated { lmax }
-                        }
-                    }
+                    SphereWahbaKernel::SobolevTruncated { lmax: lmax as u16 }
                 }
             };
             let max_degree = if matches!(method, SphereMethod::Harmonic) {
@@ -3761,21 +3754,14 @@ pub(crate) fn build_smooth_basis(
                 univariate_floor,
             );
             let spectral_rank = option_usize(options, "rank")?;
-            let center_default = if spectral_rank.is_some() {
-                // mgcv's Duchon constructor runs `uniquecombs` FIRST and caps
-                // at `max.knots` afterwards, so its knot budget is
-                // `min(n_unique, 2000)`. This took the RAW row count and let
-                // `select_r_uniform_subsample_centers` deduplicate later — so
-                // on any data carrying a repeated coordinate row with fewer
-                // than 2000 rows, the budget exceeded what the sampler could
-                // supply and the fit hard-refused rather than degrading
-                // (#2623: `prostate_gamair`, 523 requested vs 522 unique).
-                // Counting distinct rows here makes the budget satisfiable by
-                // construction, and leaves the retained spectral `rank` — a
-                // separate option — untouched.
-                count_unique_coordinate_rows(ds.values.view(), &cols).min(2000)
-            } else {
-                cap_default_spatial_centers(options, default_centers)?
+            let center_default = match spectral_rank {
+                // The spectral basis keeps the leading `rank` eigenvectors of the
+                // kernel on its landmark set, so the landmarks are sized by the
+                // engine's own n^0.4 spatial landmark budget rather than the
+                // low-rank Duchon default, and never below the retained rank a
+                // landmark set of that size must be able to span.
+                Some(rank) => default_num_centers(sizing_rows, cols.len()).max(rank),
+                None => cap_default_spatial_centers(options, default_centers)?,
             };
             let requested_centers =
                 parse_countwith_basis_alias(options, "centers", center_default)?;
@@ -3872,22 +3858,11 @@ pub(crate) fn build_smooth_basis(
                 .to_string());
             }
             let center_strategy = if spectral_rank.is_some() {
-                // Freeze the exact fixed-seed uniform landmark experiment used
-                // by mgcv's Duchon constructor. Spectral rank parity requires
-                // the same kernel matrix, not merely the same retained column
-                // count: maximin/equal-mass landmarks define a different
-                // finite-sample eigenspace and confound accuracy comparisons.
-                // Materializing 2,000×d coordinates here is cheap, avoids an
-                // O(nk) maximin pass, and makes prediction replay explicit.
-                let mut coordinates = Array2::<f64>::zeros((ds.values.nrows(), cols.len()));
-                for (axis, &column) in cols.iter().enumerate() {
-                    coordinates
-                        .column_mut(axis)
-                        .assign(&ds.values.column(column));
-                }
-                let sampled = select_r_uniform_subsample_centers(coordinates.view(), centers, 1)
-                    .map_err(|error| error.to_string())?;
-                CenterStrategy::UserProvided(sampled)
+                // The landmarks are the same space-filling design as every other
+                // Duchon smooth, held at the requested count: the joint spatial
+                // planner may not resize a set whose count the retained rank is
+                // checked against.
+                duchon_center_strategy(centers, cols.len(), false)
             } else if is_periodic {
                 if centers_explicit {
                     spatial_center_strategy_for_dimension(centers, cols.len())

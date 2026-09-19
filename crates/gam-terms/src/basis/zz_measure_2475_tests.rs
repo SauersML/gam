@@ -3,16 +3,14 @@
 //! The untruncated Sobolev kernel at `m = 1` has no finite coincident-point
 //! value, so no public Gram-matrix constructor may reach its epsilon-floored
 //! scalar evaluator. The explicit truncated kernel remains the honest way to
-//! choose a finite resolution. Pseudo-Wahba `m = 1` is a different kernel with
-//! a finite analytic diagonal and must remain supported.
+//! choose a finite resolution.
 //!
-//! The remaining tests preserve the independent pseudo-limit and spherical-jet
-//! regressions discovered while tracing the original shared-floor defect.
+//! The remaining tests preserve the independent spherical-jet regressions
+//! discovered while tracing the original shared-floor defect.
 
 use super::sphere_half_angle::HalfAngleSeparation;
 use super::sphere_kernels::{
-    wahba_sphere_kernel_pseudo, wahba_sphere_kernel_pseudo_coincident, wahba_sphere_kernel_sobolev,
-    wahba_sphere_kernel_sobolev_derivative_dhav,
+    wahba_sphere_kernel_sobolev, wahba_sphere_kernel_sobolev_derivative_dhav,
 };
 use super::sphere_spectral::{
     sobolev_s2_truncated_coefficients, sphere_truncated_spectral_derivative_eval,
@@ -31,10 +29,6 @@ fn sep_from_cos(cos_gamma: f64) -> HalfAngleSeparation {
         u: (1.0 - cos_g) * 0.5,
         v: (1.0 + cos_g) * 0.5,
     }
-}
-
-fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
-    wahba_sphere_kernel_pseudo(sep_from_cos(cos_gamma), m)
 }
 
 fn wahba_sphere_kernel_sobolev_closed_form(cos_gamma: f64, m: usize) -> f64 {
@@ -57,147 +51,6 @@ fn sobolev_truncated_diagonal(m: i32, l_max: usize) -> f64 {
             (2.0 * lf + 1.0) / (FOUR_PI * (lf * (lf + 1.0)).powi(m))
         })
         .sum()
-}
-
-// ---------------------------------------------------------------------------
-// 1. FIXED: the pseudo-spline diagonal is a closed form, not a floor.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn zz_measure_2475_pseudo_coincident_matches_closed_form_and_spectral_sum() {
-    // `1/(2π·m·(m+1)!)` for m = 1..4.
-    let expected = [
-        1.0 / (4.0 * std::f64::consts::PI),
-        1.0 / (24.0 * std::f64::consts::PI),
-        1.0 / (144.0 * std::f64::consts::PI),
-        1.0 / (960.0 * std::f64::consts::PI),
-    ];
-    println!(
-        "\n{:>2} {:>24} {:>24} {:>12} {:>12}",
-        "m", "K_m(0) = 1/(2pi m (m+1)!)", "spectral sum (L=50)", "tail_rel", "rel_legacy"
-    );
-    for (idx, &want) in expected.iter().enumerate() {
-        let m = idx + 1;
-
-        // The kernel now returns the analytic limit at coincidence.
-        let got = wahba_sphere_kernel_pseudo_from_cos(1.0, m);
-        assert_eq!(
-            got, want,
-            "pseudo m={m} coincident value must be exactly 1/(2pi*m*(m+1)!)"
-        );
-        assert_eq!(got, wahba_sphere_kernel_pseudo_coincident(m));
-
-        // Independent confirmation: the truncated spectral sum of the SAME
-        // kernel's coefficients differs from the closed form by EXACTLY the
-        // analytic truncation tail. The same telescoping identity that gives
-        // `K_m(0) = 1/(2π·m·(m+1)!)` gives the tail with `(L+k)` in place of
-        // `k`:
-        //     Σ_{ℓ>L} c_ℓ = 1 / (2π · m · Π_{k=2..m+1} (L+k)).
-        // Matching it to nine digits validates the identity twice over.
-        const L: usize = 50;
-        let coeffs = super::sphere_spectral::pseudo_s2_truncated_coefficients(L, m);
-        let spectral: f64 = coeffs.iter().sum();
-        let tail_product: f64 = (2..=(m + 1)).map(|k| (L + k) as f64).product();
-        let tail = 1.0 / (2.0 * std::f64::consts::PI * (m as f64) * tail_product);
-        let residual = want - spectral;
-        let tail_rel = (residual - tail).abs() / tail;
-
-        // What the old shared floor produced instead.
-        let legacy = {
-            let w = 0.5 * LEGACY_FLOOR;
-            let c0 = w.sqrt();
-            want - 2.0 * c0 / (2.0 * std::f64::consts::PI)
-        };
-        let rel_legacy = (legacy - want).abs() / want;
-
-        println!("{m:>2} {want:>24.16e} {spectral:>24.16e} {tail_rel:>12.2e} {rel_legacy:>12.2e}");
-
-        assert!(
-            tail_rel < 1e-9,
-            "pseudo m={m}: closed form {want:.17e} minus the L={L} spectral sum \
-             {spectral:.17e} gives {residual:.6e}, but the analytic tail is \
-             {tail:.6e} (rel {tail_rel:.3e})"
-        );
-    }
-    // The m=1 site is where the old floor actually cost something.
-    println!(
-        "\n  the legacy floor's error was the -2*sqrt(w) term, O(sqrt(floor)): \
-         4.2e-10 relative at m=1, roundoff at m>=2.\n"
-    );
-}
-
-#[test]
-fn zz_measure_2475_pseudo_floor_shrinking_has_a_hard_subnormal_floor_of_its_own() {
-    // #2475 suggested `f64::MIN_POSITIVE` as a floor that "recovers all four
-    // analytic limits exactly". That is correct — MIN_POSITIVE is the smallest
-    // NORMAL (2.225e-308), `w = 0.5*z` stays subnormal-but-nonzero, and the
-    // `-2√w` and `2aw` terms both vanish below the ulp of the leading constant.
-    // Recorded here so the claim is pinned rather than assumed.
-    let limits = [
-        1.0 / (4.0 * std::f64::consts::PI),
-        1.0 / (24.0 * std::f64::consts::PI),
-        1.0 / (144.0 * std::f64::consts::PI),
-        1.0 / (960.0 * std::f64::consts::PI),
-    ];
-    for (idx, &want) in limits.iter().enumerate() {
-        let m = idx + 1;
-        let got = wahba_sphere_kernel_pseudo_from_cos(1.0 - f64::MIN_POSITIVE, m);
-        assert_eq!(got, want, "MIN_POSITIVE floor recovers the m={m} limit");
-    }
-
-    // But shrinking the floor is not unconditionally safe: one more halving,
-    // to the smallest SUBNORMAL, makes `w = 0.5*z` underflow to zero, and then
-    // `1/c0 = +inf` turns the `2·a·w` term into `inf · 0 = NaN`. The analytic
-    // limit the kernel now takes has no such cliff.
-    let z = f64::from_bits(1); // 4.94e-324, smallest positive subnormal
-    let w = 0.5 * z;
-    assert_eq!(w, 0.0, "half the smallest subnormal rounds to zero");
-    let a = (1.0 + 1.0 / w.sqrt()).ln();
-    assert!(a.is_infinite());
-    assert!((2.0 * a * w).is_nan(), "2*a*w would be inf * 0 = NaN");
-
-    for m in 1..=4 {
-        assert!(wahba_sphere_kernel_pseudo_from_cos(1.0, m).is_finite());
-    }
-}
-
-#[test]
-fn zz_measure_2475_pseudo_change_is_confined_to_exact_coincidence() {
-    // Removing the floor must not perturb any input it could not reach. The
-    // smallest positive `1 - cos γ` is 2⁻⁵³, nine orders above the old floor,
-    // so every non-coincident value is bit-identical to the floored form.
-    let legacy = |cos_gamma: f64, m: usize| -> f64 {
-        let cg = cos_gamma.clamp(-1.0, 1.0);
-        let z = (1.0 - cg).max(LEGACY_FLOOR);
-        assert!(z > 0.0);
-        // Re-run the shipped arithmetic on the floored z by feeding back a
-        // cos γ that reproduces it exactly.
-        wahba_sphere_kernel_pseudo_from_cos(1.0 - z, m)
-    };
-    let mut checked = 0usize;
-    for k in 1..=64u64 {
-        // Representable neighbours of 1.0 from below, plus a coarse sweep.
-        let cos_gamma = 1.0 - (k as f64) * f64::EPSILON / 2.0;
-        for m in 1..=4 {
-            assert_eq!(
-                wahba_sphere_kernel_pseudo_from_cos(cos_gamma, m),
-                legacy(cos_gamma, m),
-                "m={m} at 1 - {k} ulp must be unchanged by dropping the floor"
-            );
-            checked += 1;
-        }
-    }
-    for i in 0..200 {
-        let cos_gamma = -1.0 + 2.0 * (i as f64) / 199.0;
-        for m in 1..=4 {
-            assert_eq!(
-                wahba_sphere_kernel_pseudo_from_cos(cos_gamma, m),
-                legacy(cos_gamma, m)
-            );
-            checked += 1;
-        }
-    }
-    println!("\n  {checked} non-coincident evaluations, all bit-identical\n");
 }
 
 // ---------------------------------------------------------------------------

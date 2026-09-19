@@ -60,9 +60,9 @@ fn sphere_fit_predictions_stay_finite_and_close_to_truth_across_seeds() {
     let mut rmses = Vec::new();
     for seed in [3u64, 7, 11, 17, 23] {
         let data = make_dataset(300, seed);
-        // Use the pseudo-spline path (the historically fragile one) at m=4.
+        // The high-order harmonic construction at m=4.
         let result = fit_from_formula(
-            "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)",
+            "y ~ sphere(lat, lon, k=25, m=4, kernel=harmonic)",
             &data,
             &cfg,
         )

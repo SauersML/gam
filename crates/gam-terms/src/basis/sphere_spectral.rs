@@ -1,8 +1,8 @@
 //! Truncated spectral coefficient builders and Legendre-recurrence evaluation
-//! for intrinsic S² (sphere) Wahba/pseudo-spline smooths.
+//! for intrinsic S² (sphere) Wahba smooths.
 //!
-//! These three routines are pure scalar math (no dependency on the rest of the
-//! basis machinery): two build the truncated per-degree coefficient array the
+//! These routines are pure scalar math (no dependency on the rest of the
+//! basis machinery): one builds the truncated per-degree coefficient array the
 //! `s2_wahba_legendre_colmajor` GPU kernel uploads, and one evaluates the
 //! corresponding zonal kernel `Σ_ℓ c_ℓ P_ℓ(cos γ)` via the same Legendre
 //! 3-term recurrence the kernel runs, so CPU and GPU paths stay bit-aligned.
@@ -19,22 +19,6 @@ pub(crate) fn sobolev_s2_truncated_coefficients(lmax: usize, m: usize) -> Vec<f6
         let l = ell as f64;
         let eigen = (l * (l + 1.0)).powi(mi);
         coeffs[ell] = (2.0 * l + 1.0) / (four_pi * eigen);
-    }
-    coeffs
-}
-
-/// Build the truncated pseudo-spline coefficient array
-/// `c_0 = 0`, `c_ℓ = 2 / (4π · Π_{k=1..m+1}(ℓ + k))` for `ℓ = 1..=lmax`.
-pub(crate) fn pseudo_s2_truncated_coefficients(lmax: usize, m: usize) -> Vec<f64> {
-    let four_pi = 4.0 * std::f64::consts::PI;
-    let mut coeffs = vec![0.0_f64; lmax + 1];
-    for ell in 1..=lmax {
-        let l = ell as f64;
-        let mut denom = 1.0_f64;
-        for k in 1..=(m + 1) {
-            denom *= l + k as f64;
-        }
-        coeffs[ell] = 2.0 / (four_pi * denom);
     }
     coeffs
 }

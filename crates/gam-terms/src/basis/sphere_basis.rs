@@ -7,16 +7,6 @@ pub fn build_spherical_spline_basis(
     if matches!(spec.method, SphereMethod::Harmonic) {
         return build_spherical_harmonic_basis(data, spec);
     }
-    if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
-        let mut harmonic_spec = spec.clone();
-        harmonic_spec.method = SphereMethod::Harmonic;
-        harmonic_spec.penalty_order = 2;
-        harmonic_spec.max_degree = Some(match spec.max_degree {
-            Some(degree) => degree,
-            None => harmonic_degree_for_wahba_basis_width(spec, data.nrows())?,
-        });
-        return build_spherical_harmonic_basis(data, &harmonic_spec);
-    }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
@@ -168,44 +158,6 @@ pub fn build_spherical_spline_basis(
 }
 
 pub(crate) const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
-
-/// The harmonic degree the pseudo Wahba kernel routes through: the smallest `L`
-/// with `L(L+2)` at least the requested basis width, and at least 8. Past the
-/// degree-32 cap no degree reaches the width, and the build is refused rather
-/// than handed a row-count default that silently shrinks the basis.
-pub(crate) fn harmonic_degree_for_wahba_basis_width(
-    spec: &SphericalSplineBasisSpec,
-    n_rows: usize,
-) -> Result<usize, BasisError> {
-    let target = match &spec.center_strategy {
-        CenterStrategy::Auto(inner) => match inner.as_ref() {
-            CenterStrategy::FarthestPoint { num_centers }
-            | CenterStrategy::EqualMass { num_centers }
-            | CenterStrategy::EqualMassCovarRepresentative { num_centers }
-            | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
-            CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
-            CenterStrategy::UserProvided(centers) => centers.nrows(),
-            CenterStrategy::Auto(_) => default_num_centers(n_rows, 2),
-            CenterStrategy::DuchonSpectral { knots, .. } => knots.planned_num_centers(2),
-        },
-        CenterStrategy::FarthestPoint { num_centers } => *num_centers,
-        CenterStrategy::EqualMass { num_centers } => *num_centers,
-        CenterStrategy::EqualMassCovarRepresentative { num_centers } => *num_centers,
-        CenterStrategy::KMeans { num_centers, .. } => *num_centers,
-        CenterStrategy::UniformGrid { points_per_dim } => points_per_dim.saturating_pow(2),
-        CenterStrategy::UserProvided(centers) => centers.nrows(),
-        CenterStrategy::DuchonSpectral { knots, .. } => knots.planned_num_centers(2),
-    }
-    .max(1);
-    let Some(degree) = (1..=32).find(|&l| l * (l + 2) >= target) else {
-        crate::bail_invalid_basis!(
-            "the pseudo sphere kernel routes through spherical harmonics, and {target} basis \
-             columns need a degree above the cap of 32 (1088 columns); use at most 1088 centers \
-             or the sobolev kernel"
-        );
-    };
-    Ok(degree.max(8))
-}
 
 fn real_spherical_harmonic_design_up_to_degree(
     data: ArrayView2<'_, f64>,
