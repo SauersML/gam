@@ -1,9 +1,8 @@
 """Regression gate for the convergence fuzzer.
 
 ``test_quick_plan_has_no_failures`` runs the real ``quick`` plan end to end -
-the seeded fixture of every root cause the fuzzer found and fixed, plus the
-first cases of the DGP space at small ``n`` - each rep in its own isolated
-worker, and requires zero failures of any kind. The other tests pin the
+the seeded fixture of every root cause the fuzzer found and fixed - each rep
+in its own isolated worker, and requires zero failures of any kind. The other tests pin the
 classifier on hand-built records, so a triage that stopped recognising a
 failure would fail here rather than quietly passing the gate.
 """

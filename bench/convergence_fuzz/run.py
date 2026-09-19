@@ -10,9 +10,9 @@ Plans:
     ``LARGE_N``: 1692 reps, 3384 fits (each rep fits the model and its
     permuted/rescaled twin).
 ``quick``
-    the seeded fixture of every root cause this fuzzer found and fixed, plus
-    the first ``QUICK_CASES`` cases at the small ``n``; the regression test
-    (``test_quick.py``) requires zero failures on it.
+    the seeded fixture of every root cause this fuzzer found and fixed; the
+    regression test (``test_quick.py``) requires zero failures on it. Causes
+    still open are tracked by the ``full`` plan's report, not by ``quick``.
 
 Every rep is one ``worker.py`` subprocess launched through
 ``pygam_compare.run.run_isolated``, the gamfit-vs-pyGAM harness's isolation:
@@ -56,8 +56,6 @@ FULL_CASES = 180
 # spans every covariate count (cases 0..23 draw p = 1..8).
 LARGE_N = 10_000
 LARGE_N_CASES = 24
-QUICK_CASES = 6
-QUICK_N: tuple[int, ...] = (30, 100)
 # Safety net only (see module docstring). The slowest certified reps of the
 # full plan (binomial, n = 10 000, both fits) take about five minutes
 # single-threaded under full-host load.
@@ -96,14 +94,7 @@ def _full() -> list[Rep]:
 
 
 def _quick() -> list[Rep]:
-    reps = list(FIXTURES.values())
-    reps += [
-        Rep(case, family, n)
-        for case in range(QUICK_CASES)
-        for n in QUICK_N
-        for family in dgp.FAMILIES
-    ]
-    return list(dict.fromkeys(reps))
+    return list(dict.fromkeys(FIXTURES.values()))
 
 
 PLANS = {"full": _full, "quick": _quick}

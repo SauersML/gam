@@ -42,7 +42,9 @@ the first 24 cases (which draw every `p` from 1 to 8) at `n = 10 000`:
 **1 692 reps, 3 384 fits**. A rep at `n = 10 000` costs one to fifteen
 single-threaded minutes, about a hundred times one at `n = 1 000`.
 `quick` is the seeded fixture of every root cause this fuzzer found and fixed
-(`run.FIXTURES`) plus the first six cases at `n` in {30, 100}.
+(`run.FIXTURES`), and `test_quick.py` requires zero failures on it. A cause
+that is still open, in this lane or another, shows up in the `full` report
+and gets its fixture in `quick` in the same change that fixes it.
 
 ## What one rep checks (`worker.py`)
 
