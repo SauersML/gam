@@ -3314,6 +3314,7 @@ impl WorkingModelSurvival {
         let penalty_quadratic = state.penalty_term;
 
         let mut result = InnerAssembly {
+            cone_normalizer: None,
             log_likelihood: state.log_likelihood,
             penalty_quadratic,
             beta: reparam_inner.beta_transformed,

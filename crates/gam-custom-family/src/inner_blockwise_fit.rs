@@ -3771,6 +3771,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     cached.block_logdet_s,
                 );
                 return Ok(BlockwiseInnerResult {
+                    cone_normalizer: None,
                     solved_inner_tol: cached.solved_inner_tol,
                     block_states: states,
                     terminal_working_sets: cached.terminal_working_sets.clone(),
@@ -5076,6 +5077,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
     };
 
     Ok(BlockwiseInnerResult {
+        cone_normalizer: None,
         solved_inner_tol: options.inner_tol,
         block_states: states,
         terminal_working_sets: Some(cached_eval.blockworking_sets.clone()),

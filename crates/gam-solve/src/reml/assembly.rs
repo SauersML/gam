@@ -332,6 +332,9 @@ pub struct InnerAssembly<'dp> {
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
     pub active_constraints: Option<Arc<crate::model_types::ActiveLinearConstraintBlock>>,
+    /// The constraint system and KKT gradient the constrained Laplace normalizer reads
+    /// (gam#2765); `None` prices no truncation.
+    pub cone_normalizer: Option<Arc<crate::estimate::reml::reml_outer_engine::ConeNormalizerInput>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
@@ -373,6 +376,7 @@ impl<'dp> InnerAssembly<'dp> {
         builder = builder.barrier_config(self.barrier_config);
         builder = builder.kkt_residual(self.kkt_residual);
         builder = builder.active_constraints(self.active_constraints);
+        builder = builder.cone_normalizer(self.cone_normalizer);
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);

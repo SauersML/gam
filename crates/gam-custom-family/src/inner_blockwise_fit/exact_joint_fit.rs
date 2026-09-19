@@ -7599,6 +7599,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     score: score.clone(),
                 });
         return Ok(BlockwiseInnerResult {
+            cone_normalizer: None,
             solved_inner_tol: inner_tol,
             block_states: states,
             terminal_working_sets: cached_eval
@@ -7831,6 +7832,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     score: score.clone(),
                 });
         return Ok(BlockwiseInnerResult {
+            cone_normalizer: None,
             solved_inner_tol: inner_tol,
             block_states: states,
             terminal_working_sets: cached_eval
@@ -7910,6 +7912,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     score: score.clone(),
                 });
         return Ok(BlockwiseInnerResult {
+            cone_normalizer: None,
             solved_inner_tol: inner_tol,
             block_states: states,
             terminal_working_sets: cached_eval

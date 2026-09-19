@@ -140,6 +140,32 @@ fn pre_fit_coefficient_coordinates<F: CustomFamily + ?Sized>(
     coordinates
 }
 
+/// Does the family declare a linear inequality on any block (gam#2765)?
+///
+/// Such a family's criterion prices the constrained Laplace normalizer, which the EFS fixed point
+/// does not model, so its outer search takes the gradient route. The probe state is
+/// [`pre_fit_coefficient_coordinates`]'s. A family that cannot answer there is treated as
+/// constrained: the gradient route is valid for every family, the fixed point is not.
+fn pre_fit_declares_linear_constraints<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+) -> bool {
+    let states: Vec<ParameterBlockState> = specs
+        .iter()
+        .map(|spec| {
+            let beta = spec
+                .initial_beta
+                .clone()
+                .unwrap_or_else(|| Array1::zeros(spec.design.ncols()));
+            let eta = Array1::zeros(spec.design.nrows());
+            ParameterBlockState { beta, eta }
+        })
+        .collect();
+    specs.iter().enumerate().any(|(index, spec)| {
+        !matches!(family.block_linear_constraints(&states, index, spec), Ok(None))
+    })
+}
+
 /// The `(pilot, current)` β pair the converged drift audit prices against each
 /// other, flattened over blocks in spec order.
 ///
@@ -2598,6 +2624,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // families whose joint likelihood Hessian depends on β.
     let multi_block_beta_dependent =
         specs.len() > 1 && family.exact_newton_joint_hessian_beta_dependent();
+    // The criterion of a constrained family prices the cone normalizer, which the EFS fixed
+    // point does not model (gam#2765).
+    let prices_cone_normalizer = pre_fit_declares_linear_constraints(family, raw_specs);
     // Calibrate the outer solver to the n-scaled profiled REML/LAML objective.
     // The profiled criterion is a sum over n observations, so |f| ~ O(n) for
     // every family. Without this calibration the outer search uses a bare
@@ -2804,7 +2833,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // fit unconditionally. Where the family DOES expose an analytic Hessian
         // the requirement is unchanged and still binds, saddle escape included.
         .with_require_measured_psd(need_outer_hessian)
-        .with_disable_fixed_point(multi_block_beta_dependent)
+        .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
         .with_rel_cost_tolerance(options.outer_rel_cost_tol)
         .with_max_iter(options.outer_max_iter)

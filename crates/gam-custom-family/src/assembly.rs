@@ -187,6 +187,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         contracted_psi_second_order: contracted_psi_fn,
         kkt_residual: inner.kkt_residual.clone(),
         active_constraints: inner.active_constraints.clone(),
+        cone_normalizer: inner.cone_normalizer.clone(),
     };
 
     Ok((evaluator, ext_dim, joint_log_lambdas))
@@ -1162,7 +1163,14 @@ pub(crate) fn joint_outer_evaluate(
             }
             _ => scaled_robust_jeffreys_hphi,
         };
-    let face_tangent = criterion_face_tangent(inner)?;
+    // gam#2765: a mode whose constraints the cone normalizer integrates prices `½ log|M|` over the
+    // full space, and the normalizer carries the truncation; a face determinant would drop the
+    // pinned directions a second time.
+    let face_tangent = if inner.cone_normalizer.is_some() {
+        None
+    } else {
+        criterion_face_tangent(inner)?
+    };
 
     // Build derivative provider from the caller-supplied closures.
     let base_provider_box: Box<dyn HessianDerivativeProvider + '_> =
@@ -1811,7 +1819,12 @@ pub(crate) fn joint_outer_evaluate_efs(
             0.0,
             None,
             scaled_joint_penalty.as_ref(),
-            criterion_face_tangent(inner)?.as_ref(),
+            if inner.cone_normalizer.is_some() {
+                None
+            } else {
+                criterion_face_tangent(inner)?
+            }
+            .as_ref(),
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
@@ -1934,6 +1947,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    refuse_efs_where_the_cone_normalizer_is_priced(family, specs, &inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
@@ -2460,6 +2474,118 @@ pub(crate) fn assemble_block_local_s_psi_psi(
     }
 }
 
+/// Refuse an EFS update at a mode whose family declares linear constraints (gam#2765).
+///
+/// The EFS fixed point models the penalty-trace structure of the criterion's gradient, not the
+/// constrained Laplace normalizer's share of it, so such a mode has no EFS update. The custom-family
+/// planner disables the fixed point for these families; this refusal keeps any other route from
+/// iterating a fixed point of a different criterion.
+pub(crate) fn refuse_efs_where_the_cone_normalizer_is_priced<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+) -> Result<(), CustomFamilyError> {
+    if collect_block_linear_constraints(family, states, specs)?.iter().any(Option::is_some) {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "custom-family EFS cannot price the constrained Laplace normalizer (gam#2765); \
+                     a gradient-based outer solver prices it"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The constrained Laplace normalizer's inputs at an inner mode (gam#2765): every linear
+/// inequality row the family declares over the joint coefficients, and the unprojected gradient
+/// `∇F(β̂) = S_λβ̂ + Jβ̂ − ∇ℓ(β̂) − ∇Φ(β̂)` of the objective the inner solve drove to its KKT
+/// point. `None` when the family declares no constraint.
+///
+/// `F` is the objective the inner certificate measures: with the Jeffreys term armed it is
+/// `−ℓ + ½βᵀSβ − Φ`, so its stationarity is `∇ℓ + ∇Φ − Sβ = 0` off the active rows. The gradient
+/// is formed by the same functions that form the certificate's residual
+/// ([`exact_newton_joint_stationarity_vector_from_gradient`] and
+/// [`joint_penalty_stationarity_score`]) from the likelihood score plus `∇Φ`. Without `∇Φ` the
+/// normalizer reads `−∇Φ` as a KKT gradient at an unconstrained mode, where the evaluator takes
+/// the gradient to be stationary, so the criterion's gradient does not differentiate its value.
+pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    inner: &BlockwiseInnerResult,
+) -> Result<Option<Arc<gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput>>, CustomFamilyError>
+{
+    let states = &inner.block_states;
+    let sets = collect_block_linear_constraints(family, states, specs)?;
+    if sets.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let mut rows: Vec<Array1<f64>> = Vec::new();
+    let mut bounds: Vec<f64> = Vec::new();
+    for (block, set) in sets.iter().enumerate() {
+        let Some(set) = set else { continue };
+        let dense = set.to_dense().map_err(|reason| CustomFamilyError::Optimization {
+            context: "constrained Laplace normalizer rows",
+            reason,
+        })?;
+        let (start, end) = ranges[block];
+        for row in 0..dense.a.nrows() {
+            let mut joint = Array1::<f64>::zeros(total);
+            joint.slice_mut(s![start..end]).assign(&dense.a.row(row));
+            rows.push(joint);
+            bounds.push(dense.b[row]);
+        }
+    }
+    let score = match inner
+        .terminal_likelihood_score
+        .as_ref()
+        .filter(|terminal| terminal.evaluated_at(states))
+    {
+        Some(terminal) => terminal.score.clone(),
+        // The inner solve's own gradient loader, at the returned states.
+        None => load_joint_gradient_evaluation(
+            family,
+            specs,
+            options,
+            states,
+            family.inner_joint_workspace_gradient_available(specs),
+            None,
+        )?
+        .1
+        .ok_or_else(|| CustomFamilyError::Optimization {
+            context: "constrained Laplace normalizer gradient",
+            reason: "the family publishes no joint likelihood gradient at the mode".to_string(),
+        })?,
+    };
+    let mut certified_score = score;
+    if family.joint_jeffreys_term_required()
+        && let Some(z_joint) = build_joint_jeffreys_subspace(family, specs, &ranges)?
+        && let Some((_phi, grad_phi, _hphi)) =
+            custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+    {
+        certified_score += &grad_phi;
+    }
+    let mut gradient =
+        exact_newton_joint_stationarity_vector_from_gradient(&certified_score, states, specs, &inner.s_lambdas)?;
+    if let Some(joint_score) = joint_penalty_stationarity_score(options, specs, states) {
+        gradient += &joint_score;
+    }
+    let q = rows.len();
+    let mut row_matrix = Array2::<f64>::zeros((q, total));
+    for (index, row) in rows.into_iter().enumerate() {
+        row_matrix.row_mut(index).assign(&row);
+    }
+    Ok(Some(Arc::new(
+        gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput {
+            rows: row_matrix,
+            bounds: Array1::from(bounds),
+            gradient,
+            gradient_motion: gam_solve::estimate::reml::reml_outer_engine::ConeGradientMotion::Stationary,
+        },
+    )))
+}
+
 /// A joint likelihood score together with the operating point it was
 /// evaluated at.
 ///
@@ -2723,6 +2849,9 @@ pub struct BlockwiseInnerResult {
     /// The smoothing state this mode was solved at — the cache key a reuse
     /// decision must be taken against (#2615).
     pub(crate) objective_state: InnerObjectiveState,
+    /// The constrained Laplace normalizer's inputs at this mode (gam#2765); `None` when the family
+    /// declares no linear constraint.
+    pub(crate) cone_normalizer: Option<Arc<gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {

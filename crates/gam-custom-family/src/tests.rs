@@ -633,6 +633,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
     };
     let specs = vec![spec];
     let inner = BlockwiseInnerResult {
+        cone_normalizer: None,
         solved_inner_tol: 1e-6,
         block_states: vec![ParameterBlockState {
             beta: beta.clone(),
@@ -813,6 +814,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
     };
     let specs = vec![spec];
     let inner = BlockwiseInnerResult {
+        cone_normalizer: None,
         solved_inner_tol: 1e-6,
         block_states: vec![ParameterBlockState {
             beta: beta.clone(),
@@ -957,6 +959,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
         };
         let specs = vec![spec];
         let inner = BlockwiseInnerResult {
+            cone_normalizer: None,
             solved_inner_tol: 1e-6,
             block_states: vec![ParameterBlockState {
                 beta: beta.clone(),
@@ -1309,6 +1312,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
     let per_block = vec![array![rho[0]], array![rho[1], rho[2]], array![rho[3]]];
 
     let inner = BlockwiseInnerResult {
+        cone_normalizer: None,
         solved_inner_tol: 1e-6,
         block_states: vec![
             ParameterBlockState {

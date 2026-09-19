@@ -2795,6 +2795,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    // gam#2765: the constrained Laplace normalizer's inputs at this mode.
+    inner.cone_normalizer = custom_family_cone_normalizer_input(family, specs, options, &inner)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     // ── Try to obtain a joint Hessian and route through the unified evaluator ──
@@ -4622,6 +4624,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    refuse_efs_where_the_cone_normalizer_is_priced(family, specs, &inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
 
