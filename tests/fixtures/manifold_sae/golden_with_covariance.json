@@ -128,7 +128,6 @@
         ]
       ],
       "decoder_covariance_channel_factors": null,
-      "evidence": -12.5,
       "functional_evidence": {
         "average_derivative": -0.4,
         "average_value": 1.25,
@@ -391,7 +390,6 @@
           ]
         ]
       ],
-      "evidence": -13.5,
       "functional_evidence": null,
       "shape_band_coords": null,
       "shape_band_mean": null,
@@ -463,7 +461,6 @@
         ]
       ],
       "decoder_covariance_channel_factors": null,
-      "evidence": -14.5,
       "functional_evidence": null,
       "shape_band_coords": null,
       "shape_band_mean": null,
@@ -957,7 +954,7 @@
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v9",
+  "schema": "gamfit.ManifoldSAE/v10",
   "selected_log_ard": [
     [
       0.1

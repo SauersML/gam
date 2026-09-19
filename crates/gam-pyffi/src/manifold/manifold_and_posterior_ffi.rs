@@ -4812,10 +4812,6 @@ impl AtomCore {
             .map(|v| manifold_sae_vec1(py, v))
     }
     #[getter]
-    fn evidence(&self) -> Option<f64> {
-        self.inner.evidence
-    }
-    #[getter]
     fn active_dim(&self) -> i64 {
         self.inner.active_dim
     }

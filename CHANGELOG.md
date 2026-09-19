@@ -139,6 +139,11 @@
   form the screen chose for several scores is certified by `D̂` on their joint
   law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
   with `D̂` where nothing can re-solve on it.
+- **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
+  into every atom under a label that claimed a per-atom marginal likelihood. It was
+  neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
+  `penalized_loss_score`. The `ManifoldSAE` artifact schema is now `v10`, without the
+  per-atom `evidence`. A `v9` artifact still loads and drops that copy on read.
 
 ## gamfit 0.1.268 (2026-09-11)
 

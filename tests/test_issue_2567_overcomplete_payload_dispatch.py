@@ -39,7 +39,7 @@ SUPPORT_PARSER = "ManifoldSAESupport.from_dict"
 DENSE_PARSER = "ManifoldSAE.from_json"
 
 SUPPORT_PAYLOAD = {"schema": "gamfit.ManifoldSAE/support-v2"}
-DENSE_PAYLOAD = {"schema": "gamfit.ManifoldSAE/v9"}
+DENSE_PAYLOAD = {"schema": "gamfit.ManifoldSAE/v10"}
 
 
 def _claiming_parser(fn: Any, payload: Any) -> str:

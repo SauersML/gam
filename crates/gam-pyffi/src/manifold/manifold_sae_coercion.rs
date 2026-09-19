@@ -490,7 +490,6 @@ pub(crate) fn build_manifold_sae_payload(
             assignments: assignments_col,
             coords: coords[idx].clone(),
             coords_u_arc,
-            evidence: score,
             active_dim: vi64(a, "active_dim")?,
             decoder_covariance_channel_factors,
             shape_band_coords: sb_coords,

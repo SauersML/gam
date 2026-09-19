@@ -1,7 +1,7 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v9"` schema. Version 6 was deliberately breaking: it
+//! `"gamfit.ManifoldSAE/v10"` schema. Version 6 was deliberately breaking: it
 //! persists each atom's constructor-validated geometry plan as the sole source
 //! of topology, chart dimension, analytic resolution, basis width, center set,
 //! and reference metric. Version 7 adds each atom's row-sandwich robust band
@@ -13,6 +13,11 @@
 //! Version 9 adds the operator the shape covariances invert and why learned frames
 //! are held fixed, because admission to the integrated covariance depends on host
 //! memory (#2900).
+//! Version 10 drops the per-atom `evidence`, which copied the fit-level
+//! `penalized_loss_score` into every atom under a label that claimed a marginal likelihood
+//! (#2946). A v9 reader requires that key, so the version moves with it; this reader
+//! still reads a v9 artifact and discards the copy (the one load-time exception to the
+//! strict schema below).
 //! Historically the schema lived only in the Python dataclass
 //! `gamfit/_sae_manifold.py::ManifoldSAE`
 //! (`to_dict` / `from_dict`), so a field-name / default / None-handling change
@@ -33,7 +38,8 @@
 //!   losslessly avoids mirroring ~14 sub-schemas that no consumer computes over.
 //! * **Strict schema.** Every field is required, unknown fields are rejected,
 //!   and runtime diagnostics serialize with the rest of the model.  There are
-//!   no deprecated aliases, missing-field defaults, or load-time repairs.
+//!   no deprecated aliases, missing-field defaults, or load-time repairs, except
+//!   that a v9 artifact's per-atom `evidence` copy is dropped on read (#2946).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,17 +48,23 @@ use gam::terms::sae::manifold::SaeAtomGeometryPlan;
 
 /// The on-disk schema tag. `from_json` refuses any other value with a
 /// [`SchemaRefusal`], matching the Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v9";
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v10";
 
 /// The version [`SCHEMA_TAG`] names, which a refusal compares a payload's version with.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
+
+/// The one older schema this reader still reads: v9, whose only difference is a per-atom
+/// `evidence` key that duplicated the fit-level `penalized_loss_score` (#2946). Reading
+/// drops that key and re-tags the artifact [`SCHEMA_TAG`]; nothing writes it.
+const PER_ATOM_EVIDENCE_SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v9";
 
 /// Prefix every dense `ManifoldSAE` schema tag carries before its version number.
 const SCHEMA_VERSION_PREFIX: &str = "gamfit.ManifoldSAE/v";
 
 /// Why `from_json` refuses a payload's `schema` tag. There is no migration: an
 /// artifact written under another version is refused by its version, never read
-/// field by field against this schema.
+/// field by field against this schema. The one older version read is
+/// [`PER_ATOM_EVIDENCE_SCHEMA_TAG`], whose only difference is a dropped copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SchemaRefusal {
     /// A dense `ManifoldSAE` artifact written under an older schema version.
@@ -64,12 +76,13 @@ pub(crate) enum SchemaRefusal {
 }
 
 impl SchemaRefusal {
-    /// `Ok` exactly for [`SCHEMA_TAG`]; every other tag is refused by kind.
+    /// `Ok` exactly for [`SCHEMA_TAG`] and [`PER_ATOM_EVIDENCE_SCHEMA_TAG`]; every other
+    /// tag is refused by kind.
     pub(crate) fn check(found: Option<&str>) -> Result<(), Self> {
         let Some(tag) = found else {
             return Err(Self::Unrecognized { found: None });
         };
-        if tag == SCHEMA_TAG {
+        if tag == SCHEMA_TAG || tag == PER_ATOM_EVIDENCE_SCHEMA_TAG {
             return Ok(());
         }
         let version = tag
@@ -125,7 +138,6 @@ pub(crate) struct AtomPayload {
     pub(crate) assignments: Vec<f64>,
     pub(crate) coords: Vec<Vec<f64>>,
     pub(crate) coords_u_arc: Option<Vec<f64>>,
-    pub(crate) evidence: Option<f64>,
     pub(crate) active_dim: i64,
     /// Compact per-channel factor `(p, M_k, M_k)`; the dense `(M_k·p)²` joint is
     /// never stored on disk (see `decoder_channel_cov_factors`, #2091 slice 1).
@@ -319,7 +331,6 @@ impl ManifoldSaePayload {
         "assignments",
         "coords",
         "coords_u_arc",
-        "evidence",
         "active_dim",
         "decoder_covariance_channel_factors",
         "shape_band_coords",
@@ -329,16 +340,18 @@ impl ManifoldSaePayload {
         "functional_evidence",
     ];
 
-    /// Parse the exact v8 artifact schema. Missing optional-valued fields are
+    /// Parse the exact v10 artifact schema. Missing optional-valued fields are
     /// still errors: `null` is the explicit absence representation.
     ///
     /// The schema tag is read before any other field, so an artifact written under
     /// another version is refused by its version, not by the first field the two
-    /// versions disagree on.
+    /// versions disagree on. A v9 artifact ([`PER_ATOM_EVIDENCE_SCHEMA_TAG`]) must
+    /// carry each atom's `evidence`, as v9 required. That key is dropped and the
+    /// artifact read as [`SCHEMA_TAG`].
     pub(crate) fn from_json(json: &str) -> Result<Self, String> {
-        let value: Value =
+        let mut value: Value =
             serde_json::from_str(json).map_err(|e| format!("ManifoldSAE.from_json: {e}"))?;
-        let object = value.as_object().ok_or_else(|| {
+        let object = value.as_object_mut().ok_or_else(|| {
             "ManifoldSAE.from_json: model artifact must be a JSON object".to_string()
         })?;
         if object.contains_key("schema") {
@@ -350,11 +363,22 @@ impl ManifoldSaePayload {
                 return Err(format!("ManifoldSAE.from_json: missing field {field:?}"));
             }
         }
-        if let Some(atoms) = object.get("atoms").and_then(Value::as_array) {
-            for (index, atom) in atoms.iter().enumerate() {
-                let atom = atom.as_object().ok_or_else(|| {
+        let per_atom_evidence =
+            object.get("schema").and_then(Value::as_str) == Some(PER_ATOM_EVIDENCE_SCHEMA_TAG);
+        if per_atom_evidence {
+            object.insert("schema".to_string(), Value::String(SCHEMA_TAG.to_string()));
+        }
+        if let Some(atoms) = object.get_mut("atoms").and_then(Value::as_array_mut) {
+            for (index, atom) in atoms.iter_mut().enumerate() {
+                let atom = atom.as_object_mut().ok_or_else(|| {
                     format!("ManifoldSAE.from_json: atoms[{index}] must be an object")
                 })?;
+                if per_atom_evidence && atom.remove("evidence").is_none() {
+                    return Err(format!(
+                        "ManifoldSAE.from_json: atoms[{index}] missing field \"evidence\", which a \
+                         {PER_ATOM_EVIDENCE_SCHEMA_TAG} artifact carries"
+                    ));
+                }
                 for field in Self::REQUIRED_ATOM_FIELDS {
                     if !atom.contains_key(*field) {
                         return Err(format!(
@@ -720,6 +744,51 @@ mod manifold_sae_payload_serde_tests {
         assert!(
             error.contains("unsupported schema") && error.contains("version 7 is older"),
             "a v7 artifact must be refused by its version, not by a missing field: {error}"
+        );
+    }
+
+    /// #2946: a v9 artifact still reads. Its per-atom `evidence` was a copy of the
+    /// fit-level `penalized_loss_score`, so dropping it loses nothing: the artifact reads
+    /// as the current golden, with the same `penalized_loss_score`, and writes back as v10
+    /// with no per-atom `evidence`. A v9 artifact missing that key is malformed v9, and a
+    /// v10 artifact carrying it is refused as an unknown field.
+    #[test]
+    fn a_v9_artifact_reads_without_its_per_atom_evidence_copy_2946() {
+        let golden = load_value("golden_full.json");
+        assert_eq!(golden["schema"], SCHEMA_TAG);
+        let mut v9 = golden.clone();
+        v9["schema"] = Value::String(PER_ATOM_EVIDENCE_SCHEMA_TAG.to_string());
+        for (k, atom) in v9["atoms"].as_array_mut().unwrap().iter_mut().enumerate() {
+            assert!(atom.get("evidence").is_none(), "a v10 atom has no evidence key");
+            atom.as_object_mut()
+                .unwrap()
+                .insert("evidence".to_string(), Value::from(-12.5 - k as f64));
+        }
+        let back: Value = serde_json::from_str(
+            &roundtrip_json(&serde_json::to_string(&v9).unwrap()).expect("a v9 artifact reads"),
+        )
+        .unwrap();
+        assert_eq!(back, golden, "a v9 artifact reads as the v10 golden, value for value");
+        assert_eq!(back["penalized_loss_score"], v9["penalized_loss_score"]);
+        assert!(
+            back["atoms"].as_array().unwrap().iter().all(|atom| atom.get("evidence").is_none()),
+            "a re-written artifact carries no per-atom evidence"
+        );
+
+        let mut v9_missing = v9.clone();
+        v9_missing["atoms"][1].as_object_mut().unwrap().remove("evidence");
+        let error = roundtrip_json(&serde_json::to_string(&v9_missing).unwrap()).unwrap_err();
+        assert!(
+            error.contains("atoms[1] missing field \"evidence\""),
+            "a v9 atom without evidence is malformed v9: {error}"
+        );
+
+        let mut v10_with = v9.clone();
+        v10_with["schema"] = Value::String(SCHEMA_TAG.to_string());
+        let error = roundtrip_json(&serde_json::to_string(&v10_with).unwrap()).unwrap_err();
+        assert!(
+            error.contains("unknown field") && error.contains("evidence"),
+            "a v10 artifact carrying per-atom evidence is refused: {error}"
         );
     }
 
