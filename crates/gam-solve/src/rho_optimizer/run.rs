@@ -25,6 +25,16 @@ pub(crate) struct BoundInnerSeed {
     pub(crate) beta: Array1<f64>,
 }
 
+/// Exact outer curvature bound to the one outer coordinate it was measured at.
+///
+/// It seeds the BFGS iter-0 metric only at a start bitwise equal to `theta`,
+/// so a reseed or a resumed checkpoint elsewhere never inherits it.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundOuterCurvature {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) hessian: Array2<f64>,
+}
+
 pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) -> bool {
     left.len() == right.len()
         && left
@@ -169,6 +179,16 @@ pub(crate) struct OuterConfig {
     /// the canonical frame. `None` on the first attempt and on every path outside the plan loop.
     pub(crate) carried_checkpoint: Option<OuterResult>,
     pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
+    /// The exact analytic Hessian of the criterion a continuation search
+    /// resumes, at the start it resumes from. The #784 corrected continuation
+    /// starts at the certified Laplace optimum, where the Laplace criterion's
+    /// analytic Hessian is exact and the correction's own curvature is a small
+    /// perturbation of it; BFGS takes its inverse as the iter-0 metric, so the
+    /// first step is a Newton step instead of a unit-length gradient step that
+    /// the line search halves back down one full corrected evaluation at a time.
+    /// The metric shapes the path only: BFGS reaches the same stationary point
+    /// under any SPD initial metric.
+    pub(crate) initial_curvature: Option<BoundOuterCurvature>,
     pub(crate) fallback_policy: FallbackPolicy,
     pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
     pub(crate) screen_initial_rho: bool,
@@ -386,6 +406,7 @@ impl Default for OuterConfig {
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             warm_start_outer_hessian: None,
+            initial_curvature: None,
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
@@ -426,6 +447,7 @@ pub struct OuterProblem {
     heuristic_log_lambdas: Option<Vec<f64>>,
     initial_rho: Option<Array1<f64>>,
     initial_rho_candidates: Vec<Array1<f64>>,
+    initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
     screening_cap: Option<Arc<AtomicUsize>>,
     screen_initial_rho: bool,
@@ -467,6 +489,7 @@ impl OuterProblem {
             heuristic_log_lambdas: None,
             initial_rho: None,
             initial_rho_candidates: Vec::new(),
+            initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
             screening_cap: None,
             screen_initial_rho: false,
@@ -577,6 +600,12 @@ impl OuterProblem {
     }
     pub fn with_initial_rho(mut self, rho: Array1<f64>) -> Self {
         self.initial_rho = Some(rho);
+        self
+    }
+    /// Bind the exact outer Hessian measured at `theta` to this search; see
+    /// [`OuterConfig::initial_curvature`].
+    pub(crate) fn with_initial_curvature(mut self, theta: Array1<f64>, hessian: Array2<f64>) -> Self {
+        self.initial_curvature = Some(BoundOuterCurvature { theta, hessian });
         self
     }
     pub(crate) fn with_initial_rho_candidates(mut self, candidates: Vec<Array1<f64>>) -> Self {
@@ -857,6 +886,7 @@ impl OuterProblem {
             // Populated only by the persistent-cache resume path in `run` after
             // a warm-start hit decodes a converged outer Hessian.
             warm_start_outer_hessian: None,
+            initial_curvature: self.initial_curvature.clone(),
             rho_canonical_keys: self.rho_canonical_keys.clone(),
             // Set only on the recursive canonical run's config (#2817).
             native_coordinate_order: None,
@@ -8150,6 +8180,17 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
             }
         }
         canonical.warm_start_outer_hessian = Some(hc);
+    }
+    if let Some(bound) = config.initial_curvature.as_ref()
+        && bound.hessian.nrows() == perm.len()
+        && bound.hessian.ncols() == perm.len()
+    {
+        canonical.initial_curvature = Some(BoundOuterCurvature {
+            theta: permute_arr(&bound.theta),
+            hessian: Array2::from_shape_fn((perm.len(), perm.len()), |(a, b)| {
+                bound.hessian[[perm[a], perm[b]]]
+            }),
+        });
     }
     canonical
 }

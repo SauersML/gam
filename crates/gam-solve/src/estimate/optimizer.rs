@@ -1316,6 +1316,9 @@ where
     // later run of the standard arm is the corrected search continued from that
     // optimum, alone (#1082).
     let mut corrected_continuation = false;
+    // The Laplace optimum's exact analytic outer Hessian, bound to that
+    // optimum: the corrected continuation's BFGS starts from its inverse.
+    let mut continuation_curvature: Option<Array2<f64>> = None;
     let mut negbin_best_checkpoint: Option<NegbinJointCheckpoint> = None;
     // The box every outer arm searches the ρ block in, and so the box its
     // certificate judges rails against: the #2812 resolvability domain (#2902
@@ -1423,6 +1426,12 @@ where
                 problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
             } else {
                 problem
+            };
+            let problem = match (corrected_continuation, negbin_rho_seed.as_ref(), continuation_curvature.as_ref()) {
+                (true, Some(seed), Some(hessian)) => {
+                    problem.with_initial_curvature(seed.clone(), hessian.clone())
+                }
+                _ => problem,
             };
 
             // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
@@ -2305,6 +2314,7 @@ where
                 {
                     negbin_rho_seed = Some(final_rho.clone());
                     corrected_continuation = true;
+                    continuation_curvature = outer_result.final_hessian.clone();
                     continue;
                 }
                 break;
@@ -2367,6 +2377,7 @@ where
         {
             negbin_rho_seed = Some(final_rho.clone());
             corrected_continuation = true;
+            continuation_curvature = outer_result.final_hessian.clone();
             continue;
         }
 
