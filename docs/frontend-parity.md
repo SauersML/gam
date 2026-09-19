@@ -28,6 +28,7 @@ APIs such as a matrix kernel.
 | Conformal prediction bands | `gam_predict::conformal_routes` | `predict --conformal`, `--training-data`, `--calibration`, `--level` | `Model.predict(interval="conformal", training_data=... or calibration=...)` | Same Rust routes |
 | CTN observed-response score | saved-model prediction machinery | `transformation-score` | `Model.transformation_score` | Parity |
 | Diagnostics / ALO | `gam::inference::alo`, saved-model ALO | `diagnose`; report may include diagnostics | `Model.diagnose`, `check`, `basis_check`, `curvature`, `smooth_significance` | Core diagnostics shared; Python methods are programmatic views |
+| Term partial effects with pointwise intervals and simultaneous bands | `gam_predict::partial_effect::partial_effect` | `partial-effect MODEL --term --level --n-points --grid --out` (JSON or CSV) | `Model.partial_dependence` → `PartialEffect`; `Model.plot_terms` draws it | Same Rust function |
 | Posterior coefficient sampling | `gam::inference::sample` / `gam::hmc` | `sample --samples --seed` | `Model.sample` with the same controls | Same Rust sampler |
 | Posterior predictive / response generation | `gam::predict::generative` | `generate --n-draws --seed` | `sample_replicates`, `iter_replicates`; multinomial `posterior_predict` | Same Rust generator |
 | Summary and HTML report | saved model / `gam::report` | `report` | `summary`, `report` | Parity |
@@ -48,6 +49,7 @@ The one global flag is `-v/--verbose` (the Python counterpart is the `gamfit` lo
 | `predict` | `MODEL NEW_DATA --out`; offset/noise-offset/ID, `--uncertainty`, `--level`, `--covariance-mode`, `--conformal`, `--training-data`, `--calibration` |
 | `transformation-score` | `MODEL LABELLED_DATA --out`; offset and ID columns |
 | `diagnose` | `MODEL DATA` |
+| `partial-effect` | `MODEL --term`; `--level`, `--n-points` or `--grid`, `--out` (`.json` or `.csv`) |
 | `sample` | `MODEL DATA`; `--samples`, `--seed`, `--out` |
 | `compare` | `MODEL...`; `--names` |
 | `generate` | `MODEL DATA`; `--n-draws`, `--seed`, `--out` |
@@ -76,7 +78,7 @@ The fitted `Model` public workflow methods/properties are `predict`,
 `smoothing_parameters`, `check`, `curvature`, `smooth_significance`,
 `basis_check`, `debiased_functional`, `report`, `sample`, `sample_replicates`,
 `iter_replicates`, `design_matrix`, `design_matrix_array`, `difference_smooth`,
-`partial_dependence`, `variance_share`, `evidence_ratio_vs`,
+`partial_dependence`, `plot_terms`, `variance_share`, `evidence_ratio_vs`,
 `diagnose`, `plot`, persistence methods, group extension, and model metadata.
 `MultinomialModel` exposes classes, deviance/iterations, prediction and standard
 errors, posterior prediction, smooth significance, summary, and persistence.

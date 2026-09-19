@@ -290,7 +290,7 @@ __all__ = [
     "model_debiased_functional_json",
     "model_deployment_extensions",
     "model_group_metadata",
-    "model_partial_dependence",
+    "model_partial_effect",
     "model_variance_share",
     "multinomial_model_metadata_pyfunc",
     "multinomial_smooth_significance_pyfunc",
@@ -350,6 +350,7 @@ __all__ = [
     "register_analytic_penalties",
     "report_html",
     "required_model_columns",
+    "residuals_table",
     "resolve_basis_locations_1d",
     "response_column_name",
     "response_geometry_aitchison_metric",
@@ -1999,7 +2000,7 @@ def model_deployment_extensions(model: _FittedModel) -> Any: ...
 
 def model_group_metadata(model: _FittedModel) -> Any: ...
 
-def model_partial_dependence(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int) -> dict[Any, Any]: ...
+def model_partial_effect(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int, level: float) -> dict[Any, Any]: ...
 
 def model_variance_share(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, term: str | None = ...) -> list[tuple[str, float]]: ...
 
@@ -2118,6 +2119,8 @@ def register_analytic_penalties(latents_json: str, penalties_json: str) -> str: 
 def report_html(model: _FittedModel) -> str: ...
 
 def required_model_columns(model: _FittedModel, observed_score: bool) -> list[str] | None: ...
+
+def residuals_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, kind: str) -> NDArray[np.float64]: ...
 
 def resolve_basis_locations_1d(t: NDArray[np.float64], basis_kind: str, knots_or_centers: object | None = ..., order: int = ..., periodic: bool = ...) -> tuple[NDArray[np.float64], int, bool]: ...
 

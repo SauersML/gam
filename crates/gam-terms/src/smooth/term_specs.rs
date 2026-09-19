@@ -2323,6 +2323,31 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
+    /// Every non-intercept term's name and its global coefficient columns, in
+    /// design order `[linear | random_effects | smooth]`. Smooth `coeff_range`s
+    /// are local to the smooth block, so they are shifted past the parametric
+    /// and random-effect columns here.
+    pub fn named_term_ranges(&self) -> Vec<(String, Range<usize>)> {
+        let smooth_start = self.intercept_range.len()
+            + self
+                .linear_ranges
+                .iter()
+                .chain(&self.random_effect_ranges)
+                .map(|(_, range)| range.len())
+                .sum::<usize>();
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .cloned()
+            .chain(self.smooth.terms.iter().map(|term| {
+                (
+                    term.name.clone(),
+                    (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end),
+                )
+            }))
+            .collect()
+    }
+
     /// Add this collection's fixed affine channel to a caller-owned likelihood
     /// offset, validating the universal row/finite-value contract at the seam
     /// where the two offset sources become one.

@@ -5092,7 +5092,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
-    module.add_function(wrap_pyfunction!(model_partial_dependence, module)?)?;
+    module.add_function(wrap_pyfunction!(model_partial_effect, module)?)?;
     module.add_function(wrap_pyfunction!(model_variance_share, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_rows, module)?)?;
@@ -7921,88 +7921,6 @@ fn affine_design_array_impl(
     affine_design_for_dataset(&model, dataset)
 }
 
-struct PartialDependenceOutput {
-    table: gam::inference::partial_dependence::PartialDependenceTable,
-    predicted: Vec<f64>,
-    standard_error: Vec<f64>,
-    covariance_source: String,
-}
-
-/// A term's partial dependence on the grid its saved term specification defines
-/// (`gam::inference::partial_dependence`), evaluated by
-/// `gam_predict::term_diagnostics::term_partial_dependence` on the model's
-/// mean-block design at the grid rows, with the covariance the fit publishes.
-fn model_partial_dependence_impl(
-    model: &FittedModel,
-    term: &str,
-    grid: gam::inference::partial_dependence::PartialDependenceGrid,
-) -> Result<PartialDependenceOutput, String> {
-    let payload = model.payload();
-    let schema = payload
-        .data_schema
-        .as_ref()
-        .ok_or_else(|| "partial_dependence requires a saved model schema".to_string())?;
-    let training_feature_ranges = payload
-        .training_feature_ranges
-        .as_deref()
-        .ok_or_else(|| "partial_dependence requires saved training feature ranges".to_string())?;
-    let termspec = payload.resolved_termspec.as_ref().ok_or_else(|| {
-        "partial_dependence requires a saved resolved term specification".to_string()
-    })?;
-    let training_headers = model
-        .training_headers
-        .as_deref()
-        .ok_or_else(|| "partial_dependence requires saved training headers".to_string())?;
-    let table = gam::inference::partial_dependence::partial_dependence_table(
-        gam::inference::partial_dependence::PartialDependenceInputs {
-            schema,
-            training_headers,
-            training_feature_ranges,
-            termspec,
-        },
-        term,
-        grid,
-    )?;
-    let x = standard_mean_design_dense(&model, table.table.clone())?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let beta = &fit.beta;
-    // The partial-effect band prices its SEs off the covariance the fit
-    // publishes — the same choice `summary()` makes — and names it in the
-    // result (#2779). A fit with no corrected matrix reports the conditional
-    // band under the `conditional` label, never an empty table.
-    let covariance_source = fit.published_covariance_mode();
-    let cov = match covariance_source {
-        gam_predict::InferenceCovarianceMode::SmoothingCorrected => fit.beta_covariance_corrected(),
-        gam_predict::InferenceCovarianceMode::Conditional => fit.beta_covariance(),
-    }
-    .ok_or_else(|| {
-        "partial_dependence requires a persisted coefficient covariance; refit before requesting \
-         partial-dependence standard errors"
-            .to_string()
-    })?;
-    let blocks = term_blocks_for_model_impl(model)?;
-    let (start, end) = blocks
-        .iter()
-        .find(|(name, _, _, _)| name.as_str() == term)
-        .map(|(_, _, s, e)| (*s, *e))
-        .ok_or_else(|| {
-            let available: Vec<&str> = blocks.iter().map(|(n, _, _, _)| n.as_str()).collect();
-            format!("partial_dependence: term {term:?} not found; available: {available:?}")
-        })?;
-    let (predicted, standard_error) = gam_predict::term_diagnostics::term_partial_dependence(
-        x.view(),
-        beta.view(),
-        cov.view(),
-        start..end,
-    )?;
-    Ok(PartialDependenceOutput {
-        table,
-        predicted,
-        standard_error,
-        covariance_source: covariance_source.as_str().to_string(),
-    })
-}
-
 /// Per-term variance share for each non-intercept term block (or the single
 /// `term` when supplied), evaluated by
 /// `gam_predict::term_diagnostics::term_variance_shares` on the model's
@@ -8013,7 +7931,7 @@ fn model_variance_share_encoded_impl(
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    let x = standard_mean_design_dense(&model, dataset)?;
+    let x = gam_predict::partial_effect::standard_mean_design_dense(&model, dataset)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
@@ -8025,41 +7943,71 @@ fn model_variance_share_encoded_impl(
     gam_predict::term_diagnostics::term_variance_shares(x.view(), fit.beta.view(), &selected)
 }
 
+/// A term's partial effect with pointwise and simultaneous bands at `level`,
+/// from `gam_predict::partial_effect::partial_effect` — the function the CLI's
+/// `partial-effect` command also reads.
 #[pyfunction]
-fn model_partial_dependence<'py>(
+fn model_partial_effect<'py>(
     py: Python<'py>,
     model: PyRef<'_, PyFittedModel>,
     term: String,
     grid: Option<PyReadonlyArray2<'py, f64>>,
     n_points: usize,
+    level: f64,
 ) -> PyResult<Py<PyDict>> {
     let model = Arc::clone(&model.model);
-    use gam::inference::partial_dependence::{
-        HeldValue, PARTIAL_DEPENDENCE_SCALE, PartialDependenceGrid,
-    };
+    use gam::inference::partial_dependence::PartialDependenceGrid;
     let grid = match grid {
         Some(points) => PartialDependenceGrid::Explicit(points.as_array().to_owned()),
         None => PartialDependenceGrid::TrainingRange { n_points },
     };
-    let output = detach_py_result(py, "model_partial_dependence", move || {
-        model_partial_dependence_impl(&model, &term, grid)
+    let effect = detach_py_result(py, "model_partial_effect", move || {
+        gam_predict::partial_effect::partial_effect(&model, &term, grid, level)
     })?;
-    let contribution = output.table.contribution();
-    let table = output.table;
+    let record = effect.record();
     let out = PyDict::new(py);
-    out.set_item("grid", table.grid.into_pyarray(py))?;
-    out.set_item("axes", table.axes)?;
-    out.set_item("predicted", output.predicted.into_pyarray(py))?;
-    out.set_item("standard_error", output.standard_error.into_pyarray(py))?;
-    out.set_item("covariance_source", output.covariance_source)?;
-    out.set_item("scale", PARTIAL_DEPENDENCE_SCALE)?;
-    out.set_item("quantity", table.quantity.as_str())?;
-    out.set_item("contribution", contribution)?;
+    out.set_item("term", record.term)?;
+    out.set_item("grid", effect.table.grid.into_pyarray(py))?;
+    out.set_item("axes", record.axes)?;
+    let axis_levels = PyList::empty(py);
+    for levels in record.axis_levels {
+        match levels {
+            Some(levels) => {
+                let entry = PyDict::new(py);
+                entry.set_item("values", levels.values)?;
+                entry.set_item("labels", levels.labels)?;
+                axis_levels.append(entry)?;
+            }
+            None => axis_levels.append(py.None())?,
+        }
+    }
+    out.set_item("axis_levels", axis_levels)?;
+    out.set_item("axis_values", record.axis_values)?;
+    let bands = effect.bands;
+    out.set_item("fit", bands.fit.into_pyarray(py))?;
+    out.set_item("se", bands.se.into_pyarray(py))?;
+    out.set_item("lower", bands.lower.into_pyarray(py))?;
+    out.set_item("upper", bands.upper.into_pyarray(py))?;
+    out.set_item("simultaneous_lower", bands.simultaneous_lower.into_pyarray(py))?;
+    out.set_item("simultaneous_upper", bands.simultaneous_upper.into_pyarray(py))?;
+    out.set_item("level", record.level)?;
+    out.set_item("pointwise_critical", record.pointwise_critical)?;
+    out.set_item("simultaneous_critical", record.simultaneous_critical)?;
+    out.set_item("simulations", record.simulations)?;
+    out.set_item("seed", record.seed)?;
+    out.set_item("covariance_source", record.covariance_source)?;
+    out.set_item("scale", record.scale)?;
+    out.set_item("quantity", record.quantity)?;
+    out.set_item("contribution", record.contribution)?;
     let held = PyDict::new(py);
-    for (column, value) in table.held {
+    for (column, value) in record.held {
         match value {
-            HeldValue::Level(label) => held.set_item(column, label)?,
-            HeldValue::Number(number) => held.set_item(column, number)?,
+            gam_predict::partial_effect::PartialEffectCell::Level(label) => {
+                held.set_item(column, label)?
+            }
+            gam_predict::partial_effect::PartialEffectCell::Number(number) => {
+                held.set_item(column, number)?
+            }
         }
     }
     out.set_item("held", held)?;
@@ -8080,74 +8028,6 @@ fn model_variance_share(
     detach_py_result(py, "model_variance_share", move || {
         model_variance_share_encoded_impl(&model, dataset, term)
     })
-}
-
-/// Internal full mean-block design used by term diagnostics.
-///
-/// This is deliberately distinct from the public affine predictor design.  A
-/// link-wiggle's final fitted predictor uses the mean block as its row offset
-/// and a LinkWiggle-frame matrix, so returning this internal matrix from the
-/// public API was the architectural root cause of #2299.
-fn standard_mean_design_dense(
-    model: &FittedModel,
-    dataset: EncodedDataset,
-) -> Result<Array2<f64>, String> {
-    // A scan-routed model never materializes a dense B-spline design — the
-    // exact O(n) state-space smoother is the whole point — so there is no model
-    // matrix to export. Replace the cryptic "missing resolved_termspec" error
-    // with a precise, actionable one (#1046).
-    if let Some(scan) = scan_introspection(model)? {
-        return Err(format!(
-            "{} is fit by the exact O(n) state-space spline scan, which does not \
-             build a finite coefficient-frame design; term-design diagnostics \
-             are unavailable for this fitted model.",
-            scan_smooth_label(&scan)
-        ));
-    }
-    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
-        return Err(format!(
-            "design_matrix currently supports only standard GAM models; got '{}'. \
-             For other classes use Model.predict / posterior.predict, which dispatch \
-             through the saved-model predictor.",
-            prediction_model_class_label(model)
-        ));
-    }
-    if model.saved_link_wiggle()?.is_some() {
-        return Err(
-            "term-design diagnostics do not define an additive mean-block \
-             decomposition for link-wiggle models; use design_matrix() for the \
-             exact fitted affine predictor or Model.predict for response-scale output."
-                .to_string(),
-        );
-    }
-    let col_map = dataset.column_map();
-    let training_headers = model.training_headers.as_ref();
-    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        &col_map,
-        "resolved_termspec",
-    )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    if design.affine_offset.iter().any(|value| *value != 0.0) {
-        return Err(
-            "design_matrix cannot represent a model with non-zero smooth anchors as a single \
-             coefficient matrix; use Model.predict for the complete affine predictor"
-                .to_string(),
-        );
-    }
-    let dense = design
-        .design
-        .try_to_dense_by_chunks("design_matrix prediction design")?;
-    append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &col_map,
-        training_headers,
-        dense,
-    )
-    .map_err(|err| err.to_string())
 }
 
 fn posterior_credible_interval_impl(

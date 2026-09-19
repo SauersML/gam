@@ -98,6 +98,8 @@ pub(crate) enum Command {
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Evaluate one term's partial effect with pointwise and simultaneous bands.
+    PartialEffect(PartialEffectArgs),
     /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
     Residuals(ResidualsArgs),
     /// Rank fitted models on their smoothing-corrected AIC and print the
@@ -512,6 +514,43 @@ pub(crate) struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     pub(crate) data: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PartialEffectArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long = "term",
+        help = "Term to evaluate, named as the model summary names it, e.g. \"s(x)\" or \"te(x, z)\""
+    )]
+    pub(crate) term: String,
+    #[arg(
+        long = "level",
+        default_value_t = 0.95,
+        value_parser = parse_probability_open_cli,
+        help = "Coverage level of the pointwise intervals and the simultaneous band"
+    )]
+    pub(crate) level: f64,
+    #[arg(
+        long = "n-points",
+        default_value_t = 100,
+        value_parser = parse_positive_usize_cli,
+        help = "Evaluation points per numeric axis of the default training-range grid (factor axes take every level)"
+    )]
+    pub(crate) n_points: usize,
+    #[arg(
+        long = "grid",
+        value_name = "CSV",
+        conflicts_with = "n_points",
+        help = "Evaluation grid: one column per term axis, numbers for numeric axes and level labels for factor axes"
+    )]
+    pub(crate) grid: Option<PathBuf>,
+    #[arg(
+        long = "out",
+        help = "Output path: .csv writes one row per grid point, .json the full record; default: JSON on stdout"
+    )]
+    pub(crate) out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
