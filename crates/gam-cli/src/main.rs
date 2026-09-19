@@ -232,7 +232,8 @@ fn main() {
     // Drive the whole command on a dedicated wide-stack thread (see
     // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
     // the main thread; a `join` error means `run` itself panicked, which the
-    // default panic hook has already reported, so we flush and exit non-zero.
+    // default panic hook has already reported. A panic is never the user's
+    // fault, so it exits with the internal-error code.
     let worker = std::thread::Builder::new()
         .name("gam-cli".to_string())
         .stack_size(CLI_WORKER_STACK_SIZE)
@@ -243,7 +244,7 @@ fn main() {
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
             drop(std::io::Write::flush(&mut std::io::stderr()));
-            HARD_EXIT(1);
+            HARD_EXIT(gam::ErrorCategory::Internal.exit_code());
         }
     };
     if let Err(e) = result {
@@ -253,7 +254,7 @@ fn main() {
         }
         drop(std::io::Write::flush(&mut std::io::stdout()));
         drop(std::io::Write::flush(&mut std::io::stderr()));
-        HARD_EXIT(1);
+        HARD_EXIT(e.error_category().exit_code());
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
     // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +

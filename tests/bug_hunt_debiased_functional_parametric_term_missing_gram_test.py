@@ -6,7 +6,7 @@ Gaussian/identity-link models". A plain ``y ~ x`` ordinary-least-squares fit and
 a mixed ``y ~ s(x) + z`` fit both satisfy that precondition, yet every target
 (``average_value``, ``average_derivative``, ``point``, ``contrast``) aborts with
 
-    GamError: debiased_functional: model does not carry the weighted Gram X'WX;
+    GamfitError: debiased_functional: model does not carry the weighted Gram X'WX;
     refit with a smaller basis (dense fits only)
 
 The advice is impossible to act on — ``y ~ x`` is already the smallest possible

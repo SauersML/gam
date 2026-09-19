@@ -70,7 +70,7 @@ def test_categorical_column_in_a_numeric_axis_term_is_refused(formula: str) -> N
     data = _gaussian_frame(seed=2)
     for column in (data["g"], data["g"].astype("category")):
         frame = data.assign(g=column)
-        with pytest.raises(gamfit.errors.GamError) as excinfo:
+        with pytest.raises(gamfit.errors.FormulaError) as excinfo:
             gamfit.fit(frame, formula)
         message = str(excinfo.value)
         assert "'g' is categorical" in message, message

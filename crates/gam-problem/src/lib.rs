@@ -137,6 +137,7 @@ pub use estimation_error::{
 pub use estimation_error::FitStationarityEvidence;
 pub use execution_path::ExecutionPath;
 pub use failure_category::FailureCategory;
+pub use gam_spec::ErrorCategory;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
     bail_if_cached_beta_non_finite,

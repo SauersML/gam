@@ -623,7 +623,7 @@ Returns a dict:
 | `dictionary_mean_l0` | the dictionary sparsity supplied alongside the rate |
 | `reconstruction_rank_edge` | Marchenko–Pastur reconstruction-energy edge used by the production hard reconstruction-rank count when `n_eff`, `ambient_p`, and `dispersion_r` are supplied together; otherwise `None`. This rank-charge diagnostic is not an information-theoretic detection limit, and the predictive shape race does not threshold on it. |
 
-Either mixture EM can refuse to certify convergence (a `GamError`). That is a
+Either mixture EM can refuse to certify convergence (a `GamfitError`). That is a
 typed missing adjudication, not a negative topology verdict; record it as such
 and diagnose the failed candidate rather than converting it into a winner for
 another class.

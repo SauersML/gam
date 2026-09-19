@@ -6335,7 +6335,7 @@ mod run_plan_stopped_run_2953_tests;
 /// custom-family effective-df ceiling once emitted an upper bound below
 /// `rho_lower_bound`, inverting the box, and `f64::clamp(min, max)` with
 /// `min > max` then panicked inside `project_to_bounds` and escaped as an opaque
-/// "panicked inside Rust boundary" `GamError` across the FFI. The projection no
+/// "panicked inside Rust boundary" `GamfitError` across the FFI. The projection no
 /// longer panics, so an inverted box would instead place seeds outside it; the
 /// runner rejects any such box up front, before a seed is projected against it.
 #[test]

@@ -87,7 +87,7 @@ nobody measured. Those rows are counted in the tables and left out of
 
 Sizes are at 0.10 / 0.05 / 0.01. "Not measured" counts
 `conditional_reference_unavailable` rows; "fit refused" counts replicates whose
-fit raised `FitError` (no basis check is published for them).
+fit raised `gamfit.errors.ConvergenceError` (no basis check is published for them).
 
 | family | truth | n | tested | not measured | fit refused | sizes | KS p | product reference: sizes | KS p | seed |
 |---|---|---|---|---|---|---|---|---|---|---|

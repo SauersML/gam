@@ -7770,7 +7770,7 @@ pub(crate) fn run_outer_uncertified(
     // Every downstream stage — the per-atom EFS path below and
     // `run_outer_with_plan` — projects seeds against these bounds with
     // `f64::clamp`, whose `min > max` (or NaN) precondition panics *inside the
-    // Rust boundary* and surfaces as an opaque `GamError: ... panicked` across
+    // Rust boundary* and surfaces as an opaque `GamfitError: ... panicked` across
     // the FFI, violating the fail-loudly contract. The configured box can invert
     // whenever an independently-derived upper bound drifts below the lower wall
     // (e.g. the custom-family effective-df ceiling vs. `rho_lower_bound`).

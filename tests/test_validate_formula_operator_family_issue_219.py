@@ -84,7 +84,7 @@ def test_identity_wrapper_is_refused_as_an_undocumented_term_function() -> None:
     # `I(...)` is not part of the formula DSL: docs/formulas.md documents no
     # arithmetic identity wrapper, so the materializer refuses it by name with
     # the typed error that lists the supported term functions.
-    with pytest.raises(gamfit.errors.GamError, match=r"unknown term function `i` in 'I\(x1 \+ x2\)'"):
+    with pytest.raises(gamfit.errors.GamfitError, match=r"unknown term function `i` in 'I\(x1 \+ x2\)'"):
         gamfit.validate_formula(ROWS, "y ~ I(x1 + x2)")
 
 

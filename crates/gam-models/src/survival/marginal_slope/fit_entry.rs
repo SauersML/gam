@@ -1822,7 +1822,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
         // reached from `custom_family_outer_derivatives` below, firing a bare
         // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
-        // boundary" GamError instead of an actionable message.
+        // boundary" GamfitError instead of an actionable message.
         crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
             FitFailure::invariant(format!(
                 "[survival-marginal-slope] assembled block specs invalid: {reason}"
