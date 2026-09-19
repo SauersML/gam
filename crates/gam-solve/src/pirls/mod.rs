@@ -38,6 +38,8 @@ mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
 #[cfg(test)]
+mod gaussian_row_log_free_tests;
+#[cfg(test)]
 mod residuals_tests;
 #[cfg(test)]
 mod sas_saturated_row_2733_tests;
