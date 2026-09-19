@@ -92,7 +92,7 @@ What the table shows:
     0.01 it is 0.0097. So the main cell's excess did not replicate: it is a
     seed-level fluctuation, not a miscalibrated reference.
 - **Poisson** is sized at both n.
-- **Refusals.** The two Poisson n = 200 refusals are `gamfit.FitError`, where the
+- **Refusals.** The two Poisson n = 200 refusals are `gamfit.errors.FitError`, where the
   outer optimizer could not certify the fit. A refused fit publishes no basis
   check, so it is excluded from `tested`. Every tested row had provenance
   `radial_enrichment`.

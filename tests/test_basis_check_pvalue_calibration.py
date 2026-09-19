@@ -64,7 +64,7 @@ def _basis_check_p_values(family, n, formula, truth, reps, seed):
             warnings.simplefilter("ignore")
             try:
                 model = gamfit.fit({"x": x, "y": y}, formula, family=family)
-            except gamfit.FitError:
+            except gamfit.errors.FitError:
                 refused += 1
                 continue
         row = model.summary().basis_checks[0]

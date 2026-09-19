@@ -74,7 +74,7 @@ def basis_check_cell(family, n, formula, truth, reps, seed):
         y = draw_response(family, truth_fn(x), rng)
         try:
             model = gamfit.fit({"x": x, "y": y}, formula, family=family)
-        except gamfit.FitError:
+        except gamfit.errors.FitError:
             # A fit the outer optimizer could not certify is refused, so it
             # has no basis_check to calibrate; count it and move on.
             fit_refused += 1
@@ -103,7 +103,7 @@ def compare_models_cell(family, n, reps, seed):
         try:
             small = gamfit.fit(data, "y ~ s(x)", family=family)
             large = gamfit.fit(data, "y ~ s(x) + s(z)", family=family)
-        except gamfit.FitError:
+        except gamfit.errors.FitError:
             unranked["fit refused"] = unranked.get("fit refused", 0) + 1
             continue
         try:
