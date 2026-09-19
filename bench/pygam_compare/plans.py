@@ -15,6 +15,7 @@ from .worker import DESIGNS as ALL_DESIGNS
 from .worker import FAMILIES, LIBS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
+SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,16 @@ PLANS: dict[str, Plan] = {
             name="quick",
             description="n=1e3, every family x every design, 3 reps (committed baseline)",
             cells=_grid((1_000,), ALL_DESIGNS),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="small_n",
+            description=(
+                "n in {50, 200, 500}, every family x {p1, p3, p5}, 3 reps:"
+                " fixed per-fit overhead, cold and warm"
+            ),
+            cells=_grid((50, 200, 500), SMALL_N_DESIGNS),
             reps=3,
             timeout_s=600.0,
         ),
