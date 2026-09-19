@@ -686,6 +686,8 @@ pub(super) fn plan_shape_realization(
             BasisMetadata::TensorBSpline {
                 knots,
                 degrees,
+                periods,
+                is_cr,
                 identifiability_transform,
                 ..
             },
@@ -693,7 +695,14 @@ pub(super) fn plan_shape_realization(
             if knots.len() != margins.len() || degrees.len() != margins.len() {
                 return fail("does not match the realized tensor margin count");
             }
-            let raw = tensor_bspline_shape_linear_constraints(knots, degrees, margins)?;
+            let knot_valued: Vec<bool> = (0..margins.len())
+                .map(|j| {
+                    is_cr.get(j).copied().unwrap_or(false)
+                        || periods.get(j).copied().flatten().is_some()
+                })
+                .collect();
+            let raw =
+                tensor_bspline_shape_linear_constraints(knots, degrees, &knot_valued, margins)?;
             match (raw, identifiability_transform) {
                 (Some(raw), Some(z)) => {
                     if z.nrows() != raw.a.ncols() {
@@ -799,23 +808,38 @@ pub fn bspline_shape_set_linear_constraints(
 /// `I_{q_0} ⊗ … ⊗ A_j ⊗ … ⊗ I_{q_{d-1}}` for the 1-D cone `A_j`. Because every
 /// other margin's basis is non-negative, a monotone/convex fibre for every
 /// index certifies the shape of the whole surface along margin `j`.
+///
+/// `knot_valued[j]` marks a margin whose recorded knots are one per
+/// coefficient (a cubic regression margin's value knots, or a periodic
+/// margin's control sites) rather than an open B-spline knot vector. Such a
+/// margin can only be unconstrained; it still sets the identity width.
 pub fn tensor_bspline_shape_linear_constraints(
     knots: &[Array1<f64>],
     degrees: &[usize],
+    knot_valued: &[bool],
     margins: &[ShapeSet],
 ) -> Result<Option<LinearInequalityConstraints>, BasisError> {
-    if knots.len() != margins.len() || degrees.len() != margins.len() {
+    if knots.len() != margins.len()
+        || degrees.len() != margins.len()
+        || knot_valued.len() != margins.len()
+    {
         return Err(BasisError::DimensionMismatch(format!(
-            "tensor shape request has {} margins but the basis has {} knot vectors and {} degrees",
+            "tensor shape request has {} margins but the basis has {} knot vectors, {} degrees \
+             and {} margin kinds",
             margins.len(),
             knots.len(),
-            degrees.len()
+            degrees.len(),
+            knot_valued.len()
         )));
     }
     let widths = knots
         .iter()
         .zip(degrees)
-        .map(|(k, &d)| {
+        .zip(knot_valued)
+        .map(|((k, &d), &valued)| {
+            if valued {
+                return Ok(k.len());
+            }
             k.len().checked_sub(d + 1).ok_or_else(|| {
                 BasisError::InvalidKnotVector(format!(
                     "tensor margin knot vector of length {} is too short for degree {d}",
@@ -829,6 +853,12 @@ pub fn tensor_bspline_shape_linear_constraints(
     for (j, set) in margins.iter().enumerate() {
         if set.is_empty() {
             continue;
+        }
+        if knot_valued[j] {
+            return Err(BasisError::InvalidInput(format!(
+                "tensor margin {j} is not an open B-spline, so its coefficients are not control \
+                 points and cannot certify a shape"
+            )));
         }
         let Some(cone) = bspline_shape_set_linear_constraints(knots[j].view(), degrees[j], *set)?
         else {
@@ -1462,6 +1492,7 @@ mod shape_spec_tests {
         let (qx, qz) = (kx.len() - 4, kz.len() - 3);
         let knots = [kx.clone(), kz.clone()];
         let degrees = [3usize, 2];
+        let open = [false, false];
 
         let ax = bspline_shape_linear_constraints(kx.view(), 3, MonotoneIncreasing)
             .unwrap()
@@ -1470,6 +1501,7 @@ mod shape_spec_tests {
         let along_x = tensor_bspline_shape_linear_constraints(
             &knots,
             &degrees,
+            &open,
             &[set(&[MonotoneIncreasing]), set(&[])],
         )
         .unwrap()
@@ -1481,7 +1513,7 @@ mod shape_spec_tests {
             .unwrap()
             .a;
         let along_z =
-            tensor_bspline_shape_linear_constraints(&knots, &degrees, &[set(&[]), set(&[Concave])])
+            tensor_bspline_shape_linear_constraints(&knots, &degrees, &open, &[set(&[]), set(&[Concave])])
                 .unwrap()
                 .unwrap();
         assert_eq!(along_z.a, kron(&Array2::eye(qx), &az));
@@ -1489,6 +1521,7 @@ mod shape_spec_tests {
         let both = tensor_bspline_shape_linear_constraints(
             &knots,
             &degrees,
+            &open,
             &[set(&[MonotoneIncreasing]), set(&[Concave])],
         )
         .unwrap()
@@ -1496,9 +1529,45 @@ mod shape_spec_tests {
         assert_eq!(both.a.nrows(), along_x.a.nrows() + along_z.a.nrows());
         assert_eq!(both.a.slice(s![..along_x.a.nrows(), ..]), along_x.a);
         assert!(
-            tensor_bspline_shape_linear_constraints(&knots, &degrees, &[set(&[]), set(&[])])
+            tensor_bspline_shape_linear_constraints(&knots, &degrees, &open, &[set(&[]), set(&[])])
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn knot_valued_margin_sets_its_identity_width_and_refuses_a_shape() {
+        use ShapeConstraint::MonotoneIncreasing;
+        // Margin 0 an open cubic B-spline; margin 1 a cubic regression margin
+        // whose recorded knots are its five coefficient values.
+        let kx = irregular_cubic_knots();
+        let kz = array![0.0, 0.2, 0.5, 0.8, 1.0];
+        let qx = kx.len() - 4;
+        let knots = [kx.clone(), kz.clone()];
+        let degrees = [3usize, 3];
+        let kinds = [false, true];
+        let ax = bspline_shape_linear_constraints(kx.view(), 3, MonotoneIncreasing)
+            .unwrap()
+            .unwrap()
+            .a;
+        let along_x = tensor_bspline_shape_linear_constraints(
+            &knots,
+            &degrees,
+            &kinds,
+            &[set(&[MonotoneIncreasing]), set(&[])],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(along_x.a.ncols(), qx * kz.len());
+        assert_eq!(along_x.a, kron(&ax, &Array2::eye(kz.len())));
+        assert!(
+            tensor_bspline_shape_linear_constraints(
+                &knots,
+                &degrees,
+                &kinds,
+                &[set(&[]), set(&[MonotoneIncreasing])],
+            )
+            .is_err()
         );
     }
 
