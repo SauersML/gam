@@ -168,6 +168,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
             penalized: true,
             frozen_levels: Some(vec![0, 1]),
             lenient_unseen: true,
+            carries_level: false,
         }],
         smooth_terms: vec![
             SmoothTermSpec {
@@ -1922,6 +1923,7 @@ fn term_collection_design_adds_random_effect_dummy_blockwithridge() {
             penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
+            carries_level: false,
         }],
         smooth_terms: vec![],
         level: Default::default(),
@@ -3481,6 +3483,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
             penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
+            carries_level: false,
         }],
         smooth_terms: vec![
             SmoothTermSpec {

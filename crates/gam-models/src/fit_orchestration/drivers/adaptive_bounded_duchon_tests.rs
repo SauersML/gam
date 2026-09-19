@@ -108,6 +108,7 @@ mod adaptive_bounded_duchon_tests {
                     penalized: true,
                     frozen_levels: Some(vec![0, 1]),
                     lenient_unseen: true,
+                    carries_level: false,
                 },
                 RandomEffectTermSpec {
                     name: "unpenalized_group".to_string(),
@@ -116,6 +117,7 @@ mod adaptive_bounded_duchon_tests {
                     penalized: false,
                     frozen_levels: Some(vec![0, 1, 2, 3]),
                     lenient_unseen: true,
+                    carries_level: false,
                 },
             ],
             // Distinct feature ownership is essential here. Two copies of the
@@ -338,6 +340,7 @@ mod adaptive_bounded_duchon_tests {
                 penalized: true,
                 frozen_levels: None,
                 lenient_unseen: true,
+                carries_level: false,
             }],
             smooth_terms: vec![SmoothTermSpec {
             frozen_parametric_residualization: None,

@@ -435,9 +435,10 @@ pub fn build_termspec(
         .sum::<usize>();
     // Intercept removal (`0 + …`, `… - 1`) hands the constant to one term (see
     // `ModelLevel` and docs/formulas.md "Removing the intercept"). The first
-    // fixed factor block already spans it with its full level set, and becomes
-    // unpenalized so the level is not shrunk toward zero (the cell-means
-    // model); otherwise the first pure-indicator interaction keeps its
+    // factor block already spans it with its full level set, and its penalty
+    // becomes the centring projector so the constant is the one unpenalized
+    // direction and the level contrasts stay penalized (`carries_level`);
+    // otherwise the first pure-indicator interaction keeps its
     // reference cell (unpenalized), and failing that the first B-spline smooth
     // keeps its constant with its null-space ridge dropped. A genuine random
     // effect (`group(g)`, `re(g)`) never carries the level: its levels are
@@ -543,6 +544,7 @@ pub fn build_termspec(
                                 // at predict must raise a schema mismatch rather than
                                 // be mapped to the factor's centering point (#2102).
                                 lenient_unseen: false,
+                                carries_level: false,
                             });
                         }
                     }
@@ -602,6 +604,7 @@ pub fn build_termspec(
                     // main effect, must reject an unseen level rather than
                     // collapse onto the centering point (#2137/#2102).
                     lenient_unseen: *lenient_unseen,
+                    carries_level: false,
                 });
             }
             ParsedTerm::Smooth {
@@ -735,10 +738,11 @@ pub fn build_termspec(
                                     drop_first_level: false,
                                     penalized: true,
                                     frozen_levels: None,
-                                    // A FIXED factor main effect, like a bare `+ g`:
-                                    // an unseen level is out of contract and must
-                                    // raise, not center (#2102).
+                                    // Strict like a bare `+ g`: an unseen level is
+                                    // out of contract and must raise, not center
+                                    // (#2102).
                                     lenient_unseen: false,
+                                    carries_level: false,
                                 });
                             }
                             // Unordered factor-by smooths are independent
@@ -1059,7 +1063,7 @@ pub fn build_termspec(
         if factor_block_present
             && let Some(carrier) = random_terms.iter_mut().find(|rt| !rt.lenient_unseen)
         {
-            carrier.penalized = false;
+            carrier.carries_level = true;
         }
         let level_smooth = match explicit_level_smooth.or(level_smooth_candidate) {
             Some((idx, keep_null_ridge)) if !level_carried => {

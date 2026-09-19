@@ -7246,6 +7246,7 @@ mod tests {
                 penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
                 lenient_unseen: true,
+                carries_level: false,
             });
         group_payload.resolved_termspec = Some(group_spec);
         let group_model = FittedModel::from_payload(group_payload);

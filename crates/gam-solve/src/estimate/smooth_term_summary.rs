@@ -127,25 +127,20 @@ pub fn smooth_term_summary_rows(
         .count();
 
     for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
-        // The design's RE-penalty loop skips a block when EITHER it is
-        // unpenalised OR its coefficient range is empty
-        // (`design_construction.rs` `range.is_empty() || !penalized` →
-        // `continue`), so such a term owns NO entry in the flat
-        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout. A factor `by=`
-        // smooth injects exactly such an UNPENALISED treatment-coded factor
-        // main-effect block, and a penalised RE term with zero kept groups is
-        // the empty-range case. Advancing the cursor by a fixed 1 (the #1368
-        // defect) slides it one block past every RE/smooth term that follows, so
-        // the trailing smooth's `cursor..+k` window runs off the end of
-        // `penalty_block_trace`, `per_term_edf` returns 0, the Wood test is
-        // skipped, and ref_df/chi_sq/p_value collapse to 0/None. Mirror BOTH
-        // design conditions.
-        let penalized = spec
+        // The design's RE-penalty loop skips a block that does not
+        // `owns_penalty_block` (unpenalised, empty, or a single-level level
+        // carrier), so such a term owns NO entry in the flat
+        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout. Advancing the
+        // cursor by a fixed 1 (the #1368 defect) slides it one block past every
+        // RE/smooth term that follows, so the trailing smooth's `cursor..+k`
+        // window runs off the end of `penalty_block_trace`, `per_term_edf`
+        // returns 0, the Wood test is skipped, and ref_df/chi_sq/p_value
+        // collapse to 0/None. Ask the same predicate the design asks.
+        let owns_penalty = spec
             .random_effect_terms
             .get(re_idx)
-            .map(|term| term.penalized)
-            .unwrap_or(true);
-        let k_pen = usize::from(penalized && !range.is_empty());
+            .is_none_or(|term| term.owns_penalty_block(range.len()));
+        let k_pen = usize::from(owns_penalty && !range.is_empty());
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.

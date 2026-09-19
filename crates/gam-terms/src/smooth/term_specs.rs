@@ -1192,8 +1192,8 @@ pub struct RandomEffectTermSpec {
     /// If false, keep all levels (full one-hot block, still identifiable under ridge).
     pub drop_first_level: bool,
     /// If true, add a ridge penalty and estimate this block as a random effect.
-    /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
-    /// fixed categorical main effect.  The default preserves older saved models.
+    /// If false, the block is unpenalized. Current formulas never produce this;
+    /// it is kept so that saved models which contain it still load.
     #[serde(default = "default_random_effect_penalized")]
     pub penalized: bool,
     /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
@@ -1218,6 +1218,25 @@ pub struct RandomEffectTermSpec {
     /// models serialized before this field existed.
     #[serde(default = "default_random_effect_lenient_unseen")]
     pub lenient_unseen: bool,
+    /// Whether this block carries the model's constant level because the
+    /// formula removed the intercept (see [`ModelLevel`]). Its full dummy
+    /// coding spans the constant, so the ridge is replaced by the centring
+    /// projector `I − 11ᵀ/L`: the constant direction — the level an intercept
+    /// would otherwise hold — is the one unpenalized direction, and every
+    /// contrast between levels stays REML-penalized.
+    #[serde(default)]
+    pub carries_level: bool,
+}
+
+impl RandomEffectTermSpec {
+    /// Whether a realized block of `kept_levels` columns owns an entry in the
+    /// flat penalty layout. An unpenalized or empty block owns none, and so
+    /// does a level carrier with a single kept level: that level is the
+    /// constant alone, the carrier's one unpenalized direction.
+    pub fn owns_penalty_block(&self, kept_levels: usize) -> bool {
+        let minimum = if self.carries_level { 2 } else { 1 };
+        self.penalized && kept_levels >= minimum
+    }
 }
 
 pub(crate) fn default_random_effect_penalized() -> bool {
@@ -1273,9 +1292,10 @@ pub struct TermCollectionSpec {
 /// every other term is centred against it. A formula that removes the
 /// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
 ///
-/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
+/// 1. the first factor block (`+ g`, `factor(g)`, or the main
 ///    effect of a factor `by=`), which already spans the constant with its
-///    full dummy coding and is made unpenalized, giving the cell-means model;
+///    full dummy coding; its penalty becomes the centring projector, so the
+///    common level is unpenalized and the level contrasts stay penalized;
 /// 2. else the first pure-indicator interaction (`g:h`), which keeps every
 ///    cell, its reference cell included;
 /// 3. else the first B-spline / tensor smooth whose explicit
@@ -2390,6 +2410,7 @@ impl TermCollectionDesign {
                     crate::basis::PenaltySource::Other(source)
                         if source == "LinearTermRidge"
                             || source.starts_with("RandomEffectRidge(")
+                            || source.starts_with("RandomEffectContrastRidge(")
                 )
             })
             .count()

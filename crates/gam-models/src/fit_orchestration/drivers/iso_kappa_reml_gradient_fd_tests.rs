@@ -3273,6 +3273,7 @@ fn a_root_priced_rho_gradient_matches_its_value_2959() {
             penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
+            carries_level: false,
         }],
         smooth_terms: vec![SmoothTermSpec {
             frozen_parametric_residualization: None,

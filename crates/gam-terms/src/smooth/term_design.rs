@@ -323,20 +323,40 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     }
 
     for (re_idx, (name, range)) in random_effect_ranges.iter().enumerate() {
-        if range.is_empty() || !spec.random_effect_terms[re_idx].penalized {
+        let term = &spec.random_effect_terms[re_idx];
+        if !term.owns_penalty_block(range.len()) {
             continue;
         }
         let block_size = range.len();
+        // The level carrier's constant direction is the model's level, the one
+        // direction an intercept leaves unpenalized; its contrasts keep the
+        // penalty every other categorical block has.
+        let carries_level = term.carries_level;
         let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::ridge(range.clone(), 1.0));
-        nullspace_dims.push(0);
+        let (penalty, source, nullspace_dim) = if carries_level {
+            let centring = Array2::<f64>::eye(block_size)
+                - Array2::<f64>::from_elem((block_size, block_size), 1.0 / block_size as f64);
+            (
+                BlockwisePenalty::new(range.clone(), centring),
+                format!("RandomEffectContrastRidge({name})"),
+                1,
+            )
+        } else {
+            (
+                BlockwisePenalty::ridge(range.clone(), 1.0),
+                format!("RandomEffectRidge({name})"),
+                0,
+            )
+        };
+        penalties.push(penalty);
+        nullspace_dims.push(nullspace_dim);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
             termname: Some(name.clone()),
             penalty: ActivePenaltyInfo {
-                source: PenaltySource::Other(format!("RandomEffectRidge({name})")),
+                source: PenaltySource::Other(source),
                 original_index: re_idx,
-                effective_rank: block_size,
+                effective_rank: block_size - nullspace_dim,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 structural_null_frame: None,

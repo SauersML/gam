@@ -4,9 +4,10 @@ Pins the user-visible contract of:
 
 * intercept removal (``0 + ...``, ``... + 0``, ``... - 1``): an unpenalized
   slope without the intercept is ordinary least squares through the origin,
-  and ``0 + g`` is the cell-means model;
-* backtick-quoted, non-identifier column names and ``C()`` as a ``factor()``
-  alias;
+  and ``0 + g`` hands the level to the factor, whose constant direction is
+  unpenalized while its level contrasts stay REML-penalized;
+* backtick-quoted, non-identifier column names (``C()`` is refused in favour
+  of ``factor()``);
 * ``domain=[a, b]`` on ``s()`` (validated against the data, linear
   extrapolation past it at predict time);
 * strict option parsing: a malformed value, an unknown option, or
@@ -70,15 +71,28 @@ def test_default_slope_without_intercept_passes_through_the_origin():
     assert abs(_predict(with_intercept, {"x": np.array([0.0])})[0]) > 1.0
 
 
-def test_zero_plus_factor_is_the_cell_means_model():
+def test_zero_plus_factor_carries_the_level_and_shrinks_its_contrasts():
     levels = np.array(["a", "b", "c"])
     g = np.resize(levels, N)
     means = {"a": 1.0, "b": 2.0, "c": 4.0}
     y = np.array([means[v] for v in g]) + 0.1 * np.sin(np.arange(N))
     model = gamfit.fit({"y": y, "g": g}, "y ~ 0 + g", family="gaussian")
     fitted = _predict(model, {"g": levels})
-    expected = [y[g == level].mean() for level in levels]
-    np.testing.assert_allclose(fitted, expected, rtol=1e-9)
+    raw = np.array([y[g == level].mean() for level in levels])
+
+    # The constant is the factor's one unpenalized direction: the Gaussian
+    # score equation along it makes the in-sample residuals sum to zero, and
+    # shifting the response shifts every level by exactly that amount.
+    in_sample = _predict(model, {"g": g})
+    np.testing.assert_allclose(in_sample.mean(), y.mean(), rtol=1e-9)
+    shifted = gamfit.fit({"y": y + 7.5, "g": g}, "y ~ 0 + g", family="gaussian")
+    np.testing.assert_allclose(_predict(shifted, {"g": levels}), fitted + 7.5, rtol=1e-8)
+
+    # The contrasts keep their penalty: every pairwise difference is pulled
+    # toward zero from the raw cell means, not reproduced at no cost.
+    for i in range(len(levels)):
+        for j in range(i + 1, len(levels)):
+            assert abs(fitted[i] - fitted[j]) < abs(raw[i] - raw[j])
 
 
 def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
@@ -91,13 +105,13 @@ def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
     np.testing.assert_allclose(_predict(reloaded, grid), _predict(model, grid), rtol=1e-12)
 
 
-def test_backtick_columns_and_c_alias_match_plain_names():
+def test_backtick_columns_match_plain_names():
     x, y = _linear_data()
     site = np.resize(np.array(["north", "south", "east"]), N)
     y = y + np.where(site == "south", 0.5, 0.0)
     quoted = gamfit.fit(
         {"y": y, "dose (mg)": x, "site-id": site},
-        "y ~ `dose (mg)` + C(`site-id`)",
+        "y ~ `dose (mg)` + factor(`site-id`)",
         family="gaussian",
     )
     plain = gamfit.fit(
@@ -110,6 +124,12 @@ def test_backtick_columns_and_c_alias_match_plain_names():
         _predict(plain, {"dose": x, "site": site}),
         rtol=1e-8,
     )
+    with pytest.raises(gamfit.errors.FormulaError, match=r"`C\(\)` is not a term function.*factor\(`site-id`\)"):
+        gamfit.fit(
+            {"y": y, "dose (mg)": x, "site-id": site},
+            "y ~ `dose (mg)` + C(`site-id`)",
+            family="gaussian",
+        )
 
 
 def test_domain_must_contain_the_data():

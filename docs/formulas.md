@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -153,7 +153,7 @@ mutually exclusive.
 y ~ 0 + x                 # regression through the origin (penalized slope)
 y ~ x - 1                 # the same model
 y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
-y ~ 0 + g                 # cell means: one unpenalized coefficient per level of g
+y ~ 0 + g                 # one coefficient per level; their mean is unpenalized, their contrasts penalized
 y ~ 0 + s(x) + s(z)       # s(x) carries the level; s(z) stays centred
 ```
 
@@ -164,10 +164,13 @@ shifting the response shifts the fit and nothing else. With the intercept
 it is the all-ones column and every other term is centred against it.
 Without it the level moves to one term, chosen by this rule:
 
-1. **The first fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main
+1. **The first factor** — `+ g`, `factor(g)`, or the main
    effect of a factor `by=` smooth. It is dummy-coded with every level kept
-   (no reference level) and made unpenalized, so `0 + g` is exactly the
-   cell-means model. A second factor keeps its usual coding.
+   (no reference level), and its ridge becomes the centring projector
+   `I − 11ᵀ/L` on its `L` levels: the common level of all its coefficients is
+   the one unpenalized direction, and the contrasts between levels keep the
+   REML-estimated penalty they have with an intercept. A second factor keeps
+   its usual ridge.
 2. **Else the first pure-indicator interaction** (`g:h`), which keeps every
    cell, its reference cell included.
 3. **Else the first B-spline or tensor smooth** (`s(x)`, `te(x, z)`, …). A
@@ -195,7 +198,6 @@ support shrinkage.
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -212,13 +214,14 @@ random intercepts.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing
 parameter and give the same predictions for every level seen in training.
-In a model with an intercept, no spelling fits an unpenalized fixed effect;
-without one, the first factor carries the level unpenalized (see
+No spelling fits an unpenalized level effect. Without an intercept the
+first factor also carries the model's level, and only that constant
+direction is unpenalized (see
 [Removing the intercept](#removing-the-intercept)).
 
 They differ in two ways only:
@@ -233,9 +236,11 @@ So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
-`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+`factor()`, `group()` and `re()` take no options: the penalty
 strength is always estimated, so `factor(site, k=3)` is rejected as an
-unknown option instead of being ignored. A categorical column is also
+unknown option instead of being ignored. `factor(site)` is the only
+spelling of the level effect: `C(site)` is rejected with an error that
+points to `factor(site)`. A categorical column is also
 refused inside a term that treats its inputs as numeric axes (`linear()`,
 `s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
 non-factor bases): the error points to `factor(site)` or `group(site)` for

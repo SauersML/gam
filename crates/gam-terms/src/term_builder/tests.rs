@@ -4849,31 +4849,59 @@ fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64
     (&fitted - &ones).iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
-/// `0 + g` (and `- 1`, and every spelling of the fixed factor) is the
-/// cell-means model: every level keeps its column, the block is unpenalized,
-/// and the constant is spanned at no penalty. With an intercept the same
-/// factor stays the penalized full-level block it has always been.
+/// `0 + g` (and `- 1`, and `factor(g)`) hands the level to the factor: every
+/// level keeps its column and the block's penalty becomes the centring
+/// projector, so the constant is spanned at no penalty while every contrast
+/// between levels stays penalized. With an intercept the same factor stays
+/// the plain ridge-penalized full-level block.
 #[test]
-fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
+fn no_intercept_factor_carries_the_level_and_keeps_its_contrasts_penalized() {
     let ds = two_factor_dataset();
-    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)"] {
         let spec = build_formula(formula, &ds);
         assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
         let re = &spec.random_effect_terms[0];
         assert!(!re.drop_first_level, "`{formula}` keeps every level");
-        assert!(!re.penalized, "`{formula}`: the level carrier is unpenalized");
+        assert!(re.penalized, "`{formula}`: the level carrier stays penalized");
+        assert!(re.carries_level, "`{formula}`: the factor carries the level");
         let residual = unpenalized_constant_residual(&ds, &spec);
         assert!(residual < 1e-8, "`{formula}`: {residual}");
+
+        // The carrier's penalty is exactly I − 11ᵀ/L on its block: the one
+        // null direction is the constant, and the rank is L − 1.
+        let design = crate::smooth::build_term_collection_design(ds.values.view(), &spec)
+            .expect("design builds");
+        let (_, range) = &design.random_effect_ranges[0];
+        let levels = range.len();
+        assert!(levels >= 2, "`{formula}`: {levels} levels");
+        let carrier = design
+            .penalties
+            .iter()
+            .find(|penalty| penalty.col_range == *range)
+            .expect("the carrier owns a penalty block");
+        for i in 0..levels {
+            for j in 0..levels {
+                let expected = f64::from(u8::from(i == j)) - 1.0 / levels as f64;
+                assert!(
+                    (carrier.local[[i, j]] - expected).abs() < 1e-14,
+                    "`{formula}`: S[{i},{j}] = {}",
+                    carrier.local[[i, j]]
+                );
+            }
+        }
     }
 
     let with_intercept = build_formula("y ~ f", &ds);
     assert_eq!(with_intercept.level, ModelLevel::Intercept);
     assert!(with_intercept.random_effect_terms[0].penalized);
+    assert!(!with_intercept.random_effect_terms[0].carries_level);
 
-    // Only the FIRST fixed factor carries the level; a second one stays the
-    // penalized block whose offsets shrink toward zero.
+    // Only the FIRST factor carries the level; a second one stays the plain
+    // ridge block whose offsets shrink toward zero.
     let two = build_formula("y ~ 0 + f + g", &ds);
-    assert!(!two.random_effect_terms[0].penalized);
+    assert!(two.random_effect_terms[0].carries_level);
+    assert!(two.random_effect_terms[0].penalized);
+    assert!(!two.random_effect_terms[1].carries_level);
     assert!(two.random_effect_terms[1].penalized);
     let residual = unpenalized_constant_residual(&ds, &two);
     assert!(residual < 1e-8, "`0 + f + g`: {residual}");
@@ -4980,15 +5008,16 @@ fn no_intercept_releases_the_first_default_smooth_to_carry_the_level() {
     assert!(residual < 1e-8, "te: {residual}");
 }
 
-/// A factor `by=` smooth's main effect is a fixed factor block, so without an
-/// intercept it is the unpenalized level carrier.
+/// A factor `by=` smooth's main effect is a factor block, so without an
+/// intercept it carries the level, its contrasts still penalized.
 #[test]
 fn no_intercept_factor_by_main_effect_carries_the_level() {
     let ds = factor_dataset();
     let spec = build_formula("y ~ 0 + s(x, by=g)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
     assert_eq!(spec.random_effect_terms.len(), 1);
-    assert!(!spec.random_effect_terms[0].penalized);
+    assert!(spec.random_effect_terms[0].penalized);
+    assert!(spec.random_effect_terms[0].carries_level);
     let residual = unpenalized_constant_residual(&ds, &spec);
     assert!(residual < 1e-8, "{residual}");
 }
