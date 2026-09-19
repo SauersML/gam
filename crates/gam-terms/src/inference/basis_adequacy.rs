@@ -222,6 +222,16 @@
 //! two-thirds of null replicates are refused, and the measured Poisson ones
 //! are conservative (size `0.030` at `0.05`, KS `p = 2e-4`).
 //!
+//! Two further scopes are unmeasured. A prior weight is read as the fit's
+//! likelihood reads it, as a frequency weight: `wᵢyᵢ` is a sum of `wᵢ` unit
+//! draws, so every cumulant of `wᵢ(yᵢ − μᵢ)` is `wᵢ` times the unit one. Weights
+//! that mean anything else (importance or survey weights) break that, and the
+//! reference does not describe them. And the calibration runs cover designs of
+//! about 10 columns. The row sample is capped by the conditional reference's
+//! cost, which grows with the design width squared, so a design of hundreds of
+//! columns is tested on a sample whose leverage `p/m` is not small, and that
+//! regime is untested.
+//!
 //! # What it does not claim
 //!
 //! `λ̂` is held at its fitted value and the enrichment is a fixed alternative,
@@ -599,15 +609,16 @@ pub fn canonical_null_fit(
 ///
 /// the scaled `χ²` matching the conditional mean and variance of `T_c`.
 ///
-/// `None` when the geometry supports no test (as in
-/// [`basis_adequacy_score_test`]), when `Σ` is not positive definite, or when
-/// `c ≤ 0` — the expansion is then outside the range where it describes the
-/// conditional law, and "not measured" is the honest report.
+/// Refuses with [`ConditionalTestRefusal::NoTest`] when the geometry supports
+/// no test (as in [`basis_adequacy_score_test`]), and with
+/// [`ConditionalTestRefusal::OutsideExpansion`] when `Σ` is not positive
+/// definite or `c ≤ 0` — the expansion is then outside the range where it
+/// describes the conditional law, and "not measured" is the honest report.
 pub fn conditional_basis_adequacy_test(
     enrichment: ArrayView2<'_, f64>,
     design: ArrayView2<'_, f64>,
     null_fit: &CanonicalNullFit,
-) -> Option<BasisAdequacyResult> {
+) -> Result<BasisAdequacyResult, ConditionalTestRefusal> {
     use gam_linalg::faer_ndarray::FaerCholesky;
     const ROW_BLOCK: usize = 4096;
     let m = design.nrows();
@@ -621,7 +632,7 @@ pub fn conditional_basis_adequacy_test(
         || null_fit.whitened.nrows() != m
         || null_fit.gram.dimension() != p
     {
-        return None;
+        return Err(ConditionalTestRefusal::NoTest);
     }
     let geometry = enrichment_geometry(
         enrichment,
@@ -630,7 +641,8 @@ pub fn conditional_basis_adequacy_test(
         null_fit.weights.view(),
         null_fit.score.view(),
         &null_fit.gram,
-    )?;
+    )
+    .ok_or(ConditionalTestRefusal::NoTest)?;
     let r = geometry.basis.ncols();
 
     // `L = Z̃K`, `m × r`: no wider than the enrichment the caller already holds.
@@ -711,9 +723,11 @@ pub fn conditional_basis_adequacy_test(
     }
     let covariance = 0.5 * (&covariance + &covariance.t());
     if covariance.iter().any(|value| !value.is_finite()) {
-        return None;
+        return Err(ConditionalTestRefusal::NoTest);
     }
-    let factor = covariance.cholesky(Side::Lower).ok()?;
+    let factor = covariance
+        .cholesky(Side::Lower)
+        .map_err(|_| ConditionalTestRefusal::OutsideExpansion)?;
     let centered = &geometry.projected - &offset;
     let statistic = centered.dot(&factor.solvevec(&centered));
 
@@ -725,15 +739,32 @@ pub fn conditional_basis_adequacy_test(
         - smoothed.dot(&smoothed);
     let reference_df = r as f64;
     let scale = 1.0 + fourth_cumulant / (2.0 * reference_df);
-    if !(statistic.is_finite() && statistic >= 0.0 && scale.is_finite() && scale > 0.0) {
-        return None;
+    if !(statistic.is_finite() && statistic >= 0.0 && scale.is_finite()) {
+        return Err(ConditionalTestRefusal::NoTest);
+    }
+    if scale <= 0.0 {
+        return Err(ConditionalTestRefusal::OutsideExpansion);
     }
     let p_value = chi_square_sf(statistic / scale, reference_df / scale);
-    p_value.is_finite().then_some(BasisAdequacyResult {
+    if !p_value.is_finite() {
+        return Err(ConditionalTestRefusal::NoTest);
+    }
+    Ok(BasisAdequacyResult {
         statistic,
         rank: r,
         p_value,
     })
+}
+
+/// Why [`conditional_basis_adequacy_test`] reports no p-value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionalTestRefusal {
+    /// The geometry supports no test: mismatched shapes, no estimable
+    /// enrichment direction, or a statistic that is not finite.
+    NoTest,
+    /// The expansion of the conditional law left its range of validity: `Σ`
+    /// is not positive definite, or `c ≤ 0`.
+    OutsideExpansion,
 }
 
 /// The whitened geometry of an enrichment against a fitted design: everything
@@ -2010,7 +2041,17 @@ mod tests {
                 Array1::<f64>::zeros(n).view(),
                 self.family,
             )?;
-            conditional_basis_adequacy_test(self.enrichment.view(), self.design.view(), &null_fit)
+            match conditional_basis_adequacy_test(
+                self.enrichment.view(),
+                self.design.view(),
+                &null_fit,
+            ) {
+                Ok(outcome) => Some(outcome),
+                Err(ConditionalTestRefusal::OutsideExpansion) => None,
+                Err(ConditionalTestRefusal::NoTest) => {
+                    panic!("the fixture's enrichment must support a test on every draw")
+                }
+            }
         }
 
         /// Null p-values over `replicates` draws, and how many draws the

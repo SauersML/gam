@@ -2328,6 +2328,15 @@ fn fit_materialized_once_with_notes(
     ))
 }
 
+/// What [`attach_basis_adequacy`] needs from the standard request, kept across
+/// the `fit_model` move.
+struct BasisAdequacyInputs<'a> {
+    frame: StandardFitData<'a>,
+    y: std::sync::Arc<ndarray::Array1<f64>>,
+    prior_weights: std::sync::Arc<ndarray::Array1<f64>>,
+    canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
+}
+
 /// Measure each smooth's basis adequacy (#2774) and fold the verdict into the
 /// fit result and its user-facing advisories.
 ///
@@ -2341,15 +2350,6 @@ fn fit_materialized_once_with_notes(
 /// A missing verdict is never an error. `basis_adequacy_report` returns a typed
 /// reason per term instead, and a fit is not refused, delayed, or altered by
 /// what this finds — the only thing that changes is what the caller is told.
-/// What [`attach_basis_adequacy`] needs from the standard request, kept across
-/// the `fit_model` move.
-struct BasisAdequacyInputs<'a> {
-    frame: StandardFitData<'a>,
-    y: std::sync::Arc<ndarray::Array1<f64>>,
-    prior_weights: std::sync::Arc<ndarray::Array1<f64>>,
-    canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
-}
-
 fn attach_basis_adequacy(
     result: FitResult,
     covariate_frame: Option<BasisAdequacyInputs<'_>>,

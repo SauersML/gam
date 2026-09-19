@@ -526,6 +526,14 @@ pub fn basis_adequacy_report(
     if n_rows == 0 || data.nrows() != n_rows {
         return Vec::new();
     }
+    // A canonical family is only ever referred to its conditional law; a
+    // response that does not cover the design's rows is a caller bug, not a
+    // reason to publish the first-order reference instead.
+    if response.canonical_family.is_some()
+        && (response.y.len() != n_rows || response.prior_weights.len() != n_rows)
+    {
+        return Vec::new();
+    }
 
     // The term's EDF, read through the design's OWN penalty-range accessor
     // rather than by re-deriving the flat-layout cursor walk. That walk has been
@@ -561,9 +569,7 @@ pub fn basis_adequacy_report(
             .map(|idx| undetermined(idx, BasisAdequacyProvenance::NoIrlsRowState))
             .collect();
     };
-    let canonical_family = response
-        .canonical_family
-        .filter(|_| response.y.len() == n_rows && response.prior_weights.len() == n_rows);
+    let canonical_family = response.canonical_family;
     // The conditional reference's cost grows with the design width squared, so
     // for a canonical family the row sample is also sized to ITS budget, at the
     // widest enrichment any term can ask for.
@@ -689,12 +695,20 @@ pub fn basis_adequacy_report(
             };
             let outcome = match &reference {
                 ScoreReference::Conditional(null_fit) => {
+                    use gam_terms::inference::basis_adequacy::ConditionalTestRefusal;
                     gam_terms::inference::basis_adequacy::conditional_basis_adequacy_test(
                         enrichment.view(),
                         gathered_design.view(),
                         null_fit,
                     )
-                    .ok_or(BasisAdequacyProvenance::ConditionalReferenceUnavailable)
+                    .map_err(|refusal| match refusal {
+                        ConditionalTestRefusal::NoTest => {
+                            BasisAdequacyProvenance::StatisticUnavailable
+                        }
+                        ConditionalTestRefusal::OutsideExpansion => {
+                            BasisAdequacyProvenance::ConditionalReferenceUnavailable
+                        }
+                    })
                 }
                 ScoreReference::Product {
                     hessian_weights,

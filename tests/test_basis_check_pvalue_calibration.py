@@ -149,7 +149,7 @@ def test_basis_check_is_uniform_under_an_adequate_basis(family, truth, reps, not
 
 def test_basis_check_rejects_a_basis_too_small_for_the_truth():
     # A k=4 fit of sin(6x) at n=2000. The 500-replicate bench measures power
-    # of 0.84 at 0.05. Measured at this seed: 13 of 20 rejections.
+    # of 0.86 at 0.05. Measured at this seed: 13 of 20 rejections.
     p_values, provenance = _basis_check_p_values(
         "gaussian", 2000, "y ~ s(x, k=4)", lambda x: np.sin(6.0 * x), 20, SEED + 1
     )
