@@ -1869,4 +1869,21 @@ mod rigid_row_kernel_closed_form_tests {
         }
         eprintln!("RIGID-ROW-KERNEL-CLOSED-FORM worst_scaled_error={worst:.3e}");
     }
+
+    /// gam#3035: the four BLAS-3 dense overrides agree with the generic per-row
+    /// reductions on the full data and on a Horvitz–Thompson-weighted subsample.
+    #[test]
+    fn rigid_dense_overrides_match_generic_on_every_row_set_3035() {
+        for frailty_sd in [None, Some(0.6)] {
+            let (family, states) = fixture(frailty_sd);
+            let kern = BernoulliRigidRowKernel::new(family, states);
+            crate::row_kernel::row_set_override_tests::assert_dense_overrides_match_generic(
+                &format!("rigid BMS frailty={frailty_sd:?}"),
+                &kern,
+                &[0.4, -0.3, 0.8, -0.6, 0.5],
+                &[-0.7, 0.2, 0.5, 0.9, -0.35],
+                1e-13,
+            );
+        }
+    }
 }

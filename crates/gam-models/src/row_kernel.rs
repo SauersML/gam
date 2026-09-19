@@ -351,9 +351,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row path; overrides return `None` only for row sets they explicitly
     /// decline.
     ///
-    /// `rows == RowSet::All` is the only case an override should claim; under a
-    /// subsample / non-unit-weight `RowSet` the override must return `None` so
-    /// the generic Horvitz-Thompson per-row path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn directional_derivative_dense_override(
         &self,
         rows: &RowSet,
@@ -386,14 +388,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row third tensor is INDEPENDENT of the swept axis, so it is built once
     /// and each axis closed with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs. The
     /// default declines this batched optimization, so the dispatcher runs the
-    /// exact generic per-axis path bit-for-bit. Overrides should claim only the
-    /// full-data unit-weight
-    /// `RowSet::All` case; under a subsample / non-unit-weight `RowSet` return
-    /// `None` so the generic Horvitz-Thompson per-row path runs per axis.
+    /// exact generic per-axis path bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)` reduced in
-    /// deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_directional_derivative(self, rows, e_a)` up to reassociation
+    /// of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn directional_derivative_all_axes_dense_override(
         &self,
@@ -433,9 +437,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// BLAS-3 products. The default returns the exact generic per-row path;
     /// overrides return `None` only for row sets they explicitly decline and
     /// surface failures from an algorithm they did select through `Err`.
-    /// Overrides should claim only the full-data unit-weight `RowSet::All` case;
-    /// under a subsample / non-unit-weight `RowSet` return `None` so the generic
-    /// HT path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn hessian_dense_override(
         &self,
         rows: &RowSet,
@@ -472,14 +478,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// swept axis, so it can be hoisted out of the `p`-loop and each axis closed
     /// with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs reading the shared cached
     /// fourth tensor. The default returns `None`, preserving the exact generic
-    /// per-axis path for every other kernel bit-for-bit. Overrides should claim
-    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
-    /// non-unit-weight `RowSet` return `None` so the generic Horvitz-Thompson
-    /// per-row path runs per axis.
+    /// per-axis path for every other kernel bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_second_directional_derivative(self, rows, d_beta_u,
-    /// e_a)` reduced in deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_second_directional_derivative(self, rows, d_beta_u, e_a)` up
+    /// to reassociation of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn second_directional_derivative_all_axes_dense_override(
         &self,
@@ -2615,6 +2623,116 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
                 rows: self.rows.clone(),
             },
         )))
+    }
+}
+
+/// Shared pinning check for the `RowKernel` dense overrides (gam#3035): each
+/// dispatched override must agree with the generic per-row reduction on the full
+/// data AND on a Horvitz–Thompson-weighted subsample.
+#[cfg(test)]
+pub(crate) mod row_set_override_tests {
+    use super::*;
+    use crate::outer_subsample::WeightedOuterRow;
+
+    /// A deterministic weighted subsample of `0..n` that mixes runs of
+    /// consecutive rows with gaps and carries unequal non-unit weights.
+    pub(crate) fn weighted_subsample(n: usize) -> RowSet {
+        let rows: Vec<WeightedOuterRow> = (0..n)
+            .filter(|row| (row * 7) % 5 < 2)
+            .map(|row| WeightedOuterRow {
+                index: row,
+                weight: 1.5 + 0.25 * (row % 4) as f64,
+                stratum: 0,
+            })
+            .collect();
+        RowSet::Subsample {
+            rows: Arc::new(rows),
+            n_full: n,
+        }
+    }
+
+    fn max_gap(fast: &Array2<f64>, reference: &Array2<f64>) -> f64 {
+        assert_eq!(fast.dim(), reference.dim());
+        fast.iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn max_abs(matrix: &Array2<f64>) -> f64 {
+        matrix.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    }
+
+    /// Worst relative gap of every dense override against its generic
+    /// reduction on `rows`, and the full-data Hessian it was taken at.
+    fn override_gaps<const K: usize>(
+        kern: &(impl RowKernel<K> + Sync),
+        rows: &RowSet,
+        d_beta: &[f64],
+        d_beta_u: &[f64],
+    ) -> ([f64; 4], Array2<f64>) {
+        let p = kern.n_coefficients();
+        let cache = build_row_kernel_cache(kern, rows).expect("row-kernel cache");
+        let hessian = row_kernel_hessian_dense(kern, &cache, rows).expect("dispatched dense Hessian");
+        let hessian_generic = row_kernel_hessian_dense_generic(kern, rows, &cache.hessians);
+        let hessian_gap = max_gap(&hessian, &hessian_generic) / max_abs(&hessian_generic).max(f64::MIN_POSITIVE);
+
+        let directional = row_kernel_directional_derivative(kern, rows, d_beta).expect("dispatched Hdot");
+        let directional_generic =
+            row_kernel_directional_derivative_generic(kern, rows, d_beta).expect("generic Hdot");
+        let directional_gap =
+            max_gap(&directional, &directional_generic) / max_abs(&directional_generic).max(f64::MIN_POSITIVE);
+
+        let first = row_kernel_directional_derivative_all_axes(kern, rows).expect("dispatched all-axes Hdot");
+        let second =
+            row_kernel_second_directional_derivative_all_axes(kern, rows, d_beta_u).expect("dispatched all-axes H2dot");
+        assert_eq!((first.len(), second.len()), (p, p));
+        let mut first_gap = 0.0_f64;
+        let mut second_gap = 0.0_f64;
+        for axis in 0..p {
+            let mut e_a = vec![0.0; p];
+            e_a[axis] = 1.0;
+            let first_generic =
+                row_kernel_directional_derivative_generic(kern, rows, &e_a).expect("generic per-axis Hdot");
+            let second_generic = row_kernel_second_directional_derivative(kern, rows, d_beta_u, &e_a)
+                .expect("generic per-axis H2dot");
+            first_gap = first_gap.max(max_gap(&first[axis], &first_generic) / max_abs(&first_generic).max(f64::MIN_POSITIVE));
+            second_gap =
+                second_gap.max(max_gap(&second[axis], &second_generic) / max_abs(&second_generic).max(f64::MIN_POSITIVE));
+        }
+        ([hessian_gap, directional_gap, first_gap, second_gap], hessian_generic)
+    }
+
+    /// Assert every dense override matches the generic reduction, relative to
+    /// the largest entry, within `relative_band` on the full data and on
+    /// [`weighted_subsample`]. The subsample Hessian must differ from the
+    /// full-data one, so the subsample leg cannot pass by ignoring `rows`.
+    pub(crate) fn assert_dense_overrides_match_generic<const K: usize>(
+        label: &str,
+        kern: &(impl RowKernel<K> + Sync),
+        d_beta: &[f64],
+        d_beta_u: &[f64],
+        relative_band: f64,
+    ) {
+        let n = kern.n_rows();
+        let subsample = weighted_subsample(n);
+        let (all_gaps, all_hessian) = override_gaps(kern, &RowSet::All, d_beta, d_beta_u);
+        let (subsample_gaps, subsample_hessian) = override_gaps(kern, &subsample, d_beta, d_beta_u);
+        let names = ["dense Hessian", "directional derivative", "all-axes first", "all-axes second"];
+        for (set, gaps) in [("All", all_gaps), ("weighted subsample", subsample_gaps)] {
+            for (name, gap) in names.iter().zip(gaps) {
+                assert!(
+                    gap <= relative_band,
+                    "{label}: {name} override on {set} differs from the generic reduction by {gap:e} relative"
+                );
+            }
+        }
+        assert!(
+            max_gap(&all_hessian, &subsample_hessian) > 1e-6 * max_abs(&all_hessian),
+            "{label}: the weighted subsample reproduced the full-data Hessian, so it tests nothing"
+        );
+        let show = |gaps: [f64; 4]| gaps.map(|gap| format!("{gap:.2e}")).join(", ");
+        eprintln!("{label}: relative gaps All [{}], weighted subsample [{}]", show(all_gaps), show(subsample_gaps));
     }
 }
 
