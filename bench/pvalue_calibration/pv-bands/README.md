@@ -21,8 +21,9 @@ published, because it failed calibration (see
   band at 0.95, which is the G2 comparison.
 - Seeds:
   - Replicate r uses `100_000 * (1 + family index) + 10 n + r`.
-  - The band's max|Z| law uses 10 000 draws with seed 12 345. Both are fixed
-    in Rust and reported on every row as `n_sim` and `seed`.
+  - The band's max|Z| law uses the Rust defaults, 10 000 draws with seed
+    12 345 (the request's `n_sim` and `seed`). Each row reports the
+    resulting `critical`.
 - Refused fits are counted with their message, never dropped silently.
 
 Reproduce (about 32 minutes on a 4-core container):
