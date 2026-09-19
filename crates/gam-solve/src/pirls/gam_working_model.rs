@@ -202,6 +202,15 @@ impl<'a> GamWorkingModel<'a> {
                 self.priorweights,
             )
         } else {
+            if let Some(objective) = unit_measure_deviance_and_log_kernel_from_eta(
+                self.y,
+                &self.workspace.eta_buf,
+                &self.likelihood,
+                &self.link_kind,
+                self.priorweights,
+            )? {
+                return Ok(objective);
+            }
             let deviance = self.likelihood.loglik_deviance(
                 self.y,
                 &self.workspace.eta_buf,
