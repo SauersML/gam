@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import numbers
+import sys
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from typing import Any, cast
@@ -442,21 +443,24 @@ def preferred_output_kind(input_kind: str, training_kind: str) -> str:
 
 
 def detect_table_kind(data: Any) -> str:
+    # An instance of a library's class exists only once that library is
+    # imported, so the probe reads `sys.modules` rather than importing: a dict
+    # or numpy input must not pay for a cold pandas/polars/pyarrow import.
     if data is None:
         return "unknown"
-    pd = _try_import("pandas")
+    pd = sys.modules.get("pandas")
     if pd is not None and isinstance(data, pd.DataFrame):
         return "pandas"
 
-    pl = _try_import("polars")
+    pl = sys.modules.get("polars")
     if pl is not None and isinstance(data, pl.DataFrame):
         return "polars"
 
-    pa = _try_import("pyarrow")
+    pa = sys.modules.get("pyarrow")
     if pa is not None and isinstance(data, pa.Table):
         return "pyarrow"
 
-    np = _try_import("numpy")
+    np = sys.modules.get("numpy")
     if np is not None and isinstance(data, np.ndarray):
         return "numpy"
 
