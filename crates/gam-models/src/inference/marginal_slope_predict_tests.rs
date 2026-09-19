@@ -89,6 +89,8 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
         gaussian_frailty_sd: None,
         latent_z_calibration: None,
         latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: None,
     };
     let err = score_only
@@ -219,6 +221,8 @@ fn bernoulli_marginal_slope_rigid_gaussian_frailty_uses_scaled_closed_form() {
         gaussian_frailty_sd: Some(0.8),
         latent_z_calibration: None,
         latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: None,
     };
     let theta = predictor.theta();
@@ -280,6 +284,7 @@ fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
             grids: grids.clone(),
             top_k: 1,
             bandwidth: 0.25,
+            mixture: crate::bms::LocalLawMixture::default(),
             train_row_mixtures: std::sync::Arc::new(Vec::new()),
         },
         baseline_marginal: 0.0,
@@ -290,6 +295,8 @@ fn bernoulli_marginal_slope_predictor_uses_local_empirical_latent_law() {
         gaussian_frailty_sd: None,
         latent_z_calibration: None,
         latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: None,
     };
     let input = PredictInput {
@@ -344,6 +351,8 @@ fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
         gaussian_frailty_sd: Some(0.8),
         latent_z_calibration: None,
         latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: None,
     };
     let theta = predictor.theta();
@@ -415,6 +424,8 @@ fn conditional_latent_calibration_conditions_on_the_named_design_block() {
         gaussian_frailty_sd: None,
         latent_z_calibration: None,
         latent_conditioning_span: span,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: Some(calibration.clone()),
     };
     let input_from = |design: Array2<f64>| PredictInput {
@@ -524,6 +535,8 @@ fn empirical_law_prediction_accepts_deep_tail_intercept_roots() {
         gaussian_frailty_sd: None,
         latent_z_calibration: None,
         latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+        residual_repair: None,
+        beta_residual: None,
         latent_z_conditional_calibration: None,
     };
     let theta = predictor.theta();

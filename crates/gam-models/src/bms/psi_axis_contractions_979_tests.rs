@@ -63,6 +63,8 @@ fn rigid_psi_axis_contractions_match_the_materialized_tensors_979() {
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::from_shape_fn(n, |i| {
             if (i * 7) % 5 < 2 { 1.0 } else { 0.0 }
         })),
@@ -207,6 +209,7 @@ fn flex_full_row_correction_traces_match_the_per_row_route_979() {
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: false,
+        search: None,
         y: Arc::new(Array1::from_shape_fn(n, |i| {
             if (i * 7) % 5 < 2 { 1.0 } else { 0.0 }
         })),
@@ -219,6 +222,7 @@ fn flex_full_row_correction_traces_match_the_per_row_route_979() {
         slope_design: DesignMatrix::Dense(DenseDesignMatrix::from(slope_x.clone())),
         score_warp: Some(score.runtime.clone()),
         link_dev: Some(link.runtime.clone()),
+        residual: None,
         policy: policy.clone(),
         cell_moment_lru: new_cell_moment_lru_cache(&policy),
         cell_moment_cache_stats: new_cell_moment_cache_stats(),

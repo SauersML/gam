@@ -9,6 +9,8 @@
 //! - [`KnownBlock::explained_variance`], [`KnownBlock::discarded_error`] and
 //!   [`KnownBlock::explained_variance_of_coordinates`] are R4 on a frame or on a coordinate set.
 //! - [`KnownBlock::explained_variance_gradient`] is R6.
+//! - [`KnownGatedBlock::new`] and [`KnownGatedBlock::retained_response`] are R9's gated block and its best retained
+//!   response, with the SiLU quadrature band of every entry.
 //! - [`covariance_rounding_band`] and [`frame_defect`] own the Cauchy–Schwarz rounding band a caller states to the
 //!   pair kernels.
 //!
@@ -60,9 +62,23 @@
 //!
 //! # Tiles
 //!
-//! The frame enters only through `R = W Q` (`h × k`) and the metric only through `M U` (`p × h`). One tile of `t`
-//! units forms `R_J Rᵀ` and `U_Jᵀ (M U)` (each `t × h`) and `B_J R` (`t × k`), so no `d × d` matrix and no resident
-//! `h × h` matrix is ever formed. The gradient is then `Wᵀ(B R) − Q (Qᵀ Wᵀ (B R))`.
+//! The frame enters only through `R = W Q` (`h × k`) and the metric only through `D = Uᵀ M U`. `D` is read over
+//! `j ≤ k` from the block's [`ReaderGram`], or, when the process-wide ledger declines that cache, streamed per tile
+//! by [`fill_upper_rows`] over the same tiles, so both routes read the same words. `D` and the pair law are both
+//! symmetric, so a pass evaluates only the pairs `k ≥ j` and counts each strictly upper term twice. A tile `J` of `t`
+//! units starting at `s` forms `R_J R_{k≥s}ᵀ` and its weights `B_J` over `k ≥ s` (each `t × (h − s)`). It adds
+//! `B_J R_{k≥s}` to its own rows of `B R`, and the strictly upper part transposed, `B_Jᵀ R_J`, to the rows `k ≥ s`.
+//! No `d × d` matrix is formed, and the only resident `h × h` object is the packed half of `D`, charged to the
+//! memory governor. The gradient is then `Wᵀ(B R) − Q (Qᵀ Wᵀ (B R))`.
+//!
+//! # R9, gated units
+//!
+//! A SwiGLU unit is `u_j (a_jᵀ z + c_j) s(w_jᵀ z + b_j)` with the SiLU gate `s(t) = t σ(t)`. Given `PZ = Pz`, the
+//! discarded parts `A = a_jᵀ(I − P)Z` and `W = w_jᵀ(I − P)Z` are a zero-mean Gaussian pair independent of `PZ`, with
+//! `Var W = v_j⊥ = w_jᵀ(I − P)w_j` and `Cov(A, W) = κ_j⊥ = a_jᵀ(I − P)w_j`, and Stein's lemma `E[A h(W)] = κ E h'(W)`
+//! gives the unit's conditional mean exactly as `α_j T_{v⊥} s(t_j) + κ_j⊥ T_{v⊥} s'(t_j)`, with `α_j = a_jᵀPz + c_j`
+//! and `t_j = w_jᵀPz + b_j`. SiLU has no closed-form Gaussian smoothing, so each value carries its derived quadrature
+//! bound from `gaussian_gated`.
 //!
 //! # Rounding of the pair law
 //!
@@ -70,18 +86,35 @@
 //! cone only by the rounding of its formation and by a frame's orthonormality defect, and the kernel projects a
 //! covariance within the stated band [`covariance_rounding_band`] onto the boundary and refuses one beyond it. A frame
 //! whose measured defect reaches 1 is not a frame and is refused ([`ResponseError::FrameNotOrthonormal`]).
+//!
+//! # The operator's band
+//!
+//! `V(I)`, `V(P)` and `E(P)` are [`BandedEnergy`]. Each pair term carries a first-order bound on its distance from the
+//! exact term at the exact law, summing:
+//! - the kernel's own rounding;
+//! - the covariance's formation error and the projection's move, through `sup|σ'|²`;
+//! - the variances' rounding, through the kernel's variance partials;
+//! - the means' and the metric products' errors;
+//! - the term's own roundings.
+//!
+//! The pass adds `γ_{2h+1}` of its absolute terms, and `E = V(I) − V(P)` is their [`signed_sum`]. Every pair kernel
+//! that fell back to the certified bivariate normal route is counted: [`FrameGradient::orthant_fallbacks`] reports
+//! the count, and each pass that met one logs the count and its fraction of the pass.
 
+use super::reader_gram::{ReaderGram, ReaderGramError, fill_upper_rows, upper_tile_rows};
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_abt, fast_atb};
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{
-    GaussianActivation, GaussianActivationError, PairKernel, PreactivationPair, gaussian_smoothing_derivatives,
-    pair_kernel,
+    GaussianActivation, GaussianActivationError, PairKernel, PreactivationPair, gaussian_hermite_coefficients,
+    gaussian_smoothing_derivatives, pair_kernel, pair_kernel_variance_partials,
 };
+use gam_math::gaussian_gated::{GatedMean, GaussianGatedError, gated_conditional_mean};
 use gam_runtime::resource::byte_balanced_row_chunk;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::fmt;
+use std::sync::Arc;
 
 /// A refusal of the retained-response operator.
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +154,15 @@ pub enum ResponseError {
         context: &'static str,
         error: GaussianActivationError,
     },
+    /// The reader Gram refused for a reason other than the ledger declining its footprint, which the block answers
+    /// by streaming `D`.
+    ReaderGram {
+        error: ReaderGramError,
+    },
+    GatedKernel {
+        context: &'static str,
+        error: GaussianGatedError,
+    },
 }
 
 impl fmt::Display for ResponseError {
@@ -152,6 +194,8 @@ impl fmt::Display for ResponseError {
                 "retained coordinate at position {position} is out of range or not strictly increasing"
             ),
             Self::Kernel { context, error } => write!(f, "{context}: {error}"),
+            Self::ReaderGram { error } => write!(f, "reader Gram: {error}"),
+            Self::GatedKernel { context, error } => write!(f, "{context}: {error}"),
         }
     }
 }
@@ -161,13 +205,62 @@ impl std::error::Error for ResponseError {}
 /// `V(P)`, `E(P)` and the horizontal frame gradient of `V` at one frame.
 #[derive(Debug, Clone)]
 pub struct FrameGradient {
-    /// `V(P)`, the output variance the retained response explains.
-    pub explained_variance: f64,
-    /// `E(P) = V(I) − V(P)`, the error of discarding the input outside the frame.
-    pub discarded_error: f64,
+    /// `V(P)`, the output variance the retained response explains, with its band.
+    pub explained_variance: BandedEnergy,
+    /// `E(P) = V(I) − V(P)`, the error of discarding the input outside the frame, with its band.
+    pub discarded_error: BandedEnergy,
     /// `∇_Q V = 2 (I − Q Qᵀ) Wᵀ B(P) W Q`, a `d × k` horizontal tangent: the ascent direction of `V` and the descent
     /// direction of `E`.
     pub horizontal_gradient: Array2<f64>,
+    /// How many of the pass's `h (h + 1)/2` pair kernels fell back to the certified bivariate normal route
+    /// ([`PairKernel::orthant_fallback`]), the pass's cost receipt.
+    pub orthant_fallbacks: usize,
+}
+
+/// An energy together with a bound on its absolute error: the vocabulary every producer of a variance in `response/`
+/// reports in, so a consumer decides "resolved from zero" against a derived band instead of a hand threshold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandedEnergy {
+    /// The computed value.
+    pub value: f64,
+    /// A bound on `|computed − exact|`: the arithmetic's rounding plus the producer's accuracy contract.
+    pub band: f64,
+}
+
+impl BandedEnergy {
+    /// The exact zero, `V(∅)`.
+    pub const ZERO: BandedEnergy = BandedEnergy {
+        value: 0.0,
+        band: 0.0,
+    };
+
+    /// Whether the exact value is resolved as positive: the computed value clears its band.
+    pub fn resolved_positive(&self) -> bool {
+        self.value > self.band
+    }
+}
+
+/// `Σ added − Σ subtracted` with its band: the operands' bands plus `γ_{n−1} Σ|operand|`, the rounding of `n − 1`
+/// additions of pre-formed terms (Higham, ASNA §3.1), to first order in `u`.
+pub fn signed_sum(added: &[BandedEnergy], subtracted: &[BandedEnergy]) -> BandedEnergy {
+    let mut value = 0.0;
+    let mut absolute = 0.0;
+    let mut band = 0.0;
+    for term in added {
+        value += term.value;
+        absolute += term.value.abs();
+        band += term.band;
+    }
+    for term in subtracted {
+        value -= term.value;
+        absolute += term.value.abs();
+        band += term.band;
+    }
+    let operations = (added.len() + subtracted.len()).saturating_sub(1);
+    BandedEnergy {
+        value,
+        band: band + accumulation_growth(operations) * absolute,
+    }
 }
 
 /// How a computed covariance `r̂ = fl(Σ_a left_a right_a)` was formed, for [`covariance_rounding_band`]. Every field is
@@ -198,15 +291,21 @@ pub struct CovarianceFormation {
 /// recursive rounding of the product sum (Higham, ASNA §3.1), the propagated row formation errors `δ`, and the gap
 /// between the exactly formed rows and the law. The band is their sum.
 pub fn covariance_rounding_band(formation: &CovarianceFormation, variance_x: f64, variance_y: f64) -> f64 {
-    let product_rounding = accumulation_growth(formation.terms) * formation.left_norm * formation.right_norm;
-    let row_rounding = formation.left_row_error * formation.right_norm
-        + formation.left_norm * formation.right_row_error
-        + formation.left_row_error * formation.right_row_error;
     let variance_rounding = ((variance_x + formation.variance_error_x)
         * (variance_y + formation.variance_error_y))
         .sqrt()
         - (variance_x * variance_y).sqrt();
-    product_rounding + row_rounding + formation.law_gap + variance_rounding
+    covariance_formation_error(formation) + variance_rounding
+}
+
+/// A bound on `|r̂ − r|` for a computed covariance: `γ_terms ‖left‖‖right‖ + ‖δ_left‖‖right‖ + ‖left‖‖δ_right‖ +
+/// ‖δ_left‖‖δ_right‖ + law_gap`, the part of [`covariance_rounding_band`] that moves the covariance itself.
+pub fn covariance_formation_error(formation: &CovarianceFormation) -> f64 {
+    let product_rounding = accumulation_growth(formation.terms) * formation.left_norm * formation.right_norm;
+    let row_rounding = formation.left_row_error * formation.right_norm
+        + formation.left_norm * formation.right_row_error
+        + formation.left_row_error * formation.right_row_error;
+    product_rounding + row_rounding + formation.law_gap
 }
 
 /// A measured bound `η ≥ ‖QᵀQ − I‖₂` on the orthonormality defect of a `d × k` frame, or infinity when no bound is
@@ -246,7 +345,14 @@ enum CoordinateFormation {
 #[derive(Debug, Clone)]
 pub struct KnownBlock {
     units: BlockUnits,
-    total_variance: f64,
+    total_variance: BandedEnergy,
+}
+
+/// One pair pass's result: `Σ_jk D_jk [K_σ − m_j m_k]` with its band, and the pass's orthant fallbacks.
+#[derive(Debug, Clone, Copy)]
+struct PassEnergy {
+    energy: BandedEnergy,
+    orthant_fallbacks: usize,
 }
 
 /// The per-unit data every pair term reads.
@@ -264,6 +370,9 @@ struct BlockUnits {
     metric: Array2<f64>,
     /// `M U`, `p × h`, so a tile's `D_J = U_Jᵀ (M U)`.
     metric_writers: Array2<f64>,
+    /// `D = Uᵀ M U` over `j ≤ k` when the process-wide ledger admitted it; `None` streams the same rows per tile.
+    /// Clones of the block share one charged cache.
+    reader_gram: Option<Arc<ReaderGram>>,
     activation: GaussianActivation,
     /// `v̂_j = fl(‖w_j‖²)`.
     reader_variances: Array1<f64>,
@@ -271,6 +380,16 @@ struct BlockUnits {
     reader_variance_errors: Array1<f64>,
     /// `m_j = T_{v_j} σ(b_j) = E σ(b_j + w_jᵀ Z)`.
     unit_means: Array1<f64>,
+    /// A first-order bound on `|m̂_j − m_j|` ([`unit_mean`]).
+    unit_mean_bands: Array1<f64>,
+    /// `½ T_{v̂_j} σ''(b_j) = ∂m_j/∂v_j`, and `0` for a zero reader.
+    half_curvatures: Array1<f64>,
+    /// `‖u_j‖`.
+    writer_norms: Array1<f64>,
+    /// `γ_{2p} ‖|M|‖_∞`, so `|D̂_jk − D_jk| ≤ metric_error_scale ‖u_j‖ ‖u_k‖` ([`KnownBlock::new`]).
+    metric_error_scale: f64,
+    /// `sup|σ'|²`, the covariance Lipschitz constant of every pair kernel.
+    slope_bound: f64,
 }
 
 impl KnownBlock {
@@ -290,32 +409,56 @@ impl KnownBlock {
         require_length("block writer columns", width, writers.ncols())?;
         let output_dim = writers.nrows();
         require_length("block output bias", output_dim, output_bias.len())?;
-        require_length("output metric rows", output_dim, metric.nrows())?;
-        require_length("output metric columns", output_dim, metric.ncols())?;
         require_finite("block readers", readers.iter())?;
         require_finite("block biases", biases.iter())?;
         require_finite("block writers", writers.iter())?;
         require_finite("block output bias", output_bias.iter())?;
-        require_finite("output metric", metric.iter())?;
-        for row in 0..output_dim {
-            for column in (row + 1)..output_dim {
-                if metric[[row, column]] != metric[[column, row]] {
-                    return Err(ResponseError::MetricNotSymmetric { row, column });
-                }
-            }
-        }
-        metric
-            .cholesky(Side::Lower)
-            .map_err(|error| ResponseError::MetricNotPositiveDefinite {
-                reason: error.to_string(),
-            })?;
+        require_metric(output_dim, metric)?;
         let metric_writers = fast_ab(&metric, &writers);
+        // `M U` of finite factors can still overflow. Both routes to `D` read it, so it is refused here, once.
+        require_finite("output metric times writers", metric_writers.iter())?;
+        let reader_gram = match ReaderGram::new(writers.view(), metric_writers.view()) {
+            Ok(gram) => Some(Arc::new(gram)),
+            // A footprint the ledger declines, or one with no representable byte count, streams the same rows instead.
+            Err(ReaderGramError::Admission { .. } | ReaderGramError::SizeOverflow { .. }) => None,
+            Err(error) => return Err(ResponseError::ReaderGram { error }),
+        };
         let reader_variances: Array1<f64> = readers.rows().into_iter().map(|row| row.dot(&row)).collect();
         let variance_growth = accumulation_growth(input_dim);
         let reader_variance_errors = reader_variances.mapv(|variance| variance_growth * variance / (1.0 - variance_growth));
-        let unit_means = (0..width)
-            .map(|unit| smoothing(activation, reader_variances[unit], biases[unit]))
-            .collect::<Result<Array1<f64>, ResponseError>>()?;
+        let mut unit_means = Array1::<f64>::zeros(width);
+        let mut unit_mean_bands = Array1::<f64>::zeros(width);
+        let mut half_curvatures = Array1::<f64>::zeros(width);
+        for unit in 0..width {
+            let mean = unit_mean(
+                activation,
+                biases[unit],
+                reader_variances[unit],
+                reader_variance_errors[unit],
+            )?;
+            unit_means[unit] = mean.value;
+            unit_mean_bands[unit] = mean.band;
+            half_curvatures[unit] = mean.half_curvature;
+        }
+        let writer_norms: Array1<f64> = writers
+            .columns()
+            .into_iter()
+            .map(|column| column.dot(&column).sqrt())
+            .collect();
+        // `D̂ = fl(Uᵀ fl(M U))` errs by at most `2γ_p |u_j|ᵀ |M| |u_k|` to first order, and
+        // `|u_j|ᵀ |M| |u_k| ≤ ‖|M|‖₂ ‖u_j‖ ‖u_k‖ ≤ ‖|M|‖_∞ ‖u_j‖ ‖u_k‖` for the symmetric nonnegative `|M|`.
+        let metric_row_sum = metric
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|entry| entry.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max);
+        let metric_error_scale = accumulation_growth(2 * output_dim) * metric_row_sum;
+        let slope_bound = activation
+            .slope_bound_squared()
+            .map_err(|error| ResponseError::Kernel {
+                context: "pair kernel slope bound",
+                error,
+            })?;
         let units = BlockUnits {
             readers,
             biases,
@@ -323,12 +466,20 @@ impl KnownBlock {
             output_bias,
             metric: metric.to_owned(),
             metric_writers,
+            reader_gram,
             activation,
             reader_variances,
             reader_variance_errors,
             unit_means,
+            unit_mean_bands,
+            half_curvatures,
+            writer_norms,
+            metric_error_scale,
+            slope_bound,
         };
-        let total_variance = units.pair_pass(units.readers.view(), CoordinateFormation::Copied, None)?;
+        let total_variance = units
+            .pair_pass(units.readers.view(), CoordinateFormation::Copied, None)?
+            .energy;
         Ok(Self {
             units,
             total_variance,
@@ -384,8 +535,8 @@ impl KnownBlock {
         self.units.metric_writers.view()
     }
 
-    /// `V(I) = E‖F − E F‖²_M`, the output variance of the whole block.
-    pub fn total_variance(&self) -> f64 {
+    /// `V(I) = E‖F − E F‖²_M`, the output variance of the whole block, with its band.
+    pub fn total_variance(&self) -> BandedEnergy {
         self.total_variance
     }
 
@@ -396,7 +547,7 @@ impl KnownBlock {
         frame: ArrayView2<'_, f64>,
         points: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, ResponseError> {
-        self.require_frame(frame)?;
+        require_frame(self.input_dim(), frame)?;
         require_length("retained-response point columns", self.input_dim(), points.ncols())?;
         require_finite("retained-response points", points.iter())?;
         let units = &self.units;
@@ -430,23 +581,25 @@ impl KnownBlock {
         Ok(response)
     }
 
-    /// R4: `V(P)`, the output variance explained by the best response of the input inside `frame` (`d × k`).
-    pub fn explained_variance(&self, frame: ArrayView2<'_, f64>) -> Result<f64, ResponseError> {
-        let defect = self.require_frame(frame)?;
+    /// R4: `V(P)`, the output variance explained by the best response of the input inside `frame` (`d × k`), with its
+    /// band.
+    pub fn explained_variance(&self, frame: ArrayView2<'_, f64>) -> Result<BandedEnergy, ResponseError> {
+        let defect = require_frame(self.input_dim(), frame)?;
         let coordinates = fast_ab(&self.units.readers, &frame);
-        self.units.pair_pass(
+        let pass = self.units.pair_pass(
             coordinates.view(),
             CoordinateFormation::FrameProducts {
                 frame_defect: defect,
             },
             None,
-        )
+        )?;
+        Ok(pass.energy)
     }
 
     /// R4 on a coordinate frame: `V(P_S)` for the projector onto the input coordinates `retained`, given strictly
-    /// increasing. The covariances `r_jk = Σ_{i ∈ S} W_ji W_ki` are read from the selected reader columns, so no frame
-    /// is formed.
-    pub fn explained_variance_of_coordinates(&self, retained: &[usize]) -> Result<f64, ResponseError> {
+    /// increasing, with its band. The covariances `r_jk = Σ_{i ∈ S} W_ji W_ki` are read from the selected reader
+    /// columns, so no frame is formed.
+    pub fn explained_variance_of_coordinates(&self, retained: &[usize]) -> Result<BandedEnergy, ResponseError> {
         for (position, &coordinate) in retained.iter().enumerate() {
             let increasing = position == 0 || retained[position - 1] < coordinate;
             if coordinate >= self.input_dim() || !increasing {
@@ -454,13 +607,15 @@ impl KnownBlock {
             }
         }
         let coordinates = self.units.readers.select(Axis(1), retained);
-        self.units
-            .pair_pass(coordinates.view(), CoordinateFormation::Copied, None)
+        let pass = self
+            .units
+            .pair_pass(coordinates.view(), CoordinateFormation::Copied, None)?;
+        Ok(pass.energy)
     }
 
-    /// R4: `E(P) = V(I) − V(P)`, the error of discarding the input outside `frame`.
-    pub fn discarded_error(&self, frame: ArrayView2<'_, f64>) -> Result<f64, ResponseError> {
-        Ok(self.total_variance - self.explained_variance(frame)?)
+    /// R4: `E(P) = V(I) − V(P)`, the error of discarding the input outside `frame`, with its band.
+    pub fn discarded_error(&self, frame: ArrayView2<'_, f64>) -> Result<BandedEnergy, ResponseError> {
+        Ok(signed_sum(&[self.total_variance], &[self.explained_variance(frame)?]))
     }
 
     /// R6: `V(P)`, `E(P)` and the horizontal gradient `2 (I − Q Qᵀ) Wᵀ B(P) W Q`, from one pass over the unit pairs.
@@ -468,11 +623,11 @@ impl KnownBlock {
         &self,
         frame: ArrayView2<'_, f64>,
     ) -> Result<FrameGradient, ResponseError> {
-        let defect = self.require_frame(frame)?;
+        let defect = require_frame(self.input_dim(), frame)?;
         let units = &self.units;
         let coordinates = fast_ab(&units.readers, &frame);
         let mut weighted_coordinates = Array2::<f64>::zeros(coordinates.dim());
-        let explained_variance = units.pair_pass(
+        let pass = units.pair_pass(
             coordinates.view(),
             CoordinateFormation::FrameProducts {
                 frame_defect: defect,
@@ -483,9 +638,10 @@ impl KnownBlock {
         let in_frame = fast_atb(&frame, &ambient);
         let horizontal_gradient = (&ambient - &fast_ab(&frame, &in_frame)) * 2.0;
         Ok(FrameGradient {
-            explained_variance,
-            discarded_error: self.total_variance - explained_variance,
+            explained_variance: pass.energy,
+            discarded_error: signed_sum(&[self.total_variance], &[pass.energy]),
             horizontal_gradient,
+            orthant_fallbacks: pass.orthant_fallbacks,
         })
     }
 
@@ -509,36 +665,62 @@ impl KnownBlock {
         }
         variances
     }
+}
 
-    /// Validate a frame and return its measured defect [`frame_defect`], refusing a defect of at least 1.
-    fn require_frame(&self, frame: ArrayView2<'_, f64>) -> Result<f64, ResponseError> {
-        require_length("retained frame rows", self.input_dim(), frame.nrows())?;
-        if frame.ncols() > self.input_dim() {
-            return Err(ResponseError::FrameWiderThanInput {
-                rank: frame.ncols(),
-                input_dim: self.input_dim(),
-            });
-        }
-        require_finite("retained frame", frame.iter())?;
-        let defect = frame_defect(frame);
-        if !(defect < 1.0) {
-            return Err(ResponseError::FrameNotOrthonormal { defect });
-        }
-        Ok(defect)
+/// Validate a frame in `ℝ^{input_dim}` and return its measured defect [`frame_defect`], refusing a defect of at
+/// least 1.
+fn require_frame(input_dim: usize, frame: ArrayView2<'_, f64>) -> Result<f64, ResponseError> {
+    require_length("retained frame rows", input_dim, frame.nrows())?;
+    if frame.ncols() > input_dim {
+        return Err(ResponseError::FrameWiderThanInput {
+            rank: frame.ncols(),
+            input_dim,
+        });
     }
+    require_finite("retained frame", frame.iter())?;
+    let defect = frame_defect(frame);
+    if !(defect < 1.0) {
+        return Err(ResponseError::FrameNotOrthonormal { defect });
+    }
+    Ok(defect)
+}
+
+/// Validate an output metric for `output_dim` outputs: square of that size, finite, exactly symmetric and positive
+/// definite.
+fn require_metric(output_dim: usize, metric: ArrayView2<'_, f64>) -> Result<(), ResponseError> {
+    require_length("output metric rows", output_dim, metric.nrows())?;
+    require_length("output metric columns", output_dim, metric.ncols())?;
+    require_finite("output metric", metric.iter())?;
+    for row in 0..output_dim {
+        for column in (row + 1)..output_dim {
+            if metric[[row, column]] != metric[[column, row]] {
+                return Err(ResponseError::MetricNotSymmetric { row, column });
+            }
+        }
+    }
+    metric
+        .cholesky(Side::Lower)
+        .map_err(|error| ResponseError::MetricNotPositiveDefinite {
+            reason: error.to_string(),
+        })?;
+    Ok(())
 }
 
 impl BlockUnits {
-    /// One tiled pass over the unit pairs for reader coordinates `coordinates` (`h × c`, with covariance
-    /// `r_jk = coordinates_j · coordinates_k`): returns `Σ_jk D_jk [K_σ − m_j m_k]`, and when `weighted_coordinates`
-    /// is given writes `B R` into it (`h × c`, with `B_jk = D_jk ∂_r K_σ`). Units are summed in order, so the value
-    /// does not depend on the thread count.
+    /// One tiled pass over the unit pairs `j ≤ k` for reader coordinates `coordinates` (`h × c`, with covariance
+    /// `r_jk = coordinates_j · coordinates_k`). It returns `Σ_jk D_jk [K_σ − m_j m_k]` with its band
+    /// ([`pair_term`](Self::pair_term)) and its orthant fallbacks, formed as
+    /// `Σ_j (D_jj [K_jj − m_j²] + 2 Σ_{k>j} D_jk [K_jk − m_j m_k])` because `D` and the pair law are symmetric. When
+    /// `weighted_coordinates` is given it writes `B R` into it (`h × c`, with `B_jk = D_jk ∂_r K_σ`, symmetric by
+    /// construction): row `j` is `Σ_{k≥j} B_jk R_k + Σ_{i<j} B_ij R_i`. The tiles are the reader Gram's own
+    /// ([`upper_tile_rows`]), so a streamed pass reads the cached rows' words. Units are summed in order and tiles merge
+    /// in order, so neither the value nor `B R` depends on the thread count or on the route to `D`.
     fn pair_pass(
         &self,
         coordinates: ArrayView2<'_, f64>,
         formation: CoordinateFormation,
         mut weighted_coordinates: Option<&mut Array2<f64>>,
-    ) -> Result<f64, ResponseError> {
+    ) -> Result<PassEnergy, ResponseError> {
         let (width, terms) = coordinates.dim();
         let input_dim = self.readers.ncols();
         let coordinate_norms: Array1<f64> = coordinates
@@ -556,63 +738,442 @@ impl BlockUnits {
                 frame_defect,
             ),
         };
-        let tile = byte_balanced_row_chunk(2 * width, width);
+        if let Some(out) = weighted_coordinates.as_deref_mut() {
+            out.fill(0.0);
+        }
+        let tile = upper_tile_rows(width);
         let mut unit_sums = Vec::with_capacity(width);
+        let mut streamed_rows: Vec<f64> = Vec::new();
+        let mut row_starts: Vec<usize> = Vec::with_capacity(tile + 1);
         for start in (0..width).step_by(tile) {
             let end = (start + tile).min(width);
-            let covariances = fast_abt(&coordinates.slice(s![start..end, ..]), &coordinates);
-            // Entry `(j, k)` starts as `D_jk` and leaves as `B_jk`.
-            let mut weights = fast_atb(&self.writers.slice(s![.., start..end]), &self.metric_writers);
-            let sums = weights
+            let rows = end - start;
+            // Row `j ∈ J` against the columns `k ≥ start`, at entry `k − start`.
+            let covariances = fast_abt(
+                &coordinates.slice(s![start..end, ..]),
+                &coordinates.slice(s![start.., ..]),
+            );
+            // Row `j` of `D` over `k ≥ j` starts at `row_starts[j − start]` of the tile's packed rows.
+            row_starts.clear();
+            let mut packed_length = 0;
+            for unit in start..end {
+                row_starts.push(packed_length);
+                packed_length += width - unit;
+            }
+            row_starts.push(packed_length);
+            if self.reader_gram.is_none() {
+                streamed_rows.resize(packed_length, 0.0);
+                fill_upper_rows(
+                    self.writers.view(),
+                    self.metric_writers.view(),
+                    start,
+                    end,
+                    &mut streamed_rows,
+                )
+                .map_err(|error| ResponseError::ReaderGram { error })?;
+            }
+            // `B_J` over the columns `k ≥ start`, zero below each row's diagonal.
+            let mut upper_weights = Array2::<f64>::zeros((rows, width - start));
+            let sums = upper_weights
                 .axis_iter_mut(Axis(0))
                 .into_par_iter()
                 .zip(covariances.axis_iter(Axis(0)).into_par_iter())
                 .enumerate()
                 .map(|(offset, (mut weight_row, covariance_row))| {
                     let unit = start + offset;
-                    let mut sum = 0.0;
-                    for other in 0..width {
-                        let covariance_rounding = covariance_rounding_band(
-                            &CovarianceFormation {
-                                terms,
-                                left_norm: coordinate_norms[unit],
-                                right_norm: coordinate_norms[other],
-                                left_row_error: row_error_scale * reader_norm_bounds[unit],
-                                right_row_error: row_error_scale * reader_norm_bounds[other],
-                                law_gap: projector_defect * reader_norm_bounds[unit] * reader_norm_bounds[other],
-                                variance_error_x: self.reader_variance_errors[unit],
-                                variance_error_y: self.reader_variance_errors[other],
-                            },
-                            self.reader_variances[unit],
-                            self.reader_variances[other],
-                        );
-                        let moments = pair_moments(
-                            self.activation,
-                            PreactivationPair {
-                                mean_x: self.biases[unit],
-                                mean_y: self.biases[other],
-                                variance_x: self.reader_variances[unit],
-                                variance_y: self.reader_variances[other],
-                                covariance: covariance_row[other],
-                                covariance_rounding,
-                            },
-                        )?;
-                        let metric_product = weight_row[other];
-                        sum += metric_product
-                            * (moments.value - self.unit_means[unit] * self.unit_means[other]);
-                        weight_row[other] = metric_product * moments.covariance_derivative;
+                    let metric_row = match &self.reader_gram {
+                        Some(gram) => gram.upper_row(unit),
+                        None => &streamed_rows[row_starts[offset]..row_starts[offset + 1]],
+                    };
+                    let mut row = RowSum::default();
+                    let mut off_diagonal = RowSum::default();
+                    for (index, &metric_product) in metric_row.iter().enumerate() {
+                        let other = unit + index;
+                        let formation = CovarianceFormation {
+                            terms,
+                            left_norm: coordinate_norms[unit],
+                            right_norm: coordinate_norms[other],
+                            left_row_error: row_error_scale * reader_norm_bounds[unit],
+                            right_row_error: row_error_scale * reader_norm_bounds[other],
+                            law_gap: projector_defect * reader_norm_bounds[unit] * reader_norm_bounds[other],
+                            variance_error_x: self.reader_variance_errors[unit],
+                            variance_error_y: self.reader_variance_errors[other],
+                        };
+                        let pair = PreactivationPair {
+                            mean_x: self.biases[unit],
+                            mean_y: self.biases[other],
+                            variance_x: self.reader_variances[unit],
+                            variance_y: self.reader_variances[other],
+                            covariance: covariance_row[other - start],
+                            covariance_rounding: covariance_rounding_band(
+                                &formation,
+                                self.reader_variances[unit],
+                                self.reader_variances[other],
+                            ),
+                        };
+                        let moments = pair_moments(self.activation, pair)?;
+                        let term = self.pair_term(unit, other, metric_product, &formation, pair, &moments)?;
+                        if index == 0 {
+                            row = term;
+                        } else {
+                            off_diagonal = off_diagonal.plus(term);
+                        }
+                        weight_row[other - start] = metric_product * moments.covariance_derivative;
                     }
-                    Ok(sum)
+                    Ok(row.plus(off_diagonal.doubled()))
                 })
-                .collect::<Result<Vec<f64>, ResponseError>>()?;
+                .collect::<Result<Vec<RowSum>, ResponseError>>()?;
             unit_sums.extend(sums);
             if let Some(out) = weighted_coordinates.as_deref_mut() {
-                out.slice_mut(s![start..end, ..])
-                    .assign(&fast_ab(&weights, &coordinates));
+                // `Σ_{k≥j} B_jk R_k` for the rows `j ∈ J`.
+                let own = fast_ab(&upper_weights, &coordinates.slice(s![start.., ..]));
+                out.slice_mut(s![start..end, ..]).scaled_add(1.0, &own);
+                // `Σ_{j∈J, j<k} B_jk R_j` for the rows `k ≥ start`: the strictly upper part of `B_J`, transposed.
+                for offset in 0..rows {
+                    upper_weights[[offset, offset]] = 0.0;
+                }
+                let mirrored = fast_atb(&upper_weights, &coordinates.slice(s![start..end, ..]));
+                out.slice_mut(s![start.., ..]).scaled_add(1.0, &mirrored);
             }
         }
-        Ok(unit_sums.iter().sum())
+        let total = unit_sums.iter().fold(RowSum::default(), |total, row| total.plus(*row));
+        let pairs = width * (width + 1) / 2;
+        if total.orthant_fallbacks > 0 {
+            log::debug!(
+                "retained-response pair pass (#2946): {} of {pairs} pair kernels took the certified orthant route ({:.3e} of the pass)",
+                total.orthant_fallbacks,
+                total.orthant_fallbacks as f64 / pairs as f64,
+            );
+        }
+        // Each term enters at most `2h + 1` additions: its row's off-diagonal sum, the diagonal, and the unit fold.
+        Ok(PassEnergy {
+            energy: BandedEnergy {
+                value: total.value,
+                band: total.band + accumulation_growth(2 * width + 1) * total.absolute,
+            },
+            orthant_fallbacks: total.orthant_fallbacks,
+        })
     }
+
+    /// Pair `(unit, other)`'s term `D̂ [K̂ − m̂_j m̂_k]` and a first-order bound on its distance from the exact
+    /// `D [K − m_j m_k]` at the exact law, which [`pair_pass`](Self::pair_pass) sums with its terms:
+    ///
+    /// - the kernel's own rounding `ρ` at the projected law;
+    /// - the covariance's formation error and the projection's move, at most `δr + β`, through the Lipschitz constant
+    ///   `sup|σ'|²` (mean value theorem, at fixed means and variances);
+    /// - each variance's rounding `δv` through the kernel's variance partial `∂K/∂v`;
+    /// - the means' bands, `|m_k| δm_j + |m_j| δm_k`;
+    /// - the metric product's error `δD = γ_{2p} ‖|M|‖_∞ ‖u_j‖ ‖u_k‖` times `|K̂ − m̂ m̂|`;
+    /// - the term's own three roundings, `γ_3 |D̂| (|K̂| + |m̂ m̂|)`.
+    fn pair_term(
+        &self,
+        unit: usize,
+        other: usize,
+        metric_product: f64,
+        formation: &CovarianceFormation,
+        pair: PreactivationPair,
+        moments: &PairKernel,
+    ) -> Result<RowSum, ResponseError> {
+        let mean_product = self.unit_means[unit] * self.unit_means[other];
+        let centred = moments.value - mean_product;
+        let term = metric_product * centred;
+        let (variance_partial_x, variance_partial_y) = self.variance_partials(unit, other, pair)?;
+        let law_band = moments.value_rounding
+            + self.slope_bound * (covariance_formation_error(formation) + pair.covariance_rounding)
+            + variance_partial_x.abs() * self.reader_variance_errors[unit]
+            + variance_partial_y.abs() * self.reader_variance_errors[other]
+            + self.unit_means[other].abs() * self.unit_mean_bands[unit]
+            + self.unit_means[unit].abs() * self.unit_mean_bands[other];
+        let band = metric_product.abs() * law_band
+            + self.metric_error_scale * self.writer_norms[unit] * self.writer_norms[other] * centred.abs()
+            + accumulation_growth(3) * metric_product.abs() * (moments.value.abs() + mean_product.abs());
+        Ok(RowSum {
+            value: term,
+            absolute: term.abs(),
+            band,
+            orthant_fallbacks: usize::from(moments.orthant_fallback),
+        })
+    }
+
+    /// `∂K/∂v_x` and `∂K/∂v_y` of a pair at its computed law. A zero reader is a constant unit whose variance is exact,
+    /// so its partial is never read, and the pair factorizes as `K = σ(b_k) m_j(v_j)`: the other unit's partial is
+    /// `σ(b_k) ∂m_j/∂v_j`, with no kernel call at the constant unit's kink.
+    fn variance_partials(
+        &self,
+        unit: usize,
+        other: usize,
+        pair: PreactivationPair,
+    ) -> Result<(f64, f64), ResponseError> {
+        if pair.variance_x == 0.0 || pair.variance_y == 0.0 {
+            let partial_x = self.unit_means[other] * self.half_curvatures[unit];
+            let partial_y = self.unit_means[unit] * self.half_curvatures[other];
+            return Ok((partial_x, partial_y));
+        }
+        let partials = pair_kernel_variance_partials(self.activation, pair).map_err(|error| ResponseError::Kernel {
+            context: "Gaussian pair kernel variance partials",
+            error,
+        })?;
+        Ok((partials.variance_x, partials.variance_y))
+    }
+}
+
+/// One unit row's running sum in a pair pass: the value, its absolute sum and band, and its orthant fallbacks.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowSum {
+    value: f64,
+    absolute: f64,
+    band: f64,
+    orthant_fallbacks: usize,
+}
+
+impl RowSum {
+    fn plus(self, other: RowSum) -> RowSum {
+        RowSum {
+            value: self.value + other.value,
+            absolute: self.absolute + other.absolute,
+            band: self.band + other.band,
+            orthant_fallbacks: self.orthant_fallbacks + other.orthant_fallbacks,
+        }
+    }
+
+    /// The row's strictly upper pairs counted for both orders, `(j, k)` and `(k, j)`, whose laws are mirror images.
+    fn doubled(self) -> RowSum {
+        RowSum {
+            value: 2.0 * self.value,
+            absolute: 2.0 * self.absolute,
+            band: 2.0 * self.band,
+            orthant_fallbacks: self.orthant_fallbacks,
+        }
+    }
+}
+
+/// A unit's mean `m_j = E σ(b_j + s_j E)` with a first-order bound on its error, and `½ T_v σ''(b_j) = ∂m_j/∂v_j`.
+#[derive(Debug, Clone, Copy)]
+struct UnitMean {
+    value: f64,
+    band: f64,
+    half_curvature: f64,
+}
+
+/// `m_j = a_{j,0}` from the coefficient owner at `s_j = fl(√v̂_j)`, with its rounding bound, plus the input error of
+/// the variance it is evaluated at: `|s_j² − v_j| ≤ δv_j + γ_2 v̂_j`, which moves `m_j` by `|∂m/∂v|` times that, with
+/// `∂m/∂v = ½ T_v σ''(b)` by the heat equation. A zero reader is a constant unit with an exact variance.
+fn unit_mean(
+    activation: GaussianActivation,
+    bias: f64,
+    variance: f64,
+    variance_error: f64,
+) -> Result<UnitMean, ResponseError> {
+    let kernel_error = |error| ResponseError::Kernel {
+        context: "unit mean",
+        error,
+    };
+    let mut coefficient = [0.0];
+    let mut bound = [0.0];
+    gaussian_hermite_coefficients(activation, bias, variance.sqrt(), &mut coefficient, &mut bound)
+        .map_err(kernel_error)?;
+    if variance == 0.0 {
+        return Ok(UnitMean {
+            value: coefficient[0],
+            band: bound[0],
+            half_curvature: 0.0,
+        });
+    }
+    let mut derivatives = [0.0; 3];
+    gaussian_smoothing_derivatives(activation, bias, variance, &mut derivatives).map_err(kernel_error)?;
+    let half_curvature = 0.5 * derivatives[2];
+    Ok(UnitMean {
+        value: coefficient[0],
+        band: bound[0] + half_curvature.abs() * (variance_error + accumulation_growth(2) * variance),
+        half_curvature,
+    })
+}
+
+/// A known SwiGLU block `F(z) = Σ_j u_j (a_jᵀ z + c_j) s(w_jᵀ z + b_j) + c_out` with the SiLU gate `s(t) = t σ(t)`,
+/// under the declared law `Z ~ N(0, I_d)` and its output metric (#2946 R9).
+#[derive(Debug, Clone)]
+pub struct KnownGatedBlock {
+    /// `W`, `h × d`: the gate readers.
+    gate_readers: Array2<f64>,
+    /// `b`, length `h`.
+    gate_biases: Array1<f64>,
+    /// `A`, `h × d`: the up-projection readers.
+    up_readers: Array2<f64>,
+    /// `c`, length `h`.
+    up_biases: Array1<f64>,
+    /// `U`, `p × h`.
+    writers: Array2<f64>,
+    /// `c_out`, length `p`.
+    output_bias: Array1<f64>,
+    /// `M`, `p × p`.
+    metric: Array2<f64>,
+}
+
+/// A response at points with a derived bound on each entry's quadrature error. Rounding is excluded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BandedResponse {
+    /// `n × p`.
+    pub values: Array2<f64>,
+    /// `n × p`: entry `(i, o)` bounds the quadrature error of `values[(i, o)]` by `Σ_j |U_oj| bound_ij`, with
+    /// `bound_ij` the kernel's bound on unit `j`'s conditional mean at point `i`.
+    pub quadrature_band: Array2<f64>,
+}
+
+impl KnownGatedBlock {
+    /// Build the block from gate readers `W` (`h × d`) and biases `b` (`h`), up-projection readers `A` (`h × d`) and
+    /// biases `c` (`h`), writers `U` (`p × h`), the output bias (`p`; zeros for a layer without one) and a symmetric
+    /// positive definite output metric `M` (`p × p`). A Qwen3 layer's `gate_proj`, `up_proj` and `down_proj` give `W`,
+    /// `A` and `U` once the declared law is absorbed into readers and biases.
+    pub fn new(
+        gate_readers: Array2<f64>,
+        gate_biases: Array1<f64>,
+        up_readers: Array2<f64>,
+        up_biases: Array1<f64>,
+        writers: Array2<f64>,
+        output_bias: Array1<f64>,
+        metric: ArrayView2<'_, f64>,
+    ) -> Result<Self, ResponseError> {
+        let (width, input_dim) = gate_readers.dim();
+        require_length("gated block gate biases", width, gate_biases.len())?;
+        require_length("gated block up-reader rows", width, up_readers.nrows())?;
+        require_length("gated block up-reader columns", input_dim, up_readers.ncols())?;
+        require_length("gated block up biases", width, up_biases.len())?;
+        require_length("gated block writer columns", width, writers.ncols())?;
+        require_length("gated block output bias", writers.nrows(), output_bias.len())?;
+        require_finite("gated block gate readers", gate_readers.iter())?;
+        require_finite("gated block gate biases", gate_biases.iter())?;
+        require_finite("gated block up readers", up_readers.iter())?;
+        require_finite("gated block up biases", up_biases.iter())?;
+        require_finite("gated block writers", writers.iter())?;
+        require_finite("gated block output bias", output_bias.iter())?;
+        require_metric(writers.nrows(), metric)?;
+        Ok(Self {
+            gate_readers,
+            gate_biases,
+            up_readers,
+            up_biases,
+            writers,
+            output_bias,
+            metric: metric.to_owned(),
+        })
+    }
+
+    /// Input dimension `d`.
+    pub fn input_dim(&self) -> usize {
+        self.gate_readers.ncols()
+    }
+
+    /// Unit count `h`.
+    pub fn width(&self) -> usize {
+        self.gate_readers.nrows()
+    }
+
+    /// Output dimension `p`.
+    pub fn output_dim(&self) -> usize {
+        self.writers.nrows()
+    }
+
+    /// The output metric `M`, `p × p`.
+    pub fn metric(&self) -> ArrayView2<'_, f64> {
+        self.metric.view()
+    }
+
+    /// R9: the best retained response `F̄_P(Pz)`, output bias included, at each row `z` of `points` (`n × d`), with
+    /// the derived quadrature band of every entry.
+    pub fn retained_response(
+        &self,
+        frame: ArrayView2<'_, f64>,
+        points: ArrayView2<'_, f64>,
+    ) -> Result<BandedResponse, ResponseError> {
+        // The conditional mean reads no pair law, so the frame needs only the orthonormality refusal.
+        require_frame(self.input_dim(), frame)?;
+        require_length("gated retained-response point columns", self.input_dim(), points.ncols())?;
+        require_finite("gated retained-response points", points.iter())?;
+        let gate_coordinates = fast_ab(&self.gate_readers, &frame);
+        let up_coordinates = fast_ab(&self.up_readers, &frame);
+        let (discarded_variances, discarded_couplings) =
+            self.discarded_law(frame, gate_coordinates.view(), up_coordinates.view());
+        let absolute_writers = self.writers.mapv(f64::abs);
+        // The band's own sum of `h` nonnegative products is inflated by its rounding, so it bounds the exact sum.
+        let band_rounding = 1.0 + accumulation_growth(self.width());
+        let rows = points.nrows();
+        let mut values = Array2::<f64>::zeros((rows, self.output_dim()));
+        let mut quadrature_band = Array2::<f64>::zeros((rows, self.output_dim()));
+        let chunk = byte_balanced_row_chunk(3 * self.width() + self.input_dim(), rows);
+        for start in (0..rows).step_by(chunk) {
+            let end = (start + chunk).min(rows);
+            // Row `i` of `retained` is `zᵢᵀ Q`, so the products hold `w_jᵀ P zᵢ` and `a_jᵀ P zᵢ`.
+            let retained = fast_ab(&points.slice(s![start..end, ..]), &frame);
+            let gate_arguments = fast_abt(&retained, &gate_coordinates);
+            let up_arguments = fast_abt(&retained, &up_coordinates);
+            let mut unit_means = Array2::<f64>::zeros(gate_arguments.dim());
+            let mut unit_bounds = Array2::<f64>::zeros(gate_arguments.dim());
+            unit_means
+                .axis_iter_mut(Axis(0))
+                .into_par_iter()
+                .zip(unit_bounds.axis_iter_mut(Axis(0)).into_par_iter())
+                .zip(gate_arguments.axis_iter(Axis(0)).into_par_iter())
+                .zip(up_arguments.axis_iter(Axis(0)).into_par_iter())
+                .try_for_each(|(((mut mean_row, mut bound_row), gate_row), up_row)| {
+                    for unit in 0..mean_row.len() {
+                        let mean = gated_mean(
+                            self.up_biases[unit] + up_row[unit],
+                            self.gate_biases[unit] + gate_row[unit],
+                            discarded_variances[unit],
+                            discarded_couplings[unit],
+                        )?;
+                        mean_row[unit] = mean.value.value;
+                        bound_row[unit] = mean.value.quadrature_bound;
+                    }
+                    Ok::<(), ResponseError>(())
+                })?;
+            let mut tile_values = fast_abt(&unit_means, &self.writers);
+            tile_values += &self.output_bias;
+            values.slice_mut(s![start..end, ..]).assign(&tile_values);
+            quadrature_band
+                .slice_mut(s![start..end, ..])
+                .assign(&(fast_abt(&unit_bounds, &absolute_writers) * band_rounding));
+        }
+        Ok(BandedResponse {
+            values,
+            quadrature_band,
+        })
+    }
+
+    /// `v_j⊥ = ‖w_j − Q Qᵀ w_j‖²` and `κ_j⊥ = (a_j − Q Qᵀ a_j) · (w_j − Q Qᵀ w_j) = a_jᵀ (I − P) w_j` for every unit, in
+    /// tiles, from the gate and up coordinates `W Q` and `A Q`. Both are formed from the residual rows, so `v_j⊥` is a
+    /// sum of squares and never negative.
+    fn discarded_law(
+        &self,
+        frame: ArrayView2<'_, f64>,
+        gate_coordinates: ArrayView2<'_, f64>,
+        up_coordinates: ArrayView2<'_, f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        let width = self.width();
+        let mut variances = Array1::<f64>::zeros(width);
+        let mut couplings = Array1::<f64>::zeros(width);
+        let tile = byte_balanced_row_chunk(2 * self.input_dim(), width);
+        for start in (0..width).step_by(tile) {
+            let end = (start + tile).min(width);
+            let gate_residual = &self.gate_readers.slice(s![start..end, ..])
+                - &fast_abt(&gate_coordinates.slice(s![start..end, ..]), &frame);
+            let up_residual = &self.up_readers.slice(s![start..end, ..])
+                - &fast_abt(&up_coordinates.slice(s![start..end, ..]), &frame);
+            for (offset, gate_row) in gate_residual.axis_iter(Axis(0)).enumerate() {
+                variances[start + offset] = gate_row.dot(&gate_row);
+                couplings[start + offset] = up_residual.row(offset).dot(&gate_row);
+            }
+        }
+        (variances, couplings)
+    }
+}
+
+/// The gated unit's conditional mean `E[(α + A) s(t + W)]`, with the kernel's refusal carried as a [`ResponseError`].
+pub fn gated_mean(alpha: f64, t: f64, variance: f64, coupling: f64) -> Result<GatedMean, ResponseError> {
+    gated_conditional_mean(alpha, t, variance, coupling).map_err(|error| ResponseError::GatedKernel {
+        context: "gated conditional mean",
+        error,
+    })
 }
 
 /// `T_v σ(t)`, with the kernel's refusal carried as a [`ResponseError`].
@@ -665,3 +1226,7 @@ pub fn require_finite<'a>(
 #[cfg(test)]
 #[path = "subspace_tests.rs"]
 mod subspace_tests;
+
+#[cfg(test)]
+#[path = "subspace_route_tests.rs"]
+mod subspace_route_tests;

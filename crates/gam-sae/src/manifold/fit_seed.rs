@@ -198,7 +198,6 @@ pub struct SaeFitSeedRequest<'a, 'context> {
     pub ridge_beta: f64,
     pub top_k: Option<usize>,
     pub threshold: f64,
-    pub native_ard_enabled: bool,
     pub seed_refine_routing: bool,
     pub seed_refine_random_state: u64,
     pub fit_config: SaeFitConfig,
@@ -461,18 +460,11 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         base_term.set_row_loss_weights(weights.to_vec())?;
     }
 
-    let log_ard: Vec<Array1<f64>> = latent_dims
-        .iter()
-        .map(|&d| {
-            if request.native_ard_enabled {
-                Array1::<f64>::zeros(d)
-            } else {
-                Array1::<f64>::zeros(0)
-            }
-        })
-        .collect();
+    // #2822 — every coordinate atom carries its proper coordinate prior: a full ARD block,
+    // one log-precision per latent axis.
+    let log_ard: Vec<Array1<f64>> = latent_dims.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
     let seed_dispersion = base_term.seed_reconstruction_dispersion(request.target)?;
-    let use_shared_ard = request.native_ard_enabled && k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
+    let use_shared_ard = k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
     let initial_rho = if use_shared_ard {
         SaeManifoldRho::new_shared_ard(sparsity_strength.ln(), smoothness.ln(), log_ard)
     } else {
@@ -484,10 +476,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         .penalties
         .iter()
         .any(|penalty| matches!(penalty, AnalyticPenaltyKind::Isometry(_)));
-    base_term.validate_heterogeneous_atom_compatibility(
-        Some(request.registry),
-        request.native_ard_enabled,
-    )?;
+    base_term.validate_heterogeneous_atom_compatibility(Some(request.registry))?;
 
     Ok(SaeFitSeedReport {
         base_term,
@@ -654,7 +643,6 @@ mod tests {
             ridge_beta: 1.0e-6,
             top_k: None,
             threshold: 0.0,
-            native_ard_enabled: true,
             seed_refine_routing: false,
             seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),

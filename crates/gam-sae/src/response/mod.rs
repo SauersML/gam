@@ -5,3 +5,14 @@
 //! It is a declared intervention: nothing here claims natural activations are Gaussian.
 
 pub mod subspace;
+pub mod reader_gram;
+pub mod context;
+pub mod raw_block;
+pub mod executed_transport;
+pub mod reuse;
+pub mod state_blocks;
+pub mod compose;
+pub mod compile;
+pub mod hermite;
+pub mod interaction;
+pub mod tiles;

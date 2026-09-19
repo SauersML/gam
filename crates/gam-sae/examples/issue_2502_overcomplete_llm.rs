@@ -25,8 +25,13 @@
 //!     --arm NAME --atoms K --block-size b --block-topk k [--epochs N] \
 //!     [--minibatch M] [--block-tile T] [--tolerance t] [--gpu auto|required|off] \
 //!     [--aux-k N] [--seed-policy rows|coordinate] \
-//!     [--rows N] [--eval-rows N] [--dump-recon] [--dump-codes]
+//!     [--rows N] [--eval-rows N] [--dump-recon] [--dump-codes] \
+//!     [--checkpoint PATH --checkpoint-every N] [--resume PATH]
 //! ```
+//!
+//! `--checkpoint` writes the stream's state every `N` epochs, at the epoch cap and at
+//! convergence; `--resume` continues a stream from such a checkpoint, bit for bit, with the
+//! same configuration.
 
 use gam_sae::sparse_dict::{
     BlockSparseConfig, BlockSparseStreamState, block_sparse_dictionary_transform,
@@ -304,6 +309,9 @@ struct Args {
     load_gamma: f32,
     omp_shortlist_blocks: usize,
     gpu: gam_gpu::GpuPolicy,
+    checkpoint: PathBuf,
+    checkpoint_every: usize,
+    resume: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -482,6 +490,9 @@ fn parse_args() -> Result<Args, String> {
         load_gamma: f32::NAN,
         omp_shortlist_blocks: 0,
         gpu: gam_gpu::GpuPolicy::Auto,
+        checkpoint: PathBuf::new(),
+        checkpoint_every: 0,
+        resume: PathBuf::new(),
     };
     let mut i = 1usize;
     while i < raw.len() {
@@ -550,9 +561,19 @@ fn parse_args() -> Result<Args, String> {
                 a.gpu = gam_gpu::GpuPolicy::parse(value)
                     .ok_or_else(|| format!("--gpu must be required|auto|off, got {value}"))?;
             }
+            "--checkpoint" => a.checkpoint = PathBuf::from(value),
+            "--checkpoint-every" => {
+                a.checkpoint_every = value
+                    .parse()
+                    .map_err(|e| format!("--checkpoint-every: {e}"))?
+            }
+            "--resume" => a.resume = PathBuf::from(value),
             other => return Err(format!("unknown argument {other}")),
         }
         i += 2;
+    }
+    if a.checkpoint.as_os_str().is_empty() != (a.checkpoint_every == 0) {
+        return Err("--checkpoint and a positive --checkpoint-every go together".to_string());
     }
     if a.train.as_os_str().is_empty() || a.eval.as_os_str().is_empty() {
         return Err("--train and --eval are required".to_string());
@@ -667,7 +688,20 @@ fn main() -> Result<(), String> {
         "[a5] seed_policy={:?} coordinate_fallback_blocks={seed_fallbacks}/{g}",
         args.seed_policy
     );
-    let mut state = BlockSparseStreamState::new_with_decoder(seed, &cfg)?;
+    // A resumed stream continues bit for bit from the checkpoint a previous job wrote, so a
+    // fit longer than one job runs as a chain of jobs (#2502).
+    let mut state = if args.resume.as_os_str().is_empty() {
+        BlockSparseStreamState::new_with_decoder(seed, &cfg)?
+    } else {
+        let resumed = BlockSparseStreamState::resume(&args.resume, &cfg)?;
+        println!(
+            "[a5] arm={} resumed {} at epoch {}",
+            args.arm,
+            args.resume.display(),
+            resumed.epochs_run()
+        );
+        resumed
+    };
 
     let eval_mean = eval_column_means(&eval, n_eval, args.minibatch, p);
     let train_start = Instant::now();
@@ -684,7 +718,8 @@ fn main() -> Result<(), String> {
     let mut previous_supports: Vec<u32> = Vec::new();
     let mut support_before_last_change: Vec<u32> = Vec::new();
     let mut support_change_counts = vec![0u32; n_train];
-    for epoch in 0..(if reload { 0 } else { args.epochs }) {
+    let first_epoch = state.epochs_run();
+    for epoch in (if reload { 0 } else { first_epoch })..(if reload { 0 } else { args.epochs }) {
         let mut row0 = 0usize;
         while row0 < n_train {
             let take = (n_train - row0).min(shard.nrows());
@@ -840,6 +875,14 @@ fn main() -> Result<(), String> {
             "converged": stats.converged,
             "seconds": started.elapsed().as_secs_f64(),
         }));
+        if !args.checkpoint.as_os_str().is_empty()
+            && ((epoch + 1) % args.checkpoint_every == 0
+                || epoch + 1 == args.epochs
+                || stats.converged)
+        {
+            state.checkpoint(&args.checkpoint)?;
+            println!("[a5] arm={} checkpoint written at epoch {}", args.arm, epoch + 1);
+        }
         if stats.converged {
             converged = true;
             break;

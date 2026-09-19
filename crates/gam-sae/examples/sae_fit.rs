@@ -70,7 +70,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ridge_beta: 1.0e-6,
         top_k: None,
         threshold: 0.0,
-        native_ard_enabled: true,
         seed_refine_routing: refine_routing,
         seed_refine_random_state: 0,
         fit_config: SaeFitConfig::default(),

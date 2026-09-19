@@ -146,6 +146,13 @@ pub struct ArrowSchurSystem {
     /// GPU PCG and streaming Schur paths to `O(m_i · p)` per row. Installed in
     /// lock-step with `htbeta_matvec` by [`Self::set_row_htbeta_operator`].
     pub htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
+    /// The matrix-free row operator's declaration (#2627): per-row norm bounds and the
+    /// apply depth ([`RowHtbetaDeclaration`]), installed in lock-step with
+    /// [`Self::htbeta_matvec`] by [`Self::set_row_htbeta_operator`]. A dense slab
+    /// supplement is bounded separately from its entries, and
+    /// [`Self::cross_block_row_norm_bounds`] refuses an installed operator that carries
+    /// none.
+    pub htbeta_declaration: Option<RowHtbetaDeclaration>,
     /// Whether `rows[*].htbeta` contains a dense contribution that must be added
     /// on top of the matrix-free row operator.
     pub htbeta_dense_supplement: bool,
@@ -268,6 +275,7 @@ impl Clone for ArrowSchurSystem {
             hbb_matvec: self.hbb_matvec.clone(),
             htbeta_matvec: self.htbeta_matvec.clone(),
             htbeta_transpose_matvec: self.htbeta_transpose_matvec.clone(),
+            htbeta_declaration: self.htbeta_declaration.clone(),
             htbeta_dense_supplement: self.htbeta_dense_supplement,
             hbb_diag: self.hbb_diag.clone(),
             gb: self.gb.clone(),
@@ -327,6 +335,7 @@ impl ArrowSchurSystem {
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_declaration: None,
             htbeta_dense_supplement: false,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
@@ -374,6 +383,7 @@ impl ArrowSchurSystem {
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_declaration: None,
             htbeta_dense_supplement: false,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
@@ -455,6 +465,7 @@ impl ArrowSchurSystem {
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_declaration: None,
             htbeta_dense_supplement: false,
             hbb_diag: None,
             gb,
@@ -572,13 +583,24 @@ impl ArrowSchurSystem {
     /// through the matvec instead of indexing the dense block. The transpose
     /// operator lets the reduced-Schur matvec apply `H_βt^(row)` directly
     /// (`O(m_i · p)`) instead of probing `forward` against `K` basis vectors.
-    pub fn set_row_htbeta_operator<F, T>(&mut self, forward: F, transpose: T)
-    where
+    ///
+    /// `declaration` states the operator's per-row norm bounds and apply depth, derived
+    /// from its own entries and loop structure (#2627, see [`RowHtbetaDeclaration`]). A
+    /// structural ridge termination reads it through
+    /// [`Self::cross_block_row_norm_bounds`], so it is installed with the operator and
+    /// never separately.
+    pub fn set_row_htbeta_operator<F, T>(
+        &mut self,
+        forward: F,
+        transpose: T,
+        declaration: RowHtbetaDeclaration,
+    ) where
         F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
         T: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
         self.htbeta_matvec = Some(Arc::new(forward));
         self.htbeta_transpose_matvec = Some(Arc::new(transpose));
+        self.htbeta_declaration = Some(declaration);
         self.htbeta_operator_fingerprint = None;
     }
 
@@ -596,6 +618,7 @@ impl ArrowSchurSystem {
         &mut self,
         forward: F,
         transpose: T,
+        declaration: RowHtbetaDeclaration,
         fingerprint: u64,
     ) where
         F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
@@ -603,6 +626,7 @@ impl ArrowSchurSystem {
     {
         self.htbeta_matvec = Some(Arc::new(forward));
         self.htbeta_transpose_matvec = Some(Arc::new(transpose));
+        self.htbeta_declaration = Some(declaration);
         self.htbeta_operator_fingerprint = Some(fingerprint);
     }
 
@@ -834,6 +858,17 @@ impl ArrowSchurSystem {
         }
     }
 
+    /// `out += M·x` for the majorant `M` of the shared `H_ββ` block this system
+    /// solves with (#2627), through the same operator → dense dispatch as
+    /// [`Self::penalty_matvec_add`]. Returns the accumulation depth; see
+    /// [`BetaPenaltyOp::accumulate_abs_majorant_matvec`].
+    pub fn shared_block_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        match self.penalty_op.as_ref() {
+            Some(op) => op.accumulate_abs_majorant_matvec(x, out),
+            None => dense_abs_majorant_matvec(&self.hbb, x, out),
+        }
+    }
+
     /// Add the `b×b` penalty sub-block for `id` to `out`, routing through
     /// `penalty_op` or falling back to `hbb` / `hbb_diag` inline.
     #[inline]
@@ -949,10 +984,11 @@ impl ArrowSchurSystem {
 
     /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ, diag)`.
     ///
-    /// This uses [`ArrowSolveOptions::automatic`]: BA dense RCS for
-    /// `K <= 2000`, and Agarwal-style inexact Schur PCG above that size.
-    /// Call [`ArrowSchurSystem::solve_with_options`] to force Square-Root BA
-    /// or a specific inexact solve policy.
+    /// This uses [`ArrowSolveOptions::priced`]: BA dense RCS or Agarwal-style
+    /// inexact Schur PCG, priced against each other from this system's row dims
+    /// and border at solve time (#2900 row 6.15). Call
+    /// [`ArrowSchurSystem::solve_with_options`] to force Square-Root BA or a
+    /// specific inexact solve policy.
     ///
     /// Returns `(delta_t, delta_beta, ArrowPcgDiagnostics)` with `delta_t` flat
     /// row-major of length `N · d` and `delta_beta` of length `K`. The sign
@@ -973,7 +1009,7 @@ impl ArrowSchurSystem {
         ridge_t: f64,
         ridge_beta: f64,
     ) -> Result<(Array1<f64>, Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
-        let options = ArrowSolveOptions::automatic(self.k);
+        let options = ArrowSolveOptions::priced();
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
     }
 
@@ -1372,8 +1408,9 @@ impl StreamingArrowSchur {
             match mode {
                 // InexactPCG differs from Direct only in how the *reduced* system
                 // is solved, not how it is assembled, so it shares this Schur
-                // subtraction.
-                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                // subtraction, and so does a Priced request, which resolves to one
+                // of the two.
+                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG | ArrowSolverMode::Priced => {
                     let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
                     stack.subtract_or_stack(&backend, s_part, &htbeta, &solved);
                 }
@@ -2568,15 +2605,25 @@ impl ArrowFactorCache {
     /// `(H⁻¹)_tt = A⁻¹ + A⁻¹ B S⁻¹ Bᵀ A⁻¹`, where
     /// `S = H_ββ − Bᵀ A⁻¹ B` is the Schur complement on `β`. Because `A` is
     /// block-diagonal, the `(i, j)` diagonal entry of `(H⁻¹)_tt` is computed
-    /// purely from row `i`'s factor and cross-block:
+    /// from row `i`'s factor and cross-block and the one shared `S⁺`:
     ///
     /// ```text
+    /// S⁺   = [`Self::schur_inverse_block`](0..K)  (K applies of `schur_inverse_apply`, once)
     /// a    = A_i⁻¹ e_j                       (chol_solve on the per-row factor)
     /// [A_i⁻¹]_{jj} = a[j]
     /// w    = B_iᵀ a = H_βt^(i) a             (a K-vector)
-    /// z    = S⁻¹ w                           (chol_solve on the Schur factor)
-    /// diag = a[j] + w · z
+    /// T    = { c : w[c] ≠ 0 }                (the border columns row i touches)
+    /// diag = a[j] + Σ_{c,b ∈ T} w[c]·S⁺[c,b]·w[b]
     /// ```
+    ///
+    /// `S⁺` is exactly the operator [`Self::schur_inverse_apply`] applies, gauge
+    /// quotient and β-Schur spectral deflation included, so `wᵀ S⁺ w` equals the
+    /// per-coordinate `w · (S⁺ w)` up to rounding. The columns outside `T`
+    /// multiply an exact zero. This costs `K` Schur applies (`O(K³)`, the order of
+    /// the Schur factorization the cache already holds) plus `O(K + |T|²)` per
+    /// latent coordinate, instead of one `O(K²)` Schur solve per coordinate, which
+    /// was `O(total_t·K²)` (#2900 row 6.18). The `K × K` `S⁺` is charged on the
+    /// memory governor while it lives, and a refusal is an error.
     ///
     /// The UNDAMPED per-row factors ([`Self::undamped_factor`]) are used so
     /// the result is the inverse of the *true* `H_tt`, not the LM-damped
@@ -2623,22 +2670,28 @@ impl ArrowFactorCache {
         }
         let n = self.undamped_factor_count();
         let total_len = self.delta_t_len();
+        let k = self.k;
+        let schur_inverse_charge = gam_runtime::resource::MemoryGovernor::global()
+            .try_reserve_dense_f64(k, k, "ArrowFactorCache::latent_block_inverse_diagonal S⁺")
+            .map_err(|error| ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "latent_block_inverse_diagonal: refusing the {k}×{k} Schur inverse: {error}"
+                ),
+            })?;
+        let schur_inverse = self.schur_inverse_block(0..k)?;
         let mut out = Array1::<f64>::zeros(total_len);
-        // Per-row scratch, sized to the max latent dim / K.
-        let mut e_j = Array1::<f64>::zeros(self.d);
-        let mut w = Array1::<f64>::zeros(self.k);
+        let mut w = Array1::<f64>::zeros(k);
+        let mut touched: Vec<usize> = Vec::with_capacity(k);
         for i in 0..n {
             let di = self.row_dims[i];
             let row_base = self.row_offsets[i];
             let factor = self.undamped_factor(i);
+            let mut e_j = Array1::<f64>::zeros(di);
             for j in 0..di {
                 // a = A_i⁻¹ e_j.
-                for c in 0..di {
-                    e_j[c] = 0.0;
-                }
+                e_j.fill(0.0);
                 e_j[j] = 1.0;
-                let e_j_slice = e_j.slice(ndarray::s![..di]).to_owned();
-                let a = cholesky_solve_vector(factor, &e_j_slice);
+                let a = cholesky_solve_vector(factor, &e_j);
                 // w = H_βt^(i) a (a K-vector); accumulator must start zeroed.
                 w.fill(0.0);
                 if !self.apply_htbeta_row_transpose(i, a.view(), &mut w, None) {
@@ -2649,15 +2702,22 @@ impl ArrowFactorCache {
                         ),
                     });
                 }
-                // z = S⁻¹ w; correction = w · z.
-                let z = self.schur_inverse_apply(w.view())?;
+                // correction = wᵀ S⁺ w over the border columns w touches.
+                touched.clear();
+                touched.extend((0..k).filter(|&c| w[c] != 0.0));
                 let mut corr = 0.0_f64;
-                for c in 0..self.k {
-                    corr += w[c] * z[c];
+                for &c in &touched {
+                    let mut contracted = 0.0_f64;
+                    for &b in &touched {
+                        contracted += schur_inverse[[c, b]] * w[b];
+                    }
+                    corr += w[c] * contracted;
                 }
                 out[row_base + j] = a[j] + corr;
             }
         }
+        drop(schur_inverse);
+        drop(schur_inverse_charge);
         Ok(out)
     }
 

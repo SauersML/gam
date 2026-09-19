@@ -26,10 +26,12 @@ pub trait GpuGemmDispatch: Send + Sync {
         w_bb: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>>;
 
-    /// Number of usable GPU devices in the runtime pool (`0` when no GPU
-    /// runtime is available). Geometry's multi-GPU row-tiling only engages when
-    /// this exceeds `1`.
-    fn device_count(&self) -> usize;
+    /// The batch length at which [`Self::try_fast_ab_broadcast_b_batched`]
+    /// splits its batch across devices, when the runtime pool holds more than
+    /// one usable device; `None` when no split can happen (no runtime, or a
+    /// single device). Geometry's multi-GPU row tiling cuts a tall product into
+    /// this many tiles, so the split threshold has one owner.
+    fn multi_gpu_batch_floor(&self) -> Option<usize>;
 
     /// Broadcast-`B` strided-batched GEMM: each `tiles × rows × k` slab of `a3`
     /// is multiplied by the shared `k × n` `b`, yielding a `tiles × rows × n`

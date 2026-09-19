@@ -3,20 +3,22 @@
 Three public APIs all claim to expose the same REML/LAML marginal-likelihood
 quantity for a fitted model:
 
-* ``Model.evidence`` / ``Summary.reml_score`` — the model's own reported score.
+* ``Model.evidence`` (now ``Summary.aic_corrected``) / ``Summary.reml_score``
+  — the model's own reported score.
 * ``Model.bayes_factor_vs`` — pairwise Bayes factor between two fits.
 * ``gamfit.compare_models`` — the multi-model comparison table.
 
-They do NOT agree. ``compare_models`` (via ``compare_reml_fits`` in
+They did NOT agree. ``compare_models`` (via the since-removed ``compare_reml_fits`` in
 ``crates/gam-pyffi/src/lib.rs`` -> ``extract_reml_score_from_view``, which wraps
 the raw score with ``with_tierney_kadane_normalizer_from_view``) ranks fits on a
 *rank-aware Tierney-Kadane normalized* score, namely
 
     raw_reml + (-0.5 * null_dim * ln(2*pi) + 0.5 * null_space_logdet),
 
-while ``Model.evidence`` / ``Summary.reml_score`` (``model_evidence``,
+while ``Model.evidence`` / ``Summary.reml_score`` (``model_evidence``, now
+since removed,
 ``crates/gam-pyffi/src/lib.rs``) and ``Model.bayes_factor_vs``
-(``bayes_factor_log_diff`` -> ``log_bayes_factor``) use the *raw* minimized
+(``bayes_factor_log_diff``, now ``log_evidence_ratio``) used the *raw* minimized
 ``reml_score`` with no normalizer.
 
 The normalizer term cancels in a delta only when both models share the same
@@ -33,17 +35,13 @@ not stress the normalizer). The fix is direction-agnostic: route all three
 entry points through the same score. These assertions only require *consistency*
 between the paths, so they pass whichever score the maintainer settles on.
 
-Update (#2079): the maintainer settled ``Model.evidence`` and
-``Model.bayes_factor_vs`` on the Occam-penalised conditional-AIC *ranking* score
-(``-2*loglik + 2*edf``) that ``compare_models`` ranks its ``winner`` on — so
-that the two per-model APIs can no longer contradict the declared winner when a
-model is augmented with a pure-noise smooth. That ranking score is exposed by
-``compare_models`` through the ``ranking`` list (its ``delta`` / Bayes-factor
-columns), NOT through the raw ``score_table['reml_score']`` headline (which,
-along with ``Summary.reml_score``, still reports the un-penalised REML/LAML
-evidence). The consistency assertions below therefore compare ``evidence`` /
-``bayes_factor_vs`` against the ``ranking`` columns; the raw ``score_table`` /
-``Summary.reml_score`` path is checked separately for its own self-consistency.
+Update (#2079, pyGAM audit): ``Model.bayes_factor_vs`` (now
+``Model.evidence_ratio_vs``) and the ``compare_models`` ``ranking`` are both on the
+smoothing-corrected AIC ``Summary.aic_corrected`` — the ranking's ``delta_aic``
+column is each model's ``aic_corrected`` gap from the winner. The raw
+``score_table['reml_score']`` headline, along with ``Summary.reml_score``, still
+reports the REML/LAML score and is checked separately for its own
+self-consistency.
 """
 from __future__ import annotations
 
@@ -125,38 +123,43 @@ def test_compare_models_score_matches_model_own_score() -> None:
         "in only one path)"
     )
 
-    # #2079: Model.evidence reports the conditional-AIC RANKING score, which
-    # compare_models exposes as the ``ranking`` ``delta`` (each model's ranking
-    # score minus the winner's). So evidence differences must reproduce the
-    # ranking deltas exactly -- the two are on one score.
-    ranking = {row[0]: row for row in comparison["ranking"]}
-    winner = comparison["winner"]
-    winner_evidence = {"smooth": m_smooth.evidence, "poly": m_poly.evidence}[winner]
-    for name, model in (("smooth", m_smooth), ("poly", m_poly)):
-        ranking_delta = ranking[name][2]
+    # Summary.aic_corrected is the RANKING score, which compare_models exposes
+    # as the ``ranking`` ``delta_aic`` (each model's ranking score minus the
+    # winner's). So corrected-AIC differences must reproduce the ranking deltas
+    # exactly -- the two are on one score.
+    ranking = {row["name"]: row for row in comparison["ranking"]}
+    aic = {
+        "smooth": m_smooth.summary().aic_corrected,
+        "poly": m_poly.summary().aic_corrected,
+    }
+    winner_aic = aic[comparison["winner"]]
+    for name in ("smooth", "poly"):
+        ranking_delta = ranking[name]["delta_aic"]
         assert ranking_delta == pytest.approx(
-            model.evidence - winner_evidence, rel=1e-9, abs=1e-9
+            aic[name] - winner_aic, rel=1e-9, abs=1e-9
         ), (
             f"compare_models ranking delta {ranking_delta!r} for {name!r} "
-            f"disagrees with Model.evidence gap {model.evidence - winner_evidence!r}"
+            f"disagrees with the Summary.aic_corrected gap {aic[name] - winner_aic!r}"
         )
 
 
 def test_bayes_factor_vs_agrees_with_compare_models_magnitude() -> None:
     # User-facing consequence: the log Bayes factor between two fits must be the
     # same whether read from bayes_factor_vs or implied by the compare_models
-    # ranking deltas. Both are on the conditional-AIC ranking score (#2079).
+    # ranking deltas. Both are on the corrected-AIC ranking score.
     m_smooth, m_poly = _fit_pair()
     comparison = gamfit.compare_models([m_smooth, m_poly], names=["smooth", "poly"])
-    ranking = {row[0]: row for row in comparison["ranking"]}
+    ranking = {row["name"]: row for row in comparison["ranking"]}
 
-    # The ranking ``delta`` is each model's conditional-AIC gap from the winner
+    # The ranking ``delta_aic`` is each model's corrected-AIC gap from the winner
     # (a -2*log / deviance-scale quantity), so the log Bayes factor of poly over
     # smooth implied by compare_models is HALF the delta gap: the Akaike evidence
     # ratio for an AIC gap D is exp(-D/2) (Burnham & Anderson), not exp(-D)
     # (issue #2124). The winner term cancels in the difference. bayes_factor_vs is
     # a minimized cost (lower = better), matching that direction.
-    log_bf_poly_over_smooth_compare = 0.5 * (ranking["smooth"][2] - ranking["poly"][2])
+    log_bf_poly_over_smooth_compare = 0.5 * (
+        ranking["smooth"]["delta_aic"] - ranking["poly"]["delta_aic"]
+    )
     log_bf_poly_over_smooth_pairwise = math.log(m_poly.evidence_ratio_vs(m_smooth))
 
     assert log_bf_poly_over_smooth_pairwise == pytest.approx(

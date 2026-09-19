@@ -22,10 +22,15 @@ Starting out
 
 - [Getting started](getting-started.md) — install, fit a first model,
   understand the return value.
+- [A tour on real data](tour.md) — six complete analyses of public
+  datasets: factors, noise models, counts, string labels, shape
+  constraints, surfaces.
+- [Migrating from pyGAM](migrating-from-pygam.md) — what changes, a
+  call-by-call mapping, and the gotchas.
 - [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy,
   dict of columns, list of records.
 - [CLI reference](cli.md) — `gam fit`, `predict`, `diagnose`, `sample`,
-  `generate`, and `report`.
+  `generate`, `compare`, and `report`.
 
 Building a model
 
@@ -69,6 +74,8 @@ Reference
   `explain_error()`.
 - [Cookbook](cookbook.md) — runnable examples verified against the test
   suite.
+- [Benchmarks against pyGAM](benchmarks.md) — held-out accuracy and fit
+  time on the audit suite, losses included.
 - [GPU acceleration](gpu_acceleration.md) — CUDA dispatch, probe-time
   thresholds, and CPU fallback.
 - [REML scaling](reml_scaling.md) — solver strategy at large data scales.

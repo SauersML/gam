@@ -132,10 +132,6 @@ fn gauge_lifted_precision_predicts_the_dense_covariance_bands_on_a_dropped_colum
 
     let mut precision_only = unified.clone();
     precision_only.covariance_conditional = None;
-    if let Some(inference) = precision_only.inference.as_mut() {
-        inference.beta_covariance = None;
-        inference.beta_standard_errors = None;
-    }
     assert!(
         precision_only.beta_covariance().is_none(),
         "the precision arm carries no dense conditional covariance"

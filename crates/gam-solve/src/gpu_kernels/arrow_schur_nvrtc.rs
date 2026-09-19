@@ -36,7 +36,8 @@
 //! per block.
 //!
 //! Dispatch policy (caller-facing):
-//!   * `Σ_i p_i^3 ≳ 1e5` OR `R ≥ 16` AND the data is already device-resident →
+//!   * `p ≤ MAX_FUSED_P` and `R` has a compiled template (see
+//!     `fused_path_admitted`) AND the data is already device-resident →
 //!     use the fused NVRTC path.
 //!   * Otherwise fall through to the cuSOLVER/cuBLAS path in `arrow_schur.rs`.
 //!
@@ -52,21 +53,27 @@
 #[cfg(target_os = "linux")]
 use crate::arrow_schur::ArrowSchurSystem;
 
-/// Fused-kernel dispatch admission. Returns `true` when the workload shape
-/// makes the Layer D NVRTC fused path strictly preferable to the cuSOLVER /
-/// cuBLAS Layer A+B+C path. The math-block-3 §9 heuristic:
+/// Fused-kernel dispatch admission: `true` when the Layer D NVRTC kernel can
+/// run this shape, in which case it replaces the cuSOLVER / cuBLAS Layer A+B+C
+/// path.
 ///
-///   * `Σ_i p_i^3` is the total block-Cholesky cost. Below ~1e5 flops the
-///     launch overhead of cuSOLVER batched POTRF dominates and the fused
-///     kernel wins; above ~1e5 flops both paths are launch-amortized but the
-///     fused kernel still wins on memory traffic because `L_i`, `u_i`, `Y_i`
-///     stay in shared memory between the four steps.
-///   * `R ≥ 16` makes the Schur GEMM the bottleneck of Layer B's path; the
-///     fused kernel's per-block reduction skips one global-memory round-trip
-///     per Y_i tile.
+/// This chooses between two device implementations of one solve, never
+/// between the device and the CPU. Both paths agree to 1e-10 (Layer C↔D parity,
+/// math block 3 §16 test 6), and `cuda::solve_fused` and `cuda::solve` both
+/// take the same device-dispatch gate,
+/// `route_through_gpu(SmallDenseBatchedPotrf { p, batch: n })`, before they
+/// touch the device. The fused kernel keeps `L_i`, `u_i` and `Y_i` in shared
+/// memory between the four steps and launches once per p-group. The unfused
+/// path launches batched POTRF, two batched TRSMs and `n` sequential GEMM/GEMV
+/// accumulations, so the fused kernel does less launch and memory traffic at
+/// every shape it supports. What bounds it is capability: `p ≤ MAX_FUSED_P`
+/// here, and a templated `R` in [`system_admits_fused_path`].
 ///
-/// Both conditions trigger admission; the `Unavailable` fall-through preserves
-/// the existing CPU + cuSOLVER paths when admission fails.
+/// It used to admit only `Σ_i p_i³ ≥ 1e5` flops or `R ≥ 16`. The argument for
+/// that heuristic said the fused kernel also wins below 1e5 flops, where
+/// cuSOLVER's launch overhead dominates, and neither literal was derived
+/// (#2900 row 6.11). The `Unavailable` fall-through preserves the unfused and
+/// CPU paths when the fused launch declines.
 // The fused-path admission rule is consumed only by the CUDA dispatch
 // (`arrow_schur::solve`'s `mod cuda`), which is itself `#[cfg(target_os =
 // "linux")]`. Gating the definition to match keeps it from reading as dead code
@@ -76,14 +83,7 @@ use crate::arrow_schur::ArrowSchurSystem;
 #[inline]
 #[must_use]
 pub(crate) fn fused_path_admitted(n: usize, p: usize, r: usize) -> bool {
-    if n == 0 || p == 0 || r == 0 {
-        return false;
-    }
-    if p > MAX_FUSED_P {
-        return false;
-    }
-    let total_chol_flops = (n as u128) * (p as u128).pow(3);
-    total_chol_flops >= 100_000 || r >= 16
+    n > 0 && r > 0 && p > 0 && p <= MAX_FUSED_P
 }
 
 /// Hard upper bound on per-block size that the Layer D kernel supports. The
@@ -830,19 +830,18 @@ mod tests {
         assert!(!fused_path_admitted(4, 0, 4));
         assert!(!fused_path_admitted(4, 8, 0));
         assert!(!fused_path_admitted(4, MAX_FUSED_P + 1, 4));
-        assert!(!fused_path_admitted(2, 4, 4)); // total flops ≈ 128, below 1e5, R<16
     }
 
     #[cfg(target_os = "linux")] // exercises the linux-only `fused_path_admitted`
     #[test]
-    fn fused_admission_accepts_dense_arrow_workloads() {
-        // Large-scale shape: large n, small p, moderate R. Total flops
-        // 5000 · 16^3 ≈ 2e7 — well above the 1e5 admission floor.
+    fn fused_admission_accepts_every_shape_the_kernel_supports_2900() {
+        // 2 blocks of p = 4 at R = 4 is 128 Cholesky flops with R < 16: the
+        // shape the old `Σ p³ ≥ 1e5 || R ≥ 16` heuristic refused.
+        assert!(fused_path_admitted(2, 4, 4));
+        assert!(fused_path_admitted(1, 1, 1));
         assert!(fused_path_admitted(5000, 16, 6));
-        // Big R alone admits even on a small n.
         assert!(fused_path_admitted(4, 8, 16));
-        // Multi-size sweep at the kernel's upper edge.
-        assert!(fused_path_admitted(50, 30, 8));
+        assert!(fused_path_admitted(50, MAX_FUSED_P, 8));
     }
 
     #[cfg(target_os = "linux")] // exercises `plan_fused_launch`, gated to its linux home (CI tests run on linux)

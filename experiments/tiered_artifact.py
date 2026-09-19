@@ -315,7 +315,7 @@ def load_t0_from_manifest(manifest_path: str) -> dict[str, Any]:
 def load_tier1_artifact(source: Any) -> tuple[np.ndarray, dict[str, Any] | None]:
     """T1 decoder (+ baked T0) from WS-C.
 
-    Accepts a ``gamfit.SparseDictionaryFit`` / ``SparseDictStreamArtifact`` (reads
+    Accepts a ``gamfit.sae.SparseDictionaryFit`` / ``SparseDictStreamArtifact`` (reads
     ``.decoder``) or a directory / json path that WS-C's ``dictionary_artifact``
     export writes (``{"decoder": path_or_list, "t0": {...}}``). Returns
     ``(decoder (K1,P) f32, t0_or_None)``.

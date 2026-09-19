@@ -260,7 +260,7 @@ pub(crate) fn factored_evidence_matches_full_b_at_small_p() {
         phi[[mu, mu]] = 1.0;
         jet[[mu, mu, 0]] = 1.0;
     }
-    let s_raw = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+    let s_raw = gam_linalg_test_support::coefficient_difference_penalty(m, 2);
     let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "fullrank",
         SaeAtomBasisKind::EuclideanPatch,

@@ -4,6 +4,7 @@ use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerLinalgError, FaerSvd, array1_to_col_matmut,
     col_piv_qr_solve_lstsq, default_rrqr_rank_alpha, rrqr_nullspace_basis,
 };
+use gam_linalg::gram_schmidt::ReorthogonalizedRowBasis;
 use gam_linalg::utils::{KahanSum, StableSolver, array_is_finite};
 use gam_problem::{
     ConstraintRowId, ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints,
@@ -425,12 +426,13 @@ pub fn binding_constraint_rows(
 }
 
 /// The SVD's own rounding band `max(rows, cols)·ε·σ_max` for a `rows × cols`
-/// matrix: a singular value at or below it is indistinguishable from zero. There
-/// is no absolute floor and no extra factor, so `cR` has the rank of `R` for every
+/// matrix, read from its one owner `gam_linalg::roundoff::factor_singular_band`:
+/// a singular value at or below it is indistinguishable from zero. There is no
+/// absolute floor and no extra factor, so `cR` has the rank of `R` for every
 /// `c > 0` (#2469).
 pub(crate) fn svd_rank_band(singular: &Array1<f64>, rows: usize, cols: usize) -> f64 {
     let smax = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    smax * (rows.max(cols) as f64) * f64::EPSILON
+    gam_linalg::roundoff::factor_singular_band(rows, cols, smax)
 }
 
 /// Numerical rank of a `rows × cols` matrix from its singular values, at
@@ -580,8 +582,8 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     // A refusal and an answer of zero are not the same fact.
     //
     // `project_stationarity_residual_on_constraint_cone` returns `None` on a
-    // non-finite target, a width mismatch, or the Lawson-Hanson `3m + 30`
-    // guard being reached -- and this `if let` used to leave `lambda` at its
+    // non-finite target, a width mismatch, or a Lawson-Hanson iterate that is not
+    // polar at its own resolution -- and this `if let` used to leave `lambda` at its
     // zeros in every one of those cases, with no trace. That is
     // indistinguishable from NNLS genuinely reporting `λ = 0`: both give
     // `stationarity == ‖grad‖∞` and print `stat_rel = 1.000e0`.
@@ -686,10 +688,18 @@ where
     if target_inf == 0.0 {
         return Some((Vec::new(), target.clone()));
     }
-    // Gradient tolerance in λ-space: with unit rows, `w_i = a_î·r` is bounded
-    // by ‖r‖, so a relative band on the target scale is dimensionless.
-    let tol_w = 1e-10 * target_inf;
-    let lambda_floor = 1e-14 * target_inf;
+    // The resolution of a unit correlation `wᵢ = âᵢ·r` at the current residual
+    // (#2469). The raw product `aᵢ·r` sums `p` rounded terms, so it errs by at most
+    // `γ_p·Σ_j|a_ij·r_j| ≤ γ_p·‖aᵢ‖·‖r‖` (Cauchy–Schwarz). The residual is itself
+    // known only to its band, which moves the product by at most `‖aᵢ‖·‖band‖`.
+    // Divided by `‖aᵢ‖`, a correlation is resolved above `γ_p·‖r‖ + ‖band‖`. The
+    // division by the computed norm is second order. A passive coefficient moves
+    // the residual by `λ̂_j·âⱼ`, so one at or below the same resolution changes it by
+    // less than the arithmetic resolves.
+    let resolution = |residual: &Array1<f64>, band: &Array1<f64>| {
+        gam_math::roundoff::accumulation_growth(p) * residual.dot(residual).sqrt()
+            + band.dot(band).sqrt()
+    };
 
     let mut lambda_unit = Array1::<f64>::zeros(m);
     let mut passive: Vec<usize> = Vec::new();
@@ -726,20 +736,30 @@ where
         least_squares_min_norm_any_shape(&design, target)
     };
 
-    let max_outer = m.saturating_mul(3).saturating_add(30);
-    for _ in 0..max_outer {
+    // Termination is structural, with no step count (#2469):
+    // - Between residual moves, every outer step takes its entering row out of the
+    //   eligible set, into the passive set or banned, and the inner loop bans every
+    //   row it drops. So at most `m` steps pass before the residual moves or no row
+    //   is eligible.
+    // - Every residual move decreases the objective, so exact Lawson–Hanson never
+    //   holds the same passive set at two moves. A repeat is rounding-level
+    //   cycling, and the loop stops there, leaving the verdict to the terminal
+    //   polarity check. There are finitely many passive sets.
+    let mut passive_sets_at_moves: HashSet<Vec<usize>> = HashSet::new();
+    loop {
         // Most-ascent candidate among non-passive, non-banned rows.
         let values = row_values(&residual)?;
         if values.len() != m || values.iter().any(|value| !value.is_finite()) {
             return None;
         }
+        let entering_floor = resolution(&residual, &residual_band);
         let mut best: Option<(usize, f64)> = None;
         for i in 0..m {
             if in_passive[i] || banned[i] || row_norms[i] <= 0.0 {
                 continue;
             }
             let w = values[i] / row_norms[i];
-            if w > tol_w && best.map(|(_, best_w)| w > best_w).unwrap_or(true) {
+            if w > entering_floor && best.map(|(_, best_w)| w > best_w).unwrap_or(true) {
                 best = Some((i, w));
             }
         }
@@ -749,13 +769,16 @@ where
         passive.push(entering);
         in_passive[entering] = true;
 
+        // Each inner step either accepts, stops as stuck, or drops at least one
+        // passive row, so it ends within `passive.len()` steps.
+        let coefficient_floor = entering_floor;
         let mut inner_ok = false;
-        for _ in 0..(m + 2) {
+        loop {
             let Some(z) = solve_passive(&passive) else {
                 return None;
             };
             let min_z = z.iter().copied().fold(f64::INFINITY, f64::min);
-            if min_z > lambda_floor {
+            if min_z > coefficient_floor {
                 for (pos, &row) in passive.iter().enumerate() {
                     lambda_unit[row] = z[pos];
                 }
@@ -766,7 +789,7 @@ where
             // then drop every zeroed row from the passive set.
             let mut alpha = 1.0_f64;
             for (pos, &row) in passive.iter().enumerate() {
-                if z[pos] <= lambda_floor {
+                if z[pos] <= coefficient_floor {
                     let current = lambda_unit[row];
                     let denom = current - z[pos];
                     if denom > 0.0 {
@@ -781,7 +804,7 @@ where
             }
             let mut retained = Vec::with_capacity(passive.len());
             for &row in &passive {
-                if lambda_unit[row] > lambda_floor {
+                if lambda_unit[row] > coefficient_floor {
                     retained.push(row);
                 } else {
                     lambda_unit[row] = 0.0;
@@ -843,22 +866,28 @@ where
         residual_band = new_band;
         if moved {
             banned.iter_mut().for_each(|b| *b = false);
+            let mut passive_set = passive.clone();
+            passive_set.sort_unstable();
+            if !passive_sets_at_moves.insert(passive_set) {
+                break;
+            }
         } else if !inner_ok {
             break;
         }
     }
 
     // Exact Moreau/KKT exit: the residual must lie in the polar cone, i.e.
-    // every unit generator has non-positive correlation (within the same
-    // scale-relative tolerance used for entering). This distinguishes normal
-    // Lawson–Hanson termination from exhausting the floating-point pivot cap;
-    // a capped non-polar iterate is not a projection and must never reach a
-    // stationarity certificate or projected-gradient direction.
+    // every unit generator has non-positive correlation, resolved at the same
+    // band used for entering. This distinguishes normal Lawson–Hanson
+    // termination from a stop on a repeated passive set. A non-polar iterate is
+    // not a projection and must never reach a stationarity certificate or
+    // projected-gradient direction.
     let final_values = row_values(&residual)?;
+    let polar_floor = resolution(&residual, &residual_band);
     if final_values.len() != m
         || final_values.iter().any(|value| !value.is_finite())
         || (0..m).any(|row| {
-            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > tol_w
+            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > polar_floor
         })
     {
         return None;
@@ -899,9 +928,9 @@ where
 /// Rows are unit-normalized internally so pivot ordering and tolerances are
 /// scale-invariant; the returned `λ` is in original row units. Zero rows
 /// carry `λ = 0`. Classic LH terminates after finitely many passive-set
-/// changes; a `3m + 30` outer guard bounds float pathologies, and the terminal
-/// full-row polarity check refuses rather than returning a non-KKT iterate if
-/// that guard is ever reached.
+/// changes. Here a passive set repeated at a residual move ends the loop
+/// structurally, with no step count, and the terminal full-row polarity check
+/// refuses rather than returning a non-KKT iterate (#2469).
 pub(crate) fn nonnegative_cone_multipliers(
     rows: &Array2<f64>,
     target: &Array1<f64>,
@@ -1770,6 +1799,59 @@ pub struct ReducedFace {
     pub tight_rows: Vec<ConstraintRowId>,
 }
 
+/// The representative a dropped active-face row is exactly parallel to, if any
+/// (#2469).
+///
+/// "Exactly" is the arithmetic's own resolution. The row's residual after
+/// `GRAM_SCHMIDT_PASSES` projections onto the representative's unit direction
+/// must be at or below `gam_math::roundoff::gram_schmidt_residual_band` for one
+/// direction, so the row is not resolved from a multiple of the representative.
+/// The representative with the smallest residual is the candidate. Two nearly
+/// parallel representatives are told apart by their residuals, not by cosines
+/// that round to one.
+///
+/// Returns the representative's position and `coeff = dependentᵀrep / ‖rep‖²`,
+/// so `dependent ≈ coeff·rep`. A zero row has no direction, so it is parallel to
+/// nothing, and a zero representative is never a candidate.
+fn exactly_parallel_representative<'a>(
+    dependent: ArrayView1<'_, f64>,
+    representatives: impl IntoIterator<Item = ArrayView1<'a, f64>>,
+) -> Option<(usize, f64)> {
+    let dependent_norm = dependent.dot(&dependent).sqrt();
+    if !(dependent_norm.is_finite() && dependent_norm > 0.0) {
+        return None;
+    }
+    let band = gam_math::roundoff::gram_schmidt_residual_band(
+        gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+        1,
+        dependent.len(),
+        dependent_norm,
+    );
+    let mut best: Option<(usize, f64, f64)> = None;
+    for (position, representative) in representatives.into_iter().enumerate() {
+        let norm_sq = representative.dot(&representative);
+        if !(norm_sq.is_finite() && norm_sq > 0.0) {
+            continue;
+        }
+        let unit = &representative / norm_sq.sqrt();
+        let mut residual = dependent.to_owned();
+        for _ in 0..gam_math::roundoff::GRAM_SCHMIDT_PASSES {
+            let projection = residual.dot(&unit);
+            residual.scaled_add(-projection, &unit);
+        }
+        let residual_norm = residual.dot(&residual).sqrt();
+        if !residual_norm.is_finite() {
+            continue;
+        }
+        if best.is_none_or(|(_, smallest, _)| residual_norm < smallest) {
+            let coeff = dependent.dot(&representative) / norm_sq;
+            best = Some((position, residual_norm, coeff));
+        }
+    }
+    best.filter(|&(_, residual_norm, _)| residual_norm <= band)
+        .map(|(position, _, coeff)| (position, coeff))
+}
+
 /// Reduce the tight active face of a Khatri–Rao monotonicity cone to its minimal
 /// independent set — the `KhatriRaoCone` arm of the `ConstraintSet` reduced-face
 /// op (gam#2306; the Dense arm is `dense_reduced_face`).
@@ -1783,14 +1865,15 @@ pub struct ReducedFace {
 ///
 /// Contract (matches the Dense arm): FULL rank cut (every dependent row is
 /// dropped from `representatives`, parallel OR general-position); the dependence
-/// map records `(A)`-strict — ONLY exactly-parallel dependents
-/// (`|cos(ψ_dep, ψ_rep)| ≥ 1 − 1e-9`) get a [`ConstraintRowDependence`] against their
+/// map records `(A)`-strict — ONLY exactly-parallel dependents (see
+/// [`exactly_parallel_representative`]) get a [`ConstraintRowDependence`] against their
 /// single representative (`coeff = ψ_depᵀψ_rep / ‖ψ_rep‖²`, so `a_dep ≈ coeff·a_rep`);
 /// general-position drops get no entry and re-enter via the next feasibility
 /// scan. Representatives are the lowest-flat-index row per direction (ascending
-/// obs within a block), host-deterministic with no float tie-break. The rank
-/// tolerance mirrors the Dense scan (`100·ε·max(n_tight, p_cov)·max‖ψ‖`), so the
-/// two arms cut to the same numerical rank. Flat id is `slot*n + obs`, matching
+/// obs within a block), host-deterministic with no float tie-break. A row is
+/// independent when `ReorthogonalizedRowBasis` resolves its reorthogonalized
+/// residual, as in the Dense scan, so the two arms cut to the same numerical
+/// rank. Flat id is `slot*n + obs`, matching
 /// [`KhatriRaoConeConstraints::values`].
 pub(crate) fn khatri_rao_cone_reduced_face(
     cone: &KhatriRaoConeConstraints,
@@ -1799,7 +1882,6 @@ pub(crate) fn khatri_rao_cone_reduced_face(
 ) -> Result<ReducedFace, EstimationError> {
     let psi = cone.factor();
     let n = psi.nrows();
-    let p_cov = psi.ncols();
     let coupled = cone.coupled_rows();
     let values = cone.values(beta).map_err(|error| {
         EstimationError::ParameterConstraintViolation(format!(
@@ -1814,10 +1896,6 @@ pub(crate) fn khatri_rao_cone_reduced_face(
             row.dot(&row).sqrt()
         })
         .collect();
-
-    const RANK_ALPHA: f64 = 100.0;
-    // Exactly-parallel threshold, matching the Dense scan's ±1e-9 cosine band.
-    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
 
     let mut representatives: Vec<ConstraintRowId> = Vec::new();
     let mut dependence: Vec<Vec<ConstraintRowDependence>> = Vec::new();
@@ -1842,57 +1920,23 @@ pub(crate) fn khatri_rao_cone_reduced_face(
             continue;
         }
 
-        let max_norm = tight_obs
-            .iter()
-            .map(|&i| row_norms[i])
-            .fold(0.0_f64, f64::max);
-        let rank_tol =
-            RANK_ALPHA * f64::EPSILON * (tight_obs.len().max(p_cov).max(1) as f64) * max_norm;
-
-        let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
-        // Kept representatives in THIS block: (obs, ψ_obs, index into representatives).
-        let mut kept: Vec<(usize, Array1<f64>, usize)> = Vec::new();
+        let mut ortho_basis = ReorthogonalizedRowBasis::new();
+        // Kept representatives in THIS block: (obs, index into representatives).
+        let mut kept: Vec<(usize, usize)> = Vec::new();
         for &i in &tight_obs {
-            let psi_i = psi.row(i).to_owned();
-            let mut resid = psi_i.clone();
-            for q in &ortho_basis {
-                let proj = resid.dot(q);
-                resid.scaled_add(-proj, q);
-            }
-            let resid_norm = resid.dot(&resid).sqrt();
+            let psi_i = psi.row(i);
             let flat = ConstraintRowId(slot * n + i);
-            if resid_norm > rank_tol {
-                ortho_basis.push(&resid / resid_norm);
+            if ortho_basis.admit(psi_i) {
                 let out_idx = representatives.len();
                 representatives.push(flat);
                 dependence.push(Vec::new());
-                kept.push((i, psi_i, out_idx));
-            } else {
+                kept.push((i, out_idx));
+            } else if let Some((position, coeff)) =
+                exactly_parallel_representative(psi_i, kept.iter().map(|&(rep, _)| psi.row(rep)))
+            {
                 // (A)-strict: record ONLY an exactly-parallel single-representative
                 // dependence; general-position drops carry no multiplier.
-                let mut best_abs_cos = 0.0_f64;
-                let mut best: Option<(usize, f64)> = None;
-                for (rep_obs, rep_psi, rep_out_idx) in &kept {
-                    let rep_norm = row_norms[*rep_obs];
-                    let dot = psi_i.dot(rep_psi);
-                    let cos = if rep_norm > 0.0 {
-                        dot / (row_norms[i] * rep_norm)
-                    } else {
-                        0.0
-                    };
-                    if cos.abs() > best_abs_cos {
-                        best_abs_cos = cos.abs();
-                        best = Some((*rep_out_idx, dot / (rep_norm * rep_norm)));
-                    }
-                }
-                if best_abs_cos >= PARALLEL_COS_TOL {
-                    if let Some((out_idx, coeff)) = best {
-                        dependence[out_idx].push(ConstraintRowDependence {
-                            row: flat,
-                            coeff,
-                        });
-                    }
-                }
+                dependence[kept[position].1].push(ConstraintRowDependence { row: flat, coeff });
             }
         }
     }
@@ -1906,10 +1950,11 @@ pub(crate) fn khatri_rao_cone_reduced_face(
 
 /// Dense arm of the reduced-face op: reduce the tight rows of an explicit
 /// `A x ≥ b` set at `beta` to a minimal independent set. Mirrors
-/// `khatri_rao_cone_reduced_face` exactly — ascending-index greedy MGS,
-/// `RANK_ALPHA·ε·max(n_tight,p)·max‖a‖` tolerance, (A)-strict parallel-only
-/// dependence (|cos| ≥ 1−1e-9, `coeff = a_depᵀa_rep/‖a_rep‖²`, `row` = the
-/// dependent row's flat id) — so both carriers produce the same `ReducedFace`
+/// `khatri_rao_cone_reduced_face` exactly — ascending-index greedy
+/// reorthogonalized MGS through `ReorthogonalizedRowBasis` (independent when the
+/// arithmetic resolves the residual), (A)-strict parallel-only dependence
+/// ([`exactly_parallel_representative`], `coeff = a_depᵀa_rep/‖a_rep‖²`, `row` =
+/// the dependent row's flat id) — so both carriers produce the same `ReducedFace`
 /// contract. Flat id = the constraint row index. A zero-norm row is vacuous
 /// (never a direction, never a representative).
 pub(crate) fn dense_reduced_face(
@@ -1920,7 +1965,6 @@ pub(crate) fn dense_reduced_face(
     let a = &lin.a;
     let b = &lin.b;
     let n = a.nrows();
-    let p = a.ncols();
 
     let row_norms: Vec<f64> = (0..n)
         .map(|i| {
@@ -1928,9 +1972,6 @@ pub(crate) fn dense_reduced_face(
             row.dot(&row).sqrt()
         })
         .collect();
-
-    const RANK_ALPHA: f64 = 100.0;
-    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
 
     // The scan runs in raw row indices (they address `a` / `row_norms`); the
     // ids are wrapped into constraint-row space once, at the return boundary.
@@ -1956,56 +1997,26 @@ pub(crate) fn dense_reduced_face(
         });
     }
 
-    let max_norm = tight
-        .iter()
-        .map(|&i| row_norms[i])
-        .fold(0.0_f64, f64::max);
-    let rank_tol = RANK_ALPHA * f64::EPSILON * (tight.len().max(p).max(1) as f64) * max_norm;
-
-    let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
-    // Kept representatives: (row, a_row, index into `representatives`).
-    let mut kept: Vec<(usize, Array1<f64>, usize)> = Vec::new();
+    let mut ortho_basis = ReorthogonalizedRowBasis::new();
+    // Kept representatives: (row, index into `representatives`).
+    let mut kept: Vec<(usize, usize)> = Vec::new();
     for &i in &tight {
-        let a_i = a.row(i).to_owned();
-        let mut resid = a_i.clone();
-        for q in &ortho_basis {
-            let proj = resid.dot(q);
-            resid.scaled_add(-proj, q);
-        }
-        let resid_norm = resid.dot(&resid).sqrt();
-        if resid_norm > rank_tol {
-            ortho_basis.push(&resid / resid_norm);
+        let a_i = a.row(i);
+        if ortho_basis.admit(a_i) {
             let out_idx = representatives.len();
             representatives.push(ConstraintRowId(i));
             dependence.push(Vec::new());
-            kept.push((i, a_i, out_idx));
-        } else {
+            kept.push((i, out_idx));
+        } else if let Some((position, coeff)) =
+            exactly_parallel_representative(a_i, kept.iter().map(|&(rep, _)| a.row(rep)))
+        {
             // (A)-strict: record ONLY an exactly-parallel single-representative
             // dependence; a general-position drop carries no multiplier and
             // re-enters via the next feasibility scan.
-            let mut best_abs_cos = 0.0_f64;
-            let mut best: Option<(usize, f64)> = None;
-            for (rep_row, rep_a, rep_out_idx) in &kept {
-                let rep_norm = row_norms[*rep_row];
-                let dot = a_i.dot(rep_a);
-                let cos = if rep_norm > 0.0 {
-                    dot / (row_norms[i] * rep_norm)
-                } else {
-                    0.0
-                };
-                if cos.abs() > best_abs_cos {
-                    best_abs_cos = cos.abs();
-                    best = Some((*rep_out_idx, dot / (rep_norm * rep_norm)));
-                }
-            }
-            if best_abs_cos >= PARALLEL_COS_TOL {
-                if let Some((out_idx, coeff)) = best {
-                    dependence[out_idx].push(ConstraintRowDependence {
-                        row: ConstraintRowId(i),
-                        coeff,
-                    });
-                }
-            }
+            dependence[kept[position].1].push(ConstraintRowDependence {
+                row: ConstraintRowId(i),
+                coeff,
+            });
         }
     }
 
@@ -2148,37 +2159,28 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     // the nondeterministic cross-host certification the face feeds. Instead do a
     // greedy ASCENDING-original-index independence scan: iterate rows in index
     // order and keep row r iff its residual after projecting onto the orthonormal
-    // span of the already-kept rows exceeds the rank tolerance; otherwise record
-    // it dependent. This yields the lowest-index representative per independent
-    // direction with no float-comparison tie-break.
+    // span of the already-kept rows is resolved; otherwise record it dependent.
+    // This yields the lowest-index representative per independent direction
+    // with no float-comparison tie-break.
     //
-    // Rank tolerance is relative to the largest row norm — the same |R00| scale
-    // (= largest column norm of Aᵀ = largest row norm of A) the pivoted QR used —
-    // so the accepted COUNT matches the prior numerical rank; only WHICH
-    // representative is chosen among tied near-parallel rows changes, and it
-    // changes deterministically. The scale carries NO absolute floor, preserving
-    // the unit-robustness of the prior tolerance (a perfectly independent system
-    // in tiny units, e.g. A = 1e-20·I, keeps full rank rather than being dropped).
-    const RANK_ALPHA: f64 = 100.0;
-    let max_row_norm = (0..k)
-        .map(|r| {
-            let row = a.row(r);
-            row.dot(&row).sqrt()
-        })
-        .fold(0.0_f64, f64::max);
-    let tol = RANK_ALPHA * f64::EPSILON * (k.max(p).max(1) as f64) * max_row_norm;
-
-    let mut ortho_basis: Vec<Array1<f64>> = Vec::new();
+    // `ReorthogonalizedRowBasis` decides "resolved" (#2469). The residual must
+    // exceed the row's own Gram–Schmidt band plus `Σ_j |w_j|·β_j`, the error the
+    // kept directions carry, weighted by the row's coefficients on the kept rows.
+    // This replaced `100·ε·max(k, p)·max‖a‖`, whose 100 was not derived. Per-row
+    // positive scaling does not change the decision, and there is no absolute
+    // floor: a perfectly independent system in tiny units, e.g. A = 1e-20·I,
+    // keeps full rank rather than being dropped.
+    let mut ortho_basis = ReorthogonalizedRowBasis::new();
     let mut kept_orig: Vec<usize> = Vec::new();
     let mut dropped_orig: Vec<usize> = Vec::new();
     for r in 0..k {
-        let mut resid = a.row(r).to_owned();
-        // TWO passes, and the second one is the rank decision (gam#2600).
+        // TWO passes (`GRAM_SCHMIDT_PASSES`), and the second one is the rank
+        // decision (gam#2600).
         //
         // A single modified-Gram-Schmidt sweep leaves the computed residual
         // contaminated by the accumulated loss of orthogonality in
         // `ortho_basis`, which is `O(eps * cond(A_kept))` — NOT `O(eps)`. On an
-        // ill-conditioned face that contamination is larger than `tol`, so a
+        // ill-conditioned face that contamination is larger than the band, so a
         // row that is genuinely in the span of the kept rows reports a residual
         // above the floor and is kept as "independent". The face then carries a
         // numerically redundant row, and every consumer that factors it
@@ -2188,8 +2190,8 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         // fixture: 90 reduced-face solves where the block this scan returned had
         // `nrows = svd_rank + 1`, EVERY time — `face_rows=39, rank=38` with the
         // retained singular values down to `3.86e-5` and the 39th at `~1e-15`,
-        // against this scan's `tol = 1.07e-12`. `cond(A_kept) ~ 6e4` puts the
-        // single-pass contamination at `~1.3e-11`, an order above `tol`, which
+        // against this scan's then-tolerance `1.07e-12`. `cond(A_kept) ~ 6e4` puts
+        // the single-pass contamination at `~1.3e-11`, an order above it, which
         // is exactly the observed miss. The physical reduced face then handed
         // that block to an SVD that refused it as a singular affine system and
         // ended the whole fit.
@@ -2199,16 +2201,8 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         // rank-revealing factorization of the same block agree. It is the same
         // deliberate second pass `active_constraint_tangent_geometry` already
         // runs when it completes a null basis, for the same reason.
-        for _ in 0..2 {
-            for q in &ortho_basis {
-                let proj = resid.dot(q);
-                resid.scaled_add(-proj, q);
-            }
-        }
-        let resid_norm = resid.dot(&resid).sqrt();
-        if resid_norm > tol {
+        if ortho_basis.admit(a.row(r)) {
             kept_orig.push(r);
-            ortho_basis.push(&resid / resid_norm);
         } else {
             dropped_orig.push(r);
         }
@@ -2219,7 +2213,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
         return (a, b, groups, multiplier_dependence);
     }
     if rank == 0 {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to 0 rows (all active rows numerically zero)",
             k
         );
@@ -2265,47 +2259,26 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     // `best_positive_align` merge folded such a row into whichever kept row it
     // was most positively aligned with, silently truncating a general-position
     // active row out of the enforced face and pinning the wrong vertex (#2378).
-    const PARALLEL_COS_TOL: f64 = 1.0 - 1e-9;
     for &dropped_idx in &dropped_orig {
-        let dropped_row = a.row(dropped_idx);
-        let dropped_norm = dropped_row.dot(&dropped_row).sqrt();
-        let mut best_abs_cos = 0.0_f64;
-        let mut best_target: Option<(usize, f64)> = None;
-        for &kept_idx in &kept_orig {
-            let kept_row = a.row(kept_idx);
-            let kept_norm = kept_row.dot(&kept_row).sqrt();
-            let dot = kept_row.dot(&dropped_row);
-            let cos = if kept_norm > 0.0 && dropped_norm > 0.0 {
-                dot / (kept_norm * dropped_norm)
-            } else {
-                0.0
-            };
-            let coeff = if kept_norm > 0.0 {
-                dot / (kept_norm * kept_norm)
-            } else {
-                0.0
-            };
-            if cos.abs() > best_abs_cos {
-                best_abs_cos = cos.abs();
-                best_target = Some((kept_idx, coeff));
+        // Only an exactly-parallel dependent is recorded
+        // ([`exactly_parallel_representative`]); a general-position drop carries
+        // no phantom distributed dual. The group (whose whole-set release the
+        // working-set loop drives) additionally requires POSITIVE parallelism —
+        // same constraint up to positive scale — so an opposing (anti-parallel)
+        // tight row is never released together with it.
+        let parallel = exactly_parallel_representative(
+            a.row(dropped_idx),
+            kept_orig.iter().map(|&kept_idx| a.row(kept_idx)),
+        );
+        if let Some((position, coeff)) = parallel {
+            let &out_idx = orig_to_out
+                .get(&kept_orig[position])
+                .expect("merge target must be a kept row");
+            for &active_pos in &groups[dropped_idx] {
+                multiplier_dependence[out_idx].push(ActiveRowDependence { active_pos, coeff });
             }
-        }
-        // Only an exactly-parallel dependent is recorded; a general-position
-        // drop carries no phantom distributed dual. The group (whose whole-set
-        // release the working-set loop drives) additionally requires POSITIVE
-        // parallelism — same constraint up to positive scale — so an opposing
-        // (anti-parallel) tight row is never released together with it.
-        if best_abs_cos >= PARALLEL_COS_TOL {
-            if let Some((target, coeff)) = best_target {
-                let &out_idx = orig_to_out
-                    .get(&target)
-                    .expect("merge target must be a kept row");
-                for &active_pos in &groups[dropped_idx] {
-                    multiplier_dependence[out_idx].push(ActiveRowDependence { active_pos, coeff });
-                }
-                if coeff > 0.0 {
-                    groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
-                }
+            if coeff > 0.0 {
+                groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
             }
         }
     }
@@ -2339,7 +2312,7 @@ pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     }
 
     if rank < k {
-        log::debug!(
+        log::trace!(
             "rank-reduced active constraints from {} to {} rows (rank deficiency {})",
             k,
             rank,
@@ -2533,15 +2506,14 @@ fn independent_violated_operator_rows(
         return Ok(Vec::new());
     }
 
-    // Every gathered row is unit-normalized. Use the same relative rank scale
-    // as the working-face reducer, with `p` (the maximum attainable rank) in
-    // place of a row-count-dependent tolerance.
-    let rank_tolerance = 100.0 * f64::EPSILON * p.max(1) as f64;
-    let mut basis = Vec::<Array1<f64>>::with_capacity(p);
+    // Every gathered row is unit-normalized. A row adds a normal-space direction
+    // when `ReorthogonalizedRowBasis` resolves its residual: above its own
+    // Gram–Schmidt band plus the error the held directions carry (#2469).
+    let mut basis = ReorthogonalizedRowBasis::new();
     if !active.is_empty() {
         let active_rows = ops.gather_unit_rows(active)?;
         for row in active_rows.a.rows() {
-            extend_operator_normal_basis(&mut basis, row, rank_tolerance);
+            basis.admit(row);
         }
     }
 
@@ -2551,11 +2523,7 @@ fn independent_violated_operator_rows(
         let chunk_ids = chunk.iter().map(|(row, _)| *row).collect::<Vec<_>>();
         let gathered = ops.gather_unit_rows(&chunk_ids)?;
         for (position, &row) in chunk_ids.iter().enumerate() {
-            if extend_operator_normal_basis(
-                &mut basis,
-                gathered.a.row(position),
-                rank_tolerance,
-            ) {
+            if basis.admit(gathered.a.row(position)) {
                 selected.push(row);
                 if selected.len() == max_new || basis.len() == p {
                     return Ok(selected);
@@ -2564,32 +2532,6 @@ fn independent_violated_operator_rows(
         }
     }
     Ok(selected)
-}
-
-/// Reorthogonalized modified Gram--Schmidt append for one unit constraint
-/// normal. Returns true exactly when the row adds a resolved normal-space
-/// direction.
-fn extend_operator_normal_basis(
-    basis: &mut Vec<Array1<f64>>,
-    row: ArrayView1<'_, f64>,
-    rank_tolerance: f64,
-) -> bool {
-    let mut residual = row.to_owned();
-    // The second pass prevents a long, nearly dependent active basis from
-    // manufacturing a false new direction through first-pass roundoff.
-    for _ in 0..2 {
-        for direction in basis.iter() {
-            let projection = residual.dot(direction);
-            residual.scaled_add(-projection, direction);
-        }
-    }
-    let residual_norm = residual.dot(&residual).sqrt();
-    if !(residual_norm.is_finite() && residual_norm > rank_tolerance) {
-        return false;
-    }
-    residual /= residual_norm;
-    basis.push(residual);
-    true
 }
 
 /// Retain only candidate row ids that are genuinely tight at `beta`.
@@ -2982,38 +2924,20 @@ const ACTIVE_SET_DUAL_DEPENDENCE_TOL: f64 = 1e-11;
 /// Thin QR by reorthogonalized modified Gram--Schmidt: `columns = Q R` with `Q`
 /// orthonormal (returned as its column list) and `R` upper triangular.
 ///
-/// Returns `None` when a column is numerically dependent on its predecessors.
+/// Returns `None` when a column is numerically dependent on its predecessors, as
+/// `ReorthogonalizedRowBasis` decides it (#2469).
 /// The dual active-set solve maintains an independent face by construction, so
 /// `None` is a genuine numerical breakdown rather than an expected branch, and
 /// the caller converts it into a typed refusal.
-fn thin_qr_reorthogonalized(
-    columns: &[Array1<f64>],
-    rank_tolerance: f64,
-) -> Option<(Vec<Array1<f64>>, Array2<f64>)> {
-    let k = columns.len();
-    let mut q: Vec<Array1<f64>> = Vec::with_capacity(k);
-    let mut r = Array2::<f64>::zeros((k, k));
-    for (column_index, column) in columns.iter().enumerate() {
-        let scale = column.dot(column).sqrt();
-        let mut residual = column.clone();
-        // Two passes: one sweep leaves a long, nearly dependent basis able to
-        // manufacture a false orthogonal direction out of first-pass roundoff.
-        for _ in 0..2 {
-            for (basis_index, basis) in q.iter().enumerate() {
-                let projection = residual.dot(basis);
-                r[[basis_index, column_index]] += projection;
-                residual.scaled_add(-projection, basis);
-            }
-        }
-        let norm = residual.dot(&residual).sqrt();
-        if !(norm.is_finite() && scale.is_finite() && norm > rank_tolerance * scale.max(1.0)) {
+fn thin_qr_reorthogonalized(columns: &[Array1<f64>]) -> Option<(Vec<Array1<f64>>, Array2<f64>)> {
+    let mut basis = ReorthogonalizedRowBasis::new();
+    for column in columns {
+        if !basis.admit(column.view()) {
             return None;
         }
-        r[[column_index, column_index]] = norm;
-        residual /= norm;
-        q.push(residual);
     }
-    Some((q, r))
+    let r = basis.triangular_factor();
+    Some((basis.into_directions(), r))
 }
 
 /// Back substitution against an upper-triangular `R` (`R x = y`).
@@ -3173,11 +3097,27 @@ pub(crate) fn kkt_dual_channel_violations(
     complementarity: f64,
     gradient_scale: f64,
 ) -> (bool, bool) {
-    let dual_infeasible = dual_violation > ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
-        && dual_violation / gradient_scale > ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
-    let complementarity_violated = complementarity > ACTIVE_SET_KKT_COMPLEMENTARITY_TOL
-        && complementarity / gradient_scale > ACTIVE_SET_KKT_COMPLEMENTARITY_TOL;
-    (dual_infeasible, complementarity_violated)
+    (
+        exceeds_at_gradient_scale(dual_violation, ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL, gradient_scale),
+        exceeds_at_gradient_scale(complementarity, ACTIVE_SET_KKT_COMPLEMENTARITY_TOL, gradient_scale),
+    )
+}
+
+/// Whether a gradient-unit KKT residual (stationarity `‖g − Aᵀλ‖∞`, a negative
+/// multiplier, or `|λ·slack|`) exceeds `tolerance` both absolutely AND relative
+/// to the gradient scale `max(1, ‖g‖∞)`.
+///
+/// All three channels carry the gradient's units: rescaling the response
+/// `y → c·y` scales `g`, `λ` and therefore every one of these residuals by `c`
+/// (or `c²` for a Gaussian deviance) while leaving the constrained minimizer's
+/// geometry unchanged. The relative branch is what makes the verdict invariant
+/// under that rescale; the `max(1, ·)` floor keeps a vanishing gradient from
+/// turning roundoff into a violation. This is the one contract the inner
+/// active-set solver and the outer REML startup gate both judge by, so a point
+/// the solver certifies is never one the gate then refuses. A non-finite
+/// residual is never within tolerance.
+pub(crate) fn exceeds_at_gradient_scale(residual: f64, tolerance: f64, gradient_scale: f64) -> bool {
+    !(residual <= tolerance || residual / gradient_scale.max(1.0) <= tolerance)
 }
 
 /// The part of the metric projection's stationarity residual above what its
@@ -3277,7 +3217,6 @@ fn solve_operator_metric_projection_dual_active_set(
     let p = unconstrained.len();
     let m = ops.nrows();
     let lower = factor.lower_triangular();
-    let face_rank_tolerance = 100.0 * f64::EPSILON * (p.max(1) as f64);
 
     let mut beta = unconstrained.clone();
     let mut active = Vec::<usize>::new();
@@ -3400,7 +3339,7 @@ fn solve_operator_metric_projection_dual_active_set(
                     (Array1::<f64>::zeros(0), whitened_normal.clone())
                 } else {
                     let Some((q, r)) =
-                        thin_qr_reorthogonalized(&whitened_active, face_rank_tolerance)
+                        thin_qr_reorthogonalized(&whitened_active)
                     else {
                         crate::bail_invalid_estim!(
                             "operator metric projection lost independence of its {} active normals",
@@ -3993,6 +3932,176 @@ pub fn solve_quadratic_with_linear_constraints(
 
 #[cfg(test)]
 mod tests {
+
+    /// A gradient-unit KKT residual is judged at the gradient's own scale.
+    ///
+    /// The captured cell is a monotone smooth on 300 rows with `y` scaled by
+    /// `1e6`: its solver-certified vertex carried complementarity `9.65e-5`
+    /// against `‖g‖∞ = 1.52e6`, a relative residual of `6e-11`, and the
+    /// absolute `1e-7` gate refused it. The same geometry at every response
+    /// scale must get the same verdict, and a residual that is a genuine
+    /// violation relative to the gradient must stay one at every scale whose
+    /// gradient is above the unit floor.
+    #[test]
+    fn gradient_unit_kkt_residual_verdict_is_invariant_to_response_scale() {
+        use super::exceeds_at_gradient_scale;
+        let tolerance = 1.0e-7;
+        let (roundoff, gradient) = (9.650e-5_f64, 1.519e6_f64);
+        for scale in [1.0e-6, 1.0e-3, 1.0, 1.0e3, 1.0e6] {
+            assert!(
+                !exceeds_at_gradient_scale(roundoff * scale, tolerance, gradient * scale),
+                "scale {scale}: a residual at 6e-11 of the gradient is roundoff, not a violation"
+            );
+            let violation = 1.0e-3 * gradient;
+            if gradient * scale >= 1.0 {
+                assert!(
+                    exceeds_at_gradient_scale(violation * scale, tolerance, gradient * scale),
+                    "scale {scale}: a residual at 1e-3 of the gradient is a violation"
+                );
+            }
+        }
+        assert!(
+            exceeds_at_gradient_scale(f64::NAN, tolerance, gradient),
+            "a non-finite residual is never within tolerance"
+        );
+        assert!(
+            exceeds_at_gradient_scale(1.0e-6, tolerance, 0.0),
+            "a vanishing gradient does not relax the absolute tolerance"
+        );
+    }
+
+    /// #2469: a direction joins the active set's Gram–Schmidt bases when
+    /// `ReorthogonalizedRowBasis` resolves its residual. Against `e₁` in three
+    /// dimensions, `(1, 1e-14, 0)` leaves a residual of `1e-14`. That is above the band
+    /// (`≈1.6e-15`) and below the `100·p·ε ≈ 6.7e-14` cutoff both appends used
+    /// before. A vector already in the span is refused. On the #2600 face the
+    /// dual's thin QR refuses the fourth-difference column that the band alone
+    /// would admit, and factors the six rows it is a difference of.
+    #[test]
+    fn gram_schmidt_appends_admit_a_residual_resolved_above_their_band_2469() {
+        use ndarray::array;
+        let gap = 1.0e-14_f64;
+        let band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            1,
+            3,
+            1.0,
+        );
+        assert!(
+            gap > band && gap < 100.0 * 3.0 * f64::EPSILON,
+            "fixture premise: the residual {gap:.1e} sits between the band {band:.3e} and the \
+             replaced cutoff {:.3e}",
+            100.0 * 3.0 * f64::EPSILON
+        );
+        let mut basis = super::ReorthogonalizedRowBasis::new();
+        assert!(basis.admit(array![1.0_f64, 0.0, 0.0].view()));
+        assert!(basis.admit(array![1.0_f64, gap, 0.0].view()));
+        assert_eq!(basis.len(), 2);
+        assert!(!basis.admit(array![0.6_f64, 0.8, 0.0].view()));
+        assert_eq!(basis.len(), 2);
+
+        let face = ill_conditioned_face_2600();
+        let columns: Vec<Array1<f64>> = face.rows().into_iter().map(|row| row.to_owned()).collect();
+        assert!(
+            super::thin_qr_reorthogonalized(&columns[..6]).is_some(),
+            "the six near-collinear rows are independent"
+        );
+        assert!(
+            super::thin_qr_reorthogonalized(&columns).is_none(),
+            "their fourth difference is in their span"
+        );
+
+        let columns = vec![array![2.0_f64, 0.0, 0.0], array![2.0_f64, 2.0 * gap, 0.0]];
+        let (q, r) = super::thin_qr_reorthogonalized(&columns)
+            .expect("a column resolved above its band is independent");
+        assert_eq!(q.len(), 2);
+        assert!(
+            (r[[1, 1]] - 2.0 * gap).abs()
+                <= gam_math::roundoff::gram_schmidt_residual_band(
+                    gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+                    1,
+                    3,
+                    2.0
+                )
+        );
+        assert!(
+            super::thin_qr_reorthogonalized(&[array![2.0_f64, 0.0, 0.0], array![3.0_f64, 0.0, 0.0]])
+                .is_none(),
+            "a column in its predecessors' span is dependent"
+        );
+
+        // A zero vector is never admitted: it adds no direction to a basis, and a
+        // thin QR over it is the dependent-column refusal. Upstream,
+        // `gather_unit_rows` refuses a zero-norm row typed before either append
+        // sees it.
+        let mut empty = super::ReorthogonalizedRowBasis::new();
+        assert!(!empty.admit(array![0.0_f64, 0.0, 0.0].view()));
+        assert!(empty.is_empty());
+        assert!(super::thin_qr_reorthogonalized(&[array![0.0_f64, 0.0, 0.0]]).is_none());
+    }
+
+    /// #2469: batch separation adds a violated row only when it adds a resolved
+    /// normal direction to the active face. With the six near-collinear #2600 rows
+    /// active and all eight rows violated at the origin, their fourth difference is
+    /// in the face's span and is not selected, though its residual clears its own
+    /// band. `e₈` is resolved and is selected.
+    #[test]
+    fn batch_separation_skips_a_violated_row_in_a_near_collinear_face_span_2469() {
+        let face = ill_conditioned_face_2600();
+        let mut a = Array2::<f64>::zeros((8, 8));
+        a.slice_mut(ndarray::s![..7, ..]).assign(&face);
+        a[[7, 7]] = 1.0;
+        let set = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(a, Array1::<f64>::ones(8)).expect("dense"),
+        );
+        let ops = ConstraintSetOps::new(&set, 0.0).expect("operator geometry");
+        let values = ops.values(&Array1::<f64>::zeros(8)).expect("values at the origin");
+        let active: Vec<usize> = (0..6).collect();
+        let mut is_active = vec![false; 8];
+        for &row in &active {
+            is_active[row] = true;
+        }
+        let selected =
+            independent_violated_operator_rows(&ops, &values, &active, &is_active, &[false; 8], 2)
+                .expect("batch separation");
+        assert_eq!(
+            selected,
+            vec![7],
+            "the fourth difference is in the active face's span and e₈ is not"
+        );
+    }
+
+    /// Six unit rows of `(1, x, …, x⁷)` at nodes `1, 1.05, …, 1.25`, then their
+    /// unit-normalized fourth difference, which is in their span by construction
+    /// (#2600).
+    fn ill_conditioned_face_2600() -> Array2<f64> {
+        const NODE_SPACING: f64 = 0.05;
+        let p = 8usize;
+        let independent = 6usize;
+        let mut rows = Array2::<f64>::zeros((independent + 1, p));
+        for index in 0..independent {
+            let node = 1.0 + NODE_SPACING * index as f64;
+            let mut power = 1.0_f64;
+            for column in 0..p {
+                rows[[index, column]] = power;
+                power *= node;
+            }
+            let norm = rows.row(index).dot(&rows.row(index)).sqrt();
+            let normalized = &rows.row(index).to_owned() / norm;
+            rows.row_mut(index).assign(&normalized);
+        }
+        // Fourth finite difference of the first five rows: coefficients
+        // 1, -4, 6, -4, 1 — exactly in the span, with an O(1e-3) norm.
+        let difference_weights = [1.0_f64, -4.0, 6.0, -4.0, 1.0];
+        let mut combination = Array1::<f64>::zeros(p);
+        for (index, weight) in difference_weights.iter().enumerate() {
+            combination.scaled_add(*weight, &rows.row(index));
+        }
+        let combination_norm = combination.dot(&combination).sqrt();
+        rows.row_mut(independent)
+            .assign(&(&combination / combination_norm));
+        rows
+    }
 
     /// The metric projection's stationarity is judged above its operands'
     /// roundoff floor (#1561). The measured refusal, one unit in the last place
@@ -4600,46 +4709,27 @@ mod tests {
         // difference of near-collinear rows cancels down to `2e-3`, so
         // Gram-Schmidt subtracts O(1) projections to leave an O(1e-3) residual
         // and then has to see that the rest is zero. A single modified sweep
-        // leaves contamination above this scan's own
-        // `tol = 100*eps*8 = 1.78e-13`, so the row clears the floor and the
-        // scan reports rank SEVEN. Reorthogonalizing once brings it back to
-        // `O(eps)` and the scan reports six.
+        // left contamination above the scan's then-tolerance
+        // `100*eps*8 = 1.78e-13`, so the row cleared the floor and the scan
+        // reported rank SEVEN. Reorthogonalizing once brought it back under.
+        // The row's own Gram–Schmidt band (`≈ 1.6e-14`) alone would still keep
+        // it (#2469). Its weights on the kept rows sum to about 8000, so the
+        // kept directions are only good to about `4e-11` for it, and
+        // `ReorthogonalizedRowBasis` calls it dependent.
         //
         // That is #2600's pit arm in miniature: `face_rows = rank + 1` on 90
         // consecutive reduced-face solves, handed to a factorization that
         // refused the block as a singular affine system and ended the fit.
         //
         // The assertion is deliberately NOT a hardcoded six. It is that this
-        // scan and a rank-revealing factorization of the same block, at the
-        // same floor, agree — which is the invariant the physical reduced face
-        // needs and the one that was violated.
+        // scan and a rank-revealing factorization of the same block agree,
+        // which is the invariant the physical reduced face needs and the one
+        // that was violated.
         use gam_linalg::faer_ndarray::FaerSvd;
 
-        const NODE_SPACING: f64 = 0.05;
         let p = 8usize;
         let independent = 6usize;
-        let mut rows = Array2::<f64>::zeros((independent + 1, p));
-        for index in 0..independent {
-            let node = 1.0 + NODE_SPACING * index as f64;
-            let mut power = 1.0_f64;
-            for column in 0..p {
-                rows[[index, column]] = power;
-                power *= node;
-            }
-            let norm = rows.row(index).dot(&rows.row(index)).sqrt();
-            let normalized = &rows.row(index).to_owned() / norm;
-            rows.row_mut(index).assign(&normalized);
-        }
-        // Fourth finite difference of the first five rows: coefficients
-        // 1, -4, 6, -4, 1 — exactly in the span, with an O(1e-3) norm.
-        let difference_weights = [1.0_f64, -4.0, 6.0, -4.0, 1.0];
-        let mut combination = Array1::<f64>::zeros(p);
-        for (index, weight) in difference_weights.iter().enumerate() {
-            combination.scaled_add(*weight, &rows.row(index));
-        }
-        let combination_norm = combination.dot(&combination).sqrt();
-        rows.row_mut(independent)
-            .assign(&(&combination / combination_norm));
+        let rows = ill_conditioned_face_2600();
 
         let (_u, singular, _vt) = rows.svd(false, false).expect("face SVD");
         let singular_max = singular.iter().copied().fold(0.0_f64, f64::max);
@@ -4753,6 +4843,41 @@ mod tests {
                 assert_relative_eq!(left, right, epsilon = 1e-12);
             }
         }
+    }
+
+    /// #2469: the cone projection enters, and certifies polarity for, every
+    /// correlation resolved above its own rounding band `γ_p·‖r‖ + ‖band‖`, not
+    /// above `1e-10·‖t‖∞`.
+    /// - Target `(1e-11, 1)` against the generator `e₁` has correlation `1e-11`: far
+    ///   above the band (`≈ 2.2e-16`) and below the replaced `1e-10` cutoff. That
+    ///   cutoff returned `λ = 0` with `(1e-11, 1)` as the "projection", which is
+    ///   not polar, since `e₁` still has positive correlation with it. The
+    ///   projection is `(0, 1)` with `λ = 1e-11`.
+    /// - A correlation at rounding level is not entered: the target `e₂` against
+    ///   `e₁` is already polar.
+    #[test]
+    fn nnls_enters_every_correlation_resolved_above_its_band_2469() {
+        let rows = array![[1.0, 0.0]];
+        let gap = 1.0e-11_f64;
+        let band = gam_math::roundoff::accumulation_growth(2) * (1.0 + gap * gap).sqrt();
+        assert!(
+            gap > band && gap < 1.0e-10,
+            "fixture premise: the correlation {gap:.1e} sits between the band {band:.3e} and the \
+             replaced 1e-10 cutoff"
+        );
+        let (lambda, projected) = nonnegative_cone_multipliers(&rows, &array![gap, 1.0])
+            .expect("a resolved correlation is projected");
+        assert!(
+            (lambda[0] - gap).abs() <= band,
+            "the resolved correlation enters with its multiplier: {lambda:?}"
+        );
+        assert!(projected[0].abs() <= band, "the projection is polar: {projected:?}");
+        assert_eq!(projected[1], 1.0);
+
+        let (lambda, projected) =
+            nonnegative_cone_multipliers(&rows, &array![0.0, 1.0]).expect("already polar");
+        assert_eq!(lambda[0], 0.0);
+        assert_eq!(projected, array![0.0, 1.0]);
     }
 
     #[test]
@@ -5186,6 +5311,127 @@ mod tests {
             face.dependence.iter().all(|d| d.is_empty()),
             "a general-position drop must carry no distributed multiplier"
         );
+    }
+
+    /// The Dense arm's reduced face of `a·β ≥ 0` at `β = 0`, where every row binds.
+    fn dense_face_at_origin(a: Array2<f64>) -> super::ReducedFace {
+        let (m, p) = a.dim();
+        let lin = LinearInequalityConstraints::new(a, Array1::<f64>::zeros(m)).expect("dense");
+        super::dense_reduced_face(&lin, Array1::<f64>::zeros(p).view(), 1e-8).expect("reduce")
+    }
+
+    /// The cone arm's reduced face with one coupled row over the factor `psi` at
+    /// `β = 0`, where every row binds.
+    fn cone_face_at_origin(psi: Array2<f64>) -> super::ReducedFace {
+        let p_cov = psi.ncols();
+        let cone =
+            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2).expect("cone");
+        khatri_rao_cone_reduced_face(&cone, Array1::<f64>::zeros(2 * p_cov).view(), 1e-8)
+            .expect("reduce")
+    }
+
+    /// #2469: every active-face scan (`dense_reduced_face`, the cone arm and
+    /// `rank_reduce_rows_pivoted_qr_with_dependence`) keeps a row whose
+    /// reorthogonalized residual is resolved above the Gram–Schmidt band. After
+    /// `e₁` in three dimensions, `(1, 3e-14, 0)` leaves a residual of `3e-14`. That is
+    /// above the band (`≈1.6e-15`) and below the replaced `100·ε·max(k, p)·max‖a‖ ≈
+    /// 6.7e-14`, which dropped it.
+    #[test]
+    fn active_face_scans_keep_a_residual_resolved_above_the_gram_schmidt_band_2469() {
+        let gap = 3.0e-14_f64;
+        let band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            1,
+            3,
+            1.0,
+        );
+        let replaced = 100.0 * f64::EPSILON * 3.0;
+        assert!(
+            gap > band && gap < replaced,
+            "fixture premise: the residual {gap:.1e} sits between the band {band:.3e} and the \
+             replaced cutoff {replaced:.3e}"
+        );
+        let resolved = array![[1.0_f64, 0.0, 0.0], [1.0, gap, 0.0]];
+        for face in [dense_face_at_origin(resolved.clone()), cone_face_at_origin(resolved.clone())] {
+            assert_eq!(face.representatives, rows(&[0, 1]), "a resolved residual is a representative");
+            assert!(face.dependence.iter().all(|d| d.is_empty()));
+        }
+        let (kept, _, _, _) = rank_reduce_rows_pivoted_qr_with_dependence(
+            resolved,
+            Array1::<f64>::zeros(2),
+            vec![vec![0], vec![1]],
+        );
+        assert_eq!(kept.nrows(), 2, "a resolved residual is a kept row");
+    }
+
+    /// #2469: an active-face scan records a dropped row as parallel only when its
+    /// residual against one representative lies inside the Gram–Schmidt band.
+    /// `e₁ + 1e-6·e₂` lies in the span of `e₁, e₂`, tilted `1e-6` from `e₁`. Its cosine
+    /// with `e₁` (`1 − 5e-13`) passed the replaced `|cos| ≥ 1 − 1e-9`, which recorded it
+    /// as `1·e₁` and grouped it with `e₁`. Its residual against `e₁` is `1e-6`, far above
+    /// the band, so it is a general-position drop. `2·e₁` stays parallel, with
+    /// coefficient 2.
+    #[test]
+    fn active_face_scans_record_a_parallel_dependent_only_inside_the_band_2469() {
+        let tilt = 1.0e-6_f64;
+        let band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            1,
+            3,
+            2.0,
+        );
+        assert!(
+            1.0 / (1.0 + tilt * tilt).sqrt() >= 1.0 - 1.0e-9 && tilt > band,
+            "fixture premise: the tilted row passed the replaced cosine test and is resolved"
+        );
+        let tilted =
+            array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, tilt, 0.0], [2.0, 0.0, 0.0]];
+        for face in [dense_face_at_origin(tilted.clone()), cone_face_at_origin(tilted.clone())] {
+            assert_eq!(face.representatives, rows(&[0, 1]));
+            assert_eq!(
+                face.dependence[0].len(),
+                1,
+                "only 2·e₁ is parallel to e₁: {:?}",
+                face.dependence
+            );
+            assert_eq!(face.dependence[0][0].row.index(), 3);
+            assert!((face.dependence[0][0].coeff - 2.0).abs() <= band);
+            assert!(face.dependence[1].is_empty());
+        }
+        let (kept, _, groups, _) = rank_reduce_rows_pivoted_qr_with_dependence(
+            tilted,
+            Array1::<f64>::zeros(4),
+            (0..4).map(|row| vec![row]).collect(),
+        );
+        assert_eq!(kept.nrows(), 2);
+        assert_eq!(groups, vec![vec![0, 3], vec![1]], "the tilted row joins no group");
+    }
+
+    /// #2469: of two nearly parallel representatives, a dependent is recorded
+    /// against the one its residual names. `e₁` and `a = e₁ + 1e-10·e₂` are resolved
+    /// independent. `3a` has cosine exactly 1 with both in floating point, and the
+    /// replaced cosine test took the first, `e₁`. The residual names `a`, with
+    /// coefficient 3.
+    #[test]
+    fn active_face_scans_name_the_representative_a_dependent_is_parallel_to_2469() {
+        let band = gam_math::roundoff::gram_schmidt_residual_band(
+            gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+            1,
+            3,
+            3.0,
+        );
+        let near = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0e-10, 0.0], [3.0, 3.0e-10, 0.0]];
+        for face in [dense_face_at_origin(near.clone()), cone_face_at_origin(near)] {
+            assert_eq!(face.representatives, rows(&[0, 1]));
+            assert!(
+                face.dependence[0].is_empty(),
+                "3a is not parallel to e₁: {:?}",
+                face.dependence
+            );
+            assert_eq!(face.dependence[1].len(), 1);
+            assert_eq!(face.dependence[1][0].row.index(), 2);
+            assert!((face.dependence[1][0].coeff - 3.0).abs() <= band);
+        }
     }
 
     /// Cross-block cone rows are automatically orthogonal (e_k ⊥ e_{k'}), so each

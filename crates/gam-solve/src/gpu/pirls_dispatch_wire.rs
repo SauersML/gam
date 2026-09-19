@@ -445,6 +445,7 @@ mod linux_impl {
                 let (sc, sd, sdmu, sd2, sd3) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &final_eta,
                     input.priorweights,
                 )?;
@@ -996,6 +997,7 @@ mod linux_impl {
                 let (c, d, dmu, d2mu, d3mu) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &eta_owned,
                     input.priorweights,
                 )
@@ -1071,7 +1073,8 @@ mod linux_impl {
 pub(crate) use linux_impl::{GpuGaussianPlsInput, GpuPirlsDispatchInput};
 #[cfg(target_os = "linux")]
 pub(crate) use linux_impl::{
-    try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
+    try_gpu_gaussian_pls_admit, try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit,
+    try_gpu_pirls_loop_dispatch,
 };
 
 #[cfg(test)]

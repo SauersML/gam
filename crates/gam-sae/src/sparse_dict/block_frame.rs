@@ -228,18 +228,32 @@ fn write_unit_columns(columns: ArrayView2<'_, f64>, mut rows: ArrayViewMut2<'_, 
 /// `current` stores U transposed (`b×P`), `directions` stores the search rows
 /// `[R, P]` (`2b×P`) the previous step left, and `action` holds `H·[U, R, P]`
 /// (`P×3b`) from this pass. The top-`b` Ritz vectors on `span[U, R, P]`, rotated
-/// into the gauge closest to U, go to `proposal`. The next search rows go to
+/// into the gauge closest to U, go to `proposal`, unless their stored projector lies
+/// within [`STORED_FRAME_RESOLUTION`] of U's, when U's stored bits stay and the
+/// tangent gradient becomes the next search row. The next search rows go to
 /// `next_directions`: the Ritz residual `HU' − U'(U'ᵀHU')` and the part of U
 /// outside `span U'`, each scaled to unit length. This is block LOBPCG whose
 /// residual is one pass behind, because `H·R` exists only once a pass has
 /// accumulated it. Returns the stationarity certificate of `tied_frame_tangent`,
 /// read at U, which does not depend on the step.
+///
+/// A block whose stationarity already meets `bar`, the fit's certificate bar, keeps its
+/// stored bits too, with its tangent gradient as the next search row. Its step cannot
+/// bring the certificate closer, since the block already passes it, but it shifts the
+/// conditional optimum of every block that shares its rows. On the Spark layer-18 fit
+/// 1021 of 1024 blocks sat below a 1e-4 bar (median 5.7e-7) while 89 to 517 blocks still
+/// moved per trial (lane job 1229606), and the largest residual above it fell only 0.17%
+/// per epoch. Moving only blocks above the bar certified the fit 8 epochs after the saved
+/// epoch-3360 state, against 530 epochs when every block moved (#2502, lane jobs 1255653
+/// and 1250595). A kept block's stationarity is read again every pass, so a block its
+/// neighbors push back above the bar moves again.
 pub(super) fn ritz_tied_frame_step(
     current: ArrayView2<'_, f32>,
     directions: ArrayView2<'_, f32>,
     action: ArrayView2<'_, f64>,
     code_second: ArrayView2<'_, f64>,
     normal_multiplier: f64,
+    bar: f64,
     mut proposal: ArrayViewMut2<'_, f32>,
     mut next_directions: ArrayViewMut2<'_, f32>,
 ) -> Result<f64, String> {
@@ -252,6 +266,11 @@ pub(super) fn ritz_tied_frame_step(
     }
     let (tangent, stationarity) =
         tied_frame_tangent(current, own_action, code_second, normal_multiplier)?;
+    if stationarity <= bar {
+        proposal.assign(&current);
+        write_unit_columns(tangent.view(), next_directions.slice_mut(s![..b, ..]));
+        return Ok(stationarity);
+    }
     // A zero search row has a zero action column and spans nothing.
     let searched: Vec<usize> = (0..directions.nrows())
         .filter(|&row| directions.row(row).iter().any(|&value| value != 0.0))
@@ -348,6 +367,17 @@ pub(super) fn ritz_tied_frame_step(
         for (entry, &value) in row.iter_mut().zip(column.iter()) {
             *entry = value as f32;
         }
+    }
+    // A proposal whose stored projector lies within the storage resolution of the
+    // stored frame is the same span rewritten at f32 rounding, not a step the stored
+    // rows resolve, and a paired trial would price only that rewrite. Keep the stored
+    // bits. On the Spark layer-18 fit the trials of epochs 2661-2672 rewrote 1013 to
+    // 1021 of the 1024 blocks (#2502, lane job 1196792); keeping the unresolved ones
+    // left 89 to 517 moved per trial (lane job 1229606).
+    if stored_projector_distance(current, proposal.view())? <= STORED_FRAME_RESOLUTION {
+        proposal.assign(&current);
+        write_unit_columns(tangent.view(), next_directions.slice_mut(s![..b, ..]));
+        return Ok(stationarity);
     }
     // The next search rows, read off this pass's H: the Ritz residual, and the
     // part of the stored frame outside the proposal's span.

@@ -521,8 +521,9 @@ pub(crate) fn dtm_weighted_distances(
     dtm_weighted_distances_and_radii(points, weights).0
 }
 
-/// The largest vertex count any simplex in this filtration has: a tetrahedron,
-/// which the `H₂` shell audit needs and nothing above it does.
+/// Structural (#2469): the largest vertex count any simplex in this filtration
+/// has, a tetrahedron, which the `H₂` shell audit needs and nothing above it
+/// does.
 const SIMPLEX_MAX_VERTS: usize = 4;
 
 /// Binomial coefficients `C(v, t)` for `t ≤ 4` over the vertex range, which is

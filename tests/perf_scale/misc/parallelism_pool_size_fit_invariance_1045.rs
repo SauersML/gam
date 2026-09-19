@@ -55,7 +55,7 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -109,11 +109,13 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("f_pc", centers)],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("ls_pc", centers)],
+        level: Default::default(),
     };
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -129,6 +131,8 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
         link_dev: None,
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }

@@ -151,7 +151,7 @@ pub(crate) fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64
 /// lazy operator against the dense `exact_newton_joint_hessian_from_designs`.
 /// This pins the production assembler's own row coefficients
 /// (`exact_newton_joint_hessian_row_coefficients`, the order-2 surface of
-/// `binomial_ls_row_program`, which writes the q-map `q = −η_t·e^{−η_ls}` in
+/// `binomial_ls_row`, which writes the q-map `q = −η_t·e^{−η_ls}` in
 /// local coordinates around the row) to the tower, which spells the row NLL
 /// separately in predictor coordinates. A wrong coefficient (a dropped `q m2`,
 /// a sign in the cross block — the #736 cross-term genus) would slip past both
@@ -2208,9 +2208,10 @@ pub(crate) fn simple_matern_term_collection(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 
@@ -2219,6 +2220,7 @@ pub(crate) fn empty_term_collection() -> TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -2772,6 +2774,8 @@ pub(crate) fn gaussian_location_scale_terms_reject_invalidweights_early() {
         Ok(_) => panic!("term API should reject negative weights"),
         Err(err) => err,
     };
+    assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
+    let err = err.to_string();
     assert!(err.contains("weights must be finite and non-negative"));
 }
 
@@ -2802,6 +2806,8 @@ pub(crate) fn binomial_location_scale_terms_reject_invalid_response_early() {
         Ok(_) => panic!("term API should reject invalid binomial responses"),
         Err(err) => err,
     };
+    assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
+    let err = err.to_string();
     assert!(err.contains("binomial response must be finite in [0,1]"));
 }
 
@@ -2828,6 +2834,8 @@ pub(crate) fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() 
         Ok(_) => panic!("Bernoulli free log_sigma terms must be rejected"),
         Err(err) => err,
     };
+    assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
+    let err = err.to_string();
     assert!(err.contains("identify only the composite q = -threshold / sigma"));
     assert!(err.contains("log_sigma must be intercept-only/fixed"));
 }
@@ -2855,6 +2863,8 @@ pub(crate) fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
         Ok(_) => panic!("term API should reject data/y row mismatches"),
         Err(err) => err,
     };
+    assert_eq!(err.category(), gam_problem::FailureCategory::Input, "{err}");
+    let err = err.to_string();
     assert!(err.contains("data row count must match response length"));
 }
 
@@ -4314,7 +4324,6 @@ pub(crate) fn gls_wiggle_workspace_fixture() -> (
         wiggle_knots: knots,
         wiggle_degree: 2,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
-        cached_row_scalars: std::sync::RwLock::new(None),
         jeffreys_armed: true,
     };
     // The wiggle block has dynamic geometry (q0-dependent basis): the

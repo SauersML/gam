@@ -186,8 +186,132 @@ struct Graph {
     derivatives: HashMap<(usize, usize), usize>,
 }
 
-type Polynomial = BTreeMap<Vec<usize>, f64>;
+type Polynomial = BTreeMap<Vec<usize>, Coefficient>;
 type RingPolynomial = BTreeMap<Vec<usize>, f64>;
+
+/// An exact rational coefficient of a normalized polynomial (#932). Every `f64`
+/// literal is a dyadic rational, and the normalizer only adds, multiplies and
+/// divides by constants, so it can hold every coefficient exactly: a
+/// cancellation that is zero in the mathematics is zero in the lowering, rather
+/// than an ulp-sized residue that keeps a dead term and its multiplies (the
+/// third derivative of the binomial location-scale row read the fourth loss
+/// derivative through `m4 * 1.3877787807814457e-16`). An operation whose exact
+/// result does not fit reports `None`, and that channel keeps its unnormalized
+/// form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Coefficient {
+    numerator: i128,
+    /// Positive and coprime to `numerator` (`0/1` is zero once normalized).
+    denominator: i128,
+}
+
+impl Default for Coefficient {
+    fn default() -> Self {
+        Self {
+            numerator: 0,
+            denominator: 1,
+        }
+    }
+}
+
+impl Coefficient {
+    const ONE: Self = Self {
+        numerator: 1,
+        denominator: 1,
+    };
+
+    fn new(numerator: i128, denominator: i128) -> Option<Self> {
+        if denominator == 0 {
+            return None;
+        }
+        let sign = if denominator < 0 { -1 } else { 1 };
+        let numerator = numerator.checked_mul(sign)?;
+        let denominator = denominator.checked_mul(sign)?;
+        let (mut a, mut b) = (numerator.unsigned_abs(), denominator.unsigned_abs());
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        let divisor = i128::try_from(a.max(1)).ok()?;
+        Some(Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        })
+    }
+
+    /// The exact value of a finite `f64`, `mantissa · 2^exponent`.
+    fn from_f64(value: f64) -> Option<Self> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value == 0.0 {
+            return Self::new(0, 1);
+        }
+        let bits = value.to_bits();
+        let sign = if bits >> 63 == 0 { 1 } else { -1 };
+        let biased = i32::try_from((bits >> 52) & 0x7ff).ok()?;
+        let fraction = i128::from(bits & ((1_u64 << 52) - 1));
+        let (mantissa, exponent) = if biased == 0 {
+            (fraction, -1074)
+        } else {
+            (fraction | (1_i128 << 52), biased - 1075)
+        };
+        if exponent >= 0 {
+            let shift = u32::try_from(exponent).ok()?;
+            if shift > 72 {
+                return None;
+            }
+            Self::new(sign * (mantissa << shift), 1)
+        } else {
+            let shift = u32::try_from(-exponent).ok()?;
+            if shift > 125 {
+                return None;
+            }
+            Self::new(sign * mantissa, 1_i128 << shift)
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.numerator == 0
+    }
+
+    fn neg(self) -> Self {
+        Self {
+            numerator: -self.numerator,
+            denominator: self.denominator,
+        }
+    }
+
+    fn add(self, other: Self) -> Option<Self> {
+        let numerator = self
+            .numerator
+            .checked_mul(other.denominator)?
+            .checked_add(other.numerator.checked_mul(self.denominator)?)?;
+        Self::new(numerator, self.denominator.checked_mul(other.denominator)?)
+    }
+
+    fn mul(self, other: Self) -> Option<Self> {
+        Self::new(
+            self.numerator.checked_mul(other.numerator)?,
+            self.denominator.checked_mul(other.denominator)?,
+        )
+    }
+
+    fn div(self, other: Self) -> Option<Self> {
+        if other.is_zero() {
+            return None;
+        }
+        Self::new(
+            self.numerator.checked_mul(other.denominator)?,
+            self.denominator.checked_mul(other.numerator)?,
+        )
+    }
+
+    /// The `f64` the lowering writes: exact for every coefficient whose
+    /// numerator and denominator fit a mantissa, one rounding otherwise.
+    fn to_f64(self) -> f64 {
+        self.numerator as f64 / self.denominator as f64
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ScaleDistribution {
@@ -715,9 +839,9 @@ impl Graph {
         let zero_exponents = || vec![0; parameter_count];
         let polynomial = match self.nodes[id].clone() {
             Node::Constant(bits) => {
-                let value = f64::from_bits(bits);
+                let value = Coefficient::from_f64(f64::from_bits(bits))?;
                 let mut polynomial = Polynomial::new();
-                if value != 0.0 {
+                if !value.is_zero() {
                     polynomial.insert(zero_exponents(), value);
                 }
                 Some(polynomial)
@@ -725,7 +849,7 @@ impl Graph {
             Node::Parameter(parameter) => {
                 let mut exponents = zero_exponents();
                 exponents[parameter] = 1;
-                Some([(exponents, 1.0)].into_iter().collect())
+                Some([(exponents, Coefficient::ONE)].into_iter().collect())
             }
             Node::Variable(_)
             | Node::Exp(_)
@@ -737,23 +861,20 @@ impl Graph {
                 .polynomial(value, parameter_count, memo)
                 .map(|mut value| {
                     for coefficient in value.values_mut() {
-                        *coefficient = -*coefficient;
+                        *coefficient = coefficient.neg();
                     }
                     value
                 }),
             Node::Add(left, right) | Node::Sub(left, right) => {
                 let mut left = self.polynomial(left, parameter_count, memo)?;
                 let right = self.polynomial(right, parameter_count, memo)?;
-                let sign = if matches!(self.nodes[id], Node::Add(_, _)) {
-                    1.0
-                } else {
-                    -1.0
-                };
+                let subtract = matches!(self.nodes[id], Node::Sub(_, _));
                 for (exponents, coefficient) in right {
                     let total = left.entry(exponents).or_default();
-                    *total += sign * coefficient;
+                    let term = if subtract { coefficient.neg() } else { coefficient };
+                    *total = total.add(term)?;
                 }
-                left.retain(|_, coefficient| *coefficient != 0.0);
+                left.retain(|_, coefficient| !coefficient.is_zero());
                 Some(left)
             }
             Node::Mul(left, right) => {
@@ -767,22 +888,22 @@ impl Graph {
                             .zip(right_exponents)
                             .map(|(left, right)| left + right)
                             .collect::<Vec<_>>();
-                        *product.entry(exponents).or_default() +=
-                            left_coefficient * right_coefficient;
+                        let total = product.entry(exponents).or_default();
+                        *total = total.add(left_coefficient.mul(*right_coefficient)?)?;
                     }
                 }
-                product.retain(|_, coefficient| *coefficient != 0.0);
+                product.retain(|_, coefficient| !coefficient.is_zero());
                 Some(product)
             }
             Node::Div(numerator, denominator) => {
                 let mut numerator = self.polynomial(numerator, parameter_count, memo)?;
                 let denominator = self.polynomial(denominator, parameter_count, memo)?;
                 let coefficient = denominator.get(&zero_exponents()).copied()?;
-                if denominator.len() != 1 || coefficient == 0.0 {
+                if denominator.len() != 1 || coefficient.is_zero() {
                     None
                 } else {
                     for value in numerator.values_mut() {
-                        *value /= coefficient;
+                        *value = value.div(coefficient)?;
                     }
                     Some(numerator)
                 }
@@ -807,7 +928,7 @@ impl Graph {
             return self.constant(0.0);
         }
         if variables.is_empty() {
-            return self.constant(*polynomial.values().next().expect("nonempty polynomial"));
+            return self.constant(polynomial.values().next().expect("nonempty polynomial").to_f64());
         }
         let variable = variables[0];
         let parameter = self.intern(Node::Parameter(variable));
@@ -922,10 +1043,9 @@ impl Graph {
                             else {
                                 continue;
                             };
-                            let scale = coefficient / leading_coefficient;
-                            if !scale.is_finite() {
+                            let Some(scale) = coefficient.div(*leading_coefficient) else {
                                 continue;
-                            }
+                            };
                             let mut remainder = polynomial.clone();
                             let mut exact_subset = true;
                             for (other_powers, other_coefficient) in other {
@@ -934,9 +1054,8 @@ impl Graph {
                                     .zip(&shift)
                                     .map(|(power, shift)| power + shift)
                                     .collect::<Vec<_>>();
-                                if remainder.get(&shifted).copied()
-                                    != Some(scale * other_coefficient)
-                                {
+                                let expected = scale.mul(*other_coefficient);
+                                if expected.is_none() || remainder.get(&shifted).copied() != expected {
                                     exact_subset = false;
                                     break;
                                 }
@@ -1049,7 +1168,8 @@ impl Graph {
                         })
                     })
                     .collect::<Vec<_>>();
-                let factor_polynomial = [(factor.clone(), 1.0)].into_iter().collect::<Polynomial>();
+                let factor_polynomial =
+                    [(factor.clone(), Coefficient::ONE)].into_iter().collect::<Polynomial>();
                 let mut order = (0..parameter_count).collect::<Vec<_>>();
                 loop {
                     let shared = self.polynomial_horner(&factor_polynomial, &order);
@@ -1145,6 +1265,24 @@ impl Graph {
             }
         }
         best.expect("at least the declaration order was tried").1
+    }
+
+    /// Distinct negations reachable from `roots`, each counted once, as
+    /// [`Graph::operation_count`] counts the other operations.
+    fn negation_count(&self, roots: &[usize]) -> usize {
+        let mut seen = HashSet::new();
+        let mut stack = roots.to_vec();
+        let mut negations = 0;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if matches!(self.nodes[id], Node::Neg(_)) {
+                negations += 1;
+            }
+            stack.extend(children(self, id));
+        }
+        negations
     }
 
     /// Distinct multiplies (and divisions) and distinct additions (and
@@ -1946,6 +2084,108 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+/// One term of a contracted surface: a derivative channel times one component
+/// of each direction, `T·u[a]·v[b]…`, with `axes[i]` indexing direction `i`.
+struct ContractedTerm {
+    channel: usize,
+    axes: Vec<usize>,
+}
+
+/// The sum `Σ T·u[a]·v[b]…` of each contracted entry, with the channels'
+/// signs moved onto the first direction where that takes fewer negations.
+///
+/// A negative channel is the node `Neg(T)`, one negation on each such
+/// channel's own chain. Reading `T·(−u[a])` instead costs one negation per
+/// axis `a` of the first direction, shared by every entry that reads it. The
+/// binomial location-scale third at zero has four negative channels over two
+/// axes. Raced against the hand schedule, a copy of its emitted schedule lost
+/// (`median_ratio` 0.957 and 0.965), and the same copy with the signs on the
+/// direction won (1.033 and 1.041; job 1273155, #932). The move is taken only
+/// when it strictly lowers the count of distinct negations the surface
+/// evaluates, so a surface without negative channels is emitted unchanged.
+///
+/// Returns the channel roots to schedule, the negated direction components
+/// to define ahead of the sums, and each entry's sum (`None` when every term
+/// of the entry is zero).
+fn contracted_sums(
+    graph: &Graph,
+    entries: &[Vec<ContractedTerm>],
+    directions: &[Ident],
+    primaries: &[Ident],
+    constants: &[Ident],
+) -> (Vec<usize>, Vec<TokenStream2>, Vec<Option<TokenStream2>>) {
+    let channels = entries
+        .iter()
+        .flatten()
+        .map(|term| term.channel)
+        .collect::<BTreeSet<_>>();
+    let unsigned = channels
+        .iter()
+        .filter_map(|&channel| match graph.nodes[channel] {
+            Node::Neg(value) => Some((channel, value)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let negated_axes = entries
+        .iter()
+        .flatten()
+        .filter(|term| unsigned.contains_key(&term.channel))
+        .map(|term| term.axes[0])
+        .collect::<BTreeSet<_>>();
+    let signed_roots = channels.iter().copied().collect::<Vec<_>>();
+    let unsigned_roots = channels
+        .iter()
+        .map(|channel| unsigned.get(channel).copied().unwrap_or(*channel))
+        .collect::<Vec<_>>();
+    let move_signs = graph.negation_count(&unsigned_roots) + negated_axes.len()
+        < graph.negation_count(&signed_roots);
+    let first = &directions[0];
+    let negated = |axis: usize| format_ident!("__row_atom_negated_{first}_{axis}");
+    let definitions = if move_signs {
+        negated_axes
+            .iter()
+            .map(|&axis| {
+                let name = negated(axis);
+                quote!(let #name = -#first[#axis];)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let sums = entries
+        .iter()
+        .map(|terms| {
+            let terms = terms
+                .iter()
+                .map(|term| {
+                    let axis = term.axes[0];
+                    let (channel, leading) = match unsigned.get(&term.channel) {
+                        Some(&value) if move_signs => {
+                            let name = negated(axis);
+                            (value, quote!(#name))
+                        }
+                        _ => (term.channel, quote!(#first[#axis])),
+                    };
+                    let reference = node_reference(channel, graph, primaries, constants);
+                    let rest = directions[1..]
+                        .iter()
+                        .zip(&term.axes[1..])
+                        .map(|(direction, axis)| quote!(* #direction[#axis]));
+                    quote!(#reference * #leading #(#rest)*)
+                })
+                .collect::<Vec<_>>();
+            let (head, tail) = terms.split_first()?;
+            Some(quote!(#head #(+ #tail)*))
+        })
+        .collect();
+    let roots = if move_signs {
+        unsigned_roots
+    } else {
+        signed_roots
+    };
+    (roots, definitions, sums)
+}
+
 fn schedule_definitions(
     roots: impl IntoIterator<Item = usize>,
     graph: &Graph,
@@ -1968,6 +2208,38 @@ fn constant_parameters(
                 quote!(#constant: bool)
             } else {
                 quote!(#constant: f64)
+            }
+        })
+        .collect()
+}
+
+/// The constant parameters of one emitted surface. A constant the surface's body
+/// never reads keeps its place in the signature as `_name`, so every surface of
+/// one atom takes the same arguments: once coefficients cancel exactly, a
+/// lower-order surface need not read a higher loss-stack entry at all (#932).
+fn surface_constant_parameters(
+    constants: &[Ident],
+    activity_constants: &HashSet<usize>,
+    body: &TokenStream2,
+) -> Vec<TokenStream2> {
+    let text = body.to_string();
+    constants
+        .iter()
+        .enumerate()
+        .map(|(index, constant)| {
+            let name = constant.to_string();
+            let read = text
+                .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .any(|token| token == name);
+            let parameter = if read {
+                constant.clone()
+            } else {
+                format_ident!("_{name}")
+            };
+            if activity_constants.contains(&index) {
+                quote!(#parameter: bool)
+            } else {
+                quote!(#parameter: f64)
             }
         })
         .collect()
@@ -2143,11 +2415,13 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 [#(#hessian_refs),*],
             )
         };
+        let surface_parameters =
+            surface_constant_parameters(&constants, &activity_constants, &body);
         output.push(quote! {
             #[inline(always)]
             #visibility fn #order2_name(
                 #primary_parameters
-                #(#constant_parameters),*
+                #(#surface_parameters),*
             ) -> ::gam_math::jet_scalar::StaticOrder2Atom<
                 #dimension,
                 #packed,
@@ -2198,30 +2472,40 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 *derivative = next.next().expect("one normalized channel per derivative");
             }
         }
-        let mut roots = Vec::new();
-        let mut assignments = Vec::new();
-        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        let mut cells = Vec::new();
+        let mut cell_terms = Vec::new();
         for (row, columns) in channels.iter().enumerate() {
             for (column, derivatives) in columns.iter().enumerate().skip(row) {
-                roots.extend(derivatives.iter().copied());
-                let terms = derivatives
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, id)| !graph.is_zero(**id))
-                    .map(|(axis, &id)| {
-                        let derivative = node_reference(id, &graph, &primaries, &constants);
-                        quote!(#derivative * direction[#axis])
-                    })
-                    .collect::<Vec<_>>();
-                let sum = match terms.split_first() {
-                    None => continue,
-                    Some((first, rest)) => quote!(#first #(+ #rest)*),
-                };
-                let temporary = format_ident!("__row_atom_third_{row}_{column}");
-                assignments.push(quote!(let #temporary = #sum;));
-                entries[row][column] = quote!(#temporary);
-                entries[column][row] = quote!(#temporary);
+                cells.push((row, column));
+                cell_terms.push(
+                    derivatives
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| !graph.is_zero(**id))
+                        .map(|(axis, &channel)| ContractedTerm {
+                            channel,
+                            axes: vec![axis],
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
+        }
+        let (roots, mut assignments, sums) = contracted_sums(
+            &graph,
+            &cell_terms,
+            &[format_ident!("direction")],
+            &primaries,
+            &constants,
+        );
+        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        for ((row, column), sum) in cells.into_iter().zip(sums) {
+            let Some(sum) = sum else {
+                continue;
+            };
+            let temporary = format_ident!("__row_atom_third_{row}_{column}");
+            assignments.push(quote!(let #temporary = #sum;));
+            entries[row][column] = quote!(#temporary);
+            entries[column][row] = quote!(#temporary);
         }
         let definitions = schedule_definitions(roots, &graph, &primaries, &constants)?;
         let primary_parameters = if at_zero {
@@ -2240,11 +2524,13 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             #(#assignments)*
             [#(#rows),*]
         };
+        let surface_parameters =
+            surface_constant_parameters(&constants, &activity_constants, &body);
         output.push(quote! {
             #[inline(always)]
             #visibility fn #third_name(
                 #primary_parameters
-                #(#constant_parameters,)*
+                #(#surface_parameters,)*
                 direction: &[f64; #dimension],
             ) -> [[f64; #dimension]; #dimension] {
                 #body
@@ -2303,36 +2589,46 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 *derivative = next.next().expect("one normalized channel per derivative");
             }
         }
-        let mut roots = Vec::new();
-        let mut assignments = Vec::new();
-        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        let mut cells = Vec::new();
+        let mut cell_terms = Vec::new();
+        let zero = |id: usize| graph.is_zero(id);
         for (row, columns) in channels.iter().enumerate() {
             for (column, derivatives) in columns.iter().enumerate().skip(row) {
-                roots.extend(derivatives.iter().flatten().copied());
-                let terms = derivatives
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(axis_u, derivatives)| {
-                        derivatives
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, id)| !graph.is_zero(**id))
-                            .map(|(axis_v, &id)| {
-                                let derivative = node_reference(id, &graph, &primaries, &constants);
-                                quote!(#derivative * direction_u[#axis_u] * direction_v[#axis_v])
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                let sum = match terms.split_first() {
-                    None => continue,
-                    Some((first, rest)) => quote!(#first #(+ #rest)*),
-                };
-                let temporary = format_ident!("__row_atom_fourth_{row}_{column}");
-                assignments.push(quote!(let #temporary = #sum;));
-                entries[row][column] = quote!(#temporary);
-                entries[column][row] = quote!(#temporary);
+                cells.push((row, column));
+                cell_terms.push(
+                    derivatives
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(axis_u, derivatives)| {
+                            derivatives
+                                .iter()
+                                .enumerate()
+                                .filter(move |(_, id)| !zero(**id))
+                                .map(move |(axis_v, &channel)| ContractedTerm {
+                                    channel,
+                                    axes: vec![axis_u, axis_v],
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
+        }
+        let (roots, mut assignments, sums) = contracted_sums(
+            &graph,
+            &cell_terms,
+            &[format_ident!("direction_u"), format_ident!("direction_v")],
+            &primaries,
+            &constants,
+        );
+        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        for ((row, column), sum) in cells.into_iter().zip(sums) {
+            let Some(sum) = sum else {
+                continue;
+            };
+            let temporary = format_ident!("__row_atom_fourth_{row}_{column}");
+            assignments.push(quote!(let #temporary = #sum;));
+            entries[row][column] = quote!(#temporary);
+            entries[column][row] = quote!(#temporary);
         }
         let definitions = schedule_definitions(roots, &graph, &primaries, &constants)?;
         let primary_parameters = if at_zero {
@@ -2351,11 +2647,13 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             #(#assignments)*
             [#(#rows),*]
         };
+        let surface_parameters =
+            surface_constant_parameters(&constants, &activity_constants, &body);
         output.push(quote! {
             #[inline(always)]
             #visibility fn #fourth_name(
                 #primary_parameters
-                #(#constant_parameters,)*
+                #(#surface_parameters,)*
                 direction_u: &[f64; #dimension],
                 direction_v: &[f64; #dimension],
             ) -> [[f64; #dimension]; #dimension] {
@@ -2434,46 +2732,51 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 *derivative = next.next().expect("one normalized channel per derivative");
             }
         }
-        let mut roots = Vec::new();
-        let mut assignments = Vec::new();
-        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        let mut cells = Vec::new();
+        let mut cell_terms = Vec::new();
+        let zero = |id: usize| graph.is_zero(id);
         for (row, columns) in channels.iter().enumerate() {
             for (column, derivatives) in columns.iter().enumerate().skip(row) {
-                roots.extend(derivatives.iter().flatten().flatten().copied());
-                let terms = derivatives
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(axis_u, by_v)| {
-                        by_v.iter()
-                            .enumerate()
-                            .flat_map(|(axis_v, by_w)| {
+                cells.push((row, column));
+                cell_terms.push(
+                    derivatives
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(axis_u, by_v)| {
+                            by_v.iter().enumerate().flat_map(move |(axis_v, by_w)| {
                                 by_w.iter()
                                     .enumerate()
-                                    .filter(|(_, id)| !graph.is_zero(**id))
-                                    .map(|(axis_w, &id)| {
-                                        let derivative =
-                                            node_reference(id, &graph, &primaries, &constants);
-                                        quote!(
-                                            #derivative
-                                                * direction_u[#axis_u]
-                                                * direction_v[#axis_v]
-                                                * direction_w[#axis_w]
-                                        )
+                                    .filter(move |(_, id)| !zero(**id))
+                                    .map(move |(axis_w, &channel)| ContractedTerm {
+                                        channel,
+                                        axes: vec![axis_u, axis_v, axis_w],
                                     })
-                                    .collect::<Vec<_>>()
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
-                let sum = match terms.split_first() {
-                    None => continue,
-                    Some((first, rest)) => quote!(#first #(+ #rest)*),
-                };
-                let temporary = format_ident!("__row_atom_fifth_{row}_{column}");
-                assignments.push(quote!(let #temporary = #sum;));
-                entries[row][column] = quote!(#temporary);
-                entries[column][row] = quote!(#temporary);
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
+        }
+        let (roots, mut assignments, sums) = contracted_sums(
+            &graph,
+            &cell_terms,
+            &[
+                format_ident!("direction_u"),
+                format_ident!("direction_v"),
+                format_ident!("direction_w"),
+            ],
+            &primaries,
+            &constants,
+        );
+        let mut entries = vec![vec![quote!(0.0); dimension]; dimension];
+        for ((row, column), sum) in cells.into_iter().zip(sums) {
+            let Some(sum) = sum else {
+                continue;
+            };
+            let temporary = format_ident!("__row_atom_fifth_{row}_{column}");
+            assignments.push(quote!(let #temporary = #sum;));
+            entries[row][column] = quote!(#temporary);
+            entries[column][row] = quote!(#temporary);
         }
         let definitions = schedule_definitions(roots, &graph, &primaries, &constants)?;
         let primary_parameters = if at_zero {
@@ -2487,11 +2790,13 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             #(#assignments)*
             [#(#rows),*]
         };
+        let surface_parameters =
+            surface_constant_parameters(&constants, &activity_constants, &body);
         output.push(quote! {
             #[inline(always)]
             #visibility fn #fifth_name(
                 #primary_parameters
-                #(#constant_parameters,)*
+                #(#surface_parameters,)*
                 direction_u: &[f64; #dimension],
                 direction_v: &[f64; #dimension],
                 direction_w: &[f64; #dimension],
@@ -2714,6 +3019,84 @@ mod row_atom_tests {
             error
                 .to_string()
                 .contains("explicitly typed `f64`, `scale`, or `bool`")
+        );
+    }
+
+    /// Polynomial coefficients are exact rationals (#932). The binomial
+    /// location-scale row composes its loss through its Taylor polynomial in
+    /// `D = q(δ) − q0`, and a third derivative at `δ = 0` cannot involve the
+    /// fourth loss derivative: the `D⁴` term's third derivative there is
+    /// `(72 − 48 − 24)/24 · r²·q0²·m4 = 0`. With `f64` coefficients that sum left
+    /// `m4 * 1.3877787807814457e-16`, so the lowering read `m4` and paid its
+    /// multiplies; exactly, the term is gone and `m4` is an unread parameter.
+    #[test]
+    fn at_zero_coefficients_cancel_exactly_932() {
+        let d = "((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)";
+        let source = format!(
+            "fn atom_binomial_ls [third_at_zero](
+                delta_eta_t, delta_eta_ls;
+                inv_sigma: f64, q0: f64, m1: f64, m2: f64, m3: f64, m4: f64, neg_ll: f64
+            ) {{
+                neg_ll + m1 * {d} + 0.5 * m2 * {d} * {d} + m3 / 6.0 * {d} * {d} * {d}
+                    + m4 / 24.0 * {d} * {d} * {d} * {d}
+            }}"
+        );
+        let input = syn::parse_str::<RowAtomInput>(&source).expect("binomial row atom");
+        let expanded = super::expand(input).expect("expand row atom").to_string();
+        let start = expanded
+            .find("fn atom_binomial_ls_third_contracted_at_zero")
+            .expect("the third at-zero lowering");
+        let body = &expanded[start..];
+        assert!(body.contains("_m4 : f64"), "m4 is an unread parameter:\n{body}");
+        assert!(
+            !body.contains("m4 *") && !body.contains("* m4"),
+            "no term reads m4:\n{body}"
+        );
+        assert!(!body.contains("e-16"), "no ulp-sized coefficient survives:\n{body}");
+    }
+
+    /// The binomial location-scale third at zero has four negative channels
+    /// over two axes, so its signs move onto the direction: two negations
+    /// instead of four, and no channel is negated. Its fourth has no negative
+    /// channel and reads both directions as given.
+    #[test]
+    fn contracted_signs_move_onto_the_direction_932() {
+        let d = "((q0 - delta_eta_t * inv_sigma) * exp(-delta_eta_ls) - q0)";
+        let source = format!(
+            "fn atom_binomial_ls [third_at_zero, fourth_at_zero](
+                delta_eta_t, delta_eta_ls;
+                inv_sigma: f64, q0: f64, m1: f64, m2: f64, m3: f64, m4: f64, neg_ll: f64
+            ) {{
+                neg_ll + m1 * {d} + 0.5 * m2 * {d} * {d} + m3 / 6.0 * {d} * {d} * {d}
+                    + m4 / 24.0 * {d} * {d} * {d} * {d}
+            }}"
+        );
+        let input = syn::parse_str::<RowAtomInput>(&source).expect("binomial row atom");
+        let expanded = super::expand(input).expect("expand row atom").to_string();
+        let third_start = expanded
+            .find("fn atom_binomial_ls_third_contracted_at_zero")
+            .expect("the third at-zero lowering");
+        let fourth_start = expanded
+            .find("fn atom_binomial_ls_fourth_contracted_at_zero")
+            .expect("the fourth at-zero lowering");
+        let (third, fourth) = if third_start < fourth_start {
+            (&expanded[third_start..fourth_start], &expanded[fourth_start..])
+        } else {
+            (&expanded[third_start..], &expanded[fourth_start..third_start])
+        };
+        for axis in 0..2 {
+            let negated =
+                format!("let __row_atom_negated_direction_{axis} = - direction [{axis}usize]");
+            assert_eq!(third.matches(&negated).count(), 1, "{negated} once:\n{third}");
+        }
+        assert_eq!(
+            third.matches("= - __row_atom").count(),
+            0,
+            "no channel is negated:\n{third}"
+        );
+        assert!(
+            !fourth.contains("negated"),
+            "the fourth reads its directions as given:\n{fourth}"
         );
     }
 }

@@ -22,4 +22,6 @@ use super::*;
 
 mod contracted;
 pub(crate) mod flex_jet;
+#[cfg(test)]
+mod law_node_tests;
 mod partition;

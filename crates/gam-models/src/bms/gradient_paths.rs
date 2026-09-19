@@ -77,7 +77,7 @@ pub(crate) fn standardize_latent_z_with_policy(
     if mean.abs() > mean_tol || (sd - 1.0).abs() > sd_tol {
         match policy.check_mode {
             LatentZCheckMode::Strict => return Err(check_msg()),
-            LatentZCheckMode::WarnOnly => log::warn!("{}", check_msg()),
+            LatentZCheckMode::WarnOnly => log::debug!("{}", check_msg()),
             LatentZCheckMode::Off => {}
         }
     }
@@ -130,12 +130,12 @@ pub(crate) fn standardize_latent_z_with_policy(
         );
         match policy.check_mode {
             LatentZCheckMode::Strict => return Err(msg),
-            LatentZCheckMode::WarnOnly => log::warn!("{}", msg),
+            LatentZCheckMode::WarnOnly => log::debug!("{}", msg),
             LatentZCheckMode::Off => {}
         }
     }
     if skew.abs() > 0.75 || kurt.abs() > 2.0 {
-        log::warn!(
+        log::debug!(
             "{context}: z has skewness={skew:.3} and excess kurtosis={kurt:.3}; latent-measure auto-selection will use empirical calibration unless stricter diagnostics pass"
         );
     }
@@ -580,17 +580,13 @@ pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
     Ok(&working_eta + &marg_contrib)
 }
 
-pub(super) fn joint_setup(
-    data: ArrayView2<'_, f64>,
-    marginalspec: &TermCollectionSpec,
-    slopespec: &TermCollectionSpec,
+/// The BMS exact-joint ρ seed in `[marginal | slope | extra]` penalty order.
+pub(super) fn joint_rho_seed(
     marginal_penalties: usize,
     slope_penalties: usize,
     absorber_rho0: Option<f64>,
     extra_rho0: &[f64],
-) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
-    let marginal_terms = spatial_length_scale_term_indices(marginalspec);
-    let slope_terms = spatial_length_scale_term_indices(slopespec);
+) -> Array1<f64> {
     let rho_dim = marginal_penalties + slope_penalties + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
     // The #461 influence-absorber ridge is the TRAILING marginal coordinate
@@ -606,6 +602,21 @@ pub(super) fn joint_setup(
     for (idx, &value) in extra_rho0.iter().enumerate() {
         rho0vec[marginal_penalties + slope_penalties + idx] = value;
     }
+    rho0vec
+}
+
+/// The BMS exact-joint setup: the ρ seed with the domain its caller derived over
+/// the realized blocks (#2812), and the marginal and slope κ geometry.
+pub(super) fn joint_setup(
+    data: ArrayView2<'_, f64>,
+    marginalspec: &TermCollectionSpec,
+    slopespec: &TermCollectionSpec,
+    rho0: Array1<f64>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
+) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
+    let marginal_terms = spatial_length_scale_term_indices(marginalspec);
+    let slope_terms = spatial_length_scale_term_indices(slopespec);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(marginalspec, &marginal_terms)
         .reseed_from_data(data, marginalspec, &marginal_terms)?;
     let slope_kappa = SpatialLogKappaCoords::from_length_scales_aniso(slopespec, &slope_terms)
@@ -645,7 +656,9 @@ pub(super) fn joint_setup(
     // outside the data-derived ψ window; seed was a hint, not a hard constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     Ok(ExactJointHyperSetup::new(
-        rho0vec,
+        rho0,
+        rho_lower,
+        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -3136,6 +3149,8 @@ mod flex_primary_hessian_oracle_tests {
 
         let family = BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
+            search: None,
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z.clone()),

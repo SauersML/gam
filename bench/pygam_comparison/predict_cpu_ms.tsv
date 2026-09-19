@@ -1,0 +1,13 @@
+family	n	design	gamfit_ms	pygam_ms
+gaussian	1e3	p1	4.3	1.5
+gaussian	1e4	p1	31	10
+gaussian	1e4	p5	41	37
+gaussian	1e4	te	35	23
+gaussian	1e5	p1	280	110
+gaussian	1e5	p5	410	580
+gaussian	1e6	p1	3650	4430
+binomial	1e3	p1	55	1.6
+binomial	1e3	p5	52	4.7
+binomial	1e4	p1	470	11.5
+poisson	1e3	p1	4.8	1.4
+poisson	1e4	p1	36	15

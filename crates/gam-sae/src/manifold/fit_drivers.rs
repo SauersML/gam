@@ -74,14 +74,44 @@ impl InnerGlobalizationHint {
     }
 }
 
-/// Why one bounded joint-fit chunk returned. Ordinary fits may use the two
-/// heuristic exits; evidence is certified only by [`Self::NoStrictDecrease`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why one bounded joint-fit chunk returned. A converged ordinary fit is
+/// certified by [`Self::Stationary`] or [`Self::NoStrictDecrease`]; evidence is
+/// certified only by [`Self::NoStrictDecrease`]. The ordinary fit's other exits
+/// certify nothing (#2899).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum JointFitTermination {
     Frozen,
-    Heuristic,
+    /// The raw-chart or quotient gradient norm reached the KKT tolerance.
+    Stationary {
+        grad_norm: f64,
+        quotient_grad_norm: f64,
+        tol: f64,
+    },
+    /// The pre-step objective was not finite.
+    NonFinitePreStep,
+    /// The documented objective-stall approximation, reached after the
+    /// gauge-orbit block recovered nothing: small strict decreases, not a KKT
+    /// certificate.
+    ObjectiveStall,
+    /// The proximal correction errored and the pre-step state was restored.
+    ProximalCorrectionFailed,
     NoStrictDecrease,
     IterationGrantExhausted,
+}
+
+impl JointFitTermination {
+    /// Whether this exit certifies a converged fit: stationarity, or no strict
+    /// decrease left. The match names every exit, so a new one must be decided here.
+    pub(crate) fn certifies_convergence(self) -> bool {
+        match self {
+            Self::Stationary { .. } | Self::NoStrictDecrease => true,
+            Self::Frozen
+            | Self::NonFinitePreStep
+            | Self::ObjectiveStall
+            | Self::ProximalCorrectionFailed
+            | Self::IterationGrantExhausted => false,
+        }
+    }
 }
 
 pub(crate) struct JointFitOutcome {
@@ -1103,7 +1133,6 @@ impl SaeManifoldTerm {
         }
         let transport = solve_basis_transport(new_phi.view(), old_phi.view())?;
         let old_decoder = self.atoms[atom_idx].decoder_coefficients().clone();
-        let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
         let new_decoder = fast_ab(&transport, &old_decoder);
         let (image_scale, max_abs) = image_invariance_extremes(
             old_phi.view(),
@@ -1116,28 +1145,15 @@ impl SaeManifoldTerm {
             return Ok(());
         }
 
-        // ∂S/∂κ is a Gram on the same basis, so it moves by the same congruence.
-        let transported_kappa_derivative = self.atoms[atom_idx]
-            .smooth_penalty_kappa_derivative()?
-            .map(|derivative| {
-                transport_smooth_penalty_for_decoder(transport.view(), derivative.view())
-            })
-            .transpose()?;
         let flat = Array1::from_iter(new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         let base: Arc<dyn SaeBasisEvaluator> = new_evaluator.clone();
         atom.basis_evaluator = Some(base);
         atom.basis_second_jet = Some(new_evaluator);
-        let transported_penalty =
-            transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
-        atom.install_reparameterized_basis(
-            new_phi,
-            new_jet,
-            new_decoder,
-            transported_penalty,
-            transported_kappa_derivative,
-        )?;
+        // S, ∂S/∂κ and the geometry plan all move by the transport's congruence, so
+        // a trial κ after this gauge rebuilds S(κ) in the new chart (#2935, #2947).
+        atom.install_chart_transport(new_phi, new_jet, new_decoder, transport.view())?;
         Ok(())
     }
 
@@ -1378,7 +1394,7 @@ impl SaeManifoldTerm {
         let loao_ev = self
             .per_atom_loao_explained_variance(target, rho)
             .unwrap_or_else(|err| {
-                log::warn!("[#1026] per-atom LOAO EV unavailable: {err}");
+                log::debug!("[#1026] per-atom LOAO EV unavailable: {err}");
                 vec![None; self.k_atoms()]
             });
         for atom_idx in 0..self.k_atoms() {
@@ -1404,7 +1420,7 @@ impl SaeManifoldTerm {
                 atom.decoder_coefficients().view(),
                 row_coords,
             ) {
-                Ok(Some(theta)) => log::info!(
+                Ok(Some(theta)) => log::debug!(
                     "[#1026] atom '{}' fitted turning Θ = {theta:.6e} rad, \
                      training LOAO ΔEV = {dev} \
                      (∫κ ds; 0 = linear-tail direction, 2π = full curved loop; \
@@ -1412,13 +1428,13 @@ impl SaeManifoldTerm {
                      genuine curved family — the hybrid-vs-shatter signal)",
                     atom.name
                 ),
-                Ok(None) => log::info!(
+                Ok(None) => log::debug!(
                     "[#1026] atom '{}' fitted turning unavailable, training LOAO ΔEV = {dev} \
                      (no analytic second jet or degenerate curve)",
                     atom.name
                 ),
                 Err(err) => {
-                    log::warn!("[#1026] atom '{}' fitted turning errored: {err}", atom.name)
+                    log::debug!("[#1026] atom '{}' fitted turning errored: {err}", atom.name)
                 }
             }
         }
@@ -1436,7 +1452,7 @@ impl SaeManifoldTerm {
         match self.compute_hybrid_split_report(rho, Some(target)) {
             Ok(report) => {
                 if let Some(report) = &report {
-                    log::info!(
+                    log::debug!(
                         "[#1026] hybrid split: {} curved / {} linear atoms (Σ NLE = {:.6e})",
                         report.selection.curved_atom_count,
                         report.selection.linear_atom_count(),
@@ -1446,7 +1462,7 @@ impl SaeManifoldTerm {
                 self.hybrid_split_report = report;
             }
             Err(err) => {
-                log::warn!("[#1026] hybrid split report unavailable: {err}");
+                log::debug!("[#1026] hybrid split report unavailable: {err}");
                 self.hybrid_split_report = None;
             }
         }
@@ -3311,7 +3327,7 @@ impl SaeManifoldTerm {
             // `[SAE/inner]` trace. After an accepted Newton step this is the only
             // assembly before the post-step hooks, so it separates what the step
             // did to ‖g‖ from what the re-gauge hooks do.
-            log::debug!(
+            log::trace!(
                 "SAE gauge-orbit descent: round {} entry ‖g_row‖={:.6e} ‖g_logit‖={:.6e} \
                  ‖g_β‖={:.6e} ‖Π_V g‖={projected_norm:.6e} (span dim {})",
                 outcome.rounds + 1,
@@ -3444,7 +3460,7 @@ impl SaeManifoldTerm {
             outcome.rounds += 1;
             outcome.objective_decrease += decrease;
             outcome.exit_objective = Some(committed_objective);
-            log::debug!(
+            log::trace!(
                 "SAE gauge-orbit descent: round {} committed {decrease:.6e} at α={best_alpha:.6e} \
                  (objective {base_objective:.9e} → {committed_objective:.9e}, span dim {}, \
                  maxᵢ|gᵀvᵢ|={:.6e}, floor {material_floor:.6e})",
@@ -4117,7 +4133,7 @@ impl SaeManifoldTerm {
                         SAE_FINAL_EV_DEGRADATION_TOL,
                     ) {
                         self.restore_mutable_state(&best_state)?;
-                        log::warn!(
+                        log::debug!(
                             "SaeManifoldTerm: dictionary co-collapse multi-start budget spent; \
                              restoring best basin (EV={best_ev:.4}) over last reseed (EV={ev:.4})"
                         );
@@ -4144,7 +4160,7 @@ impl SaeManifoldTerm {
                 return Ok(());
             }
             self.dictionary_cocollapse_reseeds += 1;
-            log::warn!(
+            log::debug!(
                 "SaeManifoldTerm: dictionary co-collapse ({collapse_arm}; EV telemetry={ev:.4}, \
                  max gated-signal upper bound={max_signal_upper_bound:.3e}, residual scale \
                  upper bound={residual_scale_upper:.3e}, residual roundoff floor=\
@@ -4426,7 +4442,7 @@ impl SaeManifoldTerm {
             };
         // #2023 acceptance: every reseed names its source in the log, so a fit's
         // log shows directly that no principal component seeded a collapsed atom.
-        log::info!(
+        log::debug!(
             "SaeManifoldTerm: reseeding {} collapsed atom(s) {atoms:?} from the residual's \
              {source} (retry {retry}); no principal component is read",
             atoms.len()
@@ -5107,7 +5123,7 @@ impl SaeManifoldTerm {
             return Ok(());
         }
         self.structural_cocollapse_reseeds += 1;
-        log::warn!(
+        log::debug!(
             "SaeManifoldTerm: structural coherence collapse — reseeding {} duplicate-output \
              atom(s) from the residual (structural multi-start \
              {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET})",
@@ -6201,6 +6217,44 @@ impl SaeManifoldTerm {
         .map(|outcome| outcome.loss)
     }
 
+    /// The joint fit as a converged solve, for a caller that scores or returns the
+    /// state it fitted. It runs the ordinary termination policy and returns the
+    /// loss only from an exit that certifies convergence
+    /// ([`JointFitTermination::certifies_convergence`]). It refuses every other
+    /// exit: the uncertified ordinary exits, the zero-iteration freeze and an
+    /// exhausted window. [`Self::run_joint_fit_arrow_schur`] reports the loss of
+    /// whatever state the window ended at.
+    pub(crate) fn run_joint_fit_arrow_schur_to_convergence(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        let outcome = self.run_joint_fit_arrow_schur_with_termination_policy(
+            target,
+            rho,
+            analytic_penalties,
+            max_iter,
+            step_size,
+            ridge_ext_coord,
+            ridge_beta,
+            true,
+        )?;
+        if outcome.termination.certifies_convergence() {
+            return Ok(outcome.loss);
+        }
+        Err(format!(
+            "SaeManifoldTerm::run_joint_fit_arrow_schur_to_convergence: the joint fit's \
+             {max_iter}-iteration window ended at {:?}, which certifies no convergence, so its \
+             state is not a converged fit",
+            outcome.termination
+        ))
+    }
+
     /// Evidence-gradient inner polish. The ordinary fit accepts the documented
     /// coarse KKT band immediately; a Laplace value paired with an implicit
     /// derivative cannot do that, because the resulting warm-start map is flat
@@ -6242,7 +6296,13 @@ impl SaeManifoldTerm {
             ridge_beta,
             false,
         )?;
-        if matches!(outcome.termination, JointFitTermination::Heuristic) {
+        if matches!(
+            outcome.termination,
+            JointFitTermination::Stationary { .. }
+                | JointFitTermination::NonFinitePreStep
+                | JointFitTermination::ObjectiveStall
+                | JointFitTermination::ProximalCorrectionFailed
+        ) {
             return Err(
                 "SaeManifoldTerm::run_joint_fit_arrow_schur_for_quasi_laplace: heuristic \
                  termination escaped the evidence policy"
@@ -7010,7 +7070,7 @@ impl SaeManifoldTerm {
             // pass in this crate declines to nest (`rayon::current_thread_index()
             // .is_none()`), so a criterion evaluated from inside the pool runs
             // its passes serially — the `cpu=1.5/128` shape of #2731.
-            log::info!(
+            log::debug!(
                 "[SAE/inner] setup before the first iteration: {:.2}s (max_iter={max_iter}) \
                  phases:{setup_report} entry_sweep={:.2}s in_rayon_worker={} \
                  rayon_threads={}",
@@ -7058,69 +7118,7 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?
                 .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            let mut solve_options = plan
-                .solve_options_for_border_dim(sys.k)
-                .with_gpu_policy(self.gpu_policy);
-            // #2228 — gauge-fix the inner Newton STEP on the reduced β border.
-            //
-            // The closed-form chart gauge (circle/torus phase, patch
-            // translation+scale) is an exact reconstruction symmetry whose β
-            // component is a null direction of the reduced β-Schur `S_β`. Left
-            // un-deflated, the dense Direct/SqrtBA step solves an exactly-singular
-            // `S_β`, so the orbit component of Δβ is arbitrary: it drifts the state
-            // along the orbit (walking `t` off the circle over the outer ρ-walk,
-            // fit_drivers.rs' second-root note) and starves the identifiable
-            // descent, so the fit crawls at ~0.997 contraction and eventually
-            // reports a non-stationary plateau (#2228 repro A / #2253). Installing
-            // the closed-form gauge as an [`ArrowBetaGaugeQuotient`] makes the dense
-            // step solve the Faddeev–Popov quotient `P S_β P + Q Qᵀ`, projecting Δβ
-            // onto the identifiable complement. The criterion evaluation and the
-            // outer-ρ gradient assemble their own systems and are untouched, and
-            // the loss/criterion are gauge-invariant, so this only changes the
-            // convergence path, converging to a gauge-fixed representative.
-            //
-            // Installed on the dense Direct/SqrtBA modes AND the wide-`p`
-            // InexactPCG lane: the matrix-free reduced-Schur matvec applies the
-            // same Faddeev–Popov pin `P S_β P + Q Qᵀ` (`ReducedSchurOperator`), and
-            // the CPU `steihaug_pcg_auto` lane projects the RHS onto the
-            // identifiable complement. The device `solve_sae_matrix_free_pcg`
-            // kernel does NOT yet apply the pin, so it is gated off to the CPU path
-            // whenever a quotient is present (a follow-up will project in-kernel).
-            //
-            // #2267 — that null holds only where every term is invariant along the
-            // generator, so only those generators are declared
-            // (`closed_form_beta_gauge_directions`). Where a prior moves the orbit,
-            // the step takes the direction with its real slope and curvature.
-            if sys.k > 0
-                && matches!(
-                    solve_options.mode,
-                    ArrowSolverMode::Direct | ArrowSolverMode::SqrtBA | ArrowSolverMode::InexactPCG
-                )
-            {
-                match self.closed_form_beta_gauge_directions(rho, analytic_penalties) {
-                    Ok(dirs) if !dirs.is_empty() => {
-                        let quotient = ArrowBetaGaugeQuotient::new(dirs).map_err(|err| {
-                            format!(
-                                "SaeManifoldTerm::run_joint_fit_arrow_schur: invalid closed-form \
-                                 beta-gauge quotient: {err}"
-                            )
-                        })?;
-                        sys.set_beta_gauge_quotient(quotient).map_err(|err| {
-                            format!(
-                                "SaeManifoldTerm::run_joint_fit_arrow_schur: closed-form \
-                                 beta-gauge quotient does not match the assembled border: {err}"
-                            )
-                        })?;
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        return Err(format!(
-                            "SaeManifoldTerm::run_joint_fit_arrow_schur: closed-form gauge \
-                             directions: {err}"
-                        ));
-                    }
-                }
-            }
+            let mut solve_options = plan.solve_options().with_gpu_policy(self.gpu_policy);
             // #1017 allocation residency across ACCEPTED nonlinear iterates.
             // The retained handle owns device allocations only; `prepare_*`
             // overwrites every ridge-independent operand from this freshly
@@ -7328,7 +7326,11 @@ impl SaeManifoldTerm {
             if allow_heuristic_termination
                 && (grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance)
             {
-                termination = JointFitTermination::Heuristic;
+                termination = JointFitTermination::Stationary {
+                    grad_norm,
+                    quotient_grad_norm,
+                    tol: grad_tolerance,
+                };
                 self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
@@ -7384,7 +7386,7 @@ impl SaeManifoldTerm {
                 }
             }
             if quotient_step_norm <= step_tolerance {
-                log::debug!(
+                log::trace!(
                     "SAE inner quotient step {:.3e} <= tol {:.3e} with non-stationary gradient \
                      raw={:.3e}, quotient={:.3e}; continuing after quotient trust-region gate",
                     quotient_step_norm,
@@ -7427,7 +7429,7 @@ impl SaeManifoldTerm {
                             .to_string(),
                     );
                 }
-                termination = JointFitTermination::Heuristic;
+                termination = JointFitTermination::NonFinitePreStep;
                 break;
             }
             // #2100/#1117 ordinary-fit objective-stagnation shortcut (see the
@@ -7497,7 +7499,7 @@ impl SaeManifoldTerm {
                             moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
                             consecutive_objective_stalls = 0;
                             previous_full_iterate_objective = f64::NAN;
-                            log::debug!(
+                            log::trace!(
                                 "run_joint_fit_arrow_schur: gauge-orbit descent recovered \
                                  {:.6e} over {} round(s) at the objective-stall shortcut, \
                                  iteration {outer_iteration} (span dim {}, \
@@ -7516,7 +7518,7 @@ impl SaeManifoldTerm {
                         // pre-step state is unperturbed (the snapshot was taken
                         // from it, and a descent that commits nothing restores
                         // it), so no restore is needed.
-                        termination = JointFitTermination::Heuristic;
+                        termination = JointFitTermination::ObjectiveStall;
                         self.reclaim_arrow_assembly_workspace(&mut sys);
                         break;
                     }
@@ -7634,7 +7636,7 @@ impl SaeManifoldTerm {
             }
             let logit_step_norm = logit_step_norm_sq.sqrt();
             let beta_step_norm = delta_beta.dot(&delta_beta).sqrt();
-            log::info!(
+            log::debug!(
                 "[SAE/inner] it={outer_iteration} ‖g‖={grad_norm:.6e} \
                  ‖Π⊥g‖={quotient_grad_norm:.6e} ‖g_row‖={row_grad_norm:.6e} \
                  ‖g_logit‖={logit_grad_norm:.6e} ‖g_β‖={beta_grad_norm:.6e} \
@@ -7770,7 +7772,7 @@ impl SaeManifoldTerm {
                 ) {
                     Ok(step) => step,
                     Err(err) => {
-                        log::debug!(
+                        log::trace!(
                             "run_joint_fit_arrow_schur: proximal correction errored at \
                              iteration {outer_iteration} (gᵀΔ={directional_decrease:.3e}, \
                              floor={directional_decrease_floor:.3e}, \
@@ -7785,7 +7787,7 @@ impl SaeManifoldTerm {
                                  proximal correction failed before a no-descent certificate: {err}"
                             ));
                         }
-                        termination = JointFitTermination::Heuristic;
+                        termination = JointFitTermination::ProximalCorrectionFailed;
                         break;
                     }
                 };
@@ -7802,7 +7804,7 @@ impl SaeManifoldTerm {
                     && pre_step_total - accepted_step.trial_objective_value
                         > proximal_material_floor)
                 {
-                    log::debug!(
+                    log::trace!(
                         "run_joint_fit_arrow_schur: proximal correction made no decrease at \
                          iteration {outer_iteration} (trial={:.9e}, pre={pre_step_total:.9e}, \
                          ‖g‖={:.3e})",
@@ -7853,7 +7855,7 @@ impl SaeManifoldTerm {
                     if orbit.moved() {
                         state_moved = true;
                         moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
-                        log::debug!(
+                        log::trace!(
                             "run_joint_fit_arrow_schur: gauge-orbit descent recovered \
                              {:.6e} over {} round(s) at iteration {outer_iteration} \
                              (span dim {}, maxᵢ|gᵀvᵢ|={:.6e}, {} objective evaluations) \
@@ -7895,7 +7897,7 @@ impl SaeManifoldTerm {
                 if orbit.moved() {
                     state_moved = true;
                     moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
-                    log::debug!(
+                    log::trace!(
                         "run_joint_fit_arrow_schur: paired gauge block recovered {:.6e} over \
                          {} round(s) after accepted iteration {outer_iteration}",
                         orbit.objective_decrease,
@@ -8114,7 +8116,7 @@ impl SaeManifoldTerm {
             // #2228 — whether the re-gauge triple moved the state it leaves for the
             // next iterate, and how many unit-speed charts it retracted before the
             // objective guard ruled.
-            log::debug!(
+            log::trace!(
                 "[SAE/inner] it={outer_iteration} re-gauge hook kept={regauge_kept} \
                  unit_speed_atoms={}",
                 unit_speed_atoms.get(),
@@ -8169,7 +8171,7 @@ impl SaeManifoldTerm {
                 tail_report.push_str(&format!(" {name}={:.2}s", at - previous_mark));
                 previous_mark = *at;
             }
-            log::info!(
+            log::debug!(
                 "[SAE/inner-tail] it={outer_iteration}{tail_report} iteration_total={:.2}s",
                 iteration_started.elapsed().as_secs_f64(),
             );
@@ -8205,7 +8207,7 @@ impl SaeManifoldTerm {
                 let final_ev = self
                     .dictionary_reconstruction_ev(target, rho)
                     .unwrap_or(f64::NAN);
-                log::warn!(
+                log::debug!(
                     "[#1026] restoring inner-fit incumbent: final penalized objective \
                      {final_obj:.6e} degraded past banked {best_reconstruction_obj:.6e} \
                      (EV {final_ev:.4} vs banked {best_reconstruction_ev:.4}) — \
@@ -8326,7 +8328,7 @@ impl SaeManifoldTerm {
             let warranty_tol = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(warranty_obj.abs()));
             if !(final_obj <= warranty_obj + warranty_tol) {
-                log::warn!(
+                log::debug!(
                     "[#2228] exit warranty: final penalized objective {final_obj:.6e} degraded \
                      past the best accepted boundary {warranty_obj:.6e}; restoring the banked \
                      state (non-monotone boundary-mover damage leaked to the exit)"
@@ -8525,7 +8527,7 @@ impl SaeManifoldTerm {
                     report.push_str(&format!(" {name}={:.2}s", at - previous));
                     previous = *at;
                 }
-                log::info!(
+                log::debug!(
                     "[SAE/entry-sweep] round={sweep_round} value={} best={best_objective:.10e} \
                      total={:.2}s phases:{report}",
                     match &round {
@@ -8801,7 +8803,7 @@ impl SaeManifoldTerm {
             }
             if rank < m {
                 let dropped = m - rank;
-                log::info!(
+                log::debug!(
                     "[SAE-AUDIT] decoder atom '{}' weighted design is rank-deficient \
                      (rank={rank}/{m}, {dropped} weakly-identified column(s), n={n_total}); the \
                      Arrow-Schur ridge will regularise the deficient directions{}",
@@ -9212,6 +9214,40 @@ mod projection_policy_tests {
     use crate::basis::{AmbientSphereHarmonicEvaluator, SaeBasisEvaluator};
     use ndarray::array;
     use std::sync::Arc;
+
+    /// #2899 — only stationarity and no strict decrease certify a joint fit. The
+    /// objective-stall approximation, a non-finite pre-step objective, a failed
+    /// proximal correction, the freeze and an exhausted window certify nothing.
+    #[test]
+    fn only_stationarity_and_no_strict_decrease_certify_a_joint_fit_2899() {
+        let cases = [
+            (JointFitTermination::Frozen, false),
+            (
+                JointFitTermination::Stationary {
+                    grad_norm: 1.0e-9,
+                    quotient_grad_norm: 2.0e-9,
+                    tol: 1.0e-8,
+                },
+                true,
+            ),
+            (JointFitTermination::NonFinitePreStep, false),
+            (JointFitTermination::ObjectiveStall, false),
+            (JointFitTermination::ProximalCorrectionFailed, false),
+            (JointFitTermination::NoStrictDecrease, true),
+            (JointFitTermination::IterationGrantExhausted, false),
+        ];
+        for (exit, certifies) in cases {
+            // A new exit fails to compile here until it is listed in `cases`.
+            let (JointFitTermination::Frozen
+            | JointFitTermination::Stationary { .. }
+            | JointFitTermination::NonFinitePreStep
+            | JointFitTermination::ObjectiveStall
+            | JointFitTermination::ProximalCorrectionFailed
+            | JointFitTermination::NoStrictDecrease
+            | JointFitTermination::IterationGrantExhausted) = exit;
+            assert_eq!(exit.certifies_convergence(), certifies, "{exit:?}");
+        }
+    }
 
     #[test]
     fn multivariate_compact_projection_skips_without_mutation() {

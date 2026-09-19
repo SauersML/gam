@@ -458,144 +458,6 @@ pub(crate) fn custom_family_joint_jeffreys_term_with_exact_completion<
     Ok(Some((phi, gradient, hphi, completion)))
 }
 
-pub(crate) const JEFFREYS_REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
-
-pub(crate) const JEFFREYS_REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
-
-pub(crate) const JEFFREYS_CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
-
-pub(crate) const JEFFREYS_CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
-
-pub(crate) const JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR: f64 = 16.0;
-
-pub(crate) const JEFFREYS_CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
-
-#[inline]
-pub(crate) fn custom_family_jeffreys_cap(floor: f64) -> f64 {
-    JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR.max(floor)
-}
-
-#[inline]
-pub(crate) fn custom_family_jeffreys_floored_inverse(lam: f64, floor: f64) -> f64 {
-    let cap = custom_family_jeffreys_cap(floor);
-    if lam >= cap {
-        cap / (lam * lam)
-    } else if lam >= floor {
-        1.0 / lam
-    } else if lam >= 0.0 {
-        1.0 / floor
-    } else {
-        let denom = floor - lam;
-        floor / (denom * denom)
-    }
-}
-
-#[inline]
-pub(crate) fn custom_family_jeffreys_conditioning_gate_weight(
-    lambda_min: f64,
-    lambda_max: f64,
-) -> f64 {
-    if !(lambda_max > 0.0) {
-        return 1.0;
-    }
-    #[inline]
-    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
-        if x <= under {
-            return 1.0;
-        }
-        if x >= clear {
-            return 0.0;
-        }
-        let t = (x - under) / (clear - under);
-        1.0 - t * t * (3.0 - 2.0 * t)
-    }
-    // The same floor-collapse factor as gam-solve's `conditioning_gate_weight`: once the
-    // relative floor crosses the absolute gate band the log window is empty and the term
-    // is ramped off, so the completion's contract weight gates exactly as the value does
-    // (gam#2765).
-    let floor_collapse = ramp_down(
-        JEFFREYS_REDUCED_INFO_RELATIVE_FLOOR * lambda_max,
-        JEFFREYS_CONDITIONING_GATE_ABSOLUTE,
-        JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    if !lambda_min.is_finite() {
-        return floor_collapse;
-    }
-    let w_abs = ramp_down(
-        lambda_min,
-        JEFFREYS_CONDITIONING_GATE_ABSOLUTE,
-        JEFFREYS_CONDITIONING_GATE_ABSOLUTE_CLEAR,
-    );
-    let ratio = (lambda_min / lambda_max).max(f64::MIN_POSITIVE);
-    let w_rel = ramp_down(
-        ratio.log10(),
-        JEFFREYS_CONDITIONING_GATE_RELATIVE.log10(),
-        JEFFREYS_CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
-    );
-    w_abs.max(w_rel) * floor_collapse
-}
-
-pub(crate) fn custom_family_joint_jeffreys_contract_weight(
-    h_joint: ndarray::ArrayView2<'_, f64>,
-    z_joint: ndarray::ArrayView2<'_, f64>,
-) -> Result<Option<(f64, Array2<f64>)>, CustomFamilyError> {
-    let p = h_joint.nrows();
-    if h_joint.ncols() != p {
-        return Err(CustomFamilyError::trial_point(format!(
-            "custom_family_joint_jeffreys_contract_weight: H must be square, got {}x{}",
-            h_joint.nrows(),
-            h_joint.ncols()
-        )));
-    }
-    if z_joint.nrows() != p {
-        return Err(CustomFamilyError::trial_point(format!(
-            "custom_family_joint_jeffreys_contract_weight: Z_J has {} rows, expected {p}",
-            z_joint.nrows()
-        )));
-    }
-    let m = z_joint.ncols();
-    if m == 0 {
-        return Ok(None);
-    }
-
-    let hz = h_joint.dot(&z_joint);
-    let h_id = z_joint.t().dot(&hz);
-    let mut h_id_sym = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        for j in 0..m {
-            h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
-        }
-    }
-    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!(
-            "custom_family_joint_jeffreys_contract_weight: reduced-information eigendecomposition failed: {e}"
-        )
-    })?;
-    let lambda_max = evals.iter().copied().fold(0.0_f64, f64::max);
-    let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
-    let gate_weight = custom_family_jeffreys_conditioning_gate_weight(lambda_min, lambda_max);
-    if gate_weight == 0.0 {
-        return Ok(None);
-    }
-    let floor = (JEFFREYS_REDUCED_INFO_RELATIVE_FLOOR * lambda_max)
-        .max(JEFFREYS_REDUCED_INFO_ABSOLUTE_FLOOR);
-    let mut k_reduced = Array2::<f64>::zeros((m, m));
-    for eig in 0..m {
-        let weight = custom_family_jeffreys_floored_inverse(evals[eig], floor);
-        if weight == 0.0 {
-            continue;
-        }
-        for row in 0..m {
-            let wr = weight * evecs[[row, eig]];
-            for col in 0..m {
-                k_reduced[[row, col]] += wr * evecs[[col, eig]];
-            }
-        }
-    }
-    let weight_full = z_joint.dot(&k_reduced).dot(&z_joint.t());
-    Ok(Some((gate_weight, weight_full)))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JeffreysCompletionAssembly {
     /// Use only the family's fused contracted-trace implementation. This is the
@@ -622,15 +484,22 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     assembly: JeffreysCompletionAssembly,
 ) -> Result<Option<Array2<f64>>, CustomFamilyError> {
     let p = h_joint.nrows();
-    let Some((gate_weight, trace_weight)) =
-        custom_family_joint_jeffreys_contract_weight(h_joint.view(), z_joint.view())?
-    else {
+    // The one reduced-information spectrum (gam-solve's plan) gives the gate, the trace
+    // weight `Z_J K Z_Jᵀ` and the gate/floor motion below, so the completion gates and
+    // floors exactly as the value does.
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+        h_joint.view(),
+        z_joint.view(),
+    )?;
+    if !plan.is_active() {
         return if assembly == JeffreysCompletionAssembly::Exact {
             Ok(Some(Array2::zeros((p, p))))
         } else {
             Ok(None)
         };
-    };
+    }
+    let gate_weight = plan.conditioning_gate_weight();
+    let trace_weight = plan.contracted_trace_weight();
     // Gate and floor motion (gam#1082). `−½·G·⟨Z_J K Z_Jᵀ, H''⟩` is the whole
     // second-directional remainder of `−∇²Φ` only while the conditioning gate is
     // saturated and no eigenvalue feels the relative floor move. Inside the
@@ -645,10 +514,6 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
     let motion = if assembly == JeffreysCompletionAssembly::Exact
         || family.joint_jeffreys_information_contracted_trace_hessian_available()
     {
-        let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
-            h_joint.view(),
-            z_joint.view(),
-        )?;
         if plan.hessian_motion_active() {
             // A family that forms the rotated rows hands them over, and no `p × p` axis
             // matrix is built (#1082).
@@ -1506,6 +1371,10 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
         response_scale: 1.0,
         completion_first,
         completion_second,
+        // The assembly that installs the mode response knows whether its operator carries a
+        // completion (gam#2765).
+        completion_present: false,
+        completion_derivatives_supplied: family.jeffreys_third_information_derivative().is_some(),
     }))
 }
 

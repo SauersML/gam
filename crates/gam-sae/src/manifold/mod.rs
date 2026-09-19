@@ -110,7 +110,7 @@ use ndarray::{
 
 use std::sync::Arc;
 
-pub(crate) use gam_solve::arrow_schur::{ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp, CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction, solve_with_lm_escalation_inner};
+pub(crate) use gam_solve::arrow_schur::{ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction, solve_with_lm_escalation_inner};
 
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
@@ -177,6 +177,7 @@ mod certificate;
 mod chart_atlas;
 mod chart_degeneracy;
 mod chart_gauges;
+mod compact_orbit;
 mod construction;
 mod construction_ard;
 mod construction_arrow_schur_assembly;
@@ -267,6 +268,9 @@ mod tests_penalty_pseudodeterminant_2933;
 
 #[cfg(test)]
 mod tests_kappa_outer_gradient_2935;
+
+#[cfg(test)]
+mod tests_kappa_gauge_transport_2935;
 
 #[cfg(test)]
 mod tests_parallelism_invariance_1557;
@@ -505,6 +509,9 @@ mod tests_crosscoder_olmo;
 mod tests_stall_diagnostic_2234;
 
 #[cfg(test)]
+mod tests_compact_orbit_2234;
+
+#[cfg(test)]
 mod tests_barrier_curvature_2731;
 
 #[cfg(test)]
@@ -516,11 +523,6 @@ mod tests_gauge_frame_roundtrip_2720;
 /// `|gᵀvᵢ|` scalar every prior measurement reports cannot.
 #[cfg(test)]
 mod tests_gauge_posterior_flatness_2720;
-
-/// #2267 — the joint fit's declared chart-gauge quotient must be a null of every
-/// penalized-objective term, swept per kind with coordinate ARD off and on.
-#[cfg(test)]
-mod tests_chart_gauge_structural_null_2267;
 
 /// #2267 — a dense outer evaluation decomposes its state's exact observed information once,
 /// and the block it hands its derivative prices what a fresh decomposition prices.
@@ -616,6 +618,10 @@ pub(crate) use construction::{
     BundleEvidenceGeometry, DenseExactAGeometry, EvidenceOperator,
     FittedResponseDivergenceEstimator,
 };
+// #2234 — the arrow orbit lane's elimination, which its streaming evaluation hands the gradient,
+// and the typed reason a `SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute` carries.
+pub(crate) use construction::{ArrowOrbitGeometry, StreamingOuterEvidence};
+pub use construction::{ArrowOrbitCertificate, ArrowOrbitRefusal};
 
 pub use crate::inference::atlas_nerve::AtlasCoveringSide;
 pub use atlas_topology::*;

@@ -49,17 +49,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub mod asymptote_certificate;
 mod bridges;
 mod capability;
+mod decrement_bands;
 #[cfg(test)]
 #[path = "rho_optimizer/efs_fallback_routing_tests.rs"]
 mod efs_fallback_routing_tests;
 mod hessian_operator;
+#[cfg(test)]
+#[path = "rho_optimizer/logdet_forward_error_1b_tests.rs"]
+mod logdet_forward_error_1b_tests;
+mod newton_polish;
 mod objective;
+mod outer_measurement;
+mod rail;
 pub mod rail_face;
 #[cfg(test)]
 #[path = "rho_optimizer/rail_projection_tests.rs"]
 mod rail_projection_tests;
 mod run;
 mod run_plan;
+mod saddle_escape_latch;
 mod seed_screening;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
@@ -73,6 +81,7 @@ pub use capability::*;
 pub use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 pub(crate) use hessian_operator::*;
 pub use objective::*;
+pub(crate) use rail::*;
 pub(crate) use run::*;
 // Re-export the outer-problem driver at `pub` (not just `pub(crate)`) so the
 // gam-pyffi crate can construct it directly for the SAE joint-fit FFI path.
@@ -80,7 +89,8 @@ pub use run::OuterProblem;
 // Re-export the outer-loop result struct at `pub` (the blanket `run` re-export
 // above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
-pub use run::{CertifiedOuterResult, OuterResult, OuterResultOrigin};
+pub use outer_measurement::OuterFirstOrderMeasurement;
+pub use run::{CertifiedOuterResult, MultistartOutcome, OuterResult, OuterResultOrigin};
 // Re-export the converged-via certificate vocabulary (#2235/#2241) so callers
 // that thread the termination verdict into their own payloads (gam-sae's
 // SaeOuterTermination) can name the variants.

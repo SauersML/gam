@@ -61,7 +61,6 @@ use gam_terms::smooth::penalty_priors::realize_keyed_penalty_block_gamma_priors;
 
 use gam_terms::smooth::shape_constraints::{
     linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
-    shape_lower_bounds_local,
 };
 
 // Every `pub` item that `gam_terms::smooth` exposes (the `term_specs.rs`
@@ -163,6 +162,9 @@ include!("smooth_term_lr.rs");
 // as the LR test above: a self-contained inference subsystem over the driver's
 // fit, kept out of the driver file for the same reason.
 include!("basis_adequacy.rs");
+// The per-term random-effect variance-component test. Reads the same retained
+// IRLS row state as the basis-adequacy report above.
+include!("random_effect_test.rs");
 
 #[cfg(test)]
 mod test_support {
@@ -266,3 +268,8 @@ include!("constant_curvature_kappa_jet_fd_tests.rs");
 // criterion is correct on the one cell where the truth's range IS the auto
 // heuristic's — the cell the acceptance fixture happens to use.
 include!("constant_curvature_kappa_box_probe_tests.rs");
+
+// #2953: the n-block exact-joint design cache keeps a realizer's trial refusal
+// typed, so the outer search retreats from it instead of aborting the fit.
+// Self-contained `#[cfg(test)] mod`.
+include!("n_block_realization_refusal_2953_tests.rs");

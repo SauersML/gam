@@ -641,8 +641,8 @@ fn build_duchon_basis_uncached(
         frozen_radial_reparam = Some(v.clone());
     }
     let (design, identifiability_transform) = if use_lazy {
-        // log::info! — deliberate memory-saving choice, not an anomaly.
-        log::info!(
+        // log::debug! — deliberate memory-saving choice, not an anomaly.
+        log::debug!(
             "Duchon basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             base_cols,
@@ -1005,6 +1005,47 @@ pub fn duchon_penalties_at_length_scale(
     length_scale: Option<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    let filtered = duchon_penalty_set_at_length_scale(
+        centers,
+        identifiability_transform,
+        operator_collocation_points,
+        operator_penalties,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        radial_reparam,
+        length_scale,
+        workspace,
+    )?;
+    Ok((
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect(),
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.nullity)
+            .collect(),
+    ))
+}
+
+/// The filtered Duchon penalty set [`duchon_penalties_at_length_scale`] reads its
+/// blocks from: the cold build's candidates and filter, from frozen geometry, in
+/// the chart `identifiability_transform` names.
+pub(crate) fn duchon_penalty_set_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    operator_collocation_points: Option<ArrayView2<'_, f64>>,
+    operator_penalties: &DuchonOperatorPenaltySpec,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    radial_reparam: Option<&Array2<f64>>,
+    length_scale: Option<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<FilteredPenalties, BasisError> {
     // Recompute the effective order + auto-seeded anisotropy exactly as the cold
     // build does (duchon_thinplate.rs:151/159). Both are pure functions of the
     // frozen centers + spec, so the κ trial replays the SAME structural choices.
@@ -1048,19 +1089,7 @@ pub fn duchon_penalties_at_length_scale(
             workspace,
         )?);
     }
-    let filtered = filter_penalty_candidates(candidates)?;
-    Ok((
-        filtered
-            .active
-            .iter()
-            .map(|penalty| penalty.matrix.clone())
-            .collect(),
-        filtered
-            .active
-            .iter()
-            .map(|penalty| penalty.nullity)
-            .collect(),
-    ))
+    filter_penalty_candidates(candidates)
 }
 
 /// Materialise the polynomial null-space block for a Duchon basis.
@@ -2155,7 +2184,7 @@ fn select_thin_plate_knot_rows(
         );
     }
     if selected.len() < num_knots {
-        log::warn!(
+        log::debug!(
             "[thin-plate] requested {num_knots} distinct knots but the data contain only {} \
              geometrically distinct selectable points; reducing the basis to {} knots",
             selected.len(),
@@ -3415,17 +3444,15 @@ pub(crate) fn compute_greville_abscissae(
 /// # Arguments
 /// * `knot_vector` - Full knot vector
 /// * `degree` - B-spline degree
-/// * `penalty_order` - Order of difference penalty (typically 2)
 ///
 /// # Returns
-/// Tuple of (transform Z, projected_penalty Z'SZ) where:
-/// - Z: k × (k-2) matrix mapping raw coefficients to constrained space
-/// - S_constrained: (k-2) × (k-2) projected second-difference penalty
+/// The k × (k-2) transform Z mapping constrained coefficients to raw ones.
+/// No penalty is formed here: callers restrict the basis's own function-space
+/// roughness candidates through Z (`restrict_penalty_candidates`).
 pub(crate) fn compute_geometric_constraint_transform(
     knot_vector: &Array1<f64>,
     degree: usize,
-    penalty_order: usize,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+) -> Result<Array2<f64>, BasisError> {
     // 1. Compute Greville abscissae
     let g = compute_greville_abscissae(knot_vector, degree)?;
     let k = g.len();
@@ -3478,14 +3505,7 @@ pub(crate) fn compute_geometric_constraint_transform(
         });
     }
 
-    // 5. Build raw penalty and project: S_c = Z' S Z
-    let s_raw = create_difference_penalty_matrix(k, penalty_order, Some(g.view()))?;
-    let s_constrained = {
-        let zt_s = fast_atb(&z, &s_raw);
-        fast_ab(&zt_s, &z)
-    };
-
-    Ok((z, s_constrained))
+    Ok(z)
 }
 
 /// Result of auto-deriving a clamped B-spline knot vector from 1-D data.
@@ -4436,5 +4456,3 @@ mod range_floor_psi_jet_tests {
 #[cfg(test)]
 mod sum_to_zero_sparse_projector_idempotence_tests;
 
-#[cfg(test)]
-mod owed_bughunt_splines_tests;

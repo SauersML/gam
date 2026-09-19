@@ -261,6 +261,10 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
         .as_ref()
         .map(|inf| inf.edf_total)
         .expect("gam reports total edf");
+    // The transformation-normal fit is ONE coefficient block, the response basis
+    // crossed with the covariate design, so `edf_total` spends the response
+    // transformation's degrees of freedom as well as the age smooth's.
+    let coefficient_count: usize = tn.fit.blocks.iter().map(|block| block.beta.len()).sum();
 
     // ---- age grid for the conditional-mean / smooth-effect comparison -------
     // Grid resolution for the conditional-mean / truth-recovery comparison.
@@ -431,7 +435,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
     let corr = pearson(&gam_effect, &tram_effect);
     eprintln!(
         "tram smooth transformation: n={n} grid={grid_n} \
-         gam_edf={gam_edf:.3} (df_ns={tram_spline_df}) \
+         gam_edf={gam_edf:.3} (p={coefficient_count}, df_ns={tram_spline_df}) \
          gam_recovery_rmse={gam_recovery_rmse:.4} tram_recovery_rmse={tram_recovery_rmse:.4} \
          [context only] rel_l2(E[Y|age])={rel:.4} pearson(gamma)={corr:.4}"
     );
@@ -465,10 +469,15 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
         "gam is less accurate than the tram baseline at recovering the truth: \
          RMSE(gam)={gam_recovery_rmse:.4} > 1.10 * RMSE(tram)={tram_recovery_rmse:.4}"
     );
-    // Sanity (NOT a peer match): gam's penalized effective df must sit in the sane
-    // open range for an k=8 smooth — more than a line, fewer than the basis rank.
+    // Sanity (NOT a peer match): gam's penalized effective df must sit in the open
+    // range more than a line, fewer than the fitted block's coefficients. The block
+    // is the response basis crossed with the covariate design, not the age margin
+    // alone, so its total is not bounded by the margin's k = 8. Measured at
+    // 137b3d5e29 (#1561, MSI job 1264140): p = 80, and 80 minus the five penalties'
+    // traces (3.347, 2.001, 0.001, 0.060, 63.938) = 10.653 = edf_total.
     assert!(
-        gam_edf > 1.0 && gam_edf < 8.0,
-        "gam edf {gam_edf:.3} outside the sane (1, k=8) range for this smooth"
+        gam_edf > 1.0 && gam_edf < coefficient_count as f64,
+        "gam edf {gam_edf:.3} outside the sane (1, p={coefficient_count}) range for \
+         the response-by-covariate transformation block"
     );
 }

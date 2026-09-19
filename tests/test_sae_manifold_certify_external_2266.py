@@ -7,7 +7,7 @@ torch-trained artifact available at test-authoring time, so this test uses an
 honest replay: fit a tiny model NATIVELY first (so its decoder, coordinates,
 routing logits, and regularization state are genuinely converged, not
 fabricated), then feed those
-exact arrays back into ``gamfit.sae_manifold_certify_external`` as if they had
+exact arrays back into ``gamfit.sae.sae_manifold_certify_external`` as if they had
 arrived from an external (e.g. torch) trainer, and check the certify path
 reproduces the SAME pinned contract the Rust test checks:
 
@@ -35,9 +35,9 @@ def _fit_circle(n: int = 200, noise: float = 0.15, seed: int = 0, n_iter: int = 
     t = rng.uniform(0.0, 1.0, n)
     clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)])
     x = clean + noise * rng.standard_normal((n, 2))
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
-        isometry_weight=0.0, ard_per_atom=True, sparsity_weight=0.01,
+        isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=n_iter, learning_rate=1.0, random_state=seed,
     )
     return fit, x
@@ -69,7 +69,7 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
     log_lambda_sparse = float(fit.selected_log_lambda_sparse)
     assert fit.tier0_scale is not None, "the native fit must expose its Tier-0 scale"
 
-    report = gamfit.sae_manifold_certify_external(
+    report = gamfit.sae.sae_manifold_certify_external(
         X=x,
         geometry_plans=geometry_plans,
         decoder_blocks=decoder_blocks,
@@ -141,7 +141,7 @@ def test_certify_external_returns_typed_nonfit_for_perturbed_state():
     assert fit.tier0_scale is not None, "the native fit must expose its Tier-0 scale"
     decoder_blocks = [np.asarray(block, dtype=float).copy() for block in fit.decoder_blocks]
     decoder_blocks[0].flat[0] += 0.25
-    report = gamfit.sae_manifold_certify_external(
+    report = gamfit.sae.sae_manifold_certify_external(
         X=x,
         geometry_plans=list(fit.geometry_plans),
         decoder_blocks=decoder_blocks,
@@ -181,7 +181,7 @@ def test_certify_external_requires_matching_per_atom_metadata_lengths():
     a_init = np.asarray(fit.low_level_logits, dtype=float)
 
     with pytest.raises(ValueError):
-        gamfit.sae_manifold_certify_external(
+        gamfit.sae.sae_manifold_certify_external(
             X=x,
             # Two geometry plans, one decoder block: a deliberate
             # per-atom-metadata length mismatch that must be a clean error,

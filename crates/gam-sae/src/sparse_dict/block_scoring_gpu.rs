@@ -22,15 +22,16 @@
 //! # Coding on the device (#2826)
 //!
 //! A pass also needs each row's codes: the support admitted from its shortlist by
-//! descent in the tied loss, and the γ-free projections of the admitted blocks
+//! descent in the tied loss, and the γ-free span coordinates of the admitted blocks
 //! (`super::block::code_row`). On the host that coder re-reads every shortlisted
 //! atom and, in every admission round, dots the running reconstruction against
 //! each remaining candidate: `O(k²·b·P)` f64 work per row, done after the device
 //! has already finished its route and sits idle. [`route_and_code_blocks`] runs
 //! the same coder on the device instead (`sparse_dict_block_code`, below), right
-//! after the fold, reading the resident rows, decoder and shortlists. Only the
-//! admitted blocks, their gates and their projections (`m × k × b`) are
-//! downloaded. The kernel performs the host coder's operations in the same order
+//! after the fold, reading the resident rows, decoder and shortlists and the host's
+//! per-block inverse Grams (`n_blocks × b × b`). Only the admitted blocks, their gates
+//! and their span coordinates (`m × k × b`) are downloaded. The kernel performs the
+//! host coder's operations in the same order
 //! with separately rounded f64 arithmetic, so its codes equal the host coder's on
 //! the same shortlists to the bit ([`code_block_shortlists_cpu`] is that oracle).
 //!
@@ -60,6 +61,7 @@ use ndarray::{Array2, Array3, ArrayView1, ArrayView2};
 
 use super::block::{
     RowBlockCode, block_gates, block_projections_row, code_routed_rows, route_row_blocks,
+    stored_spans,
 };
 
 /// Which path produced a block route. Returned by the fail-loud entry point so
@@ -115,17 +117,18 @@ void sparse_dict_block_gate(
 
 /// The device block coder. One thread per row repeats `super::block::code_row` on
 /// that row's resident shortlist: the orphan decision of
-/// `super::block::code_routed_rows`, the γ-free candidate coordinates
-/// `w_h = U_h x`, then support admission by descent in the tied loss, where round
+/// `super::block::code_routed_rows`, the γ-free candidate inner products
+/// `s_h = U_h x` and span coordinates `w_h = (U_hU_hᵀ)⁻¹s_h` from the host's
+/// inverse Grams, then support admission by descent in the tied loss, where round
 /// one is unconditional and every later round admits the candidate with the most
-/// negative `ΔL_h(S) = −(2γ−γ²) c_h + 2γ² (m · y_h)`, stopping when none lowers
-/// the loss. Every accumulation runs in the host coder's order with separately
-/// rounded f64 operations (the shared NVRTC options pin `--fmad=false`), so the
-/// admitted blocks, their gates and their projections equal the host coder's to
-/// the bit.
+/// negative `ΔL_h(S) = −(2γ−γ²) c_h + 2γ² (m · y_h)`, `c_h = s_h·w_h`, stopping when
+/// none lowers the loss. Every accumulation runs in the host coder's order with
+/// separately rounded f64 operations (the shared NVRTC options pin `--fmad=false`),
+/// so the admitted blocks, their gates and their span coordinates equal the host
+/// coder's to the bit.
 ///
 /// The kernel is appended to the score/fold source, so it shares that source's
-/// `PP` and `EMPTY_TOP_ATOM` definitions. `candidates`, `coordinates` and
+/// `PP` and `EMPTY_TOP_ATOM` definitions. `candidates`, `inner`, `coordinates` and
 /// `reconstruction` are per-row scratch; `counts[row]` is the number of admitted
 /// blocks, and output slots past it are left zero for the host to pad.
 #[cfg(target_os = "linux")]
@@ -134,6 +137,7 @@ extern "C" __global__
 void sparse_dict_block_code(
     const float* __restrict__ rows,               // [n_rows * PP] row-major
     const float* __restrict__ decoder,            // [(n_blocks*b) * PP] row-major
+    const double* __restrict__ inverse_grams,     // [n_blocks * b * b] row-major per block
     const unsigned int* __restrict__ top_blocks,  // [n_rows * active] (gate desc, block asc)
     const float* __restrict__ top_gates,          // [n_rows * active]
     int n_rows,
@@ -143,6 +147,7 @@ void sparse_dict_block_code(
     float gamma,
     float projection_roundoff,
     int* __restrict__ candidates,                 // [n_rows * active] scratch
+    double* __restrict__ inner,                   // [n_rows * active * b] scratch
     double* __restrict__ coordinates,             // [n_rows * active * b] scratch
     double* __restrict__ reconstruction,          // [n_rows * PP] scratch
     int* __restrict__ counts,                     // [n_rows]
@@ -180,7 +185,17 @@ void sparse_dict_block_code(
       for (int c = 0; c < PP; ++c) {
         projection = projection + (double)rows[x0 + c] * (double)decoder[a0 + c];
       }
-      coordinates[w0 + r] = projection;
+      inner[w0 + r] = projection;
+    }
+    // Span coordinates w = (UU')^-1 s, each entry summed in ascending order.
+    const long long g0 = (long long)block * (long long)b * (long long)b;
+    for (int r = 0; r < b; ++r) {
+      double value = 0.0;
+      for (int i = 0; i < b; ++i) {
+        value = value + inverse_grams[g0 + (long long)r * (long long)b + (long long)i]
+                            * inner[w0 + i];
+      }
+      coordinates[w0 + r] = value;
     }
     candidates[s0 + n_candidates] = j;
     ++n_candidates;
@@ -204,7 +219,7 @@ void sparse_dict_block_code(
       double overlap = 0.0;
       for (int r = 0; r < b; ++r) {
         const double coordinate = coordinates[w0 + r];
-        own = own + coordinate * coordinate;
+        own = own + inner[w0 + r] * coordinate;
         const long long a0 = ((long long)block * (long long)b + (long long)r) * (long long)PP;
         double projected = 0.0;
         for (int c = 0; c < PP; ++c) {
@@ -285,10 +300,10 @@ pub fn route_blocks_cpu(
 /// CPU oracle for the block coder: code each row's given `(block, gate)`
 /// shortlist exactly as a CPU-routed pass does, packed to width `k` as
 /// `(blocks[m,k], gates[m,k], projections[m,k,b])`. Each row lists its admitted
-/// blocks in admission order with their routed gates and γ-free projections,
+/// blocks in admission order with their routed gates and γ-free span coordinates,
 /// padded with block 0 and zeros. On the device's own shortlists the device
-/// coder (`route_and_code_blocks`) must reproduce it to the bit.
-#[must_use]
+/// coder (`route_and_code_blocks`) must reproduce it to the bit. A non-finite stored
+/// frame is refused by name.
 pub fn code_block_shortlists_cpu(
     rows: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -296,17 +311,18 @@ pub fn code_block_shortlists_cpu(
     b: usize,
     k: usize,
     shortlists: Vec<Vec<(u32, f32)>>,
-) -> (Array2<u32>, Array2<f32>, Array3<f64>) {
+) -> Result<(Array2<u32>, Array2<f32>, Array3<f64>), String> {
     assert_eq!(
         shortlists.len(),
         rows.nrows(),
         "code_block_shortlists_cpu needs one shortlist per row"
     );
-    pack_row_codes(
-        &code_routed_rows(rows, decoder, gamma, b, k, shortlists),
+    let inverse_grams = stored_spans(decoder, b)?.inverse_grams;
+    Ok(pack_row_codes(
+        &code_routed_rows(rows, decoder, &inverse_grams, gamma, b, k, shortlists),
         k,
         b,
-    )
+    ))
 }
 
 /// Fixed-width `(blocks, gates, projections)` arrays from per-row codes, each
@@ -509,10 +525,12 @@ pub fn route_blocks_required(
 /// Route and code one minibatch under `mode`, returning each row's codes padded
 /// to width `k`. A device route codes on the device ([`BLOCK_CODE_KERNEL_SOURCE`]);
 /// a CPU route codes on the host (`super::block::code_routed_rows`).
+/// `inverse_grams` is `super::block::stored_spans` of `decoder`, `.inverse_grams`.
 #[cfg(target_os = "linux")]
 pub(super) fn route_and_code_blocks(
     rows: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    inverse_grams: &[f64],
     gamma: f32,
     b: usize,
     k: usize,
@@ -524,7 +542,7 @@ pub(super) fn route_and_code_blocks(
         BlockRouteAdmission::Cpu => {
             let routed = cpu_block_route(rows, decoder, g, b, active);
             Ok((
-                code_routed_rows(rows, decoder, gamma, b, k, routed),
+                code_routed_rows(rows, decoder, inverse_grams, gamma, b, k, routed),
                 BlockRoutePath::Cpu,
             ))
         }
@@ -532,6 +550,7 @@ pub(super) fn route_and_code_blocks(
             let codes = device::route_and_code_blocks_device(
                 rows,
                 decoder,
+                inverse_grams,
                 gamma,
                 b,
                 g,
@@ -557,7 +576,10 @@ pub fn route_and_code_blocks_required(
     k: usize,
     mode: gam_gpu::GpuPolicy,
 ) -> Result<((Array2<u32>, Array2<f32>, Array3<f64>), BlockRoutePath), gam_gpu::GpuError> {
-    let (codes, path) = route_and_code_blocks(rows, decoder, gamma, b, k, mode)?;
+    let inverse_grams = stored_spans(decoder, b)
+        .map_err(|error| gam_gpu::gpu_err!("block-code decoder: {error}"))?
+        .inverse_grams;
+    let (codes, path) = route_and_code_blocks(rows, decoder, &inverse_grams, gamma, b, k, mode)?;
     Ok((pack_row_codes(&codes, k, b), path))
 }
 
@@ -776,7 +798,7 @@ mod device {
         // terminal synchronize, as a single unattributed block with no telemetry
         // for the whole high-`G` route. Synchronise on a cadence derived from the
         // tile count so the async backlog is bounded and each fault is attributed
-        // to its tile window; the heartbeat is `log::debug!` so an ordinary
+        // to its tile window; the heartbeat is `log::trace!` so an ordinary
         // (info-level) per-minibatch run is not flooded.
         let tile_count = n_blocks.div_ceil(tile_blocks.max(1));
         let checkpoint_stride = tile_count
@@ -880,7 +902,7 @@ mod device {
                         "sparse_dict block-gate route progress checkpoint (tiles {checkpoint_lo}..{tiles_done} of {tile_count}, blocks 0..{g0} of {n_blocks}): {err}"
                     )
                 })?;
-                log::debug!(
+                log::trace!(
                     "[SAE block route] tiles {tiles_done}/{tile_count} blocks {g0}/{n_blocks} \
                      elapsed {:.2}s",
                     route_started.elapsed().as_secs_f64(),
@@ -954,12 +976,14 @@ mod device {
 
     /// Route a whole minibatch on the device ([`route_resident`]), then code every
     /// row there with [`super::BLOCK_CODE_KERNEL_SOURCE`] against the resident rows,
-    /// decoder and shortlists. Only each row's admitted blocks, gates and γ-free
-    /// projections are downloaded; the host forms the γ-scaled codes and pads to
-    /// width `k` exactly as `super::super::block::code_row` does.
+    /// decoder and shortlists and the uploaded inverse Grams. Only each row's
+    /// admitted blocks, gates and γ-free span coordinates are downloaded; the host
+    /// forms the γ-scaled codes and pads to width `k` exactly as
+    /// `super::super::block::code_row` does.
     pub(super) fn route_and_code_blocks_device(
         rows: ArrayView2<'_, f32>,
         decoder: ArrayView2<'_, f32>,
+        inverse_grams: &[f64],
         gamma: f32,
         b: usize,
         n_blocks: usize,
@@ -967,10 +991,19 @@ mod device {
         k: usize,
         tile_blocks: usize,
     ) -> Result<Vec<RowBlockCode>, GpuError> {
+        // The kernel reads block g's inverse Gram at [g·b², (g+1)·b²).
+        if inverse_grams.len() != n_blocks * b * b {
+            return Err(gam_gpu::gpu_err!(
+                "block-code inverse Grams have {} entries, expected n_blocks*b*b = {}",
+                inverse_grams.len(),
+                n_blocks * b * b
+            ));
+        }
         let Some(route) = route_resident(rows, decoder, b, n_blocks, active, tile_blocks)? else {
             return Ok(code_routed_rows(
                 rows,
                 decoder,
+                inverse_grams,
                 gamma,
                 b,
                 k,
@@ -1006,9 +1039,15 @@ mod device {
             .checked_mul(b)
             .ok_or_else(|| gam_gpu::gpu_err!("block-code m*active*b overflows usize"))?;
 
+        let inverse_grams_dev = stream
+            .clone_htod(inverse_grams)
+            .gpu_ctx("sparse_dict block-code htod inverse Grams")?;
         let mut candidates_dev = stream
             .alloc_zeros::<i32>(slots)
             .gpu_ctx("sparse_dict block-code alloc candidates")?;
+        let mut inner_dev = stream
+            .alloc_zeros::<f64>(coefficients)
+            .gpu_ctx("sparse_dict block-code alloc inner products")?;
         let mut coordinates_dev = stream
             .alloc_zeros::<f64>(coefficients)
             .gpu_ctx("sparse_dict block-code alloc coordinates")?;
@@ -1042,6 +1081,7 @@ mod device {
         let mut code = stream.launch_builder(&code_func);
         code.arg(&rows_dev)
             .arg(&decoder_dev)
+            .arg(&inverse_grams_dev)
             .arg(&top_blocks_dev)
             .arg(&top_gates_dev)
             .arg(&m_i32)
@@ -1051,6 +1091,7 @@ mod device {
             .arg(&gamma)
             .arg(&roundoff)
             .arg(&mut candidates_dev)
+            .arg(&mut inner_dev)
             .arg(&mut coordinates_dev)
             .arg(&mut reconstruction_dev)
             .arg(&mut counts_dev)
@@ -1058,8 +1099,9 @@ mod device {
             .arg(&mut out_gates_dev)
             .arg(&mut out_projections_dev);
         // SAFETY: one thread per row within m. Each thread reads its own row, the
-        // resident decoder and its own m*active shortlist slots, and writes only its
-        // own candidate, coordinate, reconstruction, count and output ranges, all
+        // resident decoder, the n_blocks*b*b inverse Grams (length checked above) and
+        // its own m*active shortlist slots, and writes only its own candidate, inner
+        // product, coordinate, reconstruction, count and output ranges, all
         // cudarc-checked allocations of the sizes the kernel indexes.
         unsafe { code.launch(code_cfg) }.gpu_ctx("sparse_dict block-code launch")?;
 

@@ -163,6 +163,16 @@ pub struct SaeAtomGeometryPlan {
     latent_dim: usize,
     resolution: SaeBasisResolution,
     reference_metric: SaeReferenceMetricPlan,
+    /// The accumulated decoder transport `D` of every exact chart transport the
+    /// atom has taken since the plan was declared: the live decoder is `D·B` for
+    /// the declared-chart decoder `B`. The reference metric stays in the declared
+    /// chart, so every Gram the plan builds, `S(κ)` and `∂S/∂κ` alike, is moved into
+    /// the live basis by the congruence `(D⁻¹)ᵀ S D⁻¹` (#2935, #2947). `None` until
+    /// the first transport. A declared plan never carries one, so the key is written
+    /// only once a transport has happened, and a caller's declaration omits it. It
+    /// arrived with the `gamfit.ManifoldSAE/v8` artifact schema.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decoder_transport: Option<Array2<f64>>,
 }
 
 /// Deserialization proxy for [`SaeAtomGeometryPlan`]. The persisted wire carries
@@ -176,18 +186,24 @@ struct SaeAtomGeometryPlanWire {
     latent_dim: usize,
     resolution: SaeBasisResolution,
     reference_metric: SaeReferenceMetricPlan,
+    #[serde(default)]
+    decoder_transport: Option<Array2<f64>>,
 }
 
 impl TryFrom<SaeAtomGeometryPlanWire> for SaeAtomGeometryPlan {
     type Error = String;
 
     fn try_from(wire: SaeAtomGeometryPlanWire) -> Result<Self, Self::Error> {
-        Self::new(
+        let plan = Self::new(
             wire.kind,
             wire.latent_dim,
             wire.resolution,
             wire.reference_metric,
-        )
+        )?;
+        match wire.decoder_transport {
+            Some(transport) => plan.transported(transport.view()),
+            None => Ok(plan),
+        }
     }
 }
 
@@ -332,9 +348,45 @@ impl SaeAtomGeometryPlan {
             latent_dim,
             resolution,
             reference_metric,
+            decoder_transport: None,
         };
         plan.basis_size()?;
         Ok(plan)
+    }
+
+    /// This plan carried through one more exact chart transport `B_new = T·B_old`
+    /// of the atom's decoder, so the Grams it builds stay in the live basis.
+    ///
+    /// The transport is taken at the plan's full width: a chart transport acts on
+    /// the atom's own basis, which is the plan's basis until a rank reduction.
+    pub(crate) fn transported(&self, decoder_transport: ArrayView2<'_, f64>) -> Result<Self, String> {
+        let width = self.basis_size()?;
+        if decoder_transport.dim() != (width, width)
+            || decoder_transport.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "SaeAtomGeometryPlan::transported: decoder transport must be a finite ({width}, {width}) matrix; got {:?}",
+                decoder_transport.dim()
+            ));
+        }
+        let composed = match self.decoder_transport.as_ref() {
+            Some(previous) => fast_ab(&decoder_transport.to_owned(), previous),
+            None => decoder_transport.to_owned(),
+        };
+        let mut plan = self.clone();
+        plan.decoder_transport = Some(composed);
+        Ok(plan)
+    }
+
+    /// A Gram built in the declared chart, moved into the live basis by the
+    /// accumulated decoder transport.
+    fn in_live_basis(&self, declared_gram: Array2<f64>) -> Result<Array2<f64>, String> {
+        match self.decoder_transport.as_ref() {
+            Some(transport) => {
+                transport_smooth_penalty_for_decoder(transport.view(), declared_gram.view())
+            }
+            None => Ok(declared_gram),
+        }
     }
 
     /// `RP²` on the AMBIENT cover — the default, and the only pole-free one.
@@ -454,10 +506,10 @@ impl SaeAtomGeometryPlan {
 
     /// Return this geometry plan at a new raw sectional curvature.
     ///
-    /// The basis and tangent reference rows are unchanged; only the declared
-    /// Dirichlet metric moves. Re-running [`Self::new`] keeps the geometry
-    /// contract as the single validator rather than mutating a private enum arm
-    /// in place.
+    /// The basis, the tangent reference rows and the decoder transport are
+    /// unchanged; only the declared Dirichlet metric moves. Re-running
+    /// [`Self::new`] keeps the geometry contract as the single validator rather
+    /// than mutating a private enum arm in place.
     pub(crate) fn at_constant_curvature(&self, kappa: f64) -> Result<Self, String> {
         let reference_metric = match &self.reference_metric {
             SaeReferenceMetricPlan::ConstantCurvatureChart {
@@ -473,12 +525,14 @@ impl SaeAtomGeometryPlan {
                 ));
             }
         };
-        Self::new(
+        let mut plan = Self::new(
             self.kind.clone(),
             self.latent_dim,
             self.resolution.clone(),
             reference_metric,
-        )
+        )?;
+        plan.decoder_transport = self.decoder_transport.clone();
+        Ok(plan)
     }
 
     /// Numerically resolved raw-curvature search interval for this plan.
@@ -637,17 +691,17 @@ impl SaeAtomGeometryPlan {
         };
         let evaluator = self.build_evaluator()?;
         let (_, reference_jacobian) = evaluator.evaluate(reference_coords.view())?;
-        gam_geometry::constant_curvature_dirichlet_penalty_kappa_derivative(
+        let declared = gam_geometry::constant_curvature_dirichlet_penalty_kappa_derivative(
             reference_coords.view(),
             reference_jacobian.view(),
             *kappa,
         )
-        .map(Some)
         .map_err(|error| {
             format!(
                 "SaeAtomGeometryPlan::build_reference_penalty_kappa_derivative: {error}"
             )
-        })
+        })?;
+        self.in_live_basis(declared).map(Some)
     }
 
     /// Evaluate the plan's analytic basis and materialize the one declared
@@ -708,6 +762,13 @@ impl SaeAtomGeometryPlan {
     }
 
     fn reference_penalty(&self, evaluator: &dyn SaeBasisSecondJet) -> Result<Array2<f64>, String> {
+        self.in_live_basis(self.declared_reference_penalty(evaluator)?)
+    }
+
+    fn declared_reference_penalty(
+        &self,
+        evaluator: &dyn SaeBasisSecondJet,
+    ) -> Result<Array2<f64>, String> {
         match (&self.resolution, &self.reference_metric) {
             (
                 SaeBasisResolution::PeriodicHarmonics { order },

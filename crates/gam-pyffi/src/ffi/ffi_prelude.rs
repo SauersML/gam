@@ -10,8 +10,6 @@ pub(crate) use csv::StringRecord;
 
 pub(crate) use faer::Side;
 
-pub(crate) use gam::terms::basis::create_duchon_basis_1d_derivative_dense;
-
 pub(crate) use gam::solver::estimate::{
     EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_log_lambdas,
@@ -93,34 +91,38 @@ pub(crate) use gam::terms::smooth::{
 
 pub(crate) use gam::families::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 
-pub(crate) use gam::solver::evidence::{
-    RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
-};
-
 pub(crate) use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternLengthScale, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
-    SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
     bspline_derivative_penalty_matrix, bspline_tensor_first_derivative, build_duchon_basis,
     build_duchon_basis_mixed_periodicity_auto, build_duchon_basis_spec_chart,
     build_duchon_operator_penalty_matrices,
-    build_matern_basis, build_matern_basis_literal_aniso, build_periodic_bspline_basis_1d,
+    build_matern_basis_literal_aniso, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
-    cyclic_bspline_derivative_penalty_matrix, duchon_cubic_default,
-    duchon_effective_nullspace_order, duchon_kernel_constraint_nullspace,
-    duchon_nullspace_order_from_m, duchon_polynomial_first_derivative_nd,
-    duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
+    cyclic_bspline_derivative_penalty_matrix,
+    duchon_nullspace_order_from_m,
     duchon_sae_atom_basis_with_jet,
-    evaluate_bspline_basis_scalar, matern_input_location_hessian_nd, matern_input_location_jet_nd,
-    matern_radial_first_derivative_nd, periodic_bspline_derivative_nd,
+    matern_input_location_hessian_nd, matern_input_location_jet_nd,
+    periodic_bspline_derivative_nd,
     periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
     spherical_spline_design_hessian, spherical_spline_design_jet,
 };
 
 pub(crate) use gam::terms::basis::input_loc_derivatives::contract_input_loc_gradient;
+
+pub(crate) use gam::terms::basis::position_basis::{
+    PositionBasisKind, PositionBasisLocations, PositionPenaltyRequest, ResolvedPositionBasis,
+    resolve_position_basis,
+    validate_position_period,
+};
+
+pub(crate) use gam::terms::basis::{
+    duchon_cubic_default_with_periodicity,
+    duchon_function_norm_penalty as core_duchon_function_norm_penalty,
+};
 
 pub(crate) use gam::terms::decoders::interchange_decoder::{
     InterchangeDecodeForward as CoreInterchangeDecodeForward,
@@ -132,6 +134,9 @@ pub(crate) use gam::terms::decoders::interchange_decoder::{
 };
 
 pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
+pub(crate) use gam::terms::basis::latent_design::{latent_basis_kind, latent_input_location_jet, periodic_bspline_basis_dense_via_spec, build_latent_duchon_design, build_latent_forward_design};
+pub(crate) use gam::terms::latent::{LatentAuxStrengthState, latent_aux_prior_stats, ValidatedDimSelectionPrecisions, latent_prior_score_and_aux_state_for_t, latent_analytic_penalty_value};
+pub(crate) use gam::families::latent_outer::{LatentOuterProblem, LatentOuterObjective, latent_manifold_periodic_descriptor, build_latent_outer_manifold, latent_spectral_seed_start, gaussian_reml_weight_vector_local, latent_scalar_weights_with_fisher, latent_row_weights, validate_dense_fisher_w, gaussian_reml_fit_latent_impl};
 
 pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryError,
@@ -195,15 +200,11 @@ pub(crate) use pyo3::exceptions::{PyTypeError, PyValueError};
 
 pub(crate) use pyo3::prelude::*;
 
-pub(crate) use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
-
-pub(crate) use serde::de::{MapAccess, Visitor};
+pub(crate) use pyo3::types::{PyAny, PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple, PyType};
 
 pub(crate) use serde::{Deserialize, Serialize};
 
 pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap};
-
-pub(crate) use std::fmt;
 
 pub(crate) use std::panic::{AssertUnwindSafe, catch_unwind};
 

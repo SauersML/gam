@@ -159,6 +159,27 @@ slow-timeout = { period = "600s", terminate-after = 4 }
 filter = 'test(/joint_latent_law_2929::/)'
 slow-timeout = { period = "600s", terminate-after = 4 }
 
+# The gam#2924 skewed declared-law probe fits the Bernoulli marginal-slope
+# family three times at n = 32,000, twice on a 65-node global-empirical law
+# whose rows solve the finite-law anchor root and lift it through the
+# fourth-order towers, and predicts 200,000 held-out rows after each fit. On
+# 12 cores it took 609 s with the serial residual replay: 82 s score-only
+# empirical fit, 222 s repaired empirical fit, 165 s score-only prediction on
+# the per-row empirical predictor loop (gam#2926 moves it onto the pool and
+# the shared root solve), 135 s repaired prediction. A small CI runner needs
+# the declared-law probes' headroom, and terminate-after = 4 still kills a
+# genuine hang far inside the job backstop.
+[[profile.default.overrides]]
+filter = 'test(/bms_residual_repair_2924::residual_block_anchors_on_a_declared_skewed_score_law/)'
+slow-timeout = { period = "600s", terminate-after = 4 }
+
+# The gam#2926 survival moving-law acceptance probes each fit the survival default on a
+# moving conditional law and certify it (10 held-out laws per arm), and the shape-moving
+# probe re-solves on the local law and fits the declared location-scale law beside it.
+[[profile.default.overrides]]
+filter = 'test(/moving_law_certificate_2926::/)'
+slow-timeout = { period = "600s", terminate-after = 4 }
+
 # The gam#2927 survival marginal-slope posterior-mean measurement fits the
 # #2765 follow-up-varying-slope fixture once (n = 800, a quadratic time margin
 # on the slope) and then runs 2 × 20,000 full plug-in survival predictions as

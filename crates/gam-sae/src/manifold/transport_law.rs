@@ -1,30 +1,36 @@
-//! Transport-law measurement: is layer-to-layer transport of a circle atom a
-//! phase shift?
+//! Geometric correspondence between two layer images of a circle atom, and its
+//! phase-shift law.
 //!
-//! # The thesis this measures
+//! # The thesis this module tests geometrically
 //!
 //! "**Binding is transport.** Layers act through a transport groupoid; LINEAR
 //! transport of an elliptical (circle) atom is forced to be a phase shift
 //! `t ↦ ±t + φ`; the residual gauge obstruction is the atom's linear stabilizer."
 //! (module header of [`crate::manifold`]). This module turns that claim into a
-//! *measurement* on a fitted 2-layer crosscoder — a shared chart coordinate `t`
-//! decoded through per-layer honest decoders `B^(ℓ)` and `B^(ℓ+1)` (the
-//! [`CrosscoderLayout`]/[`SaeManifoldTerm::layer_decoder`] bookkeeping).
+//! *geometric* measurement on a fitted 2-layer crosscoder — a shared chart
+//! coordinate `t` decoded through per-layer honest decoders `B^(ℓ)` and `B^(ℓ+1)`
+//! (the [`CrosscoderLayout`]/[`SaeManifoldTerm::layer_decoder`] bookkeeping).
 //!
-//! # Operational definition of the transport map
+//! # Operational definition: the nearest-point correspondence
 //!
 //! Both layers of a crosscoder share the SAME ambient residual-stream dimension,
 //! so the atom image at layer `ℓ` (`C^(ℓ) = {Φ_k(t) B^(ℓ)_k}`) and at layer `ℓ+1`
-//! (`C^(ℓ+1) = {Φ_k(t) B^(ℓ+1)_k}`) are two curves in one `ℝ^p`. The network's
-//! transport carries a layer-`ℓ` feature to layer `ℓ+1`; with no network in hand
-//! we approximate that correspondence by NEAREST POINT: for a source coordinate
-//! `t`, decode the SOURCE (layer `ℓ`) image `x(t) = Φ_k(t) B^(ℓ)_k`, then PROJECT
-//! `x(t)` onto the CONTINUOUS TARGET (layer `ℓ+1`) atom image to read off the chart
-//! coordinate that best reproduces it,
-//! `t'(t) = argmin_{t'} ‖x(t) − Φ_k(t') B^(ℓ+1)_k‖²`. The empirical transport map
-//! is `t ↦ t'(t)`. The target projection enumerates every stationary point of
-//! this trigonometric polynomial through its companion-matrix roots, so `t'` is
-//! not quantized by any sampling lattice.
+//! (`C^(ℓ+1) = {Φ_k(t) B^(ℓ+1)_k}`) are two curves in one `ℝ^p`. With no network in
+//! hand, this module relates the two images by NEAREST POINT. For a source
+//! coordinate `t`, decode the SOURCE (layer `ℓ`) image `x(t) = Φ_k(t) B^(ℓ)_k`, then
+//! PROJECT `x(t)` onto the CONTINUOUS TARGET (layer `ℓ+1`) atom image to read off
+//! the chart coordinate that best reproduces it,
+//! `t'(t) = argmin_{t'} ‖x(t) − Φ_k(t') B^(ℓ+1)_k‖²`. The correspondence is
+//! `t ↦ t'(t)`. The target projection enumerates every stationary point of this
+//! trigonometric polynomial through its companion-matrix roots, so `t'` is not
+//! quantized by any sampling lattice.
+//!
+//! This is a correspondence between two decoder images, not the network's
+//! transport, which runs the block between the layers. Two layers that decode the
+//! same circle correspond by the identity whatever that block does, even when it
+//! rotates the circle. [`crate::response::executed_transport`] measures the
+//! executed transport `τ(t; c) = E_{ℓ+1}(T_ℓ(c + D_ℓ(t)) − T_ℓ(c))` next to this
+//! correspondence, and pins that planted rotation as its positive control.
 //!
 //! (The mission brief phrased the grid step as "decode at layer ℓ+1 … project
 //! back onto the layer-(ℓ+1) atom image", which is the identity map; the
@@ -46,8 +52,8 @@
 //! `∫₀¹ cos(2π(u − φ)) dt = |ρ_s|` with `ρ_s = ∫₀¹ e^{i 2π u(t)} dt`; `s` is chosen
 //! for the larger resultant, and `SS_res = 1 − |ρ_s|`.
 //!
-//! `phase_r2 = 1` exactly when transport is a phase shift everywhere on the chart
-//! (`NaN` when every transported coordinate coincides, a degenerate baseline); its
+//! `phase_r2 = 1` exactly when the correspondence is a phase shift everywhere on the
+//! chart (`NaN` when every corresponding coordinate coincides, a degenerate baseline); its
 //! shortfall is the chordal residual the law leaves unexplained, and
 //! [`AtomTransportReport::deviation_locus`] reports the chart location where the
 //! phase model deviates most (the interesting locus). No smooth-map alternative
@@ -95,8 +101,8 @@ pub enum CrosscoderLayer {
     Block(usize),
 }
 
-/// The empirical transport map of one circle atom, the phase-shift law fit, and
-/// the drift statistics.
+/// The nearest-point correspondence of one circle atom between two layer images,
+/// the phase-shift law fit, and the drift statistics.
 #[derive(Clone, Debug)]
 pub struct AtomTransportReport {
     /// The atom's harmonic order `H = (M − 1)/2`.
@@ -105,7 +111,7 @@ pub struct AtomTransportReport {
     /// and `φ` in chart units, wrapped to `[−½, ½)`.
     pub phase_shift: (f64, f64),
     /// Circular `R²` of the phase-shift fit (`1 − SS_res/SS_tot`). The LAW's
-    /// goodness of fit; `≈ 1` when transport is a pure phase shift.
+    /// goodness of fit; `≈ 1` when the correspondence is a pure phase shift.
     pub phase_r2: f64,
     /// Honest-units decoder drift `δ_k = ‖B_tgt − B_src‖_F /
     /// √(‖B_src‖_F · ‖B_tgt‖_F)` (gam#2231 §3). `NaN` if either decoder is
@@ -118,16 +124,16 @@ pub struct AtomTransportReport {
     /// rank_tgt)` with `|rank_src − rank_tgt|` trailing `π/2` entries when the
     /// ranks differ; empty only if BOTH images are numerically rank-0.
     pub principal_angles: Vec<f64>,
-    /// The transport samples `(t, t')` in chart units that the integrals'
+    /// The correspondence samples `(t, t')` in chart units that the integrals'
     /// accepted cells evaluated, sorted by `t`, for plotting / downstream analysis.
     pub transport_grid: Vec<(f64, f64)>,
 }
 
 impl AtomTransportReport {
     /// The chart location `t` where the phase-shift model deviates most from the
-    /// empirical transport (the largest chordal residual) among the transport
-    /// samples. `None` for an empty grid. This is the "interesting locus" where
-    /// linear transport breaks.
+    /// nearest-point correspondence (the largest chordal residual) among the
+    /// correspondence samples. `None` for an empty grid. This is the "interesting
+    /// locus" where the correspondence departs from a phase shift.
     pub fn deviation_locus(&self) -> Option<f64> {
         let (s, phi) = self.phase_shift;
         let two_pi = std::f64::consts::TAU;
@@ -152,8 +158,8 @@ pub enum AtomTransportStatus {
     Undefined { reason: String },
 }
 
-/// Measure the empirical transport of one circle atom between two explicit
-/// crosscoder layers (source image projected onto the target image).
+/// Measure the nearest-point correspondence of one circle atom between two
+/// explicit crosscoder layers (source image projected onto the target image).
 pub fn measure_atom_transport_between(
     term: &SaeManifoldTerm,
     layout: &CrosscoderLayout,

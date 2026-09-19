@@ -27,8 +27,8 @@ mod tests {
     use ndarray::{Array2, Axis};
 
     /// Test-visible forwarding logger: the engine's diagnostic channels
-    /// (`log::debug!` bail naming in `terminal_exact_newton_polish`, the
-    /// `log::warn!` incumbent/warranty restores) are silently dropped by the
+    /// (`log::trace!` bail naming in `terminal_exact_newton_polish`, the
+    /// `log::debug!` incumbent/warranty restores) are silently dropped by the
     /// test harness unless a logger is installed — the exact trap that left
     /// the tier-0 refusal unadjudicated across multiple probe runs. eprintln
     /// is the test-side convention (`log::warn` is dropped in tests); this
@@ -53,7 +53,7 @@ mod tests {
     fn install_test_logger() {
         // Ignore the error when another test already installed a logger.
         if log::set_logger(&FORWARDING_TEST_LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Debug);
+            log::set_max_level(log::LevelFilter::Trace);
         }
     }
 
@@ -149,7 +149,6 @@ mod tests {
             ridge_beta: 1.0e-6,
             top_k: None,
             threshold: 0.0,
-            native_ard_enabled: true,
             seed_refine_routing: refine_routing,
             seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),
@@ -331,7 +330,6 @@ mod tests {
             ridge_beta: 1.0e-6,
             top_k: None,
             threshold: 0.0,
-            native_ard_enabled: true,
             seed_refine_routing: refine_routing,
             seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),

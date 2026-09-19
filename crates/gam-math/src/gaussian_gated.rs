@@ -13,7 +13,11 @@
 //!   ([`gated_conditional_mean`]);
 //! * the pair second moment under the coupling `Z' = PZ + (I − P)Z̃`: a six-term
 //!   contraction of the table `K_pq = E[s^(p)(X_j)·s^(q)(X_k)]` against the
-//!   up-projection covariances ([`gated_pair_second_moment`]).
+//!   up-projection covariances ([`gated_pair_second_moment`]);
+//! * the gate's normalised Hermite coefficients
+//!   `h_n = E[s(b + √v·x)·He_n(x)]/√(n!)`, the per-unit input of the Mehler
+//!   (Wiener-chaos) pair series `E[s(X)s(Y)] = Σ_n ρⁿ·h_n(X)·h_n(Y)`
+//!   ([`silu_hermite_coefficients`]).
 //!
 //! Their derivatives are exact too: `∂_v T_v f = ½·T_v f''` (the heat equation)
 //! and `∂_r K_pq = K_{p+1,q+1}` (Price's theorem). One table through `p = 3`
@@ -44,8 +48,11 @@
 use std::f64::consts::{FRAC_2_SQRT_PI, FRAC_PI_2, PI, SQRT_2};
 use std::fmt;
 
+use crate::gaussian_activation::{
+    GaussianActivationError, PreactivationPair, ProjectedCovariance, project_covariance,
+};
 use crate::probability::{normal_cdf, normal_pdf};
-use crate::special::logistic;
+use crate::special::{logaddexp, logistic};
 
 /// The derivative orders `p = 0..=3` of `s^(p)` that the kernels tabulate: the
 /// value, plus the three derivatives read by the Stein reductions and their
@@ -62,8 +69,9 @@ pub enum GaussianGatedError {
     NonFiniteArgument { name: &'static str, value: f64 },
     /// A variance must be non-negative.
     NegativeVariance { name: &'static str, value: f64 },
-    /// `r² > v·w`: no Gaussian pair has this covariance.
-    CovarianceOutsideCone { v: f64, w: f64, r: f64 },
+    /// The pair covariance failed the one Cauchy-Schwarz predicate,
+    /// [`project_covariance`].
+    Covariance(GaussianActivationError),
 }
 
 impl fmt::Display for GaussianGatedError {
@@ -75,10 +83,7 @@ impl fmt::Display for GaussianGatedError {
             Self::NegativeVariance { name, value } => {
                 write!(formatter, "SiLU Gaussian kernel variance {name} is negative: {value}")
             }
-            Self::CovarianceOutsideCone { v, w, r } => write!(
-                formatter,
-                "SiLU pair covariance r = {r} violates r² ≤ v·w for variances v = {v}, w = {w}"
-            ),
+            Self::Covariance(error) => write!(formatter, "SiLU pair covariance: {error}"),
         }
     }
 }
@@ -383,31 +388,37 @@ pub struct SiluPairMoments {
     pub quadrature_bound: [[f64; SILU_TABLE_ORDERS]; SILU_TABLE_ORDERS],
 }
 
-/// The SiLU pair kernel table `K_pq(b, c; v, w, r)` of a Gaussian pair, with
-/// `X ~ N(b, v)`, `Y ~ N(c, w)` and `Cov(X, Y) = r`.
+/// The SiLU pair kernel table `K_pq(b, c; v, w, r)` of the Gaussian pair
+/// `X ~ N(b, v)`, `Y ~ N(c, w)`, `Cov(X, Y) = r`: the same law `pair_kernel` takes.
 ///
-/// The argument order is that of `K_σ(b, c; v, w, r)` on #2946. `r² ≤ v·w` is
-/// required exactly: a caller whose inputs round across the cone owns that
-/// rounding.
-pub fn silu_pair_moments(
-    b: f64,
-    c: f64,
-    v: f64,
-    w: f64,
-    r: f64,
-) -> Result<SiluPairMoments, GaussianGatedError> {
-    require_finite("b", b)?;
-    require_finite("c", c)?;
-    require_variance("v", v)?;
-    require_variance("w", w)?;
-    require_finite("r", r)?;
-    if r * r > v * w {
-        return Err(GaussianGatedError::CovarianceOutsideCone { v, w, r });
-    }
+/// The covariance first passes the one Cauchy-Schwarz predicate,
+/// [`project_covariance`], with the pair's stated `covariance_rounding`.
+/// - Within that band it is evaluated on the boundary `|r| = √(vw)`. There the
+///   table collapses exactly onto a one-axis rule.
+/// - Beyond it the law is refused.
+///
+/// A stored residual above zero means `r` was not moved. Otherwise projection moves
+/// `r` by at most `β + ε(vw + r²)/(|r| + √(vw)) ≤ β + 2ε(√(vw) + β)`, to first order.
+/// By Price's theorem that moves `K_pq` by at most that shift times
+/// `sup|s^(p+1)|·sup|s^(q+1)|`. The real-line envelopes
+/// give `sup|s'| ≤ 1.25`, `sup|s''| ≤ 0.75`, `sup|s'''| ≤ 1.375` and
+/// `sup|s''''| ≤ 3.5`. Like any rounding of the caller's inputs, that shift belongs
+/// to the caller and is not part of `quadrature_bound`.
+pub fn silu_pair_moments(pair: PreactivationPair) -> Result<SiluPairMoments, GaussianGatedError> {
+    require_finite("mean_x", pair.mean_x)?;
+    require_finite("mean_y", pair.mean_y)?;
+    let law = project_covariance(
+        pair.variance_x,
+        pair.variance_y,
+        pair.covariance,
+        pair.covariance_rounding,
+    )
+    .map_err(GaussianGatedError::Covariance)?;
+    let (b, c, v, w) = (pair.mean_x, pair.mean_y, pair.variance_x, pair.variance_y);
     if v >= w {
-        return Ok(ordered_pair_moments(b, c, v, w, r));
+        return Ok(ordered_pair_moments(b, c, v, law));
     }
-    let swapped = ordered_pair_moments(c, b, w, v, r);
+    let swapped = ordered_pair_moments(c, b, w, law);
     Ok(SiluPairMoments {
         moments: transpose(&swapped.moments),
         quadrature_bound: transpose(&swapped.quadrature_bound),
@@ -433,15 +444,17 @@ struct PairCoordinates {
 }
 
 impl PairCoordinates {
-    /// The coordinates of a law with `v > 0`, `w ≤ v` and `r² ≤ v·w`.
-    fn of(b: f64, c: f64, v: f64, w: f64, r: f64) -> Self {
+    /// The coordinates of a projected law with `v > 0` and `w ≤ v`. The predicate
+    /// carries the residual `vw − r² ≥ 0` exactly, so `γ² = residual/v` avoids the
+    /// cancellation in forming `w − r²/v`.
+    fn of(b: f64, c: f64, v: f64, law: ProjectedCovariance) -> Self {
         let root_v = v.sqrt();
         PairCoordinates {
             b,
             c,
             root_v,
-            beta: r / root_v,
-            gamma: ((v * w - r * r) / v).sqrt(),
+            beta: law.covariance / root_v,
+            gamma: (law.residual / v).sqrt(),
         }
     }
 }
@@ -455,9 +468,10 @@ struct PairRule {
     second: Option<TrapezoidAxis>,
 }
 
-fn ordered_pair_moments(b: f64, c: f64, v: f64, w: f64, r: f64) -> SiluPairMoments {
+fn ordered_pair_moments(b: f64, c: f64, v: f64, law: ProjectedCovariance) -> SiluPairMoments {
     if v == 0.0 {
-        // `w ≤ v` and `r² ≤ v·w`, so both coordinates are constants.
+        // The caller orders `w ≤ v`, and the projection keeps `r² ≤ v·w`, so both
+        // coordinates are constants.
         let first = silu_derivatives(b);
         let second = silu_derivatives(c);
         return SiluPairMoments {
@@ -465,7 +479,7 @@ fn ordered_pair_moments(b: f64, c: f64, v: f64, w: f64, r: f64) -> SiluPairMomen
             quadrature_bound: [[0.0; SILU_TABLE_ORDERS]; SILU_TABLE_ORDERS],
         };
     }
-    let coordinates = PairCoordinates::of(b, c, v, w, r);
+    let coordinates = PairCoordinates::of(b, c, v, law);
     let rule = pair_rule(&coordinates);
     SiluPairMoments {
         moments: pair_sums(&coordinates, &rule),
@@ -684,6 +698,224 @@ fn pair_sums(
         }
     }
     sums
+}
+
+/// Normalised Hermite coefficients of the SiLU gate under a Gaussian law, with the
+/// gate's second moment and slope energy: the per-unit inputs of the Wiener-chaos
+/// pair series.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SiluHermiteCoefficients {
+    /// `h_n = E[s(b + √v·x)·He_n(x)]/√(n!)` for `n = 0..=orders`, so that
+    /// `s(b + √v·x) = Σ_n h_n·He_n(x)/√(n!)` in `L²(φ)`. Gaussian integration by
+    /// parts gives `h_n = v^{n/2}·T_v s^(n)(b)/√(n!)`, and Mehler's formula gives
+    /// `E[s(X)·s(Y)] = Σ_n ρⁿ·h_n(X)·h_n(Y)` for a pair with correlation `ρ`.
+    pub coefficients: Vec<f64>,
+    /// A derived bound on each coefficient's discretisation and truncation error.
+    /// Rounding is excluded.
+    pub quadrature_bound: Vec<f64>,
+    /// `E s(X)² = Σ_n h_n²`.
+    pub second_moment: BoundedValue,
+    /// `v·E s'(X)² = Σ_n n·h_n²`.
+    pub slope_energy: BoundedValue,
+}
+
+/// `ln L_n(−y) = ln Σ_j C(n, j)·y^j/j!`: the log of the weighted energy
+/// `E|He_n(x + ib)|²/n!` at `y = b²`.
+///
+/// Appell's identity `He_n(x + ib) = Σ_k C(n, k)·He_k(x)·(ib)^{n−k}` and the
+/// orthogonality `E[He_k·He_l] = k!·δ_kl` give
+/// `Σ_k C(n, k)²·k!·b^{2(n−k)}/n! = Σ_j C(n, j)·b^{2j}/j!`. The sum is carried in
+/// logs, so large orders cannot overflow.
+fn ln_hermite_strip_energy(order: usize, y: f64) -> f64 {
+    if y == 0.0 {
+        return 0.0;
+    }
+    let ln_y = y.ln();
+    let mut ln_term = 0.0;
+    let mut ln_sum = 0.0;
+    for j in 0..order {
+        ln_term += ((order - j) as f64).ln() + ln_y - 2.0 * ((j + 1) as f64).ln();
+        ln_sum = logaddexp(ln_sum, ln_term);
+    }
+    ln_sum
+}
+
+/// The envelope data of one Hermite rule at `ω = √v·a`: the band envelope
+/// `A + B|x|` of `s(b + √v·x)`, and the constant envelope `A₁` of `s'`.
+fn hermite_envelopes(b: f64, root_v: f64, strip: f64) -> (f64, f64, f64) {
+    let envelope = silu_envelope(root_v * strip, b);
+    (envelope[0].0, envelope[0].1 * root_v, envelope[1].0)
+}
+
+/// `E(A + B|x|)² = A² + 2AB·√(2/π) + B²`.
+fn squared_envelope_mean(constant: f64, slope: f64) -> f64 {
+    constant * constant + 2.0 * constant * slope * MEAN_ABS_STANDARD_NORMAL + slope * slope
+}
+
+/// The log strip masses `ln M` of the Hermite rule's integrands at strip `a`, in
+/// the order `[coefficients 0..=orders, second moment, slope energy]`:
+/// * `φ·s·ψ_n`: Cauchy-Schwarz under `φ` gives
+///   `M_n ≤ e^{a²/2}·√(E(A + B|x|)²)·√(L_n(−a²))`;
+/// * `φ·s²`: `M ≤ e^{a²/2}·E(A + B|x|)²`;
+/// * `φ·v·s'²`: `M ≤ e^{a²/2}·v·A₁²`.
+///
+/// At `a = 0` these are the real-line envelope scales `R ≥ E|integrand|`.
+fn hermite_ln_strip_masses(b: f64, v: f64, orders: usize, strip: f64) -> Vec<f64> {
+    let root_v = v.sqrt();
+    let (constant, slope, slope_bound) = hermite_envelopes(b, root_v, strip);
+    let ln_growth = 0.5 * strip * strip;
+    let ln_square_envelope = squared_envelope_mean(constant, slope).ln();
+    let mut masses: Vec<f64> = (0..=orders)
+        .map(|order| {
+            ln_growth
+                + 0.5 * ln_square_envelope
+                + 0.5 * ln_hermite_strip_energy(order, strip * strip)
+        })
+        .collect();
+    masses.push(ln_growth + ln_square_envelope);
+    masses.push(ln_growth + (v * slope_bound * slope_bound).ln());
+    masses
+}
+
+/// Both tails of every integrand beyond the last node `L`, in the
+/// `hermite_ln_strip_masses` order:
+/// * the envelope squared `φ(A + B|x|)²` decreases past `√2`, so its dropped nodes
+///   carry at most `2[A²Q(L) + 2AB·φ(L) + B²(L·φ(L) + Q(L))]`;
+/// * `s·ψ_n`: Cauchy-Schwarz over the dropped nodes gives
+///   `√(dropped envelope²)·√(h·Σ_k φ(kh)·ψ_n(kh)²)`. By Poisson summation the
+///   full-line sum is `1 + Σ_{m≠0} FT(φψ_n²)(2πm/h) ≤ 1 + e^{a²/2}·L_n(−a²)·(S − 1)`,
+///   because `ψ_n` is entire;
+/// * `v·s'²`: `2v·A₁²·Q(L)`.
+fn hermite_tails(b: f64, v: f64, orders: usize, axis: &TrapezoidAxis) -> Vec<f64> {
+    let root_v = v.sqrt();
+    let (constant, slope, slope_bound) = hermite_envelopes(b, root_v, 0.0);
+    let tails = standard_normal_tails(axis.last_node());
+    let square_tail = 2.0
+        * (constant * constant * tails[0]
+            + 2.0 * constant * slope * tails[1]
+            + slope * slope * tails[2]);
+    let aliasing = axis.aliasing();
+    let ln_growth = 0.5 * axis.strip * axis.strip;
+    let mut result: Vec<f64> = (0..=orders)
+        .map(|order| {
+            let full_line = 1.0
+                + aliasing
+                    * (ln_growth + ln_hermite_strip_energy(order, axis.strip * axis.strip)).exp();
+            (square_tail * full_line).sqrt()
+        })
+        .collect();
+    result.push(square_tail);
+    result.push(2.0 * v * slope_bound * slope_bound * tails[0]);
+    result
+}
+
+/// The least rule meeting `ε·R` in every entry, with the smoothing's split: half
+/// the target to the Poisson bound and half to the tails. The Laguerre growth
+/// `√L_n(−a²) ≈ e^{a√n}` shrinks the step where `ψ_n` oscillates, without a
+/// separate rule.
+fn hermite_rule(b: f64, v: f64, orders: usize) -> TrapezoidAxis {
+    let root_v = v.sqrt();
+    let strip = (strip_pole_budget() / root_v).min(strip_gaussian_cap());
+    let ln_masses = hermite_ln_strip_masses(b, v, orders, strip);
+    let ln_scales = hermite_ln_strip_masses(b, v, orders, 0.0);
+    // 2πa/h ≥ ln(1 + 4M/(ε·R)), carried in logs.
+    let aliasing_nats = ln_masses
+        .iter()
+        .zip(&ln_scales)
+        .map(|(ln_mass, ln_scale)| {
+            logaddexp(0.0, 4.0_f64.ln() + ln_mass - ln_scale - f64::EPSILON.ln())
+        })
+        .fold(0.0, f64::max);
+    TrapezoidAxis::least_count(strip, 2.0 * PI * strip / aliasing_nats, |axis| {
+        hermite_tails(b, v, orders, axis)
+            .iter()
+            .zip(&ln_scales)
+            .any(|(tail, ln_scale)| *tail > 0.5 * f64::EPSILON * ln_scale.exp())
+    })
+}
+
+fn hermite_bound(b: f64, v: f64, orders: usize, axis: &TrapezoidAxis) -> Vec<f64> {
+    let aliasing = axis.aliasing();
+    hermite_ln_strip_masses(b, v, orders, axis.strip)
+        .iter()
+        .zip(hermite_tails(b, v, orders, axis))
+        .map(|(ln_mass, tail)| ln_mass.exp() * aliasing + tail)
+        .collect()
+}
+
+fn hermite_sums(b: f64, v: f64, orders: usize, axis: &TrapezoidAxis) -> Vec<f64> {
+    let root_v = v.sqrt();
+    let root_orders: Vec<f64> = (0..=orders + 1).map(|order| (order as f64).sqrt()).collect();
+    let mut sums = vec![0.0; orders + 3];
+    for index in axis.indices() {
+        let node = axis.node(index);
+        let weight = axis.step * normal_pdf(node);
+        let derivatives = silu_derivatives(b + root_v * node);
+        // ψ_0 = 1, ψ_1 = x, ψ_{n+1} = (x·ψ_n − √n·ψ_{n−1})/√(n + 1): the normalised
+        // form of He_{n+1} = x·He_n − n·He_{n−1}.
+        let mut previous = 0.0;
+        let mut current = 1.0;
+        for order in 0..=orders {
+            sums[order] += weight * derivatives[0] * current;
+            let next = (node * current - root_orders[order] * previous) / root_orders[order + 1];
+            previous = current;
+            current = next;
+        }
+        sums[orders + 1] += weight * derivatives[0] * derivatives[0];
+        sums[orders + 2] += weight * v * derivatives[1] * derivatives[1];
+    }
+    sums
+}
+
+/// The normalised Hermite coefficients `h_0..=h_orders` of the SiLU gate at
+/// `X ~ N(b, v)`, with its second moment and slope energy. `v = 0` is exact.
+///
+/// Only `s` itself is evaluated, so every coefficient's rounding floor is about
+/// `ε·N·‖s(X)‖`. Computing `T_v s^(n)` directly and rescaling by `v^{n/2}/√(n!)`
+/// would carry a floor near `ε·√(n!)·v^{(n−1)/2}/πⁿ`.
+pub fn silu_hermite_coefficients(
+    b: f64,
+    v: f64,
+    orders: usize,
+) -> Result<SiluHermiteCoefficients, GaussianGatedError> {
+    require_finite("b", b)?;
+    require_variance("v", v)?;
+    if v == 0.0 {
+        let value = silu_derivatives(b)[0];
+        let mut coefficients = vec![0.0; orders + 1];
+        coefficients[0] = value;
+        return Ok(SiluHermiteCoefficients {
+            coefficients,
+            quadrature_bound: vec![0.0; orders + 1],
+            second_moment: BoundedValue {
+                value: value * value,
+                quadrature_bound: 0.0,
+            },
+            slope_energy: BoundedValue {
+                value: 0.0,
+                quadrature_bound: 0.0,
+            },
+        });
+    }
+    let axis = hermite_rule(b, v, orders);
+    let mut sums = hermite_sums(b, v, orders, &axis);
+    let mut bounds = hermite_bound(b, v, orders, &axis);
+    let slope_energy = BoundedValue {
+        value: sums[orders + 2],
+        quadrature_bound: bounds[orders + 2],
+    };
+    let second_moment = BoundedValue {
+        value: sums[orders + 1],
+        quadrature_bound: bounds[orders + 1],
+    };
+    sums.truncate(orders + 1);
+    bounds.truncate(orders + 1);
+    Ok(SiluHermiteCoefficients {
+        coefficients: sums,
+        quadrature_bound: bounds,
+        second_moment,
+        slope_energy,
+    })
 }
 
 /// A quantity together with a derived bound on its quadrature error. Rounding is
@@ -1168,10 +1400,26 @@ mod tests {
             silu_gaussian_smoothing(0.0, -1.0),
             Err(GaussianGatedError::NegativeVariance { .. })
         ));
+        let unit_law = |covariance: f64, covariance_rounding: f64| PreactivationPair {
+            mean_x: 0.3,
+            mean_y: -0.2,
+            variance_x: 1.0,
+            variance_y: 1.0,
+            covariance,
+            covariance_rounding,
+        };
         assert!(matches!(
-            silu_pair_moments(0.0, 0.0, 1.0, 1.0, 1.5),
-            Err(GaussianGatedError::CovarianceOutsideCone { .. })
+            silu_pair_moments(unit_law(1.5, 0.0)),
+            Err(GaussianGatedError::Covariance(
+                GaussianActivationError::CovarianceOutsideCauchySchwarz { .. }
+            ))
         ));
+        // A covariance past the boundary by less than its stated rounding is evaluated
+        // on the boundary, so the table equals the exact |ρ| = 1 table bit for bit.
+        assert_eq!(
+            silu_pair_moments(unit_law(1.0 + 1.0e-9, 2.0e-9)).expect("within the stated rounding"),
+            silu_pair_moments(unit_law(1.0, 0.0)).expect("an exact boundary law")
+        );
     }
 
     /// First-order rounding of a computed pair table. Recursive summation over the
@@ -1214,6 +1462,18 @@ mod tests {
         allowance.map(|row| row.map(|entry| f64::EPSILON * entry))
     }
 
+    /// An exactly stated pair law: `covariance_rounding = 0`.
+    fn exact_law(b: f64, c: f64, v: f64, w: f64, r: f64) -> PreactivationPair {
+        PreactivationPair {
+            mean_x: b,
+            mean_y: c,
+            variance_x: v,
+            variance_y: w,
+            covariance: r,
+            covariance_rounding: 0.0,
+        }
+    }
+
     /// The pair table through the production path, with its rounding, for a law in
     /// the production orientation `v ≥ w`, `v > 0`.
     fn pair_with_rounding(
@@ -1224,7 +1484,12 @@ mod tests {
         r: f64,
     ) -> (SiluPairMoments, [[f64; ORDERS]; ORDERS]) {
         assert!(v >= w && v > 0.0, "the helper takes the production orientation");
-        let coordinates = PairCoordinates::of(b, c, v, w, r);
+        let coordinates = PairCoordinates::of(
+            b,
+            c,
+            v,
+            project_covariance(v, w, r, 0.0).expect("an exact law inside the cone"),
+        );
         let rule = pair_rule(&coordinates);
         let second_nodes = match &rule.second {
             Some(axis) => trapezoid_nodes(axis),
@@ -1236,7 +1501,7 @@ mod tests {
             &trapezoid_nodes(&rule.first),
             &second_nodes,
         );
-        let moments = silu_pair_moments(b, c, v, w, r).expect("a valid pair law");
+        let moments = silu_pair_moments(exact_law(b, c, v, w, r)).expect("a valid pair law");
         (moments, rounding)
     }
 
@@ -1247,7 +1512,12 @@ mod tests {
         let (b, c, v, w): (f64, f64, f64, f64) = (0.8, -1.3, 4.0, 2.25);
         let r = 0.6 * (v * w).sqrt();
         let (table, rounding) = pair_with_rounding(b, c, v, w, r);
-        let coordinates = PairCoordinates::of(b, c, v, w, r);
+        let coordinates = PairCoordinates::of(
+            b,
+            c,
+            v,
+            project_covariance(v, w, r, 0.0).expect("an exact law inside the cone"),
+        );
         let first_pole = PI / coordinates.root_v.max(coordinates.beta.abs());
         let second_pole = PI / coordinates.gamma;
         let reference = |refinement: usize| {
@@ -1383,6 +1653,249 @@ mod tests {
                     "p={p} q={q}: at |ρ| = 1 − 1e−8 the table moved by {residual:e} > {allowance:e}"
                 );
             }
+        }
+    }
+
+    /// `ψ_n(x) = He_n(x)/√(n!)` for `n = 0..=orders`, by the normalised recurrence.
+    fn normalised_hermite(orders: usize, node: f64) -> Vec<f64> {
+        let mut values = Vec::with_capacity(orders + 1);
+        let mut previous = 0.0;
+        let mut current = 1.0;
+        for order in 0..=orders {
+            values.push(current);
+            let next =
+                (node * current - (order as f64).sqrt() * previous) / ((order + 1) as f64).sqrt();
+            previous = current;
+            current = next;
+        }
+        values
+    }
+
+    /// First-order rounding of the Hermite rule's sums, in `hermite_sums` order:
+    /// * coefficient n: the counts of `sum_rounding`, plus `n` for the relative
+    ///   error the forward recurrence accumulates;
+    /// * `s²` and `v·s'²`: the same counts, with each perturbation magnified twice.
+    fn hermite_rounding(b: f64, v: f64, orders: usize, axis: &TrapezoidAxis) -> Vec<f64> {
+        let root_v = v.sqrt();
+        let count = axis.indices().count() as f64;
+        let mut allowance = vec![0.0; orders + 3];
+        for index in axis.indices() {
+            let node = axis.node(index);
+            let weight = axis.step * normal_pdf(node);
+            let envelopes = real_envelopes(b + root_v * node);
+            let perturbation = b.abs() + 2.0 * root_v * node.abs();
+            let relative = count + 10.0 + node * node;
+            for (order, psi) in normalised_hermite(orders, node).iter().enumerate() {
+                allowance[order] += weight
+                    * psi.abs()
+                    * ((relative + order as f64) * envelopes[0] + perturbation * envelopes[1]);
+            }
+            allowance[orders + 1] += weight
+                * 2.0
+                * envelopes[0]
+                * (relative * envelopes[0] + perturbation * envelopes[1]);
+            allowance[orders + 2] += weight
+                * 2.0
+                * v
+                * envelopes[1]
+                * (relative * envelopes[1] + perturbation * envelopes[2]);
+        }
+        allowance.into_iter().map(|entry| f64::EPSILON * entry).collect()
+    }
+
+    /// Production sums, bounds and rounding of one Hermite rule.
+    fn hermite_with_rounding(b: f64, v: f64, orders: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let axis = hermite_rule(b, v, orders);
+        (
+            hermite_sums(b, v, orders, &axis),
+            hermite_bound(b, v, orders, &axis),
+            hermite_rounding(b, v, orders, &axis),
+        )
+    }
+
+    const HERMITE_ORDERS: usize = 48;
+
+    #[test]
+    fn silu_hermite_coefficients_match_the_smoothing_table_and_the_exact_reflection() {
+        for (b, v) in SMOOTHING_LAWS {
+            let root_v = v.sqrt();
+            let (plus, plus_bound, plus_rounding) = hermite_with_rounding(b, v, HERMITE_ORDERS);
+            let (minus, minus_bound, minus_rounding) = hermite_with_rounding(-b, v, HERMITE_ORDERS);
+            // Gaussian integration by parts: h_n = v^{n/2}·T_v s^(n)(b)/√(n!), which the
+            // smoothing computes through a different rule and integrand.
+            let axis = smoothing_rule(b, v);
+            let smoothing = smoothing_sums(b, v, &axis);
+            let smoothing_bounds = smoothing_bound(b, v, &axis);
+            let smoothing_roundings = smoothing_rounding(b, v, &axis);
+            for order in 0..ORDERS {
+                let factorial: f64 = (1..=order).map(|k| k as f64).product();
+                let scale = v.powi(order as i32).sqrt() / factorial.sqrt();
+                let residual = (plus[order] - scale * smoothing[order]).abs();
+                let allowance = plus_bound[order]
+                    + plus_rounding[order]
+                    + scale * (smoothing_bounds[order] + smoothing_roundings[order]);
+                assert!(
+                    residual <= allowance,
+                    "b={b} v={v} n={order}: h_n {} vs v^(n/2)·T s^(n)/√n! {} differ by \
+                     {residual:e} > {allowance:e}",
+                    plus[order],
+                    scale * smoothing[order]
+                );
+            }
+            // s(t) − s(−t) = t, so s(b + √v·x) − s(−b − √v·x) = b + √v·x, whose
+            // coefficients are b at n = 0 and √v at n = 1; reflecting x gives (−1)ⁿ.
+            for order in 0..=HERMITE_ORDERS {
+                let sign = if order % 2 == 0 { 1.0 } else { -1.0 };
+                let exact = match order {
+                    0 => b,
+                    1 => root_v,
+                    _ => 0.0,
+                };
+                let residual = (plus[order] - sign * minus[order] - exact).abs();
+                let allowance = plus_bound[order]
+                    + minus_bound[order]
+                    + plus_rounding[order]
+                    + minus_rounding[order]
+                    + f64::EPSILON * (b.abs() + root_v);
+                assert!(
+                    residual <= allowance,
+                    "b={b} v={v} n={order}: reflection residual {residual:e} > {allowance:e}"
+                );
+            }
+            // Parseval: a partial sum cannot exceed the full energy.
+            let partial_energy: f64 = plus[..=HERMITE_ORDERS].iter().map(|h| h * h).sum();
+            let partial_slope: f64 = plus[..=HERMITE_ORDERS]
+                .iter()
+                .enumerate()
+                .map(|(order, h)| order as f64 * h * h)
+                .sum();
+            let coefficient_error: f64 = (0..=HERMITE_ORDERS)
+                .map(|order| {
+                    let error = plus_bound[order] + plus_rounding[order];
+                    (2.0 * plus[order].abs() + error) * error * (1.0 + order as f64)
+                })
+                .sum();
+            let energy_error = plus_bound[HERMITE_ORDERS + 1] + plus_rounding[HERMITE_ORDERS + 1];
+            let slope_error = plus_bound[HERMITE_ORDERS + 2] + plus_rounding[HERMITE_ORDERS + 2];
+            assert!(
+                partial_energy <= plus[HERMITE_ORDERS + 1] + energy_error + coefficient_error,
+                "b={b} v={v}: Σh_n² = {partial_energy} exceeds E s² = {}",
+                plus[HERMITE_ORDERS + 1]
+            );
+            assert!(
+                partial_slope <= plus[HERMITE_ORDERS + 2] + slope_error + coefficient_error,
+                "b={b} v={v}: Σn·h_n² = {partial_slope} exceeds v·E s'² = {}",
+                plus[HERMITE_ORDERS + 2]
+            );
+        }
+        let exact = silu_hermite_coefficients(1.25, 0.0, 4).expect("a degenerate gate is exact");
+        assert_eq!(
+            exact.coefficients,
+            vec![silu_derivatives(1.25)[0], 0.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(exact.quadrature_bound, vec![0.0; 5]);
+    }
+
+    #[test]
+    fn silu_mehler_series_reproduces_the_pair_table() {
+        // Mehler: E[s(X)·s(Y)] = Σ_n ρⁿ·h_n(X)·h_n(Y). Parseval bounds |h_n| by ‖s(X)‖, so
+        // the tail past N is at most |ρ|^{N+1}/(1 − |ρ|)·‖s(X)‖·‖s(Y)‖.
+        let (b, c, v, w): (f64, f64, f64, f64) = (0.8, -1.3, 4.0, 2.25);
+        let (first, first_bound, first_rounding) = hermite_with_rounding(b, v, HERMITE_ORDERS);
+        let (second, second_bound, second_rounding) = hermite_with_rounding(c, w, HERMITE_ORDERS);
+        let norm = |values: &[f64], bound: &[f64], rounding: &[f64]| {
+            (values[HERMITE_ORDERS + 1] + bound[HERMITE_ORDERS + 1] + rounding[HERMITE_ORDERS + 1])
+                .sqrt()
+        };
+        let first_norm = norm(&first, &first_bound, &first_rounding);
+        let second_norm = norm(&second, &second_bound, &second_rounding);
+        for correlation in [0.2, -0.45, 0.6] {
+            let r = correlation * (v * w).sqrt();
+            let (table, table_rounding) = pair_with_rounding(b, c, v, w, r);
+            let mut series = 0.0;
+            let mut series_error = 0.0;
+            let mut power = 1.0;
+            for order in 0..=HERMITE_ORDERS {
+                let first_error = first_bound[order] + first_rounding[order];
+                let second_error = second_bound[order] + second_rounding[order];
+                series += power * first[order] * second[order];
+                series_error += power.abs()
+                    * (first[order].abs() * second_error
+                        + second[order].abs() * first_error
+                        + first_error * second_error
+                        + 4.0 * f64::EPSILON * (first[order] * second[order]).abs());
+                power *= correlation;
+            }
+            let tail = correlation.abs().powi(HERMITE_ORDERS as i32 + 1)
+                / (1.0 - correlation.abs())
+                * first_norm
+                * second_norm;
+            let residual = (table.moments[0][0] - series).abs();
+            let allowance =
+                table.quadrature_bound[0][0] + table_rounding[0][0] + series_error + tail;
+            assert!(
+                residual <= allowance,
+                "ρ={correlation}: pair table {} vs Mehler series {series} differ by {residual:e} \
+                 > {allowance:e}",
+                table.moments[0][0]
+            );
+        }
+    }
+
+    #[test]
+    fn silu_hermite_rule_is_stable_under_step_halving_and_detects_an_under_resolved_rule() {
+        for (b, v) in SMOOTHING_LAWS {
+            let axis = hermite_rule(b, v, HERMITE_ORDERS);
+            let halved = TrapezoidAxis {
+                step: 0.5 * axis.step,
+                half_count: 2 * axis.half_count,
+                ..axis
+            };
+            let coarse = TrapezoidAxis {
+                step: 4.0 * axis.step,
+                half_count: axis.half_count.div_ceil(4),
+                ..axis
+            };
+            let values = hermite_sums(b, v, HERMITE_ORDERS, &axis);
+            let bound = hermite_bound(b, v, HERMITE_ORDERS, &axis);
+            let rounding = hermite_rounding(b, v, HERMITE_ORDERS, &axis);
+            let halved_values = hermite_sums(b, v, HERMITE_ORDERS, &halved);
+            let halved_bound = hermite_bound(b, v, HERMITE_ORDERS, &halved);
+            let halved_rounding = hermite_rounding(b, v, HERMITE_ORDERS, &halved);
+            let coarse_values = hermite_sums(b, v, HERMITE_ORDERS, &coarse);
+            let coarse_bound = hermite_bound(b, v, HERMITE_ORDERS, &coarse);
+            let coarse_rounding = hermite_rounding(b, v, HERMITE_ORDERS, &coarse);
+            let ln_scales = hermite_ln_strip_masses(b, v, HERMITE_ORDERS, 0.0);
+            let mut largest_excess = f64::NEG_INFINITY;
+            for entry in 0..values.len() {
+                let change = (values[entry] - halved_values[entry]).abs();
+                let allowance =
+                    bound[entry] + halved_bound[entry] + rounding[entry] + halved_rounding[entry];
+                assert!(
+                    change <= allowance,
+                    "b={b} v={v} entry {entry}: halving the step moved it by {change:e} > \
+                     {allowance:e}"
+                );
+                let coarse_error = (coarse_values[entry] - values[entry]).abs();
+                let coarse_allowance =
+                    coarse_bound[entry] + bound[entry] + rounding[entry] + coarse_rounding[entry];
+                assert!(
+                    coarse_error <= coarse_allowance,
+                    "b={b} v={v} entry {entry}: the quarter-density rule is off by \
+                     {coarse_error:e}, beyond its bound {coarse_allowance:e}"
+                );
+                largest_excess = largest_excess.max(
+                    coarse_error
+                        - (f64::EPSILON * ln_scales[entry].exp()
+                            + rounding[entry]
+                            + coarse_rounding[entry]),
+                );
+            }
+            assert!(
+                largest_excess > 0.0,
+                "b={b} v={v}: the quarter-density rule met the production contract, so this \
+                 comparison cannot detect an under-resolved rule (largest excess {largest_excess:e})"
+            );
         }
     }
 
@@ -1550,13 +2063,13 @@ mod tests {
             lambda_kj: dot(&up_k, &project(&retained, &gate_j)),
             rho: dot(&up_j, &project(&retained, &up_k)),
         };
-        let moments = silu_pair_moments(
+        let moments = silu_pair_moments(exact_law(
             bias_j,
             bias_k,
             dot(&gate_j, &gate_j),
             dot(&gate_k, &gate_k),
             dot(&gate_j, &project(&retained, &gate_k)),
-        )
+        ))
         .expect("a valid pair law");
         let moment = gated_pair_second_moment(&law, &moments);
         let mut stream = GaussianStream::new(0x2946_0010);

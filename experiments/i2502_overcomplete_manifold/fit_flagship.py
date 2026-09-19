@@ -60,9 +60,9 @@ def lane_kwargs(lane, top_k):
     """Per-lane validated recipes: support-sparse minimal contract for topk;
     the bench/massive_k_manifold_validate regime for threshold_gate."""
     if lane == "topk":
-        return dict(top_k=top_k, sparsity_weight=0.0, ard_per_atom=True)
+        return dict(top_k=top_k, sparsity_weight=0.0)
     return dict(sparsity_weight=0.01, smoothness_weight=0.01,
-                isometry_weight=0.0, learning_rate=1.0, ard_per_atom=False)
+                isometry_weight=0.0, learning_rate=1.0)
 
 
 def run_arm(out, name, base, fitfn, X_train, X_test):
@@ -141,7 +141,7 @@ def main():
             model, _ = run_arm(
                 out, f"pilot_{lane}_k{args.pilot_k}{args.tag}",
                 {**base, "k": args.pilot_k, "n_train": len(Xp), "lane": lane},
-                lambda lane=lane: gamfit.sae_manifold_fit(
+                lambda lane=lane: gamfit.sae.sae_manifold_fit(
                     Xp, K=args.pilot_k, d_atom=1,
                     assignment=lane, n_iter=args.n_iter, random_state=args.seed,
                     gpu=args.gpu, **lane_kwargs(lane, args.top_k),
@@ -152,7 +152,7 @@ def main():
     if "manifold" in args.arms:
         model, alive = run_arm(
             out, f"manifold_k{args.k}", {**base, "k": args.k, "lane": args.lane},
-            lambda: gamfit.sae_manifold_fit(
+            lambda: gamfit.sae.sae_manifold_fit(
                 X_train, K=args.k, d_atom=1,
                 assignment=args.lane, n_iter=args.n_iter, random_state=args.seed,
                 gpu=args.gpu, **lane_kwargs(args.lane, args.top_k)),
@@ -169,7 +169,7 @@ def main():
     if "linear" in args.arms:
         model, _ = run_arm(
             out, f"linear_k{args.k}", {**base, "k": args.k},
-            lambda: gamfit.sae_manifold_fit(
+            lambda: gamfit.sae.sae_manifold_fit(
                 X_train, K=args.k, assignment="softmax", top_k=args.top_k,
                 n_iter=30, random_state=args.seed, gpu=args.gpu),
             X_train, X_test)

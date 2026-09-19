@@ -9,17 +9,13 @@
 //! Three gates, one per §7 item that is landable today:
 //!
 //!  §7.1 — exact affine pass-through at the DEFAULT settings
-//!         (`exact_affine_passes_through_at_default_tau`). The realized term
-//!         today is the single-scale/multiscale energy of `measure_jet_energy_form`, not
-//!         the §1 unpenalized-head frame basis, so machine-exact affine
-//!         pass-through requires that future frame block. The strongest
+//!         (`exact_affine_passes_through`). The realized term today is the
+//!         single-scale/multiscale energy of `measure_jet_energy_form`, not
+//!         the §1 unpenalized-head frame basis, so affine pass-through of the
+//!         fit itself requires that future frame block. The strongest
 //!         property the current energy gives is asserted: an ambient-affine
-//!         function over the centers is damped to ≤ 1e-2× a rough vector at
-//!         the DEFAULT τ = 1e-3 (not merely at τ = 0), AND exactly annihilated
-//!         (≤ 1e-8× rough) at τ = 0 (the rank-revealing local-affine
-//!         projection). UPGRADE: when the §1 unpenalized polynomial head lands
-//!         this becomes machine-exact at the default τ too — tighten the
-//!         default-τ bound to the τ = 0 tolerance.
+//!         function over the centers is exactly annihilated (≤ 1e-8× a rough
+//!         vector) by the rank-revealing local-affine projection.
 //!
 //!  §7.2 — off-support variance growth obeys the support-domination theorem
 //!         (`support_domination_variance_monotone`): plain Euclidean
@@ -31,8 +27,8 @@
 //!
 //!  §7.3 — near-miss strand decoupling, re-verified under the single-scale-mode
 //!         default (`near_miss_decoupling_holds_in_single_scale_mode`): two parallel
-//!         strands at a near-miss separation pay at most the τ-ridge toll for
-//!         the cross-strand value offset — ≤ 1e-2× the checkerboard energy —
+//!         strands at a near-miss separation pay no energy for the
+//!         cross-strand value offset — ≤ 1e-8× the checkerboard energy —
 //!         because the offset is ambient-affine on the support.
 
 use gam::basis::{MeasureJetBand, measure_jet_band, measure_jet_energy_form};
@@ -40,17 +36,12 @@ use ndarray::{Array1, Array2};
 
 /// `MeasureJetBasisSpec` default dials, made explicit for the energy-form
 /// gates: the `order_s = 0.0` sentinel realizes s = 1.5
-/// (`MEASURE_JET_DEFAULT_ORDER_S`), α = 1, and the DEFAULT τ ridge is 1e-3.
-/// These mirror the constants the in-module and near-miss tests pin so the
-/// gates speak to exactly the displayed analysis-form target.
+/// (`MEASURE_JET_DEFAULT_ORDER_S`) and α = 1. These mirror the constants the
+/// in-module and near-miss tests pin so the gates speak to exactly the
+/// displayed analysis-form target.
 const ORDER_S: f64 = 1.5;
 const ALPHA: f64 = 1.0;
-const TAU_DEFAULT: f64 = 1e-3;
-/// Affine damping ceiling at the default τ (§7.1): the local affine residual
-/// of a function already in the affine span survives only through the ridge
-/// `λ_k τ / (λ_k + τ) ≤ τ`, two orders below a rough vector's full residual.
-const AFFINE_DEFAULT_TAU_RATIO: f64 = 1e-2;
-/// Machine-precision affine annihilation at τ = 0 (rank-revealing projection).
+/// Machine-precision affine annihilation (rank-revealing projection).
 const AFFINE_EXACT_RATIO: f64 = 1e-8;
 
 fn quadratic_form(q: &Array2<f64>, v: &Array1<f64>) -> f64 {
@@ -58,7 +49,7 @@ fn quadratic_form(q: &Array2<f64>, v: &Array1<f64>) -> f64 {
 }
 
 // ===========================================================================
-// Gate §7.1 — exact affine pass-through at the DEFAULT τ.
+// Gate §7.1 — exact affine pass-through.
 // ===========================================================================
 
 /// Deterministic 2-D center cloud: a `GRID × GRID` lattice on [0, 1]² with a
@@ -83,7 +74,7 @@ fn lattice_centers() -> (Array2<f64>, Array1<f64>) {
 
 /// An ambient-affine function sampled at the centers: f(x, y) = a + b·x + c·y.
 /// On any support this lies in every local affine fit's column span, so the
-/// jet-residual energy can charge it only the τ-ridge toll.
+/// jet-residual energy annihilates it.
 fn affine_over_centers(centers: &Array2<f64>) -> Array1<f64> {
     let a = 0.4;
     let b = 1.3;
@@ -104,15 +95,14 @@ fn rough_over_centers(centers: &Array2<f64>) -> Array1<f64> {
     })
 }
 
-/// §7.1. The ambient-affine field over the centers is near-null for the
-/// jet-residual energy at the DEFAULT τ = 1e-3 — damped to ≤ 1e-2× the rough
-/// comparator — and EXACTLY annihilated (≤ 1e-8× rough) at τ = 0, the
-/// rank-revealing local-affine projection. This is the strongest affine
-/// pass-through property the current energy realization exposes; the
-/// machine-exact-at-default-τ form needs the unlanded §1 unpenalized
-/// polynomial head (see module docs UPGRADE note).
+/// §7.1. The ambient-affine field over the centers is EXACTLY annihilated
+/// (≤ 1e-8× the rough comparator) by the jet-residual energy at the default
+/// dials: the field lies in the local affine span, which the rank-revealing
+/// local-affine projection removes. This is the strongest affine pass-through
+/// property the current energy realization exposes; pass-through of the fit
+/// itself needs the unlanded §1 unpenalized polynomial head.
 #[test]
-fn exact_affine_passes_through_at_default_tau() {
+fn exact_affine_passes_through() {
     let (centers, masses) = lattice_centers();
     let band: MeasureJetBand =
         measure_jet_band(centers.view(), 0).expect("auto band over deterministic lattice");
@@ -120,18 +110,10 @@ fn exact_affine_passes_through_at_default_tau() {
     let affine = affine_over_centers(&centers);
     let rough = rough_over_centers(&centers);
 
-    // Default τ = 1e-3: only the ridge toll on the affine field may survive.
-    let q_default = measure_jet_energy_form(
-        centers.view(),
-        masses.view(),
-        &band,
-        ORDER_S,
-        ALPHA,
-        TAU_DEFAULT,
-    )
-    .expect("default-τ energy form");
-    let e_affine = quadratic_form(&q_default, &affine);
-    let e_rough = quadratic_form(&q_default, &rough);
+    let q = measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA)
+        .expect("energy form");
+    let e_affine = quadratic_form(&q, &affine);
+    let e_rough = quadratic_form(&q, &rough);
     assert!(
         e_rough > 0.0,
         "the rough comparator must pay energy; got {e_rough:.3e}"
@@ -141,26 +123,9 @@ fn exact_affine_passes_through_at_default_tau() {
         "energy form must be PSD; affine energy {e_affine:.3e} is negative"
     );
     assert!(
-        e_affine <= AFFINE_DEFAULT_TAU_RATIO * e_rough,
-        "ambient-affine field is not near-null at the DEFAULT τ: vᵀQv = {e_affine:.3e} \
-         vs {AFFINE_DEFAULT_TAU_RATIO:.0e} × rough {e_rough:.3e}"
-    );
-
-    // τ = 0 (pseudo-inverse oracle mode): machine-precision affine
-    // annihilation — the field lies exactly in the local affine span.
-    let q_unridged =
-        measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA, 0.0)
-            .expect("unridged energy form");
-    let e_affine0 = quadratic_form(&q_unridged, &affine);
-    let e_rough0 = quadratic_form(&q_unridged, &rough);
-    assert!(
-        e_rough0 > 0.0,
-        "rough comparator energy must stay positive at τ = 0; got {e_rough0:.3e}"
-    );
-    assert!(
-        e_affine0.abs() <= AFFINE_EXACT_RATIO * e_rough0,
-        "unridged affine energy {e_affine0:.3e} is not annihilated vs \
-         {AFFINE_EXACT_RATIO:.0e} × rough {e_rough0:.3e}"
+        e_affine.abs() <= AFFINE_EXACT_RATIO * e_rough,
+        "affine energy {e_affine:.3e} is not annihilated vs \
+         {AFFINE_EXACT_RATIO:.0e} × rough {e_rough:.3e}"
     );
 }
 
@@ -186,9 +151,6 @@ const NM_C2: f64 = 1.0;
 /// Gaussian profile truncation in units of ε (mirrors the module cutoff so the
 /// near-miss diagnostic below sums the same kernel support the energy uses).
 const NM_PROFILE_CUTOFF: f64 = 3.0;
-/// Decoupling ceiling: the cross-strand value offset pays ≤ 1e-2× the
-/// checkerboard energy.
-const NM_DECOUPLE_RATIO: f64 = 1e-2;
 
 fn parallel_strand_centers() -> (Array2<f64>, Array1<f64>) {
     let m = 2 * NM_M1;
@@ -206,12 +168,12 @@ fn parallel_strand_centers() -> (Array2<f64>, Array1<f64>) {
 }
 
 /// §7.3. Two parallel strands at a near-miss separation, evaluated with the
-/// single-scale-mode default energy (default τ = 1e-3). The cross-strand two-level
-/// offset (c1 on strand 1, c2 on strand 2) equals the ambient-affine function
+/// single-scale-mode default energy. The cross-strand two-level offset (c1 on
+/// strand 1, c2 on strand 2) equals the ambient-affine function
 /// c1 + (c2−c1)·y/δ on the support {y = 0} ∪ {y = δ}, so it lives in the local
-/// affine span and the energy charges it only the τ-ridge toll — ≤ 1e-2× the
-/// checkerboard energy, which pays the full multiscale residual. Re-verifies
-/// the §7.3 affine-order decoupling under the new default.
+/// affine span and the energy annihilates it — ≤ 1e-8× the checkerboard
+/// energy, which pays the full multiscale residual. Re-verifies the §7.3
+/// affine-order decoupling under the new default.
 #[test]
 fn near_miss_decoupling_holds_in_single_scale_mode() {
     let (centers, masses) = parallel_strand_centers();
@@ -238,18 +200,12 @@ fn near_miss_decoupling_holds_in_single_scale_mode() {
         if parity % 2 == 0 { 1.0 } else { -1.0 }
     });
 
-    // single-scale-mode default τ: only the affine-order ridge toll may survive.
-    let q_default = measure_jet_energy_form(
-        centers.view(),
-        masses.view(),
-        &band,
-        ORDER_S,
-        ALPHA,
-        TAU_DEFAULT,
-    )
-    .expect("default-τ energy form");
-    let e_offset = quadratic_form(&q_default, &offset);
-    let e_checker = quadratic_form(&q_default, &checker);
+    // The offset lives EXACTLY in the local affine span, so the single-scale
+    // energy leaves only roundoff on it.
+    let q = measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA)
+        .expect("energy form");
+    let e_offset = quadratic_form(&q, &offset);
+    let e_checker = quadratic_form(&q, &checker);
 
     assert!(
         e_checker > 0.0,
@@ -260,22 +216,8 @@ fn near_miss_decoupling_holds_in_single_scale_mode() {
         "energy form must be PSD; offset energy {e_offset:.3e} is negative"
     );
     assert!(
-        e_offset <= NM_DECOUPLE_RATIO * e_checker,
-        "parallel-strand value offset is not decoupled at affine order in single-scale mode: \
-         vᵀQv = {e_offset:.3e} vs {NM_DECOUPLE_RATIO:.0e} × checkerboard {e_checker:.3e}"
-    );
-
-    // τ = 0 floor check: the offset lives EXACTLY in the local affine span, so
-    // the single-scale-mode coupling above is genuinely the ridge toll, not a small
-    // residual that happens to clear the ratio.
-    let q_unridged =
-        measure_jet_energy_form(centers.view(), masses.view(), &band, ORDER_S, ALPHA, 0.0)
-            .expect("unridged energy form");
-    let e_offset0 = quadratic_form(&q_unridged, &offset);
-    let e_checker0 = quadratic_form(&q_unridged, &checker);
-    assert!(
-        e_offset0.abs() <= AFFINE_EXACT_RATIO * e_checker0,
-        "unridged parallel offset energy {e_offset0:.3e} vs {AFFINE_EXACT_RATIO:.0e} × \
-         checkerboard {e_checker0:.3e} — the near-miss offset is not exactly affine"
+        e_offset.abs() <= AFFINE_EXACT_RATIO * e_checker,
+        "parallel offset energy {e_offset:.3e} vs {AFFINE_EXACT_RATIO:.0e} × \
+         checkerboard {e_checker:.3e} — the near-miss offset is not exactly affine"
     );
 }

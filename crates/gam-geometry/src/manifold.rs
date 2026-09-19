@@ -38,6 +38,30 @@ pub enum GeometryError {
         support_radius: f64,
         uniqueness_radius: f64,
     },
+    /// The weighted support of a Fréchet mean on a positively curved manifold
+    /// spreads from its seed, a positive-mass sample, by at least twice the
+    /// global-uniqueness radius. A mean certified by that radius would lie
+    /// within it of every positive-mass sample, the seed included, so by the
+    /// triangle inequality no stationary point can be certified and the Karcher
+    /// descent is not run. Callers must provide an explicit base point or
+    /// better-localized data.
+    FrechetMeanSupportNotLocalized {
+        context: &'static str,
+        seed_spread: f64,
+        uniqueness_radius: f64,
+    },
+    /// A point that must lie on the unit sphere is off it by more than an f64
+    /// normalization can leave it: `squared_norm_defect = |‖p‖² − 1|` exceeds
+    /// [`unit_normalization_band`](gam_math::roundoff::unit_normalization_band).
+    /// Iterates stay inside that band by construction (the sphere exponential
+    /// normalizes its output), so this names an input that was never normalized
+    /// in f64, or not normalized at all. It is refused rather than normalized
+    /// silently, so a wrong vector passed as a point is caught where it enters.
+    PointOffUnitSphere {
+        context: &'static str,
+        squared_norm_defect: f64,
+        band: f64,
+    },
 }
 
 impl fmt::Display for GeometryError {
@@ -73,6 +97,26 @@ impl fmt::Display for GeometryError {
                  {tolerance:.6e}) but its weighted support radius \
                  {support_radius:.6e} is not below the global-uniqueness radius \
                  {uniqueness_radius:.6e}"
+            ),
+            Self::FrechetMeanSupportNotLocalized {
+                context,
+                seed_spread,
+                uniqueness_radius,
+            } => write!(
+                f,
+                "{context}: the weighted support spreads {seed_spread:.6e} from its seed, \
+                 at least twice the global-uniqueness radius {uniqueness_radius:.6e}, so no \
+                 stationary point can be certified as the unique global mean"
+            ),
+            Self::PointOffUnitSphere {
+                context,
+                squared_norm_defect,
+                band,
+            } => write!(
+                f,
+                "{context}: the point is not unit-norm in f64: |‖p‖² − 1| = \
+                 {squared_norm_defect:.3e} exceeds {band:.3e}, the widest an f64 normalization \
+                 leaves it; normalize the point in f64 before passing it, e.g. p / ‖p‖"
             ),
         }
     }
@@ -591,10 +635,12 @@ pub(crate) fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
 /// auto-dispatch `fast_ab` (single-device GPU or faer). f64 throughout, so the
 /// result is identical regardless of which path produced it.
 ///
-/// Choosing the tiling: we target as many equal tiles as there are output rows
-/// can support while keeping each tile a non-trivial GEMM, so the batch axis is
-/// long enough to cross `crate::gpu::linalg_dispatch`'s multi-GPU batch floor and spread
-/// across every device.
+/// Choosing the tiling: the dispatch layer splits a batch across devices once
+/// the batch reaches its multi-GPU batch floor
+/// ([`GpuGemmDispatch::multi_gpu_batch_floor`](gam_linalg::gpu_hook::GpuGemmDispatch::multi_gpu_batch_floor)),
+/// so the rows are cut into equal tiles of `⌊m/floor⌋` rows, at least `floor`
+/// of them. Whether a batch of that shape is worth the GPU at all is the
+/// dispatch policy's own decision.
 pub(crate) fn fast_ab_rows_multi_gpu(
     a: ArrayView2<'_, f64>,
     b: ArrayView2<'_, f64>,
@@ -604,16 +650,17 @@ pub(crate) fn fast_ab_rows_multi_gpu(
     let (kb, n) = b.dim();
     assert_eq!(k, kb, "fast_ab_rows_multi_gpu inner dimension mismatch");
 
-    // Only worth the reshape/stitch overhead when the pool actually has more than
-    // one device and there are enough rows to tile across it; otherwise the plain
-    // single-device shim is strictly better.
-    let multi_gpu = gam_linalg::gpu_hook::gpu_dispatch().is_some_and(|d| d.device_count() > 1);
-    // The batch axis must clear the multi-GPU floor used inside the dispatch
-    // layer (64) for the split to engage, so we need at least that many tiles.
-    const MIN_TILES: usize = 64;
-    const MIN_TILE_ROWS: usize = 4;
-    if multi_gpu && m >= MIN_TILES * MIN_TILE_ROWS && n > 0 {
-        let rows_per_tile = (m / MIN_TILES).max(MIN_TILE_ROWS);
+    // Only worth the reshape/stitch overhead when the pool can split a batch at
+    // all (more than one device) and there are at least as many rows as the
+    // split needs tiles; otherwise the plain single-device shim is strictly
+    // better.
+    let floor = gam_linalg::gpu_hook::gpu_dispatch().and_then(|d| d.multi_gpu_batch_floor());
+    if let Some(floor) = floor
+        && floor > 0
+        && m >= floor
+        && n > 0
+    {
+        let rows_per_tile = m / floor;
         let tiles = m / rows_per_tile;
         let covered = tiles * rows_per_tile;
         // Reshape the first `covered` rows into a tiles×rows_per_tile×k batch

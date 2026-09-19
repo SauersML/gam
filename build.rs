@@ -198,6 +198,15 @@ fn main() {
     let mut debug_eprintln_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_debug_eprintln(&manifest_dir, &manifest_dir, &mut debug_eprintln_offenders);
 
+    // gam#2967: a survival marginal-slope primary tower (`Tower3`/`Tower4`) is
+    // seeded and evaluated only inside the out-of-line
+    // `SurvivalMarginalSlopeFamily::write_primary_tower`. A tower seeded inline
+    // puts the row program's 64-276 KiB frame in its caller, and a Rayon
+    // closure's frame can be inlined into every level of the recursive split,
+    // which overflowed 2 MiB default workers.
+    let mut marginal_slope_tower_seed_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_marginal_slope_tower_seeds(&manifest_dir, &mut marginal_slope_tower_seed_offenders);
+
     // Bare `const <ident>: bool = <literal>;` items are dead-by-construction
     // guards (rustc's `dead_code` cannot prove unreachability through them)
     // or constant truths that should not exist. Real toggles belong in
@@ -496,6 +505,21 @@ fn main() {
             title: "eprintln!/eprint! with {:?} debug formatting (use real logging or delete)"
                 .to_string(),
             rows: debug_eprintln_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !marginal_slope_tower_seed_offenders.is_empty() {
+        sections.push(Section {
+            title: "survival marginal-slope primary tower seeded outside \
+                    `SurvivalMarginalSlopeFamily::write_primary_tower`, or that owner lost \
+                    `#[inline(never)]` (gam#2967: the row program's frame then lands in the \
+                    caller, and in a Rayon closure at every split level; evaluate the tower \
+                    through the owner)"
+                .to_string(),
+            rows: marginal_slope_tower_seed_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -2984,6 +3008,137 @@ fn scan_for_debug_eprintln(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
             }
         }
     });
+}
+
+const MARGINAL_SLOPE_DIR: &str = "crates/gam-models/src/survival/marginal_slope";
+const MARGINAL_SLOPE_TOWER_OWNER_FILE: &str =
+    "crates/gam-models/src/survival/marginal_slope/contraction.rs";
+const MARGINAL_SLOPE_TOWER_OWNER_FN: &str = "fnwrite_primary_tower<";
+
+/// gam#2967. In the survival marginal-slope module's production code a rigid
+/// row's primary tower (`Tower3` / `Tower4`, sparse or dense) is seeded and
+/// evaluated only inside `SurvivalMarginalSlopeFamily::write_primary_tower`, and
+/// that owner stays `#[inline(never)]`. Evaluated inline, the row program's jet
+/// intermediates (64 KiB at four primaries, 276 KiB at six) sit in the caller's
+/// frame. When the caller is a Rayon closure the optimizer may inline it into the
+/// recursive split helper, which then reserves the whole row program at every
+/// split level: gnomon's 2,000-row fit overflowed 2 MiB default workers with
+/// 80,000-byte split frames. Out of line, the program's frame exists once per
+/// thread, at the leaf, whatever the inliner does.
+///
+/// Matching runs on the stripped code with all whitespace removed, so a seed
+/// cannot be hidden by reformatting; test code is exempt.
+fn scan_for_marginal_slope_tower_seeds(root: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    enforce_tower_seed_matcher_invariants();
+    let mut owner_file_seen = false;
+    visit_files(root, &root.join(MARGINAL_SLOPE_DIR), &mut |rel, content| {
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        let mask = compute_test_mask(content, rel);
+        let stripped_lines = strip_file_lines(content);
+        let mut stream = String::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for (idx, line) in stripped_lines.iter().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            for ch in line.chars().filter(|ch| !ch.is_whitespace()) {
+                stream.push(ch);
+                while owner.len() < stream.len() {
+                    owner.push(idx);
+                }
+            }
+        }
+        let raw_lines: Vec<&str> = content.lines().collect();
+        let line_text =
+            |idx: usize| raw_lines.get(idx).map(|l| l.trim().to_string()).unwrap_or_default();
+        for pos in tower_seed_positions(&stream) {
+            let idx = owner.get(pos).copied().unwrap_or(0);
+            offenders.push((rel.to_path_buf(), idx + 1, line_text(idx)));
+        }
+        if rel.to_string_lossy().replace('\\', "/") == MARGINAL_SLOPE_TOWER_OWNER_FILE {
+            owner_file_seen = true;
+            match stream.find(MARGINAL_SLOPE_TOWER_OWNER_FN) {
+                Some(at) => {
+                    let item_start = stream[..at].rfind(['}', ';']).map_or(0, |b| b + 1);
+                    if !stream[item_start..at].contains("#[inline(never)]") {
+                        let idx = owner.get(at).copied().unwrap_or(0);
+                        offenders.push((rel.to_path_buf(), idx + 1, line_text(idx)));
+                    }
+                }
+                None => offenders.push((
+                    rel.to_path_buf(),
+                    1,
+                    "the tower owner `write_primary_tower` is missing from this file".to_string(),
+                )),
+            }
+        }
+    });
+    if !owner_file_seen {
+        offenders.push((
+            PathBuf::from(MARGINAL_SLOPE_TOWER_OWNER_FILE),
+            1,
+            "the tower owner's file is missing".to_string(),
+        ));
+    }
+}
+
+/// Byte offsets of every `Tower3::variable(` / `Tower4::variable(` seed in a
+/// whitespace-free code stream, with any path prefix (`G::`, `SparseTower4`,
+/// `gam_math::jet_tower::`) and an optional turbofish (`Tower4::<2>::variable(`).
+fn tower_seed_positions(stream: &str) -> Vec<usize> {
+    const CALL: &str = "::variable(";
+    let bytes = stream.as_bytes();
+    let mut found = Vec::new();
+    for (at, _) in stream.match_indices(CALL) {
+        let mut end = at;
+        if end > 0 && bytes[end - 1] == b'>' {
+            let mut depth = 0usize;
+            let mut open = None;
+            for back in (0..end).rev() {
+                match bytes[back] {
+                    b'>' => depth += 1,
+                    b'<' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(back);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match open {
+                Some(open) if stream[..open].ends_with("::") => end = open - 2,
+                _ => continue,
+            }
+        }
+        let path = &stream[..end];
+        if path.ends_with("Tower3") || path.ends_with("Tower4") {
+            found.push(at);
+        }
+    }
+    found
+}
+
+fn enforce_tower_seed_matcher_invariants() {
+    for seed in [
+        "std::array::from_fn(|axis|G::Tower4::variable(primaries[axis],axis))",
+        "std::array::from_fn(|a|SparseTower4::variable(shifted[a],a))",
+        "letqt=Tower4::<2>::variable(q,0);",
+        "gam_math::jet_tower::Tower3::variable(0.0,axis)",
+    ] {
+        assert_eq!(tower_seed_positions(seed).len(), 1, "tower seed matcher misses {seed}");
+    }
+    for other in [
+        "std::array::from_fn(|a|S::variable(primaries[a],a))",
+        "OneSeed::variable(x,0)",
+        "G::Tower4::constant(0.0)",
+        "MyTower40::variable(x,0)",
+    ] {
+        assert!(tower_seed_positions(other).is_empty(), "tower seed matcher flags {other}");
+    }
 }
 
 /// Per-line wrapper around `strip_strings_and_comments_stateful` that

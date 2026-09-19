@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run -p gam-sae --release --example support_fit_dump -- \
-//!     chart.bin <rows> <cols> <k_atoms> <top_k> <max_cycles> <out_dir>
+//!     chart.bin <rows> <cols> <k_atoms> <top_k> <out_dir>
 //! ```
 
 use gam_sae::front_door::{SaeFitLane, admit_topk_manifold};
@@ -66,13 +66,13 @@ fn build_digest() -> String {
 fn main() -> Result<(), String> {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
-    if !matches!(args.len(), 8 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21) {
-        return Err("usage: support_fit_dump <f64-le.bin> <rows> <cols> <k> <top_k> <max_cycles> <out_dir> [test.bin test_rows] [reserved] [seed]".into());
+    if !matches!(args.len(), 7 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20) {
+        return Err("usage: support_fit_dump <f64-le.bin> <rows> <cols> <k> <top_k> <out_dir> [test.bin test_rows] [reserved] [seed]".into());
     }
     // Seed for BOTH the support cold start and the term seed. A single fit
     // cannot support a gap claim, so this has to be varied and reported.
-    let seed_arg: u64 = if args.len() >= 12 {
-        args[11].parse().map_err(|e| format!("seed: {e}"))?
+    let seed_arg: u64 = if args.len() >= 11 {
+        args[10].parse().map_err(|e| format!("seed: {e}"))?
     } else {
         0
     };
@@ -86,7 +86,7 @@ fn main() -> Result<(), String> {
     // silent downgrade -- a run that asked for one model and got another is
     // how this campaign ended up reporting fixed-smoothing numbers from an
     // alternating fit, which is why the mode is echoed on the line above.
-    if args.get(12).map(String::as_str) == Some("fixed") {
+    if args.get(11).map(String::as_str) == Some("fixed") {
         return Err(
             "fixed smoothing was removed: it pins lambda = 1 for every atom, \
              which is not a selection. Pass `reml`."
@@ -97,16 +97,16 @@ fn main() -> Result<(), String> {
     // Coordinate-prior precision. Fixed at 1.0 for the whole campaign because
     // nothing selected it; `0` removes the prior entirely, which is the arm the
     // containment argument needs.
-    let alpha_arg: f64 = if args.len() >= 14 {
-        args[13].parse().map_err(|e| format!("alpha: {e}"))?
+    let alpha_arg: f64 = if args.len() >= 13 {
+        args[12].parse().map_err(|e| format!("alpha: {e}"))?
     } else {
         1.0
     };
     // Smoothing strength. Same unselected-penalty asymmetry as `alpha`: this
     // charges `lambda * tr(B' S B)` on the decoder while the TopK SAE baseline
     // carries no decoder penalty at all.
-    let lambda_arg: f64 = if args.len() >= 15 {
-        args[14].parse().map_err(|e| format!("lambda: {e}"))?
+    let lambda_arg: f64 = if args.len() >= 14 {
+        args[13].parse().map_err(|e| format!("lambda: {e}"))?
     } else {
         1.0
     };
@@ -116,8 +116,7 @@ fn main() -> Result<(), String> {
     let cols: usize = args[3].parse().map_err(|e| format!("cols: {e}"))?;
     let k_atoms: usize = args[4].parse().map_err(|e| format!("k: {e}"))?;
     let top_k: usize = args[5].parse().map_err(|e| format!("top_k: {e}"))?;
-    let max_cycles: usize = args[6].parse().map_err(|e| format!("max_cycles: {e}"))?;
-    let out_dir = &args[7];
+    let out_dir = &args[6];
     std::fs::create_dir_all(out_dir).map_err(|e| format!("{out_dir}: {e}"))?;
 
     let bytes = std::fs::read(&args[1]).map_err(|e| format!("{}: {e}", args[1]))?;
@@ -139,8 +138,8 @@ fn main() -> Result<(), String> {
     // every atom to "linear" reduces this model to the TopK SAE it contains,
     // which is how the optimizer is measured separately from the manifold
     // hypothesis.
-    let topology_arg = if args.len() >= 11 && args[10] != "0" {
-        args[10].clone()
+    let topology_arg = if args.len() >= 10 && args[9] != "0" {
+        args[9].clone()
     } else {
         "auto".to_string()
     };
@@ -307,9 +306,9 @@ fn main() -> Result<(), String> {
     println!("seeded: retained {k_ret} of {k_atoms}");
 
     // Which tolerance the initial fit actually certified at, and how many
-    // cycles it consumed getting there. `max_cycles` is the request; these are
-    // the dose, and they differ by up to 120 cycles across arms this issue
-    // compares directly.
+    // cycles it consumed getting there. The inner fixed point takes no cycle
+    // budget (#2576); these are the dose, and they differ by up to 120 cycles
+    // across arms this issue compares directly.
     let certified_tolerance = std::cell::Cell::new(1.0e-4_f64);
     let escalation_cycles = std::cell::Cell::new(0_usize);
     // "exact_train" arms the exact affine ranking BEFORE the initial solve, so
@@ -334,19 +333,18 @@ fn main() -> Result<(), String> {
     // prior through extra drift rounds. Same derived rule, per quantity.
     let mut previous_ard_move = f64::INFINITY;
     let mut ard_frozen = false;
-    // A capped fit still holds a usable model: the objective converges long before
+    // A refused fit still holds a usable model: the objective converges long before
     // the KKT test does (measured on the all-linear arm -- objective flat to 2e-5
     // relative over the last 170 of 2000 cycles, while `raw KKT rel` sat at 2.7e-4
     // against a 1e-4 request and `max_change` stayed pinned at 8.578e-1, a parameter
     // move the objective does not see). Returning `Err` there throws the whole fit
     // away; three hours of compute produced no artifact at all. Report the miss
-    // loudly, then re-enter for one cycle at the tolerance the iterate actually
-    // reached so the caller gets a real report and the atoms can be dumped.
+    // loudly, then re-solve at the tolerance the iterate actually reached so the
+    // caller gets a real report and the atoms can be dumped.
     let mut report = match term_seed.term.solve_fixed_point(
         centered.view(),
         &lambda,
         &ard,
-        max_cycles,
         1.0e-4,
         1.0,
     ) {
@@ -356,17 +354,12 @@ fn main() -> Result<(), String> {
             eprintln!("[fit] accepting the stalled iterate; downstream numbers carry this caveat");
             term_seed
                 .term
-                // Three cycles, not one: the certificate needs `candidate &&
-                // previous_candidate` -- two CONSECUTIVE qualifying cycles -- so a
-                // single-cycle re-entry can never certify and errors out too, which
-                // is exactly what discarded the first attempt at this fallback.
-                //
-                // And escalate the tolerance until one closes. Both limbs are
+                // Escalate the tolerance until one closes. Both limbs are
                 // relative to the objective scale, so a fit still moving fast fails
                 // even a loose request: measured, a 2-cycle toy moved 4.07e5 against
                 // a 2.3e4 threshold at 1e-2. Report which tolerance certified, so
                 // the caveat travels with the numbers.
-                .solve_fixed_point(centered.view(), &lambda, &ard, 20, 1.0e-2, 1.0)
+                .solve_fixed_point(centered.view(), &lambda, &ard, 1.0e-2, 1.0)
                 .inspect(|report| {
                     certified_tolerance.set(1.0e-2);
                     escalation_cycles.set(escalation_cycles.get() + report.iterations);
@@ -383,7 +376,6 @@ fn main() -> Result<(), String> {
                             centered.view(),
                             &lambda,
                             &ard,
-                            20,
                             tolerance,
                             1.0,
                         ) {
@@ -637,13 +629,12 @@ fn main() -> Result<(), String> {
             ard = updated_ard;
         }
         // The same acceptance ladder as the initial solve: a re-solve that
-        // misses its cap still holds a usable iterate, and returning Err here
-        // is what discarded a four-round REML arm at its round-4 cap.
+        // refuses still holds a usable iterate, and returning Err here is what
+        // discarded a four-round REML arm at its round 4.
         report = match term_seed.term.solve_fixed_point(
             centered.view(),
             &lambda,
             &ard,
-            max_cycles,
             1.0e-4,
             1.0,
         ) {
@@ -663,7 +654,6 @@ fn main() -> Result<(), String> {
                         centered.view(),
                         &lambda,
                         &ard,
-                        20,
                         tolerance,
                         1.0,
                     ) {
@@ -755,9 +745,9 @@ fn main() -> Result<(), String> {
     let tot: f64 = centered.iter().map(|v| v * v).sum();
     println!("centered train EV = {:.4}", 1.0 - res / tot);
 
-    if args.len() >= 10 {
-        let te_rows: usize = args[9].parse().map_err(|e| format!("test rows: {e}"))?;
-        let te_bytes = std::fs::read(&args[8]).map_err(|e| format!("{}: {e}", args[8]))?;
+    if args.len() >= 9 {
+        let te_rows: usize = args[8].parse().map_err(|e| format!("test rows: {e}"))?;
+        let te_bytes = std::fs::read(&args[7]).map_err(|e| format!("{}: {e}", args[7]))?;
         if te_bytes.len() != te_rows * cols * 8 {
             println!("HELDOUT skipped: bad size");
         } else {
@@ -845,7 +835,7 @@ fn main() -> Result<(), String> {
                     let ss: f64 = centered_test.iter().map(|x| x * x).sum();
                     println!(
                         "HELDOUT rows={te_rows} recurred={} EV={:.4} chart={te_digest} \
-                         build={} cycles={max_cycles} certified_at={:.0e} \
+                         build={} certified_at={:.0e} \
                          escalation_cycles={}",
                         rep.recurred,
                         1.0 - sse / ss,

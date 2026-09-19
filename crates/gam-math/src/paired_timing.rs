@@ -471,7 +471,11 @@ where
 ///   `PairedTiming::ratio_resolution`. Loss when
 ///   `median_ratio() + ratio_resolution() < 1`. There is no chosen tolerance
 ///   here: the instrument reports its noise floor, and that is the only
-///   denominator a parity bar can honestly be stated in.
+///   denominator a parity bar can honestly be stated in. Where the two arms
+///   compile to one program, the floor also has to cover the offset between two
+///   copies of it, which the resolution does not see.
+///   `SpeedGate::not_slower_than_self_races` grades the same contract against
+///   the spread of races of A against a copy of itself.
 ///
 /// A gate that is opened and dropped without `SpeedGate::finish` panics, and
 /// a gate finished with no cells panics: both are gates that verified nothing.
@@ -528,6 +532,53 @@ impl SpeedGate {
             "pass"
         } else {
             "FAIL: A is slower than B beyond the measurement's resolution"
+        };
+        self.record(verdict, cell, timing, a, b);
+    }
+
+    /// Record a `not_slower` cell whose two arms compile to one program, graded
+    /// against the instrument's measured between-copy noise instead of its
+    /// within-run resolution alone.
+    ///
+    /// Two copies of one closure raced against each other do not read 1. The
+    /// copies sit at different code addresses and draw different orders, so each
+    /// race carries an offset of its own, which the per-repetition spread
+    /// ([`PairedTiming::ratio_resolution`]) does not see. On EPYC 7763 one
+    /// self-race read 0.996 at resolution 0.0028 (#932, job 1279199), which
+    /// [`Self::not_slower`] calls a loss. `self_races` are at least
+    /// [`MIN_SELF_RACES`] races of arm A against a second copy of A, on this host
+    /// in this process. Their spread (the largest minus the smallest
+    /// `ln(median_ratio)`) is the band, never narrower than the cell's own
+    /// resolution. The cell passes when A takes at most `1 + band` times B's
+    /// time: `median_ratio ≥ 1 / (1 + band)`.
+    ///
+    /// # Panics
+    ///
+    /// With fewer than [`MIN_SELF_RACES`] self-races, or a self-race whose median
+    /// ratio is not a positive finite number: either is a band nobody measured.
+    pub fn not_slower_than_self_races(
+        &mut self,
+        cell: &str,
+        timing: &PairedTiming,
+        self_races: &[PairedTiming],
+        a: &str,
+        b: &str,
+    ) {
+        let band = self_race_band(self_races).max(timing.ratio_resolution());
+        eprintln!(
+            "{} {cell} self_races={} self_race_medians=[{}] band={band:.4}",
+            self.token,
+            self_races.len(),
+            self_races
+                .iter()
+                .map(|race| format!("{:.4}", race.median_ratio()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        let verdict = if timing.median_ratio() * (1.0 + band) >= 1.0 {
+            "pass"
+        } else {
+            "FAIL: A is slower than B beyond its own self-races' spread"
         };
         self.record(verdict, cell, timing, a, b);
     }
@@ -637,6 +688,35 @@ fn median(values: &[f64]) -> f64 {
     } else {
         0.5 * (sorted[mid - 1] + sorted[mid])
     }
+}
+
+/// The fewest self-races a between-copy band is read from
+/// ([`SpeedGate::not_slower_than_self_races`]). #932's lead ruling (09-18) set it:
+/// the band is the self-races' spread, and one or two races give a spread that a
+/// single lucky pair of copies can make arbitrarily small.
+pub const MIN_SELF_RACES: usize = 5;
+
+/// The instrument's between-copy band from races of one arm against a copy of
+/// itself: `exp(max − min) − 1` over their `ln(median_ratio)`, a fraction of B's
+/// time.
+fn self_race_band(self_races: &[PairedTiming]) -> f64 {
+    assert!(
+        self_races.len() >= MIN_SELF_RACES,
+        "a self-race band needs at least {MIN_SELF_RACES} self-races, got {}",
+        self_races.len()
+    );
+    let mut lowest = f64::INFINITY;
+    let mut highest = f64::NEG_INFINITY;
+    for race in self_races {
+        let ratio = race.median_ratio();
+        assert!(
+            ratio.is_finite() && ratio > 0.0,
+            "a self-race's median ratio must be positive and finite, got {ratio}"
+        );
+        lowest = lowest.min(ratio.ln());
+        highest = highest.max(ratio.ln());
+    }
+    (highest - lowest).exp() - 1.0
 }
 
 /// Linear-interpolated quantile of an already-sorted slice.
@@ -795,6 +875,67 @@ mod tests {
         ] {
             assert!(line.contains(field), "summary is missing {field}: {line}");
         }
+    }
+
+    /// A timing whose every repetition reads `ratio`, so its median is `ratio` and
+    /// its resolution is zero.
+    fn constant_timing(ratio: f64, reps: usize) -> PairedTiming {
+        PairedTiming {
+            a_ns: vec![1.0; reps],
+            b_ns: vec![ratio; reps],
+            ratios: vec![ratio; reps],
+            a_went_first: (0..reps).map(|rep| rep % 2 == 0).collect(),
+        }
+    }
+
+    /// #932 BINOMIAL-Q-PRUNE: a same-program cell that reads 0.996 is a loss by
+    /// its resolution alone, and inside the spread of its own self-races. The
+    /// self-race grade passes it, and fails a cell slower than that spread.
+    #[test]
+    fn a_same_program_cell_is_graded_by_its_self_races_spread_932() {
+        let self_races: Vec<PairedTiming> = [0.996, 1.001, 0.999, 1.003, 0.998]
+            .iter()
+            .map(|&ratio| constant_timing(ratio, 15))
+            .collect();
+        let band = self_race_band(&self_races);
+        // Two logarithms, a difference and an exponential near 1: a few ulps of 1.
+        assert!(
+            (band - (1.003_f64 / 0.996 - 1.0)).abs() <= 4.0 * f64::EPSILON,
+            "the band is the self-races' spread: {band}"
+        );
+
+        let floor_cell = constant_timing(0.996, 15);
+        let mut resolution_only = SpeedGate::open("SELF-RACE-CONTROL");
+        resolution_only.not_slower("floor", &floor_cell, "a", "b");
+        assert_eq!(
+            resolution_only.losses.len(),
+            1,
+            "a 0.996 cell with no resolution is a loss by resolution alone"
+        );
+        resolution_only.finished = true;
+
+        let mut gate = SpeedGate::open("SELF-RACE-CONTROL");
+        gate.not_slower_than_self_races("floor", &floor_cell, &self_races, "a", "b");
+        assert!(gate.losses.is_empty(), "{:?}", gate.losses);
+        let slower = constant_timing(0.99, 15);
+        gate.not_slower_than_self_races("slower", &slower, &self_races, "a", "b");
+        assert_eq!(gate.losses.len(), 1, "{:?}", gate.losses);
+        assert!(
+            gate.losses[0].contains("beyond its own self-races' spread"),
+            "{:?}",
+            gate.losses
+        );
+        gate.finished = true;
+    }
+
+    #[test]
+    #[should_panic(expected = "at least 5 self-races")]
+    fn a_band_from_too_few_self_races_is_refused_932() {
+        let self_races: Vec<PairedTiming> =
+            (0..MIN_SELF_RACES - 1).map(|_| constant_timing(1.0, 15)).collect();
+        let mut gate = SpeedGate::open("SELF-RACE-CONTROL");
+        gate.not_slower_than_self_races("few", &constant_timing(1.0, 15), &self_races, "a", "b");
+        gate.finish();
     }
 
     #[test]

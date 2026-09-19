@@ -9,10 +9,7 @@
 //! one semantic input contract.
 
 use super::hessian_paths::PrimarySlices;
-use gam_math::jet_scalar::{
-    DynamicJetBatchWorkspace, DynamicThreeSeedBatch, RuntimeJetScalar,
-    filtered_implicit_solve_runtime_scalar,
-};
+use gam_math::jet_scalar::{RuntimeJetScalar, filtered_implicit_solve_runtime_scalar};
 use ndarray::Array1;
 
 /// Declarative second-order lowering of the calibration-CDF semantic node.
@@ -347,16 +344,13 @@ pub(super) struct BmsFlexCalibrationProgramNode {
     pub(super) index: BmsFlexIndexProgram,
     pub(super) weight: f64,
     pub(super) cdf_stack: [f64; 5],
-    /// `Φ⁽⁵⁾` at the node's index, beside the order-four stack.
-    pub(super) cdf_fifth: f64,
 }
 
 /// The single typed BMS FLEX row expression.
 ///
 /// Rigid BMS is the `h = w = None`, dimension-two specialization. FLEX adds
 /// score-warp and link-deviation primaries. V/G/H, one-seed third, and two-seed
-/// fourth channels are interpretations of [`Self::evaluate`], and the laned
-/// three-seed fifth channel is [`Self::evaluate_fifth`]; optimized lowerings
+/// fourth channels are interpretations of [`Self::evaluate`]; optimized lowerings
 /// may change storage and loop order, but consume the same
 /// [`BmsFlexProgramPoint`] contract.
 #[derive(Clone)]
@@ -366,12 +360,10 @@ pub(super) struct BmsFlexRowProgram {
     pub(super) inv_f_a: f64,
     scale: f64,
     mu_stack: [f64; 5],
-    mu_fifth: f64,
     calibration: Vec<BmsFlexCalibrationProgramNode>,
     observed: BmsFlexIndexProgram,
     pub(super) observed_sign: f64,
     pub(super) observed_neglog_stack: [f64; 5],
-    observed_neglog_fifth: f64,
 }
 
 impl BmsFlexRowProgram {
@@ -834,12 +826,10 @@ impl BmsFlexRowProgram {
 
     pub(super) fn from_parts(
         point: BmsFlexProgramPoint<'_>,
-        mu_fifth: f64,
         calibration: Vec<BmsFlexCalibrationProgramNode>,
         observed: BmsFlexIndexProgram,
         observed_sign: f64,
         observed_neglog_stack: [f64; 5],
-        observed_neglog_fifth: f64,
     ) -> Result<Self, String> {
         Ok(Self {
             primary: point.primary().clone(),
@@ -847,12 +837,10 @@ impl BmsFlexRowProgram {
             inv_f_a: point.inv_f_a(),
             scale: point.scale(),
             mu_stack: point.mu_stack(),
-            mu_fifth,
             calibration,
             observed,
             observed_sign,
             observed_neglog_stack,
-            observed_neglog_fifth,
         })
     }
 
@@ -864,7 +852,7 @@ impl BmsFlexRowProgram {
         index: &BmsFlexIndexProgram,
         workspace: &'arena S::Workspace,
     ) -> S {
-        let dimension = self.primary.total;
+        let dimension = a.dimension();
         let b = &vars[self.primary.slope];
         // Every step below is one fused jet operation: the runtime jets
         // allocate and stream a fresh `(1 + lanes)·(d + d²)` block per
@@ -904,13 +892,17 @@ impl BmsFlexRowProgram {
         lift_iters: usize,
         workspace: &'arena S::Workspace,
     ) -> Result<S, String> {
-        let dimension = self.primary.total;
-        if vars.len() != dimension {
+        let primaries = self.primary.total;
+        if vars.len() != primaries {
             return Err(format!(
-                "BMS FLEX row program received {} primaries, expected {dimension}",
+                "BMS FLEX row program received {} primaries, expected {primaries}",
                 vars.len()
             ));
         }
+        // The jets' free axes are the primaries themselves, or a fixed set of
+        // directions of the primary space for a projected contraction (gam#2922).
+        // Every primary must carry the same ones.
+        let dimension = vars.first().map_or(primaries, |var| var.dimension());
         if vars.iter().any(|var| var.dimension() != dimension) {
             return Err("BMS FLEX row program received a mismatched jet dimension".to_string());
         }
@@ -958,84 +950,6 @@ impl BmsFlexRowProgram {
             .evaluate_index(&intercept, vars, &self.observed, workspace)
             .scale(self.observed_sign);
         Ok(signed.compose_unary(self.observed_neglog_stack))
-    }
-
-    /// [`Self::evaluate_index`] in the laned three-seed algebra. The
-    /// link-deviation basis is cubic, so every link term composes with a zero
-    /// fifth derivative.
-    #[inline]
-    fn evaluate_index_fifth<'arena>(
-        &self,
-        a: &DynamicThreeSeedBatch<'arena>,
-        vars: &[DynamicThreeSeedBatch<'arena>],
-        index: &BmsFlexIndexProgram,
-        zero: &DynamicThreeSeedBatch<'arena>,
-    ) -> DynamicThreeSeedBatch<'arena> {
-        let b = &vars[self.primary.slope];
-        let u = a.add(&b.scale(index.z));
-        let mut inside = u;
-        if let Some(range) = self.primary.h.as_ref() {
-            let score = vars[range.clone()]
-                .iter()
-                .zip(&index.score_values)
-                .fold(*zero, |sum, (var, &value)| sum.add(&var.scale(value)));
-            inside = b.mul(&score).add(&inside);
-        }
-        if let Some(range) = self.primary.w.as_ref() {
-            for (coefficient, stack) in vars[range.clone()].iter().zip(&index.link_stacks) {
-                inside = coefficient
-                    .mul(&u.compose_unary_fifth(*stack, 0.0))
-                    .add(&inside);
-            }
-        }
-        inside.scale(self.scale)
-    }
-
-    /// Interpret the canonical program in the laned three-seed algebra: the
-    /// expression of [`Self::evaluate`], with every outer function composed
-    /// through its fifth derivative and the implicit intercept lifted by five
-    /// filtered steps, the algebra's nilpotency order. Lane `l` of the result
-    /// carries the contracted fifth `Σ_{cde} ℓ_{abcde} u_c v_d w_{l,e}` of the
-    /// row negative log-likelihood.
-    pub(super) fn evaluate_fifth<'arena>(
-        &self,
-        vars: &[DynamicThreeSeedBatch<'arena>],
-        workspace: &'arena DynamicJetBatchWorkspace,
-    ) -> Result<DynamicThreeSeedBatch<'arena>, String> {
-        let dimension = self.primary.total;
-        if vars.len() != dimension {
-            return Err(format!(
-                "BMS FLEX row program received {} primaries, expected {dimension}",
-                vars.len()
-            ));
-        }
-        if vars.iter().any(|var| var.dimension() != dimension) {
-            return Err("BMS FLEX row program received a mismatched jet dimension".to_string());
-        }
-        let zero = DynamicThreeSeedBatch::constant(0.0, dimension, workspace);
-        let neg_mu = vars[self.primary.q]
-            .compose_unary_fifth(self.mu_stack, self.mu_fifth)
-            .neg();
-        let constraint = |a: &DynamicThreeSeedBatch<'arena>| -> DynamicThreeSeedBatch<'arena> {
-            self.calibration.iter().fold(neg_mu, |residual, node| {
-                let mut stack = node.cdf_stack;
-                for entry in stack.iter_mut() {
-                    *entry *= node.weight;
-                }
-                let eta = self.evaluate_index_fifth(a, vars, &node.index, &zero);
-                residual.add(&eta.compose_unary_fifth(stack, node.cdf_fifth * node.weight))
-            })
-        };
-        let mut intercept =
-            DynamicThreeSeedBatch::constant(self.intercept_root, dimension, workspace);
-        for _ in 0..5 {
-            let residual = constraint(&intercept);
-            intercept = intercept.sub(&residual.scale(self.inv_f_a));
-        }
-        let signed = self
-            .evaluate_index_fifth(&intercept, vars, &self.observed, &zero)
-            .scale(self.observed_sign);
-        Ok(signed.compose_unary_fifth(self.observed_neglog_stack, self.observed_neglog_fifth))
     }
 }
 

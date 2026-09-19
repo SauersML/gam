@@ -23,6 +23,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 
 
 LEDGER = "docs/source-removal-changes.json"
@@ -174,6 +175,79 @@ def removed_declarations(before, after, key):
     return max(0, before[key].get("declarations", 1) - survivors)
 
 
+# A `git grep -w` match is a whole run of these bytes (git's word characters are
+# ASCII alphanumerics and `_`), so a name's whole-word occurrences are the runs equal to it.
+WORD_RUN = re.compile(rb"[A-Za-z0-9_]+")
+
+
+def source_words(root, revision, names):
+    """Count what `git grep -h -o -w -F -e NAME... REVISION -- '*.rs'` prints, in one linear pass.
+
+    The tree is read the way git grep reads it: regular `*.rs` files, and a blob
+    with a NUL in its first 8000 bytes is binary and contributes no match. git
+    grep itself does not scale in the number of names: for the 88 private names
+    of a pure move of latent/survival/mod.rs (09-18) it took 0.3 s for one name
+    and 15 s for all 88 on an 8-CPU node, and on a workstation it ran 318 CPU-s
+    until a CPU watchdog killed it at 60 s, twice. Tokenising each blob once
+    costs the same for one name as for thousands.
+    """
+    wanted = {name.encode() for name in names}
+    words = Counter()
+    if not wanted:
+        return words
+    blobs = []
+    for entry in git(root, "ls-tree", "-r", "-z", revision).split(b"\0"):
+        meta, _, path = entry.partition(b"\t")
+        mode, kind, oid = (meta.split() + [b"", b"", b""])[:3]
+        if kind == b"blob" and mode in (b"100644", b"100755") and path.endswith(b".rs"):
+            blobs.append(oid)
+    with tempfile.TemporaryFile() as ids:
+        ids.write(b"".join(oid + b"\n" for oid in blobs)); ids.seek(0)
+        batch = subprocess.Popen(["git", "-C", str(root), "cat-file", "--batch"], stdin=ids, stdout=subprocess.PIPE)
+        for oid in blobs:
+            header = batch.stdout.readline().split()
+            size = int(header[2]) if len(header) == 3 and header[:2] == [oid, b"blob"] else -1
+            data = batch.stdout.read(size) if size >= 0 else b""
+            if size < 0 or len(data) != size:
+                # A read that stops short has not measured anything.
+                batch.kill(); batch.wait()
+                raise subprocess.CalledProcessError(1, f"git cat-file --batch (blob {oid.decode()} of {revision} unreadable)")
+            batch.stdout.read(1)
+            if b"\0" not in data[:8000]:
+                words.update(run for run in WORD_RUN.findall(data) if run in wanted)
+        if batch.wait() != 0:
+            raise subprocess.CalledProcessError(batch.returncode, "git cat-file --batch")
+    return Counter({run.decode(): count for run, count in words.items()})
+
+
+def changed_paths(root, base, head):
+    """Each changed Rust file as (base path, head path), the same path unless it was renamed.
+
+    `diff --name-only` under git's default rename detection printed only a renamed
+    file's head path, so its base declarations were never read: c7768c15c2 renamed
+    empirical_intercept_bracket_tests.rs, dropped two of its tests, and passed.
+    Renames are requested explicitly instead of inherited from configuration, and a
+    renamed file's base declarations are compared with what it declares where it now
+    lives. A rename git does not detect is a deletion plus an addition, which refuses
+    every guarded item of the old path; a copy removes nothing, so its new path is an
+    addition.
+    """
+    fields = git(root, "diff", "--name-status", "-z", "--find-renames", base, head,
+                 "--", "crates", "src", "tests").split(b"\0")
+    pairs, i = [], 0
+    while i < len(fields) - 1:
+        status = fields[i][:1]
+        if status in (b"R", b"C"):
+            old, new, i = fields[i + 1], fields[i + 2], i + 3
+            old = new if status == b"C" else old
+        else:
+            old = new = fields[i + 1]
+            i += 2
+        if old.endswith(b".rs") or new.endswith(b".rs"):
+            pairs.append((old.decode(), new.decode()))
+    return pairs
+
+
 def changed_inventory(root, base, head):
     """Inventory only changed Rust files, then query removed private names globally.
 
@@ -181,13 +255,16 @@ def changed_inventory(root, base, head):
     turn a cheap policy gate into a runtime gate. Git already provides the
     exact candidate set; global source queries are needed only for private
     names that actually lost a declaration, and one pass counts all of them.
+    An identity carries its base path, including when the file was renamed.
     """
-    paths = git(root, "diff", "--name-only", "-z", base, head, "--", "crates", "src", "tests").split(b"\0")
-    paths = [path.decode() for path in paths if path.endswith(b".rs")]
+    pairs = changed_paths(root, base, head)
 
-    def at(revision):
+    def at(revision, side):
         found = {}
-        for path in paths:
+        for pair in pairs:
+            path, identity_path = pair[side], pair[0]
+            if not path.endswith(".rs"):
+                continue
             try:
                 source = subprocess.check_output(
                     ["git", "-C", str(root), "show", f"{revision}:{path}"],
@@ -200,11 +277,11 @@ def changed_inventory(root, base, head):
                 match = ITEM.match(line)
                 if not match:
                     continue
-                key = f"{path}:{match['kind']}:{match['name']}"
+                key = f"{identity_path}:{match['kind']}:{match['name']}"
                 public, test_scoped = bool(match["vis"]), number in tests
                 held = found.get(key)
                 if held is None:
-                    found[key] = {"path": path, "line": number, "kind": match["kind"],
+                    found[key] = {"path": identity_path, "line": number, "kind": match["kind"],
                                   "name": match["name"], "public": public,
                                   "test_scoped": test_scoped, "declarations": 1}
                 else:
@@ -214,23 +291,16 @@ def changed_inventory(root, base, head):
                     held["test_scoped"] = held["test_scoped"] or test_scoped
         return found
 
-    before, after = at(base), at(head)
+    before, after = at(base, 0), at(head, 1)
     # Public and test-scoped removals are guarded outright and need no count. A
     # placeholder count for them would also overwrite a private homonym's real
     # count, letting that private item's callers go unseen.
     candidates = sorted({item["name"] for key, item in before.items()
                          if removed_declarations(before, after, key)
                          and not (item["public"] or item["test_scoped"])})
-    words = Counter()
-    for start in range(0, len(candidates), 2000):
-        patterns = [part for name in candidates[start:start + 2000] for part in ("-e", name)]
-        query = subprocess.run(["git", "-C", str(root), "grep", "-h", "-o", "-w", "-F", *patterns, base,
-                                "--", "*.rs"], stdout=subprocess.PIPE)
-        if query.returncode != 0:
-            raise subprocess.CalledProcessError(query.returncode, "git grep")
-        # Counts are deliberately conservative: every occurrence, test source
-        # included. A false positive asks for review; a false negative permits deletion.
-        words.update(line.decode() for line in query.stdout.splitlines())
+    # Counts are deliberately conservative: every occurrence, test source
+    # included. A false positive asks for review; a false negative permits deletion.
+    words = source_words(root, base, candidates)
     unseen = [name for name in candidates if words[name] < 1]
     if unseen:
         # Every candidate is declared in the base tree, so its own declaration

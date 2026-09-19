@@ -78,10 +78,10 @@ def main():
           f"topology=auto-portfolio", flush=True)
 
     t0 = time.time()
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         X_train, K=args.k, d_atom=1, assignment="topk",
         top_k=args.top_k, n_iter=args.n_iter, random_state=args.seed,
-        sparsity_weight=0.0, ard_per_atom=True, gpu="auto")
+        sparsity_weight=0.0, gpu="auto")
     wall = time.time() - t0
     print(f"[flag] FIT DONE wall={wall:.0f}s r2={model.reconstruction_r2:.4f}",
           flush=True)

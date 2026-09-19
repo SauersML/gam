@@ -18,13 +18,13 @@ def main() -> None:
     )
     data = {"y": y}
 
-    latent = gamfit.LatentCoord(
+    latent = gamfit.smooth.LatentCoord(
         n=n,
         d=1,
         init=((theta + 0.05 * rng.standard_normal(n)) % (2.0 * np.pi)).reshape(-1, 1),
         aux_prior={"u": theta.reshape(-1, 1), "family": "ridge", "strength": "auto"},
     )
-    selector = gamfit.TopologyAutoSelector(candidates=["euclidean", "circle"])
+    selector = gamfit.topology.TopologyAutoSelector(candidates=["euclidean", "circle"])
     result = selector.fit(
         data,
         "y ~ s(theta, type=AUTO, k=32)",

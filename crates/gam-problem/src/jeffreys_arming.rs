@@ -65,6 +65,109 @@ pub enum JeffreysArmingEvidence {
         lineality_negative: usize,
         copositive_minimum: Option<f64>,
     },
+    /// The pre-fit certificate found a threshold on one realized design column
+    /// that separates the binary outcomes, so the likelihood has no finite
+    /// maximizer along that column.
+    PrefitColumnSeparation {
+        column_index: usize,
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
+    /// The pre-fit certificate found a direction in the realized design's
+    /// parametric columns that separates the binary outcomes with this minimum
+    /// signed margin, so the likelihood has no finite maximizer along it.
+    PrefitLinearSeparation {
+        column_indices: Vec<usize>,
+        min_signed_margin: f64,
+    },
+}
+
+impl JeffreysArmingEvidence {
+    /// One sentence naming why the Jeffreys prior was armed, written for a
+    /// fit's summary. Every surface that reports the estimator reads this, so
+    /// the Python summary, the model repr and the CLI say the same thing.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::PrefitColumnSeparation {
+                column_index,
+                threshold,
+                positive_above_threshold,
+            } => {
+                let side = if *positive_above_threshold { "above" } else { "below" };
+                format!(
+                    "separation: design column {column_index} puts every success {side} \
+                     {threshold:.6e}"
+                )
+            }
+            Self::PrefitLinearSeparation {
+                column_indices,
+                min_signed_margin,
+            } => format!(
+                "separation: a combination of design columns {column_indices:?} separates \
+                 the outcomes with margin {min_signed_margin:.3e}"
+            ),
+            Self::DescendingRay { block, .. } => format!(
+                "the likelihood kept improving along a direction block {block}'s penalty \
+                 does not close"
+            ),
+            Self::UnpenalizedDescendingRay { .. } => {
+                "the likelihood kept improving along a direction no penalty opposes".to_string()
+            }
+            Self::NullPenalizedHessian { nullity: Some(nullity) } => format!(
+                "the penalized information is singular at the fitted mode (nullity {nullity})"
+            ),
+            Self::NullPenalizedHessian { nullity: None } => {
+                "the penalized information is singular at the fitted mode".to_string()
+            }
+            Self::DivergentInnerState { .. } => {
+                "the coefficients diverged without the Jeffreys prior".to_string()
+            }
+            Self::StrictSaddle { .. } => {
+                "the fit without the Jeffreys prior stopped at a saddle point".to_string()
+            }
+            Self::ImproperConePosterior { .. } => {
+                "the constrained posterior without the Jeffreys prior is improper".to_string()
+            }
+        }
+    }
+}
+
+impl crate::EstimationError {
+    /// The separation certificate this refusal carries, or `None` when it does
+    /// not prove the binomial likelihood has no finite maximizer.
+    ///
+    /// Only the pre-fit separation certificates are proofs. A solve that did
+    /// not converge, a railed smoothing strength or a refused cubature says the
+    /// fit did not finish, not that the likelihood is unbounded, so none of
+    /// them may switch the estimator. A wrapper is read through to the error
+    /// that decided it, and a declined plateau through its terminal refusal.
+    #[must_use]
+    pub fn separation_arming_evidence(&self) -> Option<JeffreysArmingEvidence> {
+        match self.innermost_estimation_error() {
+            Self::PrefitPerfectSeparationDetected {
+                column_index,
+                threshold,
+                positive_above_threshold,
+            } => Some(JeffreysArmingEvidence::PrefitColumnSeparation {
+                column_index: *column_index,
+                threshold: *threshold,
+                positive_above_threshold: *positive_above_threshold,
+            }),
+            Self::PrefitLinearSeparationDetected {
+                min_signed_margin,
+                column_indices,
+                ..
+            } => Some(JeffreysArmingEvidence::PrefitLinearSeparation {
+                column_indices: column_indices.clone(),
+                min_signed_margin: *min_signed_margin,
+            }),
+            Self::DominatedCertifiedPlateau {
+                terminal_refusal, ..
+            } => terminal_refusal.separation_arming_evidence(),
+            _ => None,
+        }
+    }
 }
 
 impl CustomFamilyError {
@@ -73,8 +176,10 @@ impl CustomFamilyError {
     ///
     /// A whole-search refusal is read through the typed refusal of its last
     /// objective evaluation (see [`CustomFamilyError::OuterSmoothingFailed`]).
-    /// The match over joint-Newton terminal reasons is exhaustive, so a new
-    /// reason must be graded when it is added.
+    /// Its `search_inner_refusal` is never read here: the search stepped away
+    /// from that refusal, so it proves nothing about the objective where the
+    /// search ended (#2943). The match over joint-Newton terminal reasons is
+    /// exhaustive, so a new reason must be graded when it is added.
     #[must_use]
     pub fn jeffreys_arming_evidence(&self) -> Option<JeffreysArmingEvidence> {
         let Self::InnerSolveNotConverged {
@@ -92,12 +197,6 @@ impl CustomFamilyError {
                 Self::OuterSmoothingFailed { last_refusal, .. } => last_refusal
                     .as_deref()
                     .and_then(Self::jeffreys_arming_evidence),
-                // A fit-ending refusal carries the same verdict as the refusal
-                // it wraps, so the arm-and-retry lifecycle must still read it
-                // (gam#2943).
-                Self::FitEndedWithoutCertifiedInnerMode { refusal } => {
-                    refusal.jeffreys_arming_evidence()
-                }
                 _ => None,
             };
         };
@@ -175,16 +274,17 @@ impl CustomFamilyError {
     /// where the refusal leaves it, with the identifiability gauge's linear
     /// lift, so arming evidence reads the direction in raw joint order (#979).
     pub fn map_descending_ray_direction(&mut self, lift: &dyn Fn(&[f64]) -> std::sync::Arc<[f64]>) {
+        // Both refusals a whole-search refusal carries are lifted, so they read in
+        // one coordinate order (#2943).
         if let Self::OuterSmoothingFailed {
-            last_refusal: Some(refusal),
+            last_refusal,
+            search_inner_refusal,
             ..
         } = self
         {
-            refusal.map_descending_ray_direction(lift);
-        }
-        // A fit-ending refusal holds its terminal refusal whole (gam#2943).
-        if let Self::FitEndedWithoutCertifiedInnerMode { refusal } = self {
-            refusal.map_descending_ray_direction(lift);
+            for refusal in [last_refusal, search_inner_refusal].into_iter().flatten() {
+                refusal.map_descending_ray_direction(lift);
+            }
         }
         if let Self::InnerSolveNotConverged {
             terminal:
@@ -236,48 +336,81 @@ mod tests {
     }
 
     #[test]
-    fn a_fit_ending_refusal_keeps_its_arming_evidence_and_ray_lift_2943() {
-        let ray = RayRestoration {
-            block: 1,
-            rho_first: 2,
-            rho_count: 1,
-            log_strength_ratio: 0.75,
-            likelihood_slope: -3.0,
-            penalty_slope: 1.4,
-            block_step_inf: 0.2,
-            direction: std::sync::Arc::from(vec![0.1, -0.2, 0.3]),
-        };
+    fn only_the_last_evaluation_refusal_arms_a_whole_search_refusal_2943() {
+        // A whole-search refusal carries two refusals (gam#2943). `last_refusal`
+        // is the typed refusal of the search's last objective evaluation, and
+        // arming reads it. `search_inner_refusal` is the search's most recent
+        // uncertified inner solve, kept across the finite trials after it so the
+        // fit boundary can name it. The search stepped away from that refusal, so
+        // it proves nothing about the objective where the search ended.
         let stalled = joint_newton_refusal(
             JointNewtonTerminalReason::StalledOnDescendingRay {
                 residual: 1.0e-1,
                 residual_tol: 1.0e-6,
                 cycles: 9,
-                ray,
+                ray: RayRestoration {
+                    block: 1,
+                    rho_first: 2,
+                    rho_count: 1,
+                    log_strength_ratio: 0.75,
+                    likelihood_slope: -3.0,
+                    penalty_slope: 1.4,
+                    block_step_inf: 0.2,
+                    direction: std::sync::Arc::from(vec![0.1, -0.2, 0.3]),
+                },
             },
             false,
         );
-        let unwrapped = stalled.jeffreys_arming_evidence();
-        assert!(unwrapped.is_some(), "the fixture must carry arming evidence");
-
-        let mut ended = CustomFamilyError::fit_ended_without_certified_inner_mode(stalled);
-        assert_eq!(
-            ended.jeffreys_arming_evidence(),
-            unwrapped,
-            "the arm-and-retry lifecycle must read the verdict a fit-ending refusal wraps"
+        let evidence = stalled.jeffreys_arming_evidence();
+        assert!(evidence.is_some(), "the fixture must carry arming evidence");
+        let nullity = joint_newton_refusal(
+            JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
+                condition: ConstrainedFixedPointCondition::HpenNullity { nullity: 2 },
+            },
+            false,
         );
-        ended.map_descending_ray_direction(&|direction| {
-            std::sync::Arc::from(direction.iter().map(|value| 2.0 * value).collect::<Vec<_>>())
-        });
+        assert!(
+            nullity.jeffreys_arming_evidence().is_some()
+                && nullity.jeffreys_arming_evidence() != evidence,
+            "the whole-search record must carry evidence distinct from the last refusal's"
+        );
+        let budget_only = joint_newton_refusal(JointNewtonTerminalReason::CycleBudget, false);
         assert_eq!(
-            ended.jeffreys_arming_evidence(),
-            Some(JeffreysArmingEvidence::DescendingRay {
-                block: 1,
-                log_strength_ratio: 0.75,
-                likelihood_slope: -3.0,
-                penalty_slope: 1.4,
-                direction: vec![0.2, -0.4, 0.6],
-            }),
-            "the gauge lift must reach the ray inside a fit-ending refusal"
+            budget_only.jeffreys_arming_evidence(),
+            None,
+            "the no-evidence ending must carry no evidence"
+        );
+        let search = |last_refusal: Option<CustomFamilyError>,
+                      search_inner_refusal: Option<CustomFamilyError>| {
+            CustomFamilyError::OuterSmoothingFailed {
+                reason: "outer smoothing optimization failed".to_string(),
+                last_refusal: last_refusal.map(Box::new),
+                search_inner_refusal: search_inner_refusal.map(Box::new),
+                outer_error: std::sync::Arc::new(crate::EstimationError::RemlOptimizationFailed(
+                    "outer smoothing optimization failed".to_string(),
+                )),
+            }
+        };
+        assert_eq!(
+            search(Some(stalled.clone()), Some(nullity)).jeffreys_arming_evidence(),
+            evidence,
+            "the last evaluation's refusal arms the search, never the whole-search record"
+        );
+        assert_eq!(
+            search(None, Some(stalled.clone())).jeffreys_arming_evidence(),
+            None,
+            "a ray refusal the search stepped away from must not arm it"
+        );
+        assert_eq!(
+            search(Some(budget_only), Some(stalled.clone())).jeffreys_arming_evidence(),
+            None,
+            "a search that ends on a refusal without evidence must not arm on an earlier ray"
+        );
+        assert_eq!(
+            CustomFamilyError::fit_ended_without_certified_inner_mode(stalled)
+                .jeffreys_arming_evidence(),
+            None,
+            "a fit-ending refusal is minted above every arming consumer and never arms"
         );
     }
 
@@ -376,6 +509,7 @@ mod tests {
             CustomFamilyError::OuterSmoothingFailed {
                 reason: "outer smoothing optimization failed".to_string(),
                 last_refusal: last_refusal.map(Box::new),
+                search_inner_refusal: None,
                 outer_error: std::sync::Arc::new(crate::EstimationError::RemlOptimizationFailed(
                     "outer smoothing optimization failed".to_string(),
                 )),
@@ -456,10 +590,68 @@ mod tests {
         );
 
         // The evidence survives a saved model's JSON round trip.
-        for evidence in [ray_evidence, divergent_evidence] {
+        let separation = JeffreysArmingEvidence::PrefitLinearSeparation {
+            column_indices: vec![0, 2],
+            min_signed_margin: 0.125,
+        };
+        for evidence in [ray_evidence, divergent_evidence, separation] {
             let wire = serde_json::to_string(&evidence).unwrap();
             let restored: JeffreysArmingEvidence = serde_json::from_str(&wire).unwrap();
             assert_eq!(restored, evidence);
         }
+    }
+
+    #[test]
+    fn only_a_separation_certificate_switches_the_standard_estimator() {
+        use crate::EstimationError;
+        let column = EstimationError::PrefitPerfectSeparationDetected {
+            column_index: 1,
+            threshold: 0.5,
+            positive_above_threshold: true,
+        };
+        let column_evidence = JeffreysArmingEvidence::PrefitColumnSeparation {
+            column_index: 1,
+            threshold: 0.5,
+            positive_above_threshold: true,
+        };
+        assert_eq!(column.separation_arming_evidence(), Some(column_evidence.clone()));
+        assert!(
+            column_evidence.reason().contains("design column 1"),
+            "{}",
+            column_evidence.reason()
+        );
+        let linear = EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin: 0.25,
+            num_unpenalized_columns: 2,
+            column_indices: vec![0, 1],
+        };
+        assert_eq!(
+            linear.separation_arming_evidence(),
+            Some(JeffreysArmingEvidence::PrefitLinearSeparation {
+                column_indices: vec![0, 1],
+                min_signed_margin: 0.25,
+            })
+        );
+        // A fit that did not finish proves nothing about the likelihood.
+        for unfinished in [
+            EstimationError::RemlOptimizationFailed("railed rho".to_string()),
+            EstimationError::PerfectSeparationDetected {
+                iteration: 4,
+                max_abs_eta: 40.0,
+            },
+            EstimationError::TrialPointRefused {
+                reason: "cubature refused".to_string(),
+            },
+        ] {
+            assert_eq!(unfinished.separation_arming_evidence(), None, "{unfinished}");
+        }
+        // A custom-family whole-search refusal is read through to its outer error.
+        let wrapped = EstimationError::CustomFamily(CustomFamilyError::OuterSmoothingFailed {
+            reason: "outer smoothing optimization failed".to_string(),
+            last_refusal: None,
+            search_inner_refusal: None,
+            outer_error: std::sync::Arc::new(column),
+        });
+        assert_eq!(wrapped.separation_arming_evidence(), Some(column_evidence));
     }
 }

@@ -230,7 +230,7 @@ where
 /// * [`ArrowSolverMode::Direct`] is BA's dense reduced-camera-system solve:
 ///   eliminate the per-point/per-row blocks, form the reduced system, and
 ///   Cholesky factor it. This is the Ceres/g2o default for modest camera
-///   counts and is appropriate here for `K <= 2000`.
+///   counts.
 ///   **GPU support: ✓** — requires dense H_ββ and dense per-row H_tβ slabs.
 ///
 /// * [`ArrowSolverMode::SqrtBA`] ports Square-Root BA (Demmel/Gao/Gu et al.,
@@ -252,25 +252,21 @@ where
 ///   Schur path cannot consume. At K ≥ 5000 the GPU PCG path will supersede the CPU path
 ///   once the row-procedural H_tβ kernel and boxed GPU matvec backend in
 ///   `run_pcg_with_preconditioner` are wired.
+///
+/// * [`ArrowSolverMode::Priced`] prices Direct against InexactPCG at solve time,
+///   from the system's own row dims and border (#2900 row 6.15). Direct builds
+///   `Σ_i q_i·k·(k + q_i)` plus the penalty and factors `k³/3`; one reduced-Schur
+///   product costs `Σ_i q_i·(2k + q_i)` plus one penalty matvec. Where the dense
+///   Schur fits the materialization cap, CG may spend the dense route's cost in
+///   products and Direct answers a miss; otherwise CG may take the Krylov
+///   dimension `k` and a miss refuses the trial. It resolves to Direct or
+///   InexactPCG, with its [`ArrowPcgBudget`], before any route reads the mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrowSolverMode {
     Direct,
     SqrtBA,
     InexactPCG,
-}
-
-impl ArrowSolverMode {
-    /// BA-size heuristic: dense RCS for modest `K`, inexact Schur PCG for
-    /// large shared systems. This follows Agarwal et al.'s direct-vs-iterative
-    /// split for large BA, mapped from cameras to decoder coefficients.
-    pub const fn automatic(k: usize) -> Self {
-        if k <= DIRECT_SOLVE_MAX_K {
-            Self::Direct
-        } else {
-            Self::InexactPCG
-        }
-    }
-
+    Priced,
 }
 
 /// Reason the Steihaug-CG loop stopped.
@@ -279,8 +275,9 @@ pub enum PcgStopReason {
     /// Residual fell below the relative tolerance threshold.
     #[default]
     Converged,
-    /// Loop exhausted max_iterations without converging.
-    MaxIter,
+    /// The loop spent its resolved product budget without meeting its forcing
+    /// tolerance ([`ArrowPcgBudget::stop_at`], #2900 row 6.15).
+    BudgetExhausted,
     /// Step hit the trust-region boundary (Steihaug boundary projection).
     ///
     /// This is also what a BOUNDED solve reports on negative curvature or a
@@ -358,17 +355,16 @@ pub enum MixedPrecisionStatus {
 /// The defaults mirror the loose inner tolerances used by inexact-step LM in
 /// "Bundle Adjustment in the Large": solve the Schur system only accurately
 /// enough for a useful trust-region step, then let the outer LM iteration
-/// correct the remaining error.
+/// correct the remaining error. How many products CG may take is not an
+/// option: it is resolved against the system per solve ([`ArrowPcgBudget`]).
 #[derive(Debug, Clone)]
 pub struct ArrowPcgOptions {
-    pub max_iterations: usize,
     pub relative_tolerance: f64,
 }
 
 impl Default for ArrowPcgOptions {
     fn default() -> Self {
         Self {
-            max_iterations: DEFAULT_PCG_MAX_ITERATIONS,
             relative_tolerance: DEFAULT_PCG_RELATIVE_TOLERANCE,
         }
     }
@@ -384,7 +380,6 @@ impl Default for ArrowPcgOptions {
 pub struct ArrowTrustRegionOptions {
     pub radius: f64,
     pub steihaug_relative_tolerance: f64,
-    pub max_iterations: usize,
 }
 
 impl Default for ArrowTrustRegionOptions {
@@ -392,7 +387,83 @@ impl Default for ArrowTrustRegionOptions {
         Self {
             radius: DEFAULT_TRUST_REGION_RADIUS,
             steihaug_relative_tolerance: DEFAULT_PCG_RELATIVE_TOLERANCE,
-            max_iterations: DEFAULT_PCG_MAX_ITERATIONS,
+        }
+    }
+}
+
+/// How a CG launch may spend reduced-Schur products, resolved against the system
+/// at solve time (#2900 row 6.15).
+///
+/// There is no iteration count to configure. A request carries `None` until
+/// `resolve_arrow_route` prices it, and a launch accepts only this resolved type,
+/// so a request that was never priced cannot reach the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArrowPcgBudget {
+    products: usize,
+    basis: ArrowPcgBudgetBasis,
+}
+
+/// What a resolved budget was priced from, and so what answers a miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowPcgBudgetBasis {
+    /// No dense route fits the materialization cap: CG may take the Krylov
+    /// dimension `k` of the reduced Schur, the exact-arithmetic termination bound,
+    /// and a miss refuses the trial. In floating point CG can need more than `k`
+    /// products (Greenbaum 1997), so the refusal carries the products spent and
+    /// the final residual.
+    KrylovDimension,
+    /// CG may spend what the dense route costs, `(build + k³/3) / apply` products.
+    /// For a Priced request Direct answers a miss (`direct_answers_miss`), so the
+    /// step costs at most twice the cheaper route. A request that asked for
+    /// InexactPCG refuses the trial instead.
+    DenseRoutePriced { direct_answers_miss: bool },
+}
+
+impl ArrowPcgBudget {
+    /// The Krylov-dimension budget of a `k`-wide border.
+    pub const fn krylov_dimension(k: usize) -> Self {
+        Self {
+            products: k,
+            basis: ArrowPcgBudgetBasis::KrylovDimension,
+        }
+    }
+
+    /// The dense route's price, `products`, with what answers a miss.
+    pub const fn dense_route_priced(products: usize, direct_answers_miss: bool) -> Self {
+        Self {
+            products,
+            basis: ArrowPcgBudgetBasis::DenseRoutePriced { direct_answers_miss },
+        }
+    }
+
+    /// The products CG may take.
+    pub const fn products(self) -> usize {
+        self.products
+    }
+
+    pub const fn basis(self) -> ArrowPcgBudgetBasis {
+        self.basis
+    }
+
+    /// Whether Direct answers a miss (a Priced request with a dense route).
+    pub const fn direct_answers_miss(self) -> bool {
+        matches!(
+            self.basis,
+            ArrowPcgBudgetBasis::DenseRoutePriced {
+                direct_answers_miss: true
+            }
+        )
+    }
+
+    /// The one budget stop a CG loop reads: `Some(PcgStopReason::BudgetExhausted)`
+    /// once `products_spent` has reached the budget. A loop consults it after its
+    /// accuracy test, so a solve that meets its tolerance on the last product it
+    /// may spend succeeds.
+    pub const fn stop_at(self, products_spent: usize) -> Option<PcgStopReason> {
+        if products_spent >= self.products {
+            Some(PcgStopReason::BudgetExhausted)
+        } else {
+            None
         }
     }
 }
@@ -512,11 +583,14 @@ impl ArrowEvidencePolicy {
 
 /// Complete BA Schur solve options.
 ///
-/// Use [`ArrowSolveOptions::automatic`] for normal latent-coordinate fits and
-/// [`ArrowSolveOptions::inexact_pcg`] for SAE-manifold scale `K`.
+/// Use [`ArrowSolveOptions::priced`] for normal latent-coordinate fits and
+/// [`ArrowSolveOptions::inexact_pcg`] where no dense route is wanted.
 #[derive(Clone)]
 pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
+    /// How an InexactPCG step may spend products, resolved against the system at
+    /// solve time. Every constructor leaves it `None`.
+    pub pcg_budget: Option<ArrowPcgBudget>,
     /// Backend policy owned by this solve. Keeping it in the immutable solve
     /// request prevents one fit from changing another fit's device routing.
     pub gpu_policy: gam_gpu::GpuPolicy,
@@ -589,6 +663,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArrowSolveOptions")
             .field("mode", &self.mode)
+            .field("pcg_budget", &self.pcg_budget)
             .field("gpu_policy", &self.gpu_policy)
             .field("pcg", &self.pcg)
             .field("trust_region", &self.trust_region)
@@ -615,7 +690,6 @@ impl std::fmt::Debug for ArrowSolveOptions {
 pub struct ArrowProximalCorrectionOptions {
     pub initial_ridge: f64,
     pub ridge_growth: f64,
-    pub max_attempts: usize,
     pub armijo_c1: f64,
     pub gradient_tolerance: f64,
     /// Relative objective resolution below which the proximal correction
@@ -642,7 +716,6 @@ impl Default for ArrowProximalCorrectionOptions {
         Self {
             initial_ridge: DEFAULT_PROXIMAL_INITIAL_RIDGE,
             ridge_growth: DEFAULT_PROXIMAL_RIDGE_GROWTH,
-            max_attempts: DEFAULT_PROXIMAL_MAX_ATTEMPTS,
             armijo_c1: DEFAULT_ARMIJO_C1,
             gradient_tolerance: DEFAULT_GRADIENT_TOLERANCE,
             convergence_objective_rel_tol: DEFAULT_PROXIMAL_CONVERGENCE_REL_TOL,
@@ -665,11 +738,12 @@ pub struct ArrowAcceptedProximalStep {
 }
 
 impl ArrowSolveOptions {
-    /// Select Direct for `K <= 2000` and InexactPCG above, following BA RCS
-    /// practice for dense-vs-iterative reduced systems.
-    pub fn automatic(k: usize) -> Self {
+    /// Price Direct against InexactPCG at solve time from the system's row dims
+    /// and border ([`ArrowSolverMode::Priced`]).
+    pub fn priced() -> Self {
         Self {
-            mode: ArrowSolverMode::automatic(k),
+            mode: ArrowSolverMode::Priced,
+            pcg_budget: None,
             gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
@@ -688,6 +762,7 @@ impl ArrowSolveOptions {
     pub fn direct() -> Self {
         Self {
             mode: ArrowSolverMode::Direct,
+            pcg_budget: None,
             gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
@@ -705,6 +780,7 @@ impl ArrowSolveOptions {
     pub fn inexact_pcg() -> Self {
         Self {
             mode: ArrowSolverMode::InexactPCG,
+            pcg_budget: None,
             gpu_policy: gam_gpu::GpuPolicy::Auto,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),

@@ -13,11 +13,14 @@ synthetic Rust-FFI payloads. The dispatcher's contract is:
 * Bernoulli marginal-slope, transformation-normal, and standard GAMs all
   default to a 1-D ``ndarray`` of point predictions when no tabular knob
   was set, and to a column payload otherwise.
+
+The synthetic payloads mirror what ``predict_table`` hands back: a dict whose
+``columns`` map each column name to a float64 ``ndarray``, already in the Rust
+preferred order.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import numpy as np
@@ -28,21 +31,13 @@ from gamfit._tables import PredictionResult, restore_output_table
 
 class _FakeRust:
     @staticmethod
-    def ordered_prediction_columns(columns_json: str) -> str:
-        return columns_json
-
-    @staticmethod
-    def marginal_slope_clip_probabilities(values: list[float]) -> list[float]:
+    def marginal_slope_clip_probabilities(values: np.ndarray) -> np.ndarray:
         return values
-
-    @staticmethod
-    def vec_to_array1_f64(values: list[float]) -> Any:
-        return np.asarray(values, dtype=float)
 
 
 def _dispatch(
     monkeypatch: Any,
-    raw: str,
+    raw: dict[str, Any],
     *,
     interval: float | None = None,
     return_type: str | None = None,
@@ -53,8 +48,6 @@ def _dispatch(
     monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
     return _predict_shape.shape_predict_response(
         raw,
-        headers=[],
-        rows=[],
         table_kind="pandas",
         training_table_kind="pandas",
         interval=interval,
@@ -73,7 +66,7 @@ def _payload(
     columns: dict[str, list[float]],
     *,
     covariance_source: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     """A point payload carrying the fields the FFI ``PredictionPayload`` serializes.
 
     ``point_shape`` / ``point_column`` are what ``PredictModelClass::point_shape``
@@ -87,11 +80,13 @@ def _payload(
         "family": family,
         "point_shape": point_shape,
         "point_column": point_column,
-        "columns": columns,
+        "columns": {
+            name: np.asarray(values, dtype=np.float64) for name, values in columns.items()
+        },
     }
     if covariance_source is not None:
         payload["covariance_source"] = covariance_source
-    return json.dumps(payload)
+    return payload
 
 
 def test_interval_dict_exposes_exact_covariance_provenance(monkeypatch: Any) -> None:
@@ -178,8 +173,8 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
 
     class _ClippingRust(_FakeRust):
         @staticmethod
-        def marginal_slope_clip_probabilities(values: list[float]) -> list[float]:
-            return [min(1.0, max(0.0, v)) for v in values]
+        def marginal_slope_clip_probabilities(values: np.ndarray) -> np.ndarray:
+            return np.clip(values, 0.0, 1.0)
 
     rust = _ClippingRust()
     monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
@@ -202,8 +197,6 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
 
     out = _predict_shape.shape_predict_response(
         raw,
-        headers=[],
-        rows=[],
         table_kind="pandas",
         training_table_kind="pandas",
         interval=0.95,
@@ -235,6 +228,38 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     np.testing.assert_allclose(out["mean_upper"], [0.40, 0.58, 1.0])
     np.testing.assert_allclose(out.mean_lower, [0.0, 0.42, 0.70])
     np.testing.assert_allclose(out.mean_upper, [0.40, 0.58, 1.0])
+
+
+def test_withheld_fit_point_note_reaches_the_prediction_dict_2985(monkeypatch: Any) -> None:
+    """gam#2985: a fit that withheld its covariance predicts its posterior mean
+    conditional on the fitted latent law, and the FFI payload says so under
+    ``point_covariance_note``; the dict result carries that note beside
+    ``point_covariance_source``, and a payload without it adds no key."""
+    columns = {"linear_predictor": [-0.2, 0.3], "mean": [0.43, 0.61]}
+    note = (
+        "posterior mean conditional on the fitted latent law; the generated-regressor "
+        "correction was declined: no coefficient covariance was published"
+    )
+    withheld = _payload(
+        "marginal-slope",
+        "bernoulli-marginal-slope",
+        "marginal_slope_probability",
+        "mean",
+        columns,
+    )
+    withheld["point_covariance_source"] = "conditional"
+    withheld["point_covariance_note"] = note
+
+    out = _dispatch(monkeypatch, withheld, return_type="dict")
+
+    assert isinstance(out, PredictionResult)
+    assert out["point_covariance_source"] == "conditional"
+    assert out["point_covariance_note"] == note
+
+    published = dict(withheld)
+    del published["point_covariance_note"]
+    plain = _dispatch(monkeypatch, published, return_type="dict")
+    assert "point_covariance_note" not in plain
 
 
 def test_bernoulli_marginal_slope_no_interval_stays_1d(monkeypatch: Any) -> None:

@@ -42,6 +42,9 @@ tempfile = "3.27.0"
 # No dependency cycle: gam-test-support depends on gam-linalg/models/problem/
 # runtime/terms only -- neither gam-cli nor the root `gam` crate.
 gam-test-support = { path = "../gam-test-support" }
+# The #2946 finite-response composition example reads gam-math's activation, standard-normal draw and probability
+# owners directly.
+gam-math = { path = "../gam-math" }
 
 [lints.rust]
 warnings = "deny"

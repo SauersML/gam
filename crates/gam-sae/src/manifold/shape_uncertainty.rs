@@ -6,13 +6,6 @@ use super::*;
 /// evaluated at an evenly-strided subset of the atom's own on-atom coordinates.
 pub const SHAPE_BAND_MAX_POINTS: usize = 512;
 
-/// Entry budget for materializing one atom's dense `(M_k·p)²` decoder
-/// covariance in the fit payload. Above it (LLM-scale ambient `p`) the band
-/// quantities are computed exactly from the factored frame covariance and the
-/// dense export is omitted (`decoder_covariance: None`) — the python reader
-/// treats it as optional. 2^24 f64 entries = 128 MiB per atom.
-pub const SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES: usize = 1 << 24;
-
 /// Posterior uncertainty of one fitted atom's manifold shape.
 ///
 /// In the primary path — [`SaeManifoldTerm::assemble_shape_uncertainty`], and
@@ -36,12 +29,13 @@ pub struct SaeAtomShapeUncertainty {
     /// `Cov(β_k) = φ·[A⁺]_ββ[block_k]`, shape `(M_k·p, M_k·p)` in the decoder's
     /// row-major `(basis, channel)` flat layout (flat index `b·p + c`).
     ///
-    /// `None` when materializing it would exceed
-    /// [`SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES`] (LLM-scale ambient `p`: at
-    /// `(M=8, p=2048)` the dense block is 2 GiB *per atom*, at
-    /// `(M=16, p=5120)` ~50 GiB). The band quantities below are then computed
-    /// from the factored `(M_k·r_k)²` frame covariance without lifting it, which
-    /// holds the frame at its fitted value (see [`SaeFrameConditioning`]).
+    /// `None` on a framed atom held at its fitted frame when every framed atom's
+    /// dense `(M_k·p)²` covariance together exceeds the memory governor's
+    /// single-materialization cap (LLM-scale ambient `p`: at `(M=8, p=2048)` the
+    /// dense block is 2 GiB *per atom*). The band quantities below are then
+    /// computed from the factored `(M_k·r_k)²` frame covariance without lifting
+    /// it, which holds the frame at its fitted value (see
+    /// [`SaeFrameConditioning`]).
     pub decoder_covariance: Option<Array2<f64>>,
     /// Coordinates at which the band is evaluated, shape `(G, d_k)`.
     pub band_coords: Option<Array2<f64>>,
@@ -209,9 +203,9 @@ pub enum SaeFrameMarginalUnavailable {
     /// The execution plan does not admit the dense observed information of the
     /// unframed decoder `(t, vec B)`, from which the tangent operator is formed.
     UnframedObservedInformationNotAdmitted,
-    /// Atom `atom`'s dense `(M_k·p)²` decoder covariance exceeds
-    /// [`SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES`].
-    DecoderCovarianceExceedsPayload { atom: usize },
+    /// The dense `(M_k·p)²` decoder covariances of every framed atom together
+    /// exceed the memory governor's single-materialization cap.
+    DecoderCovariancesExceedMaterializationCap,
     /// Atom `atom`'s decoder has numerical rank below its frame rank. The
     /// fixed-rank manifold is singular there and has no tangent space of
     /// dimension `r_k(M_k + p − r_k)`.
@@ -318,6 +312,35 @@ impl SaeShapeCovarianceOperator {
             Self::Unavailable(
                 SaeShapeCovarianceUnavailable::IndefiniteObservedInformation { .. },
             ) => "unavailable_indefinite_observed_information",
+        }
+    }
+
+    /// Wire name of why every learned frame is held at its fitted value, or `None`
+    /// when the covariance integrates the frames, no atom carries one, or no
+    /// covariance was produced. Admission to the integrated covariance depends on
+    /// the host's memory, so a result says which covariance it holds and why.
+    pub fn frame_conditioning_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ObservedInformation {
+                frame_conditioning: SaeFrameConditioning::ConditionalOnFittedFrames(reason),
+                ..
+            } => Some(reason.as_str()),
+            Self::ObservedInformation { .. } | Self::Unavailable(_) => None,
+        }
+    }
+}
+
+impl SaeFrameMarginalUnavailable {
+    /// Wire name of the reason, owned here so bindings marshal rather than map.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnframedObservedInformationNotAdmitted => {
+                "unframed_observed_information_not_admitted"
+            }
+            Self::DecoderCovariancesExceedMaterializationCap => {
+                "decoder_covariances_exceed_materialization_cap"
+            }
+            Self::FrameCoordinatesRankDeficient { .. } => "frame_coordinates_rank_deficient",
         }
     }
 }

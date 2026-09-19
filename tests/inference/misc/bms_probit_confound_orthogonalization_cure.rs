@@ -129,7 +129,7 @@ fn build_confounded_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTerm
                 boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 
@@ -137,6 +137,7 @@ fn build_confounded_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTerm
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![make_bspline("f_marginal", 10)],
+        level: Default::default(),
     };
     // Slope surface over the SAME covariate x — this is what overlaps the
     // marginal span once weighted by the x-correlated exposure z.
@@ -144,6 +145,7 @@ fn build_confounded_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTerm
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![make_bspline("f_slope", 8)],
+        level: Default::default(),
     };
 
     let spec = BernoulliMarginalSlopeTermSpec {
@@ -160,6 +162,8 @@ fn build_confounded_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTerm
         link_dev: None,
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }

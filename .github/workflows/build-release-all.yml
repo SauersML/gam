@@ -286,4 +286,8 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: Release ${{ steps.tag.outputs.release_tag }}
-          files: release-artifacts/**/*
+          # Only the platform archives. download-artifact pulls every artifact of the run, including the CUDA
+          # toolkit's installer log, and a bare **/* published cuda-installer.log beside the binaries.
+          files: |
+            release-artifacts/**/gam-*.tar.gz
+            release-artifacts/**/gam-*.zip

@@ -9,7 +9,7 @@ and metrics that score feature recovery directly instead of only
 reconstruction.
 
 The SAE being benchmarked is the repo's public implementation:
-``gamfit.sae_manifold_fit``. This file only supplies data generation and
+``gamfit.sae.sae_manifold_fit``. This file only supplies data generation and
 ground-truth scoring.
 
 Comparable-protocol convention (BSF toy)
@@ -257,7 +257,7 @@ def _basis_values(
                 "fitted basis for scoring (refusing to fake [1, x])."
             )
         return np.asarray(
-            gamfit.duchon_basis(np.asarray(coords, dtype=float), np.asarray(centers, dtype=float)),
+            gamfit.basis.duchon_basis(np.asarray(coords, dtype=float), np.asarray(centers, dtype=float)),
             dtype=float,
         )
     if kind in ("linear", "affine"):
@@ -269,7 +269,7 @@ def _basis_values(
     )
 
 
-def _published_basis_plan(fit: gamfit.ManifoldSAE, atom: int) -> tuple[str, int]:
+def _published_basis_plan(fit: gamfit.sae.ManifoldSAE, atom: int) -> tuple[str, int]:
     """``(basis kind, harmonic count)`` of one fitted atom, read from the plan the fit publishes.
 
     A fitted ``ManifoldSAE`` exposes ``basis_kinds`` / ``basis_sizes``; it carries no
@@ -297,7 +297,7 @@ def _published_basis_plan(fit: gamfit.ManifoldSAE, atom: int) -> tuple[str, int]
     return kind, (width - 1) // 2
 
 
-def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray]:
+def _learned_components(fit: gamfit.sae.ManifoldSAE) -> tuple[np.ndarray, np.ndarray]:
     directions: list[np.ndarray] = []
     activations: list[np.ndarray] = []
     assignments = np.asarray(fit.assignments, dtype=float)
@@ -319,7 +319,7 @@ def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray
     return np.vstack(directions), np.column_stack(activations)
 
 
-def _manifold_total_slots(fit: gamfit.ManifoldSAE) -> int:
+def _manifold_total_slots(fit: gamfit.sae.ManifoldSAE) -> int:
     """Architectural latent-slot count for a manifold SAE (#1435).
 
     A manifold SAE allocates ``atoms`` decoder blocks, each expanded over its
@@ -361,7 +361,7 @@ def _best_f1(score: np.ndarray, truth: np.ndarray) -> tuple[float, float, float]
     return best
 
 
-def _component_scores_from_payload(fit: gamfit.ManifoldSAE, payload: dict[str, Any]) -> np.ndarray:
+def _component_scores_from_payload(fit: gamfit.sae.ManifoldSAE, payload: dict[str, Any]) -> np.ndarray:
     assignments = np.asarray(payload["assignments"], dtype=float)
     all_scores: list[np.ndarray] = []
     for k, block in enumerate(fit.decoder_blocks):
@@ -398,7 +398,7 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     test_x, test_coeff, test_fire = synth.sample(args.n_test, seed + 2)
 
     t0 = time.perf_counter()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=train_x,
         K=args.atoms,
         atom_basis=args.atom_basis,
@@ -406,7 +406,6 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         assignment=args.assignment,
         top_k=args.top_k,
         isometry_weight=args.isometry_weight,
-        ard_per_atom=args.ard_per_atom,
         sparsity_weight=args.sparsity_weight,
         smoothness_weight=args.smoothness_weight,
         n_iter=args.max_iter,
@@ -462,7 +461,7 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     score_seconds = time.perf_counter() - t1
 
     return BenchmarkMetrics(
-        fit_api="gamfit.sae_manifold_fit",
+        fit_api="gamfit.sae.sae_manifold_fit",
         seed=seed,
         n_features=args.features,
         hidden_dim=args.hidden_dim,
@@ -572,7 +571,7 @@ def _benchmark_notes() -> dict[str, Any]:
 
 
 def _probing_metrics_for_matches(
-    fit: gamfit.ManifoldSAE,
+    fit: gamfit.sae.ManifoldSAE,
     payload: dict[str, Any],
     fire: np.ndarray,
     rows: np.ndarray,
@@ -601,7 +600,6 @@ def main() -> int:
     parser.add_argument("--sparsity-weight", type=float, default=0.01)
     parser.add_argument("--smoothness-weight", type=float, default=0.01)
     parser.add_argument("--isometry-weight", type=float, default=0.0)
-    parser.add_argument("--ard-per-atom", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--corr-rank", type=int, default=8)
     parser.add_argument("--corr-scale", type=float, default=0.1)
     parser.add_argument("--p-min", type=float, default=5e-4)
@@ -620,7 +618,7 @@ def main() -> int:
     metrics = [run_one(args, int(seed)) for seed in seeds]
     payload = {
         "benchmark": "SynthSAEBench-style direct ground-truth benchmark for gamfit manifold SAE",
-        "fit_api": "gamfit.sae_manifold_fit",
+        "fit_api": "gamfit.sae.sae_manifold_fit",
         "notes": _benchmark_notes(),
         "runs": [asdict(item) for item in metrics],
         "summary": _summarize(metrics),

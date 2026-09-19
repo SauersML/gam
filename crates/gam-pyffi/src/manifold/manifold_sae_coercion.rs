@@ -490,7 +490,6 @@ pub(crate) fn build_manifold_sae_payload(
             assignments: assignments_col,
             coords: coords[idx].clone(),
             coords_u_arc,
-            evidence: score,
             active_dim: vi64(a, "active_dim")?,
             decoder_covariance_channel_factors,
             shape_band_coords: sb_coords,
@@ -589,12 +588,25 @@ pub(crate) fn build_manifold_sae_payload(
         },
         metric_provenance,
         fisher_mass_residual,
+        shape_covariance_operator: vstr(raw, "shape_covariance_operator")?,
+        shape_covariance_frame_conditioning_reason: match vopt(
+            raw,
+            "shape_covariance_frame_conditioning_reason",
+        ) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or("sae fit payload 'shape_covariance_frame_conditioning_reason' is not a string")?
+                    .to_string(),
+            ),
+        },
         selected_log_lambda_sparse,
         selected_log_lambda_smooth,
         selected_log_ard,
         structured_residual_diagnostics,
         // #2235 — termination ledger carried straight from the raw fit payload
-        // into the persisted v7 artifact.
+        // into the persisted artifact.
         termination: report("termination"),
     })
 }

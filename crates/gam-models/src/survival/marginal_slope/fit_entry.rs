@@ -1,6 +1,8 @@
 //! The public fitting entry point `fit_survival_marginal_slope_terms`.
 
 use super::*;
+use crate::fit_orchestration::FitFailure;
+use crate::latent_law_compression::{CompressedLaw, DesignPoint, default_design};
 
 /// Recover the terminal hyperparameter vector from the optimizer that owned
 /// each coordinate.
@@ -58,23 +60,151 @@ pub(crate) fn fit_survival_marginal_slope_terms(
     spec: SurvivalMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<SurvivalMarginalSlopeFitResult, String> {
+) -> Result<SurvivalMarginalSlopeFitResult, FitFailure> {
     // The outer search is bounded by deterministic work (iteration/cycle caps
     // and the seed-screening cascade budget), not by wall-clock time (#2055):
     // clipping a fit by elapsed time is non-deterministic and machine-dependent,
     // so a slow-to-converge fit is fixed or bounded by work, never by a timer.
-    fit_survival_marginal_slope_terms_impl(data, spec, options, kappa_options)
+    //
+    // gam#2926: a closed form the adequacy screen chose, and the arm a moving law
+    // was fitted on, are certified at the converged fit; where the certificate
+    // prefers another law, the same spec is re-solved on it from the converged
+    // coefficients, and the re-solve carries that certificate.
+    //
+    // A declared law with many atoms is fit on its certified compression
+    // (gam#2928), designed first over the default operating range. Where a
+    // converged row's anchor misses the target, the compression is refined at
+    // that row's inputs and the fit is repeated on the refined law, a bounded
+    // number of times.
+    // Only a declared law can be compressed; whether it is, is the certified
+    // compression's own decision (`CompressedLaw::compress`).
+    if spec.declared_latent_law.is_none() {
+        let (outcome, _) =
+            fit_survival_marginal_slope_terms_impl(data, spec.clone(), options, kappa_options, &[], None)?;
+        return match outcome {
+            SurvivalCertifiedFit::Fitted(result) => Ok(*result),
+            SurvivalCertifiedFit::ReSolve(fallback) => {
+                match fit_survival_marginal_slope_terms_impl(
+                    data,
+                    spec,
+                    options,
+                    kappa_options,
+                    &[],
+                    Some(fallback),
+                )?
+                .0
+                {
+                    SurvivalCertifiedFit::Fitted(result) => Ok(*result),
+                    SurvivalCertifiedFit::ReSolve(_) => Err(FitFailure::invariant(
+                        "survival marginal-slope: a re-solve on the law its certificate chose \
+                         asked to be re-solved again, but it carries that certificate",
+                    )),
+                }
+            }
+        };
+    }
+    let mut design = default_design();
+    let mut refinements = 0usize;
+    loop {
+        let (outcome, missed) = fit_survival_marginal_slope_terms_impl(
+            data,
+            spec.clone(),
+            options,
+            kappa_options,
+            &design,
+            None,
+        )?;
+        // A declared law is the caller's statement about the score: nothing is
+        // estimated, so no certificate asks for a re-solve.
+        let SurvivalCertifiedFit::Fitted(result) = outcome else {
+            return Err(FitFailure::invariant(
+                "survival marginal-slope: a fit on a declared latent law asked to be re-solved \
+                 on another law, but a declared law carries no certificate",
+            ));
+        };
+        let result = *result;
+        if missed.is_empty() {
+            return Ok(result);
+        }
+        let record = result.latent_law_compression.as_ref().ok_or_else(|| {
+            FitFailure::invariant(
+                "survival marginal-slope declared law compression reported missed anchors \
+                 without its record",
+            )
+        })?;
+        if refinements == DECLARED_LAW_COMPRESSION_REFINEMENTS {
+            return Err(FitFailure::integration(format!(
+                "survival marginal-slope declared latent law of {} atoms: after {refinements} \
+                 refinements its certified compression ({} bins, {} nodes) still misses \
+                 10⁻³ of the anchor's sampling standard error at {} of {} converged anchors \
+                 (largest certified error {:e} standard errors) (gam#2928)",
+                record.atoms,
+                record.bins,
+                record.nodes,
+                record.anchors_checked - record.anchors_meeting_target,
+                record.anchors_checked,
+                record.max_delta_over_standard_error,
+            )));
+        }
+        refinements += 1;
+        log::debug!(
+            "[survival-marginal-slope latent-z] declared law compression refinement {refinements}: \
+             {} of {} converged anchors missed 10⁻³·SE (largest {:e}); refining at {} of their \
+             inputs and refitting (gam#2928)",
+            record.anchors_checked - record.anchors_meeting_target,
+            record.anchors_checked,
+            record.max_delta_over_standard_error,
+            missed.len(),
+        );
+        design.extend(missed);
+    }
 }
 
+/// What a converged survival fit whose certificate prefers another law hands the
+/// re-solve on that law (gam#2926): each score's calibration and law, the label the
+/// re-solved fit records, which carries the certificate that chose it, and the
+/// coefficients it starts from.
+pub(crate) struct SurvivalClosedFormFallback {
+    calibrations: Vec<crate::bms::LatentMeasureCalibration>,
+    measures: Vec<crate::bms::LatentMeasureKind>,
+    consumed: crate::bms::LatentLawConsumed,
+    hints: ThetaHints,
+}
+
+/// One survival fit's outcome under its latent-law certificate.
+pub(crate) enum SurvivalCertifiedFit {
+    Fitted(Box<SurvivalMarginalSlopeFitResult>),
+    ReSolve(SurvivalClosedFormFallback),
+}
+
+/// Refinements of a declared law's compression a fit may run before it
+/// refuses (gam#2928).
+const DECLARED_LAW_COMPRESSION_REFINEMENTS: usize = 3;
+
+/// The fit itself, on `compression_design` for a declared law with many atoms
+/// (gam#2928). Returns the anchors of the converged fit whose certified error
+/// missed its target, which the caller refines at.
 pub(crate) fn fit_survival_marginal_slope_terms_impl(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<SurvivalMarginalSlopeFitResult, String> {
+    compression_design: &[DesignPoint],
+    fallback: Option<SurvivalClosedFormFallback>,
+) -> Result<(SurvivalCertifiedFit, Vec<DesignPoint>), FitFailure> {
     let fit_started = std::time::Instant::now();
+    let (fallback_law, fallback_hints) = match fallback {
+        Some(SurvivalClosedFormFallback {
+            calibrations,
+            measures,
+            consumed,
+            hints,
+        }) => (Some((calibrations, measures, consumed)), Some(hints)),
+        None => (None, None),
+    };
     let mut spec = spec;
-    validate_spec(&spec)?;
+    // The spec validator checks only what the caller supplied (#2937).
+    validate_spec(&spec).map_err(FitFailure::input)?;
     if spec.base_link != InverseLink::Standard(StandardLink::Probit) {
         return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
             reason: format!(
@@ -92,13 +222,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &mut spec.time_block,
         spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
         &entry_at_origin,
-    )?;
+    )
+    .map_err(FitFailure::invariant)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
         "survival-marginal-slope",
         &spec.latent_z_policy,
-    )?;
+    )
+    .map_err(FitFailure::input)?;
     spec.z = z_standardized;
     let n = spec.age_entry.len();
     let (initial_sigma, learned_sigma_initial, learned_log_sigma_coordinate) = match &spec.frailty {
@@ -165,12 +297,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         enable_surface_identifiability_double_penalty(surface_spec);
     }
     let (_raw_joint_designs, mut joint_specs) =
-        build_term_collection_designs_and_freeze_joint(data, &design_specs)
-            .map_err(|e| e.to_string())?;
+        build_term_collection_designs_and_freeze_joint(data, &design_specs)?;
     // Rebuild the probe designs from the frozen `joint_specs` so the probe's
     // penalty topology matches the topology produced by every other build path
     // in this optimization. The spatial optimizer's own bootstrap inside
-    // `optimize_spatial_length_scale_exact_joint` and every subsequent
+    // `optimize_spatial_length_scale_exact_joint_typed` and every subsequent
     // kappa-driven rebuild feed the basis builder the captured
     // `FrozenTransform` identifiability. Applying that captured transform
     // changes the coefficient chart in which every penalty is represented.
@@ -180,11 +311,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // a "joint hyper rho dimension mismatch". Mirrors the CTN- and BMS-side
     // fixes in `fit_transformation_normal` and `fit_bernoulli_marginal_slope_terms`.
     let (mut joint_designs, _) = build_term_collection_designs_and_freeze_joint(data, &joint_specs)
-        .map_err(|e| format!("failed to rebuild frozen probe SMGS joint designs: {e}"))?;
+        .map_err(|e| FitFailure::from(e).context("failed to rebuild frozen probe SMGS joint designs"))?;
     let marginal_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
     let (slope_design, slopespec_boot, slope_topology) =
-        combine_slope_surface_designs(joint_designs, &joint_specs)?;
+        combine_slope_surface_designs(joint_designs, &joint_specs).map_err(FitFailure::invariant)?;
     // gam#2765 / gam#2767: if the request asked for a follow-up-varying slope,
     // the block's coefficient design is the covariate design tensored against a
     // time margin, and the layout carries the other two follow-up channels. The
@@ -240,7 +371,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let (slope_design, slope_follow_up) = tensorize_slope_design_over_time(
         slope_cov_design.clone(),
         &spec.slope_template,
-    )?;
+    )
+    .map_err(FitFailure::invariant)?;
     if slope_follow_up.is_some() {
         // The flex surfaces evaluate the row program through the four-primary
         // frame. Each is a real combination to support, and each is a separate
@@ -302,18 +434,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let tensorize_slope = move |design: &TermCollectionDesign| {
         tensorize_slope_design_over_time(design.clone(), &slope_template)
     };
-    spec.marginal_offset = marginal_design
-        .compose_offset(
-            spec.marginal_offset.view(),
-            "survival marginal-slope marginal block",
-        )
-        .map_err(|error| error.to_string())?;
-    spec.slope_offset = slope_design
-        .compose_offset(
-            spec.slope_offset.view(),
-            "survival marginal-slope slope block",
-        )
-        .map_err(|error| error.to_string())?;
+    spec.marginal_offset = marginal_design.compose_offset(
+        spec.marginal_offset.view(),
+        "survival marginal-slope marginal block",
+    )?;
+    spec.slope_offset = slope_design.compose_offset(
+        spec.slope_offset.view(),
+        "survival marginal-slope slope block",
+    )?;
     // gam#2768: the automatic latent-measure gate, on the same marginal-index
     // span a(C) BMS conditions on. This has to sit HERE and not beside
     // `standardize_latent_z_matrix_with_policy` above: the conditioning block is
@@ -322,7 +450,103 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // seed, the score covariance Σ, the score-warp seed basis, every design and
     // every kernel evaluation — is therefore sequenced after it, so no consumer
     // can see the uncalibrated axis.
-    let latent_calibration = resolve_survival_latent_score_calibration(&mut spec, &marginal_design)?;
+    // gam#2928: a declared law with many atoms is anchored on its certified
+    // compression, designed over `compression_design`. The compressed law is
+    // what the gate below persists as the fit's latent measure, and every
+    // converged anchor is certified against the declared atoms after the solve.
+    let declared_law_compression = match spec.declared_latent_law.as_ref() {
+        // The declared law is the caller's; compressing it refuses its nodes,
+        // weights or tails (#2937).
+        Some(law) => CompressedLaw::compress(&law.nodes, &law.weights, compression_design)
+            .map_err(FitFailure::input)?,
+        None => None,
+    };
+    // The declared atoms, kept for the saved model beside the compressed law.
+    let declared_latent_law = if declared_law_compression.is_some() {
+        spec.declared_latent_law.clone()
+    } else {
+        None
+    };
+    if let Some(compressed) = declared_law_compression.as_ref() {
+        let grid = compressed.grid();
+        log::debug!(
+            "[survival-marginal-slope latent-z] declared latent law of {} atoms compressed to {} \
+             nodes in {} bins for the anchor (gam#2928)",
+            compressed.atoms(),
+            grid.nodes.len(),
+            compressed.bins(),
+        );
+        spec.declared_latent_law = Some(
+            crate::bms::EmpiricalZGrid::new(
+                grid.nodes.clone(),
+                grid.weights.clone(),
+                "survival marginal-slope compressed declared latent law",
+            )
+            .map_err(FitFailure::invariant)?,
+        );
+    }
+    let latent_calibration = match fallback_law {
+        // gam#2926: the re-solve of a closed form whose certificate preferred the
+        // estimated law anchors on that law, and records why.
+        // With several scores it anchors on their joint law, transported on the
+        // same conditioning span the gate used, and persists each score's own law.
+        Some((calibrations, measures, consumed)) => {
+            let k = spec.z.ncols();
+            if measures.len() != k || calibrations.len() != k {
+                return Err(FitFailure::invariant(format!(
+                    "survival marginal-slope re-solve carried {} laws and {} calibrations for \
+                     K={k} scores",
+                    measures.len(),
+                    calibrations.len()
+                )));
+            }
+            let absorber_active = spec
+                .score_influence_jacobian
+                .as_ref()
+                .is_some_and(|jacobian| jacobian.ncols() > 0);
+            let conditioning = if absorber_active {
+                None
+            } else {
+                Some(
+                    marginal_design
+                        .design
+                        .try_to_dense_arc("survival marginal-slope re-solve conditioning span")
+                        .map_err(FitFailure::input)?,
+                )
+            };
+            let raw_scores = spec.z.clone();
+            // A location-scale law the certificate chose replaces the score before
+            // any consumer sees it, as the gate's own decision would have.
+            for (col, calibration) in calibrations.iter().enumerate() {
+                if let crate::bms::LatentMeasureCalibration::ConditionalLocationScale(cal) =
+                    calibration
+                {
+                    let a_block = conditioning.as_ref().ok_or_else(|| {
+                        FitFailure::invariant(
+                            "survival marginal-slope re-solve on a location-scale law requires \
+                             the marginal conditioning block",
+                        )
+                    })?;
+                    let calibrated = cal
+                        .apply(raw_scores.column(col), a_block.view())
+                        .map_err(FitFailure::invariant)?;
+                    spec.z.column_mut(col).assign(&calibrated);
+                }
+            }
+            SurvivalLatentScoreCalibration {
+                per_score: calibrations,
+                per_score_measure: measures,
+                consumed,
+                certificate_laws: vec![None; k],
+                moving_law: None,
+                raw_scores,
+                conditioning,
+            }
+        }
+        // The latent-measure gate reads the caller's scores and declared law.
+        None => resolve_survival_latent_score_calibration(&mut spec, &marginal_design, data)
+            .map_err(FitFailure::input)?,
+    };
     // gam#2766: `Σ` in this family's defining identity is `Var(z | a)`, so the
     // pooled matrix above is only the right object when that conditional
     // covariance does not move. One robust Rao score test per score PAIR, on the
@@ -337,7 +561,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .conditioning
             .as_ref()
             .map(|design| design.view()),
-    )?;
+    )
+    .map_err(FitFailure::unclassified)?;
     // gam#2923: the measure the gate settled on. An empirical measure means the
     // fit runs the anchored frame — the marginal identity solved on that law per
     // row — instead of the Gaussian closed form; the law is materialised once
@@ -352,7 +577,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if latent_calibration
             .per_score_measure
             .iter()
-            .any(|measure| measure.is_empirical())
+            .any(|measure| !matches!(measure, crate::bms::LatentMeasureKind::StandardNormal))
         {
             if let Some(reason) = joint_latent_law_measure_refusal(
                 spec.z.ncols(),
@@ -369,7 +594,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .as_ref()
                     .map(|design| design.view()),
                 DEFAULT_JOINT_LATENT_NODES,
-            )?;
+            )
+            .map_err(FitFailure::unclassified)?;
             joint_latent_law = Some(persisted);
             Some(Arc::new(SurvivalLatentLaw::from_joint(
                 latent_calibration.primary_measure().clone(),
@@ -379,12 +605,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             None
         }
     } else {
-        SurvivalLatentLaw::from_kind(latent_calibration.primary_measure(), n)?.map(Arc::new)
+        SurvivalLatentLaw::from_kind(latent_calibration.primary_measure(), n)
+            .map_err(FitFailure::invariant)?
+            .map(Arc::new)
     };
     if let Some(law) = latent_law.as_ref()
         && let Some(reason) = anchored_kernel_unavailable_reason(&spec)
     {
-        return Err(format!(
+        return Err(FitFailure::input(format!(
             "survival marginal-slope latent-measure gate produced a {} latent law, but {reason}",
             if law.joint().is_some() {
                 "joint"
@@ -395,21 +623,27 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     crate::bms::LatentMeasureKind::StandardNormal => "standard-normal",
                 }
             }
-        ));
+        )));
     }
     let z_primary = spec.z.column(0).to_owned();
+    // The pilot reads score 0, so its variance is that score's conditional
+    // variance `Σ(a_i)₀₀` from the field the fitted likelihood reads (gam#2952).
+    let z_primary_variance = Array1::from_shape_fn(z_primary.len(), |row| {
+        score_covariance.at_row(row).to_dense()[[0, 0]]
+    });
     let baseline_started = std::time::Instant::now();
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
         &entry_at_origin,
         &z_primary,
+        &z_primary_variance,
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
         probit_scale,
     );
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] baseline seed slope={:.6e} elapsed={:.3}s",
         baseline_slope,
         baseline_started.elapsed().as_secs_f64(),
@@ -454,9 +688,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         marginal_design.design.clone(),
     ])
     .map_err(|e| {
-        format!(
+        FitFailure::invariant(format!(
             "survival marginal-slope cross-block anchor stack failed to concatenate time + marginal design at training rows: {e}"
-        )
+        ))
     })?;
     // Non-rigid pilot η₁ via one IRLS step on the rigid joint design
     // `[T_exit | M | G]`. The offset-only `survival_rigid_pilot_eta` was a
@@ -481,7 +715,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &spec.weights,
         &spec.event_target,
         probit_scale,
-    )?;
+    )
+    .map_err(FitFailure::numerical)?;
     // Split the location half of the pilot's joint Newton step back into the
     // two blocks it was stacked from at line ~193. `location_anchor_design`
     // is `hstack([time_block.design_exit, marginal_design.design])`, so the
@@ -491,7 +726,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let pilot_time_width = spec.time_block.design_exit.ncols();
     let pilot_marginal_width = marginal_design.design.ncols();
     if pilot.location_beta.len() != pilot_time_width + pilot_marginal_width {
-        return Err(format!(
+        return Err(FitFailure::invariant(format!(
             "survival marginal-slope non-rigid pilot returned a location-block coefficient \
              vector of length {} but the anchor design it was solved against stacks \
              time_exit({}) + marginal({}) = {} columns; the pilot warm start cannot be \
@@ -500,7 +735,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             pilot_time_width,
             pilot_marginal_width,
             pilot_time_width + pilot_marginal_width,
-        ));
+        )));
     }
     let pilot_time_beta = pilot
         .location_beta
@@ -517,7 +752,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &spec.weights,
         &spec.event_target,
     )
-    .map_err(|e| format!("survival cross-block W metric construction: {e}"))?;
+    .map_err(|e| FitFailure::numerical(format!("survival cross-block W metric construction: {e}")))?;
     // Absorbed Stage-1 influence columns `Z̃_infl` (#461, design §3). When the
     // workflow chained a CTN Stage-1 into this marginal-slope fit,
     // `spec.score_influence_jacobian` carries the out-of-fold `J = ∂z/∂θ₁`. The
@@ -543,7 +778,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         use crate::marginal_slope_orthogonal::residualized_influence_block;
         let marginal_dense = marginal_design
             .design
-            .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+            .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")
+            .map_err(FitFailure::input)?;
         // `β̂₀(x_i)` is the rigid-pilot slope; `s_f = probit_scale`; `z_primary`
         // is the OOF latent z on these rows.
         let rigid_slope_at_rows = &spec.slope_offset + baseline_slope;
@@ -598,7 +834,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             }
             .into());
         }
-        let mut base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
+        let mut base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)
+            .map_err(crate::gamlss::wiggle_basis_failure)?;
         let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
             (&location_anchor_design, ParametricAnchorBlock::Marginal),
             (&slope_design.design, ParametricAnchorBlock::Slope),
@@ -610,13 +847,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &parametric_anchors,
             &[],
             &cross_block_pilot_w,
-        )?;
+        )
+        .map_err(FitFailure::unclassified)?;
         match outcome {
-            FlexCompileOutcome::Reparameterised => Some(stripe_score_warp_across_z_coords(
-                base.block,
-                base.runtime,
-                &spec.z,
-            )?),
+            FlexCompileOutcome::Reparameterised => Some(
+                stripe_score_warp_across_z_coords(base.block, base.runtime, &spec.z)
+                    .map_err(FitFailure::invariant)?,
+            ),
             FlexCompileOutcome::FullyAliased { reason } => {
                 // Record via the structured channel. The block is still
                 // included with its original (non-compiled) design so the
@@ -631,11 +868,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     anchor_summary: "marginal+slope".to_string(),
                     reason,
                 });
-                Some(stripe_score_warp_across_z_coords(
-                    base.block,
-                    base.runtime,
-                    &spec.z,
-                )?)
+                Some(
+                    stripe_score_warp_across_z_coords(base.block, base.runtime, &spec.z)
+                        .map_err(FitFailure::invariant)?,
+                )
             }
         }
     } else {
@@ -653,7 +889,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &padded_seed,
             &q0_seed,
             cfg,
-        )?;
+        )
+        .map_err(crate::gamlss::wiggle_basis_failure)?;
         // Cross-block identifiability: residualise the link-deviation
         // basis against the parametric anchor union (marginal + slope
         // designs) at training rows so its column span is orthogonal
@@ -689,7 +926,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let score_warp_anchor_design = score_warp_prepared
             .as_ref()
             .map(|sw| sw.runtime.design_at_training_with_residual(&z_primary))
-            .transpose()?;
+            .transpose()
+            .map_err(FitFailure::invariant)?;
         let parametric_anchors: [(&DesignMatrix, ParametricAnchorBlock); 2] = [
             (&location_anchor_design, ParametricAnchorBlock::Marginal),
             (&slope_design.design, ParametricAnchorBlock::Slope),
@@ -703,7 +941,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             &parametric_anchors,
             &flex_anchors,
             &cross_block_pilot_w,
-        )?;
+        )
+        .map_err(FitFailure::unclassified)?;
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
@@ -750,25 +989,31 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
         );
+        // A seed refuses a design or penalty with no usable Gram scale, a
+        // degenerate block the caller's data produced (#2937).
         seeds.extend(block_log_lambda_seeds(
             &spec.time_block.design_exit,
             spec.time_block.penalties.iter(),
-        )?);
+        )
+        .map_err(FitFailure::input)?);
         seeds.extend(block_log_lambda_seeds(
             &marginal_design.design,
             marginal_design.penalties.iter().map(|bp| &bp.local),
-        )?);
+        )
+        .map_err(FitFailure::input)?);
         seeds.extend(block_log_lambda_seeds(
             &slope_design.design,
             slope_design.penalties.iter().map(|bp| &bp.local),
-        )?);
+        )
+        .map_err(FitFailure::input)?);
         seeds
     };
     // The ρ domain per coordinate, in the layout the seeds above use: the time
     // block's penalties against its exit design, the marginal and slope blocks
     // against their own designs, the prepared extra blocks against theirs, and
-    // the absorber ridge on the precision box (#2812).
-    let rho_domain = {
+    // the absorber's identity ridge against the residualized influence columns
+    // it penalizes (#2812, #2902 item 15).
+    let (rho_lower, rho_upper) = {
         let mut lower = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let mut upper = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
@@ -805,12 +1050,15 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             lower.extend(lo);
             upper.extend(hi);
         }
-        if influence_absorber_residualized.is_some() {
-            let (lo, hi) = gam_problem::precision_box();
-            lower.push(lo);
-            upper.push(hi);
+        if let Some(absorber) = influence_absorber_residualized.as_ref() {
+            let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
+                &DesignMatrix::from(absorber.clone()),
+                [&Array2::<f64>::eye(absorber.ncols())],
+            );
+            lower.extend(lo);
+            upper.extend(hi);
         }
-        Some((Array1::from_vec(lower), Array1::from_vec(upper)))
+        (Array1::from_vec(lower), Array1::from_vec(upper))
     };
     let setup = joint_setup(
         data,
@@ -821,16 +1069,17 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         slope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
-        rho_domain,
+        rho_lower,
+        rho_upper,
         &baseline_initial_theta,
         &baseline_lower_theta,
         &baseline_upper_theta,
         learned_log_sigma_coordinate,
         kappa_options,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
 
-    let hints = RefCell::new(ThetaHints::default());
+    // A re-solve on the estimated law starts from the closed-form coefficients.
+    let hints = RefCell::new(fallback_hints.unwrap_or_default());
     // #808 operating-point warm start for the slope block. The inner
     // joint-Newton seeds each block at `spec.initial_beta` (→ `hints.slope_beta`
     // via `build_slope_blockspec`). At the default `g = 0` seed the slope
@@ -890,7 +1139,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if marginal_installed {
             hints_mut.marginal_beta = Some(pilot_marginal_beta.clone());
         }
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] #2627 location warm start: \
              time_installed={time_installed} (len={} vs design_exit={}), \
              marginal_installed={marginal_installed} (len={} vs marginal={}), \
@@ -905,8 +1154,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 .fold(0.0_f64, |a, v| a.max(v.abs())),
         );
     }
-    let exact_mode_branch =
-        RefCell::new(crate::exact_mode_branch::ExactCoefficientModeBranch::default());
+    let walk_signals = crate::exact_mode_branch::OuterWalkSignals::default();
+    let exact_mode_branch = RefCell::new(crate::exact_mode_branch::ExactCoefficientModeBranch::new(
+        walk_signals.clone(),
+    ));
     // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
     // `seed_inner_beta_fn` on a cache hit before any eval has run at the
     // restored ρ. Per-block widths are only known once `build_blocks(rho,…)`
@@ -932,7 +1183,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .timewiggle_block
         .as_ref()
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
-        .transpose()?;
+        .transpose()
+        .map_err(FitFailure::input)?;
     // Coordinate-cone time bases already encode monotonicity as β >= 0:
     // validation proved D >= 0 and offsets absorb the derivative guard. Emitting
     // row-wise `D β + o >= guard` constraints here duplicates the same condition
@@ -951,12 +1203,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &design_derivative_exit,
                 derivative_offset_exit.as_ref(),
                 derivative_guard,
-            )?;
+            )
+            .map_err(FitFailure::unclassified)?;
             append_timewiggle_tail_nonnegative_constraints(
                 derivative_guard_constraints,
                 design_exit.ncols(),
                 derived_time_wiggle_ncols.unwrap_or(0),
-            )?
+            )
+            .map_err(FitFailure::invariant)?
         }
     };
 
@@ -1359,14 +1613,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             gam_solve::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
     if outer_cache_seed_available {
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
             n,
             setup.rho_dim(),
         );
     } else {
         let pilot_started = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} slope_p={}",
             n,
             design_exit.ncols(),
@@ -1380,18 +1634,21 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let rigid_rho = Array1::<f64>::zeros(
             time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
         );
+        // Blocks and families are built from the designs above (#2937).
         let rigid_blocks = build_blocks(
             &rigid_rho,
             &marginal_design,
             &slope_cov_design,
             FlexActivation::OffForRigidPilot,
-        )?;
+        )
+        .map_err(FitFailure::invariant)?;
         let rigid_family = make_family(
             &marginal_design,
             &slope_cov_design,
             &initial_hyper_theta,
             FlexActivation::OffForRigidPilot,
-        )?;
+        )
+        .map_err(FitFailure::invariant)?;
         let mut pilot_options = options.clone();
         // The pilot is only a warm start, so it skips production covariance
         // assembly. Its inner solve runs at the family's cycle budget and stops on
@@ -1439,7 +1696,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         hints_mut.slope_beta = Some(beta.clone());
                     }
                 }
-                log::info!(
+                log::debug!(
                     "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s hints_installed={}",
                     if converged { "converged" } else { "partial" },
                     cycles,
@@ -1473,7 +1730,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 // actually accept); outer-inner-fit does not because it operates
                 // at the penalised optimum where identifiability is a hard
                 // contract.
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
                     pilot_started.elapsed().as_secs_f64(),
                     err,
@@ -1499,14 +1756,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         marginal_has_spatial || slope_has_spatial || setup.log_kappa_dim() == 0;
 
     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
-        return Err(
-            "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives"
-                .to_string(),
-        );
+        return Err(FitFailure::invariant(
+            "exact survival marginal-slope spatial optimization requires analytic joint psi derivatives",
+        ));
     }
 
     let derivative_probe_started = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] initial derivative probe start rho_dim={} log_kappa_dim={}",
         setup.rho_dim(),
         setup.log_kappa_dim(),
@@ -1517,7 +1773,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &marginal_design,
         &slope_cov_design,
         FlexActivation::On,
-    )?;
+    )
+    .map_err(FitFailure::invariant)?;
     // Validate the assembled block specs at the construction boundary so any
     // design/penalty width inconsistency surfaces here as a clean typed error
     // string. Without this, the inconsistency would only be
@@ -1527,14 +1784,17 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
     // boundary" GamError instead of an actionable message.
     crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
-        format!("[survival-marginal-slope] assembled block specs invalid: {reason}")
+        FitFailure::invariant(format!(
+            "[survival-marginal-slope] assembled block specs invalid: {reason}"
+        ))
     })?;
     let initial_family = make_family(
         &marginal_design,
         &slope_cov_design,
         &initial_hyper_theta,
         FlexActivation::On,
-    )?;
+    )
+    .map_err(FitFailure::invariant)?;
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -1555,8 +1815,38 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
     // gradient without declared curvature: declaring it would refuse every trial point that
     // asks for curvature.
+    //
+    // gam#2930: an armed Jeffreys objective prices its second-order completion wherever the
+    // family serves the completion's outer derivatives, and a ψ coordinate that reshapes the
+    // Jeffreys information moves that completion. The completion's explicit ψ derivative joins
+    // the gradient everywhere. Its ψψ and ρψ curvature is served where the rigid frame contracts
+    // every ψ-moved trace Hessian in one pass, which covers baseline-chart and design axes on a
+    // time-constant slope; any other such θ declares no curvature.
+    let psi_moves_priced_completion = initial_family.joint_jeffreys_term_required()
+        && initial_family.jeffreys_completion_outer_derivatives().is_some()
+        && initial_family.joint_jeffreys_information_depends_on_psi();
+    // gam#2945: a learned log σ moves the priced completion too, and the completion's explicit σ
+    // derivative `∂C/∂σ|_β` needs the σ-mixed third information derivative, which has no closed
+    // form here. Such a θ has neither an exact outer gradient nor a curvature certificate, so the
+    // fit is refused once, by name, before the smoothing search. Without this rule every
+    // value+gradient evaluation refuses at the completion's σ column action; before the completion
+    // was priced in every eval mode, the search ran and the curvature guard refused its point as
+    // unevaluated (219 s on the #2930 minimal fixture with a learned σ).
+    if psi_moves_priced_completion && learned_sigma_initial.is_some() {
+        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: "a learned Gaussian frailty σ with the armed Jeffreys completion is refused: the \
+                     completion's explicit σ derivative needs the σ-mixed third information \
+                     derivative, which is not derived, so the fit has neither an exact outer \
+                     gradient nor a curvature certificate (gam#2945)"
+                .to_string(),
+        }
+        .into());
+    }
+    let completion_psi_curvature_served = initial_family.rigid_psi_jeffreys_third_served()
+        && !initial_family.slope_is_follow_up_varying();
     let psi_curvature_exact = setup.theta0().len() == setup.rho_dim()
-        || (initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
+        || ((!psi_moves_priced_completion || completion_psi_curvature_served)
+            && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
             && (!initial_family.joint_jeffreys_term_required()
                 || initial_family.rigid_psi_jeffreys_third_served()
                 || (setup.auxiliary_dim() == 0
@@ -1564,7 +1854,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && joint_hessian.is_analytic()
         && psi_curvature_exact;
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
@@ -1653,7 +1943,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         Ok(layout)
     };
 
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope/outer] solve start rho_dim={} log_kappa_dim={} aux_dim={}",
         setup.rho_dim(),
         setup.log_kappa_dim(),
@@ -1666,7 +1956,28 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // disable fixed-point at plan time.
     let outer_policy = initial_family.outer_derivative_policy(&initial_blocks, options);
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol;
-    let solved = optimize_spatial_length_scale_exact_joint(
+    // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
+    // the driver's fast path. A fit that also searches length-scale or auxiliary
+    // coordinates runs the driver's own search, which a saved model's certified
+    // point does not describe, so it is refused before any fitting.
+    if options.warm_start.is_some()
+        && !(setup.auxiliary_dim() == 0
+            && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
+    {
+        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "warm_start_from resumes a fit whose only outer coordinates are smoothing \
+                 parameters; this fit also searches {} length-scale and {} auxiliary coordinates",
+                setup.log_kappa_dim(),
+                setup.auxiliary_dim(),
+            ),
+        }
+        .into());
+    }
+    // The final fit's error reaches the caller typed (#2937): blocks and the
+    // family are built from the designs above, and the solver's
+    // `CustomFamilyError` is carried whole.
+    let solved = optimize_spatial_length_scale_exact_joint_typed(
         data,
         &[marginalspec_boot.clone(), slopespec_boot.clone()],
         &[marginal_terms.clone(), slope_terms.clone()],
@@ -1677,6 +1988,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         analytic_joint_hessian_available,
         true,
         None,
+        Some(walk_signals),
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {
             assert_eq!(
@@ -1685,7 +1997,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 "survival-marginal-slope outer-inner-fit: specs/designs length mismatch",
             );
             let eval_started = std::time::Instant::now();
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
                 theta.len(),
             );
@@ -1695,19 +2007,23 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 &designs[0],
                 &designs[1],
                 FlexActivation::On,
-            )?;
+            )
+            .map_err(FitFailure::invariant)?;
             let family = make_family(
                 &designs[0],
                 &designs[1],
                 theta,
                 FlexActivation::On,
-            )?;
+            )
+            .map_err(FitFailure::invariant)?;
             // A warm start carried across an outer step can sit outside the
             // follow-up-varying likelihood domain at the NEW baseline chart
             // (gam#2765). Restore it here, the same way the time block's seed is
             // projected onto its own guard inside `build_blocks`; no-op on the
             // time-constant frame and no-op when the seed is already interior.
-            family.retreat_seed_into_follow_up_domain(&mut blocks)?;
+            family
+                .retreat_seed_into_follow_up_domain(&mut blocks)
+                .map_err(FitFailure::numerical)?;
             let blocks = blocks;
             let fit = match provenance {
                 SpatialFitProvenance::NoOuterOptimization => inner_fit(&family, &blocks, options)?,
@@ -1736,7 +2052,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     hints_mut.link_dev_beta = Some(block.beta.clone());
                 }
             }
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
                 eval_started.elapsed().as_secs_f64(),
                 fit.inner_cycles,
@@ -1751,7 +2067,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
          owned_value_mode| {
             use gam_problem::EvalMode;
             let eval_started = std::time::Instant::now();
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={} rows={}",
                 eval_mode,
                 theta.len(),
@@ -1769,13 +2085,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         if !exact_mode_branch.borrow_mut().install_seed(ws) {
-                            log::debug!(
+                            log::trace!(
                                 "[SMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
                             );
                         }
                     }
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             "[SMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
                         );
                     }
@@ -1818,7 +2134,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 )
             };
             let selection = if let Some(value_selection) = owned_value_mode {
-                log::info!(
+                log::debug!(
                     "[SMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
                 );
                 upgrade_custom_family_joint_hyper_mode_shared(
@@ -1836,7 +2152,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .borrow_mut()
                     .candidates(effective_mode, theta, &rho);
                 if first_iterate {
-                    log::info!(
+                    log::debug!(
                         "[SMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                     );
                 }
@@ -1862,7 +2178,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     "exact survival marginal-slope inner solve did not converge".to_string()
                 );
             }
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
                 selection.result.objective,
                 eval_mode,
@@ -1891,7 +2207,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 // aborting, and without violating the analytic-route contract
                 // (an infeasible eval owes no Hessian). A genuinely feasible mode
                 // (analytic Hessian present) is byte-identical.
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope/outer-eval] no analytic outer Hessian at this ρ \
                      (pseudo-objective={:.6e}, mode={:?}) — the constrained inner mode is \
                      indefinite (not a Laplace mode); reporting the profiled objective as +∞ so \
@@ -1927,14 +2243,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let solved = match solved {
         Ok(s) => s,
         Err(e) => {
-            log::warn!(
+            log::debug!(
                 "[survival-marginal-slope/outer] solve FAILED n={n} elapsed={:.3}s reason={e}",
                 fit_started.elapsed().as_secs_f64(),
             );
             return Err(e);
         }
     };
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope/outer] solve end n={n} elapsed={:.3}s outer_iters={} inner_cycles={} certified",
         fit_started.elapsed().as_secs_f64(),
         solved.fit.outer_iterations,
@@ -1945,15 +2261,20 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         kappa_options_ref.enabled,
         &solved.fit.log_lambdas,
         solved.certified_outer.as_ref(),
-    )?;
-    let final_sigma = sigma_from_theta(&certified_theta)?;
+    )
+    .map_err(FitFailure::invariant)?;
+    // Everything below re-reads the converged fit the driver certified: failing
+    // to rebuild its family or re-evaluate its rows is an engine defect.
+    let final_sigma = sigma_from_theta(&certified_theta).map_err(FitFailure::invariant)?;
+    let mut compression_outcome = None;
     let (baseline_offset_residuals, baseline_offset_curvatures, final_baseline_config, fitted_exit_index) = {
         let final_family = make_family(
             &solved.designs[0],
             &solved.designs[1],
             &certified_theta,
             FlexActivation::On,
-        )?;
+        )
+        .map_err(FitFailure::invariant)?;
         let selected_baseline = match (
             &spec.baseline_hyper,
             final_family.family_hyper.baseline_geometry.as_ref(),
@@ -1964,20 +2285,19 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 Some(geometry),
             ) => geometry.baseline_config.clone(),
             (SurvivalMarginalSlopeBaselineHyperSpec::Linear { .. }, Some(_)) => {
-                return Err(
-                    "fixed linear survival marginal-slope baseline unexpectedly realized family coordinates"
-                        .to_string(),
-                );
+                return Err(FitFailure::invariant(
+                    "fixed linear survival marginal-slope baseline unexpectedly realized family coordinates",
+                ));
             }
             (SurvivalMarginalSlopeBaselineHyperSpec::Nonlinear { .. }, None) => {
-                return Err(
-                    "learned nonlinear survival marginal-slope baseline lost its certified geometry"
-                        .to_string(),
-                );
+                return Err(FitFailure::invariant(
+                    "learned nonlinear survival marginal-slope baseline lost its certified geometry",
+                ));
             }
         };
-        let (residuals, curvatures) =
-            final_family.offset_channel_geometry(&solved.fit.block_states)?;
+        let (residuals, curvatures) = final_family
+            .offset_channel_geometry(&solved.fit.block_states)
+            .map_err(FitFailure::invariant)?;
         // The fitted marginal survival index at every training row's exit time
         // (gam#2923): the quantity the anchoring identity makes the marginal
         // survival index, read exactly as the row program reads it.
@@ -1987,7 +2307,54 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .row_dynamic_q_values(row, &solved.fit.block_states)
                     .map(|values| values.q1)
             })
-            .collect::<Result<Vec<f64>, String>>()?;
+            .collect::<Result<Vec<f64>, String>>()
+            .map_err(FitFailure::invariant)?;
+        // gam#2928: certify every anchor the converged fit solves on a
+        // compressed declared law against the declared atoms — each row's entry
+        // and exit anchor at its converged `(q, b)`. The anchored frame's slope
+        // is time-constant, so both anchors read the exit slope channel.
+        if let Some(compressed) = declared_law_compression.as_ref() {
+            let probit_scale = final_family.probit_frailty_scale();
+            let mut anchors = Vec::with_capacity(2 * n);
+            for row in 0..n {
+                let q = final_family
+                    .row_dynamic_q_values(row, &solved.fit.block_states)
+                    .map_err(FitFailure::invariant)?;
+                let slope = final_family
+                    .row_slope_channels(row, &solved.fit.block_states)
+                    .map_err(FitFailure::invariant)?;
+                let observed_slope = probit_scale * slope.exit;
+                anchors.push((q.q0, observed_slope));
+                anchors.push((q.q1, observed_slope));
+            }
+            anchors.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            anchors.dedup();
+            // Certifying solves each anchor's root on both laws.
+            let (record, missed) =
+                compressed.certify_anchors(&anchors).map_err(FitFailure::numerical)?;
+            log::debug!(
+                "[survival-marginal-slope latent-z] declared law compression ledger: {} atoms, {} \
+                 bins, {} nodes; {} of {} converged anchors certified within 10⁻³ of their \
+                 sampling standard error; largest certified error {:e} ({:e} standard errors); \
+                 certified error / target min {:e} median {:e} max {:e}; measured / certified \
+                 on {} audited anchors min {:e} median {:e} max {:e} (gam#2928)",
+                record.atoms,
+                record.bins,
+                record.nodes,
+                record.anchors_meeting_target,
+                record.anchors_checked,
+                record.max_delta,
+                record.max_delta_over_standard_error,
+                record.bound_over_target[0],
+                record.bound_over_target[1],
+                record.bound_over_target[2],
+                record.anchors_audited,
+                record.measured_over_bound[0],
+                record.measured_over_bound[1],
+                record.measured_over_bound[2],
+            );
+            compression_outcome = Some((record, missed));
+        }
         (
             residuals,
             curvatures,
@@ -1996,6 +2363,320 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )
     };
 
+    // gam#2926: certify a closed form the adequacy screen chose, by the error it
+    // controls: at every training row's exit, and at its entry where the entry
+    // survival probability is below one, the anchoring residual under the
+    // estimated law at the closed-form anchor of the converged fit, and its
+    // sampling error. When their excess-KL estimate prefers that law, the fit is
+    // re-solved on it from these coefficients.
+    //
+    // With several scores the law is their joint law, transported to each row's
+    // context by the covariance field the closed form lowered on (gam#2929), and
+    // the residual is the closed form's under it.
+    //
+    // A declared Gaussian law whose score failed the screen is measured the same
+    // way and kept, with the measurement warned about.
+    let mut latent_law_consumed = latent_calibration.consumed.clone();
+    let certificate_pending = matches!(
+        &latent_law_consumed,
+        crate::bms::LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
+            | crate::bms::LatentLawConsumed::DeclaredGaussian {
+                adequacy: Some(_),
+                residual: None,
+                ..
+            }
+    );
+    if certificate_pending {
+        let laws = latent_calibration
+            .certificate_laws
+            .iter()
+            .cloned()
+            .collect::<Option<Vec<_>>>();
+        let frame_unavailable = anchored_kernel_unavailable_reason(&spec);
+        let certificate_family = make_family(
+            &solved.designs[0],
+            &solved.designs[1],
+            &certified_theta,
+            FlexActivation::On,
+        )
+        .map_err(FitFailure::invariant)?;
+        let block_states = &solved.fit.block_states;
+        // The estimated law was compressed from these weighted scores, so its
+        // sampling error scales with their Kish effective size.
+        let weight_sum = spec.weights.iter().sum::<f64>();
+        let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
+        let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
+        let to_rows = |per_anchor: [(f64, f64, f64); 2], weight: f64| {
+            per_anchor.map(|(anchoring_residual, law_sd, scale)| {
+                (anchoring_residual, law_sd / sqrt_effective_n, scale, weight)
+            })
+        };
+        let (anchors, nodes) = if spec.z.ncols() == 1 {
+            let law = laws
+                .as_ref()
+                .and_then(|laws| laws.first())
+                .ok_or_else(|| {
+                    FitFailure::invariant(
+                        "survival marginal-slope: a provisional closed form carried no \
+                         estimated law to certify it against",
+                    )
+                })?;
+            let anchors = (0..n)
+                .into_par_iter()
+                .map(|row| -> Result<[(f64, f64, f64, f64); 2], String> {
+                    Ok(to_rows(
+                        certificate_family.closed_form_certificate_anchors(
+                            row,
+                            block_states,
+                            law,
+                        )?,
+                        spec.weights[row],
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(FitFailure::numerical)?;
+            (anchors, law.nodes.len())
+        } else {
+            let (_, joint_law) = build_joint_latent_law(
+                spec.z.view(),
+                spec.weights.view(),
+                &score_covariance,
+                latent_calibration
+                    .conditioning
+                    .as_ref()
+                    .map(|design| design.view()),
+                DEFAULT_JOINT_LATENT_NODES,
+            )
+            .map_err(FitFailure::unclassified)?;
+            let anchors = (0..n)
+                .into_par_iter()
+                .map_init(
+                    || super::calibration::JointCertificateWorkspace::new(
+                        &certificate_family,
+                        &joint_law,
+                    ),
+                    |workspace, row| -> Result<[(f64, f64, f64, f64); 2], String> {
+                        let workspace = workspace.as_mut().map_err(|error| error.clone())?;
+                        Ok(to_rows(
+                            certificate_family.closed_form_joint_certificate_anchors(
+                                row,
+                                block_states,
+                                &joint_law,
+                                workspace,
+                            )?,
+                            spec.weights[row],
+                        ))
+                    },
+                )
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(FitFailure::numerical)?;
+            (anchors, joint_law.node_count())
+        };
+        let rows: Vec<(f64, f64, f64, f64)> = anchors.into_iter().flatten().collect();
+        let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
+            &rows,
+            nodes,
+            sqrt_effective_n * sqrt_effective_n,
+        )
+        .map_err(FitFailure::numerical)?;
+        let mut uncertified = None;
+        if let crate::bms::LatentLawConsumed::DeclaredGaussian {
+            adequacy: Some(adequacy),
+            residual,
+            ..
+        } = &mut latent_law_consumed
+        {
+            log::debug!(
+                "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
+                 the score fails the standard-normal adequacy screen (adequacy ledger, x = \
+                 statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
+                 anchoring loss at the converged fit: {} (gam#2926)",
+                adequacy.ledger(),
+                certificate.summary()
+            );
+            *residual = Some(certificate);
+        } else if let crate::bms::LatentLawConsumed::EstimatedGaussianAdequate {
+            evidence,
+            adequacy,
+            residual,
+        } = &mut latent_law_consumed
+        {
+            if certificate.closed_form_chosen {
+                log::debug!(
+                    "[survival-marginal-slope latent-z] the closed form is certified at the \
+                     converged fit: {} (gam#2926)",
+                    certificate.summary()
+                );
+                *residual = Some(certificate);
+            } else if let Some(reason) = frame_unavailable {
+                // The fit the closed form converged to is kept, as the Bernoulli
+                // frailty σ keeps its own, with the certificate that prefers the
+                // estimated law recorded beside why nothing here re-solves on it.
+                let missing = format!(
+                    "at the converged closed-form fit the estimated law is expected to be the more \
+                     accurate anchor ({}), and nothing on this configuration can re-solve on it: \
+                     {reason}",
+                    certificate.summary()
+                );
+                log::debug!(
+                    "[survival-marginal-slope latent-z] the closed form stays uncertified: {missing} \
+                     (gam#2926)"
+                );
+                uncertified = Some(crate::bms::LatentLawConsumed::GaussianUncertified {
+                    evidence: evidence.clone(),
+                    adequacy: Some(adequacy.clone()),
+                    certificate: Some(certificate),
+                    missing,
+                });
+            } else {
+                log::debug!(
+                    "[survival-marginal-slope latent-z] at the converged closed-form fit the \
+                     estimated law is expected to be the more accurate anchor ({}); re-solving on \
+                     it from the closed-form coefficients (gam#2926)",
+                    certificate.summary()
+                );
+                let laws = laws.ok_or_else(|| {
+                    FitFailure::invariant(
+                        "survival marginal-slope: a re-solve on the estimated law needs every \
+                         score's own law, and a provisional closed form carried none for some \
+                         score",
+                    )
+                })?;
+                return Ok((
+                    SurvivalCertifiedFit::ReSolve(SurvivalClosedFormFallback {
+                        calibrations: vec![
+                            crate::bms::LatentMeasureCalibration::None;
+                            laws.len()
+                        ],
+                        measures: laws
+                            .into_iter()
+                            .map(|grid| crate::bms::LatentMeasureKind::GlobalEmpirical { grid })
+                            .collect(),
+                        consumed: crate::bms::LatentLawConsumed::EstimatedGlobalByResidual {
+                            evidence: evidence.clone(),
+                            adequacy: adequacy.clone(),
+                            residual: certificate,
+                        },
+                        hints: ThetaHints {
+                            time_beta: Some(block_states[0].beta.clone()),
+                            marginal_beta: Some(block_states[1].beta.clone()),
+                            slope_beta: Some(block_states[2].beta.clone()),
+                            score_warp_beta: None,
+                            link_dev_beta: None,
+                            influence_beta: None,
+                        },
+                    }),
+                    Vec::new(),
+                ));
+            }
+        }
+        if let Some(record) = uncertified {
+            latent_law_consumed = record;
+        }
+    }
+    // gam#2926: certify the arm a moving law was fitted on against the other arms,
+    // by their cross-fitted cross-entropy at the converged fit, over each row's exit
+    // and entry anchors, both read at its partner's times (the row's own times are an
+    // outcome of its score). An entry anchor whose survival is one to rounding
+    // weighs its arms' tails by the row's own vanishing event probability, so it
+    // costs nothing it does not observe. When the rule prefers another arm, the fit
+    // is re-solved on it from these coefficients.
+    if let Some(candidates) = latent_calibration.moving_law.as_ref() {
+        let certificate_family = make_family(
+            &solved.designs[0],
+            &solved.designs[1],
+            &certified_theta,
+            FlexActivation::On,
+        )
+        .map_err(FitFailure::invariant)?;
+        let block_states = &solved.fit.block_states;
+        let losses = (0..n)
+            .into_par_iter()
+            .map(|row| -> Result<Option<Vec<f64>>, crate::bms::moving_law_rule::MovingLawError> {
+                if !(spec.weights[row] > 0.0) {
+                    return Ok(None);
+                }
+                let partner = candidates.partner(row);
+                // The row's own score as a one-point law: its survival
+                // probabilities at the anchors are what each arm's are scored on.
+                let own = certificate_family.moving_law_certificate_anchors(
+                    row,
+                    partner,
+                    block_states,
+                    &crate::bms::EmpiricalZGrid {
+                        nodes: vec![candidates.own_score(row)],
+                        weights: vec![1.0],
+                    },
+                )?;
+                let arms = candidates
+                    .row_laws(row)?
+                    .iter()
+                    .map(|law| {
+                        certificate_family.moving_law_certificate_anchors(row, partner, block_states, law)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let anchors: Vec<crate::bms::moving_law_rule::MovingLawAnchor> = (0..2)
+                    .map(|anchor| crate::bms::moving_law_rule::MovingLawAnchor {
+                        arms: arms.iter().map(|arm| arm[anchor]).collect(),
+                        own: own[anchor],
+                    })
+                    .collect();
+                crate::bms::moving_law_rule::moving_law_row_losses(&anchors)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let certificate = candidates.certify(&spec.weights, &losses)?;
+        if certificate.chosen == certificate.fitted {
+            log::debug!(
+                "[survival-marginal-slope latent-z] the {} law is certified at the converged fit: \
+                 {} (gam#2926)",
+                certificate.fitted.label(),
+                certificate.summary()
+            );
+            if let crate::bms::LatentLawConsumed::EstimatedMovingLaw {
+                certificate: slot, ..
+            } = &mut latent_law_consumed
+            {
+                *slot = Some(certificate);
+            }
+        } else {
+            log::debug!(
+                "[survival-marginal-slope latent-z] at the converged {} fit the moving-law \
+                 certificate chooses the {} law ({}); re-solving on it from these coefficients \
+                 (gam#2926)",
+                certificate.fitted.label(),
+                certificate.chosen.label(),
+                certificate.summary()
+            );
+            // The slope lives on the latent axis: it carries over only when the
+            // chosen arm reads the same axis as the fitted one.
+            let calibrated_axis = |arm: crate::bms::MovingLawArm| {
+                matches!(
+                    arm,
+                    crate::bms::MovingLawArm::LocationScaleGaussian
+                        | crate::bms::MovingLawArm::LocationScaleEmpirical
+                )
+            };
+            let same_axis = calibrated_axis(certificate.chosen) == calibrated_axis(certificate.fitted);
+            let chosen = certificate.chosen;
+            let decision = candidates.decision_for(chosen, Some(certificate))?;
+            return Ok((
+                SurvivalCertifiedFit::ReSolve(SurvivalClosedFormFallback {
+                calibrations: vec![decision.calibration],
+                measures: vec![decision.kind],
+                consumed: decision.consumed,
+                hints: ThetaHints {
+                    time_beta: Some(block_states[0].beta.clone()),
+                    marginal_beta: Some(block_states[1].beta.clone()),
+                    slope_beta: same_axis.then(|| block_states[2].beta.clone()),
+                    score_warp_beta: None,
+                    link_dev_beta: None,
+                    influence_beta: None,
+                },
+                }),
+                Vec::new(),
+            ));
+        }
+    }
     let mut resolved_specs = solved.resolved_specs;
     let designs = solved.designs;
     let mut solved_fit = solved.fit;
@@ -2025,7 +2706,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         {
             let resolved = designs[0]
                 .design
-                .try_to_dense_arc("survival marginal-slope resolved conditioning check")?;
+                .try_to_dense_arc("survival marginal-slope resolved conditioning check")
+                .map_err(FitFailure::input)?;
             conditioning.shape() == resolved.shape()
                 && conditioning
                     .iter()
@@ -2037,25 +2719,33 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
     if let Some(calibration) = latent_calibration.primary_conditional() {
         let conditioning = latent_calibration.conditioning.as_ref().ok_or_else(|| {
-            "survival marginal-slope conditional latent calibration without its conditioning \
-             block"
-                .to_string()
+            FitFailure::invariant(
+                "survival marginal-slope conditional latent calibration without its \
+                 conditioning block",
+            )
         })?;
         let correction_family = make_family(
             &designs[0],
             &designs[1],
             &certified_theta,
             FlexActivation::On,
-        )?;
+        )
+        .map_err(FitFailure::invariant)?;
+        // The correction rewrites the converged fit's own covariance store.
         apply_survival_generated_regressor_correction(
             &correction_family,
             calibration,
             &mut solved_fit,
             latent_calibration.raw_scores.column(0),
             conditioning.view(),
-        )?;
+        )
+        .map_err(FitFailure::invariant)?;
     }
-    Ok(SurvivalMarginalSlopeFitResult {
+    let (latent_law_compression, missed_anchors) = match compression_outcome {
+        Some((record, missed)) => (Some(record), missed),
+        None => (None, Vec::new()),
+    };
+    Ok((SurvivalCertifiedFit::Fitted(Box::new(SurvivalMarginalSlopeFitResult {
         fit: solved_fit,
         marginalspec_resolved: resolved_specs.remove(0),
         slopespec_resolved: resolved_specs.remove(0),
@@ -2063,7 +2753,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         marginal_design: designs[0].clone(),
         // The tensor product, not the covariate factor: this is the design the
         // fitted coefficients live against.
-        slope_design: tensorize_slope(per_score_slope_design.as_ref().unwrap_or(&designs[1]))?.0,
+        slope_design: tensorize_slope(per_score_slope_design.as_ref().unwrap_or(&designs[1]))
+            .map_err(FitFailure::invariant)?
+            .0,
         slope_time_basis: spec
             .slope_template
             .resolved_time_basis()
@@ -2076,6 +2768,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         fitted_exit_index,
         z_normalization,
         latent_measure: latent_calibration.primary_measure().clone(),
+        latent_law_compression,
+        declared_latent_law,
+        latent_law_consumed,
         latent_z_calibrations: latent_calibration.per_score,
         latent_conditioning_reproducible,
         score_covariance: score_covariance.pooled_covariance().to_dense(),
@@ -2094,5 +2789,5 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .as_ref()
             .map(|z_tilde| z_tilde.ncols()),
         influence_absorber_design: influence_absorber_residualized,
-    })
+    })), missed_anchors))
 }

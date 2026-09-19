@@ -79,7 +79,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-gradient] eval start n={} p={} source=cache",
                 n,
                 slices.total
@@ -103,8 +103,9 @@ impl BernoulliMarginalSlopeFamily {
         let row_chunk = bms_row_chunk_size(n);
         let n_row_chunks = n.div_ceil(row_chunk);
         let (log_likelihood, grad_marginal, grad_slope, grad_h, grad_w) =
-            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let mut acc = make_acc();
                     for chunk_idx in chunk_range {
@@ -201,7 +202,7 @@ impl BernoulliMarginalSlopeFamily {
             gradient.slice_mut(s![range.clone()]).assign(grad_w);
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-gradient] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 slices.total,
@@ -251,8 +252,9 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let row_chunk = bms_row_chunk_size(n);
             let n_row_chunks = n.div_ceil(row_chunk);
-            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let mut chunk_out = Array1::<f64>::zeros(slices.total);
                     for chunk_idx in chunk_range {
@@ -442,8 +444,9 @@ impl BernoulliMarginalSlopeFamily {
             // own action scratch.
             let row_chunk = bms_row_chunk_size(n);
             let n_row_chunks = n.div_ceil(row_chunk);
-            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let mut chunk_out = Array1::<f64>::zeros(slices.total);
                     let mut action_scratch = Array1::<f64>::zeros(r_pr);
@@ -488,7 +491,7 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS exact-newton HVP] route=tiled-host rows={} r={} tiles={} bytes={}",
                     n,
                     tiles.r,
@@ -507,8 +510,9 @@ impl BernoulliMarginalSlopeFamily {
             // action scratch, so there is no per-call `v_rows` allocation on a
             // shared path and no serial bottleneck across the ~`n/tile_rows`
             // tiles.
-            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 tiles.tiles.len(),
+                tiles.tile_rows,
                 |tile_range| -> Result<_, String> {
                     let mut tile_out = Array1::<f64>::zeros(slices.total);
                     let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
@@ -597,8 +601,9 @@ impl BernoulliMarginalSlopeFamily {
 
         let row_chunk = bms_row_chunk_size(n);
         let n_row_chunks = n.div_ceil(row_chunk);
-        let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             n_row_chunks,
+            row_chunk,
             |chunk_range| -> Result<_, String> {
                 let mut chunk_out = Array1::<f64>::zeros(slices.total);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
@@ -724,8 +729,9 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
             let r_pr = primary.total;
-            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 tiles.tiles.len(),
+                tiles.tile_rows,
                 |tile_range| -> Result<_, String> {
                     let mut tile_out = Array2::<f64>::zeros((total, n_rhs));
                     let mut col_scratch = Array1::<f64>::zeros(total);
@@ -851,8 +857,9 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let row_chunk = bms_row_chunk_size(n);
             let n_row_chunks = n.div_ceil(row_chunk);
-            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let mut chunk_diag = Array1::<f64>::zeros(slices.total);
                     for chunk_idx in chunk_range {
@@ -952,8 +959,9 @@ impl BernoulliMarginalSlopeFamily {
             // reduction order, and removing the serial walk over all `n` rows.
             let row_chunk = bms_row_chunk_size(n);
             let n_row_chunks = n.div_ceil(row_chunk);
-            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let mut chunk_diag = Array1::<f64>::zeros(slices.total);
                     for chunk_idx in chunk_range {
@@ -1018,7 +1026,7 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS exact-newton diag] route=tiled-host rows={} r={} tiles={} bytes={}",
                     n,
                     tiles.r,
@@ -1032,8 +1040,9 @@ impl BernoulliMarginalSlopeFamily {
             // row chunks. Each tile owns a disjoint row block, so the
             // accumulation is order-independent up to f.p. reduction; the
             // partials sum to the same diagonal the serial loop produced.
-            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 tiles.tiles.len(),
+                tiles.tile_rows,
                 |tile_range| -> Result<_, String> {
                     let mut tile_diag = Array1::<f64>::zeros(slices.total);
                     for tile in &tiles.tiles[tile_range] {
@@ -1130,8 +1139,9 @@ impl BernoulliMarginalSlopeFamily {
 
         let row_chunk = bms_row_chunk_size(n);
         let n_row_chunks = n.div_ceil(row_chunk);
-        let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             n_row_chunks,
+            row_chunk,
             |chunk_range| -> Result<_, String> {
                 let mut chunk_diag = Array1::<f64>::zeros(slices.total);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
@@ -3247,7 +3257,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
-        log::info!(
+        log::debug!(
             "[BMS batched dH start] n={} rows={} p={} dirs={} flex={} cell_moments_bundle={}",
             n,
             n_rows,
@@ -3262,7 +3272,7 @@ impl BernoulliMarginalSlopeFamily {
         let bump_progress = |progress: &AtomicUsize| {
             let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if now == n_rows || now.is_multiple_of(progress_step) {
-                log::info!(
+                log::debug!(
                     "[BMS batched dH progress] rows={}/{} dirs={} elapsed={:.3}s",
                     now,
                     n_rows,
@@ -3370,7 +3380,7 @@ impl BernoulliMarginalSlopeFamily {
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
-            log::info!(
+            log::debug!(
                 "[BMS batched dH chunks] mode=rigid-blas3 rows_per_chunk={} chunks={}",
                 chunk_rows,
                 chunks.len(),
@@ -3451,8 +3461,9 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                     chunks.len(),
+                    chunk_rows,
                     // Pin faer's per-chunk GEMM parallelism to `Par::Seq` so the
                     // chunk fan-out (this tree fold) owns the global Rayon
                     // pool and the inner `fast_ab` / weighted-Gram GEMMs do not
@@ -3557,7 +3568,7 @@ impl BernoulliMarginalSlopeFamily {
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
-            log::info!(
+            log::debug!(
                 "[BMS batched dH chunks] rows_per_chunk={} chunks={} gpu_sized={}",
                 chunk_rows,
                 chunks.len(),
@@ -3659,8 +3670,9 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 accs
             } else {
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                     chunks.len(),
+                    chunk_rows,
                     // Each chunk runs on a Rayon worker and issues `fast_ab` /
                     // weighted-Gram GEMMs; pin their faer parallelism to
                     // `Par::Seq` so they do not re-fan the global Rayon pool
@@ -3742,7 +3754,7 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         let elapsed = started.elapsed().as_secs_f64();
-        log::info!(
+        log::debug!(
             "[BMS batched dH] n={} rows={} p={} dirs={} elapsed={:.3}s",
             n,
             n_rows,
@@ -4042,7 +4054,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS batched d2H n={n} rows={n_rows} p={} pairs={n_pairs} unique_dirs={n_unique_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
-        log::info!(
+        log::debug!(
             "[BMS batched d2H start] n={} rows={} p={} pairs={} unique_dirs={} flex={} cell_moments_bundle={}",
             n,
             n_rows,
@@ -4057,7 +4069,7 @@ impl BernoulliMarginalSlopeFamily {
         let bump_progress = |progress: &AtomicUsize| {
             let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if now == n_rows || now.is_multiple_of(progress_step) {
-                log::info!(
+                log::debug!(
                     "[BMS batched d2H progress] rows={}/{} pairs={} unique_dirs={} elapsed={:.3}s",
                     now,
                     n_rows,
@@ -4244,7 +4256,7 @@ impl BernoulliMarginalSlopeFamily {
             )?
             .unwrap_or_else(make_accs)
         };
-        log::info!(
+        log::debug!(
             "[BMS batched d2H done] n={} rows={} p={} pairs={} unique_dirs={} elapsed={:.3}s",
             n,
             n_rows,
@@ -4296,8 +4308,9 @@ impl BernoulliMarginalSlopeFamily {
         // `par_deterministic_try_block_fold`'s ordered `Vec<Acc>` instead of an
         // arbitrary pop/push order off a shared `Mutex<Vec<_>>`, which depended
         // on worker scheduling and made the reduction non-reproducible run to run.
-        let reduced = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        let reduced = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             n_chunks,
+            row_chunk,
             |chunk_range| -> Result<BernoulliExactNewtonAccumulator, String> {
                 let mut acc = BernoulliExactNewtonAccumulator::new(slices);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
@@ -4378,6 +4391,9 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        if self.residual_active() {
+            return self.evaluate_residual_block_diagonals(block_states);
+        }
         let slices = block_slices(self);
         let flex_active = self.effective_flex_active(block_states)?;
 
@@ -4416,8 +4432,9 @@ impl BernoulliMarginalSlopeFamily {
         let row_chunk = bms_row_chunk_size(n);
         let n_row_chunks = n.div_ceil(row_chunk);
         let (ll, grad_marginal, grad_slope, hess_marginal, hess_slope) =
-            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
                 n_row_chunks,
+                row_chunk,
                 |chunk_range| -> Result<_, String> {
                     let (mut ll, mut gm, mut gl, mut hm, mut hl) = make_acc();
                     for chunk_idx in chunk_range {

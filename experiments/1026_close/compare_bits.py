@@ -122,13 +122,14 @@ def _components(record, target):
 
 
 def _predicted_support_margin(hybrid) -> float:
-    """`log2 C(G, L0)` of the external config minus that of the hybrid config.
+    """The external config's support code minus the hybrid config's.
 
-    Uses the same overflow-safe product form the Rust scorer's `selection_bits`
-    uses, so this is the scorer's own arithmetic rather than an approximation of
-    it. A chart firing spends `1 + d` of the active-scalar budget where a flat
-    firing spends one, so the hybrid names fewer atoms per token while
-    transmitting the same number of scalars; that is the whole predicted effect.
+    Each config names a fixed number of atoms on every row, so the scorer's
+    cardinality-then-subset code `log2(G+1) + mean_i log2 C(G, |S_i|)` is
+    `log2(G+1) + log2 C(G, L0)` for it, with no fitted input. A chart firing
+    spends `1 + d` of the active-scalar budget where a flat firing spends one, so
+    the hybrid names fewer atoms per token while transmitting the same number of
+    scalars; that is the whole predicted effect.
     """
     # Imported here, against this file's own directory: the comparator's
     # regression test loads this module by path with `spec_from_file_location`
@@ -136,11 +137,11 @@ def _predicted_support_margin(hybrid) -> float:
     here = os.path.dirname(os.path.abspath(__file__))
     if here not in sys.path:
         sys.path.insert(0, here)
-    from crossover_theorem_check import selection_bits
+    from crossover_theorem_check import support_code_bits
 
     flat_actives = int(hybrid["top_k"]) - int(hybrid["curved_k"]) * (1 + int(hybrid["d_atom"]))
-    external = selection_bits(int(hybrid["K"]), int(hybrid["top_k"]))
-    paired = selection_bits(
+    external = support_code_bits(int(hybrid["K"]), int(hybrid["top_k"]))
+    paired = support_code_bits(
         int(hybrid["k_flat"]) + int(hybrid["curved_atoms"]),
         flat_actives + int(hybrid["curved_k"]),
     )

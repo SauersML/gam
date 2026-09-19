@@ -1,0 +1,2 @@
+monotone_increasing fit 1148.6s plugin 9.97e-04 post_mean 9.97e-04 lower 1.01e-03 upper 9.14e-04 pdep 1.06e-03 cov_src smoothing-corrected
+monotone_increasing sample 0.0s draws (80, 60) frac_violating 0.0

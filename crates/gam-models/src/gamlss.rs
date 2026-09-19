@@ -76,7 +76,7 @@ use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 
 use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint_typed,
     spatial_dims_per_term, spatial_length_scale_term_indices,
 };
 use gam_terms::smooth::{

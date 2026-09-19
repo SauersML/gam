@@ -369,23 +369,34 @@ fn default_thin_plate_fit_is_row_permutation_invariant_1378() {
         tp.signal_range
     );
 
-    // Anchors: the value-based local bases were ALWAYS row-order invariant
-    // (the issue measured cr = 0, ps ≤ 1e-14). They guard against a regression
-    // in the fit/predict harness itself masking the tp result.
+    // Anchors: the value-based local bases guard against a regression in the
+    // fit/predict harness itself masking the tp result. Both now select λ by the
+    // same certified dense REML search as tp, so they are judged the way tp is:
+    // on the optimum their certificates license, not on a borrowed curve-drift
+    // literal. A permutation reorders every O(n) reduction, and a certified search
+    // may stop anywhere inside its stationarity ball. Measured at 95115c8a1f (sw4l
+    // job 1244874): the ps permutations stop up to 1.6e-7 apart in log-λ̂ against
+    // a ball of 2.2e-2, with criteria within 24 ulps and a curve drift of 2.3e-9.
+    // The cr permutations are within 72 ulps, with a drift of 1.2e-12.
     let cr = worst_permutation_drift("cr");
     let ps = worst_permutation_drift("ps");
     eprintln!("#1378 bs=cr row-permutation drift = {:.3e}", cr.worst_drift);
     eprintln!("#1378 bs=ps row-permutation drift = {:.3e}", ps.worst_drift);
-    assert!(
-        cr.worst_drift < 1e-10,
-        "cr is value-anchored and must be row-permutation invariant; harness drift {:.3e}",
-        cr.worst_drift
-    );
-    assert!(
-        ps.worst_drift < 1e-10,
-        "ps is value-anchored and must be row-permutation invariant; harness drift {:.3e}",
-        ps.worst_drift
-    );
+    for (bs, report) in [("cr", &cr), ("ps", &ps)] {
+        assert!(
+            report.certified,
+            "anchor s(x, bs=\"{bs}\") published no certified outer optimum, so it cannot \
+             anchor the harness"
+        );
+        assert!(
+            report.optimum_violations.is_empty(),
+            "anchor s(x, bs=\"{bs}\") is value-anchored and must be row-permutation invariant, \
+             but a permuted fit left the unpermuted fit's certified optimum (harness drift \
+             {:.3e}):\n{}",
+            report.worst_drift,
+            report.optimum_violations.join("\n")
+        );
+    }
 
     // The fix: a value-lexicographic knot tie-break plus the mgcv-sized default
     // basis make the selected knot set, basis, and REML criterion a pure function

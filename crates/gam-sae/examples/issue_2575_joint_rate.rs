@@ -83,7 +83,7 @@ struct Arm {
     residual: f64,
 }
 
-fn run_arm(arm: &Arm, budget: usize, tolerance: f64) -> Result<String, String> {
+fn run_arm(arm: &Arm, tolerance: f64) -> Result<String, String> {
     let atom_basis: Vec<String> = vec!["periodic".to_string(); arm.k_atoms];
     let atom_dim: Vec<usize> = vec![1usize; arm.k_atoms];
     let effective = sae_support_effective_atom_dims(&atom_basis, &atom_dim)?;
@@ -126,7 +126,7 @@ fn run_arm(arm: &Arm, budget: usize, tolerance: f64) -> Result<String, String> {
         .collect();
     let lambda = vec![1.0e-3_f64; k_ret];
 
-    let outcome = term.solve_fixed_point(centered.view(), &lambda, &ard, budget, tolerance, 1.0);
+    let outcome = term.solve_fixed_point(centered.view(), &lambda, &ard, tolerance, 1.0);
     let stationarity = term.raw_stationarity(centered.view(), &lambda, &ard)?;
     let objective = term.penalized_objective(centered.view(), &lambda, &ard)?;
     let verdict = match &outcome {
@@ -156,7 +156,6 @@ fn run_arm(arm: &Arm, budget: usize, tolerance: f64) -> Result<String, String> {
 }
 
 fn main() {
-    let budget = 256usize;
     let tolerance = 1.0e-6_f64;
     let arms = [
         Arm { n_obs: 120, p_out: 4, k_atoms: 9, support_k: 1, residual: 1.0e-4 },
@@ -168,7 +167,7 @@ fn main() {
         Arm { n_obs: 480, p_out: 8, k_atoms: 24, support_k: 3, residual: 1.0e-2 },
         Arm { n_obs: 120, p_out: 8, k_atoms: 12, support_k: 2, residual: 1.0e-4 },
     ];
-    println!("#2575 support fixed-point rate sweep: budget {budget}, tolerance {tolerance:.1e}");
+    println!("#2575 support fixed-point rate sweep: tolerance {tolerance:.1e}");
     let mut recurred = 0usize;
     for arm in &arms {
         let label = format!(
@@ -176,7 +175,7 @@ fn main() {
             arm.n_obs, arm.p_out, arm.k_atoms, arm.support_k, arm.residual
         );
         let started = std::time::Instant::now();
-        match run_arm(arm, budget, tolerance) {
+        match run_arm(arm, tolerance) {
             Ok(line) => {
                 if line.contains("RECURRED") {
                     recurred += 1;

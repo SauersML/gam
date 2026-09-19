@@ -257,15 +257,15 @@ pub fn wald_half_width(v_pp: f64, level: f64) -> Option<f64> {
 /// * `v_pp` — the exact outer curvature `∂²V_p/∂κ²` at κ̂ (from the κ-channel
 ///   LAML second derivative). Used only to size the initial Wald step; the CI
 ///   itself is the exact likelihood crossing, not the Wald ellipsoid. May be
-///   non-positive, in which case a default initial step is used.
+///   non-positive, in which case each side's first probe is its chart bound.
 /// * `(kappa_min, kappa_max)` — chart-validity bounds on κ; the walk refuses to
 ///   step outside them and flags the corresponding endpoint as `*_at_bound`.
 /// * `level` — two-sided coverage, e.g. `0.95`.
-/// * `tol` — the κ resolution the bisection stops at; it must be finite and
-///   positive, and anything else is refused.
 ///
-/// The walk does geometric step-growth to bracket each crossing, then bisects to
-/// `tol` in κ. The threshold uses the full χ²₁ quantile (interior point).
+/// The walk does geometric step-growth to bracket each crossing, then bisects
+/// until no double lies strictly between the bracket ends, so each endpoint is
+/// resolved to adjacent doubles with no chosen tolerance. The threshold uses the
+/// full χ²₁ quantile (interior point).
 pub(crate) fn profile_ci_walk<F>(
     mut v_p: F,
     kappa_hat: f64,
@@ -273,7 +273,6 @@ pub(crate) fn profile_ci_walk<F>(
     kappa_min: f64,
     kappa_max: f64,
     level: f64,
-    tol: f64,
 ) -> Result<KappaProfileCi, String>
 where
     F: FnMut(f64) -> Result<f64, String>,
@@ -287,20 +286,15 @@ where
     if !(kappa_hat.is_finite()) || kappa_hat < kappa_min || kappa_hat > kappa_max {
         return Err("kappa_hat must be finite and inside [kappa_min, kappa_max]".into());
     }
-    if !(tol.is_finite() && tol > 0.0) {
-        return Err("profile CI tolerance must be finite and positive".into());
-    }
     let half_thresh = 0.5 * chi2_1_quantile(level);
     let v_hat = v_p(kappa_hat)?;
     if !v_hat.is_finite() {
         return Err("V_p(kappa_hat) is non-finite".into());
     }
 
-    // Initial step: Wald half-width if the curvature is usable, else a modest
-    // default scaled to the bracket so the first probe is informative.
-    let init_step = wald_half_width(v_pp, level)
-        .filter(|h| h.is_finite() && *h > 0.0)
-        .unwrap_or_else(|| 0.1 * (kappa_max - kappa_min).max(tol));
+    // Initial step: the Wald half-width if the curvature is usable. Without it
+    // there is no scale to step by, so each side probes its bound first.
+    let init_step = wald_half_width(v_pp, level).filter(|h| h.is_finite() && *h > 0.0);
 
     // Profile drop relative to κ̂: `g(κ) = 2[V_p(κ) − V_p(κ̂)] ≥ 0`. The CI
     // endpoint is the κ where `g = χ²` (i.e. half_thresh on the raw `V_p` scale).
@@ -310,17 +304,16 @@ where
         kappa_hat,
         init_step,
         half_thresh,
-        tol,
     };
     let (ci_lo, lo_at_bound) = walk_one_side(&mut v_p, &cfg, -1.0, kappa_min, &drop)?;
     let (ci_hi, hi_at_bound) = walk_one_side(&mut v_p, &cfg, 1.0, kappa_max, &drop)?;
 
-    // Is κ̂ itself a box endpoint? Denominated in the SAME `tol` the walk
-    // bisects to, so "κ̂ is at the bound" and "this side returned zero width"
-    // are one statement rather than two thresholds that can disagree.
-    let kappa_hat_support = if (kappa_hat - kappa_min).abs() <= tol {
+    // Is κ̂ itself a box endpoint? The same exact comparison the walk makes
+    // when a side has no room, so "κ̂ is at the bound" and "this side returned
+    // zero width" are one statement rather than two thresholds that can disagree.
+    let kappa_hat_support = if kappa_hat == kappa_min {
         KappaEstimateSupport::RailedAtLowerBound
-    } else if (kappa_max - kappa_hat).abs() <= tol {
+    } else if kappa_hat == kappa_max {
         KappaEstimateSupport::RailedAtUpperBound
     } else {
         KappaEstimateSupport::Interior
@@ -348,9 +341,9 @@ where
 /// Shared scalar configuration for the two one-sided CI walks.
 struct WalkCfg {
     kappa_hat: f64,
-    init_step: f64,
+    /// The first step, when the curvature at κ̂ supplies a scale.
+    init_step: Option<f64>,
     half_thresh: f64,
-    tol: f64,
 }
 
 /// Walk in one direction (`sign = ±1`) from κ̂ until the profile-drop crossing,
@@ -370,17 +363,17 @@ where
         kappa_hat,
         init_step,
         half_thresh,
-        tol,
     } = *cfg;
     // Bracket: grow the step geometrically until `drop ≥ half_thresh` or we hit
     // the chart bound. `lo` is inside the CI (drop < thresh), `hi` is outside.
     let mut lo = kappa_hat;
-    let mut step = init_step.max(tol);
     let span = (bound - kappa_hat) * sign; // ≥ 0 distance to the bound
-    if span <= tol {
+    if !(span > 0.0) {
         // No room to move toward the bound: CI is open at the bound here.
         return Ok((bound, true));
     }
+    // Without a curvature scale the first probe is the bound itself.
+    let mut step = init_step.unwrap_or(span);
     let mut probe = step.min(span);
     loop {
         let kappa = kappa_hat + sign * probe;
@@ -389,11 +382,16 @@ where
             return Err("V_p returned a non-finite value during the CI walk".into());
         }
         if drop(v) >= half_thresh {
-            // Crossing bracketed in [lo, kappa]: bisect to tolerance.
+            // Crossing bracketed in [lo, kappa]: bisect until no double lies
+            // strictly between the ends. Each step halves the bracket, so the
+            // bisection ends.
             let mut a = lo; // drop < thresh
             let mut b = kappa; // drop ≥ thresh
-            while (b - a).abs() > tol {
+            loop {
                 let m = 0.5 * (a + b);
+                if !(m > a.min(b) && m < a.max(b)) {
+                    break;
+                }
                 let vm = v_p(m)?;
                 if !vm.is_finite() {
                     return Err("V_p returned a non-finite value during bisection".into());
@@ -408,7 +406,7 @@ where
         }
         // Still inside: advance.
         lo = kappa;
-        if (probe - span).abs() <= tol {
+        if probe == span {
             // Reached the chart bound without crossing: CI open at the bound.
             return Ok((bound, true));
         }
@@ -486,7 +484,7 @@ mod tests {
         let tail = chi2_1_sf(chi2_1_quantile(level));
         assert!((tail / (1.0 - level) - 1.0).abs() < 2.0e-13);
 
-        let ci = profile_ci_walk(quad(0.0, 1.0, 0.0), 0.0, 1.0, -20.0, 20.0, level, 1e-9)
+        let ci = profile_ci_walk(quad(0.0, 1.0, 0.0), 0.0, 1.0, -20.0, 20.0, level)
             .unwrap();
         assert!(!ci.lo_at_bound && !ci.hi_at_bound);
         assert!((ci.ci_lo + width).abs() < 1.0e-7);
@@ -513,7 +511,6 @@ mod tests {
             -10.0,
             10.0,
             level,
-            1e-9,
         )
         .expect("CI walk");
         let chi2 = chi2_1_quantile(level);
@@ -540,7 +537,7 @@ mod tests {
         let a = 50.0; // sharp ⇒ narrow CI
         let k_star = -2.0;
         let f = quad(0.0, a, k_star);
-        let ci = profile_ci_walk(|k| f(k), k_star, a, -10.0, 10.0, level, 1e-9).unwrap();
+        let ci = profile_ci_walk(|k| f(k), k_star, a, -10.0, 10.0, level).unwrap();
         assert!(ci.ci_hi < 0.0, "ci_hi {}", ci.ci_hi);
         assert_eq!(ci.verdict, CurvatureVerdict::Hyperbolic);
     }
@@ -553,7 +550,7 @@ mod tests {
         let a = 1e-6;
         let k_star = 0.0;
         let f = quad(0.0, a, k_star);
-        let ci = profile_ci_walk(|k| f(k), k_star, a, -0.01, 0.01, level, 1e-9).unwrap();
+        let ci = profile_ci_walk(|k| f(k), k_star, a, -0.01, 0.01, level).unwrap();
         assert!(ci.lo_at_bound && ci.hi_at_bound);
         assert!((ci.ci_lo + 0.01).abs() < 1e-12 && (ci.ci_hi - 0.01).abs() < 1e-12);
         assert_eq!(ci.verdict, CurvatureVerdict::Flat);
@@ -652,7 +649,7 @@ mod tests {
     #[test]
     fn a_monotone_criterion_rails_kappa_hat_and_the_walk_declares_it_2687() {
         for upper in [1.389_f64, 2.78, 40.0] {
-            let ci = profile_ci_walk(|kappa| Ok(-kappa), upper, -1.0, -upper, upper, 0.95, 1e-8)
+            let ci = profile_ci_walk(|kappa| Ok(-kappa), upper, -1.0, -upper, upper, 0.95)
                 .expect("a monotone profile must report its constrained optimum");
             assert_eq!(ci.kappa_hat, upper);
             assert_eq!(
@@ -663,7 +660,7 @@ mod tests {
             assert!(ci.hi_at_bound);
             assert_eq!(ci.ci_hi, upper);
         }
-        let ci = profile_ci_walk(|kappa| Ok(kappa), -2.0, -1.0, -2.0, 2.0, 0.95, 1e-8)
+        let ci = profile_ci_walk(|kappa| Ok(kappa), -2.0, -1.0, -2.0, 2.0, 0.95)
             .expect("the mirrored monotone profile must report the lower rail");
         assert_eq!(
             ci.kappa_hat_support,
@@ -679,7 +676,7 @@ mod tests {
         let optimum = -0.37_f64;
         let curvature = 16.0_f64;
         let quadratic = |kappa: f64| Ok(7.0 + 0.5 * curvature * (kappa - optimum) * (kappa - optimum));
-        let ci = profile_ci_walk(quadratic, optimum, curvature, -3.0, 3.0, 0.95, 1e-8)
+        let ci = profile_ci_walk(quadratic, optimum, curvature, -3.0, 3.0, 0.95)
             .expect("the interior quadratic has a closed confidence interval");
         assert_eq!(ci.kappa_hat_support, KappaEstimateSupport::Interior);
         assert!(!ci.lo_at_bound && !ci.hi_at_bound);
@@ -687,7 +684,7 @@ mod tests {
         assert!((ci.ci_lo + ci.ci_hi - 2.0 * optimum).abs() < 2e-8);
         // Only the chart box moves: the profile and its optimum are unchanged.
         // Provenance must reflect that the point is now on the lower endpoint.
-        let squeezed = profile_ci_walk(quadratic, optimum, curvature, optimum, 3.0, 0.95, 1e-8)
+        let squeezed = profile_ci_walk(quadratic, optimum, curvature, optimum, 3.0, 0.95)
             .expect("a box touching the optimum remains a supported profile");
         assert_eq!(
             squeezed.kappa_hat_support,
@@ -722,7 +719,7 @@ mod tests {
         );
 
         // And the profile CI must straddle 0 (geometry verdict Flat) for flat data.
-        let ci = profile_ci_walk(v_p, 0.0, a, -10.0, 10.0, 0.95, 1e-9).expect("CI walk");
+        let ci = profile_ci_walk(v_p, 0.0, a, -10.0, 10.0, 0.95).expect("CI walk");
         assert!(
             ci.ci_lo < 0.0 && ci.ci_hi > 0.0,
             "flat profile CI must straddle 0: [{}, {}]",

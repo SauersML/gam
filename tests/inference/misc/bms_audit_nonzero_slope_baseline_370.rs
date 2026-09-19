@@ -142,13 +142,14 @@ fn build_problem(
                 boundary_conditions: Default::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let marginalspec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![smooth],
+        level: Default::default(),
     };
     // Empty slope smooth == rigid `slope_formula = "1"`: the slope
     // channel is driven purely by its offset, which we set large and nonzero.
@@ -156,6 +157,7 @@ fn build_problem(
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
 
     let spec = BernoulliMarginalSlopeTermSpec {
@@ -175,6 +177,8 @@ fn build_problem(
         link_dev: None,
         latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     };
     (data, spec)
 }

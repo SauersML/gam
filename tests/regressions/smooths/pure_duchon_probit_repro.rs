@@ -79,7 +79,7 @@ fn duchon_pc3(name: &str) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -103,7 +103,7 @@ fn matern_pc3(name: &str) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -137,11 +137,13 @@ fn build_problem(
         linear_terms: vec![linear("sex", 0)],
         random_effect_terms: vec![],
         smooth_terms: vec![nuisance("nuisance_mean")],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![nuisance("nuisance_slope")],
+        level: Default::default(),
     };
 
     (
@@ -160,6 +162,8 @@ fn build_problem(
             link_dev: None,
             latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
             score_influence_jacobian: None,
+            residual: None,
+            declared_latent_law: None,
         },
     )
 }

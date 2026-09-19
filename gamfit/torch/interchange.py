@@ -18,7 +18,7 @@ its own parameter space so it has something to transplant.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -26,14 +26,17 @@ from torch import nn
 
 from .._binding import rust_module
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
-def _as_f64_cpu(t: torch.Tensor) -> np.ndarray:
+
+def _as_f64_cpu(t: torch.Tensor) -> NDArray[np.float64]:
     # Move host first, then cast: a fused ``.to(dtype=float64, device="cpu")``
     # forces the float64 cast on the source device, which MPS cannot do.
     return np.ascontiguousarray(t.detach().cpu().to(dtype=torch.float64).numpy())
 
 
-def _as_bool_1d(t: torch.Tensor) -> np.ndarray:
+def _as_bool_1d(t: torch.Tensor) -> NDArray[np.bool_]:
     return np.ascontiguousarray(t.detach().to(device="cpu").numpy().astype(np.bool_))
 
 
@@ -45,7 +48,7 @@ class _InterchangeDecodeFn(torch.autograd.Function):
     """Plain gated-decode autograd shim around the Rust primitive."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx: Any,
         z: torch.Tensor,
         weights: torch.Tensor,
@@ -63,7 +66,7 @@ class _InterchangeDecodeFn(torch.autograd.Function):
         return _from_numpy_like(out_np, z)
 
     @staticmethod
-    def backward(  # type: ignore[override]
+    def backward(
         ctx: Any, grad_out: torch.Tensor
     ) -> tuple[
         torch.Tensor | None,
@@ -95,7 +98,7 @@ class _InterchangeSwapFn(torch.autograd.Function):
     """Masked-swap autograd shim around the Rust primitive."""
 
     @staticmethod
-    def forward(  # type: ignore[override]
+    def forward(
         ctx: Any,
         z_a: torch.Tensor,
         z_b: torch.Tensor,
@@ -120,7 +123,7 @@ class _InterchangeSwapFn(torch.autograd.Function):
         return _from_numpy_like(out_np, z_a)
 
     @staticmethod
-    def backward(  # type: ignore[override]
+    def backward(
         ctx: Any, grad_out: torch.Tensor
     ) -> tuple[
         torch.Tensor | None,
@@ -190,7 +193,7 @@ class InterchangeSwapDecoder(nn.Module):
     Examples
     --------
     >>> import torch
-    >>> from gamfit import InterchangeSwapDecoder
+    >>> from gamfit.torch import InterchangeSwapDecoder
     >>> dec = InterchangeSwapDecoder(D=8, F=4)
     >>> x_hat = dec(torch.randn(3, 4))
     >>> z_a, z_b = torch.randn(3, 4), torch.randn(3, 4)
@@ -258,7 +261,10 @@ class InterchangeSwapDecoder(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Standard gated decode via the Rust primitive."""
         z = self._check_latent(z, "z")
-        return _InterchangeDecodeFn.apply(z, self.W_dec, self.gate, self.bias)
+        out: torch.Tensor = _InterchangeDecodeFn.apply(
+            z, self.W_dec, self.gate, self.bias
+        )
+        return out
 
     def swap_decode(
         self,
@@ -290,9 +296,10 @@ class InterchangeSwapDecoder(nn.Module):
                 f"atom_mask must be 1-D of length F={self.F}, "
                 f"got shape {tuple(atom_mask.shape)}"
             )
-        return _InterchangeSwapFn.apply(
+        out: torch.Tensor = _InterchangeSwapFn.apply(
             z_a, z_b, atom_mask, self.W_dec, self.gate, self.bias
         )
+        return out
 
 
 __all__ = ["InterchangeSwapDecoder"]

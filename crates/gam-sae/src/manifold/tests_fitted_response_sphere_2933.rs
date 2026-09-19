@@ -14,6 +14,7 @@ use super::tests_fitted_response_edf_2933::{
     ROOT_GRADIENT_CEILING, assert_prices_resolved_response, polish_to_root, resolved_response,
     root_norm, trace_and_residual_dof,
 };
+use super::tests_fitted_response_frames_2933::rademacher_quadratic_form_variance;
 use super::*;
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
@@ -101,11 +102,13 @@ fn sphere_coordinates_price_their_tangent_response_2933_f39() {
     assert_prices_resolved_response("sphere", &term, &target, &rho, &cache);
 }
 
-/// The matrix-free route prices the same tangent response: the Hutchinson
-/// divergence within four of its standard errors of `tr R`, and the output-space
-/// residual dof within four standard errors of `‖I − R‖²_F`. The latter's
-/// standard error is taken from the re-solved response itself: for Rademacher
-/// probes `Var(zᵀCz) = 2(‖C‖²_F − Σᵢ Cᵢᵢ²)` with `C = (I − R)ᵀ(I − R)`.
+/// The matrix-free route prices the same tangent response: the output-space
+/// residual dof within four standard errors of `‖I − R‖²_F`, and the divergence
+/// read off the same probes within four standard errors of `tr R`. Both standard
+/// errors are taken from the re-solved response itself
+/// ([`rademacher_quadratic_form_variance`]), at the probe count the estimator
+/// chose, and that count must meet its own stopping rule: the residual dof's
+/// Monte Carlo variance within the `2ν` sampling variance the dispersion carries.
 #[test]
 fn sphere_hutchinson_response_brackets_the_tangent_response_2933_f39() {
     let (mut term, target, rho, cache) = sphere_state();
@@ -115,44 +118,48 @@ fn sphere_hutchinson_response_brackets_the_tangent_response_2933_f39() {
     let priced = term
         .fitted_response_divergence(target.view(), &rho, &cache)
         .expect("the matrix-free estimator solves where the dense route is refused");
-    let FittedResponseDivergenceEstimator::Hutchinson {
-        probes,
-        standard_error,
-    } = priced.estimator
-    else {
+    let FittedResponseDivergenceEstimator::Hutchinson { likelihood, .. } = priced.estimator else {
         panic!(
             "without an admitted eigensystem the divergence must be the Hutchinson estimate, got \
              {:?}",
             priced.estimator
         );
     };
+    let probes = likelihood.probes;
     let complement = Array2::<f64>::eye(response.nrows()) - &response;
     let gram = complement.t().dot(&complement);
-    let off_diagonal_energy = gram.iter().map(|value| value * value).sum::<f64>()
-        - (0..gram.nrows()).map(|i| gram[[i, i]] * gram[[i, i]]).sum::<f64>();
-    let residual_dof_standard_error = (2.0 * off_diagonal_energy / probes as f64).sqrt();
+    let residual_dof_standard_error =
+        (rademacher_quadratic_form_variance(&gram) / probes as f64).sqrt();
+    let divergence_standard_error =
+        (rademacher_quadratic_form_variance(&response) / probes as f64).sqrt();
     eprintln!(
-        "[#2933 F39 sphere Hutchinson] probes={probes} divergence={:.9e} (se {standard_error:.3e}) \
-         resolved tr R={trace:.9e}; residual dof {:.9e} (se {residual_dof_standard_error:.3e}) \
-         resolved ‖I−R‖²={residual_dof:.9e}",
+        "[#2933 F39 sphere Hutchinson] probes={probes} divergence={:.9e} (sample se {:.3e}, \
+         resolved se {divergence_standard_error:.3e}) resolved tr R={trace:.9e}; residual dof \
+         {:.9e} (sample se {:.3e}, resolved se {residual_dof_standard_error:.3e}) resolved \
+         ‖I−R‖²={residual_dof:.9e}",
         priced.divergence,
-        priced.likelihood_residual_dof
+        likelihood.divergence_standard_error,
+        priced.likelihood_residual_dof,
+        likelihood.residual_dof_standard_error
     );
     assert!(
-        standard_error.is_finite() && standard_error > 0.0 && standard_error < 0.5 * trace,
-        "a Hutchinson estimate with standard error {standard_error} cannot resolve a trace of \
-         {trace}"
-    );
-    assert!(
-        (priced.divergence - trace).abs() <= 4.0 * standard_error,
-        "the Hutchinson divergence {} is more than four standard errors ({standard_error:.3e}) \
-         from the re-solved tangent response {trace}",
-        priced.divergence
+        probes >= 2
+            && likelihood.residual_dof_standard_error.powi(2) <= 2.0 * likelihood.residual_dof,
+        "the probes stopped at {probes} with a residual-dof Monte Carlo variance {:.3e} above \
+         the 2ν̂ = {:.3e} the dispersion carries",
+        likelihood.residual_dof_standard_error.powi(2),
+        2.0 * likelihood.residual_dof
     );
     assert!(
         (priced.likelihood_residual_dof - residual_dof).abs() <= 4.0 * residual_dof_standard_error,
         "the Hutchinson residual dof {} is more than four standard errors \
          ({residual_dof_standard_error:.3e}) from the re-solved ‖I − R‖²_F {residual_dof}",
         priced.likelihood_residual_dof
+    );
+    assert!(
+        (priced.divergence - trace).abs() <= 4.0 * divergence_standard_error,
+        "the Hutchinson divergence {} is more than four standard errors \
+         ({divergence_standard_error:.3e}) from the re-solved tangent response {trace}",
+        priced.divergence
     );
 }

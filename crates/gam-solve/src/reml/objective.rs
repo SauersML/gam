@@ -204,7 +204,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
                 cost_call_idx,
                 prefix.join(","),
@@ -213,7 +213,7 @@ impl<'a> RemlState<'a> {
         }
         let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
                 cost_call_idx,
                 eval.cost,
@@ -239,7 +239,7 @@ impl<'a> RemlState<'a> {
         // configured-prior cost from `ConfiguredRhoPriorAtom`).
         let prior_cost = self.configured_rho_prior_atom(p).cost();
         if !prior_cost.is_finite() {
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
                  without inner solve | elapsed {:.1}ms",
                 cost_call_idx,
@@ -259,7 +259,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
                 // Inner linear algebra says "too singular" — treat as barrier.
-                log::debug!(
+                log::trace!(
                     "P-IRLS flagged ill-conditioning for current rho; returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
@@ -267,7 +267,7 @@ impl<'a> RemlState<'a> {
             Err(EstimationError::PerfectSeparationDetected { .. })
             | Err(EstimationError::PirlsDidNotConverge { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::debug!(
+                log::trace!(
                     "P-IRLS separation/non-convergence at current rho; returning +inf cost to retreat."
                 );
                 return Ok(f64::INFINITY);
@@ -282,9 +282,9 @@ impl<'a> RemlState<'a> {
         // tabulated `backend DenseSpectral` from THIS line on both sides of a
         // 12x per-trial cost change and could conclude only "it is not a
         // backend switch" -- the label is two-valued, so it cannot say which of
-        // the six routes to it was taken, nor whether a density was measured at
+        // the routes to it was taken, nor whether a density was measured at
         // all.
-        log::debug!(
+        log::trace!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?} | {}",
             cost_call_idx,
             pirls_ms,
@@ -308,7 +308,7 @@ impl<'a> RemlState<'a> {
                 )?
             };
             let cost = result.cost;
-            log::debug!(
+            log::trace!(
                 "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
                 cost_call_idx,
                 cost,
@@ -356,13 +356,13 @@ impl<'a> RemlState<'a> {
                     && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
                 {
                     if gam_problem::diagnostics::should_emit_h_min_eig_diag(min_eig) {
-                        log::debug!(
+                        log::trace!(
                             "[Diag] H min_eig={:.3e}",
                             min_eig
                         );
                     }
                     if min_eig <= 0.0 {
-                        log::warn!(
+                        log::debug!(
                             "Penalized Hessian not PD (min eig <= 0)."
                         );
                     }
@@ -372,7 +372,7 @@ impl<'a> RemlState<'a> {
                     let resolvable_floor = eigs.len() as f64 * f64::EPSILON * spectral_scale;
                     if !min_eig.is_finite() || min_eig <= resolvable_floor {
                         let condition_number = symmetric_spectrum_condition_number(&pht_dense);
-                        log::warn!(
+                        log::debug!(
                             "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing.",
                             condition_number
                         );
@@ -394,7 +394,7 @@ impl<'a> RemlState<'a> {
             )?
         };
         let cost = result.cost;
-        log::debug!(
+        log::trace!(
             "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
             cost_call_idx,
             cost,
@@ -1035,6 +1035,34 @@ impl<'a> RemlState<'a> {
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
     /// here to avoid repeating the 18-field struct literal.
+    /// The inner residual an assembly presents to the unified evaluator (#2954).
+    ///
+    /// `populate` says whether the evaluator applies the inner-KKT envelope
+    /// correction; without it the assembly presents exact KKT and the value is
+    /// the raw criterion at `β̂`. An armed certificate capture is handed the
+    /// residual either way, so the certificate's band can charge the error the
+    /// inner mode leaves in `V` where this assembly declines to correct it: the
+    /// normal-equation residual of a direct Gaussian-identity solve, or the
+    /// iterative inner Newton's own final penalized gradient.
+    fn presented_inner_kkt_residual(
+        &self,
+        residual: Option<crate::model_types::ProjectedKktResidual>,
+        populate: bool,
+    ) -> Option<crate::model_types::ProjectedKktResidual> {
+        if let Some(residual) = residual.as_ref() {
+            let source = if self.gaussian_fixed_cache_eligible() {
+                crate::estimate::outer_eval_capture::InnerResidualSource::NormalEquations
+            } else {
+                crate::estimate::outer_eval_capture::InnerResidualSource::InnerGradient
+            };
+            crate::estimate::outer_eval_capture::stash_certificate_band_residual(
+                residual.clone(),
+                source,
+            );
+        }
+        residual.filter(|_| populate)
+    }
+
     pub(crate) fn finish_assembly(
         &self,
         pirls_result: &PirlsResult,
@@ -1222,6 +1250,7 @@ impl<'a> RemlState<'a> {
             );
         }
         Ok(super::assembly::InnerAssembly {
+            cone_normalizer: None,
             // The single-eta GLM lane prices its logdet on the same operator its
             // inner solve converged against, so the mode response has nothing to
             // separate from (#2612).
@@ -1324,16 +1353,13 @@ impl<'a> RemlState<'a> {
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Only the penalty-side `log|S|₊` machinery consumes the penalty
-        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
-        // and no longer needs `range(S_+)`. Its rank bounds H's identified rank
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // need `range(S_+)`. The penalty rank bounds H's identified rank
         // below, so it is computed before the Hessian operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet.as_ref())?);
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet.as_ref(),
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             free_basis_opt.as_ref(),
@@ -1355,6 +1381,26 @@ impl<'a> RemlState<'a> {
         // c-nontrivial fits and design-moving ψ coordinates
         // (`force_spectral_logdet`, #1376) stay on the spectral path even for
         // value-only probes (#901).
+        // A spectral operator priced on the full transformed frame publishes its
+        // rank decision (#2959 D1). One priced on an active-constraint face's
+        // free basis does not: its matrix is the face's projection, whose rank
+        // the identified-rank certificate does not evaluate.
+        let publish_spectral = |operator: std::sync::Arc<DenseSpectralOperator>| {
+            if free_basis_opt.is_none() {
+                bundle.publish_criterion_rank_decision(|| super::CriterionRankDecision {
+                    predicate: if structural_rank.is_some() {
+                        super::CriterionRankPredicate::StructuralRank
+                    } else {
+                        super::CriterionRankPredicate::IdentifiedSubspace
+                    },
+                    frame: super::CriterionFrame::Transformed,
+                    penalty_rank,
+                    hessian: std::sync::Arc::clone(&bundle.h_total),
+                    operator: std::sync::Arc::clone(&operator),
+                });
+            }
+            operator
+        };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = if mode
             == super::reml_outer_engine::EvalMode::ValueOnly
             && structural_rank.is_none()
@@ -1366,7 +1412,7 @@ impl<'a> RemlState<'a> {
                 h_for_operator.as_ref(),
             ) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
-                Err(_) => std::sync::Arc::new(
+                Err(_) => publish_spectral(std::sync::Arc::new(
                     DenseSpectralOperator::from_symmetric_on_identified_subspace(
                         h_for_operator.as_ref(),
                         penalty_rank,
@@ -1376,10 +1422,10 @@ impl<'a> RemlState<'a> {
                             "DenseSpectralOperator from PIRLS Hessian: {e}"
                         ))
                     })?,
-                ),
+                )),
             }
         } else {
-            std::sync::Arc::new(
+            publish_spectral(std::sync::Arc::new(
                 if let Some(rank) = structural_rank {
                     DenseSpectralOperator::from_symmetric_with_structural_rank(
                         h_for_operator.as_ref(),
@@ -1396,7 +1442,7 @@ impl<'a> RemlState<'a> {
                         "DenseSpectralOperator from PIRLS Hessian: {e}"
                     ))
                 })?,
-            )
+            ))
         };
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
@@ -1416,10 +1462,10 @@ impl<'a> RemlState<'a> {
 
         // #1271 diagnostic: dump the REML logdet internals at every dense
         // evaluation so the rank/logdet mechanism is visible in the test log.
-        // Pure logging — no numeric behavior change. Routed through `log::info!`
+        // Pure logging — no numeric behavior change. Routed through `log::debug!`
         // so it is harmless in production (default off) and captured by a
         // test-installed logger in the #1271 probe.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             use faer::Side;
             use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
@@ -1442,7 +1488,7 @@ impl<'a> RemlState<'a> {
                 .map(|r| format!("{:.3e}", r.exp()))
                 .collect::<Vec<_>>()
                 .join(",");
-            log::info!(
+            log::debug!(
                 "[#1271-diag] p={p} penalty_rank={pr} nullspace_dim={nd} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
                  h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
@@ -1467,7 +1513,9 @@ impl<'a> RemlState<'a> {
         // vector additionally carries a constraint-normal (Lagrange multiplier)
         // component this standard path does not strip, so present exact-KKT
         // there (unchanged behaviour) rather than a mis-projected residual.
-        let inner_kkt_residual = if populate_inner_kkt && free_basis_opt.is_none() {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented && free_basis_opt.is_none() {
             self.standard_inner_kkt_residual_transformed(
                 pirls_result,
                 bundle.firth_dense_operator.is_some(),
@@ -1483,6 +1531,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1523,6 +1573,7 @@ impl<'a> RemlState<'a> {
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
+            op = op.with_hessian(sparse.hessian.clone());
             std::sync::Arc::new(op)
         };
 
@@ -1566,7 +1617,9 @@ impl<'a> RemlState<'a> {
         // Sparse-exact assembles β and H in the original basis (see `beta =
         // sparse_exact_beta_original`), so the envelope residual is mapped to
         // that basis. Sparse-native fits are unconstrained on this path.
-        let inner_kkt_residual = if populate_inner_kkt {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
                 bundle.firth_dense_operator.is_some()
@@ -1575,6 +1628,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1675,7 +1730,7 @@ impl<'a> RemlState<'a> {
                     h_total_original -= &rotated;
                 }
                 Err(e) => {
-                    log::warn!(
+                    log::debug!(
                         "Transformed-basis barrier-diagonal reconstruction failed ({e}); \
                          leaving bundle Hessian unchanged before adding original-basis barrier"
                     );
@@ -1688,7 +1743,7 @@ impl<'a> RemlState<'a> {
             .and_then(Self::barrier_config_from_constraints)
             && let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta)
         {
-            log::warn!(
+            log::debug!(
                 "Original-basis barrier Hessian diagonal skipped: {e}; \
                      cost/gradient/logdet consistency may regress on infeasible \
                      candidates (slack ≤ 0).  BFGS line search must maintain \
@@ -1712,15 +1767,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
-        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`. Its
-        // rank bounds H's identified rank, so it is computed before the operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet)?);
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // consume `range(S_+)`. The penalty rank bounds H's identified rank,
+        // so it is computed before the operator.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet,
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             // Original-basis assembly is only used when there are no active
@@ -1748,6 +1801,7 @@ impl<'a> RemlState<'a> {
             weights: pirls_result.finalweights.view(),
             penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
+            data_root: Some(&self.data_root_cache),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
@@ -1833,7 +1887,28 @@ impl<'a> RemlState<'a> {
                     "using the canonical spectral Hessian operator for moving-design coordinates"
                 );
             }
-            build_spectral()?
+            let operator = build_spectral()?;
+            bundle.publish_criterion_rank_decision(|| {
+                let root_priced = bundle
+                    .root_scale_hessian_operator
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|root| std::sync::Arc::ptr_eq(root, &operator));
+                super::CriterionRankDecision {
+                    predicate: if root_priced {
+                        super::CriterionRankPredicate::RootScale
+                    } else if structural_rank.is_some() {
+                        super::CriterionRankPredicate::StructuralRank
+                    } else {
+                        super::CriterionRankPredicate::IdentifiedSubspace
+                    },
+                    frame: super::CriterionFrame::Original,
+                    penalty_rank,
+                    hessian: std::sync::Arc::new(h_total_original.clone()),
+                    operator: std::sync::Arc::clone(&operator),
+                }
+            });
+            operator
         };
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
@@ -1848,8 +1923,8 @@ impl<'a> RemlState<'a> {
         // #1271 diagnostic (twin of the build_dense_assembly probe): this is the
         // path the unconstrained Gaussian tp fit actually takes. Dump REML
         // logdet internals per dense original-basis evaluation. Pure logging via
-        // log::info! (default-off in production, no numeric behavior change).
-        if log::log_enabled!(log::Level::Info) {
+        // log::debug! (default-off in production, no numeric behavior change).
+        if log::log_enabled!(log::Level::Debug) {
             use faer::Side;
             use gam_linalg::faer_ndarray::FaerEigh;
             let h_logdet = hessian_op.logdet();
@@ -1903,7 +1978,7 @@ impl<'a> RemlState<'a> {
             let pen = pirls_result.stable_penalty_term;
             let dp = rss + pen;
             let pedf = pirls_result.edf;
-            log::info!(
+            log::debug!(
                 "[#1271-diag] path=orig p={p} penalty_rank={pr} nullspace_dim={nd} \
                  rss={rss:.6} pen={pen:.6} Dp={dp:.6} pirls_edf={pedf:.4} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
@@ -1926,7 +2001,9 @@ impl<'a> RemlState<'a> {
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
         // maps up cleanly via the same orthogonal `Qs`.
-        let inner_kkt_residual = if populate_inner_kkt {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
                 bundle.firth_dense_operator.is_some()
@@ -1935,6 +2012,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1980,6 +2059,37 @@ impl<'a> RemlState<'a> {
     /// branch, where `free_basis_opt` already rotates everything into a reduced QS
     /// subspace (penalty-coord fast path uses `build_dense_assembly` there because
     /// the projected-`Z` original-basis route is unavailable in that subspace).
+    /// The evaluation bundle at `rho` and the rank decision the dense criterion
+    /// priced there (#2959 D1).
+    ///
+    /// An outer evaluation served from the outer-eval cache builds no assembly,
+    /// and a value-only probe prices a Cholesky that decides no rank, so the
+    /// decision may not be published yet. Then the criterion's own builder is run
+    /// once at a derivative order, which prices the spectral operator and
+    /// publishes the decision: the decision is always the builder's, never a
+    /// second call to its predicate. The sparse route prices a strict
+    /// factorization and publishes none.
+    pub(crate) fn criterion_rank_decision_at(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<(EvalShared, Option<std::sync::Arc<super::CriterionRankDecision>>), EstimationError>
+    {
+        let bundle = self.obtain_eval_bundle(rho)?;
+        if bundle.criterion_rank_decision().is_none()
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
+        {
+            self.build_auto_assembly(
+                rho,
+                &bundle,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
+                false,
+                false,
+            )?;
+        }
+        let decision = bundle.criterion_rank_decision();
+        Ok((bundle, decision))
+    }
+
     pub(crate) fn build_auto_assembly(
         &self,
         rho: &Array1<f64>,
@@ -2104,7 +2214,22 @@ impl<'a> RemlState<'a> {
             mode,
             prior,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|error| match error {
+            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
+            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} evaluation refused this trial point: {fold}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} evaluation refused this trial point: {refusal}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        })?;
         let result = self.apply_theta_correction_atom_to_result(result, &tk_atom)?;
         // Adaptive, block-local Laplace-to-sampling fallback (issue #784): where
         // a curvature direction is too non-Gaussian for the Laplace summary,
@@ -2117,7 +2242,12 @@ impl<'a> RemlState<'a> {
             "sampled_block_marginal",
             block_terms,
         );
-        let result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
+        // A latched correction's `Δ_b` has no ρ-Hessian: the spliced criterion
+        // declares none rather than the Laplace Hessian without `∂²Δ_b`.
+        if self.block_correction_latched() {
+            result.hessian = HessianValue::Unavailable;
+        }
         let components = [
             result.criterion_components.fixed_beta,
             result.criterion_components.logdet_h,
@@ -2147,6 +2277,16 @@ impl<'a> RemlState<'a> {
             );
         }
         crate::estimate::outer_eval_capture::record_rho_outer_criterion(result.cost, components);
+        crate::estimate::outer_eval_capture::record_certificate_criterion(
+            crate::estimate::outer_eval_capture::CertificateCriterion {
+                cost: result.cost,
+                fixed_beta: components[0],
+                logdet_h: components[1],
+                logdet_s: components[2],
+                kkt: components[3],
+                inner_residual_energy: result.ift_residual_energy,
+            },
+        );
         // This value/derivative tuple is the genuine REML/LAML criterion. An
         // optimizer-only diagnostic must never mutate it: a former hard-gated
         // ALO augmentation introduced a finite objective jump when leverage
@@ -2196,7 +2336,26 @@ impl<'a> RemlState<'a> {
             eval_mode,
             prior,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|error| match error {
+            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
+            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!(
+                        "the {eval_mode:?} EFS evaluation refused this trial point: {fold}"
+                    ),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!(
+                        "the {eval_mode:?} EFS evaluation refused this trial point: {refusal}"
+                    ),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        })?;
         let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &tk_atom)?;
         // Fold the #784 adaptive block-local Laplace-to-sampling correction into
         // the EFS objective too, so the EFS fixed-point and the BFGS/Newton path
@@ -2209,7 +2368,11 @@ impl<'a> RemlState<'a> {
             "sampled_block_marginal",
             block_terms,
         );
-        let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        let mut cost_result =
+            self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        if self.block_correction_latched() {
+            cost_result.hessian = HessianValue::Unavailable;
+        }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
             cost_result.cost,
             [
@@ -2454,7 +2617,7 @@ impl<'a> RemlState<'a> {
         let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
         let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
 
-        log::info!(
+        log::debug!(
             "[outer-timing] evaluate_unified_with_psi_ext: PIRLS={:.1}ms  tau_build={:.1}ms  reml_eval={:.1}ms  total={:.1}ms",
             pirls_ms,
             tau_build_ms,
@@ -2543,7 +2706,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only begin | rho[..4]=[{}] | k={}",
                 prefix.join(","),
                 p.len()
@@ -2552,7 +2715,7 @@ impl<'a> RemlState<'a> {
         let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only cache hit | |g| {:.3e} | elapsed {:.1}ms",
                 gnorm,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
@@ -2572,7 +2735,7 @@ impl<'a> RemlState<'a> {
             }
         };
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::debug!(
+        log::trace!(
             "[REML] grad-only pirls done | elapsed {:.1}ms | backend {:?} | {}",
             pirls_ms,
             bundle.backend_kind(),
@@ -2599,7 +2762,7 @@ impl<'a> RemlState<'a> {
                     mode: "ValueAndGradient",
                 })?;
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] grad-only sparse done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
                 gnorm,
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -2619,7 +2782,7 @@ impl<'a> RemlState<'a> {
                 mode: "ValueAndGradient",
             })?;
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        log::debug!(
+        log::trace!(
             "[REML] grad-only dense done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
             gnorm,
             t_assemble.elapsed().as_secs_f64() * 1000.0,
@@ -2654,7 +2817,7 @@ impl<'a> RemlState<'a> {
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
-            log::debug!(
+            log::trace!(
                 "[REML] outer-eval begin {:?} | rho[..4]=[{}] | k={} | 2nd-order={}",
                 order,
                 prefix.join(","),
@@ -2667,7 +2830,7 @@ impl<'a> RemlState<'a> {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {
                 let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-                log::debug!(
+                log::trace!(
                     "[REML] outer-eval cache hit | cost {:.6e} | |g| {:.3e} | elapsed {:.1}ms",
                     eval.cost,
                     gnorm,
@@ -2682,7 +2845,7 @@ impl<'a> RemlState<'a> {
             Ok(bundle) => bundle,
             Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
-                log::debug!(
+                log::trace!(
                     "P-IRLS inner-solve retreat at current rho ({}); returning infeasible outer eval.",
                     err
                 );
@@ -2713,7 +2876,7 @@ impl<'a> RemlState<'a> {
                 self.evaluate_unified(p, &bundle, super::reml_outer_engine::EvalMode::ValueOnly)?
             };
             let cost = result.cost;
-            log::debug!(
+            log::trace!(
                 // The four atoms, not just their sum. `cost` alone cannot say
                 // WHICH term moved, and #2748 spent a measurement cycle
                 // discovering that a 0.865 jump between two adjacent
@@ -2765,7 +2928,7 @@ impl<'a> RemlState<'a> {
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
-        log::debug!(
+        log::trace!(
             "[REML] outer-eval pirls done | elapsed {:.1}ms | backend {:?} | mode {:?} | {}",
             pirls_ms,
             bundle.backend_kind(),
@@ -2802,7 +2965,7 @@ impl<'a> RemlState<'a> {
         };
         {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
+            log::trace!(
                 "[REML] outer-eval done | cost {:.12e} | |g| {:.3e} | \
                  fixed_beta {:.12e} logdet_h {:.12e} logdet_s {:.12e} kkt {:.12e} | \
                  assemble {:.1}ms | total {:.1}ms",
@@ -2860,7 +3023,8 @@ impl<'a> RemlState<'a> {
         } else if let Some(mix_state) = &self.runtime_mixture_link_state {
             self.build_mixture_link_ext_coords(bundle, mix_state)
         } else {
-            Ok(Vec::new())
+            // Student-t (ln σ, ln ν); empty for every other family.
+            self.build_student_t_ext_coords(bundle)
         }
     }
 
@@ -3945,11 +4109,11 @@ mod ift_warm_start_tests {
         }
         let nullity = p - rank;
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,

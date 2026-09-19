@@ -123,9 +123,31 @@ pub enum LinkFunction {
     BetaLogistic,
     Identity,
     Log,
+    /// Reciprocal link `g(mu) = 1/mu`, `mu = 1/eta`: the canonical Gamma link.
+    Inverse,
+    /// Inverse-square link `g(mu) = 1/mu^2`, `mu = eta^(-1/2)`: the canonical
+    /// inverse-Gaussian link.
+    InverseSquared,
 }
 
 impl LinkFunction {
+    /// Every link, in the order error messages list them. The single source of
+    /// the link vocabulary: parsers, legality listings and diagnostics derive
+    /// their name sets from this table rather than spelling them out.
+    pub const ALL: [LinkFunction; 11] = [
+        Self::Identity,
+        Self::Log,
+        Self::Inverse,
+        Self::InverseSquared,
+        Self::Logit,
+        Self::Probit,
+        Self::CLogLog,
+        Self::LogLog,
+        Self::Cauchit,
+        Self::Sas,
+        Self::BetaLogistic,
+    ];
+
     #[inline]
     pub const fn name(self) -> &'static str {
         match self {
@@ -138,9 +160,65 @@ impl LinkFunction {
             Self::BetaLogistic => "beta-logistic",
             Self::Identity => "identity",
             Self::Log => "log",
+            Self::Inverse => "inverse",
+            Self::InverseSquared => "inverse-squared",
         }
     }
+
+    /// Accepted spellings beyond the canonical [`Self::name`], normalized
+    /// (lower-case, `_` read as `-`). These are the names other GAM/GLM
+    /// packages use for the same link (R's `1/mu^2`, pyGAM's `inv_squared`),
+    /// and the binomial links' family-qualified names (`binomial-probit`), so a
+    /// `--family` value is also a valid `--link` / `link(type=...)` / `link=`.
+    const fn aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Logit => &["binomial-logit"],
+            Self::Probit => &["binomial-probit"],
+            Self::CLogLog => &["binomial-cloglog"],
+            Self::Inverse => &["1/mu"],
+            Self::InverseSquared => &["inv-squared", "1/mu^2"],
+            Self::BetaLogistic => &["betalogistic"],
+            Self::LogLog | Self::Cauchit | Self::Sas | Self::Identity | Self::Log => &[],
+        }
+    }
+
+    /// Parse a link name. Case-insensitive; `_` and `-` are interchangeable.
+    /// Returns `None` for an unknown name; callers report it through
+    /// [`UnknownLinkName`], whose message lists [`Self::ALL`].
+    pub fn from_name(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
+        Self::ALL.into_iter().find(|link| {
+            link.name() == normalized || link.aliases().iter().any(|alias| *alias == normalized)
+        })
+    }
+
+    /// `a|b|c` listing of the given links' canonical names.
+    pub fn join_names(links: &[LinkFunction]) -> String {
+        links
+            .iter()
+            .map(|link| link.name())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
+
+/// An unrecognised link name. The message lists the full canonical link
+/// vocabulary, generated from [`LinkFunction::ALL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownLinkName(pub String);
+
+impl std::fmt::Display for UnknownLinkName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unsupported link type '{}'; use one of {}",
+            self.0,
+            LinkFunction::join_names(&LinkFunction::ALL)
+        )
+    }
+}
+
+impl std::error::Error for UnknownLinkName {}
 
 /// Legal-only link descriptor for the state-less `InverseLink::Standard` cell.
 ///
@@ -158,6 +236,8 @@ pub enum StandardLink {
     Cauchit,
     Identity,
     Log,
+    Inverse,
+    InverseSquared,
 }
 
 impl StandardLink {
@@ -176,6 +256,8 @@ impl StandardLink {
             Self::Cauchit => LinkFunction::Cauchit,
             Self::Identity => LinkFunction::Identity,
             Self::Log => LinkFunction::Log,
+            Self::Inverse => LinkFunction::Inverse,
+            Self::InverseSquared => LinkFunction::InverseSquared,
         }
     }
 }
@@ -220,6 +302,8 @@ impl TryFrom<LinkFunction> for StandardLink {
             LinkFunction::Cauchit => Ok(Self::Cauchit),
             LinkFunction::Identity => Ok(Self::Identity),
             LinkFunction::Log => Ok(Self::Log),
+            LinkFunction::Inverse => Ok(Self::Inverse),
+            LinkFunction::InverseSquared => Ok(Self::InverseSquared),
             LinkFunction::Sas | LinkFunction::BetaLogistic => {
                 Err(StateBearingLinkInStandardSlot(link))
             }
@@ -400,6 +484,30 @@ impl InverseLink {
                 | Self::BetaLogistic(_)
                 | Self::Mixture(_)
         )
+    }
+}
+
+/// The `InverseLink` a bare [`LinkFunction`] names, for legality probing only.
+/// `is_legal_cell` never reads a SAS / beta-logistic state, so the neutral
+/// state (`ε = 0`, `log δ = 0`) stands in for it.
+fn legality_probe(link: LinkFunction) -> InverseLink {
+    const NEUTRAL: SasLinkState = SasLinkState {
+        epsilon: 0.0,
+        log_delta: 0.0,
+        delta: 1.0,
+    };
+    match link {
+        LinkFunction::Sas => InverseLink::Sas(NEUTRAL),
+        LinkFunction::BetaLogistic => InverseLink::BetaLogistic(NEUTRAL),
+        LinkFunction::Logit => InverseLink::Standard(StandardLink::Logit),
+        LinkFunction::Probit => InverseLink::Standard(StandardLink::Probit),
+        LinkFunction::CLogLog => InverseLink::Standard(StandardLink::CLogLog),
+        LinkFunction::LogLog => InverseLink::Standard(StandardLink::LogLog),
+        LinkFunction::Cauchit => InverseLink::Standard(StandardLink::Cauchit),
+        LinkFunction::Identity => InverseLink::Standard(StandardLink::Identity),
+        LinkFunction::Log => InverseLink::Standard(StandardLink::Log),
+        LinkFunction::Inverse => InverseLink::Standard(StandardLink::Inverse),
+        LinkFunction::InverseSquared => InverseLink::Standard(StandardLink::InverseSquared),
     }
 }
 
@@ -627,10 +735,49 @@ pub enum ResponseFamily {
         phi: f64,
     },
     Gamma,
+    /// Inverse-Gaussian (Wald) response, `y > 0`, variance function
+    /// `V(μ) = μ³` and exponential-dispersion `φ` (`Var(y) = φ·μ³`). The
+    /// dispersion is stored as `φ` itself (never `√φ`) in the scale metadata,
+    /// estimated jointly with the mean by default.
+    InverseGaussian,
     RoystonParmar,
+    /// Scaled Student-t response on the identity link:
+    /// `y = η + σ·T_ν`, density
+    /// `Γ((ν+1)/2) / (Γ(ν/2)·√(νπ)·σ) · (1 + r²/(νσ²))^{-(ν+1)/2}`, `r = y − η`.
+    /// The scale `σ` and the degrees of freedom `ν` are hyperparameters of the
+    /// marginal likelihood, estimated jointly with the smoothing parameters by
+    /// LAML; the values carried here are the current point on that search (the
+    /// seed at construction, the estimate on a fitted model).
+    StudentT {
+        sigma: f64,
+        nu: f64,
+    },
 }
 
 impl ResponseFamily {
+    /// One value of every variant, for walking the legality table by family.
+    /// [`LikelihoodSpec::is_legal_cell`] matches on the variant alone, so the
+    /// parameters carried here (Tweedie `p`, NB `theta`, Beta `phi`, Student-t
+    /// `sigma` and `nu`) are any valid value and are never read.
+    pub const LEGALITY_PROBES: [ResponseFamily; 10] = [
+        Self::Gaussian,
+        Self::Binomial,
+        Self::Poisson,
+        Self::Tweedie { p: 1.5 },
+        Self::NegativeBinomial {
+            theta: 1.0,
+            theta_fixed: false,
+        },
+        Self::Beta { phi: 1.0 },
+        Self::Gamma,
+        Self::InverseGaussian,
+        Self::RoystonParmar,
+        Self::StudentT {
+            sigma: 1.0,
+            nu: 4.0,
+        },
+    ];
+
     #[inline]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -641,7 +788,9 @@ impl ResponseFamily {
             Self::NegativeBinomial { .. } => "negative-binomial",
             Self::Beta { .. } => "beta",
             Self::Gamma => "gamma",
+            Self::InverseGaussian => "inverse-gaussian",
             Self::RoystonParmar => "royston-parmar",
+            Self::StudentT { .. } => "student-t",
         }
     }
 
@@ -658,10 +807,12 @@ impl ResponseFamily {
         match self {
             Self::Binomial | Self::RoystonParmar | Self::Beta { .. } => Some((0.0, 1.0)),
             Self::Gaussian
+            | Self::StudentT { .. }
             | Self::Poisson
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
-            | Self::Gamma => None,
+            | Self::Gamma
+            | Self::InverseGaussian => None,
         }
     }
 
@@ -694,11 +845,13 @@ impl ResponseFamily {
     #[inline]
     pub fn response_support_bounds(&self) -> Option<(f64, f64)> {
         match self {
-            Self::Gamma | Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
-                Some((0.0, f64::INFINITY))
-            }
+            Self::Gamma
+            | Self::InverseGaussian
+            | Self::Poisson
+            | Self::NegativeBinomial { .. }
+            | Self::Tweedie { .. } => Some((0.0, f64::INFINITY)),
             Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
-            Self::Gaussian | Self::RoystonParmar => None,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -717,7 +870,9 @@ impl ResponseFamily {
     #[inline]
     pub(crate) fn response_support_requirement(&self) -> Option<&'static str> {
         match self {
-            Self::Gamma => Some("strictly positive response values (y > 0)"),
+            Self::Gamma | Self::InverseGaussian => {
+                Some("strictly positive response values (y > 0)")
+            }
             Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
                 Some("non-negative response values (y ≥ 0)")
             }
@@ -726,7 +881,7 @@ impl ResponseFamily {
                  (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
             ),
             Self::Binomial => Some("response values in the closed interval [0, 1]"),
-            Self::Gaussian | Self::RoystonParmar => None,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -745,13 +900,13 @@ impl ResponseFamily {
     #[inline]
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
-            Self::Gamma => yi.is_finite() && yi > 0.0,
+            Self::Gamma | Self::InverseGaussian => yi.is_finite() && yi > 0.0,
             Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
                 yi.is_finite() && yi >= 0.0
             }
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
             Self::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
-            Self::Gaussian | Self::RoystonParmar => true,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => true,
         }
     }
 
@@ -768,7 +923,9 @@ impl ResponseFamily {
             Self::NegativeBinomial { .. } => "Negative-Binomial",
             Self::Beta { .. } => "Beta",
             Self::Gamma => "Gamma",
+            Self::InverseGaussian => "Inverse-Gaussian",
             Self::RoystonParmar => "Royston-Parmar",
+            Self::StudentT { .. } => "Student-t",
         }
     }
 
@@ -934,17 +1091,27 @@ impl ResponseFamily {
                     Ok(())
                 }
             }
-            Self::Tweedie { .. } | Self::Beta { .. } | Self::Gamma | Self::RoystonParmar => Ok(()),
+            Self::Tweedie { .. }
+            | Self::Beta { .. }
+            | Self::Gamma
+            | Self::InverseGaussian
+            | Self::RoystonParmar
+            | Self::StudentT { .. } => Ok(()),
         }
     }
 
     /// Auto-infer a likelihood family when the user did not specify one.
     ///
     /// Policy:
-    ///   * A string-valued (`Categorical`) response column is refused —
-    ///     numeric-encoded level indices (e.g. `"yes"`/`"no"` → `0.0`/`1.0`)
-    ///     would otherwise be silently interpreted as a binary outcome,
-    ///     producing a probability model the user never asked for.
+    ///   * A string-valued (`Categorical`) response column with exactly two
+    ///     levels (e.g. `"yes"`/`"no"`) is a binary outcome and maps to
+    ///     `Binomial`. The fit orchestration layer codes its levels to `0`/`1`
+    ///     in canonical sorted level order before the fit, so the second
+    ///     level in sorted order is the event.
+    ///   * Any other string-valued response column is refused: its level
+    ///     indices (`0.0, 1.0, 2.0, ...`) are labels, not counts or magnitudes,
+    ///     and reading them as either would produce a model the user never
+    ///     asked for.
     ///   * A strictly-binary numeric response (`Binary` kind, or `Numeric`
     ///     with only `{0, 1}` values) maps to `Binomial`.
     ///   * A non-negative integer-valued count response (every value finite,
@@ -964,6 +1131,7 @@ impl ResponseFamily {
         y_kind: ResponseColumnKind,
     ) -> Result<Self, ResponseInferenceRefusal> {
         match y_kind {
+            ResponseColumnKind::Categorical { levels } if levels.len() == 2 => Ok(Self::Binomial),
             ResponseColumnKind::Categorical { levels } => Err(ResponseInferenceRefusal {
                 reason: ResponseInferenceRefusalReason::NonNumericResponse,
                 levels,
@@ -1117,7 +1285,8 @@ impl ResponseDegeneracy {
     pub fn message_for(&self, response_name: &str) -> String {
         match self.kind {
             ResponseDegeneracyKind::BinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: all values are 0 (no events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 0, no events). \
                  The maximum-likelihood logit is −∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -1126,7 +1295,8 @@ impl ResponseDegeneracy {
                 name = response_name,
             ),
             ResponseDegeneracyKind::BinomialAllOnes => format!(
-                "{family} response '{name}' is degenerate: all values are 1 (no non-events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 1, no non-events). \
                  The maximum-likelihood logit is +∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -1169,7 +1339,8 @@ impl std::error::Error for ResponseDegeneracy {}
 ///
 /// `Categorical { levels }` flags a column that arrived as non-numeric strings
 /// (the ingest layer encoded its levels to `0.0, 1.0, ...` indices) — the
-/// `levels` list is preserved so the auto-inference refusal can echo them
+/// `levels` list is preserved so a two-level column can be coded as a binary
+/// outcome and any other level count's auto-inference refusal can echo them
 /// back to the user verbatim. `Binary` is the ingest-layer signal that a
 /// numeric column already contains only `{0, 1}` (used to short-circuit the
 /// scan inside [`ResponseFamily::infer_from_response`]). `Numeric` is the
@@ -1217,10 +1388,12 @@ impl ResponseInferenceRefusal {
                     format!("[{head}]")
                 };
                 format!(
-                    "response column '{name}' contains non-numeric values {preview}. \
-                     Did you mean to use family='binomial' for a binary outcome, \
-                     or does '{name}' contain categorical labels that should be encoded first?",
+                    "response column '{name}' holds {count} distinct non-numeric label(s) \
+                     {preview}; a family is inferred only for a two-level label column \
+                     (binomial). Name the family explicitly (family='multinomial' for a \
+                     categorical outcome), or encode '{name}' numerically first.",
                     name = response_name,
+                    count = self.levels.len(),
                     preview = preview,
                 )
             }
@@ -1296,18 +1469,20 @@ impl TryFrom<LikelihoodSpecWire> for LikelihoodSpec {
 pub struct IllegalLikelihoodCell {
     pub response: &'static str,
     pub link: &'static str,
+    /// The links legal for `response`, from [`LikelihoodSpec::legal_links_for`].
+    pub legal_links: Vec<LinkFunction>,
 }
 
 impl std::fmt::Display for IllegalLikelihoodCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "illegal likelihood cell: response `{}` does not admit inverse link `{}`. \
-             Each non-binomial family is pinned to one link (Gaussian/Royston-Parmar→identity, \
-             Poisson/Gamma/Tweedie/Negative-Binomial→log, Beta→logit); the binomial family \
-             admits logit/probit/cloglog and the latent-cloglog/SAS/beta-logistic/blended \
-             links, but not identity/log.",
-            self.response, self.link
+            "illegal likelihood cell: response `{}` does not admit inverse link `{}`; \
+             legal links for `{}`: {}",
+            self.response,
+            self.link,
+            self.response,
+            LinkFunction::join_names(&self.legal_links)
         )
     }
 }
@@ -1323,11 +1498,16 @@ impl std::error::Error for IllegalLikelihoodCell {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FamilySpecKind {
     GaussianIdentity,
+    GaussianInverse,
     PoissonLog,
     GammaLog,
+    GammaInverse,
+    InverseGaussianInverseSquared,
+    InverseGaussianLog,
     TweedieLog { p: f64 },
     NegativeBinomialLog { theta: f64 },
     BetaLogit { phi: f64 },
+    StudentTIdentity { sigma: f64, nu: f64 },
     RoystonParmar,
     BinomialLogit,
     BinomialProbit,
@@ -1346,11 +1526,16 @@ impl FamilySpecKind {
     pub(crate) const fn name(&self) -> &'static str {
         match self {
             Self::GaussianIdentity => "gaussian",
+            Self::GaussianInverse => "gaussian-inverse",
             Self::PoissonLog => "poisson-log",
             Self::TweedieLog { .. } => "tweedie-log",
             Self::NegativeBinomialLog { .. } => "negative-binomial-log",
             Self::BetaLogit { .. } => "beta-regression-logit",
+            Self::StudentTIdentity { .. } => "student-t",
             Self::GammaLog => "gamma-log",
+            Self::GammaInverse => "gamma-inverse",
+            Self::InverseGaussianInverseSquared => "inverse-gaussian-inverse-squared",
+            Self::InverseGaussianLog => "inverse-gaussian-log",
             Self::RoystonParmar => "royston-parmar",
             Self::BinomialLogit => "binomial-logit",
             Self::BinomialProbit => "binomial-probit",
@@ -1369,11 +1554,16 @@ impl FamilySpecKind {
     pub(crate) const fn pretty_name(&self) -> &'static str {
         match self {
             Self::GaussianIdentity => "Gaussian Identity",
+            Self::GaussianInverse => "Gaussian Inverse",
             Self::PoissonLog => "Poisson Log",
             Self::TweedieLog { .. } => "Tweedie Log",
             Self::NegativeBinomialLog { .. } => "Negative-Binomial Log",
             Self::BetaLogit { .. } => "Beta Regression Logit",
+            Self::StudentTIdentity { .. } => "Student-t Identity",
             Self::GammaLog => "Gamma Log",
+            Self::GammaInverse => "Gamma Inverse",
+            Self::InverseGaussianInverseSquared => "Inverse-Gaussian Inverse-Squared",
+            Self::InverseGaussianLog => "Inverse-Gaussian Log",
             Self::RoystonParmar => "Royston Parmar",
             Self::BinomialLogit => "Binomial Logit",
             Self::BinomialProbit => "Binomial Probit",
@@ -1450,19 +1640,35 @@ impl LikelihoodSpec {
 
     /// Returns `true` when the `(response, link)` pair is one of the legal cells
     /// the family math honours — exactly the cells enumerated by
-    /// [`LikelihoodSpec::kind`] before any masking. Each non-binomial response
-    /// is pinned to a single inverse link; the binomial family admits its full
-    /// set of probability links but never the identity/log standard links.
+    /// [`LikelihoodSpec::kind`] before any masking. This is the single legality
+    /// table: [`LikelihoodSpec::legal_links_for`] (and therefore every "legal
+    /// links for this family" error message) is generated from it.
+    ///
+    /// The reciprocal links are legal only where the family's mean is strictly
+    /// positive (Gaussian and Gamma take the inverse link `μ = 1/η`,
+    /// Inverse-Gaussian its canonical `μ = η^{-1/2}`); their `η > 0` domain is
+    /// kept by the inner solver's feasibility step-halving.
     #[inline]
     pub fn is_legal_cell(response: &ResponseFamily, link: &InverseLink) -> bool {
         match response {
             // Pure-identity families.
-            ResponseFamily::Gaussian | ResponseFamily::RoystonParmar => {
+            ResponseFamily::StudentT { .. } | ResponseFamily::RoystonParmar => {
                 matches!(link, InverseLink::Standard(StandardLink::Identity))
             }
+            ResponseFamily::Gaussian => matches!(
+                link,
+                InverseLink::Standard(StandardLink::Identity | StandardLink::Inverse)
+            ),
+            ResponseFamily::Gamma => matches!(
+                link,
+                InverseLink::Standard(StandardLink::Log | StandardLink::Inverse)
+            ),
+            ResponseFamily::InverseGaussian => matches!(
+                link,
+                InverseLink::Standard(StandardLink::InverseSquared | StandardLink::Log)
+            ),
             // Log-link families.
             ResponseFamily::Poisson
-            | ResponseFamily::Gamma
             | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => {
                 matches!(link, InverseLink::Standard(StandardLink::Log))
@@ -1481,13 +1687,52 @@ impl LikelihoodSpec {
                     | StandardLink::LogLog
                     | StandardLink::Cauchit,
                 ) => true,
-                InverseLink::Standard(StandardLink::Identity | StandardLink::Log) => false,
+                InverseLink::Standard(
+                    StandardLink::Identity
+                    | StandardLink::Log
+                    | StandardLink::Inverse
+                    | StandardLink::InverseSquared,
+                ) => false,
                 InverseLink::LatentCLogLog(_)
                 | InverseLink::Sas(_)
                 | InverseLink::BetaLogistic(_)
                 | InverseLink::Mixture(_) => true,
             },
         }
+    }
+
+    /// The links legal for `response`, in [`LinkFunction::ALL`] order, generated
+    /// from [`LikelihoodSpec::is_legal_cell`] so error messages can never drift
+    /// from the table. A state-bearing link (SAS, beta-logistic) is probed with
+    /// its default state; legality never depends on the state value.
+    pub fn legal_links_for(response: &ResponseFamily) -> Vec<LinkFunction> {
+        LinkFunction::ALL
+            .into_iter()
+            .filter(|&link| Self::is_legal_cell(response, &legality_probe(link)))
+            .collect()
+    }
+
+    /// The clause ``legal links for `family`: a|b`` every illegal-cell error
+    /// ends with, generated from [`LikelihoodSpec::legal_links_for`].
+    pub fn legal_links_clause(response: &ResponseFamily) -> String {
+        format!(
+            "legal links for `{}`: {}",
+            response.name(),
+            LinkFunction::join_names(&Self::legal_links_for(response))
+        )
+    }
+
+    /// The response families whose legal links include `link`, in declaration
+    /// order, generated from [`LikelihoodSpec::is_legal_cell`]. A link that more
+    /// than one family admits (`log`, `inverse`) does not determine the family,
+    /// and the error that says so names these.
+    pub fn families_admitting(link: LinkFunction) -> Vec<&'static str> {
+        let probe = legality_probe(link);
+        ResponseFamily::LEGALITY_PROBES
+            .iter()
+            .filter(|response| Self::is_legal_cell(response, &probe))
+            .map(ResponseFamily::name)
+            .collect()
     }
 
     /// Fallible constructor over an arbitrary `(response, link)` pair. Validates
@@ -1505,6 +1750,7 @@ impl LikelihoodSpec {
             Err(IllegalLikelihoodCell {
                 response: response.name(),
                 link: link.link_function().name(),
+                legal_links: Self::legal_links_for(&response),
             })
         }
     }
@@ -1594,9 +1840,29 @@ impl LikelihoodSpec {
             (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
                 FamilySpecKind::GaussianIdentity
             }
+            (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Inverse)) => {
+                FamilySpecKind::GaussianInverse
+            }
+            (ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Inverse)) => {
+                FamilySpecKind::GammaInverse
+            }
+            (
+                ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::InverseSquared),
+            ) => FamilySpecKind::InverseGaussianInverseSquared,
+            (ResponseFamily::InverseGaussian, InverseLink::Standard(StandardLink::Log)) => {
+                FamilySpecKind::InverseGaussianLog
+            }
             (ResponseFamily::RoystonParmar, InverseLink::Standard(StandardLink::Identity)) => {
                 FamilySpecKind::RoystonParmar
             }
+            (
+                ResponseFamily::StudentT { sigma, nu },
+                InverseLink::Standard(StandardLink::Identity),
+            ) => FamilySpecKind::StudentTIdentity {
+                sigma: *sigma,
+                nu: *nu,
+            },
             (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
                 FamilySpecKind::PoissonLog
             }
@@ -1691,8 +1957,22 @@ impl LikelihoodSpec {
     #[inline]
     pub fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
         match &self.response {
-            ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
+            // The identity link profiles `σ²` out of the closed-form penalized
+            // least-squares criterion. A non-identity Gaussian mean is a genuine
+            // non-linear GLM, so its `φ` is a jointly estimated dispersion, the
+            // same contract as the inverse-Gaussian `φ`.
+            ResponseFamily::Gaussian => match self.link {
+                InverseLink::Standard(StandardLink::Identity) => {
+                    LikelihoodScaleMetadata::ProfiledGaussian
+                }
+                _ => LikelihoodScaleMetadata::EstimatedDispersion { phi: 1.0 },
+            },
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
+            // Inverse-Gaussian `φ` (`Var(y) = φ·μ³`) is estimated jointly with the
+            // mean; `φ = 1` is only the seed, refined at the converged η.
+            ResponseFamily::InverseGaussian => {
+                LikelihoodScaleMetadata::EstimatedDispersion { phi: 1.0 }
+            }
             // Binomial and Poisson have `phi ≡ 1` (variance fully pinned by the
             // mean), so a fixed unit dispersion is correct.
             ResponseFamily::Binomial | ResponseFamily::Poisson => {
@@ -1732,6 +2012,10 @@ impl LikelihoodSpec {
             // (magic-by-default, issue #567): the family-variant `phi` is the
             // seed, refined from the working residuals during fitting.
             ResponseFamily::Beta { phi } => LikelihoodScaleMetadata::EstimatedBetaPhi { phi: *phi },
+            // The Student-t scale σ and degrees of freedom ν live on the family
+            // variant and are outer LAML hyperparameters; the likelihood carries
+            // no separate exponential-dispersion multiplier.
+            ResponseFamily::StudentT { .. } => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
@@ -1776,9 +2060,11 @@ impl LikelihoodSpec {
     #[inline]
     pub const fn fixed_dispersion(&self) -> Option<f64> {
         match self.response {
-            ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::RoystonParmar => {
-                None
-            }
+            ResponseFamily::Gaussian
+            | ResponseFamily::Gamma
+            | ResponseFamily::InverseGaussian
+            | ResponseFamily::RoystonParmar
+            | ResponseFamily::StudentT { .. } => None,
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
             | ResponseFamily::Tweedie { .. }
@@ -1867,10 +2153,12 @@ pub fn inverse_link_to_binomial_spec(
         | InverseLink::Mixture(_) => {
             Ok(LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()))
         }
-        InverseLink::Standard(StandardLink::Log)
-        | InverseLink::Standard(StandardLink::Identity) => {
-            Err(UnsupportedLinkError::new("binomial", link))
-        }
+        InverseLink::Standard(
+            StandardLink::Log
+            | StandardLink::Identity
+            | StandardLink::Inverse
+            | StandardLink::InverseSquared,
+        ) => Err(UnsupportedLinkError::new("binomial", link)),
     }
 }
 
@@ -1912,6 +2200,16 @@ pub enum LikelihoodScaleMetadata {
     /// so the coefficient covariance `Vb = H⁻¹` already scales as `phi` and the
     /// reported SEs track `√phi` (issue #771).
     EstimatedTweediePhi { phi: f64 },
+    /// Exponential-dispersion `phi` estimated jointly with the mean model, for
+    /// the families whose log-density couples `phi` to the data only through
+    /// the unit deviance, `ℓ = −d(y,μ)/(2φ) − ½·log(2πφ·a(y))`: inverse-Gaussian
+    /// (`a(y) = y³`) and Gaussian with a non-identity link (`a(y) = 1`). The
+    /// exact MLE is then `phî = Σ wᵢ dᵢ / Σ wᵢ` at the converged η. `phi` is
+    /// stored as the dispersion itself (not `√phi`) and enters the IRLS working
+    /// weight as `prior·(dμ/dη)²/(phi·V(μ))`, so `Vb = H⁻¹` already scales as
+    /// `phi`. Held as [`Self::FixedDispersion`] across the λ search and
+    /// refreshed at the final fit, exactly like the Tweedie `phi`.
+    EstimatedDispersion { phi: f64 },
     /// Negative-Binomial overdispersion `theta` estimated jointly with the mean
     /// model. `Var(y) = mu + mu^2 / theta`; larger `theta` means less
     /// overdispersion (the Poisson limit is `theta → ∞`). Estimated by the
@@ -1950,7 +2248,8 @@ impl LikelihoodScaleMetadata {
             Self::FixedDispersion { phi }
             | Self::EstimatedBetaPhi { phi }
             | Self::FixedBetaPhi { phi }
-            | Self::EstimatedTweediePhi { phi } => Some(phi),
+            | Self::EstimatedTweediePhi { phi }
+            | Self::EstimatedDispersion { phi } => Some(phi),
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
                 Some(1.0 / shape)
             }
@@ -1982,6 +2281,13 @@ impl LikelihoodScaleMetadata {
     #[inline]
     pub(crate) const fn tweedie_phi_is_estimated(self) -> bool {
         matches!(self, Self::EstimatedTweediePhi { .. })
+    }
+
+    /// Whether the generic exponential-dispersion `phi`
+    /// ([`Self::EstimatedDispersion`]) is estimated from data.
+    #[inline]
+    pub const fn dispersion_phi_is_estimated(self) -> bool {
+        matches!(self, Self::EstimatedDispersion { .. })
     }
 
     #[inline]
@@ -2035,6 +2341,9 @@ impl LikelihoodScaleMetadata {
             // `η` (Tweedie, #771). Both multiply the reported covariance, so
             // both carry their own sampling variability.
             Self::EstimatedBetaPhi { .. } | Self::EstimatedTweediePhi { .. } => true,
+            // Inverse-Gaussian / non-identity Gaussian `φ̂ = Σw·d/Σw` from the
+            // converged fit's unit deviances.
+            Self::EstimatedDispersion { .. } => true,
             // Supplied by the caller, or held fixed for the duration of the λ
             // search: no estimation variance to spend degrees of freedom on.
             Self::FixedDispersion { .. }
@@ -2131,6 +2440,13 @@ pub enum ResolvedLikelihoodScale {
         theta: PositiveLikelihoodScale,
         estimated: bool,
     },
+    /// Generic exponential-dispersion `φ` of the inverse-Gaussian family and
+    /// of a non-identity-link Gaussian (see
+    /// [`LikelihoodScaleMetadata::EstimatedDispersion`]).
+    Dispersion {
+        phi: PositiveLikelihoodScale,
+        estimated: bool,
+    },
     Unspecified,
 }
 
@@ -2221,6 +2537,21 @@ impl ResolvedLikelihoodScale {
         }
     }
 
+    /// The generic exponential-dispersion `φ` ([`Self::Dispersion`]).
+    pub fn dispersion_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Dispersion { phi, .. } => Ok(phi.value()),
+            other => Err(other.wrong_family("an exponential-dispersion phi")),
+        }
+    }
+
+    /// `ln φ` of the generic exponential dispersion ([`Self::Dispersion`]).
+    pub fn dispersion_log_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Dispersion { phi, .. } => Ok(phi.log_value()),
+            other => Err(other.wrong_family("an exponential-dispersion phi")),
+        }
+    }
 
     pub fn negative_binomial_theta(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
@@ -2229,7 +2560,6 @@ impl ResolvedLikelihoodScale {
         }
     }
 
-
     pub fn beta_precision(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
             Self::BetaPrecision { precision, .. } => Ok(precision.value()),
@@ -2237,16 +2567,19 @@ impl ResolvedLikelihoodScale {
         }
     }
 
+    /// `ln φ` of a Gaussian whose dispersion is a value rather than profiled:
+    /// the fixed identity-link dispersion, or the estimated/fixed dispersion of
+    /// a non-identity link.
     pub fn gaussian_log_phi(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
-            Self::FixedGaussian { phi } => Ok(phi.log_value()),
+            Self::FixedGaussian { phi } | Self::Dispersion { phi, .. } => Ok(phi.log_value()),
             other => Err(other.wrong_family("a fixed Gaussian dispersion")),
         }
     }
 
     pub fn gaussian_phi(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
-            Self::FixedGaussian { phi } => Ok(phi.value()),
+            Self::FixedGaussian { phi } | Self::Dispersion { phi, .. } => Ok(phi.value()),
             other => Err(other.wrong_family("a fixed Gaussian dispersion")),
         }
     }
@@ -2355,17 +2688,36 @@ impl GlmLikelihoodSpec {
             ))
         };
 
+        let identity_link = matches!(
+            self.spec.link,
+            InverseLink::Standard(StandardLink::Identity)
+        );
         match (&self.spec.response, self.scale) {
-            (ResponseFamily::Gaussian, Metadata::ProfiledGaussian) => {
+            (ResponseFamily::Gaussian, Metadata::ProfiledGaussian) if identity_link => {
                 Ok(Resolved::ProfiledGaussian)
             }
-            (ResponseFamily::Gaussian, Metadata::FixedDispersion { phi }) => {
+            (ResponseFamily::Gaussian, Metadata::FixedDispersion { phi }) if identity_link => {
                 Ok(Resolved::FixedGaussian {
                     phi: positive(phi, "Gaussian dispersion phi")?,
                 })
             }
-            (ResponseFamily::Gaussian, _) => {
+            (ResponseFamily::Gaussian, _) if identity_link => {
                 Err(mismatch("ProfiledGaussian or FixedDispersion metadata"))
+            }
+            (ResponseFamily::Gaussian | ResponseFamily::InverseGaussian, Metadata::EstimatedDispersion { phi }) => {
+                Ok(Resolved::Dispersion {
+                    phi: positive(phi, "dispersion phi")?,
+                    estimated: true,
+                })
+            }
+            (ResponseFamily::Gaussian | ResponseFamily::InverseGaussian, Metadata::FixedDispersion { phi }) => {
+                Ok(Resolved::Dispersion {
+                    phi: positive(phi, "dispersion phi")?,
+                    estimated: false,
+                })
+            }
+            (ResponseFamily::Gaussian | ResponseFamily::InverseGaussian, _) => {
+                Err(mismatch("EstimatedDispersion or FixedDispersion metadata"))
             }
 
             (
@@ -2373,6 +2725,19 @@ impl GlmLikelihoodSpec {
                 Metadata::FixedDispersion { phi },
             ) if phi.to_bits() == 1.0_f64.to_bits() => Ok(Resolved::Unit),
             (ResponseFamily::Binomial | ResponseFamily::Poisson, _) => {
+                Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
+            }
+
+            // Student-t: σ and ν are validated on the family variant; the
+            // likelihood carries no further dispersion multiplier.
+            (ResponseFamily::StudentT { sigma, nu }, Metadata::FixedDispersion { phi })
+                if phi.to_bits() == 1.0_f64.to_bits() =>
+            {
+                positive(*sigma, "Student-t scale sigma")?;
+                positive(*nu, "Student-t degrees of freedom nu")?;
+                Ok(Resolved::Unit)
+            }
+            (ResponseFamily::StudentT { .. }, _) => {
                 Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
             }
 
@@ -2491,6 +2856,11 @@ impl GlmLikelihoodSpec {
     }
 
     #[inline]
+    pub fn resolved_dispersion_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.dispersion_phi()
+    }
+
+    #[inline]
     pub fn resolved_negbin_theta(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.negative_binomial_theta()
     }
@@ -2578,6 +2948,9 @@ impl GlmLikelihoodSpec {
             | ResolvedLikelihoodScale::Gamma { .. }
             | ResolvedLikelihoodScale::BetaPrecision { .. }
             | ResolvedLikelihoodScale::Tweedie { .. }
+            // Inverse-Gaussian / non-identity Gaussian fold `1/φ` into
+            // `W = prior·h'²/(φ·V)`, exactly like Tweedie.
+            | ResolvedLikelihoodScale::Dispersion { .. }
             // Negative-Binomial folds `theta` into the working weight
             // `W = μθ/(θ+μ)` (the full NB2 Fisher information), so the stored
             // `H = XᵀWX + S_λ` is already the true penalized Hessian and the
@@ -2635,6 +3008,41 @@ impl GlmLikelihoodSpec {
         self
     }
 
+    /// Set the Student-t scale `σ` and degrees of freedom `ν` on the family
+    /// variant, where every PIRLS weight / deviance / log-likelihood expression
+    /// reads them. The outer LAML search moves `(log σ, log ν)` and installs
+    /// each trial point through this mutator. No-op for non-Student-t families.
+    #[inline]
+    #[must_use]
+    pub fn with_student_t(mut self, sigma: f64, nu: f64) -> Self {
+        if let ResponseFamily::StudentT {
+            sigma: family_sigma,
+            nu: family_nu,
+        } = &mut self.spec.response
+        {
+            *family_sigma = sigma;
+            *family_nu = nu;
+        }
+        self
+    }
+
+    /// The Student-t `(σ, ν)` carried on the family variant, validated finite
+    /// and positive; `None` for every other family.
+    #[inline]
+    pub fn student_t_parameters(&self) -> Option<Result<(f64, f64), InvalidLikelihoodScale>> {
+        match self.spec.response {
+            ResponseFamily::StudentT { sigma, nu } => Some(
+                PositiveLikelihoodScale::try_new(sigma, "Student-t scale sigma").and_then(
+                    |sigma| {
+                        PositiveLikelihoodScale::try_new(nu, "Student-t degrees of freedom nu")
+                            .map(|nu| (sigma.value(), nu.value()))
+                    },
+                ),
+            ),
+            _ => None,
+        }
+    }
+
     /// Mutate the Tweedie dispersion `phi` in place. Unlike Beta, the Tweedie
     /// power `p` (not `phi`) is what is carried on the `ResponseFamily::Tweedie`
     /// variant; the dispersion lives purely in the scale metadata and is read by
@@ -2647,6 +3055,33 @@ impl GlmLikelihoodSpec {
     pub fn with_tweedie_phi(mut self, phi: f64) -> Self {
         if matches!(self.spec.response, ResponseFamily::Tweedie { .. }) {
             self.scale = LikelihoodScaleMetadata::EstimatedTweediePhi { phi };
+        }
+        self
+    }
+
+    /// Mutate the jointly estimated exponential-dispersion `phi`
+    /// ([`LikelihoodScaleMetadata::EstimatedDispersion`]) in place. No-op for
+    /// any other scale, including a user-fixed `phi`.
+    #[inline]
+    #[must_use]
+    pub fn with_dispersion_phi(mut self, phi: f64) -> Self {
+        if self.scale.dispersion_phi_is_estimated() {
+            self.scale = LikelihoodScaleMetadata::EstimatedDispersion { phi };
+        }
+        self
+    }
+
+    /// Pin the estimated exponential-dispersion `phi` for the λ search: the
+    /// `EstimatedDispersion` scale becomes the statistically identical
+    /// `FixedDispersion`, closing the per-inner-solve refresh so
+    /// `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ. Same rationale as
+    /// [`Self::with_tweedie_phi_frozen_for_search`]; `phi` is refreshed at the
+    /// final reported fit. No-op for every other scale.
+    #[inline]
+    #[must_use]
+    pub fn with_dispersion_phi_frozen_for_search(mut self, phi: f64) -> Self {
+        if self.scale.dispersion_phi_is_estimated() {
+            self.scale = LikelihoodScaleMetadata::FixedDispersion { phi };
         }
         self
     }
@@ -3250,15 +3685,34 @@ mod tests {
     }
 
     #[test]
-    fn infer_categorical_kind_refuses() {
-        let y = arr1(&[0.0_f64, 1.0]);
+    fn infer_two_level_categorical_kind_gives_binomial() {
+        let y = arr1(&[0.0_f64, 1.0, 1.0]);
         let result = ResponseFamily::infer_from_response(
             y.view(),
             ResponseColumnKind::Categorical {
                 levels: vec!["yes".to_string(), "no".to_string()],
             },
         );
-        assert!(result.is_err());
+        assert!(matches!(result, Ok(ResponseFamily::Binomial)));
+    }
+
+    #[test]
+    fn infer_categorical_kind_with_other_level_counts_refuses() {
+        for levels in [vec!["a"], vec!["a", "b", "c"]] {
+            let y = arr1(&vec![0.0_f64; levels.len()]);
+            let levels: Vec<String> = levels.into_iter().map(str::to_string).collect();
+            let count = levels.len();
+            let refusal = ResponseFamily::infer_from_response(
+                y.view(),
+                ResponseColumnKind::Categorical { levels },
+            )
+            .expect_err("only a two-level label column infers a family");
+            let message = refusal.message_for("y");
+            assert!(
+                message.contains(&format!("holds {count} distinct non-numeric")),
+                "{message}"
+            );
+        }
     }
 
     #[test]
@@ -3832,5 +4286,109 @@ mod tests {
         assert!(!mixed.upper_tail_gradient_vanishes_everywhere(2));
         // Out of range is malformed, not flat.
         assert!(!mixed.upper_tail_gradient_vanishes(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Link vocabulary and the legality table
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_link_name_round_trips_through_the_one_vocabulary() {
+        for link in LinkFunction::ALL {
+            assert_eq!(LinkFunction::from_name(link.name()), Some(link));
+            assert_eq!(
+                LinkFunction::from_name(&link.name().to_ascii_uppercase().replace('-', "_")),
+                Some(link),
+                "case and `_`/`-` spelling must not matter for {}",
+                link.name()
+            );
+        }
+        // Other packages' spellings of the reciprocal links.
+        assert_eq!(LinkFunction::from_name("inv_squared"), Some(LinkFunction::InverseSquared));
+        assert_eq!(LinkFunction::from_name("1/mu^2"), Some(LinkFunction::InverseSquared));
+        assert_eq!(LinkFunction::from_name("1/mu"), Some(LinkFunction::Inverse));
+        // The binomial family names name their link too.
+        assert_eq!(LinkFunction::from_name("binomial-logit"), Some(LinkFunction::Logit));
+        assert_eq!(LinkFunction::from_name("binomial_probit"), Some(LinkFunction::Probit));
+        assert_eq!(LinkFunction::from_name("Binomial-CLogLog"), Some(LinkFunction::CLogLog));
+        assert_eq!(LinkFunction::from_name("sqrt"), None);
+    }
+
+    #[test]
+    fn unknown_link_message_lists_the_whole_vocabulary() {
+        let message = UnknownLinkName("sqrt".to_string()).to_string();
+        assert!(message.contains("'sqrt'"), "{message}");
+        for link in LinkFunction::ALL {
+            assert!(message.contains(link.name()), "{message} is missing {}", link.name());
+        }
+    }
+
+    #[test]
+    fn legality_table_admits_the_reciprocal_links_only_on_positive_mean_families() {
+        use ResponseFamily as R;
+        let legal = |response: &ResponseFamily| LikelihoodSpec::legal_links_for(response);
+        assert_eq!(legal(&R::Gaussian), vec![LinkFunction::Identity, LinkFunction::Inverse]);
+        assert_eq!(legal(&R::Gamma), vec![LinkFunction::Log, LinkFunction::Inverse]);
+        assert_eq!(
+            legal(&R::InverseGaussian),
+            vec![LinkFunction::Log, LinkFunction::InverseSquared]
+        );
+        assert_eq!(legal(&R::Poisson), vec![LinkFunction::Log]);
+        for link in [LinkFunction::Inverse, LinkFunction::InverseSquared] {
+            assert!(!legal(&R::Binomial).contains(&link));
+            assert!(!legal(&R::Poisson).contains(&link));
+        }
+        // Every listed link is a legal cell, and every cell `try_new` accepts
+        // is listed: the listing is the table, not a copy of it.
+        for response in [R::Gaussian, R::Gamma, R::InverseGaussian, R::Poisson, R::Binomial] {
+            for link in LinkFunction::ALL {
+                let probe = legality_probe(link);
+                assert_eq!(
+                    LikelihoodSpec::try_new(response.clone(), probe).is_ok(),
+                    legal(&response).contains(&link),
+                    "{} / {}",
+                    response.name(),
+                    link.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn illegal_cell_error_lists_the_family_legal_links() {
+        let err = LikelihoodSpec::try_new(
+            ResponseFamily::Gamma,
+            InverseLink::Standard(StandardLink::Identity),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("legal links for `gamma`: log|inverse"), "{message}");
+
+        let err = LikelihoodSpec::try_new(
+            ResponseFamily::InverseGaussian,
+            InverseLink::Standard(StandardLink::Inverse),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("legal links for `inverse-gaussian`: log|inverse-squared"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn inverse_gaussian_support_is_the_strictly_positive_reals() {
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::InverseGaussian,
+            InverseLink::Standard(StandardLink::InverseSquared),
+        );
+        assert!(spec.response.validate_response_support(arr1(&[0.5, 2.0]).view()).is_ok());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let violation = spec
+                .response
+                .validate_response_support(arr1(&[1.0, bad]).view())
+                .unwrap_err();
+            assert_eq!(violation.total_violations, 1, "y = {bad}");
+        }
     }
 }

@@ -606,6 +606,7 @@ fn the_shapes_with_no_channel_are_still_withheld_and_say_which_2484() {
         grids: vec![build.grid.clone(), build.grid.clone()],
         top_k: 1,
         bandwidth: 1.0,
+        mixture: crate::bms::LocalLawMixture::default(),
         train_row_mixtures: std::sync::Arc::new(Vec::new()),
     };
     assert_unavailable_because(

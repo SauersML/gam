@@ -71,7 +71,7 @@ def test_save_load_preserves_training_table_kind_and_predict_container() -> None
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = str(Path(tmp_dir) / "model.gam")
-        gamfit.save(model, tmp_path)
+        model.save(tmp_path)
         reloaded = gamfit.load(tmp_path)
 
     # The reloaded model must carry the same training-table kind ...

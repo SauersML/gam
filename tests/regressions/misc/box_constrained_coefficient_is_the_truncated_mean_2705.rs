@@ -51,6 +51,13 @@ const INTERCEPT: f64 = 2.0;
 const SLOPE: f64 = 5.0;
 const N: usize = 41;
 
+/// The closed form truncates the UNPENALIZED least-squares Gaussian,
+/// `N(β̂_unc, φ̂/XᵀX)`. Since b7b874a2a1 a formula linear effect carries the
+/// null-recovery ridge by default, which moves both the centre and the spread
+/// of the Gaussian the fit truncates. So every fit here opts out with
+/// `double_penalty=false`: the unconstrained control and both boxed fits.
+const UNCONSTRAINED_CONTROL: &str = "y ~ linear(x, double_penalty=false)";
+
 /// Noise-free `y = 2 + 5x` on an even grid over `[-1, 1]` — the fixture
 /// `misc::linear_box_constraint_violated_by_internal_scaling` uses.
 fn fixture() -> (Vec<f64>, Vec<f64>) {
@@ -123,7 +130,8 @@ fn a_binding_coefficient_box_reports_the_truncated_posterior_mean_2705() {
     // The unconstrained slope is the centre of the Gaussian that gets
     // truncated. Read it from a fit rather than from `SLOPE`, so the identity is
     // pinned against what the engine computed and not against the generator.
-    let unconstrained = match fit_from_formula("y ~ x", &data, &FitConfig::default()) {
+    let unconstrained = match fit_from_formula(UNCONSTRAINED_CONTROL, &data, &FitConfig::default())
+    {
         Ok(FitResult::Standard(fit)) => fit,
         other => panic!("the unconstrained control must fit: {other:?}", other = other.is_ok()),
     };
@@ -134,7 +142,7 @@ fn a_binding_coefficient_box_reports_the_truncated_posterior_mean_2705() {
     );
 
     for upper in [1.0_f64, 2.0, 3.0, 4.0] {
-        let formula = format!("y ~ linear(x, min=0, max={upper})");
+        let formula = format!("y ~ linear(x, min=0, max={upper}, double_penalty=false)");
         let fitted = match fit_from_formula(&formula, &data, &FitConfig::default()) {
             Ok(FitResult::Standard(fit)) => fit,
             Ok(_) => panic!("`{formula}` is a Standard GAM fit"),
@@ -202,7 +210,8 @@ fn a_binding_half_line_reports_the_truncated_posterior_mean_2705() {
     let data = dataset(&x, &y);
     let cross_product: f64 = x.iter().map(|xi| xi * xi).sum();
 
-    let unconstrained = match fit_from_formula("y ~ x", &data, &FitConfig::default()) {
+    let unconstrained = match fit_from_formula(UNCONSTRAINED_CONTROL, &data, &FitConfig::default())
+    {
         Ok(FitResult::Standard(fit)) => fit,
         _ => panic!("the unconstrained control must fit"),
     };
@@ -212,7 +221,8 @@ fn a_binding_half_line_reports_the_truncated_posterior_mean_2705() {
         "the control must recover the negative noise-free slope, got {centre}"
     );
 
-    let fitted = match fit_from_formula("y ~ nonnegative(x)", &data, &FitConfig::default()) {
+    let half_line = "y ~ nonnegative(x, double_penalty=false)";
+    let fitted = match fit_from_formula(half_line, &data, &FitConfig::default()) {
         Ok(FitResult::Standard(fit)) => fit,
         Ok(_) => panic!("`y ~ nonnegative(x)` is a Standard GAM fit"),
         Err(error) => panic!("`y ~ nonnegative(x)` must fit: {error}"),

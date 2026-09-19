@@ -1929,6 +1929,113 @@ fn nuclear_norm_wide_zero_joint_rowspace_rejects_biting_zero_tie() {
     );
 }
 
+/// #2469: the tie guard at a biting `max_rank` refuses only a gap the right
+/// Gram's spectrum cannot resolve: twice the eigensolver band `p·ε·‖G‖₂` plus the
+/// `m`-term formation band `γ_m·‖|T|ᵀ|T|‖_F`. `G = diag(1, 1 + 1e-12, 4)` with
+/// `max_rank = 2` puts the cutoff between eigenvalues `1e-12` apart, about ninety
+/// times twice that band. The `1e-12·(|λ₀| + |λ₁|)` guard it replaced refused it.
+/// An exact tie `diag(1, 1, 4)` is still refused.
+#[test]
+fn nuclear_norm_tie_guard_refuses_only_an_unresolved_gap_2469() {
+    let n_eff = 3usize;
+    let p = 3usize;
+    let pen = |max_rank| {
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-3, max_rank, false).unwrap()
+    };
+    let v = array![[0.1_f64, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]];
+    let gap = 1.0e-12_f64;
+    let near = array![[1.0_f64, 0.0, 0.0], [0.0, (1.0_f64 + gap).sqrt(), 0.0], [0.0, 0.0, 2.0]];
+    let gram_absolute = near.mapv(f64::abs).t().dot(&near.mapv(f64::abs));
+    let band = p as f64 * f64::EPSILON * 4.0
+        + gam_linalg::roundoff::accumulation_growth(n_eff)
+            * gram_absolute.iter().map(|value| value * value).sum::<f64>().sqrt();
+    assert!(
+        gap > 10.0 * 2.0 * band && gap <= 1.0e-12 * 2.0,
+        "fixture premise: the gap {gap:.1e} is resolved (2·band = {:.3e}) and inside the \
+         replaced 1e-12·(|λ₀| + |λ₁|) guard",
+        2.0 * band
+    );
+    pen(Some(2))
+        .right_spectral_inverse_sqrt_derivative(near.view(), v.view())
+        .expect("a resolved gap at the cutoff is not a tie");
+    let tied = array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
+    let err = pen(Some(2))
+        .right_spectral_inverse_sqrt_derivative(tied.view(), v.view())
+        .expect_err("an exact tie at the cutoff is refused");
+    assert!(err.contains("splits a tied"), "got: {err}");
+}
+
+/// #2469: a row joins the wide-block joint row-space basis when its residual is
+/// resolved, not above `1e-13·‖row‖`. In `d = 40`, `T = e₀` and `V = e₀ + 5e-14·e₁`
+/// leave `V` a residual of `5e-14`. `e₀` is exact, so its direction carries no
+/// error, and the residual only has to clear `V`'s own band for one direction
+/// (`2·γ₄₄ ≈ 9.8e-15`), which is below the replaced cutoff. The basis has two
+/// directions. A row exactly in the span (`V = 3·e₀`) adds none, and a zero row is
+/// skipped.
+#[test]
+fn nuclear_norm_joint_row_space_basis_admits_a_residual_above_its_band_2469() {
+    use crate::analytic_penalties::nuclear_norm::joint_row_space_basis;
+    let d = 40usize;
+    let gap = 5.0e-14_f64;
+    let band = gam_math::roundoff::gram_schmidt_residual_band(
+        gam_math::roundoff::GRAM_SCHMIDT_PASSES,
+        1,
+        d,
+        1.0,
+    );
+    assert!(
+        gap > band && gap < 1.0e-13,
+        "fixture premise: the residual {gap:.1e} sits between the band {band:.3e} and the \
+         replaced 1e-13 cutoff"
+    );
+    let mut t = Array2::<f64>::zeros((1, d));
+    t[[0, 0]] = 1.0;
+    let mut v = Array2::<f64>::zeros((2, d));
+    v[[0, 0]] = 1.0;
+    v[[0, 1]] = gap;
+    let basis = joint_row_space_basis(t.view(), v.view());
+    assert_eq!(basis.len(), 2, "the resolved residual is a second direction");
+    assert!((basis[1][1].abs() - 1.0).abs() <= band);
+
+    let mut in_span = Array2::<f64>::zeros((1, d));
+    in_span[[0, 0]] = 3.0;
+    assert_eq!(joint_row_space_basis(t.view(), in_span.view()).len(), 1);
+}
+
+/// #2469: the joint row space does not take a row whose residual only its own
+/// band resolves. `T` holds six near-collinear unit rows of `(1, x, …, x⁷)` at
+/// nodes `1, 1.05, …, 1.25` (#2600), and `V` their unit fourth difference, which
+/// is in their span by construction. Its weights on the six sum to about 8000,
+/// so the directions it is measured against are too coarse to resolve it, and
+/// the basis keeps six directions.
+#[test]
+fn nuclear_norm_joint_row_space_skips_a_near_collinear_difference_2469() {
+    use crate::analytic_penalties::nuclear_norm::joint_row_space_basis;
+    let d = 8usize;
+    let mut t = Array2::<f64>::zeros((6, d));
+    for index in 0..6 {
+        let node = 1.0 + 0.05 * index as f64;
+        let mut power = 1.0_f64;
+        for column in 0..d {
+            t[[index, column]] = power;
+            power *= node;
+        }
+        let norm = t.row(index).dot(&t.row(index)).sqrt();
+        t.row_mut(index).mapv_inplace(|value| value / norm);
+    }
+    let mut difference = Array1::<f64>::zeros(d);
+    for (index, weight) in [1.0_f64, -4.0, 6.0, -4.0, 1.0].iter().enumerate() {
+        difference.scaled_add(*weight, &t.row(index));
+    }
+    let length = difference.dot(&difference).sqrt();
+    let v = (&difference / length).insert_axis(ndarray::Axis(0));
+    assert_eq!(joint_row_space_basis(t.view(), v.view()).len(), 6);
+}
+
 #[test]
 fn nuclear_norm_hvp_truncated_rank_matches_gradient_directional_derivative() {
     let n_eff = 4usize;

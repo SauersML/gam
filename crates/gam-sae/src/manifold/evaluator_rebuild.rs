@@ -51,6 +51,9 @@ pub const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 /// Seed patches use degree 2 ([`SAE_EUCLIDEAN_PATCH_MAX_DEGREE`]); a structure
 /// birth may explicitly persist the degree-3 line candidate. The degree lives
 /// in `SaeBasisResolution::Polynomial`, never inferred from decoder width.
+///
+/// Structural (#2469): a supported-order cap, the highest degree any producer
+/// persists (the cubic line birth).
 pub const SAE_EUCLIDEAN_PATCH_RACE_MAX_DEGREE: usize = 3;
 
 /// Flat-line polynomial degree of a Cylinder `S¹ × ℝ` atom's line axis (axis 1).

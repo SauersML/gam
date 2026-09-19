@@ -563,6 +563,7 @@ pub fn kernel_ratio_jet(
     // log-difference.  This avoids redundant exp() calls when the same ratio
     // appears in multiple derivative orders.
     let mut rk = [0.0f64; 5]; // rk[0] unused; rk[r] = K_{k+r}/K_k
+    // Structural (#2469): the jet holds orders 0..=4, so `rk` has slots 1..=4.
     for r in 1..=order.min(4) {
         let delta = log_bundle.get(k + r) - log_k0;
         rk[r] = if delta.is_finite() {
@@ -639,6 +640,7 @@ pub struct KernelSumTerm {
 /// relative error, and it leaves every pair a runtime row actually forms —
 /// interval widths of order the observation scale — on the numerical path.
 fn analytic_log_mass_gap_threshold() -> f64 {
+    // Derived (#2469): the error crossing `(24ε)^{1/4}` stated above.
     (24.0 * f64::EPSILON).sqrt().sqrt()
 }
 

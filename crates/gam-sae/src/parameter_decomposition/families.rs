@@ -81,9 +81,10 @@
 //! reference as evidence through `precision::decode_then_evaluate`. The score reads
 //! only an exact figure: the largest distortion over what the executor ran, with its
 //! derived rounding. A bound, an estimate, a counterexample or a bracket is not that
-//! figure, and it is refused. The resulting [`DecodedArtifactScore`] is what `codec`'s
-//! comparison at declared fidelity and `fit`'s rule read. It certifies nothing beyond the
-//! executed inputs and masks (#2946 fr-census overclaim audit, comment 5716123817).
+//! figure, and it is refused. The artifact's code length with that fidelity is what
+//! `codec`'s comparison at proven fidelity and `fit`'s rule read. It certifies nothing
+//! beyond the executed inputs and masks (#2946 fr-census overclaim audit, comment
+//! 5716123817).
 //!
 //! # Relation to `field`
 //!
@@ -98,8 +99,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use super::codec::{
-    BitReader, BitString, CodecError, DecodedArtifactScore, decode_prefix_integer, decode_subset,
-    encode_prefix_integer, encode_subset,
+    BitReader, BitString, CodecError, decode_prefix_integer, decode_subset, encode_prefix_integer,
+    encode_subset,
 };
 use super::field::{FieldCoefficient, MatrixParameterField, ParameterFamily};
 use super::precision::{
@@ -851,9 +852,8 @@ fn decode_families(artifact: &FamilyArtifact) -> Result<DecodedFamilies, FamilyE
 /// against `native_reference` under the declared `tolerance`.
 ///
 /// `measure` states the largest declared distortion over what `evaluate` executed as
-/// evidence. The score's code length is the artifact's exact message length, and its
-/// distortion and rounding are the exact figure's value and numerical error. The
-/// fidelity evidence and its proven verdict are returned with the score. The
+/// evidence. Returns the artifact's exact message length with that fidelity evidence and
+/// its proven verdict, the pair `codec`'s comparison at proven fidelity reads. The
 /// measurement covers only the executed inputs and masks (#2946 fr-census overclaim
 /// audit, comment 5716123817). Refuses what `decode_then_evaluate` refuses, and a
 /// status that is not exact.
@@ -863,18 +863,14 @@ pub fn score_decoded_families<O, E, M, W, D>(
     native_reference: &O,
     measure: M,
     tolerance: f64,
-) -> Result<(DecodedArtifactScore, DecodedFidelity<W, D>), String>
+) -> Result<(u64, DecodedFidelity<W, D>), String>
 where
     E: FnOnce(&DecodedFamilies) -> Result<O, String>,
     M: FnOnce(&O, &O) -> Result<EvidenceStatus<W, D>, String>,
 {
     let fidelity = decode_then_evaluate(artifact, evaluate, native_reference, measure, tolerance)?;
-    let (decoded_distortion, distortion_roundoff) = match fidelity.status() {
-        EvidenceStatus::Exact {
-            value,
-            numerical_error,
-            ..
-        } => (*value, *numerical_error),
+    match fidelity.status() {
+        EvidenceStatus::Exact { .. } => {}
         EvidenceStatus::UniformBound { .. } => {
             return Err(not_the_largest_distortion("a uniform bound"));
         }
@@ -887,15 +883,8 @@ where
         EvidenceStatus::Unresolved { .. } => {
             return Err(not_the_largest_distortion("an unresolved bracket"));
         }
-    };
-    Ok((
-        DecodedArtifactScore {
-            code_bits: artifact.code_bits(),
-            decoded_distortion,
-            distortion_roundoff,
-        },
-        fidelity,
-    ))
+    }
+    Ok((artifact.code_bits(), fidelity))
 }
 
 fn not_the_largest_distortion(kind: &str) -> String {
@@ -909,9 +898,12 @@ fn not_the_largest_distortion(kind: &str) -> String {
 mod tests {
     use super::*;
     use crate::parameter_decomposition::codec::{
-        code_saving_at_declared_fidelity, prefix_integer_len_bits, subset_code_len_bits,
+        code_saving_at_proven_fidelity, prefix_integer_len_bits, subset_code_len_bits,
     };
     use crate::parameter_decomposition::precision::FidelityVerdict;
+    use crate::parameter_decomposition::fit::{
+        ProposalAcceptance, ProposalKind, ProposalRejection, decide_proposal,
+    };
     use crate::parameter_decomposition::supports::ExactBasis;
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, symmetric_spectrum_rounding_band};
     use ndarray::Array1;
@@ -1423,31 +1415,29 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
-    /// The score and the fidelity verdict of `artifact` over the declared masks and inputs.
-    fn score_and_verdict(
+    /// An artifact's code length with its decoded fidelity.
+    type Score = (u64, DecodedFidelity<usize, &'static str>);
+
+    /// The score of `artifact` over the declared masks and inputs.
+    fn score(
         artifact: &FamilyArtifact,
         family: MaskFamily,
         inputs: &[Array1<f64>],
         native: &Executed,
-    ) -> (DecodedArtifactScore, FidelityVerdict) {
-        let (score, fidelity) = score_decoded_families(
+    ) -> Score {
+        score_decoded_families(
             artifact,
             |decoded: &DecodedFamilies| execute_decoded(decoded, family, inputs),
             native,
             measure,
             TOLERANCE,
         )
-        .expect("the decoded artifact executes");
-        (score, fidelity.verdict())
+        .expect("the decoded artifact executes")
     }
 
-    fn score(
-        artifact: &FamilyArtifact,
-        family: MaskFamily,
-        inputs: &[Array1<f64>],
-        native: &Executed,
-    ) -> DecodedArtifactScore {
-        score_and_verdict(artifact, family, inputs, native).0
+    /// A score as the pair `code_saving_at_proven_fidelity` reads.
+    fn pair(score: &Score) -> (u64, &DecodedFidelity<usize, &'static str>) {
+        (score.0, &score.1)
     }
 
     fn one_family(components: usize, dimension: usize) -> FamilyPartition {
@@ -1467,7 +1457,7 @@ mod tests {
         components: &[Array2<f64>],
         dimension: usize,
         inputs: &[Array1<f64>],
-    ) -> (FamilyArtifact, DecodedArtifactScore, FamilyArtifact, DecodedArtifactScore) {
+    ) -> (FamilyArtifact, Score, FamilyArtifact, Score) {
         let view = views(components);
         let native = execute(
             &native_instances(components),
@@ -1495,7 +1485,7 @@ mod tests {
         // fidelity.
         let planted = planted_components();
         let (literal, literal_score, shared, shared_score) = literal_and_family_scores(&planted, 2, &inputs);
-        let saving = code_saving_at_declared_fidelity(TOLERANCE, &literal_score, &shared_score);
+        let saving = code_saving_at_proven_fidelity(pair(&literal_score), pair(&shared_score));
         assert!(
             matches!(saving, Ok(bits) if bits > 0 && bits == i128::from(literal.code_bits()) - i128::from(shared.code_bits())),
             "the planted field ({} bits) must save code against its literals ({} bits), got {saving:?}",
@@ -1508,29 +1498,28 @@ mod tests {
             literal_and_family_scores(&planted, 1, &inputs);
         assert!(reduced.code_bits() < shared.code_bits());
         assert_eq!(reduced_literal, literal, "the literals do not depend on the family");
-        assert!(
-            reduced_score.decoded_distortion > TOLERANCE,
-            "a dropped label dimension must miss the tolerance: {reduced_score:?}"
+        assert_eq!(
+            reduced_score.1.verdict(),
+            FidelityVerdict::Violates,
+            "a dropped label dimension must be proven to miss the tolerance: {reduced_score:?}"
         );
-        // precision's verdict agrees: the reduced family is proven to violate.
+        // A re-execution of the native reference scores the reduced family the same.
         let planted_native = execute(
             &native_instances(&planted),
             0,
             MaskFamily::AllOnAndSingleDeletions,
             &inputs,
         );
-        let (rescored, reduced_verdict) =
-            score_and_verdict(&reduced, MaskFamily::AllOnAndSingleDeletions, &inputs, &planted_native);
+        let rescored = score(&reduced, MaskFamily::AllOnAndSingleDeletions, &inputs, &planted_native);
         assert_eq!(rescored, reduced_score);
-        assert_eq!(reduced_verdict, FidelityVerdict::Violates);
-        assert!(code_saving_at_declared_fidelity(TOLERANCE, &reduced_literal_score, &reduced_score).is_err());
+        assert!(code_saving_at_proven_fidelity(pair(&reduced_literal_score), pair(&reduced_score)).is_err());
 
         // Random-init control: the full-dimension family meets the tolerance, so both are
         // at equal fidelity, and it loses on code.
         let random = random_components();
         let (random_literal, random_literal_score, full, full_score) =
             literal_and_family_scores(&random, MEMBERS - 1, &inputs);
-        let lost = code_saving_at_declared_fidelity(TOLERANCE, &random_literal_score, &full_score);
+        let lost = code_saving_at_proven_fidelity(pair(&random_literal_score), pair(&full_score));
         assert!(
             matches!(lost, Ok(bits) if bits < 0),
             "a field through random components ({} bits) must lose to the literals ({} bits), got {lost:?}",
@@ -1543,7 +1532,7 @@ mod tests {
         assert_eq!(truncated_literal, random_literal);
         assert!(truncated.code_bits() < full.code_bits());
         assert!(
-            code_saving_at_declared_fidelity(TOLERANCE, &truncated_literal_score, &truncated_score).is_err(),
+            code_saving_at_proven_fidelity(pair(&truncated_literal_score), pair(&truncated_score)).is_err(),
             "a truncated field through random components must miss the tolerance: {truncated_score:?}"
         );
     }
@@ -1554,7 +1543,7 @@ mod tests {
         let inputs = declared_inputs(2);
         let components = projector_components(instances);
         let (literal, literal_score, shared, shared_score) = literal_and_family_scores(&components, 2, &inputs);
-        let saving = code_saving_at_declared_fidelity(TOLERANCE, &literal_score, &shared_score);
+        let saving = code_saving_at_proven_fidelity(pair(&literal_score), pair(&shared_score));
         assert!(
             matches!(saving, Ok(bits) if bits > 0),
             "the smooth family ({} bits) must save code against its literals ({} bits), got {saving:?}",
@@ -1571,11 +1560,10 @@ mod tests {
         )
         .expect("the identity encodes");
         let native_all_on = execute(&native_instances(&identity), 0, MaskFamily::AllOn, &inputs);
-        let (shared_all_on, shared_verdict) = score_and_verdict(&shared, MaskFamily::AllOn, &inputs, &native_all_on);
-        let (identity_score, identity_verdict) =
-            score_and_verdict(&identity_artifact, MaskFamily::AllOn, &inputs, &native_all_on);
+        let shared_all_on = score(&shared, MaskFamily::AllOn, &inputs, &native_all_on);
+        let identity_score = score(&identity_artifact, MaskFamily::AllOn, &inputs, &native_all_on);
         assert_eq!(
-            (shared_verdict, identity_verdict),
+            (shared_all_on.1.verdict(), identity_score.1.verdict()),
             (FidelityVerdict::Meets, FidelityVerdict::Meets),
             "both programs are proven within the tolerance at all-on"
         );
@@ -1597,7 +1585,7 @@ mod tests {
             TOLERANCE,
         );
         assert!(restated.is_err(), "a uniform bound must not stand in for the largest distortion");
-        let identity_saving = code_saving_at_declared_fidelity(TOLERANCE, &shared_all_on, &identity_score);
+        let identity_saving = code_saving_at_proven_fidelity(pair(&shared_all_on), pair(&identity_score));
         assert!(
             matches!(identity_saving, Ok(bits) if bits > 0),
             "identity ({} bits) must be the short program against the family ({} bits), got {identity_saving:?}",
@@ -1606,7 +1594,7 @@ mod tests {
         );
         // Negative control: from the identity start, the family is longer at equal fidelity.
         assert!(matches!(
-            code_saving_at_declared_fidelity(TOLERANCE, &identity_score, &shared_all_on),
+            code_saving_at_proven_fidelity(pair(&identity_score), pair(&shared_all_on)),
             Ok(bits) if bits < 0
         ));
     }
@@ -1837,5 +1825,137 @@ mod tests {
             literal_decoded.families()[0].parameter_family(),
             Err(FamilyError::Field(..))
         ));
+    }
+
+    /// The score and the fidelity status its measure proved over the declared family: the
+    /// status `fit`'s proposal rule reads.
+    fn score_and_status(
+        artifact: &FamilyArtifact,
+        family: MaskFamily,
+        inputs: &[Array1<f64>],
+        native: &Executed,
+    ) -> (Score, Status) {
+        let scored = score(artifact, family, inputs, native);
+        let status = scored.1.status().clone();
+        (scored, status)
+    }
+
+    fn encode_one_family(components: &[Array2<f64>], dimension: usize) -> FamilyArtifact {
+        encode_families(&views(components), &one_family(components.len(), dimension), precision())
+            .expect("the family encodes")
+    }
+
+    fn encode_literals(components: &[Array2<f64>]) -> FamilyArtifact {
+        encode_families(
+            &views(components),
+            &FamilyPartition::literal(components.len()).expect("literal partition"),
+            precision(),
+        )
+        .expect("the literals encode")
+    }
+
+    #[test]
+    fn family_proposals_are_decided_by_fits_rule_on_decoded_code_at_declared_fidelity() {
+        let inputs = declared_inputs(COLS);
+        let deletions = MaskFamily::AllOnAndSingleDeletions;
+
+        // Planted field: Share at d = 2 is accepted and certified, with the saving equal
+        // to the code-length difference.
+        let planted = planted_components();
+        let planted_native = execute(&native_instances(&planted), 0, deletions, &inputs);
+        let literal = encode_literals(&planted);
+        let shared = encode_one_family(&planted, 2);
+        let (literal_score, literal_status) = score_and_status(&literal, deletions, &inputs, &planted_native);
+        let (shared_score, shared_status) = score_and_status(&shared, deletions, &inputs, &planted_native);
+        let expected_saving = i128::from(literal.code_bits()) - i128::from(shared.code_bits());
+        let accepted = decide_proposal(ProposalKind::Share, pair(&literal_score), pair(&shared_score), shared_status);
+        assert!(
+            matches!(
+                &accepted,
+                Ok(ProposalAcceptance { kind: ProposalKind::Share, saving_bits, fidelity_certified: true, .. })
+                    if *saving_bits == expected_saving && *saving_bits > 0
+            ),
+            "sharing the planted field must be accepted, got {accepted:?}"
+        );
+        // Reduce d from 2 to 1: shorter, but its exhaustive status refutes the tolerance.
+        let reduced = encode_one_family(&planted, 1);
+        let (reduced_score, reduced_status) = score_and_status(&reduced, deletions, &inputs, &planted_native);
+        assert!(reduced.code_bits() < shared.code_bits());
+        assert_eq!(reduced_score.1.verdict(), FidelityVerdict::Violates);
+        let refuted = decide_proposal(ProposalKind::Reduce, pair(&shared_score), pair(&reduced_score), reduced_status);
+        assert!(
+            matches!(refuted, Err(ProposalRejection::FidelityRefuted(..))),
+            "a dropped label dimension must be refuted, got {refuted:?}"
+        );
+        // Split back into the literals: they are proven within the tolerance and longer, so
+        // the verdict is on code.
+        let split = decide_proposal(ProposalKind::Split, pair(&shared_score), pair(&literal_score), literal_status);
+        assert!(
+            matches!(split, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
+            "splitting the planted field into literals must lose on code, got {split:?}"
+        );
+
+        // Random-init control: at equal (proven) fidelity the full-dimension share loses on code.
+        let random = random_components();
+        let random_native = execute(&native_instances(&random), 0, deletions, &inputs);
+        let random_literal = encode_literals(&random);
+        let full = encode_one_family(&random, MEMBERS - 1);
+        let (random_literal_score, random_literal_status) =
+            score_and_status(&random_literal, deletions, &inputs, &random_native);
+        let (full_score, full_status) = score_and_status(&full, deletions, &inputs, &random_native);
+        assert!(
+            random_literal_status.certifies_at_most(TOLERANCE) && full_status.certifies_at_most(TOLERANCE),
+            "both artifacts are proven within the tolerance: equal fidelity"
+        );
+        let lost = decide_proposal(ProposalKind::Share, pair(&random_literal_score), pair(&full_score), full_status);
+        assert!(
+            matches!(lost, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
+            "a field through random components must lose on code at equal fidelity, got {lost:?}"
+        );
+
+        // P11: the smooth family shares, Reduce to identity at all-on is accepted, and Expose
+        // from identity loses on code.
+        let instances = 16;
+        let projectors = projector_components(instances);
+        let projector_inputs = declared_inputs(2);
+        let projector_native = execute(&native_instances(&projectors), 0, deletions, &projector_inputs);
+        let projector_literal = encode_literals(&projectors);
+        let projector_family = encode_one_family(&projectors, 2);
+        let projector_literal_score =
+            score_and_status(&projector_literal, deletions, &projector_inputs, &projector_native).0;
+        let (projector_family_score, projector_family_status) =
+            score_and_status(&projector_family, deletions, &projector_inputs, &projector_native);
+        let projector_share = decide_proposal(
+            ProposalKind::Share,
+            pair(&projector_literal_score),
+            pair(&projector_family_score),
+            projector_family_status,
+        );
+        assert!(
+            matches!(&projector_share, Ok(acceptance) if acceptance.saving_bits > 0),
+            "the smooth family must beat its literals, got {projector_share:?}"
+        );
+        let identity = vec![Array2::<f64>::eye(2)];
+        let identity_artifact = encode_literals(&identity);
+        let native_all_on = execute(&native_instances(&identity), 0, MaskFamily::AllOn, &projector_inputs);
+        let (family_all_on, family_all_on_status) =
+            score_and_status(&projector_family, MaskFamily::AllOn, &projector_inputs, &native_all_on);
+        let (identity_score, identity_status) =
+            score_and_status(&identity_artifact, MaskFamily::AllOn, &projector_inputs, &native_all_on);
+        let reduce_to_identity =
+            decide_proposal(ProposalKind::Reduce, pair(&family_all_on), pair(&identity_score), identity_status);
+        assert!(
+            matches!(
+                &reduce_to_identity,
+                Ok(acceptance) if acceptance.saving_bits > 0 && acceptance.fidelity_certified
+            ),
+            "identity must be the short program, got {reduce_to_identity:?}"
+        );
+        let expose =
+            decide_proposal(ProposalKind::Expose, pair(&identity_score), pair(&family_all_on), family_all_on_status);
+        assert!(
+            matches!(expose, Err(ProposalRejection::NoShorterCode { saving_bits }) if saving_bits < 0),
+            "exposing the smooth family from identity must lose on code, got {expose:?}"
+        );
     }
 }

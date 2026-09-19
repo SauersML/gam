@@ -169,7 +169,9 @@ fn railed_on_canonical_slot_three() -> OuterCriterionCertificate {
             lower: -BOX,
             upper: BOX,
             margin: 0.5,
+            face: crate::model_types::RailFaceKind::Representability,
         }],
+        newton_polish: None,
         curvature_floor: None,
     }
 }

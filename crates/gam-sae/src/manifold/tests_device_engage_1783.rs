@@ -376,7 +376,7 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         term.beta_dim(),
     );
     assert_eq!(sys.k, K_ATOMS * M * FRAME_RANK);
-    assert_eq!(sys.k, 2_048, "fixture must clear DIRECT_SOLVE_MAX_K=2000");
+    assert_eq!(sys.k, 2_048, "fixture border must keep the production large-border shape");
     let device = sys
         .device_sae_pcg
         .as_ref()
@@ -390,16 +390,19 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         .expect("fixture CUDA admission must resolve")
         .admitted_or_error(N_OBS, P, K_ATOMS)
         .expect("fixture admitted by production memory plan");
-    let options = plan.solve_options_for_border_dim(sys.k);
+    let plan_options = plan.solve_options();
+    // The step resolves its route from the assembled system (#2900 row 6.15), so the
+    // mode and the CG budget the offload gate reads are the resolved ones.
+    let options = gam_solve::arrow_schur::resolve_arrow_route(&sys, &plan_options).into_owned();
     assert_eq!(
         options.mode,
         gam_solve::arrow_schur::ArrowSolverMode::InexactPCG,
         "the actual assembled border, not full beta_dim, selects the solver"
     );
     let cg_iters = options
-        .pcg
-        .max_iterations
-        .min(options.trust_region.max_iterations);
+        .pcg_budget
+        .map(gam_solve::arrow_schur::ArrowPcgBudget::products)
+        .expect("a resolved InexactPCG request carries its product budget");
     let offload_admitted =
         gam_gpu::policy::GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
             sys.rows.len(),

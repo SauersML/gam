@@ -13,8 +13,10 @@
 //!   `Z' = PZ + (I - P)Z~` of R4. Writes `z.npy`, `z_tilde.npy`, every block's
 //!   `h` rows stacked into one `h.npy` (blocks `Z`, `Z~`, then the frames), and
 //!   `draw.json`. A principal frame copies its retained coordinates from `Z`
-//!   exactly, so the frame `all:k` gives `Z' = Z` bit for bit: a row-alignment
-//!   control whose executed error is exactly 0.
+//!   exactly, so the frame `all:k` gives `Z' = Z` bit for bit. Its executed
+//!   error then reads only the row-position rounding of forming `h` and of the
+//!   batched torch execution (about 1e-17 per row on Pythia-70m, #2946): a
+//!   row-alignment control, since misaligned rows give `E(P) ≈ V(I)`.
 //! * `forward`  this file's `F(h)` from the exported parameters against the
 //!   executed outputs, with the first-order rounding bound of one evaluation
 //!   (a sum of `n` rounded products is within `n eps sum|terms|`). Two
@@ -27,6 +29,17 @@
 //!   `E|F(Z) - F(Z')|^2 = 2 (V(I) - V(P)) = 2 E(P)`. Row by row:
 //!   `V(I) = E|F(Z) - F(Z~)|^2 / 2`, `E(P) = E|F(Z) - F(Z')|^2 / 2`, and
 //!   `V(P)` from the paired difference, each with standard error `sd / (2 sqrt n)`.
+//! * `analytic` (A6, the gated Qwen3 MLP) the declared law absorbed into the
+//!   SwiGLU block, gate readers `W_gate L` and biases `W_gate h0`, up readers
+//!   `W_up L` and biases `W_up h0`, writers `W_down`, by
+//!   `gam_sae::response::raw_block::UnabsorbedGatedBlock::absorb` into a
+//!   `KnownGatedBlock`, and its Stein gated mean `g = F̄_P` on the draws of each
+//!   principal frame. By R2, `E|F(Z) - g(PZ)|^2 = E(P) + E|F̄_P - g|^2`, so the
+//!   row-paired `D = |F(Z) - g(PZ)|^2 - |F(Z) - F(Z')|^2 / 2` has
+//!   `E D = E|F̄_P - g|^2`, which is 0 exactly when `g` is the conditional mean and
+//!   at most the mean squared quadrature band for the computed one. The
+//!   unsmoothed `g0 = F(Pz)`, which ignores the discarded input, is its positive
+//!   control. The dense receipt (A3) is fr-commutant's runner.
 //!
 //! ```text
 //! cargo run --release -p gam-cli --example finite_response_teacher_2946 -- declare --harvest H --rank K --out LAW
@@ -37,21 +50,26 @@
 //!     --executed DRAW/executed.npy --rows R --out DRAW/forward.json
 //! cargo run --release -p gam-cli --example finite_response_teacher_2946 -- mc --draw DRAW \
 //!     --executed DRAW/executed.npy --out DRAW/receipt.json
+//! cargo run --release -p gam-cli --example finite_response_teacher_2946 -- analytic --harvest H --law LAW \
+//!     --draw DRAW --executed DRAW/executed.npy --rows N --out DRAW/analytic.json
 //! ```
 
 use clap::{Parser, Subcommand};
 use gam::faer_ndarray::{FaerSvd, fast_atb};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use gam_sae::response::raw_block::UnabsorbedGatedBlock;
+use ndarray::{Array1, Array2, ArrayD, ArrayView2, Axis, IxDyn, s};
 use npyz::{NpyFile, Order, WriterBuilder};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, StandardNormal};
 use serde_json::{Value, json};
 use statrs::function::erf::erfc;
+use std::collections::BTreeMap;
 use std::f64::consts::{PI, SQRT_2};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(about = "Teacher receipts for #2946 on an executed real MLP block")]
@@ -111,6 +129,22 @@ enum Stage {
         #[arg(long)]
         out: PathBuf,
     },
+    /// A6: the Stein gated mean of the absorbed Qwen3 block against the executed block, by the R2 paired statistic.
+    Analytic {
+        #[arg(long)]
+        harvest: PathBuf,
+        #[arg(long)]
+        law: PathBuf,
+        #[arg(long = "draw")]
+        draw_dir: PathBuf,
+        #[arg(long)]
+        executed: PathBuf,
+        /// Leading draw rows the retained-response statistic reads.
+        #[arg(long)]
+        rows: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -136,6 +170,14 @@ fn main() -> ExitCode {
             executed,
             out,
         } => monte_carlo(&draw_dir, &executed, &out),
+        Stage::Analytic {
+            harvest,
+            law,
+            draw_dir,
+            executed,
+            rows,
+            out,
+        } => analytic(&harvest, &law, &draw_dir, &executed, rows, &out),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -147,8 +189,10 @@ fn main() -> ExitCode {
 }
 
 fn declare(harvest: &Path, rank: usize, out: &Path) -> Result<(), String> {
+    let started = Instant::now();
     let meta = read_json(&harvest.join("meta.json"))?;
     let rows = read_rows::<f32>(&harvest.join("post_norm.npy"), None)?;
+    let read_seconds = started.elapsed().as_secs_f64();
     let (n, d) = rows.dim();
     if n < 2 {
         return Err(format!("{n} post-norm rows cannot carry a covariance"));
@@ -157,9 +201,11 @@ fn declare(harvest: &Path, rank: usize, out: &Path) -> Result<(), String> {
         .mean_axis(Axis(0))
         .ok_or("post_norm.npy holds no rows")?;
     let centred = (&rows - &h0) * (1.0 / ((n - 1) as f64).sqrt());
+    let centred_seconds = started.elapsed().as_secs_f64();
     let factors = centred
         .svd(false, true)
         .map_err(|err| format!("thin SVD of the centred post-norm rows: {err}"))?;
+    let svd_seconds = started.elapsed().as_secs_f64();
     let singular = factors.1;
     let vt = factors.2.ok_or("the SVD returned no right singular vectors")?;
     let mut order: Vec<usize> = (0..singular.len()).collect();
@@ -209,11 +255,20 @@ fn declare(harvest: &Path, rank: usize, out: &Path) -> Result<(), String> {
             "retained_variance": retained,
             "retained_fraction": retained / total,
             "principal_variances": variances,
+            "seconds": {
+                "read": read_seconds,
+                "centre": centred_seconds - read_seconds,
+                "svd": svd_seconds - centred_seconds,
+                "factor_and_write": started.elapsed().as_secs_f64() - svd_seconds,
+            },
         }),
     )?;
     println!(
-        "[declare] rows={n} hidden={d} rank={rank} retained variance {retained:.6e} of {total:.6e} ({:.4})",
-        retained / total
+        "[declare] rows={n} hidden={d} rank={rank} retained variance {retained:.6e} of {total:.6e} ({:.4}); seconds read={read_seconds:.1} centre={:.1} svd={:.1} total={:.1}",
+        retained / total,
+        centred_seconds - read_seconds,
+        svd_seconds - centred_seconds,
+        started.elapsed().as_secs_f64()
     );
     Ok(())
 }
@@ -649,6 +704,218 @@ fn monte_carlo(draw_dir: &Path, executed: &Path, out: &Path) -> Result<(), Strin
     )?;
     println!("[mc] rows={rows} V(I)={variance:.6e} +- {variance_se:.3e} |m|={mean_norm:.6e}");
     Ok(())
+}
+
+fn analytic(
+    harvest: &Path,
+    law: &Path,
+    draw_dir: &Path,
+    executed: &Path,
+    rows: usize,
+    out: &Path,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let meta = read_json(&harvest.join("meta.json"))?;
+    let hidden_act = meta
+        .get("hidden_act")
+        .and_then(Value::as_str)
+        .ok_or("meta.json names no hidden_act")?;
+    let mlp_class = meta.get("mlp_class").and_then(Value::as_str);
+    if mlp_class != Some("Qwen3MLP") {
+        return Err(format!(
+            "the analytic receipt here is A6, the gated Qwen3 MLP; meta.json names {hidden_act:?} {mlp_class:?}"
+        ));
+    }
+    let parameters = torch_parameters(harvest, &meta)?;
+    let output_dim = parameters
+        .get("down_proj.weight")
+        .map(|weight| weight.shape()[0])
+        .ok_or("the harvest holds no down_proj.weight")?;
+    let h0 = read_vector(&law.join("h0.npy"))?;
+    let factor = read_rows::<f64>(&law.join("L.npy"), None)?;
+    let rank = factor.ncols();
+    // The torch layout and the absorption of the declared law `h = h0 + L z` (gate and up readers `W L`, `A L`,
+    // biases `W h0`, `A h0`) have one owner in gam-sae.
+    let block = UnabsorbedGatedBlock::from_torch_parameters(parameters, hidden_act, Array2::<f64>::eye(output_dim))
+        .map_err(|err| format!("torch block: {err}"))?
+        .absorb(h0.view(), factor.view())
+        .map_err(|err| format!("absorbed block: {err}"))?;
+    let absorb_seconds = started.elapsed().as_secs_f64();
+
+    let layout = read_json(&draw_dir.join("draw.json"))?;
+    let draw_rows = layout
+        .get("rows")
+        .and_then(Value::as_u64)
+        .ok_or("draw.json names no rows")? as usize;
+    let blocks = layout
+        .get("blocks")
+        .and_then(Value::as_array)
+        .ok_or("draw.json names no blocks")?;
+    let monte_carlo = read_json(&draw_dir.join("receipt.json"))?;
+    let mc_frames = monte_carlo
+        .get("frames")
+        .and_then(Value::as_array)
+        .ok_or("receipt.json names no frames")?;
+    if rows < 2 || rows > draw_rows {
+        return Err(format!("--rows {rows} outside 2..={draw_rows}"));
+    }
+    let z = read_rows::<f64>(&draw_dir.join("z.npy"), Some(rows))?;
+    let y = read_rows::<f64>(executed, None)?;
+    if z.ncols() != rank || y.nrows() != draw_rows * blocks.len() {
+        return Err(format!(
+            "draws {:?} and executed rows {:?} disagree with rank {rank} x blocks {}",
+            z.dim(),
+            y.dim(),
+            blocks.len()
+        ));
+    }
+    let base = y.slice(s![0..rows, ..]);
+    let full_frame = Array2::<f64>::eye(rank);
+
+    let mut frames = Vec::new();
+    for (index, entry) in blocks.iter().enumerate().skip(2) {
+        let frame_started = Instant::now();
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("a draw block names no frame")?;
+        if entry["frame"]["kind"] != "principal" {
+            return Err(format!("frame {name} is not a principal frame"));
+        }
+        let retained = entry["frame"]
+            .get("retained")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("frame {name} names no retained count"))? as usize;
+        let mc = mc_frames
+            .iter()
+            .find(|frame| frame.get("name").and_then(Value::as_str) == Some(name))
+            .ok_or_else(|| format!("receipt.json has no frame {name}"))?;
+        let (mc_discarded, mc_discarded_se) = estimate(&mc["E"])?;
+
+        let mut frame = Array2::<f64>::zeros((rank, retained));
+        for column in 0..retained {
+            frame[[column, column]] = 1.0;
+        }
+        let response = block
+            .retained_response(frame.view(), z.view())
+            .map_err(|err| format!("F-bar({name}): {err}"))?;
+        // The positive control `g0 = F(Pz)` ignores the discarded input: the full frame's response at the retained
+        // point, whose discarded variances are zero.
+        let mut retained_points = z.clone();
+        retained_points.slice_mut(s![.., retained..]).fill(0.0);
+        let unsmoothed = block
+            .retained_response(full_frame.view(), retained_points.view())
+            .map_err(|err| format!("F(Pz) ({name}): {err}"))?;
+        let coupled = y.slice(s![index * draw_rows..index * draw_rows + rows, ..]);
+        let half_coupled: Vec<f64> = squared_distances(base, coupled)
+            .into_iter()
+            .map(|value| 0.5 * value)
+            .collect();
+        let (gap, gap_se) = paired_gap(base, response.values.view(), &half_coupled);
+        let (control, control_se) = paired_gap(base, unsmoothed.values.view(), &half_coupled);
+        // `E D = E|F̄_P − g|²`, and the computed `g` departs from `F̄_P` by at most the quadrature band per entry, so
+        // a correct conditional mean leaves `E D` at most the mean squared band.
+        let quadrature_bias = response
+            .quadrature_band
+            .outer_iter()
+            .map(|row| row.dot(&row))
+            .sum::<f64>()
+            / rows as f64;
+        let largest_band = response.quadrature_band.iter().fold(0.0_f64, |largest, &band| largest.max(band));
+        let frame_seconds = frame_started.elapsed().as_secs_f64();
+        println!(
+            "[analytic] frame={name} retained={retained} E|F-bar - g|^2: Stein gated mean {gap:.3e} +- {gap_se:.3e} (z={:.2}, quadrature bias <= {quadrature_bias:.3e}), unsmoothed F(Pz) {control:.3e} +- {control_se:.3e} (z={:.2}); executed E(P)={mc_discarded:.6e} +- {mc_discarded_se:.3e}; {frame_seconds:.1}s",
+            gap / gap_se,
+            control / control_se,
+        );
+        frames.push(json!({
+            "name": name,
+            "retained": retained,
+            "stein_gated_mean_gap": { "mean": gap, "se": gap_se, "z": gap / gap_se },
+            "quadrature_bias_bound": quadrature_bias,
+            "largest_quadrature_band": largest_band,
+            "unsmoothed_control_gap": { "mean": control, "se": control_se, "z": control / control_se },
+            "executed_E": { "estimate": mc_discarded, "se": mc_discarded_se },
+            "seconds": frame_seconds,
+        }));
+    }
+    write_json(
+        out,
+        &json!({
+            "stage": "analytic",
+            "acceptance": "#2946 A6: the Stein gated mean matches Monte Carlo on the executed Qwen3 MLP under the declared law",
+            "harvest": harvest.display().to_string(),
+            "law": law.display().to_string(),
+            "draw": draw_dir.display().to_string(),
+            "activation": "silu gate (SwiGLU)",
+            "absorption": "W = W_gate L, b = W_gate h0, A = W_up L, c = W_up h0, U = W_down, M = I",
+            "gap_statistic": "D = |F(Z) - g(PZ)|^2 - |F(Z) - F(Z')|^2 / 2, E D = E|F-bar_P - g|^2 (R2); mean +- sd/sqrt n",
+            "rows_used": rows,
+            "V_I_executed": monte_carlo["V_I"].clone(),
+            "absorb_seconds": absorb_seconds,
+            "frames": frames,
+        }),
+    )
+}
+
+/// Every MLP parameter `meta.json` lists, read from `<torch name>.npy` into the map the torch-layout parser takes.
+fn torch_parameters(harvest: &Path, meta: &Value) -> Result<BTreeMap<String, ArrayD<f64>>, String> {
+    let listed = meta
+        .get("mlp_params")
+        .and_then(Value::as_object)
+        .ok_or("meta.json lists no mlp_params")?;
+    let mut parameters = BTreeMap::new();
+    for name in listed.keys() {
+        let path = harvest.join(format!("{name}.npy"));
+        let npy = open_npy(&path)?;
+        let shape = npy
+            .shape()
+            .iter()
+            .map(|&extent| usize::try_from(extent).map_err(|err| format!("{}: {err}", path.display())))
+            .collect::<Result<Vec<usize>, String>>()?;
+        let values = npy
+            .try_data::<f64>()
+            .map_err(|npy| format!("{} has dtype {}", path.display(), npy.dtype().descr()))?
+            .collect::<std::io::Result<Vec<f64>>>()
+            .map_err(|err| format!("read {}: {err}", path.display()))?;
+        let array = ArrayD::from_shape_vec(IxDyn(&shape), values)
+            .map_err(|err| format!("{} has an invalid shape: {err}", path.display()))?;
+        parameters.insert(name.clone(), array);
+    }
+    Ok(parameters)
+}
+
+/// The `estimate` and `se` of one `mc` receipt entry.
+fn estimate(entry: &Value) -> Result<(f64, f64), String> {
+    match (
+        entry.get("estimate").and_then(Value::as_f64),
+        entry.get("se").and_then(Value::as_f64),
+    ) {
+        (Some(value), Some(se)) => Ok((value, se)),
+        _ => Err(format!("receipt entry {entry} carries no estimate and se")),
+    }
+}
+
+/// Mean and standard error of `D_i = |F(Z_i) - g_i|^2 - |F(Z_i) - F(Z'_i)|^2 / 2`.
+fn paired_gap(
+    executed: ArrayView2<'_, f64>,
+    response: ArrayView2<'_, f64>,
+    half_coupled: &[f64],
+) -> (f64, f64) {
+    let samples: Vec<f64> = squared_distances(executed, response)
+        .iter()
+        .zip(half_coupled)
+        .map(|(gap, half)| gap - half)
+        .collect();
+    mean_with_se(&samples)
+}
+
+/// The sample mean and its standard error `sd / sqrt n`.
+fn mean_with_se(samples: &[f64]) -> (f64, f64) {
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let variance = samples.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0);
+    (mean, (variance / n).sqrt())
 }
 
 fn squared_distances(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Vec<f64> {

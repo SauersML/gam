@@ -70,6 +70,11 @@ fn coupled_row_system(
     let couplings = Arc::new(couplings);
     let (forward_supports, forward_couplings) = (Arc::clone(&supports), Arc::clone(&couplings));
     let (transpose_supports, transpose_couplings) = (Arc::clone(&supports), Arc::clone(&couplings));
+    // Each row's supports are distinct, so its couplings are exactly the row's entries.
+    let row_norm_bounds: Arc<[f64]> = couplings
+        .chunks(active * active)
+        .map(|row_couplings| frobenius_norm_upper_bound(row_couplings.iter().copied()))
+        .collect();
     sys.set_row_htbeta_operator(
         move |row: usize, x: ArrayView1<'_, f64>, out: &mut Array1<f64>| {
             for r in 0..active {
@@ -89,6 +94,11 @@ fn coupled_row_system(
                 }
                 out[transpose_supports[row * active + ci] as usize] += acc;
             }
+        },
+        // Each apply accumulates `active` terms, one more for the transpose's addition.
+        RowHtbetaDeclaration {
+            row_norm_bounds,
+            apply_depth: active + 1,
         },
     );
     sys

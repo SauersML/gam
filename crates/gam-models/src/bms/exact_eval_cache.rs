@@ -1,5 +1,7 @@
+use super::family::{BernoulliInterceptPredictorWarmStart, BernoulliMarginalSlopeFamily};
 use super::hessian_paths::{
     BernoulliMarginalSlopeRowExactContext, BlockSlices, PrimarySlices, RowCellMomentsBundle,
+    block_slices, primary_slices,
 };
 use super::*;
 
@@ -49,6 +51,34 @@ pub(super) fn observe_capacity_floor(runtime_available_bytes: u64) -> u64 {
     bms_row_primary_hessian_capacity_floor()
         .fetch_max(runtime_available_bytes, Ordering::AcqRel)
         .max(runtime_available_bytes)
+}
+
+/// The memory readings the row-primary cache decision takes:
+/// `(runtime_available, stable_capacity, workspace_pinned)`.
+///
+/// A fit on its own reads live availability, the monotone capacity floor and
+/// every co-resident cache's pins. One search of a parallel multistart reads its
+/// lane instead: the availability read once before launch, for both budgets, and
+/// its own pins. Its decision is then the one it makes running alone, whatever
+/// the other searches have pinned (gnomon#2359).
+pub(super) fn row_primary_cache_memory_readings(
+    lane: Option<&gam_runtime::resource::SearchLaneBudget>,
+) -> (u64, u64, u64) {
+    match lane {
+        Some(lane) => (
+            lane.serial_available_bytes(),
+            lane.serial_available_bytes(),
+            lane.pinned_bytes().load(Ordering::Acquire),
+        ),
+        None => {
+            let runtime_available = runtime_available_memory_bytes();
+            (
+                runtime_available,
+                observe_capacity_floor(runtime_available),
+                bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire),
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,9 +173,90 @@ pub(super) fn decide_row_primary_hessian_cache(
     }
 }
 
+/// One outer search's predicted working set in bytes, when the search runs
+/// alone on `serial_available_bytes` (gnomon#2359, SPEC 10). Each term is what
+/// the search allocates, from the element counts and types of the buffers:
+///
+/// - the row-primary cache (`neglog`, `grad`, `hess`: `n·(r²+r+1)` f64) at the
+///   size `decide_row_primary_hessian_cache` gives it on that availability with
+///   nothing else pinned: materialized or tiled, or nothing when streamed;
+/// - three exact-evaluation caches, the two its own store retains and the one it
+///   builds on a miss (`BmsSearchMember`), each with its per-row contexts, its degree-9 and
+///   degree-15 cell-moment bundles at `RowCellMomentsBundle::estimated_resident_bytes`
+///   over the partition's most cells per row, and its per-row flex third
+///   tensors (two `r×r` f64 per row);
+/// - on the rigid path, three of each of its own store's per-row third and
+///   fourth [`RigidRowTensors`] tables (a lazy `Result` of 8 and of 16 f64 per row);
+/// - the row-intercept warm starts: two `u64` and a predictor slot per row,
+///   each predictor two `r`-vectors of f64;
+/// - the block states' linear predictors, `n` f64 per block;
+/// - the joint coefficient Hessian and its factor, two `p×p` f64.
+pub(super) fn outer_search_working_set_bytes(
+    family: &BernoulliMarginalSlopeFamily,
+    specs: &[ParameterBlockSpec],
+    serial_available_bytes: u64,
+) -> u64 {
+    let n = family.y.len() as u64;
+    let r = primary_slices(&block_slices(family)).total as u64;
+    let p = specs.iter().map(|spec| spec.design.ncols() as u64).sum::<u64>();
+    let f64_bytes = std::mem::size_of::<f64>() as u64;
+    let flex_active = family.score_warp.is_some() || family.link_dev.is_some();
+    let row_primary_cache = if flex_active {
+        let plan = decide_row_primary_hessian_cache(
+            n as usize,
+            r as usize,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            serial_available_bytes,
+            serial_available_bytes,
+            0,
+        );
+        let tiled = plan.expected_reuse_passes >= BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES
+            && plan.bytes <= plan.global_pin_budget_bytes;
+        if plan.materialize || tiled { plan.bytes } else { 0 }
+    } else {
+        0
+    };
+    let cells = n.saturating_mul(family.max_denested_partition_cells_per_row() as u64) as usize;
+    let cell_bundles = [9usize, 15]
+        .iter()
+        .map(|&degree| {
+            RowCellMomentsBundle::estimated_resident_bytes(n as usize, cells, degree) as u64
+        })
+        .sum::<u64>();
+    let row_contexts =
+        n.saturating_mul(std::mem::size_of::<BernoulliMarginalSlopeRowExactContext>() as u64);
+    let flex_third = if flex_active {
+        n.saturating_mul(2 * r * r).saturating_mul(f64_bytes)
+    } else {
+        0
+    };
+    let exact_eval_caches = 3 * (row_contexts + cell_bundles + flex_third);
+    let rigid_tensors = if flex_active {
+        0
+    } else {
+        let row_bytes = RigidRowTensors::<[[[f64; 2]; 2]; 2]>::row_bytes()
+            + RigidRowTensors::<[[[[f64; 2]; 2]; 2]; 2]>::row_bytes();
+        3 * n.saturating_mul(row_bytes as u64)
+    };
+    let predictor_slot = std::mem::size_of::<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>()
+        as u64
+        + 2 * r * f64_bytes;
+    let intercept_warm_starts =
+        n.saturating_mul(2 * std::mem::size_of::<AtomicU64>() as u64 + predictor_slot);
+    let block_predictors = n.saturating_mul(specs.len() as u64).saturating_mul(f64_bytes);
+    let joint_hessian = 2 * p.saturating_mul(p).saturating_mul(f64_bytes);
+    row_primary_cache
+        .saturating_add(exact_eval_caches)
+        .saturating_add(rigid_tensors)
+        .saturating_add(intercept_warm_starts)
+        .saturating_add(block_predictors)
+        .saturating_add(joint_hessian)
+}
+
 /// RAII handle around a materialized row-primary evaluation cache
-/// (neglog + gradient + Hessian) that decrements the process-global
-/// pinned-bytes counter on drop.
+/// (neglog + gradient + Hessian) that decrements the pinned-bytes counter it
+/// charged on drop: its search's own inside a multistart lane, else the
+/// process-global one.
 pub struct RowPrimaryEvalPin {
     /// Per-row negative log-likelihood, length `n`.
     pub(super) neglog: Array1<f64>,
@@ -154,6 +265,7 @@ pub struct RowPrimaryEvalPin {
     /// Per-row Hessian, shape `(n, r*r)`.
     pub(super) hess: Array2<f64>,
     pub(super) bytes: u64,
+    pub(super) lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
 }
 
 pub(super) struct RowPrimaryEvalTile {
@@ -231,13 +343,18 @@ impl RowPrimaryEvalPin {
         grad: Array2<f64>,
         hess: Array2<f64>,
         bytes: u64,
+        lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
     ) -> Self {
-        bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
+        match lane.as_deref() {
+            Some(lane) => lane.pinned_bytes().fetch_add(bytes, Ordering::AcqRel),
+            None => bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel),
+        };
         Self {
             neglog,
             grad,
             hess,
             bytes,
+            lane,
         }
     }
 
@@ -256,7 +373,10 @@ impl RowPrimaryEvalPin {
 
 impl Drop for RowPrimaryEvalPin {
     fn drop(&mut self) {
-        bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
+        match self.lane.as_deref() {
+            Some(lane) => lane.pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel),
+            None => bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel),
+        };
     }
 }
 
@@ -406,6 +526,58 @@ pub(super) struct FlexAxisFourthRowTensors {
     pub(super) gg: Array2<f64>,
 }
 
+/// A table of per-row rigid tensors, each built once, on its row's first read
+/// (gam#3022). It backs the exact cache's `rigid_third_full` and
+/// `rigid_fourth_full`, and the rigid row kernel's tables.
+///
+/// Each row is a `OnceLock`, not a `RayonSafeOnce`: the row's first reader builds
+/// it and every concurrent reader of that row waits for that build instead of
+/// repeating it. `RayonSafeOnce` would let every reader that arrives before the
+/// publish build the row again, up to the reader count when several tasks sweep
+/// the same rows in the same order. Waiting is safe because a row build is serial
+/// arithmetic (the row's closed-form jet and its anchor root, read and written
+/// through atomic slots): it runs no Rayon work, so the builder never steals a
+/// task that could read this row. A failed build's `Err` stays in its row and
+/// reaches every reader of that row. Holders share one table across evaluations
+/// at one β by holding it in their same-β store.
+pub(super) struct RigidRowTensors<T> {
+    rows: Vec<std::sync::OnceLock<Result<T, String>>>,
+}
+
+impl<T> RigidRowTensors<T> {
+    /// `n_rows` rows, none built.
+    pub(super) fn new(n_rows: usize) -> Self {
+        Self {
+            rows: (0..n_rows).map(|_| std::sync::OnceLock::new()).collect(),
+        }
+    }
+
+    /// The bytes one row occupies, built or not.
+    pub(super) const fn row_bytes() -> usize {
+        std::mem::size_of::<std::sync::OnceLock<Result<T, String>>>()
+    }
+
+    /// Row `row`'s tensor, built by `build` on the row's first read. `build` must
+    /// run no Rayon work (see the type's contract).
+    pub(super) fn row(
+        &self,
+        row: usize,
+        build: impl FnOnce() -> Result<T, String>,
+    ) -> Result<&T, String> {
+        self.rows
+            .get(row)
+            .ok_or_else(|| {
+                format!(
+                    "rigid row tensor table: row {row} out of range for {} rows",
+                    self.rows.len()
+                )
+            })?
+            .get_or_init(build)
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
 /// Lazy derivative-channel cache for one canonical BMS FLEX row program.
 ///
 /// The row has one semantic program identity, while third- and fourth-order
@@ -479,22 +651,27 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// for the standard-normal measure) run at most once per row per cache
     /// lifetime; per-axis callers reduce to a 2×2 [`contract_third_full`].
     ///
-    /// Stored as `Result` because the build is fallible (per-row jet may
-    /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
-    /// safe when the first caller is already inside a Rayon row pass; failure
-    /// is sticky and propagated identically to every caller.
+    /// Two-level lazy, like `flex_row_program_derivatives`: the outer slot
+    /// allocates a [`RigidRowTensors`] table on first touch, and each row's
+    /// tensor is built serially by the first reader of that row while any other
+    /// reader of the row waits. Each row is therefore built exactly once however
+    /// many tasks read it, and a subsampled pass builds only the rows it samples.
+    /// Stored per row as `Result` because the build is fallible (a per-row jet
+    /// may surface a non-finite value); a row's failure is sticky and
+    /// propagated identically to every reader of that row.
     pub(super) rigid_third_full:
-        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<RigidRowTensors<[[[f64; 2]; 2]; 2]>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
-    /// the second-order analogue of `rigid_third_full`. The outer-Hessian
-    /// build at large-scale shape evaluates `rigid_row_fourth_contracted` for
+    /// the second-order analogue of `rigid_third_full`, in the same per-row
+    /// slots. The outer-Hessian build at large-scale shape evaluates
+    /// `rigid_row_fourth_contracted` for
     /// every (ψ-axis-i, ψ-axis-j) pair: `(rank² + rank)/2 ≈ 528` pairs at
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
     pub(super) rigid_fourth_full:
-        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<RigidRowTensors<[[[[f64; 2]; 2]; 2]; 2]>>,
 
     /// One lazy slot per canonical FLEX row program. Each slot owns separate
     /// third/fourth channel cells, preserving order-specific work while making

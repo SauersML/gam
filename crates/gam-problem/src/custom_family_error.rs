@@ -745,6 +745,10 @@ pub enum CustomFamilyError {
     /// carrying block and verdict. It is built only by
     /// [`CustomFamilyError::fit_ended_without_certified_inner_mode`], at the
     /// boundary that hands a fit to its caller, never inside a trial (gam#2943).
+    ///
+    /// It carries no Jeffreys arming evidence. It is minted above every arming
+    /// consumer, and it may wrap the search's whole-search inner-refusal record,
+    /// which arming never reads (#979, #2943).
     #[error("{}", render_fit_ended_without_certified_inner_mode(refusal))]
     FitEndedWithoutCertifiedInnerMode { refusal: Box<CustomFamilyError> },
     #[error("{reason}")]
@@ -793,10 +797,18 @@ pub enum CustomFamilyError {
     /// Jeffreys arming lifecycle is one: it arms on a descending ray, a null
     /// penalized Hessian or a divergent inner state (#979). The rendered message
     /// is the one that `Optimization` printed for this context.
+    ///
+    /// `search_inner_refusal` is the most recent uncertified inner solve
+    /// (`InnerSolveNotConverged`) that any evaluation of the search raised. A
+    /// later finite trial clears `last_refusal` but not this record, so the fit
+    /// boundary (`FitFailure::ending_the_fit`) can name the inner solve that
+    /// decided the fit (gam#2943). Nothing else reads it. Jeffreys arming reads
+    /// `last_refusal`, because the search stepped away from every earlier refusal.
     #[error("custom-family optimization error in fit_custom_family outer smoothing: {reason}")]
     OuterSmoothingFailed {
         reason: String,
         last_refusal: Option<Box<CustomFamilyError>>,
+        search_inner_refusal: Option<Box<CustomFamilyError>>,
         /// The outer search's own typed verdict, which `reason` renders. It is
         /// what decides the failure's category: a search whose every seed was
         /// refused and one that started and did not converge render into the

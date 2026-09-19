@@ -72,7 +72,7 @@ fn term_spec(length_scale: f64) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -82,6 +82,7 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![term_spec(length_scale)],
+        level: Default::default(),
     }
 }
 
@@ -247,6 +248,9 @@ fn main() {
                 dropped_penalties: moved.dropped_penalties.clone(),
                 linear_constraints_local: moved.linear_constraints.as_ref(),
                 joint_null_rotation: moved.joint_null_rotation.as_ref(),
+                duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
+                    &term_spec(ell),
+                ),
                 termname: "duchon_1d",
             },
         );

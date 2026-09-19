@@ -77,9 +77,9 @@
 //! the range that decides WHICH span the representers occupy has to be chosen
 //! by the criterion, exactly as the Matérn κ is. Consequences:
 //!
-//! - **Penalty-dial design drift is identically zero**: the (s, α, τ) dials
+//! - **Penalty-dial design drift is identically zero**: the (s, α) dials
 //!   reweight only the jet-energy penalty, never the Gaussian representer
-//!   design (`∂X/∂{s,α,τ} ≡ 0`), so those channels are penalty-only
+//!   design (`∂X/∂{s,α} ≡ 0`), so those channels are penalty-only
 //!   (`is_penalty_like` auto-derives true in the outer engine's
 //!   `DirectionalHyperParam`).
 //! - **The representer range ℓ is a design-and-pullback-moving dial** (matérn's
@@ -265,10 +265,6 @@ pub struct MeasureJetBasisSpec {
     pub order_s: f64,
     /// Density-normalization exponent α (outer weight `q^{1−2α}`).
     pub alpha: f64,
-    /// Historical τ coordinate retained for frozen specs and ψ layout. The
-    /// measure-jet energy itself uses the exact weighted affine projection and
-    /// is independent of τ; the τ ψ derivatives are therefore zero.
-    pub tau0: f64,
     /// Number of scale nodes; `0` sentinel = auto dyadic band.
     pub num_scales: usize,
     /// Representer (Gaussian RBF) range ℓ; `0.0` sentinel = auto
@@ -363,7 +359,6 @@ impl Default for MeasureJetBasisSpec {
             // header-derived default; an explicit `alpha=` still overrides for
             // genuinely density-free use on a full-dimensional stratum.
             alpha: 1.0,
-            tau0: 1e-3,
             num_scales: 0,
             length_scale: 0.0,
             double_penalty: true,
@@ -1254,11 +1249,9 @@ pub(crate) fn measure_jet_alpha_window(
         &band,
         geom.order_s_eval,
         spec.alpha,
-        spec.tau0,
         1,
-        1,
-        &|scale_idx, _: f64, q: f64, _: f64, out: &mut [[f64; 3]]| {
-            out[0] = [0.0, 0.0, 0.0];
+        &|scale_idx, _: f64, q: f64, _: f64, out: &mut [f64]| {
+            out[0] = 0.0;
             let ln_q = q.ln();
             let mut table = spread
                 .lock()
@@ -1417,10 +1410,8 @@ pub fn measure_jet_quadrature_nodes(
 /// is the fully-assembled outer weight
 /// `log_step · ε^(−η) · net_mass_i · q^(1−2α)`, with
 /// `η = 2s + d(2−2α)` for the available dimension parameter, and writes, per requested
-/// form, one weight triple `[w_R, w_2, w_3]`. Only `w_R` is live:
-/// `R = CᵀWC − B·G⁺·Bᵀ/q`, with `G⁺` the rank-revealing pseudo-inverse.
-/// The extra slots are retained for the ψ layout and receive zero local
-/// channels because τ no longer changes the energy.
+/// form, one weight `w`; the form accumulates `w·R` with
+/// `R = CᵀWC − B·G⁺·Bᵀ/q`, `G⁺` the rank-revealing pseudo-inverse.
 ///
 /// The outer sum over centers is coarsened per scale to a deterministic
 /// ε/2-net with nearest-member mass aggregation (the outer Riemann sum needs
@@ -1434,20 +1425,16 @@ pub(crate) fn assemble_weighted_forms<F>(
     band: &MeasureJetBand,
     order_s: f64,
     alpha: f64,
-    tau0: f64,
     n_forms: usize,
-    channels: usize,
     weights: &F,
 ) -> Result<Vec<Array2<f64>>, BasisError>
 where
-    F: Fn(usize, f64, f64, f64, &mut [[f64; 3]]) + Sync,
+    F: Fn(usize, f64, f64, f64, &mut [f64]) + Sync,
 {
     let m = centers.nrows();
     let d = centers.ncols();
-    if n_forms == 0 || !(1..=3).contains(&channels) {
-        crate::bail_invalid_basis!(
-            "measure-jet assembly needs at least one output form and 1..=3 block channels"
-        );
+    if n_forms == 0 {
+        crate::bail_invalid_basis!("measure-jet assembly needs at least one output form");
     }
     if masses.len() != m {
         crate::bail_dim_basis!(
@@ -1464,10 +1451,8 @@ where
             "measure-jet order s must lie in (0, 2) for the affine-jet energy; got {order_s}"
         );
     }
-    if !(alpha.is_finite() && tau0.is_finite() && tau0 >= 0.0) {
-        crate::bail_invalid_basis!(
-            "measure-jet energy needs finite alpha and finite tau0 >= 0; got alpha={alpha}, tau0={tau0}"
-        );
+    if !alpha.is_finite() {
+        crate::bail_invalid_basis!("measure-jet energy needs a finite alpha; got alpha={alpha}");
     }
     if masses.iter().any(|v| !(v.is_finite() && *v >= 0.0)) {
         crate::bail_invalid_basis!("measure-jet energy needs finite nonnegative center masses");
@@ -1516,7 +1501,7 @@ where
                 net_mass[best_o] += masses[i];
             }
         }
-        let mut wbuf = vec![[0.0_f64; 3]; n_forms];
+        let mut wbuf = vec![0.0_f64; n_forms];
         for &i in &outer {
             // Local neighbor set (always includes i itself).
             let mut idx: Vec<usize> = Vec::new();
@@ -1567,8 +1552,7 @@ where
             let bm = b.dot(&g_pinv);
             let base = scale_weight * net_mass[i] * q.powf(1.0 - 2.0 * alpha);
             weights(scale_idx, eps, q, base, &mut wbuf);
-            // Scatter-add Σ_k wbuf[k]·R into each form. The τ channels are
-            // zero because the exact projection is τ-independent.
+            // Scatter-add wbuf[k]·R into each form k.
             for (a, &ja) in idx.iter().enumerate() {
                 let bma = bm.row(a);
                 for (c, &jc) in idx.iter().enumerate() {
@@ -1578,8 +1562,7 @@ where
                         val_r += w[a];
                     }
                     for (k, out_k) in out.iter_mut().enumerate() {
-                        let wk = wbuf[k];
-                        out_k[(ja, jc)] += wk[0] * val_r;
+                        out_k[(ja, jc)] += wbuf[k] * val_r;
                     }
                 }
             }
@@ -1637,7 +1620,6 @@ pub fn measure_jet_energy_form(
     band: &MeasureJetBand,
     order_s: f64,
     alpha: f64,
-    tau0: f64,
 ) -> Result<Array2<f64>, BasisError> {
     let mut forms = assemble_weighted_forms(
         centers,
@@ -1645,10 +1627,8 @@ pub fn measure_jet_energy_form(
         band,
         order_s,
         alpha,
-        tau0,
         1,
-        1,
-        &|_, _, _, base, out: &mut [[f64; 3]]| out[0] = [base, 0.0, 0.0],
+        &|_, _, _, base, out: &mut [f64]| out[0] = base,
     )?;
     let q = forms.swap_remove(0);
     // The energy `Q = Σ wᵢ Rᵢ` is a nonnegative combination of analytically
@@ -1707,7 +1687,6 @@ pub(crate) fn measure_jet_energy_forms_per_scale(
     band: &MeasureJetBand,
     order_s: f64,
     alpha: f64,
-    tau0: f64,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
     let n_scales = band.eps.len();
     let forms = assemble_weighted_forms(
@@ -1716,16 +1695,10 @@ pub(crate) fn measure_jet_energy_forms_per_scale(
         band,
         order_s,
         alpha,
-        tau0,
         n_scales,
-        1,
-        &|scale_idx, _, _, base, out: &mut [[f64; 3]]| {
+        &|scale_idx, _, _, base, out: &mut [f64]| {
             for (k, slot) in out.iter_mut().enumerate() {
-                *slot = if k == scale_idx {
-                    [base, 0.0, 0.0]
-                } else {
-                    [0.0, 0.0, 0.0]
-                };
+                *slot = if k == scale_idx { base } else { 0.0 };
             }
         },
     )?;
@@ -2475,7 +2448,6 @@ pub fn build_measure_jet_basis(
             &band,
             order_s,
             spec.alpha,
-            spec.tau0,
         )?;
         for (level, q_l) in forms.into_iter().enumerate() {
             // Constructive pullback, not a dense triple product: the per-scale
@@ -2503,7 +2475,6 @@ pub fn build_measure_jet_basis(
             &band,
             order_s,
             spec.alpha,
-            spec.tau0,
         )?;
         // The Primary is exactly the jet-energy functional pulled back through
         // the center evaluation map. It is independent of `double_penalty`:
@@ -2633,7 +2604,6 @@ pub fn build_measure_jet_basis(
             // fused mode and desync the penalty count.
             order_s: spec.order_s,
             alpha: spec.alpha,
-            tau0: spec.tau0,
             masses,
             support_means,
             penalty_normalization_scales,
@@ -2653,8 +2623,7 @@ pub fn build_measure_jet_basis(
 ///
 /// Coordinates (the layout contract for the registration arm):
 /// - per-level (spectral) mode: `[ln ℓ?, α]` — order is absorbed by the
-///   REML-learned scale amplitudes, and the ridge τ moves nothing because the
-///   energy uses the exact weighted affine projection;
+///   REML-learned scale amplitudes;
 /// - single-scale mode: `[ln ℓ?]`, because its energy dials are fixed.
 ///
 /// Only `ln ℓ` moves the design. It also moves every coefficient-space penalty
@@ -2784,19 +2753,17 @@ pub fn build_measure_jet_basis_psi_derivatives(
             &band,
             geom.order_s_eval,
             spec.alpha,
-            spec.tau0,
             3 * l_count,
-            3,
-            &|scale_idx, eps: f64, q: f64, base: f64, out: &mut [[f64; 3]]| {
+            &|scale_idx, eps: f64, q: f64, base: f64, out: &mut [f64]| {
                 for slot in out.iter_mut() {
-                    *slot = [0.0, 0.0, 0.0];
+                    *slot = 0.0;
                 }
                 let intrinsic_dim = geom.centers.ncols() as f64;
                 let ga = 2.0 * intrinsic_dim * eps.ln() - 2.0 * q.max(f64::MIN_POSITIVE).ln();
                 let k0 = 3 * scale_idx;
-                out[k0] = [base, 0.0, 0.0];
-                out[k0 + 1] = [ga * base, 0.0, 0.0];
-                out[k0 + 2] = [ga * ga * base, 0.0, 0.0];
+                out[k0] = base;
+                out[k0 + 1] = ga * base;
+                out[k0 + 2] = ga * ga * base;
             },
         )?;
         let alpha_coord = coord_offset;
@@ -2838,7 +2805,6 @@ pub fn build_measure_jet_basis_psi_derivatives(
             &band,
             geom.order_s_eval,
             spec.alpha,
-            spec.tau0,
         )?;
         let mut first: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
         let mut second_diag: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
@@ -2940,7 +2906,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
             value,
             first,
             second_diag,
-            // H₀ is independent of α and τ; its only moving object is E(ℓ),
+            // H₀ is independent of α; its only moving object is E(ℓ),
             // so every mixed coordinate derivative is zero.
             cross: (0..pairs.len()).map(|_| zero_p()).collect(),
         });
@@ -3135,7 +3101,7 @@ mod tests {
     pub(crate) fn energy_form_annihilates_constants_exactly() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
-        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0)
             .expect("energy form");
         let m = q.nrows();
         let ones = Array1::<f64>::ones(m);
@@ -3155,10 +3121,10 @@ mod tests {
         );
     }
 
-    /// The default local projection annihilates ambient affine functions
-    /// exactly; τ is retained for ψ layout but no longer adds an affine toll.
+    /// The local weighted affine projection annihilates ambient affine
+    /// functions exactly: no affine direction pays energy.
     #[test]
-    pub(crate) fn energy_form_annihilates_affine_at_default_tau() {
+    pub(crate) fn energy_form_annihilates_affine_exactly() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
         let m = centers.nrows();
@@ -3169,7 +3135,7 @@ mod tests {
             affine[i] = 0.7 + 1.3 * centers[(i, 0)] - 0.4 * centers[(i, 1)];
             rough[i] = if i % 2 == 0 { 1.0 } else { -1.0 };
         }
-        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0)
             .expect("energy form");
         let e_affine = affine.dot(&q.dot(&affine));
         let e_rough = rough.dot(&q.dot(&rough));
@@ -3180,12 +3146,28 @@ mod tests {
         );
     }
 
+    /// Frozen specs written before the τ field was deleted carry `"tau0"`.
+    /// The spec does not deny unknown fields, so they still load and the
+    /// stale key is dropped.
+    #[test]
+    pub(crate) fn frozen_spec_with_removed_tau0_still_deserializes() {
+        let current = serde_json::to_value(MeasureJetBasisSpec::default()).expect("serialize");
+        let mut legacy = current.clone();
+        legacy
+            .as_object_mut()
+            .expect("the spec serializes as an object")
+            .insert("tau0".to_string(), serde_json::json!(1e-3));
+        let loaded: MeasureJetBasisSpec =
+            serde_json::from_value(legacy).expect("a spec carrying tau0 loads");
+        assert_eq!(serde_json::to_value(&loaded).expect("serialize"), current);
+    }
+
     /// PSD: the energy is a sum of weighted least-squares residuals.
     #[test]
     pub(crate) fn energy_form_is_psd() {
         let (centers, masses) = two_cluster_centers();
         let band = band_for(&centers);
-        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0)
             .expect("energy form");
         let m = q.nrows();
         for trial in 0..5usize {
@@ -3212,7 +3194,7 @@ mod tests {
         });
         let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
         let band = band_for(&centers);
-        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0, 1e-3)
+        let q = measure_jet_energy_form(centers.view(), masses.view(), &band, 1.5, 1.0)
             .expect("energy form");
         let slow = Array1::<f64>::from_shape_fn(m, |i| (i as f64 / (m as f64 - 1.0)).powi(2));
         let fast = Array1::<f64>::from_shape_fn(m, |i| if i % 2 == 0 { 0.5 } else { -0.5 });
@@ -3539,7 +3521,6 @@ mod tests {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             order_s,
             alpha: spec.alpha,
-            tau0: spec.tau0,
             num_scales: eps_band.len(),
             // MeasureJet freezes its range STANDARDIZED and replays it
             // verbatim; the tag is what records that it is the odd family out.
@@ -3856,7 +3837,6 @@ mod tests {
             eps_band,
             order_s,
             alpha,
-            tau0,
             masses,
             support_means,
             penalty_normalization_scales,
@@ -3872,7 +3852,6 @@ mod tests {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             order_s: *order_s,
             alpha: *alpha,
-            tau0: *tau0,
             num_scales: eps_band.len(),
             // MeasureJet freezes its range STANDARDIZED and replays it
             // verbatim; the tag is what records that it is the odd family out.

@@ -24,22 +24,18 @@ rows.
    declined to fetch are recorded exactly, together with the share of the arm's
    firings they carry -- the size of that undercharge.
 4. **Is the support term charged in a currency both arms deserve?** The Eq-4
-   scorer prices naming the active set at the COMBINATORIAL worst case
-   ``log2 C(G, round(L0))``, which assumes every ``L0``-subset of the ``G`` atoms
-   is equally likely. ``description_length.rs`` already calls that the worst-case
-   line and prefers the empirical support entropy where it is available, because
-   a dictionary whose firings are predictable is overpaid at the combinatorial
-   bound. That matters more here than anywhere else: with the dictionary term
-   equalised by the faithful ``k_flat`` config and the theorem predicting no code
-   or residual movement for a circle-class chart, SUPPORT is the entire predicted
-   margin. The audit therefore also reports the exact independent-support cost
-   ``sum_g H2(p_g)`` -- an upper bound on the true ``H(S)`` (dependence between
-   firings only lowers it). By concavity of ``H2`` that sum is MAXIMISED at
-   uniform firing rates, where it sits a little ABOVE ``log2 C(G, L0)`` (it also
-   pays for not fixing the support cardinality, ~``0.5*log2(2*pi*L0)`` bits); as
-   the rates become non-uniform it falls strictly below. Reporting both lets the
-   margin be read in a currency that does not assume every atom fires equally
-   often, which is exactly the assumption a dead-atom-heavy dictionary breaks.
+   scorer charges the COMBINATORIAL code ``log2(G+1) + mean_i log2 C(G, |S_i|)``:
+   each row sends its cardinality, then which subset of that size, as if every
+   subset were equally likely. It learns nothing from the data, so it stays
+   invariant to the estimation rows, but a dictionary whose firings are
+   predictable is overpaid by it. That matters more here than anywhere else: with
+   the dictionary term equalised by the faithful ``k_flat`` config and the theorem
+   predicting no code or residual movement for a circle-class chart, SUPPORT is
+   the entire predicted margin. The audit therefore reports, next to the charged
+   ``support_bits``, the scorer's uncharged ``independent_support_bits``: the
+   independent Krichevsky-Trofimov code over the estimation rows, which pays for
+   learning each firing rate and credits uneven rates. Both are read from the
+   scorer's own report, so the audit never re-derives either price.
 5. **What does a curved atom's ``code_dim = d+1`` truncation leave unpriced?** A
    curved atom's contribution spans ``m`` decoder rows (``m = 2H+1`` for an
    H-harmonic circle) while transmitting ``d+1`` scalars. Charging ``d+1`` is the
@@ -60,17 +56,8 @@ from typing import Any
 import numpy as np
 
 from bits_eq4 import description_length
-from crossover_theorem_check import selection_bits
 
 __all__ = ["audit_row", "flat_span_widths"]
-
-
-def _binary_entropy_bits(probabilities: np.ndarray) -> float:
-    """``sum_g H2(p_g)``: the exact cost of naming an independent support."""
-    p = np.asarray(probabilities, dtype=np.float64)
-    interior = (p > 0.0) & (p < 1.0)
-    q = p[interior]
-    return float(-(q * np.log2(q) + (1.0 - q) * np.log2(1.0 - q)).sum())
 
 
 def flat_span_widths(n_atoms: int) -> np.ndarray:
@@ -336,10 +323,8 @@ def audit_row(
             "atoms": int(n_atoms),
             "atoms_that_ever_fire": int((firing_counts > 0).sum()),
             "achieved_l0": float(firing_probability.sum()),
-            "combinatorial_bits": float(
-                selection_bits(n_atoms, int(round(float(firing_probability.sum()))))
-            ),
-            "independent_support_bits": _binary_entropy_bits(firing_probability),
+            "combinatorial_bits": float(ledger["support_bits"]),
+            "independent_support_bits": float(ledger["independent_support_bits"]),
         },
         "log_variance_bias_bits": log_variance_bias_bits,
         "bracket": {

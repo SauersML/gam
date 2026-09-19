@@ -32,9 +32,12 @@ use std::fmt;
 use gam_linalg::utils::splitmix64_hash;
 use gam_runtime::resource::Governed;
 use ndarray::{Array1, Array2, ArrayView2, ArrayViewD};
+use serde::{Deserialize, Serialize};
 
 use super::apply::{ApplyError, FactorView, FactoredEdit, apply_anchored_linear, native_linear};
-use crate::inference::intervention_shard::InterventionChange;
+use super::field::CotangentTerm;
+use super::occurrence::{OccurrenceError, ParameterEditRecord};
+use crate::inference::intervention_shard::{ExperimentUnit, InterventionChange, ParameterEditScope};
 
 /// The stable id of one named parameter: its name in the executing framework.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,7 +63,7 @@ impl UseSiteId {
 /// operation applies, not to how the framework reached the tensor: `x @ W.t()`
 /// multiplies by `A = W` and is an identity use, while `x @ W` is a transposed one.
 /// The read width is `A`'s column count and the written width its row count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TieOrientation {
     /// `A = Theta`: input rows of the stored column count, output rows of the stored
     /// row count.
@@ -71,7 +74,7 @@ pub enum TieOrientation {
 }
 
 /// What a use site does with the parameter it reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UseMap {
     /// The use multiplies its input rows by a matrix-shaped parameter, in the named
     /// orientation.
@@ -525,6 +528,7 @@ impl<'a> ResidualAnchor<'a> {
             rank,
             left,
             right,
+            scope: ParameterEditScope::Global,
         }))
     }
 
@@ -708,6 +712,411 @@ impl fmt::Display for LiftError {
 }
 
 impl std::error::Error for LiftError {}
+
+/// One forward pass of the teacher under typed parameter edits.
+#[derive(Clone, Debug)]
+pub struct ParameterExperiment {
+    /// The token unit the pass executes.
+    pub unit: ExperimentUnit,
+    /// The edits applied together in this pass.
+    pub edits: Vec<ParameterEditRecord>,
+    /// The declared readouts. An executor returns one block per readout, in order.
+    pub readouts: Vec<ParameterReadout>,
+}
+
+/// One declared readout of a pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterReadout {
+    /// The model output's rows at declared positions: `(positions, output width)`.
+    Output { positions: Vec<usize> },
+    /// The rows a linear use multiplied, one per position of the unit:
+    /// `(length, width read)`.
+    UseSiteInput(UseSiteId),
+    /// The rows a linear use wrote, one per position of the unit:
+    /// `(length, width written)`.
+    UseSiteOutput(UseSiteId),
+}
+
+/// The forward-error status of executed readouts.
+#[derive(Clone, Debug)]
+pub enum ForwardRoundoff {
+    /// A derived entrywise band for every readout block, in the blocks' shapes.
+    Derived(Vec<Array2<f64>>),
+    /// No derived band, as from an external executor that supplies none. A
+    /// certificate built on these readouts is unresolved.
+    Unresolved,
+}
+
+/// The executed readouts of one experiment.
+#[derive(Clone, Debug)]
+pub struct ExecutedExperiment {
+    /// One block per declared readout, in order.
+    pub readouts: Vec<Array2<f64>>,
+    /// Their forward-error status.
+    pub roundoff: ForwardRoundoff,
+}
+
+/// A forward executor of the teacher under typed parameter edits.
+///
+/// The Rust lift implements it natively, and the Python surface wraps an external
+/// framework object as the same trait. An executor returns executed rows only:
+/// divergences, cotangent contractions and bounds are computed in Rust from them.
+pub trait ParameterExecutor {
+    /// Executes every experiment. A batch of one is the scalar case.
+    fn forward(
+        &self,
+        experiments: &[ParameterExperiment],
+    ) -> Result<Vec<ExecutedExperiment>, ExecutorError>;
+
+    /// Pulls each experiment's readout cotangents (one block per readout, in the
+    /// readout's shape) back to the cotangent term of every use site its edits reach,
+    /// in that use's orientation. `occurrence::edit_cotangent` sums the terms through
+    /// each use's tie.
+    fn vjp(
+        &self,
+        experiments: &[ParameterExperiment],
+        cotangents: &[Vec<Array2<f64>>],
+    ) -> Result<Vec<Vec<(UseSiteId, CotangentTerm)>>, ExecutorError>;
+}
+
+impl ParameterExperiment {
+    /// The shape each readout block must have: `(positions, output_width)` for the
+    /// model output, and `(length, width)` for a linear use's rows, with the width read
+    /// or written in the use's orientation.
+    pub fn readout_shapes(
+        &self,
+        registry: &TensorRegistry,
+        output_width: usize,
+    ) -> Result<Vec<(usize, usize)>, ExecutorError> {
+        let mut shapes = Vec::with_capacity(self.readouts.len());
+        for (index, readout) in self.readouts.iter().enumerate() {
+            let shape = match readout {
+                ParameterReadout::Output { positions } => {
+                    if positions.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(ExecutorError::UnorderedPositions { readout: index });
+                    }
+                    if let Some(&position) = positions.iter().find(|&&position| position >= self.unit.length) {
+                        return Err(ExecutorError::Position {
+                            readout: index,
+                            position,
+                            length: self.unit.length,
+                        });
+                    }
+                    (positions.len(), output_width)
+                }
+                ParameterReadout::UseSiteInput(site) | ParameterReadout::UseSiteOutput(site) => {
+                    let read = registry.resolve_use_site(site)?;
+                    let UseMap::Linear(orientation) = read.map else {
+                        return Err(ExecutorError::NotALinearUse {
+                            readout: index,
+                            site: site.clone(),
+                        });
+                    };
+                    let stored = registry
+                        .storage(&read.storage)
+                        .map(|tensor| tensor.shape.clone())
+                        .unwrap_or_default();
+                    let [rows, cols] = stored[..] else {
+                        return Err(ExecutorError::Lift(LiftError::NotAMatrix {
+                            tensor: read.storage.0,
+                            shape: stored,
+                        }));
+                    };
+                    let (written, width_read) = match orientation {
+                        TieOrientation::Identity => (rows, cols),
+                        TieOrientation::Transpose => (cols, rows),
+                    };
+                    let width = if matches!(readout, ParameterReadout::UseSiteInput(..)) {
+                        width_read
+                    } else {
+                        written
+                    };
+                    (self.unit.length, width)
+                }
+            };
+            shapes.push(shape);
+        }
+        Ok(shapes)
+    }
+}
+
+impl ExecutedExperiment {
+    /// Refuses executed readouts unless there is one finite block of the declared
+    /// shape per readout, and, when a band is derived, one finite non-negative band of
+    /// the same shape per block. `shapes` comes from
+    /// [`ParameterExperiment::readout_shapes`].
+    pub fn check(&self, shapes: &[(usize, usize)]) -> Result<(), ExecutorError> {
+        check_blocks("readout block", &self.readouts, shapes)?;
+        if let ForwardRoundoff::Derived(bands) = &self.roundoff {
+            check_blocks("roundoff band", bands, shapes)?;
+            if let Some(index) = bands.iter().position(|band| band.iter().any(|&value| value < 0.0)) {
+                return Err(ExecutorError::NegativeBand { readout: index });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_blocks(
+    operand: &'static str,
+    blocks: &[Array2<f64>],
+    shapes: &[(usize, usize)],
+) -> Result<(), ExecutorError> {
+    if blocks.len() != shapes.len() {
+        return Err(ExecutorError::ReadoutCount {
+            operand,
+            declared: shapes.len(),
+            returned: blocks.len(),
+        });
+    }
+    for (index, (block, &expected)) in blocks.iter().zip(shapes).enumerate() {
+        if block.dim() != expected {
+            return Err(ExecutorError::Shape {
+                readout: index,
+                operand,
+                expected,
+                found: block.dim(),
+            });
+        }
+        if !block.iter().all(|value| value.is_finite()) {
+            return Err(ExecutorError::NonFinite {
+                readout: index,
+                operand,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A refusal at the executor boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecutorError {
+    /// The registry refused a name or a use site.
+    Lift(LiftError),
+    /// An edit record refused.
+    Occurrence(OccurrenceError),
+    /// An output readout declares a position outside the unit.
+    Position {
+        readout: usize,
+        position: usize,
+        length: usize,
+    },
+    /// An output readout's positions are not strictly increasing.
+    UnorderedPositions { readout: usize },
+    /// A use-site readout names a stored read, which applies no linear map and so has
+    /// no input or output rows.
+    NotALinearUse { readout: usize, site: UseSiteId },
+    /// The executor returned a different number of blocks than readouts were declared.
+    ReadoutCount {
+        operand: &'static str,
+        declared: usize,
+        returned: usize,
+    },
+    /// A block does not have its declared shape.
+    Shape {
+        readout: usize,
+        operand: &'static str,
+        expected: (usize, usize),
+        found: (usize, usize),
+    },
+    /// A block holds a non-finite value.
+    NonFinite {
+        readout: usize,
+        operand: &'static str,
+    },
+    /// A derived roundoff band holds a negative value.
+    NegativeBand { readout: usize },
+    /// An external executor's refusal, carried verbatim.
+    External(String),
+}
+
+impl From<LiftError> for ExecutorError {
+    fn from(err: LiftError) -> Self {
+        Self::Lift(err)
+    }
+}
+
+impl From<OccurrenceError> for ExecutorError {
+    fn from(err: OccurrenceError) -> Self {
+        Self::Occurrence(err)
+    }
+}
+
+impl fmt::Display for ExecutorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lift(err) => write!(formatter, "{err}"),
+            Self::Occurrence(err) => write!(formatter, "{err}"),
+            Self::Position {
+                readout,
+                position,
+                length,
+            } => write!(
+                formatter,
+                "readout {readout} declares position {position} in a unit of length {length}"
+            ),
+            Self::UnorderedPositions { readout } => write!(
+                formatter,
+                "readout {readout} declares positions that are not strictly increasing"
+            ),
+            Self::NotALinearUse { readout, site } => write!(
+                formatter,
+                "readout {readout} names use site {}, which applies no linear map and has no rows",
+                site.0
+            ),
+            Self::ReadoutCount {
+                operand,
+                declared,
+                returned,
+            } => write!(
+                formatter,
+                "the executor returned {returned} {operand}s for {declared} declared readouts"
+            ),
+            Self::Shape {
+                readout,
+                operand,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "{operand} {readout} has shape {found:?}; the readout declares {expected:?}"
+            ),
+            Self::NonFinite { readout, operand } => {
+                write!(formatter, "{operand} {readout} holds a non-finite value")
+            }
+            Self::NegativeBand { readout } => {
+                write!(formatter, "roundoff band {readout} holds a negative value")
+            }
+            Self::External(message) => write!(formatter, "external executor: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutorError {}
+
+#[cfg(test)]
+mod executor_tests {
+    use super::*;
+
+    /// A registry holding a `(5, 3)` weight read by an identity and a transposed linear
+    /// use, and a length-5 bias read as stored.
+    fn registry_with_uses() -> (TensorRegistry, UseSiteId, UseSiteId, UseSiteId) {
+        let mut registry = TensorRegistry::default();
+        let weight = TensorId("mlp.weight".to_string());
+        let bias = TensorId("mlp.bias".to_string());
+        registry
+            .register_storage(weight.clone(), Array2::<f64>::zeros((5, 3)).view().into_dyn())
+            .expect("fresh name");
+        registry
+            .register_storage(bias.clone(), Array1::<f64>::zeros(5).view().into_dyn())
+            .expect("fresh name");
+        let identity = UseSiteId::read(&weight, 0);
+        let transposed = UseSiteId::read(&weight, 1);
+        let stored = UseSiteId::read(&bias, 0);
+        registry
+            .register_use_site(identity.clone(), weight.clone(), UseMap::Linear(TieOrientation::Identity))
+            .expect("fresh site");
+        registry
+            .register_use_site(transposed.clone(), weight, UseMap::Linear(TieOrientation::Transpose))
+            .expect("fresh site");
+        registry
+            .register_use_site(stored.clone(), bias, UseMap::Stored)
+            .expect("fresh site");
+        (registry, identity, transposed, stored)
+    }
+
+    fn experiment(readouts: Vec<ParameterReadout>) -> ParameterExperiment {
+        ParameterExperiment {
+            unit: ExperimentUnit {
+                group: 0,
+                sequence: 0,
+                length: 4,
+            },
+            edits: Vec::new(),
+            readouts,
+        }
+    }
+
+    #[test]
+    fn readout_shapes_follow_the_map_orientation_and_refuse_readouts_without_rows() {
+        let (registry, identity, transposed, stored) = registry_with_uses();
+        let declared = experiment(vec![
+            ParameterReadout::Output { positions: vec![0, 3] },
+            ParameterReadout::UseSiteInput(identity.clone()),
+            ParameterReadout::UseSiteOutput(identity),
+            ParameterReadout::UseSiteInput(transposed.clone()),
+            ParameterReadout::UseSiteOutput(transposed),
+        ]);
+        assert_eq!(
+            declared.readout_shapes(&registry, 11),
+            Ok(vec![(2, 11), (4, 3), (4, 5), (4, 5), (4, 3)])
+        );
+
+        // Each refusal fires on its bad input; the declared experiment above is the good one.
+        assert_eq!(
+            experiment(vec![ParameterReadout::Output { positions: vec![4] }]).readout_shapes(&registry, 11),
+            Err(ExecutorError::Position { readout: 0, position: 4, length: 4 })
+        );
+        assert_eq!(
+            experiment(vec![ParameterReadout::Output { positions: vec![2, 2] }]).readout_shapes(&registry, 11),
+            Err(ExecutorError::UnorderedPositions { readout: 0 })
+        );
+        assert_eq!(
+            experiment(vec![ParameterReadout::UseSiteInput(stored.clone())]).readout_shapes(&registry, 11),
+            Err(ExecutorError::NotALinearUse { readout: 0, site: stored })
+        );
+        assert!(matches!(
+            experiment(vec![ParameterReadout::UseSiteOutput(UseSiteId("missing#0".to_string()))])
+                .readout_shapes(&registry, 11),
+            Err(ExecutorError::Lift(LiftError::UnknownUseSite(..)))
+        ));
+    }
+
+    #[test]
+    fn executed_readouts_are_refused_unless_every_block_and_band_has_its_declared_shape() {
+        let shapes = vec![(2, 11), (4, 3)];
+        let blocks = || vec![Array2::<f64>::zeros((2, 11)), Array2::<f64>::zeros((4, 3))];
+        assert_eq!(
+            ExecutedExperiment { readouts: blocks(), roundoff: ForwardRoundoff::Derived(blocks()) }.check(&shapes),
+            Ok(())
+        );
+        assert_eq!(
+            ExecutedExperiment { readouts: blocks(), roundoff: ForwardRoundoff::Unresolved }.check(&shapes),
+            Ok(())
+        );
+
+        // Positive controls: each malformed return is refused, naming what is wrong.
+        let mut wrong_block = blocks();
+        wrong_block[1] = Array2::zeros((4, 2));
+        assert_eq!(
+            ExecutedExperiment { readouts: wrong_block, roundoff: ForwardRoundoff::Unresolved }.check(&shapes),
+            Err(ExecutorError::Shape { readout: 1, operand: "readout block", expected: (4, 3), found: (4, 2) })
+        );
+        assert_eq!(
+            ExecutedExperiment { readouts: blocks()[..1].to_vec(), roundoff: ForwardRoundoff::Unresolved }
+                .check(&shapes),
+            Err(ExecutorError::ReadoutCount { operand: "readout block", declared: 2, returned: 1 })
+        );
+        let mut wrong_band = blocks();
+        wrong_band[0] = Array2::zeros((3, 11));
+        assert_eq!(
+            ExecutedExperiment { readouts: blocks(), roundoff: ForwardRoundoff::Derived(wrong_band) }.check(&shapes),
+            Err(ExecutorError::Shape { readout: 0, operand: "roundoff band", expected: (2, 11), found: (3, 11) })
+        );
+        let mut nan_block = blocks();
+        nan_block[0][[1, 4]] = f64::NAN;
+        assert_eq!(
+            ExecutedExperiment { readouts: nan_block, roundoff: ForwardRoundoff::Unresolved }.check(&shapes),
+            Err(ExecutorError::NonFinite { readout: 0, operand: "readout block" })
+        );
+        let mut negative_band = blocks();
+        negative_band[1][[0, 0]] = -1.0;
+        assert_eq!(
+            ExecutedExperiment { readouts: blocks(), roundoff: ForwardRoundoff::Derived(negative_band) }.check(&shapes),
+            Err(ExecutorError::NegativeBand { readout: 1 })
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1021,10 +1430,16 @@ mod tests {
             .parameter_edit(&mask)
             .expect("a unit residual mask has a product form");
         let (parameter, rows, cols, rank, left, right) = match edit {
-            Some(InterventionChange::ParameterEdit { parameter, rows, cols, rank, left, right }) => {
-                (parameter, rows, cols, rank, left, right)
-            }
-            other => panic!("expected a parameter edit, got {other:?}"),
+            Some(InterventionChange::ParameterEdit {
+                parameter,
+                rows,
+                cols,
+                rank,
+                left,
+                right,
+                scope: ParameterEditScope::Global,
+            }) => (parameter, rows, cols, rank, left, right),
+            other => panic!("expected a global parameter edit, got {other:?}"),
         };
         assert_eq!((parameter.as_str(), rows, cols, rank), ("mlp.dense.weight", 6, 5, 3));
         let product = Array2::from_shape_vec((rows, rank), left)

@@ -1,0 +1,9 @@
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.0156e208). This indicates a numerical instability.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.1988e91). This indicates a numerical instability.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.8646e-8): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.4438e177). This indicates a numerical instability.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.3889e242). This indicates a numerical instability.
+[5m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.8493e-8): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+2000 y ~ s(balance) + s(income) wall 330.6s cpu 63.7s certified True edf 2.8909802377782086

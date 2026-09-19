@@ -11,8 +11,8 @@
 //!
 //! The classes live here (not in any fit/predict module) so the Rust
 //! extension owns the canonical type identity; `gamfit/_exceptions.py`
-//! re-exports them so the public names remain `gamfit.GamError`,
-//! `gamfit.FormulaError`, etc.
+//! re-exports them so the public names remain `gamfit.errors.GamError`,
+//! `gamfit.errors.FormulaError`, etc.
 //!
 //! Inheritance: every gamfit exception is a subclass of `GamError`, and
 //! `GamError` itself is a subclass of Python's built-in `ValueError`.
@@ -62,7 +62,7 @@ create_exception!(
      present in the input, `similar` is a cheap shortlist of close matches, \
      and `tsv_hint` is True when the file is almost certainly a TSV mis-\
      extensioned as CSV (sole header contains literal tab characters). \
-     Subclass of `FormulaError` so `except gamfit.FormulaError` still \
+     Subclass of `FormulaError` so `except gamfit.errors.FormulaError` still \
      catches it."
 );
 
@@ -86,7 +86,8 @@ create_exception!(
 // `gam::solver::estimate::EstimationError`. Catching the specific subclass lets
 // callers branch on the exact failure mode (e.g. retry with looser
 // tolerances on `RemlConvergenceError`, suggest more data on
-// `ModelOverparameterizedError`, which `PrefitRankDeficientDesignDetected` raises).
+// `ModelOverparameterizedError`, which `PrefitRankDeficientDesignDetected` and
+// `PrefitUnpenalizedSpaceExceedsObservations` raise).
 
 create_exception!(
     _rust,
@@ -245,7 +246,9 @@ create_exception!(
     _rust,
     ModelOverparameterizedError,
     GamError,
-    "Model is over-parameterized: more coefficients than samples."
+    "Model is over-parameterized: its unpenalized coefficient directions \
+     (intercept, unpenalized terms, penalty null spaces) are not fewer than the \
+     observations, or the design is rank deficient."
 );
 
 create_exception!(
@@ -641,6 +644,7 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // (resume from the carried checkpoint / loosen the outer tolerance) is
         // the same across these lanes.
         EstimationError::RemlDidNotConverge { .. } => RemlConvergenceError::new_err(message),
+        EstimationError::DominatedCertifiedPlateau { .. } => RemlConvergenceError::new_err(message),
         EstimationError::BlockOrthogonalRemlDidNotConverge { .. } => {
             RemlConvergenceError::new_err(message)
         }
@@ -688,6 +692,16 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // holding is an outer non-convergence, and the remedy (reseed, widen
         // the window, loosen the outer tolerance) is the REML one.
         EstimationError::TrialPointRefused { .. } => RemlConvergenceError::new_err(message),
+        // A rho-local stage of the #784 block quadrature correction reaches Python only when the
+        // outer search found no rho it could evaluate, which is an outer non-convergence like
+        // `TrialPointRefused`. A corrector that breaks its moment contract is an engine invariant.
+        EstimationError::BlockQuadratureCorrectionRefused { stage } => {
+            if stage.is_trial_point_local() {
+                RemlConvergenceError::new_err(message)
+            } else {
+                FitInvariantError::new_err(message)
+            }
+        }
         EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
             if let Some(source) = source.estimation_error() {
                 estimation_error_to_pyerr_with_message(source, message)
@@ -703,7 +717,8 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         }
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
-        EstimationError::PrefitRankDeficientDesignDetected { .. } => {
+        EstimationError::PrefitRankDeficientDesignDetected { .. }
+        | EstimationError::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
         EstimationError::PrefitNearDegenerateDesignDetected { .. } => {
@@ -752,8 +767,15 @@ pub(crate) fn py_value_error(message: String) -> PyErr {
     // Engine errors funneled here are gamfit-specific failures, so they must
     // carry GamError identity (a ValueError subclass) — preserving the
     // historical `except ValueError` contract while making `except
-    // gamfit.GamError` reliable for engine errors (issue #330).
+    // gamfit.errors.GamError` reliable for engine errors (issue #330).
     GamError::new_err(message)
+}
+
+/// A table gam-data refuses to encode (an unsupported value, a blank label,
+/// a malformed layout) is a data error on every ingestion path, whichever
+/// transport the table crossed the boundary in.
+pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
+    DataError::new_err(error.to_string())
 }
 
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
@@ -877,7 +899,7 @@ where
 /// `estimation_error_to_pyerr`. This is the principled engine→Python
 /// adaptor: no `err.to_string()` flattening, no message-regex
 /// reclassification on the Python side. Each `EstimationError` variant
-/// surfaces as a specific `gamfit.GamError` subclass (see issue #343).
+/// surfaces as a specific `gamfit.errors.GamError` subclass (see issue #343).
 pub(crate) fn detach_estimation_result<T, F>(
     py: Python<'_>,
     context: &'static str,
@@ -896,7 +918,7 @@ where
 
 /// Variant-dispatch the engine's top-level `WorkflowError` into the matching
 /// Python exception class. The key entry is `WorkflowError::ColumnNotFound`,
-/// which surfaces as `gamfit.ColumnNotFoundError` with the structured
+/// which surfaces as `gamfit.errors.ColumnNotFoundError` with the structured
 /// fields attached as Python attributes (`column`, `role`, `available`,
 /// `similar`, `tsv_hint`) — issue #305 / #343. Other variants degrade to
 /// the most appropriate existing gamfit exception type; new variants can
@@ -1004,8 +1026,12 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
             )
         }
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
+        WorkflowError::TermBuilder { .. } => TermBuilderError::new_err(err.to_string()),
         WorkflowError::MarginalSlopeLink { .. } => InvalidConfigurationError::new_err(err.to_string()),
         WorkflowError::TransformationNormalConflict { .. } => {
+            InvalidConfigurationError::new_err(err.to_string())
+        }
+        WorkflowError::WarmStartRefused { .. } => {
             InvalidConfigurationError::new_err(err.to_string())
         }
     }
@@ -1126,10 +1152,10 @@ where
 }
 
 /// Variant-dispatch the engine's `GeometryError` into the typed Python
-/// `gamfit.GeometryError`. All three variants — `DimensionMismatch`,
+/// `gamfit.errors.GeometryError`. All three variants — `DimensionMismatch`,
 /// `InvalidPoint`, `Singular` — share the same Python class because the
 /// distinction matters only in the message text; the typed class makes
-/// `except gamfit.GeometryError` actionable without parsing the prose.
+/// `except gamfit.errors.GeometryError` actionable without parsing the prose.
 pub(crate) fn geometry_error_to_pyerr(err: EngineGeometryError) -> PyErr {
     GeometryError::new_err(err.to_string())
 }
@@ -1160,7 +1186,7 @@ where
 // Engine error → typed `PyErr` adaptors (issue #343).
 //
 // One trivial converter per typed engine→Python boundary actually used.
-// Each helper preserves the typed-class identity so `except gamfit.SurvivalError`
+// Each helper preserves the typed-class identity so `except gamfit.errors.SurvivalError`
 // (etc.) is actionable without the user parsing the prose. A call site that does
 // `.map_err(|e| e.to_string())?` against a `Result<_, EngineError>` in a
 // `PyResult<_>` function should swap to `.map_err(<engine>_error_to_pyerr)?` —
@@ -1255,7 +1281,7 @@ mod fit_failure_dispatch_tests {
             ));
             assert!(integration.is_instance_of::<IntegrationError>(py));
 
-            let prose = raise(FitFailure::from("a helper's prose".to_string()));
+            let prose = raise(FitFailure::unclassified("a helper's prose"));
             assert!(prose.is_instance_of::<FitError>(py));
             for subclass_check in [
                 prose.is_instance_of::<FitConvergenceError>(py),

@@ -47,7 +47,7 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
         .try_init()
         .is_err()
     {
-        log::debug!("zz_measure #2613: a logger was already installed by another test");
+        log::trace!("zz_measure #2613: a logger was already installed by another test");
     }
 
     let calls = Arc::new(Mutex::new(Vec::<(char, f64, f64, f64)>::new()));
@@ -776,17 +776,22 @@ fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
     );
 }
 
-/// #2458 — exactly one rung may call itself the derived standard, and it is the
-/// one computed from the family's own exact curvature.
+/// #2458 — only the rungs computed from the family's own exact curvature may
+/// call themselves the derived standard.
 ///
-/// This is the invariant the reopened issue turned on. A second rung carrying
+/// This is the invariant the reopened issue turned on. A rung carrying
 /// `derived_standard = true` on `O(√ε)` evidence is how "which derivative
 /// machinery does this route implement" gets back into the answer to "which
 /// standard was this fit held to" — the exact substitution #2458 exists to
 /// remove. Enumerated rather than spot-checked so a new rung cannot claim the
 /// flag by being added below the ones a spot check happened to name.
+///
+/// #2954 added the Newton-decrement verdict on rounding bands, the same exact
+/// curvature judged against the arithmetic's resolution instead of an n-scaled
+/// tolerance, in its deciding and its undecided form. The typed refusals of its
+/// polish (#2954, #3012) are not stationarity standards and do not claim it.
 #[test]
-fn exactly_one_rung_is_the_derived_standard_2458() {
+fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
     let rungs = [
         StationarityBoundSource::SolverBand,
         StationarityBoundSource::CertificateScoreRelative,
@@ -794,6 +799,10 @@ fn exactly_one_rung_is_the_derived_standard_2458() {
         StationarityBoundSource::GradientReproducibility,
         StationarityBoundSource::FixedPointResidual,
         StationarityBoundSource::CallerRequirement,
+        StationarityBoundSource::NewtonDecrement,
+        StationarityBoundSource::NewtonDecrementUndecided,
+        StationarityBoundSource::RepresentabilityFace,
+        StationarityBoundSource::NewtonBacktrackUnresolved,
     ];
     let derived: Vec<&'static str> = rungs
         .iter()
@@ -802,7 +811,11 @@ fn exactly_one_rung_is_the_derived_standard_2458() {
         .collect();
     assert_eq!(
         derived,
-        vec!["curvature-resolvability"],
+        vec![
+            "curvature-resolvability",
+            "newton-decrement",
+            "newton-decrement-undecided"
+        ],
         "the derived standard must be the exact-curvature decrement test alone",
     );
     // And the enumeration above must be the whole enum: a rung added without
@@ -829,6 +842,10 @@ fn exactly_one_rung_is_the_derived_standard_2458() {
         | StationarityBoundSource::CurvatureResolvability
         | StationarityBoundSource::GradientReproducibility
         | StationarityBoundSource::FixedPointResidual
-        | StationarityBoundSource::CallerRequirement) = rung;
+        | StationarityBoundSource::CallerRequirement
+        | StationarityBoundSource::NewtonDecrement
+        | StationarityBoundSource::NewtonDecrementUndecided
+        | StationarityBoundSource::RepresentabilityFace
+        | StationarityBoundSource::NewtonBacktrackUnresolved) = rung;
     }
 }

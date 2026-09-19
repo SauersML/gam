@@ -4170,5 +4170,365 @@
     },
     "reason": "#2933 audit remainder, SPEC 25 (gam-60 ruling): the #1026 ungated background tier had no production producer and is deleted. has_ungated and validate_gate_configuration existed only for it. Without partial fixed-logit masks the per-atom logit_is_fixed(k) and fixed_logit_mask() are replaced by the scalar SaeAssignment::logits_are_fixed() (TopK or frozen routing).",
     "evidence": "At the base, git grep -n finds has_ungated and validate_gate_configuration only in assignment.rs, and logit_is_fixed and fixed_logit_mask in assignment.rs, construction_exact_hessian.rs, construction_quasi_laplace.rs, construction_rank_charge_derivative.rs, construction_arrow_schur_assembly.rs, fit_drivers.rs and three gam-sae tests, all of which now call logits_are_fixed or were restated on frozen routing. No example, Python or FFI source names them."
+  },
+  {
+    "base": "7d5c48d9220f566227ab096dad10b3a17cf697aa",
+    "removed": {
+      "crates/gam-sae/src/manifold/construction_ard.rs::latent_block_inverse_diagonal_hutchinson": 1,
+      "crates/gam-sae/src/manifold/construction_smoothness_dof.rs::decoder_smoothness_effective_dof_per_atom_hutchinson": 1,
+      "crates/gam-sae/src/manifold/tests.rs::latent_block_inverse_diagonal_hutchinson_matches_exact_trace": 1
+    },
+    "reason": "#2900 rows 6.18 and 6.19 (SPEC rule 6: no size window): the SAE ARD latent inverse diagonal and the decoder-smoothness effective dof switched from their exact routes to 64-probe Hutchinson estimates at K = 2048 atoms. Both are exact at every K now, so the two estimators and the test that compared the latent estimator with the exact diagonal are deleted.",
+    "evidence": "Pool job 1190978 (pool-gx2) ran scripts/public_api_census.py --base acdf183fe6 over the landing tree (overlay 5a601c05c2, tree cf69208822) and measured exactly these three declarations. source_removal_guard.py verified the same removals with their ledger entry (11 guarded removals). The replacement routes are ArrowFactorCache::latent_block_inverse_diagonal (exact at every K, pinned by latent_inverse_diagonal_contracts_touched_columns_against_the_dense_inverse_2900) and the existing exact per-column smoothness trace."
+  },
+  {
+    "base": "d9c299af61e2a892238be5ddf174a9f96ec8976c",
+    "removed": {
+      "crates/gam-terms/src/basis/measure_jet_smooth.rs::energy_form_annihilates_affine_at_default_tau": 1
+    },
+    "reason": "#2902: τ is deleted from the measure-jet spec and energy, which never read it. The in-module test energy_form_annihilates_affine_at_default_tau was named after that dial; it is renamed energy_form_annihilates_affine_exactly, and its assertions are unchanged. This census counts function identities. The removed pub field MeasureJetBasisSpec::tau0 and the tau0 parameters of the pub measure_jet_energy_form and the pub(crate) measure_jet_energy_forms_per_scale and assemble_weighted_forms are not function identities, so they appear here only as described. The source-removal entry at this base records the same change.",
+    "evidence": "At a07a79095f, git grep -w finds energy_form_annihilates_affine_at_default_tau only at its declaration, a pub(crate) fn, which public_api_census.py counts. The removed map was derived by reading the change against the census rule, and the gate job runs the census against this entry."
+  },
+  {
+    "base": "aa61f826cc08f4190137e231dd1cda55b03fd211",
+    "removed": {
+      "crates/gam-linalg/src/roundoff.rs::accumulation_growth": 1
+    },
+    "reason": "#2946 L-0 (gam-21 ruling): gam_linalg::roundoff::accumulation_growth is re-exported from its new owner gam_math::roundoff, where it is a pub const fn, instead of declared in gam-linalg. The public path is unchanged. The census counts the declaration gam-linalg no longer holds.",
+    "evidence": "Gate 1217155 (pool-gx7) ran scripts/public_api_census.py --base 666558f622 over this commit's tree (8162f1d1b2) and measured exactly this removal. The count goes from 12424 to 12425 public function declarations: this one removed, and gam_math::roundoff's accumulation_growth and inflated added. The same gate's workspace --all-targets --locked check is RC 0, so every gam_linalg::roundoff::accumulation_growth caller compiles through the re-export."
+  },
+  {
+    "base": "32cf9943331d3b16168fb4bf575d51f91c0b9427",
+    "removed": {
+      "crates/gam-inference/src/rho_posterior.rs::standard_normal_gh_rule": 1
+    },
+    "reason": "#784: rho_posterior's crate-private standard_normal_gh_rule moves into gam_math::quadrature as standard_normal_gauss_hermite_rule, with the same arithmetic in the same operation order, so the representable-order ceiling and gam-solve's block_quadrature_units_784 probe read one rule builder; every caller now calls gam-math.",
+    "evidence": "The removed map is the census's own output: scripts/public_api_census.py in direct lane dy3 run q784ceil-g2 (base fca653ffde, exact tree 813288c2, patch md5 d3171157) refused exactly this item. At the base, git grep -w standard_normal_gh_rule finds the definition and its callers only in rho_posterior.rs and hmc_io.rs, both edited here."
+  },
+  {
+    "base": "c098f269f3abb5a23dd92b00f47196f42e3fd3f8",
+    "removed": {
+      "crates/gam-sae/src/identifiability.rs::identifiable_factor_log_evidence": 1,
+      "crates/gam-solve/src/inference/residual_factor.rs::log_evidence": 1
+    },
+    "reason": "#2946 T5 (Stage A census): renames with no value change. StructuredResidualModel::log_evidence returns the Gaussian log-likelihood minus the Schwarz penalty (-BIC/2) and becomes bic_penalized_log_likelihood. identifiable_factor_log_evidence returns a penalized profile likelihood with no log-determinant or Occam term and becomes identifiable_factor_profile_log_likelihood.",
+    "evidence": "At origin/main ff77e70e78, git grep on lane sw2c finds StructuredResidualModel::log_evidence called only in residual_factor.rs and crates/gam-sae/src/manifold/fit_entry.rs:1782. identifiable_factor_log_evidence occurs only in identifiability.rs, crates/gam-pyffi/src/manifold/geometry_ffi.rs and gamfit/identifiability.py:723. Every caller is renamed in this commit."
+  },
+  {
+    "base": "2f2b68715adeb37cee18a57aca611d07cd9ee5f5",
+    "removed": {
+      "crates/gam-solve/src/evidence.rs::format_bayes_factor": 1,
+      "crates/gam-solve/src/evidence.rs::log_bayes_factor": 1
+    },
+    "reason": "#2946 T3 (Stage A census): renames with no value change. log_bayes_factor(a, b) returns b - a, the gap between two minimised criterion costs, used by both the raw REML/LAML score table and the conditional-AIC ranking delta. It is a Bayes factor on neither, and becomes criterion_gap. The crate-private formatter format_bayes_factor formats exp() of its argument and becomes format_exp_ratio.",
+    "evidence": "At origin/main 96c3427cca, git grep on lane sw2c finds log_bayes_factor only in crates/gam-solve/src/evidence.rs, crates/gam-pyffi/src/ffi/ffi_prelude.rs:97 and crates/gam-pyffi/src/model/model_ffi.rs:1418, plus two Python test docstrings; format_bayes_factor occurs only in evidence.rs (the definition, one call, one comment). Every occurrence is renamed in this commit. The removed map is the census's own identity set: direct gate dy4 fr-census-t3 (tree fc0cb2ff) refused the entry that listed log_bayes_factor alone, because the census counts pub(crate) fns too."
+  },
+  {
+    "base": "07dee4dc09ce52dbc32fa97ccab89a2de82e9e13",
+    "removed": {
+      "crates/gam-sae/src/parameter_decomposition/codec.rs::code_saving_at_declared_fidelity": 1
+    },
+    "reason": "#2951 P11, P18, codec step 3 of 3 (mpd-spec NOTE 12): code_saving_at_declared_fidelity decided fidelity with an unrounded predicate beside precision.rs's proven verdict. Its replacement code_saving_at_proven_fidelity landed in step 1 (91473e08eb); fit.rs migrated in d0b3432912 and this commit migrates families.rs, teacher_tests.rs and controls_tests.rs.",
+    "evidence": "Replacement: code_saving_at_proven_fidelity in crates/gam-sae/src/parameter_decomposition/codec.rs (since 91473e08eb). A no-write grep at main's tip found the name only in codec.rs, families.rs, teacher_tests.rs, controls_tests.rs and the removal ledger. Before this entry, public_api_census.py on probe commits main+wave2 (ae25b88872) -> +step3 (994084a376), Slurm 1246008, refused exactly this removal."
+  },
+  {
+    "base": "f232342866e77552f9bc26f5e438cb6caacf5970",
+    "removed": {
+      "crates/gam-custom-family/src/jeffreys.rs::custom_family_jeffreys_cap": 1,
+      "crates/gam-custom-family/src/jeffreys.rs::custom_family_jeffreys_conditioning_gate_weight": 1,
+      "crates/gam-custom-family/src/jeffreys.rs::custom_family_jeffreys_floored_inverse": 1,
+      "crates/gam-custom-family/src/jeffreys.rs::custom_family_joint_jeffreys_contract_weight": 1
+    },
+    "reason": "#979 Jeffreys floor stage (a1): the crate-private custom-family twin of gam-solve's reduced-information spectrum is deleted. custom_family_joint_jeffreys_contract_weight and its helpers custom_family_jeffreys_cap, custom_family_jeffreys_floored_inverse and custom_family_jeffreys_conditioning_gate_weight re-derived the gate, floor and floored inverse that JointJeffreysPlan already owns. The completion now reads the plan's conditioning_gate_weight() and the new contracted_trace_weight() instead.",
+    "evidence": "At the base, git grep -w finds these four names only in crates/gam-custom-family/src/jeffreys.rs: their definitions and the one caller, custom_family_joint_jeffreys_second_order_completion, which this commit rewrites to read the plan. None is pub outside the crate, and gam-pyffi has 0 references. Lane job 1247303 (a1.patch md5 76b566a7 at e7955a5704): gam-custom-family lib 315 passed, 0 failed."
+  },
+  {
+    "removed": {
+      "crates/gam-sae/src/manifold/construction_orbit_elimination.rs::price_compact_orbit": 1
+    },
+    "reason": "#2234 item 2: the dense exact-A criterion now integrates every closure-certified circle orbit alone in its connected block of A and Φ, not one, so the crate-private one-orbit pricer price_compact_orbit is replaced by price_compact_orbits, which prices each eliminated orbit off the same stiffened decomposition and forms the joint correction −log det N − 2·Σ log I_k + K·log 2π.",
+    "evidence": "The removed map is the census's own output: scripts/public_api_census.py in direct lane dy5 run i2234-item2d (base 8473989829, exact tree 50344beb, patch md5 16372d8d) refused exactly this item. At that base, git grep -n -w price_compact_orbit finds the pub(crate) declaration (construction_orbit_elimination.rs:254) and its two callers only: the value site in construction_exact_hessian.rs (:4697) and compact_orbit_differential (construction_orbit_elimination.rs:572). This landing moves both to price_compact_orbits.",
+    "base": "cd4e4d3662be44e5bfa4e8f3e0047b1941cf3aa8"
+  },
+  {
+    "base": "5f8f3080558ccb3f851f22afe09d5b5b6d9d3af5",
+    "removed": {
+      "crates/gam-event-history/src/saved.rs::read_saved_model_file": 1,
+      "crates/gam-event-history/src/saved.rs::read_saved_model_text": 1,
+      "crates/gam-event-history/src/saved.rs::saved_model_text": 1,
+      "crates/gam-event-history/src/saved.rs::write_saved_model": 1
+    },
+    "reason": "#2966 (gam-21 and lead ruling): the saved-model envelope functions move from gam-event-history's saved.rs to gam_model_api::saved_model (public there, with docs), so both event engines and gam-models share one owner. The kind becomes an owner-named &'static str, and write_saved_model's temporary name gains a per-call counter.",
+    "evidence": "Guard-only job 1212841 (base 22f30c2e61, tree 208cc2b8 with the saved.rs deletion appended) reported exactly these 4 unacknowledged removals. The same four names are declared in crates/gam-model-api/src/saved_model.rs in the same commit, and joint/model.rs calls them there. At origin/main dca31ddc96, `git grep -w` over crates, src, tests, gamfit, examples, scripts and bench finds the gam-event-history versions called only from saved.rs itself and joint/model.rs (:13-14, :137-154)."
+  },
+  {
+    "base": "90a88caa111aeb60d43c2617afeb2457cb942af2",
+    "removed": {
+      "crates/gam-models/src/bms/cell_moment_assembly.rs::empirical_flex_row_fifth_axis_slabs": 1,
+      "crates/gam-models/src/bms/cell_moment_assembly.rs::flex_third_information_all_axes": 1,
+      "crates/gam-models/src/bms/cell_moment_assembly.rs::rigid_row_contracted_trace_hessian_coefficients": 1,
+      "crates/gam-models/src/bms/custom_family_impl.rs::rigid_row_third_information_contraction": 1,
+      "crates/gam-models/src/bms/custom_family_impl.rs::rigid_third_information_all_axes": 1,
+      "crates/gam-models/src/bms/flex_row_program.rs::evaluate_fifth": 1,
+      "crates/gam-models/src/bms/standard_normal_flex_fifth.rs::contraction": 1,
+      "crates/gam-models/src/bms/standard_normal_flex_fifth.rs::standard_normal_flex_row_fifth_axis_slabs": 1,
+      "crates/gam-models/src/bms/standard_normal_flex_fifth.rs::standard_normal_flex_row_totals": 1
+    },
+    "reason": "#2922: the Bernoulli marginal-slope Jeffreys information becomes the expected Fisher information (bms/expected_information.rs), whose derivatives need row derivatives of order at most four. The pub(super) observed third-information producers (flex_third_information_all_axes, rigid_row_contracted_trace_hessian_coefficients, rigid_row_third_information_contraction, rigid_third_information_all_axes) and the fifth-order channels only they consumed (empirical_flex_row_fifth_axis_slabs #2898, standard_normal_flex_row_fifth_axis_slabs with standard_normal_flex_row_totals and StandardNormalFlexRowTotals::contraction #2901, and the row program's evaluate_fifth) are deleted. The source-removal entry at this base records the same change with the private items.",
+    "evidence": "The removed map is scripts/public_api_census.py's own refusal in direct lane dy5 run i2922-ei-p1 (base d0b3432912, exact tree b13f2450, patch md5 3ea0a200): exactly these nine function identities."
+  },
+  {
+    "base": "90bd72343f65114991afe130b7274926d9093405",
+    "removed": {
+      "crates/gam-solve/src/estimate/edf_accounting.rs::penalized_edf_bundle": 1
+    },
+    "reason": "#2901: penalized_edf_bundle clamped a per-block trace outside [0, rank] to the interval. Every route now admits its traces through penalized_edf_bundle_within_bands against their solves' bands, so it has no caller and is deleted together with its gam_solve::estimate re-export.",
+    "evidence": "Gate 1192361 (gx6, acdf183fe6 + patch adc41e92): public_api_census.py reported exactly this identity as removed without an acknowledgement; gate 1198492 (gx6, 5b2af0f350 + patch 836cf538, with this entry) gave census 0."
+  },
+  {
+    "base": "ee6d82a55482800c1f2f7a65245851da5362b818",
+    "removed": {
+      "crates/gam-sae/src/sparse_dict/block.rs::stored_span_inverse_gram": 1,
+      "crates/gam-sae/src/sparse_dict/block.rs::stored_span_inverse_grams": 1
+    },
+    "reason": "#2502: replaced by stored_span and stored_spans, which return each block's inverse Gram with tr(UU^T) and the Frobenius norm of the inverse, so the span coordinates' rounding band carries the stored frame's conditioning, and which refuse by name a nonzero frame its f32 storage cannot resolve.",
+    "evidence": "Replacement: stored_spans and StoredSpans::coordinate_rounding in crates/gam-sae/src/sparse_dict/block.rs. git grep -n stored_span_inverse_gram at db6a3680d8 finds 22 lines, all in crates/gam-sae/src/sparse_dict, each rewritten in this commit. Gate gx1 job 1260605 at db6a3680d8: public_api_census refused exactly these two removals before this entry."
+  },
+  {
+    "removed": {
+      "crates/gam-sae/src/parameter_decomposition/rewrite.rs::from_slot": 1,
+      "crates/gam-sae/src/parameter_decomposition/rewrite.rs::mask_assignment": 1,
+      "crates/gam-sae/src/parameter_decomposition/rewrite.rs::name": 1,
+      "crates/gam-sae/src/parameter_decomposition/rewrite.rs::program": 1,
+      "crates/gam-sae/src/parameter_decomposition/rewrite.rs::slot": 1
+    },
+    "reason": "#2951 P5, cycle-break pure move (lead gam-dd): MlpParameter::{slot, from_slot, name}, ComponentMlp::program and ComponentMlp::mask_assignment move unchanged from rewrite.rs to the new downstream module parameter_decomposition/rewrite_program.rs, so rewrite.rs no longer imports program.rs.",
+    "evidence": "public_api_census.py without this entry, on object-only probe commit 2496d95fcc (base 5f8f308055 + move patch md5 43544105) through the dx2 lane object store, refused exactly these five removals (all five reappear in rewrite_program.rs). git grep -l -w at cd4e4d3662be44e5bfa4e8f3e0047b1941cf3aa8 finds mask_assignment and from_slot only in rewrite.rs; ComponentMlp::program is declared at rewrite.rs:823 and called only from rewrite.rs's tests.",
+    "base": "19143a151111c307d64fc49a3f99347306c416c3"
+  },
+  {
+    "base": "7c01c5dc958bc4220f601f96faf58e47c5c7c08f",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::curvature_inference_forspec": 1,
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::spatial_dims_per_term": 1,
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::try_build_latent_coord_hyper_dirs": 1
+    },
+    "reason": "Pure move, no behaviour change: three contiguous regions of crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs moved verbatim into the sibling files spatial_hyper_dirs.rs, spatial_single_block_caches.rs and spatial_curvature_inference.rs, each include!d at the exact position it was cut from. spatial_optimization.rs is itself include!d into drivers/mod.rs, so every item stays in the same module with the same privacy, and no call site or use line changes. The guard and the census key items by file path, so each moved item reads as a removal from spatial_optimization.rs and an addition in its new file. The move keeps the file under the 10,000-line limit (lead gam-dd, 09-18).",
+    "evidence": "Split gate 1266315 (pool/ad-spec/splitgate.1266315.log): expanding each include! line of the split file (dropping its one comment line) reproduces the parent blob byte for byte (cmp, md5 78ba8cc1b981a80809f7c60b5972487b). Workspace --all-targets check 0 and pyffi 0. The moved and neighbouring gam-models tests give identical per-test verdicts before and after the split (TESTS_IDENTICAL_PER_TEST differing=0). This acknowledgement lists exactly the identities the guard/census reported for that gate."
+  },
+  {
+    "base": "335d389144a21dfe1ae8dbef9be00f679d2b078b",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::joint_rho_resolvability_domain_over_blocks": 1,
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::with_rho_domain": 1
+    },
+    "reason": "#2902 item 15 (i2902, reviewed by ad-spec): an exact-joint setup carries a required rho domain that its builder derives over the realized blocks (realized_blocks_rho_domain). The driver's term-collection derivation, which kept the precision box on a count mismatch, and the optional with_rho_domain installer are deleted.",
+    "evidence": "git grep -n -w at eead230646 finds joint_rho_resolvability_domain_over_blocks only in spatial_optimization.rs (its definition, its test and the driver call), and with_rho_domain in spatial_optimization.rs, marginal_slope/fit_setup.rs and transformation_normal/fit.rs, whose callers now pass the domain to ExactJointHyperSetup::new. No example, Python or FFI source names them."
+  },
+  {
+    "base": "7540fb6a8b7f3a077aca18af9266fd7536f4653b",
+    "removed": {
+      "crates/gam-geometry/src/manifolds/sphere.rs::normalize_sphere_matrix": 1
+    },
+    "reason": "#2469: the pub(crate) normalize_sphere_matrix silently divided every row of the sphere response geometry and of sphere_frechet_mean by its norm, a second entry rule beside SphereManifold's UNIT_TOL. It becomes require_unit_sphere_rows, which refuses a row whose |‖y‖² − 1| exceeds gam_math::roundoff::unit_normalization_band, the band SphereManifold::require_unit now applies too, with the measured defect and the fix in the message.",
+    "evidence": "At base be3343133604d5e5374cde0406cc728d847e2d23, git grep -n -w normalize_sphere_matrix finds its declaration at crates/gam-geometry/src/manifolds/sphere.rs:441 and its five callers at :467, :469, :536, :907 and :1017, all inside sphere.rs, all rewritten to require_unit_sphere_rows; nothing outside gam-geometry can name a pub(crate) item. Gate job 1271657 on gx4 (base 880d26d69a, exact tree a548e8bcdc) had public_api_census.py refuse exactly this removal, and source_removal_guard.py verified the three removals this commit's source-removal entry acknowledges."
+  },
+  {
+    "base": "ebc736505ce6241abfa76700f167638e560ae0d3",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::optimize_spatial_length_scale_exact_joint": 1
+    },
+    "reason": "#2937 final slice: optimize_spatial_length_scale_exact_joint was the text wrapper over optimize_spatial_length_scale_exact_joint_typed. It took a fit closure returning String, converted that text into FitFailure::Unclassified and rendered the typed driver's failure back to text. Every production caller moved to the typed driver in the #2937 slices f554cf4063, e2fb2948a6 and 19143a1511 and in 3b92de22cc and 6fd360fb42, and the one test caller moves in this landing. With From<String> for FitFailure deleted in the same landing, the wrapper has no way to convert text.",
+    "evidence": "git grep -n 'optimize_spatial_length_scale_exact_joint(' at a99ab01898 finds only its test caller, design_assembly_constraint_tests.rs:2250, which this landing switches to optimize_spatial_length_scale_exact_joint_typed. Lane check sw1a job 1272252 at a99ab01898, with the wrapper deleted: the workspace --all-targets check and gam-pyffi --all-targets are RC 0."
+  },
+  {
+    "base": "fc4cb094ef948447dc2ecf293772770345fc3593",
+    "removed": {
+      "crates/gam-sae/src/manifold/streaming_plan.rs::solve_options_for_border_dim": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::automatic": 2
+    },
+    "reason": "#2900 row 6.15: ArrowSolverMode::automatic(k) and ArrowSolveOptions::automatic(k) switched the arrow-Schur step to Direct at the literal k <= 2000; ArrowSolveOptions::priced() and resolve_arrow_route price Direct against InexactPCG from the system instead. SaeStreamingPlan::solve_options_for_border_dim becomes solve_options(), since the border only fed automatic(k).",
+    "evidence": "git grep -w at f554cf4063: every caller (system.rs, streaming_plan.rs, fit_drivers.rs, gam-sae tests.rs and tests_device_engage_1783.rs, arrow_schur/tests.rs, examples/full_color_fit_1017.rs) is migrated in this commit; gam-pyffi names neither. Direct gate dy6 i2900-615-g1 (base 6b6c05401e) named exactly these census removals."
+  },
+  {
+    "base": "18e7ce6254708f7e119ead693e17bc901eb39794",
+    "removed": {
+      "crates/gam-models/src/gamlss/binomial/kernel.rs::binomial_ls_row_program": 1
+    },
+    "reason": "#932: the pub(crate) row_program! declaration binomial_ls_row_program is replaced by the row_atom! declaration binomial_ls_row (same row, same fourth-order Taylor loss in q, lowered exactly at delta = 0), read only through the pub(crate) wrappers binomial_ls_row_order2, binomial_ls_row_third_contracted and binomial_ls_row_fourth_contracted.",
+    "evidence": "git grep -c -w binomial_ls_row_program at 7c01c5dc958bc4220f601f96faf58e47c5c7c08f finds callers only in gamlss/binomial/kernel.rs and gamlss/binomial/location_scale.rs, all converted here; no gam-cli, gam-pyffi, python or other-crate code names it. The workspace check with the replacement is green (job 1269170)."
+  },
+  {
+    "base": "a7a0301949fabfcf51ccce64214a0c9f741c222f",
+    "removed": {
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs::fixed_frame_geometry": 1
+    },
+    "reason": "#2933 F33/F35/F39: ShapeInformationRoute::fixed_frame_geometry returned the fixed-frame geometry the dispersion could share, or None on the frame-marginal route, which then formed its frame-integrated information twice. The route now carries that FrameMarginalInformation, and held_response_geometry returns the operator the dispersion shares on either route.",
+    "evidence": "The removed map is the census's own refusal in direct lane dy7 run adf39-g2 (base bdc83e85fe, exact tree bd9f9571): 12669 to 12673 public function declarations with this one removed. git grep -n -w fixed_frame_geometry at bdc83e85fe501ea97e57d1b3a897e1d600ce6324 finds the declaration (construction_quasi_laplace.rs:8276) and its two callers (construction_reconstruction.rs:662, outer_objective.rs:1912), both rewritten in this commit."
+  },
+  {
+    "removed": {
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs::converge_inner_for_undamped_logdet": 1,
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs::is_undamped_evidence_row_non_pd": 1
+    },
+    "reason": "Pure move for line-count headroom (build.rs MAX_TRACKED_FILE_LINES = 10000; construction_quasi_laplace.rs was 9740 lines): main :706-2447, the inner solve behind the undamped evidence log-determinant (is_undamped_evidence_row_non_pd, freeze_collapse_prevention_gates, converge_inner_for_undamped_logdet, descend_exact_a_saddle, converge_inner_for_undamped_logdet_gate_frozen), moves verbatim into construction_undamped_inner.rs as a further impl SaeManifoldTerm block, which construction_quasi_laplace.rs include!s, so every method keeps its type, module and visibility.",
+    "evidence": "Pure move: every removed identity is declared again, with the same body, in the new sibling file of this landing (the sorted line multiset of the old file equals the two new files' lines plus only the added include and comment lines); gated in Slurm job 1270438, which re-runs this instrument with the entry and checks the workspace.",
+    "base": "38c2680c1201b0e7ba985cd85ebe51ffe273c60f"
+  },
+  {
+    "removed": {
+      "crates/gam-models/src/survival/latent/survival/mod.rs::latent_kernel_differentiate_terms": 1,
+      "crates/gam-models/src/survival/latent/survival/mod.rs::latent_kernel_sum_log_jet": 1
+    },
+    "reason": "Pure move for line-count headroom (build.rs MAX_TRACKED_FILE_LINES = 10000; latent/survival/mod.rs was 9712 lines): main :1777-4125, the latent row kernel's jet machinery (the primary-coordinate constants, LatentExactExpansion and its certified cumulants, the A-basis term kernels, the LatentRowJet backends, the primary direction maps and their inline tests_* modules), moves verbatim into row_kernel_jets.rs, which mod.rs include!s at the same position, so every item keeps its module, path, visibility and textual order.",
+    "evidence": "Pure move: every removed identity is declared again, with the same body, in the new sibling file of this landing (the sorted line multiset of the old file equals the two new files' lines plus only the added include and comment lines); gated in Slurm job 1270437, which re-runs this instrument with the entry and checks the workspace.",
+    "base": "776bd1ad6664690f4b75a51b9ad0e55eb5478006"
+  },
+  {
+    "base": "5890931cf86ea4de6f978659c6bf2e29328a4187",
+    "removed": {
+      "crates/gam-inference/src/rho_posterior.rs::rho_posterior_certificate": 1
+    },
+    "reason": "#2946 T2 (Stage A census): rename with no value change. rho_posterior_certificate computes the Tier-0 PSIS tail-shape adequacy diagnostic. Its k_hat has a standard error of about 0.27 at the default M = 64, so it certifies nothing, and it becomes rho_posterior_adequacy.",
+    "evidence": "At origin/main fe8a7a4ffe, git grep on lane sw2c finds rho_posterior_certificate only in gam-inference rho_posterior.rs (the pub fn, its escalator impl and tests), the gam-problem escalator trait and gam-solve reml/eval.rs. All are renamed in this commit. Gates: pre-gate gx6 job 1251077 and landing gate direct lane dy4 tag fr-census-t2."
+  },
+  {
+    "base": "1a7cb1008b8575f2b5d13df9c975d1ffa1b654bc",
+    "removed": {
+      "crates/gam-sae/src/manifold/chart_gauges.rs::closed_form_beta_gauge_directions": 1
+    },
+    "reason": "#2822 commit A: closed_form_beta_gauge_directions emitted a harmonic atom's chart generators as structural nulls of the penalized objective only when the atom's ARD block was empty (atom_step_gauge_is_structural_null). Commit A makes the coordinate ARD prior mandatory and refuses an empty block at criterion entry. A centered coordinate prior moves under every generator on its axes, so no chart phase direction is a null of the penalized objective (#2720), the declaration is unreachable, and its producer, its one install site (fit_drivers.rs run_joint_fit_arrow_schur) and its pin tests_chart_gauge_structural_null_2267 are deleted.",
+    "evidence": "Gate job 1245170 (base f58b6715be, tree 292c4eec): public_api_census.py refuses exactly this removal before this entry. git grep -n -w closed_form_beta_gauge_directions at eead230646b20751308a3a660796cd440f70e6bd finds it only in chart_gauges.rs (declaration and a doc link), the fit_drivers.rs install branch and the deleted test."
+  },
+  {
+    "base": "0672d284b2db09ef27c3f7ec5da26b9740ae1b9d",
+    "removed": {
+      "crates/gam-models/src/bms/family.rs::hash_intercept_warm_start_key_rigid": 1,
+      "crates/gam-models/src/bms/family.rs::new_intercept_warm_start_cache": 1,
+      "crates/gam-models/src/bms/mod.rs::build_latent_measure_with_geometry": 1,
+      "crates/gam-models/src/bms/mod.rs::is_empirical": 1
+    },
+    "reason": "gam#2926: the marginal-slope latent-law gate returns a typed LatentMeasureDecision that carries which law the fit consumed, and the Bernoulli empirical intercept is solved in root slots on the fit's anchor law. build_latent_measure_with_geometry (the tuple-returning gate) and LatentMeasureKind::is_empirical are replaced by build_latent_measure_decision and exhaustive matches on the kind; new_intercept_warm_start_cache and hash_intercept_warm_start_key_rigid (the per-row rigid intercept key cache) are replaced by new_intercept_warm_start_cache_on_law, whose root slots are keyed on the law itself.",
+    "evidence": "scripts/public_api_census.py --base bf8bcd492c --head the landing commit on MSI acl42 measured exactly these four removals. Every caller at the base (bms/block_specs.rs build_latent_measure_with_geometry, is_empirical and new_intercept_warm_start_cache; bms/cell_moment_assembly.rs hash_intercept_warm_start_key_rigid; survival/marginal_slope/fit_entry.rs is_empirical and new_intercept_warm_start_cache) moved to the successors. Successor tests: bms::anchor_law_2926_tests::rigid_intercept_slots_answer_repeats_and_seed_moved_iterates_2926 and rigid_intercept_slots_refuse_a_grid_that_is_not_the_law_2926 (root slots), bms::tests::a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declaration (the gate), bms::moving_law_rule::tests (the moving-law certificate), and the root bms_estimated_latent_law_2926 and bms_moving_law_certificate_2926 regressions."
+  },
+  {
+    "base": "97ecb63d7c8ef5d6162770a0a4f2aa8de825cc02",
+    "removed": {
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs::plan_softmax_row_jets_trace": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs::project_output_bases": 1,
+      "crates/gam-sae/src/manifold/construction_quasi_laplace.rs::logdet_theta_adjoint": 1,
+      "crates/gam-sae/src/manifold/construction_row_jet_logdet_channels.rs::contracted_trace_adjoint": 1
+    },
+    "reason": "#2333/#2933 F03: the outer-gradient assembler's pairing refusal left no route to the bundle-free arm that called logdet_theta_adjoint, the last non-test caller of the Trace-seam majorizer theta-adjoint. The adjoint, its consumer contracted_trace_adjoint, the Trace planner plan_softmax_row_jets_trace and the output-base projection project_output_bases that only the consumer used are deleted.",
+    "evidence": "Gate job 1197886 (gx8, 5023324b3c + patch d72e32519a06a71d81fb8c0a79207eec): public_api_census.py reported exactly these four identities as removed without an acknowledgement (12200 public function declarations before, 12196 after). The three selected-inverse helpers this change also deletes are private or struct items that the census does not count."
+  },
+  {
+    "base": "d10950d360992888269dc1543a904ef14e5d05b5",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::reserve_dense_touched_pair_partials": 1
+    },
+    "reason": "#2822 (i2280): the keyed touched-pair store is deleted, and with it the reservation that chose between dense and keyed partials. plan_touched_pair_fold now charges the governor per dense partial and admits as many as fit, down to an in-place serial reduction.",
+    "evidence": "Gate dy3 run i2280-fold-g1 (direct-dy3-i2280-fold-g1.log) at b78a4a2f5e: public_api_census.py refused exactly this removal. At eded626399, git grep -w finds reserve_dense_touched_pair_partials only in crates/gam-solve/src/arrow_schur/reduced_solve.rs (declaration and its caller) and touched_pair_fold_2900_tests.rs; the landing names it nowhere."
+  },
+  {
+    "base": "017ee5ce8ca8539e7e90ba3236913566f0595f68",
+    "removed": {
+      "crates/gam-event-history/src/joint/law.rs::history": 1
+    },
+    "reason": "#2961 landing 4: JointSpecification::history, the law's own rank-zero record builder, is deleted. joint/data.rs's FrozenJointSchema is the one encoder the fit, conditioning and every surface use; history()'s refusals are the cohort's, reached through that encoder.",
+    "evidence": "Direct lane dy6 run ad-nuts-l4-g2 (gate8, base 309d02a7bc, exact tree 3ea9320389, patch md5 57909cfe) had public_api_census.py refuse exactly this one removal. Its only production callers were joint/model.rs's fit and condition, which this landing rewrites to encode through FrozenJointSchema. Re-gated on direct lane dy5 run jls-l4-g3 (gate8), on the same code plus one comment in data_tests.rs and the A12 bench's joint-rank0 arm ported to the table API (code patch md5 758b354f), with these entries in its tree."
+  },
+  {
+    "base": "3101e933be2e80bcea0c1765b47519c2c37042a5",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::assign_block": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::assign_symmetric_block": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mask_row_vec": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwx": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwx_psi": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::mxtwxd": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::safe_fast_xt_diag_x": 1,
+      "crates/gam-models/src/survival/location_scale/dense_linalg.rs::weighted_crossprod_dense": 1,
+      "crates/gam-models/src/survival/location_scale/numeric_guards.rs::safe_sum3": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::collect_joint_quantities": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::collect_joint_quantities_rescaled": 1,
+      "crates/gam-models/src/survival/location_scale/row_kernel.rs::row_predictor_state": 1
+    },
+    "reason": "#2695 whole-residual survival location-scale kernel (i2940's unit, landed by surv-ls-1). These crate-visible helpers served only the location-only kernel's q-chain assembly (collect_joint_quantities -> SurvivalJointQuantities -> the mxtwx/mxtwxd/mxtwx_psi/mask_row_vec/assign_symmetric_block crossproducts in family_solver.rs), which is deleted because its chain dq/d(eta_t) = -exp(-eta_ls) holds only for u = h - eta_t*exp(-eta_ls). Consumers now read the one row program (exact_row_kernel / exact_row_kernel_rescaled) and row_predictor_state_at(dynamic, row). weighted_crossprod_dense's last caller (a tests.rs pin) moves to weighted_crossprod_dense_with_parallelism, safe_sum3's callers regroup the entry-exit gap channel by channel, and assign_block and safe_fast_xt_diag_x had no caller.",
+    "evidence": "git grep -w at 34ea9c6ca2b1043b39389c2ab70403d086ce6e17 names these only inside crates/gam-models/src/survival/location_scale (dense_linalg.rs, numeric_guards.rs, row_kernel.rs, family_solver.rs, mod.rs, wiggle_geometry.rs, time_block.rs, tests.rs); the landing tree declares and calls none of them. public_api_census.py refused exactly these 12 at job 1286875 (i2940's p10 tree); Slurm job 1338925 (lane sw5c) ran it on this tree at 34ea9c6ca2 with RC 0."
+  },
+  {
+    "base": "1ec9ae7e88215e48c9a7d686f3bc994ad2188e74",
+    "removed": {
+      "crates/gam-solve/src/quadrature.rs::cloglog_posterior_meanwith_deriv_gamma_reference": 1
+    },
+    "reason": "#2469: cloglog_posterior_meanwith_deriv_gamma_reference was a pub(crate) test-module reference built on cloglog_survival_gamma_reference, the Gamma/Mellin-Barnes route this commit deletes (see docs/source-removal-changes.json). The integrated cloglog pin now grades the router against 50-digit mpmath references instead.",
+    "evidence": "At 651eabad3f, git grep -w finds cloglog_posterior_meanwith_deriv_gamma_reference only inside quadrature.rs's test module: its declaration and one call in test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case, which this commit deletes. public_api_census.py in gate dy6 run spec-lead-q1-g1 refused exactly this one removal."
+  },
+  {
+    "base": "52389090ca99fe8caf15b4c92b6e0e2406d37779",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/run.rs::certificate_curvature_shift": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::certificate_hessian_is_psd_at_resolution": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::newton_predicted_decrease": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::newton_predicted_decrease_at_resolution": 1
+    },
+    "reason": "#2900 row 24.2 (SPEC rule 24): the four pub(crate) second-order helpers are opt::second_order at opt 53ce029, re-exported by run.rs under the same names, so no call site changes.",
+    "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
+  },
+  {
+    "base": "ae20ed3b52b554c6379b92ae588611a08d2376a3",
+    "removed": {
+      "crates/gam-inference/src/model_comparison.rs::corrected_edf": 1,
+      "crates/gam-inference/src/model_comparison.rs::rho_uncertainty_df": 1,
+      "crates/gam-solve/src/evidence.rs::compare_reml_fits": 1,
+      "crates/gam-solve/src/evidence.rs::criterion_gap": 1,
+      "crates/gam-solve/src/evidence.rs::ranking_score": 1
+    },
+    "reason": "slop.md G2 / pyGAM audit d11: model comparison ranks on the smoothing-corrected AIC through one Rust function. corrected_edf and CorrectedEdf::rho_uncertainty_df move from gam-inference::model_comparison to gam_solve::inference::information_criteria under the same names, so the fitted summary can form aic_corrected. compare_reml_fits (which ranked on ranking_score, the uncorrected -2*loglik + 2*edf) is replaced by evidence::compare_models ranking on aic_corrected, and criterion_gap by log_evidence_ratio, half the corrected-AIC gap.",
+    "evidence": "At the base, git grep -w finds compare_reml_fits, ranking_score and criterion_gap only in crates/gam-solve/src/evidence.rs and the gam-pyffi FFI (ffi_prelude.rs imports, model_ffi.rs), and corrected_edf / rho_uncertainty_df only in gam-inference; every caller is rewritten in this change. See the matching docs/source-removal-changes.json entry."
+  },
+  {
+    "base": "da5b1ad4bd7ecf8081e094aaf5e8573a7d9792af",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs::resolve_marginal_slope_base_link": 1
+    },
+    "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
+    "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
+  },
+  {
+    "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::consumed": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::from_model": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::required": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::session": 1
+    },
+    "reason": "gam#3002: OuterWarmStart's four methods staged a saved model's point as a one-entry outer cache session. They are replaced by resolve_warm_start, which builds a gam_model_api::WarmStart (the point, its certified value, and whether the inputs are the parent's), and every outer search takes it through OuterProblem::with_warm_start. See docs/source-removal-changes.json at the same base.",
+    "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
+  },
+  {
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
+  },
+  {
+    "base": "e110c67a94b801ddc9cc3756a3d0c61dada87550",
+    "removed": {
+      "crates/gam-math/src/probability.rs::signed_weighted_chi_square_sf_to_tolerance": 1
+    },
+    "reason": "pyGAM audit pv-tails-numerics (inference L4). The caller-tolerance Imhof evaluator lost all relative accuracy below about 1e-16, because 1/2 + I/pi cancels there. Its tolerance argument was the reason the smooth-term LR driver clamped the request to [1e-13, 1e-3]. It is replaced by signed_weighted_chi_square_sf in crates/gam-math/src/probability/weighted_chi_square.rs, re-exported from gam_math::probability. The replacement takes no tolerance and returns a TailProbability whose relative error bound is derived. Its only caller, smooth_term_lr.rs (conditional_tail_with_bound), calls the replacement.",
+    "evidence": "public_api_census.py, run with base 0b7f21d97b and head 5e41417f1c, reported exactly this identity as removed (13342 public function declarations before, 13343 after). git grep -c -w signed_weighted_chi_square_sf_to_tolerance finds 0 files under crates, src and tests at the landing tree. crates/gam-math/tests/tail_references.rs passes all five of its tests against the stored mpmath references."
+  },
+  {
+    "base": "0b0d0120c207ebec5299e3cbe19e8cc9a3d6335d",
+    "removed": {
+      "crates/gam-solve/src/topology_selector.rs::bic_score": 1
+    },
+    "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
+    "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
   }
 ]

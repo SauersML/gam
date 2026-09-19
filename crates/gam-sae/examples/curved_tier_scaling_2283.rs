@@ -163,10 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // measurement. Turn it on here, and start the process monitor so a stall
     // names its own frame instead of being reported as "no output".
     let level = match arg_value("log").as_deref() {
-        Some("debug") => log::LevelFilter::Debug,
         Some("trace") => log::LevelFilter::Trace,
         Some("warn") => log::LevelFilter::Warn,
-        _ => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
     };
     gam_solve::progress_log::init_logging_at(level);
     gam_runtime::process_monitor::start();
@@ -222,7 +221,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ridge_beta: 1.0e-6,
         top_k: Some(top_k),
         threshold: 0.0,
-        native_ard_enabled: true,
         seed_refine_routing: refine_routing,
         seed_refine_random_state: seed,
         fit_config: SaeFitConfig::default(),

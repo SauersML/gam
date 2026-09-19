@@ -17,21 +17,22 @@
 
 use crate::bms::deviation_runtime::AnchorComponentTag;
 use crate::bms::{
-    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
+    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentLawConsumed, LatentMeasureKind, LatentZConditionalCalibration,
 };
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, FitConfig, FitRequest, FitResult, StandardFitResult,
-    WorkflowError, expectile_tau_for_config, fit_expectile_if_requested,
+    DispersionLocationScaleFitResult, ExpectileFit, ExpectileLocationScaleFitResult, FitConfig,
+    FitNoteSink, FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
+    expectile_levels_for_config, fit_expectile_if_requested,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
 use crate::gamlss::{
     BinomialLocationScaleFitResult, DispersionFamilyKind, GaussianLocationScaleFitResult,
 };
 use crate::inference::model::{
-    FittedEstimator, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
+    FittedEstimator, FittedFamily, FittedModelPayload, JOINT_EXPECTILE_FAMILY_TAG,
+    MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     SavedResidualCascade, SavedSplineScan, SavedSurvivalLocationScaleStructure,
     SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
@@ -50,6 +51,7 @@ use crate::transformation_normal::{TransformationNormalFamily, TransformationNor
 use crate::wiggle::{WigglePenaltyMetadata, canonical_wiggle_function_penalties};
 use gam_data::{DataSchema, EncodedDataset};
 use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_linalg::matrix::LinearOperator;
 use gam_problem::BlockRole;
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
@@ -274,29 +276,16 @@ impl RealizedRawPenaltyTopology {
     }
 }
 
-fn response_for_standard_payload(formula: &str, dataset: &EncodedDataset) -> Option<Array1<f64>> {
-    let response = gam_terms::inference::formula_dsl::parse_formula(formula)
-        .ok()?
-        .response;
-    let column = *dataset.column_map().get(&response)?;
-    Some(dataset.values.column(column).to_owned())
-}
-
-fn standard_conformal_substrates(
-    formula: &str,
-    dataset: &EncodedDataset,
+/// The frozen penalty the exact full-conformal set of an eligible standard fit
+/// needs, recovered as `Sλ = M₀ − XᵀX` from the unit-weight training Gram. Only
+/// the p × p penalty is persisted: the labeled rows the set is built on are
+/// supplied again at prediction time, so the saved model never grows with `n`.
+fn standard_conformal_penalty(
     fit_config: &FitConfig,
     family: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     design: &TermCollectionDesign,
-) -> Option<crate::inference::full_conformal::ExactFullConformalSubstrate> {
-    // #2633: the substrate grows with the training rows. A caller that keeps
-    // its training data, or never asks for a conformal interval, can decline it;
-    // see `FitConfig::precompute_conformal` for the measured trade-off and why
-    // the default is to keep it.
-    if fit_config.precompute_conformal == Some(false) {
-        return None;
-    }
+) -> Option<crate::inference::full_conformal::ExactFullConformalPenalty> {
     let expectile = fit_config.family.as_deref().is_some_and(|family| {
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
@@ -310,28 +299,21 @@ fn standard_conformal_substrates(
     {
         return None;
     }
-    let y = response_for_standard_payload(formula, dataset)?;
-    let x = design.design.try_to_dense_arc("standard conformal design").ok()?;
     let normal_matrix = fit.penalized_hessian()?;
-    if x.nrows() != y.len()
-        || normal_matrix.nrows() != x.ncols()
-        || normal_matrix.ncols() != x.ncols()
-    {
-        return None;
-    }
-    let weights = Array1::<f64>::ones(y.len());
-    // The substrate may legitimately decline this design (rank, shape, or a
-    // non-invertible normal matrix). `None` is the contract, but the reason is
-    // what explains a fit that silently ships without conformal intervals.
-    match crate::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-        x.as_ref(),
-        &y,
-        &weights,
-        normal_matrix,
-    ) {
-        Ok(substrate) => Some(substrate),
+    let unit_weights = Array1::<f64>::ones(design.design.nrows());
+    // The penalty may legitimately be unavailable (the Gram cannot be formed
+    // for this design). `None` is the contract, but the reason is what explains
+    // a fit that ships without exact full-conformal intervals.
+    let penalty = design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
+        crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
+            &gram,
+            normal_matrix,
+        )
+    });
+    match penalty {
+        Ok(penalty) => Some(penalty),
         Err(reason) => {
-            log::debug!("exact full-conformal substrate unavailable: {reason}");
+            log::trace!("exact full-conformal penalty unavailable: {reason}");
             None
         }
     }
@@ -384,17 +366,24 @@ pub fn assemble_standard_payload(
             "standard fit reached payload assembly without its resolved likelihood family"
                 .to_string()
         })?;
-    let estimator = expectile_tau_for_config(fit_config)
+    let estimator = match expectile_levels_for_config(fit_config)
         .map_err(|error| format!("failed to persist estimator metadata: {error}"))?
-        .map_or(FittedEstimator::Likelihood, |tau| {
-            FittedEstimator::Expectile { tau }
-        });
-    let family_label = match estimator {
-        FittedEstimator::Likelihood => family.name().to_string(),
-        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+        .as_deref()
+    {
+        None => FittedEstimator::Likelihood,
+        Some([tau]) => FittedEstimator::Expectile { tau: *tau },
+        Some(levels) => {
+            return Err(format!(
+                "a standard fit cannot persist the joint expectile levels {levels:?}; they are \
+                 fitted as one location-scale model"
+            ));
+        }
     };
-    let full_conformal =
-        standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
+    let family_label = match &estimator {
+        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+        _ => family.name().to_string(),
+    };
+    let full_conformal = standard_conformal_penalty(fit_config, &family, &fit, &design);
     let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
             "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()
@@ -476,12 +465,15 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub baseline_slope: f64,
     pub latent_z_normalization: SavedLatentZNormalization,
     pub latent_measure: LatentMeasureKind,
-    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    pub latent_law_consumed: LatentLawConsumed,
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
     pub base_link: InverseLink,
     pub frailty: crate::survival::lognormal_kernel::FrailtySpec,
+    /// The residual genetic repair geometry (gam#2924) when the fit carried a
+    /// residual block; its coefficients are block 2 of `fit_result`.
+    pub residual_repair: Option<crate::bms::ResidualRepairGeometry>,
 }
 
 /// Drop the #461 training-only influence-absorber coefficients `γ` from a fitted
@@ -732,12 +724,13 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         baseline_slope,
         latent_z_normalization,
         latent_measure,
-        latent_z_rank_int_calibration,
+        latent_law_consumed,
         latent_z_conditional_calibration,
         score_warp_runtime,
         link_dev_runtime,
         base_link,
         frailty,
+        residual_repair,
     } = inputs;
 
     // #461 predict seam: drop the training-only influence-absorber γ (and
@@ -768,7 +761,8 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.z_columns = Some(vec![z_column]);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
-    payload.latent_z_rank_int_calibration = latent_z_rank_int_calibration;
+    latent_law_consumed.require_recorded("bernoulli marginal-slope payload")?;
+    payload.latent_law_consumed = Some(latent_law_consumed);
     payload.latent_z_conditional_calibration = latent_z_conditional_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.baseline_slope = Some(baseline_slope);
@@ -779,6 +773,7 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.resolved_slopespec = Some(resolved_slopespec);
     payload.score_warp_runtime = score_warp_runtime.map(serialize_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(serialize_anchored_deviation_runtime);
+    payload.residual_repair = residual_repair;
     source.apply_to(&mut payload);
     Ok(payload)
 }
@@ -1073,14 +1068,21 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     /// The automatic latent-measure gate's decision for the persisted score
     /// surface (gam#2768), split by
     /// [`SurvivalMarginalSlopeFitResult::persisted_latent_z_calibrations`].
-    /// Mutually exclusive; both `None` when the gate did not fire.
-    pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// `None` unless the declared conditional location-scale law calibrated the
+    /// score.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// Which latent law the fit consumed (gam#2926).
+    pub latent_law_consumed: LatentLawConsumed,
     /// The latent measure the fit's row program integrated against
     /// (gam#2923): the standard-normal law of the closed form, or the declared
     /// finite law the index was anchored on. Replayed by the shared
     /// marginal-slope predictor through the same anchoring equation.
     pub latent_measure: LatentMeasureKind,
+    /// The declared atoms a compressed fit was certified against, and the
+    /// compression's ledger (gam#2928); both `None` for a law anchored as
+    /// declared.
+    pub declared_latent_law: Option<crate::bms::EmpiricalZGrid>,
+    pub declared_latent_law_compression: Option<crate::inference::model::SavedDeclaredLawCompression>,
     pub baseline_slope: f64,
     /// Frozen nonlinear time-wiggle authority, including the raw fitted tail.
     pub timewiggle: Option<SurvivalTimewiggle>,
@@ -1103,10 +1105,12 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
 /// differ — `survival_distribution` and `frailty` — and then set their own
 /// family-specific fields on the returned payload.
 ///
-/// A fit whose constrained posterior declined its moments stores an optimizer
-/// mode, not the posterior mean a saved model publishes, so every survival
-/// contract refuses it here by the decline's summary, as the location-scale and
-/// transformation-normal assemblers do (#979).
+/// A fit whose constrained posterior declined its moments keeps its optimizer
+/// mode under that typed decline, which records why the moments are unavailable
+/// at the boundary and, when a boundary-mode approximation was measured, its
+/// certificate and overturn tail mass. The model is saved with the mode: plug-in
+/// predictions read it, and every consumer of posterior moments refuses by the
+/// decline's summary (#979, gnomon#2336).
 fn new_royston_parmar_survival_payload(
     formula: String,
     fit_result: UnifiedFitResult,
@@ -1115,9 +1119,13 @@ fn new_royston_parmar_survival_payload(
     survival_distribution: Option<ResidualDistribution>,
     frailty: crate::survival::lognormal_kernel::FrailtySpec,
 ) -> Result<FittedModelPayload, String> {
-    fit_result
-        .require_posterior_mean("survival saved-model assembly")
-        .map_err(|error| error.to_string())?;
+    if let Some(decline) = fit_result.posterior_moment_decline() {
+        log::debug!(
+            "[survival saved-model assembly] saving the converged constrained mode; posterior \
+             moments are unavailable at the boundary: {}",
+            decline.summary()
+        );
+    }
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         formula,
@@ -1181,7 +1189,12 @@ pub fn assemble_survival_marginal_slope_payload(
     // the marginal identity on. The pair below is the pre-transform applied to z
     // before either kernel.
     payload.latent_measure = Some(inputs.latent_measure);
-    payload.latent_z_rank_int_calibration = inputs.latent_z_rank_int_calibration;
+    payload.declared_latent_law = inputs.declared_latent_law;
+    payload.declared_latent_law_compression = inputs.declared_latent_law_compression;
+    inputs
+        .latent_law_consumed
+        .require_recorded("survival marginal-slope payload")?;
+    payload.latent_law_consumed = Some(inputs.latent_law_consumed);
     payload.latent_z_conditional_calibration = inputs.latent_z_conditional_calibration;
     payload.baseline_slope = Some(inputs.baseline_slope);
     payload.baseline_slopes = Some(vec![inputs.baseline_slope]);
@@ -1474,24 +1487,79 @@ pub fn assemble_latent_window_payload(
 pub fn apply_request_metadata(
     payload: &mut FittedModelPayload,
     fit_config: &FitConfig,
-    inference_notes: Vec<String>,
+    notes: FitNotes,
 ) {
     payload.group_metadata = fit_config.group_metadata.clone();
     payload.training_table_kind = fit_config.training_table_kind.clone();
-    payload.inference_notes = inference_notes;
+    payload.inference_notes = notes.advisories;
+    payload.informational_notes = notes.informational;
+}
+
+/// Record, on every certified outer point the payload carries, the fingerprint of
+/// the inputs it is certified for, so a later warm start can tell a resume from a
+/// new fit (gam#3002). `None` leaves the point able only to join a later search.
+fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint: Option<String>) {
+    for fit in [payload.fit_result.as_mut(), payload.unified.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(record) = fit.artifacts.outer_warm_start.as_mut() {
+            record.input_fingerprint = input_fingerprint.clone();
+        }
+    }
 }
 
 /// One authoritative "formula fit → saved payload" service: materialize once,
 /// dispatch on the request variant, fit, and assemble the persistence payload.
 /// Both front ends (CLI, Python FFI) must route through this function so a fit
 /// requested through any surface produces an identical saved model. (#2470)
+///
+/// An automatic `.` term is expanded against `dataset` first, so the payload
+/// stores (and `model.formula` shows) the formula that was actually fitted, and
+/// the expansion's notes lead the payload's inference notes.
 pub fn fit_formula_to_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
+    let dataset = &*crate::fit_orchestration::drop_zero_weight_rows(dataset, fit_config)?;
+    let automatic = crate::fit_orchestration::expand_automatic_fit_formula(
+        &formula, dataset, fit_config,
+    )?;
+    let mut payload = fit_expanded_formula_to_payload(automatic.formula, dataset, fit_config)?;
+    if !automatic.notes.is_empty() {
+        let mut notes = automatic.notes;
+        notes.append(&mut payload.inference_notes);
+        payload.inference_notes = notes;
+    }
+    Ok(payload)
+}
+
+fn fit_expanded_formula_to_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+) -> Result<FittedModelPayload, WorkflowError> {
+    let warm_start_route_refused = |route: &'static str| WorkflowError::WarmStartRefused {
+        refusal: crate::fit_orchestration::WarmStartRefusal::NoSearchTakesIt { route },
+    };
+    if fit_config.warm_start.is_some()
+        && crate::fit_orchestration::expectile_levels_for_config(fit_config)?.is_some()
+    {
+        return Err(warm_start_route_refused("an expectile fit"));
+    }
+    // A CTN chain's certified point is its outcome fit's, and that fit is a
+    // function of the chain's own inputs (the stage-1 transform is fitted or
+    // frozen from them), so the point is recorded against the chain's inputs.
+    // The outcome fit takes the warm start through its configuration and says
+    // what its searches did with it; the stage-1 fits never receive it.
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
-        return crate::inference::ctn::fit_chain(formula, dataset, fit_config);
+        let mut payload = crate::inference::ctn::fit_chain(formula.clone(), dataset, fit_config)?;
+        record_input_fingerprint(
+            &mut payload,
+            crate::fit_orchestration::fit_input_fingerprint(&formula, dataset, fit_config),
+        );
+        return Ok(payload);
     }
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
@@ -1503,15 +1571,18 @@ pub fn fit_formula_to_payload(
     // `StandardFitResult`, so the persistence payload is built by the same
     // `assemble_standard_payload` used for every other standard fit.
     if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        let mut payload = assemble_standard_payload(StandardPayloadInputs {
-            formula,
-            dataset,
-            fit_config,
-            result: expectile_result,
-        })?;
+        let mut payload = match expectile_result {
+            ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
+                formula,
+                dataset,
+                fit_config,
+                result,
+            })?,
+            ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
+        };
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
-        apply_request_metadata(&mut payload, fit_config, Vec::new());
+        apply_request_metadata(&mut payload, fit_config, FitNotes::default());
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:
@@ -1519,6 +1590,7 @@ pub fn fit_formula_to_payload(
     // materializers do not consume this standard-only orchestration field.
     let mut dispatch_config = fit_config.clone();
     dispatch_config.spatial_center_counts = Some(Vec::new());
+    let formula_for_fingerprint = formula.clone();
     let materialized = materialize(&formula, dataset, &dispatch_config)?;
     let request = materialized.request;
     // The time basis THIS materialization built, carried to the save path so a
@@ -1851,6 +1923,36 @@ pub fn fit_formula_to_payload(
             payload_for_dispersion_location_scale(formula, dataset, fit_config, kind, ls_result)?
         }
     };
+    // A route whose outer driver never received the model's point fitted cold;
+    // that is not the warm start the caller asked for. One that received it says
+    // what it did in the model's notes, so a point it did not use is never silent.
+    if let Some(warm_start) = fit_config.warm_start.as_ref() {
+        match warm_start.recorded() {
+            None => return Err(warm_start_route_refused("this fit's route")),
+            // A point that was used is what the caller asked for; one that was
+            // not is a fit that differs from the request.
+            Some(gam_model_api::WarmStartOutcome::Resumed) => inference_notes.inform(
+                "warm_start_from: resumed from the model's certified point (same inputs)"
+                    .to_string(),
+            ),
+            Some(gam_model_api::WarmStartOutcome::JoinedMultistart) => inference_notes.inform(
+                "warm_start_from: the model's certified point joined the multistart as one \
+                 more seed (other inputs)"
+                    .to_string(),
+            ),
+            Some(gam_model_api::WarmStartOutcome::NotUsed(reason)) => inference_notes.advise(
+                format!("warm_start_from: the model's certified point was not used: {reason}"),
+            ),
+        }
+    }
+    record_input_fingerprint(
+        &mut payload,
+        crate::fit_orchestration::fit_input_fingerprint(
+            &formula_for_fingerprint,
+            dataset,
+            fit_config,
+        ),
+    );
     payload.unidentified_scalar_terms = unidentified_scalar_terms;
     apply_request_metadata(&mut payload, fit_config, inference_notes);
     Ok(payload)
@@ -1940,12 +2042,13 @@ fn payload_for_bernoulli_marginal_slope(
                 sd: ms_result.z_normalization.sd,
             },
             latent_measure: ms_result.latent_measure.clone(),
-            latent_z_rank_int_calibration: ms_result.latent_z_rank_int_calibration.clone(),
+            latent_law_consumed: ms_result.latent_law_consumed.clone(),
             latent_z_conditional_calibration: ms_result.latent_z_conditional_calibration.clone(),
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
             base_link,
             frailty,
+            residual_repair: ms_result.residual_repair.clone(),
         },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),
@@ -2101,8 +2204,7 @@ fn payload_for_survival_marginal_slope(
             );
         }
     };
-    let (persisted_rank_int, persisted_conditional) =
-        ms_result.persisted_latent_z_calibrations()?;
+    let persisted_conditional = ms_result.persisted_latent_z_calibrations()?;
     // gam#2929: a K ≥ 2 per-score fit anchored on the joint law of its score
     // vector persists that law, one score column and one slope surface per
     // coordinate. What the single-score contract cannot carry is refused here.
@@ -2128,10 +2230,9 @@ fn payload_for_survival_marginal_slope(
                         .to_string(),
                 );
             }
-            if let Some(reason) = joint_latent_law_calibration_save_refusal(
-                persisted_rank_int.as_ref(),
-                persisted_conditional.as_ref(),
-            ) {
+            if let Some(reason) =
+                joint_latent_law_calibration_save_refusal(persisted_conditional.as_ref())
+            {
                 return Err(reason.to_string());
             }
             if law.conditional.is_some() && !ms_result.latent_conditioning_reproducible {
@@ -2197,9 +2298,14 @@ fn payload_for_survival_marginal_slope(
                 mean: ms_result.z_normalization.mean,
                 sd: ms_result.z_normalization.sd,
             },
-            latent_z_rank_int_calibration: persisted_rank_int,
+            latent_law_consumed: ms_result.latent_law_consumed.clone(),
             latent_z_conditional_calibration: persisted_conditional,
             latent_measure: ms_result.latent_measure.clone(),
+            declared_latent_law: ms_result.declared_latent_law.clone(),
+            declared_latent_law_compression: ms_result
+                .latent_law_compression
+                .as_ref()
+                .map(crate::inference::model::SavedDeclaredLawCompression::from),
             baseline_slope: ms_result.baseline_slope,
             timewiggle,
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
@@ -2231,10 +2337,9 @@ fn payload_for_survival_marginal_slope(
 /// columns, so a model whose scores were calibrated before the fit would predict
 /// on scores other than the ones it was fitted on.
 fn joint_latent_law_calibration_save_refusal(
-    rank_int: Option<&crate::bms::LatentZRankIntCalibration>,
     conditional: Option<&crate::bms::LatentZConditionalCalibration>,
 ) -> Option<&'static str> {
-    (rank_int.is_some() || conditional.is_some()).then_some(
+    conditional.is_some().then_some(
         "survival marginal-slope K ≥ 2 model calibrated its scores before the fit, and the joint \
          latent law's saved contract replays the anchor on the raw score columns: saving is \
          refused rather than writing a model whose prediction evaluates different scores",
@@ -2391,6 +2496,37 @@ fn payload_for_gaussian_location_scale(
             noise_offset_column: fit_config.noise_offset_column.clone(),
         },
     )
+}
+
+/// Saved payload of a joint multi-level expectile fit: the Gaussian
+/// location-scale payload of its `μ`/`σ` surfaces, tagged with the joint
+/// estimator that turns them into one non-crossing curve per level.
+fn payload_for_joint_expectile(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+    joint: ExpectileLocationScaleFitResult,
+) -> Result<FittedModelPayload, String> {
+    let noise_formula = crate::fit_orchestration::expectile_noise_formula(&formula, fit_config)
+        .map_err(|error| error.to_string())?;
+    let location_scale_config = FitConfig {
+        noise_formula: Some(noise_formula),
+        ..fit_config.clone()
+    };
+    let response_scale = joint.location_scale.response_scale;
+    let mut payload = payload_for_gaussian_location_scale(
+        formula,
+        dataset,
+        &location_scale_config,
+        joint.location_scale,
+        response_scale,
+    )?;
+    payload.family = JOINT_EXPECTILE_FAMILY_TAG.to_string();
+    payload.estimator = FittedEstimator::ExpectileLocationScale {
+        levels: joint.levels,
+        standardized_expectiles: joint.standardized_expectiles,
+    };
+    Ok(payload)
 }
 
 /// Map the optional `(knots, degree, beta)` link-wiggle parts a location-scale
@@ -2811,18 +2947,14 @@ mod joint_latent_law_save_tests {
     use super::*;
 
     /// A joint-law model refuses to save by name when its score column carries a
-    /// persisted rank-INT or conditional location-scale calibration, and saves
-    /// when it carries neither.
+    /// persisted conditional location-scale calibration, and saves when it does
+    /// not. Fits no longer persist a rank-INT calibration (gam#2926).
     #[test]
     fn joint_law_model_with_a_calibrated_score_refuses_to_save_2929() {
         assert!(
-            joint_latent_law_calibration_save_refusal(None, None).is_none(),
+            joint_latent_law_calibration_save_refusal(None).is_none(),
             "an uncalibrated joint-law model must save"
         );
-        let z = ndarray::Array1::from_vec(vec![-1.3, -0.4, 0.2, 0.9, 1.7, 2.8]);
-        let weights = ndarray::Array1::from_elem(z.len(), 1.0);
-        let rank_int = crate::bms::LatentZRankIntCalibration::fit(&z, &weights)
-            .expect("rank-INT calibration");
         let conditional = crate::bms::LatentZConditionalCalibration {
             mean_coeffs: vec![0.1, 0.4],
             var_coeffs: Vec::new(),
@@ -2833,25 +2965,13 @@ mod joint_latent_law_save_tests {
             post_sd: 1.0,
             theta1_cov: ndarray::Array2::zeros((0, 0)),
         };
-        for (label, reason) in [
-            (
-                "rank-INT",
-                joint_latent_law_calibration_save_refusal(Some(&rank_int), None),
-            ),
-            (
-                "conditional location-scale",
-                joint_latent_law_calibration_save_refusal(None, Some(&conditional)),
-            ),
-        ] {
-            let reason = reason.unwrap_or_else(|| {
-                panic!("a {label} calibration must refuse the joint-law save")
-            });
-            assert!(
-                reason.contains("model calibrated its scores before the fit")
-                    && reason.contains("saving is refused"),
-                "{label}: unexpected refusal {reason}"
-            );
-        }
+        let reason = joint_latent_law_calibration_save_refusal(Some(&conditional))
+            .expect("a conditional location-scale calibration must refuse the joint-law save");
+        assert!(
+            reason.contains("model calibrated its scores before the fit")
+                && reason.contains("saving is refused"),
+            "unexpected refusal {reason}"
+        );
     }
 }
 
@@ -3390,6 +3510,7 @@ mod survival_payload_decline_tests {
                         reason: "fixture: properness was not certified".to_string(),
                     },
                     active_rows: vec![0],
+                    boundary_approximation_refusal: None,
                 },
             )),
             working: None,
@@ -3435,14 +3556,15 @@ mod survival_payload_decline_tests {
         .expect("the survival fixture fit must assemble")
     }
 
-    /// #979: a fit that keeps its optimizer mode under a moment decline has no
-    /// posterior mean, so no survival contract may save it. The refusal must name
-    /// the operation, the missing estimand and the decline's own reason. The
-    /// control is the same fit with reportable moments, which must still assemble.
+    /// #979 ruling (c), gnomon#2336: a fit that keeps its optimizer mode under a
+    /// moment decline is saved with that mode, and the saved fit keeps the typed
+    /// decline, so every consumer of posterior moments still refuses it, naming the
+    /// operation, the missing estimand and the decline's own reason. The control is
+    /// the same fit with reportable moments, which must still assemble.
     #[test]
-    fn a_declined_survival_fit_is_refused_at_saved_model_assembly_979() {
+    fn a_declined_survival_fit_is_saved_with_its_mode_and_its_decline_979() {
         let schema = DataSchema { columns: Vec::new() };
-        let refusal = new_royston_parmar_survival_payload(
+        let payload = new_royston_parmar_survival_payload(
             "Surv(time, status) ~ x".to_string(),
             survival_fit(true),
             schema.clone(),
@@ -3450,10 +3572,21 @@ mod survival_payload_decline_tests {
             None,
             FrailtySpec::None,
         )
-        .err()
-        .expect("a declined fit stores a mode, not a posterior mean, and must not be saved");
+        .expect("a declined fit saves its converged mode");
+        let saved = payload
+            .fit_result
+            .as_ref()
+            .expect("the declined payload must carry its fit");
+        assert!(
+            saved.posterior_moment_decline().is_some(),
+            "the saved fit must keep its typed moment decline"
+        );
+        let refusal = saved
+            .require_posterior_mean("saved-model covariance summary")
+            .expect_err("a saved declined fit has no posterior mean")
+            .to_string();
         for needle in [
-            "survival saved-model assembly",
+            "saved-model covariance summary",
             "posterior-mean",
             "the ambient precision is indefinite",
         ] {

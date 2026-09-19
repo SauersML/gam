@@ -76,21 +76,7 @@
 use std::fmt;
 
 use crate::probability::signed_log_sum_exp;
-
-/// Unit roundoff `u = ε/2` of binary64 under round to nearest. gam-linalg's `roundoff` module owns the Wilkinson growth
-/// factors, but gam-math does not depend on gam-linalg, and adding that edge would pull faer and ndarray into the math
-/// crate, so the one factor this module reads is restated here.
-const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
-
-/// Wilkinson's growth factor `γ_n = n·u/(1 − n·u)` (Higham, ASNA 2nd ed., Lemma 3.1), infinite once `n·u ≥ 1`.
-fn growth(operations: usize) -> f64 {
-    let scaled = operations as f64 * UNIT_ROUNDOFF;
-    if scaled < 1.0 {
-        scaled / (1.0 - scaled)
-    } else {
-        f64::INFINITY
-    }
-}
+use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 
 /// A logit vector that names no categorical distribution, or two logit vectors that cannot be compared.
 #[derive(Clone, Debug, PartialEq)]
@@ -181,7 +167,7 @@ fn normalizer_error(log_terms: &[f64], normalizer: f64) -> (f64, Vec<f64>) {
         weights.push(weight);
     }
     // The additions forming `total` add γ_K·total.
-    let rounding = rounding + growth(log_terms.len()) * total;
+    let rounding = rounding + accumulation_growth(log_terms.len()) * total;
     // `total − 1` is exact for `total` in [½, 2] (Sterbenz), and `ln_1p` errs by one unit, 2u relatively.
     let defect = (total - 1.0).ln_1p().abs() * (1.0 + 2.0 * UNIT_ROUNDOFF);
     (defect + rounding / total, weights)
@@ -249,7 +235,7 @@ fn log_excess_exponential(d: f64) -> (f64, f64) {
         // Every retained term passes through at most `operations` rounded operations (d·d, then a division, a product
         // and an addition per step), so the sum errs by γ_n·Σ|t_j| (Higham, ASNA Lemma 3.1). Truncation adds at most u
         // relatively, and `ln` one unit, 2u·|value|.
-        (value, growth(operations) * absolute / sum + u + 2.0 * u * value.abs())
+        (value, accumulation_growth(operations) * absolute / sum + u + 2.0 * u * value.abs())
     }
 }
 
@@ -357,7 +343,7 @@ pub fn categorical_kl_from_logits_with_error(
         mean_gap_rounding += probability * entry.2.abs() * (u * (log_probability.abs() + 4.0) + normalizer_bound)
             + smallest * entry.2.abs();
     }
-    let mean_gap_error = mean_gap_rounding + growth(supported.len()) * absolute_gap;
+    let mean_gap_error = mean_gap_rounding + accumulation_growth(supported.len()) * absolute_gap;
 
     let mut log_terms = Vec::with_capacity(supported.len());
     let mut relative_errors = Vec::with_capacity(supported.len());
@@ -464,7 +450,7 @@ mod tests {
     fn log_cosh_series(c: f64) -> (f64, f64) {
         let terms = [c * c / 2.0, c.powi(4) / 12.0, c.powi(6) / 45.0];
         let value = terms[0] - terms[1] + terms[2];
-        (value, growth(8) * (terms[0] + terms[1] + terms[2]) + c.powi(8))
+        (value, accumulation_growth(8) * (terms[0] + terms[1] + terms[2]) + c.powi(8))
     }
 
     /// `log cosh c = |c| + log1p(e^{−2|c|}) − log 2` with its rounding: the exponential's unit through `log1p` (at most
@@ -490,7 +476,7 @@ mod tests {
     fn shift_spread(logits: &[f64]) -> f64 {
         let normalizer = log_sum_exp(logits).expect("valid logits");
         let normalization = normalizer_error(logits, normalizer).0;
-        UNIT_ROUNDOFF * (16.0 + 16.0 + 14.0) + 14.0 * normalization + growth(4) * 7.0 * (1.0 + 2.0 * normalization)
+        UNIT_ROUNDOFF * (16.0 + 16.0 + 14.0) + 14.0 * normalization + accumulation_growth(4) * 7.0 * (1.0 + 2.0 * normalization)
     }
 
     #[test]
@@ -593,7 +579,7 @@ mod tests {
                     + smallest * (difference.abs() + 1.0);
             }
             // First-order terms doubled, plus γ_K for the sum.
-            let band = numerical_error + 2.0 * first_order + growth(logits.len()) * absolute;
+            let band = numerical_error + 2.0 * first_order + accumulation_growth(logits.len()) * absolute;
             assert!(divergence > band, "the fixture must move the distribution; KL {divergence}, band {band}");
             assert!((divergence - route).abs() <= band, "KL {divergence}, route {route}, band {band}");
         }
@@ -677,7 +663,7 @@ mod tests {
             .fold(0.0_f64, |largest, value| largest.max(value.abs()));
         let gap_error = UNIT_ROUNDOFF * 27.0
             + 9.0 * (UNIT_ROUNDOFF * (largest_log_probability + 4.0) + normalization)
-            + growth(4) * 9.0 * (1.0 + 2.0 * normalization);
+            + accumulation_growth(4) * 9.0 * (1.0 + 2.0 * normalization);
         let floor = 2.0 * (2.0 * spread * gap_error + gap_error * gap_error * (1.0 + gap_error).exp() / 2.0 + spread * spread);
         assert!(numerical_error <= floor, "bound {numerical_error}, floor {floor}");
         // Positive control for the refusal: at logits of size 4·10¹⁶ one unit in the last place is 8, the mean gap's
@@ -713,7 +699,7 @@ mod tests {
             .zip(&radii)
             .map(|(value, radius)| 2.0 * (radius + 2.0 * UNIT_ROUNDOFF) * value.exp())
             .sum::<f64>()
-            + growth(3) * total;
+            + accumulation_growth(3) * total;
         assert!((total - 1.0).abs() <= total_band, "softmax total {total}, band {total_band}");
 
         assert_eq!(log_sum_exp(&[]), Err(CategoricalError::Empty { name: "logits" }));

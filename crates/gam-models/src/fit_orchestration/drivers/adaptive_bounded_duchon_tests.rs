@@ -68,7 +68,7 @@ mod adaptive_bounded_duchon_tests {
                     boundary: OneDimensionalBoundary::Open,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
@@ -125,6 +125,7 @@ mod adaptive_bounded_duchon_tests {
             // Each surviving smooth emits BOTH its primary roughness and its
             // function-space null ridge, so every repeated axis has width two.
             smooth_terms: vec![smooth("first_smooth", 4), smooth("second_smooth", 5)],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("mixed design");
 
@@ -265,9 +266,10 @@ mod adaptive_bounded_duchon_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
 
         let base_design = build_term_collection_design(data.view(), &spec).expect("base design");
@@ -355,9 +357,10 @@ mod adaptive_bounded_duchon_tests {
                         boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         let fit_opts = FitOptions {
             max_iter: 40,
@@ -424,7 +427,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 
@@ -432,11 +435,13 @@ mod adaptive_bounded_duchon_tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![duchon_term("mean_duchon", 0.8)],
+            level: Default::default(),
         };
         let noisespec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![duchon_term("noise_duchon", 1.1)],
+            level: Default::default(),
         };
 
         let solved = run_two_block_exact_joint_optimize(
@@ -496,7 +501,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 
@@ -504,11 +509,13 @@ mod adaptive_bounded_duchon_tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![pure_duchon_term("mean_pure_duchon")],
+            level: Default::default(),
         };
         let noisespec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![pure_duchon_term("noise_pure_duchon")],
+            level: Default::default(),
         };
 
         let (boot_designs, frozen_specs) = build_term_collection_designs_and_freeze_joint(
@@ -653,6 +660,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
 
         let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
@@ -731,6 +739,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
 
         let fitted = fit_term_collection_forspec(
@@ -830,6 +839,7 @@ mod adaptive_bounded_duchon_tests {
             }],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let constraints = design.linear_constraints.expect("constraints");
@@ -890,6 +900,7 @@ mod adaptive_bounded_duchon_tests {
             ],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         assert_eq!(design.penalties.len(), 2);
@@ -1257,10 +1268,15 @@ mod adaptive_bounded_duchon_tests {
         }
     }
 
+    /// The setup projects its ρ seed into the domain its builder derived
+    /// (#2902 item 15): a non-finite seed takes the domain's midpoint, an
+    /// interior seed is kept, and a seed past an edge lands on that edge.
     #[test]
-    fn two_block_exact_joint_setup_sanitizes_non_finite_rho_seed() {
+    fn exact_joint_setup_projects_its_rho_seed_into_the_derived_domain_2902() {
         let setup = ExactJointHyperSetup::new(
-            array![f64::NEG_INFINITY, 0.25, f64::INFINITY],
+            array![f64::NEG_INFINITY, 0.25, 40.0],
+            array![-30.0, -30.0, -30.0],
+            array![10.0, 10.0, 10.0],
             SpatialLogKappaCoords::new_with_dims(array![0.5], vec![1]),
             SpatialLogKappaCoords::new_with_dims(array![-2.0], vec![1]),
             SpatialLogKappaCoords::new_with_dims(array![2.0], vec![1]),
@@ -1268,9 +1284,9 @@ mod adaptive_bounded_duchon_tests {
 
         let theta0 = setup.theta0();
         assert!(theta0.iter().all(|v| v.is_finite()));
-        assert_eq!(theta0[0], 0.0);
+        assert_eq!(theta0[0], -10.0);
         assert_eq!(theta0[1], 0.25);
-        assert_eq!(theta0[2], 0.0);
+        assert_eq!(theta0[2], 10.0);
         assert_eq!(theta0[3], 0.5);
     }
 

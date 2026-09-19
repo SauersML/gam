@@ -1,0 +1,38 @@
+[11m 06s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[11m 06s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.0929e87). This indicates a numerical instability.
+[11m 13s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 2.531016e109.
+[11m 13s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.4178e1). This indicates a numerical instability.
+[11m 13s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1757e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[11m 13s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1757e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[11m 13s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.4178e1). This indicates a numerical instability.
+[11m 14s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[11m 14s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 1.168498e91.
+[11m 14s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.0174e78). This indicates a numerical instability.
+[11m 15s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.5207e0). This indicates a numerical instability.
+[11m 15s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 5.380122e118.
+[11m 15s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1752e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[11m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[11m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.2709e101). This indicates a numerical instability.
+[11m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.3641e161). This indicates a numerical instability.
+[11m 47s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 8.593191e115.
+[11m 47s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[11m 47s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.2915e1). This indicates a numerical instability.
+[11m 52s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1722e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[11m 52s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 2.703856e143.
+[11m 52s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[11m 52s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[12m 11s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[12m 11s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2204e1). This indicates a numerical instability.
+[12m 11s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.5494e51). This indicates a numerical instability.
+[12m 25s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[12m 25s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 3.208502e80.
+[12m 25s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0257e140). This indicates a numerical instability.
+[12m 25s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1656e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[12m 29s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[12m 29s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian factorization failed although the (lower-triangle) spectrum is positive (minimum eigenvalue: 2.1726e2): the condition number exceeds float precision or the assembled matrix is asymmetric/non-finite outside the factored triangle. This indicates a numerical instability in the Hessian assembly or scaling.
+[12m 30s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 1.520908e132.
+[12m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Model is ill-conditioned with condition number inf. This typically occurs when the model is over-parameterized (too many knots relative to data points). Consider reducing the number of knots or increasing regularization.
+[12m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2321e1). This indicates a numerical instability.
+[12m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was inf.
+[12m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: The P-IRLS inner loop did not converge within 300 iterations. Last gradient norm was 7.817151e149.
+10000 y ~ s(balance) wall 777.6s cpu 248.5s certified True edf 1.9984284536831645

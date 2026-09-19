@@ -10,8 +10,9 @@
 //!
 //! The CUDA leaf uses native full-precision `erfc`, while NVRTC compilation
 //! disables FMA contraction for close agreement with separately rounded host
-//! arithmetic. Direct device tests cover both ordinary and probability-tail
-//! rows against the CPU row program.
+//! arithmetic. On a CUDA host, `rigid_row_jet_device_admission_and_parity_2900`
+//! compares every channel of ordinary and probability-tail rows with the CPU
+//! row program.
 
 #[cfg(target_os = "linux")]
 use crate::survival::marginal_slope::RIGID_FEATURE_PROGRAM_CUDA_VGH;
@@ -41,10 +42,18 @@ pub(crate) struct SurvivalRowInputs {
     pub(crate) cov_ones: f64,
 }
 
-/// Minimum row count that amortises probe, transfer, and launch costs.
-const DEVICE_ROW_THRESHOLD: usize = 100_000;
-
 /// Whether this batch is admitted to the production CUDA V/G/H path.
+///
+/// The batch runs one independent row program per row with no cross-row
+/// reduction, so the row count is the work, and what the device has to
+/// overcome is probe, transfer and launch latency. That crossover is the
+/// dispatch policy's `fused_kernel_min_n`, which device calibration derives
+/// from the device's measured row crossover; the Pólya-Gamma batch takes the
+/// same admission. A batch below
+/// `GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N`, which no reachable
+/// policy admits, returns before availability is resolved, so a CPU-sized fit
+/// creates no CUDA context. The row count used to be compared against a local
+/// 100,000-row literal (#2900 row 6.11).
 ///
 /// Admission is a capability decision made before execution, not an
 /// operating-system guess. A large CPU-only Linux fit therefore stays on the
@@ -52,12 +61,12 @@ const DEVICE_ROW_THRESHOLD: usize = 100_000;
 /// compile/launch failures remain errors and are never hidden by a retry.
 #[inline]
 pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> Result<bool, String> {
-    if n_rows < DEVICE_ROW_THRESHOLD {
-        return Ok(false);
-    }
-    gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
-        .map(|runtime| runtime.is_some())
-        .map_err(String::from)
+    let runtime = gam_gpu::device_runtime::GpuRuntime::resolve_if_fused_batch_exceeds_floor(
+        gam_gpu::global_policy(),
+        n_rows,
+    )
+    .map_err(String::from)?;
+    Ok(runtime.is_some_and(|runtime| n_rows >= runtime.policy().fused_kernel_min_n))
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.

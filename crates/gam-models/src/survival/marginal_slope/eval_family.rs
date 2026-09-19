@@ -78,7 +78,7 @@ fn rigid_family_primary_terms<const P: usize>(channel: Order2<P>) -> RigidFamily
 }
 
 impl SurvivalMarginalSlopeFamily {
-    fn rigid_baseline_geometry(
+    pub(crate) fn rigid_baseline_geometry(
         &self,
     ) -> Result<&crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry, String> {
         self.family_hyper.baseline_geometry.as_deref().ok_or_else(|| {
@@ -90,7 +90,7 @@ impl SurvivalMarginalSlopeFamily {
     /// The baseline chart moves the OFFSET channels of the location index only.
     /// It cannot move the slope, so every slope primary of the frame is exactly
     /// zero here whichever frame is in play.
-    fn rigid_baseline_primary_first<const P: usize>(
+    pub(crate) fn rigid_baseline_primary_first<const P: usize>(
         geometry: &crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry,
         row: usize,
         axis: usize,
@@ -108,7 +108,7 @@ impl SurvivalMarginalSlopeFamily {
         Ok(direction)
     }
 
-    fn rigid_baseline_primary_second<const P: usize>(
+    pub(crate) fn rigid_baseline_primary_second<const P: usize>(
         geometry: &crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry,
         row: usize,
         axis: usize,
@@ -738,6 +738,189 @@ impl SurvivalMarginalSlopeFamily {
             || self.flex_active()
             || self.flex_timewiggle_active()
             || self.anchored_law_active())
+    }
+
+    /// Whether [`Self::baseline_contracted_trace_hessian_psi_with_options`] serves this frame: the
+    /// rigid time-constant slope, the frame with closed-form fifth likelihood derivatives.
+    pub(crate) fn baseline_contracted_trace_hessian_psi_available(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<bool, String> {
+        Ok(self.rigid_third_information_available()
+            && !self.slope_is_follow_up_varying()
+            && !self.effective_flex_active(block_states)?)
+    }
+
+    /// `⟨W, ∂_θ H²[e_a, e_b]⟩` for a baseline-chart coordinate `θ` under the outer row measure
+    /// (gam#2930); see `SurvivalMarginalSlopeRowKernel::contracted_trace_hessian_primary_shift`.
+    /// `None` on a frame [`Self::baseline_contracted_trace_hessian_psi_available`] declines.
+    pub(crate) fn baseline_contracted_trace_hessian_psi_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        weight: &Array2<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let geometry = self.rigid_baseline_geometry()?;
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .contracted_trace_hessian_primary_shift(weight, &row_weights, |row| {
+            Self::rigid_baseline_primary_first::<STATIC_SLOPE_PRIMARIES>(geometry, row, axis)
+        })
+        .map(Some)
+    }
+
+    /// `⟨W, ∂_θ H³[v, e_a, e_b]⟩` for a baseline-chart coordinate `θ` and coefficient direction
+    /// `v` under the outer row measure (gam#2930); see
+    /// `SurvivalMarginalSlopeRowKernel::contracted_trace_hessian_primary_shift_directional`.
+    pub(crate) fn baseline_contracted_trace_hessian_psi_directional_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        weight: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let geometry = self.rigid_baseline_geometry()?;
+        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .contracted_trace_hessian_primary_shift_directional(weight, &row_weights, d_beta, |row| {
+            Self::rigid_baseline_primary_first::<STATIC_SLOPE_PRIMARIES>(geometry, row, axis)
+        })
+        .map(Some)
+    }
+
+    /// `⟨W, ∂²_θθ' H²[e_a, e_b]⟩` for a pair of baseline-chart coordinates under the outer row
+    /// measure (gam#2930); see `SurvivalMarginalSlopeRowKernel::contracted_trace_hessian_primary_shift_pair`.
+    pub(crate) fn baseline_contracted_trace_hessian_psi_pair_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        other_axis: usize,
+        weight: &Array2<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let geometry = self.rigid_baseline_geometry()?;
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .contracted_trace_hessian_primary_shift_pair(weight, &row_weights, |row| {
+            Ok((
+                Self::rigid_baseline_primary_first::<STATIC_SLOPE_PRIMARIES>(geometry, row, axis)?,
+                Self::rigid_baseline_primary_first::<STATIC_SLOPE_PRIMARIES>(
+                    geometry, row, other_axis,
+                )?,
+                Self::rigid_baseline_primary_second::<STATIC_SLOPE_PRIMARIES>(
+                    geometry, row, axis, other_axis,
+                )?,
+            ))
+        })
+        .map(Some)
+    }
+
+    /// Whether [`Self::design_contracted_trace_hessian_psi_with_options`] serves design axis
+    /// `psi_index`: a ψ block on the frame [`Self::baseline_contracted_trace_hessian_psi_available`]
+    /// serves (gam#2930).
+    pub(crate) fn design_contracted_trace_hessian_psi_available(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+    ) -> Result<bool, String> {
+        Ok(self.baseline_contracted_trace_hessian_psi_available(block_states)?
+            && self.psi_block_info(derivative_blocks, psi_index)?.is_some())
+    }
+
+    /// `⟨W, ∂_ψ H²[e_a, e_b]⟩` for a design coordinate ψ under the outer row measure (gam#2930);
+    /// see `SurvivalMarginalSlopeRowKernel::design_contracted_trace_hessian_psi_from`. `None` on a
+    /// frame or axis [`Self::design_contracted_trace_hessian_psi_available`] declines.
+    pub(crate) fn design_contracted_trace_hessian_psi_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .design_contracted_trace_hessian_psi(derivative_blocks, psi_index, weight, &row_weights)
+    }
+
+    /// `⟨W, ∂_ψ H³[v, e_a, e_b]⟩` for a design coordinate ψ and coefficient direction `v` under
+    /// the outer row measure (gam#2930); see
+    /// `SurvivalMarginalSlopeRowKernel::design_contracted_trace_hessian_psi_directional_from`.
+    pub(crate) fn design_contracted_trace_hessian_psi_directional_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        weight: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .design_contracted_trace_hessian_psi_directional(
+            derivative_blocks,
+            psi_index,
+            weight,
+            &row_weights,
+            d_beta,
+        )
+    }
+
+    /// `⟨W, ∂²_ψψ' H²[e_a, e_b]⟩` for a pair of design coordinates under the outer row measure
+    /// (gam#2930); see `SurvivalMarginalSlopeRowKernel::design_contracted_trace_hessian_psi_pair_from`.
+    pub(crate) fn design_contracted_trace_hessian_psi_pair_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
+        weight: &Array2<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.baseline_contracted_trace_hessian_psi_available(block_states)? {
+            return Ok(None);
+        }
+        let row_weights = self.rigid_third_row_weights(options);
+        SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            self.clone(),
+            block_states.to_vec(),
+        )
+        .design_contracted_trace_hessian_psi_pair(derivative_blocks, psi_i, psi_j, weight, &row_weights)
     }
 
     /// Refuse a frame without closed-form fifth likelihood derivatives; see

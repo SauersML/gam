@@ -69,6 +69,9 @@ use rayon::prelude::*;
 /// replacement ledger ([`crate::manifold::curve_promotion`]) adjudicates on
 /// [`ring_recognition`] and its own finite codebook and never reads this screen
 /// (#2933 F23). [`CurlVerdict::geometry_ok`] still conjoins it.
+///
+/// Derived (#2469): `π/√3`, the zero of the per-row gain above, written to
+/// f64 precision.
 pub const RD_CROSSOVER_FACTOR: f64 = 1.8137993642342178; // π / √3
 
 /// The evidence level the κ / resultant gates fire at (a 2σ screen, matching the

@@ -181,16 +181,13 @@ fn run_cell(cell: &Cell) -> Result<String, String> {
         .collect();
     let lambda = vec![1.0_f64; k_ret];
 
-    // The fixed point is allowed to run out of cycles: this is a shape probe,
-    // not a convergence probe. Only an ABORT is a defect here.
-    let mut inner = String::new();
-    for cycle in 1..=3 {
-        inner = term
-            .solve_fixed_point(centered.view(), &lambda, &ard, 1, 1.0e-4, 1.0)
-            .map(|report| format!("inner recurred in {}", report.iterations))
-            .unwrap_or_else(|error| format!("inner Err({})", &error[..error.len().min(60)]));
-        audit_atom_shape_contract(&term, &format!("after cycle {cycle}"))?;
-    }
+    // The fixed point may refuse: this is a shape probe, not a convergence probe.
+    // Only an ABORT is a defect here.
+    let inner = term
+        .solve_fixed_point(centered.view(), &lambda, &ard, 1.0e-4, 1.0)
+        .map(|report| format!("inner recurred in {}", report.iterations))
+        .unwrap_or_else(|error| format!("inner Err({})", &error[..error.len().min(60)]));
+    audit_atom_shape_contract(&term, "after the fixed point")?;
     term.reconstruct()?;
     term.raw_stationarity(centered.view(), &lambda, &ard)?;
     term.penalized_objective(centered.view(), &lambda, &ard)?;

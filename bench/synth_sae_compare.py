@@ -11,7 +11,7 @@ the same direct ground-truth metrics:
 * direction recovery precision/recall/F1/Jaccard (quality-aware coverage)
 * matched-latent firing precision/recall/F1
 
-The manifold row uses the repo's public ``gamfit.sae_manifold_fit`` API. The
+The manifold row uses the repo's public ``gamfit.sae.sae_manifold_fit`` API. The
 baseline rows use PyTorch modules in this file to avoid changing package
 dependencies; if SAELens is installed, the output records that official-library
 availability so larger official SAELens runs can be wired separately.
@@ -325,7 +325,7 @@ def _score_manifold(
     atom_dim: int,
 ) -> ModelResult:
     t0 = time.perf_counter()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=train_x,
         K=atoms,
         atom_topology=basis,
@@ -333,7 +333,6 @@ def _score_manifold(
         assignment="softmax",
         top_k=top_k,
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=max_iter,
@@ -377,7 +376,7 @@ def _score_manifold(
         decoder_dirs=decoder_dirs,
         seconds=seconds,
         steps=max_iter,
-        notes=f"gamfit.sae_manifold_fit, atoms={atoms}, basis={basis}, top_k={top_k}",
+        notes=f"gamfit.sae.sae_manifold_fit, atoms={atoms}, basis={basis}, top_k={top_k}",
     )
 
 

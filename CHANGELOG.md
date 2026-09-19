@@ -1,5 +1,159 @@
 ## Unreleased
 
+- **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
+  open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
+  coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
+  its truth RMSE stayed at ~0.134 from `n = 1e3` to `n = 1e5` while `basis_check`
+  rejected it at `p = 0`. The default now starts from that pilot resolution and grows
+  through the adaptive resolution loop the spatial smooths already use, one doubling at
+  a time, until the basis is neither saturated nor rejected by the #2774 lack-of-fit
+  test. The growth is bounded only by the covariate's distinct values (the
+  interpolating limit) and by the design rank (the model keeps a residual degree of
+  freedom). Null and linear truths still shrink to ~0 and ~1 EDF. An explicit `k=`,
+  `knots=`, a Python smooth override, or a cyclic, factor, tensor or radial basis keeps
+  its fixed size. Knot placement stays uniform by default (`knot_placement=quantile`
+  opts in). The per-fit "Automatically set N internal knots" note is gone. **Behavior change:** default
+  `s(x)` fits on signal-rich data have more coefficients and different EDF.
+- **`basis_check` on an estimated-scale fit uses the exact added-variable F** (pyGAM audit,
+  lane pv-model-comparison). With the scale estimated (Gaussian and other
+  estimated-dispersion families), the lack-of-fit p-value compared `T/r` with
+  `F(r, ν)`. But `νφ̂` contains the numerator's own share `T·φ̂`, so `T/r` is
+  `(ν/r)·Beta(r/2, (ν − r)/2)`, not F. The test was conservative: at n = 200 under an
+  adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
+  replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
+  the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
+  Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
+  (binomial, Poisson) are unchanged. Calibration is in `bench/pvalue_calibration/pv-model-comparison/`.
+- **The top-level `gamfit` namespace is 19 names** (PKG-06). `import gamfit` exposed about
+  340 names: the core API next to every research helper, basis primitive, result class and
+  error type, several under two names. The top level now holds the fit and load entry
+  points and the fitted-model classes: `fit`, `fit_array`, `load`, `loads`,
+  `validate_formula`, `explain_error`, `build_info`, `compare_models`,
+  `competing_risks_cif`, `fit_event_history`, `fit_joint_event_model`,
+  `load_joint_event_model`, `Model`, `MultinomialModel`, `EventHistoryModel`,
+  `JointEventModel`, `ResponseGeometryModel`, `CtnStage1` and `__version__`. Everything else
+  lives in one public submodule, loaded on first access: `basis`, `cuda`, `diagnostics`,
+  `errors`, `examples`, `geometry`, `identifiability`, `inference`, `kernels`, `manifolds`,
+  `penalties`, `plot`, `reml`, `response_geometry`, `results`, `sae`, `sklearn`, `smooth`,
+  `topology`, `torch` (and `kernels_jax` / `kernels_torch`). Every other module is private.
+  `import gamfit` no longer loads the SAE, topology-selection or plotting code.
+  **Migration:** `gamfit.X` becomes `gamfit.<submodule>.X`, for example
+  `gamfit.GamError` → `gamfit.errors.GamError`, `gamfit.Diagnostics` →
+  `gamfit.results.Diagnostics`, `gamfit.bspline_basis` → `gamfit.basis.bspline_basis`,
+  `gamfit.sae_manifold_fit` → `gamfit.sae.sae_manifold_fit`,
+  `gamfit.select_topology` → `gamfit.topology.select_topology`. Duplicates were removed
+  rather than aliased: `gamfit.save(m, path)` → `m.save(path)`;
+  `gamfit.identifiability_check` → `gamfit.identifiability.check`;
+  `gamfit.TopologySphere` → `gamfit.topology.Sphere`; `gamfit.SmoothSpec` →
+  `gamfit.smooth.Smooth`; `gamfit.plot_atom` / `gamfit.plot_fit` →
+  `gamfit.plot.sae_atom` / `gamfit.plot.sae_fit`; `gamfit.PoincareAtoms` /
+  `gamfit.InterchangeSwapDecoder` → `gamfit.torch.PoincareAtoms` /
+  `gamfit.torch.InterchangeSwapDecoder`. The research modules `structure_discovery`,
+  `layer_transport`, `manifold_crosscoder`, `manifold_behavior`, `checkpoint_dynamics`,
+  `intervention_calibration`, `parameter_decomposition`, `bartlett` and `full_conformal`
+  are now private; their public functions are in `gamfit.sae` and `gamfit.inference`.
+- **`gamfit.plot` is a plotting module.** `gamfit.plot.model`, `trace`, `sae_atom` and
+  `sae_fit` import matplotlib when called. Without it they raise an `ImportError` naming
+  the `gamfit[plot]` extra, as do `Model.plot` and `PosteriorSamples.plot_trace`.
+- **Weighted chi-square, F and t tails are accurate relative to the tail itself** (pyGAM
+  audit pv-tails-numerics, inference L4). The signed weighted chi-square survival function
+  used Imhof's `½ + (1/π)∫`, which cancels once the tail falls below about `1e-16`. It
+  also had its tolerance clamped to `[1e-13, 1e-3]` by the smooth-term LR driver, and its
+  result clamped to `[0, 1]`. Its equal-weights shortcut read negative weights as
+  `1 − chi_square_sf`. Together these put a floor under small p-values: a profiled-scale
+  tail at `1e-200` came back as `5e-16`, and an all-negative spectrum near `1e-16` was off
+  by `0.11` while claiming a bound of zero. `signed_weighted_chi_square_sf` now inverts
+  the moment generating function along a hyperbolic contour through its saddle point, and
+  returns a `TailProbability { probability, relative_error }`. The error bound is derived
+  from the arithmetic that produced the value: level difference, truncation, per-node
+  conditioning and pairwise-summed rounding. There is no tolerance argument;
+  `signed_weighted_chi_square_sf_to_tolerance` is removed. Against 25-digit mpmath
+  references from `1 − 1e-12` down to `1e-300`, the worst error is `1.1e-13`, and the
+  bound is honest and below `1e-10` everywhere.
+  `fisher_snedecor_sf` and `student_t_two_sided_probability` returned `1` when the beta
+  argument `x` rounded to one. For example, `F(0.001, 1)` at `f = 1.3e-48` should be
+  `0.0575`. They now carry `ln(1 − x)` exactly and use the complement series there. The
+  smooth-term LR driver drops `SmoothLrReferenceDf::statistic_resolution` and its
+  tolerance floor and ceiling. `p_value_bound` is now the inversion's own bound.
+
+- **Several expectile levels fit jointly and never cross** (pyGAM audit F5b). A list of
+  levels (`expectile_tau=[0.1, 0.5, 0.9]` in Python, `--expectile-tau 0.1,0.5,0.9` on the
+  CLI, a list `expectile_tau` in a fit request document) could not be requested, and
+  levels fitted one at a time can cross, most visibly where the spread is small or past
+  the data. A multi-level request now fits ONE Gaussian location-scale GAM `(μ, σ)`, with
+  REML/LAML smoothing on both surfaces, and reports the level-`τ` curve as
+  `μ(x) + c_τ·E[σ(x)]`, where `c_τ` is the closed-form weighted `τ`-expectile of the
+  standardized residuals. `c_τ` increases strictly with `τ` and `σ > 0`, so the curves are
+  ordered at every `x`, including under extrapolation; nothing is sorted afterwards.
+  Python `predict` returns an `(n, K)` array (one column per level), and the CLI and the
+  prediction table add one `expectile_{τ}` column per level. A single level, as a scalar
+  or a one-element list, is still the single-level LAWS fit. Saved joint models refuse
+  estimator metadata whose levels or standardized expectiles are not strictly increasing.
+  They do not sample (no observation law is claimed) and do not take conformal intervals.
+- **Model comparison ranks on the smoothing-corrected AIC, in one Rust function** (pyGAM
+  audit d11). `gamfit.compare_models`, `Model.evidence_ratio_vs` and the new `gam compare`
+  used to rank on an uncorrected `−2·loglik + 2·edf` that the Python FFI assembled from
+  summary fields. It counted no estimated scale and no correction for having estimated
+  the smoothing parameters, and on `y ~ s(x)` against `y ~ s(x) + s(z)` with `z` pure
+  noise it preferred the noise model in 9 of 20 fixed-seed replicates; the corrected
+  ranking prefers the true model in 18 of 20. The fitted summary
+  now carries `aic_conditional = −2·loglik + 2·(edf + scale_dof)`, `edf_corrected`
+  (Wood, Pya and Säfken 2016: `edf + tr(X'WX·J V_ρ Jᵀ)/scale`), `aic_corrected`,
+  `scale_dof` and, when no correction exists (the O(n) spline scan keeps no ρ covariance),
+  `aic_corrected_unavailable`. `compare_saved_models` ranks on `aic_corrected` and refuses
+  a fit without it, with that reason; it never falls back to the conditional AIC. Both
+  `compare_models` and `gam compare MODEL... --names ...` print its serialized result.
+  `compare_models` takes fitted models (or their saved bytes) only; summary mappings and
+  `cv_scores` are gone. The REML/LAML `score_table` stays, for nested comparisons that
+  share the family, data and unpenalized fixed-effect space.
+  **Migration:** `Model.conditional_aic` is removed; read `model.summary().aic_corrected`
+  (or `aic_conditional`). Ranking rows are dicts keyed `name`, `aic_corrected`,
+  `delta_aic`, `evidence_ratio`, `aic_conditional`, `edf_corrected`, `edf_conditional`.
+- Rust: `gam_solve::inference::information_criteria` (`corrected_edf`,
+  `information_criteria`, `InformationCriteria`) is the one place the criteria are formed.
+  `evidence::compare_models` takes `ComparisonCandidate`s and returns
+  `criterion = "aic_corrected"`; `criterion_gap` is now `log_evidence_ratio`. The pyffi
+  bindings `model_conditional_aic` and `compare_reml_fits` and the helper
+  `ranking_score_from_summary_payload` are deleted.
+- **Fitted models pickle, copy and cross process boundaries** (pyGAM audit api F1 / PKG-02).
+  `pickle.dumps`, `copy.deepcopy`, `joblib.dump` and `joblib.Parallel` refused a fitted
+  `Model`, `MultinomialModel` or sklearn `GAMRegressor`/`GAMClassifier` with
+  `cannot pickle '_FittedModel'`. They now serialize the saved-model bytes `dumps()` returns
+  and rebuild through `gamfit.loads`, so a round trip is byte-identical and every accessor
+  returns bit-identical values. The compiled prediction handle is never pickled; it is
+  rebuilt from the bytes.
+- **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
+  accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
+  `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`
+  normalized their rows silently. Both now apply one rule: `|‖p‖² − 1|` may not exceed the
+  band an f64 normalization leaves, `γ_{2d+6}` (about `1.3e-15` for `d = 3`). A wider
+  point is refused with the measured defect and the fix, and is never normalized. This
+  deliberately refuses points normalized in f32 or rounded to about six digits.
+  **Migration:** normalize each point in f64 before passing it, e.g. `p / np.linalg.norm(p)`.
+  The sphere exponential now normalizes its output, so iterates stay inside that band
+  however many steps they take.
+- **The Bernoulli marginal-slope Jeffreys prior uses the expected Fisher information** (#2922).
+  The binary marginal-slope family priced its Jeffreys/Firth term from the observed
+  joint Hessian. Away from the mode that matrix is indefinite (smallest eigenvalue down
+  to −4.5 on a 50-row flexible fit), and the term's value jumped between trust-region
+  trials whose likelihood barely moved. The term now uses the expected information
+  `Σ w·∇p∇pᵀ/(p(1 − p))`, the matrix the custom-family contract asks of a non-canonical
+  Bernoulli likelihood, for its value and every coefficient, design-hyperparameter and
+  learned frailty-scale derivative. Fits whose Jeffreys term is armed get different
+  coefficients and EDF. A flexible fit with a learned frailty scale and an armed Jeffreys
+  term refuses on the frailty-scale axis, as its observed frailty-scale derivatives
+  already did.
+- Rust: `CustomFamily` gains `joint_jeffreys_information_psi_derivative`,
+  `joint_jeffreys_information_psi_derivative_all_axes`,
+  `joint_jeffreys_information_psi_second_derivative`,
+  `joint_jeffreys_information_psi_second_derivative_all_axes` and
+  `joint_jeffreys_information_psi_directional_second_all_axes`: the design-hyperparameter
+  motion of a Jeffreys information that is not the observed joint Hessian. The explicit-ψ
+  Jeffreys terms used to substitute the observed Hessian's motion for such a family; a
+  family that supplies none of its own now gets a typed `UnsupportedConfiguration`
+  refusal. The binomial location-scale and location-scale-wiggle families declare the
+  expected information and supply none yet, so their armed fits with a design
+  hyperparameter refuse.
 - **A failed fit raises the class of what failed, not `IntegrationError`** (#2937).
   Every fit-solver failure used to reach Python as `IntegrationError`, so a
   refused start, a stalled outer search and a numerical refusal could not be
@@ -30,7 +184,88 @@
   `CustomFamilyError::FitEndedWithoutCertifiedInnerMode` wraps the refusal a fit
   ended with, and `fit_ended_without_certified_inner_mode` is its only
   constructor; inside a trial the refusal stays `InnerSolveNotConverged`, which
-  the outer search steps away from.
+  the outer search steps away from. `CustomFamilyError::OuterSmoothingFailed`
+  gains `search_inner_refusal`, the search's most recent uncertified inner
+  solve, which the fit boundary names even when finite trials ran after it;
+  `last_refusal` stays the last evaluation's refusal, which Jeffreys arming reads.
+- **The raw REML/LAML score-table ratio is no longer called a Bayes factor** (#2946).
+  `compare_models`'s `score_table` key `bayes_factor_best_over_model` is now
+  `reml_criterion_ratio_best_over_model`. It is `exp(delta_reml)`, the exp of the raw
+  criterion gap: a restricted-evidence ratio only at plug-in λ with normalized evidence
+  over a fixed-effect space the candidates share, and never a prior-integrated Bayes
+  factor. **Migration:** read `reml_criterion_ratio_best_over_model`.
+- Rust: `ScoreRow.bayes_factor_best_over_model` is renamed to match, and
+  `evidence::log_bayes_factor(a, b)` is now `criterion_gap(a, b)` (`b − a`). The same gap
+  measures the conditional-AIC ranking delta, where "Bayes" was wrong as well.
+- **`Model.evidence` is now `Model.conditional_aic`** (#2946). The property has returned
+  the conditional AIC `−2·loglik + 2·edf` that `compare_models` ranks on since #2079. That
+  is a cost on the −2·log scale, not a marginal likelihood or evidence. No alias is kept.
+  **Migration:** read `Model.conditional_aic`. `Model.evidence_ratio_vs` keeps its name,
+  since it is the Akaike evidence ratio of that cost.
+- **The Tier-0 ρ-posterior diagnostic is an adequacy grade, not a certificate** (#2946).
+  Its PSIS tail shape `k̂` is fitted to `⌈√M⌉` excesses. At the default `M = 64` it has a
+  standard error of about `0.27` at the `0.7` cutoff, so the grade certifies nothing.
+  Rust: `RhoCertificate` is now `RhoProposalAdequacy` (`PlugInCertified` → `PlugInAdequate`),
+  `RhoPosteriorCertificate` is now `RhoPosteriorAdequacy` (field `certificate` → `adequacy`),
+  `RhoPosteriorOutcome::Certified` is now `Assessed`, `PLUG_IN_CERTIFIED_K_HAT` is now
+  `PLUG_IN_ADEQUATE_K_HAT`, and `rho_posterior_certificate` is now `rho_posterior_adequacy`.
+  New `gam_solve::psis::shape_standard_error` and
+  `inference::rho_posterior::k_hat_standard_error` give the grade's resolution.
+  **Saved models:** new payloads write only the new tokens. A payload written earlier still
+  reads, because the old tokens are accepted as read-only aliases.
+- **Marginal-slope fits anchor on the estimated law of the score by default**
+  (#2926). Both families test the score's conditional law on the
+  marginal-index span. Where that law does not move and the score passes the
+  standard-normal adequacy screen, the fit uses the closed form, kept at the
+  converged fit only when the rows' anchoring residuals under the estimated
+  law say it is expected to be at least as accurate as that law's own anchor
+  (`D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0`), and records it as
+  `estimated-gaussian-adequate`; otherwise the fit is re-solved on the
+  estimated law (`estimated-global-by-residual`). Otherwise it anchors the index on
+  one estimated finite law, or on local laws by context where the law moves,
+  with the score on its own axis. The rank inverse-normal and automatic
+  conditional standardisation are gone from the default.
+- The standard-normal adequacy screen's bounds are the null quantiles of its
+  own statistics at the sample's effective size, at level 0.05 split over its
+  eight clauses (the KS bound is Kolmogorov's critical value, about
+  `1.70/√n`), instead of fixed skewness, kurtosis, KS, tail and `|z|`
+  constants. An exactly Gaussian score fails it at most 5% of the time at any
+  `n` (by Kolmogorov's law the fixed KS bound of 0.025 failed about 16% of
+  them at n = 2000), and a departure fails it once `n` resolves it (the fixed
+  bound passed KS up to 0.025 at any `n`).
+- `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain declare
+  the Gaussian closed form. A declaration is refused when the score's
+  conditional law moves on the span; when the pooled score fails the
+  adequacy screen it is fitted with a warning, and the model records the
+  ledger and the declaration's excess anchoring loss `D̂`.
+  `latent_measure="conditional-location-scale"`
+  keeps the location-scale law on the span as an explicit choice, and
+  `declared_latent_law` now serves the Bernoulli family too.
+- Saved models record which law the fit consumed in `latent_law_consumed`.
+  Models saved earlier replay their old calibration unchanged.
+- Fits that anchor on an estimated law are slower than the closed form until
+  the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
+  score took 199 s where the closed form took 4.6 s, and on a moving law
+  1 031 s where the previous default refused. A closed form the certificate
+  keeps costs what it did (5.1 s against 5.3 s on a Gaussian score).
+- Survival configurations whose kernel is closed-form only (flex blocks, an
+  influence absorber, time-wiggle, follow-up-varying slope) keep the closed
+  form and certify it by `D̂`. Where it prefers the estimated law, which
+  nothing there can re-solve on yet (#2948), the fit keeps the closed form,
+  recorded `gaussian-uncertified` with that certificate. A fit on
+  any of them whose law departs or moves records `gaussian-uncertified` with
+  a warning naming what is missing.
+- Several survival scores anchor on their joint law where some score departs
+  from the standard normal. Where a score's law moves, every score keeps the
+  closed form as `gaussian-uncertified`, naming that score (#2949). A closed
+  form the screen chose for several scores is certified by `D̂` on their joint
+  law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
+  with `D̂` where nothing can re-solve on it.
+- **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
+  into every atom under a label that claimed a per-atom marginal likelihood. It was
+  neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
+  `penalized_loss_score`. The `ManifoldSAE` artifact schema is now `v10`, without the
+  per-atom `evidence`. A `v9` artifact still loads and drops that copy on read.
 
 ## gamfit 0.1.268 (2026-09-11)
 

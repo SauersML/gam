@@ -36,6 +36,31 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
 }
 
 impl SparseExactFactor {
+    /// Stored nonzeros of the Cholesky factor `L`, which fixes the cost of
+    /// one triangular solve pair (`≈ 4·nnz(L)` flops).
+    pub fn factor_nnz(&self) -> usize {
+        self.simplicial.l_values.len()
+    }
+
+    /// Multiply-adds of the Takahashi recurrence on this factor: every pair of
+    /// off-diagonal rows in a column of `L` costs one, so this is
+    /// `Σ_j c_j²` over the off-diagonal counts `c_j`, the same order as the
+    /// numeric factorization itself.
+    pub fn selected_inverse_flops(&self) -> usize {
+        self.simplicial
+            .l_col_ptr
+            .windows(2)
+            .map(|w| {
+                let off_diagonal = w[1] - w[0] - 1;
+                off_diagonal * off_diagonal
+            })
+            .sum()
+    }
+
+    /// `H⁻¹` on the filled pattern of this factor (see [`TakahashiInverse`]).
+    pub fn selected_inverse(&self) -> Result<TakahashiInverse, LinalgError> {
+        TakahashiInverse::compute(&self.simplicial)
+    }
 }
 
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
@@ -202,7 +227,7 @@ pub fn factorize_sparse_spd(
     let logdet = simplicial.logdet;
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     if elapsed_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
             n_input,
             elapsed_ms
@@ -629,6 +654,7 @@ pub fn assemble_sparse_factor_h_dense(
 // ---------------------------------------------------------------------------
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
+use faer::linalg::cholesky::ldlt::factor::LdltRegularization;
 use faer::linalg::cholesky::llt::factor::LltRegularization;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
@@ -846,6 +872,81 @@ fn factorize_simplicial_canonical_upper(
         n,
         logdet,
     })
+}
+
+/// The inertia of a sparse symmetric matrix from its simplicial `LDLᵀ` factor, on the
+/// AMD ordering and symbolic analysis the sparse Cholesky here uses (#2901).
+///
+/// `P A Pᵀ = L D Lᵀ` with `L` unit lower triangular is a congruence, so by Sylvester's
+/// law of inertia `A` has as many negative, zero and positive eigenvalues as `D` has
+/// pivots of each sign. The factorization does not pivot, so an exactly zero pivot
+/// stops it before the inertia is known, and `None` is returned. `factor_magnitude` is
+/// `‖L̂‖_F²·max|D̂|`.
+pub fn sparse_symmetric_inertia(
+    h: &SparseColMat<usize, f64>,
+) -> Result<Option<crate::faer_ndarray::SymmetricInertia>, LinalgError> {
+    let h_upper = canonicalize_sparse_symmetric_upper(h)?;
+    let n = h_upper.ncols();
+    let mut inertia = crate::faer_ndarray::SymmetricInertia {
+        negative: 0,
+        zero: 0,
+        positive: 0,
+        smallest_pivot: f64::INFINITY,
+        factor_magnitude: 0.0,
+    };
+    if n == 0 {
+        return Ok(Some(inertia));
+    }
+    let SparseCholeskyAnalysis {
+        a_perm_upper,
+        symbolic,
+        ..
+    } = analyze_canonical_upper(&h_upper)?;
+    let mut l_values = vec![0.0f64; symbolic.len_val()];
+    let mut mem = MemBuffer::new(simplicial::factorize_simplicial_numeric_ldlt_scratch::<
+        usize,
+        f64,
+    >(n));
+    if simplicial::factorize_simplicial_numeric_ldlt::<usize, f64>(
+        &mut l_values,
+        a_perm_upper.as_ref(),
+        LdltRegularization::default(),
+        &symbolic,
+        MemStack::new(&mut mem),
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    // Each column of `L` stores its pivot `D_jj` first, in place of the unit diagonal.
+    let col_ptr = symbolic.col_ptr();
+    let mut lower_frobenius_sq = 0.0_f64;
+    let mut pivot_norm = 0.0_f64;
+    let mut finite = true;
+    for j in 0..n {
+        let start = col_ptr[j];
+        let pivot = l_values[start];
+        if !pivot.is_finite() {
+            finite = false;
+        } else if pivot < 0.0 {
+            inertia.negative += 1;
+        } else if pivot > 0.0 {
+            inertia.positive += 1;
+        } else {
+            inertia.zero += 1;
+        }
+        inertia.smallest_pivot = inertia.smallest_pivot.min(pivot);
+        pivot_norm = pivot_norm.max(pivot.abs());
+        lower_frobenius_sq += 1.0;
+        for value in &l_values[start + 1..col_ptr[j + 1]] {
+            lower_frobenius_sq += value * value;
+        }
+    }
+    if !finite {
+        return Ok(None);
+    }
+    inertia.factor_magnitude = lower_frobenius_sq * pivot_norm;
+    Ok(Some(inertia))
 }
 
 impl SimplicialFactor {
@@ -1152,6 +1253,36 @@ impl TakahashiInverse {
         } else {
             self.exact_permuted_column(col)[row]
         }
+    }
+
+    /// `tr(H⁻¹ RᵀR)` for a root `R` whose columns are the coefficients
+    /// `col_offset..col_offset + R.ncols()`, as `Σ_r r H⁻¹ rᵀ` over the rows
+    /// `r` of `R`, each row contracted on its own support.
+    ///
+    /// A pair `(j, k)` inside one row's support is a nonzero of `RᵀR`; when
+    /// `RᵀR` is a summand of `H` that pair is on `H`'s pattern and therefore on
+    /// the selected-inverse pattern, so no column solve is needed. A
+    /// random-effect ridge root (one nonzero per row) costs one lookup per level
+    /// instead of forming `RᵀR` or solving against its rows.
+    pub fn trace_root_gram(&self, root: ArrayView2<'_, f64>, col_offset: usize) -> f64 {
+        let mut support: Vec<(usize, f64)> = Vec::new();
+        let mut trace = 0.0;
+        for row in root.outer_iter() {
+            support.clear();
+            support.extend(
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &value)| value != 0.0)
+                    .map(|(col, &value)| (col_offset + col, value)),
+            );
+            for (a, &(j, r_j)) in support.iter().enumerate() {
+                trace += r_j * r_j * self.get(j, j);
+                for &(k, r_k) in &support[a + 1..] {
+                    trace += 2.0 * r_j * r_k * self.get(j, k);
+                }
+            }
+        }
+        trace
     }
 
     /// Diagonal of H⁻¹ in original ordering.

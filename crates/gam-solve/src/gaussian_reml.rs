@@ -11,7 +11,6 @@ use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s,
 };
-use opt::{RidgeSchedule, escalate_ridge};
 use rayon::prelude::*;
 
 const EIGEN_REL_TOL: f64 = 1.0e-10;
@@ -701,8 +700,8 @@ pub fn gaussian_reml_fit_blocks_exact(
 
     if f_blocks == 1 {
         // The scalar solver whitens by X'WX.  Certify that exact matrix before
-        // delegating so this block entry point never reaches the scalar
-        // compatibility jitter path.
+        // delegating so this block entry point rejects a singular Gram with
+        // the certified factorization's diagnosis.
         let xtwx = fast_xt_diag_x(&design.view(), &weight.view());
         gam_linalg::utils::certified_spd_factorize(
             &xtwx,
@@ -1569,68 +1568,150 @@ struct BlockOrthogonalEval {
     fitted_energy: Array1<f64>,
     penalty_energy: Array1<f64>,
     curvature_energy: Array1<f64>,
+    /// `Σ_i c²_i·u_i`: the block's share of the profiled residual deviance
+    /// beyond the whole design's unpenalized residual (see
+    /// [`block_orthogonal_profiled_residual`]).
+    penalized_residual: Array1<f64>,
     edf: f64,
 }
 
-fn block_penalty_rank_logdet(
-    penalty: ArrayView2<'_, f64>,
-) -> Result<(usize, f64), EstimationError> {
-    let eigs = penalty
-        .to_owned()
-        .eigh(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?
-        .0;
-    // The range predicate every other consumer of a penalty spectrum uses
-    // (#2740), so rank, nullity and log-determinant are invariant under S -> c S.
-    let tol = penalty_range_tolerance(eigs.view());
-    let mut rank = 0_usize;
-    let mut logdet = 0.0;
-    for eig in eigs.iter().copied() {
-        if eig > tol {
-            rank += 1;
-            logdet += eig.ln();
-        }
-    }
-    Ok((rank, logdet))
+/// Every block's eigen cache and projected response, and the whole design's
+/// unpenalized residual, read off ONE Householder factor of the concatenated
+/// weighted design `W½·[X_1 | … | X_B]`.
+///
+/// The blocks are W-orthogonal, so that factor's `R` is block diagonal: its
+/// diagonal blocks are the blocks' own triangular factors, the leading rows of
+/// `Qᵀ·W½y` split into the blocks' heads, and the trailing rows are the part of
+/// the response no block reaches. That last part is `r0` as a sum of squares
+/// (see [`rotated_weighted_response`]). A per-block factor cannot supply it: each
+/// block's tail still holds the other blocks' signal, and taking it back out is
+/// the `ywy − explained` subtraction this route replaces (#2280).
+struct BlockOrthogonalPrepared {
+    caches: Vec<GaussianRemlEigenCache>,
+    projected_rhs: Vec<Array2<f64>>,
+    unpenalized_residual: Array1<f64>,
 }
 
+fn prepare_block_orthogonal(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    weight: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+) -> Result<BlockOrthogonalPrepared, EstimationError> {
+    let n = y.nrows();
+    let total_columns = designs.iter().map(|design| design.ncols()).sum::<usize>();
+    let mut concatenated = Array2::<f64>::zeros((n, total_columns));
+    let mut offset = 0;
+    for design in designs {
+        concatenated
+            .slice_mut(s![.., offset..offset + design.ncols()])
+            .assign(design);
+        offset += design.ncols();
+    }
+    let factor = weighted_design_qr(concatenated.view(), weight)?;
+    drop(concatenated);
+    let (head, unpenalized_residual) = rotated_weighted_response(&factor, weight, y);
+    let mut caches = Vec::with_capacity(designs.len());
+    let mut projected_rhs = Vec::with_capacity(designs.len());
+    let mut offset = 0;
+    for (design, penalty) in designs.iter().zip(penalties.iter()) {
+        let columns = offset..offset + design.ncols();
+        let lower = factor
+            .upper
+            .slice(s![columns.clone(), columns.clone()])
+            .t()
+            .to_owned();
+        let cache = gaussian_reml_eigen_cache_from_lower(
+            lower,
+            penalty.view(),
+            None,
+            matrix_fingerprint(dense_xt_diag_x(design.view(), weight).view()),
+        )?;
+        projected_rhs.push(dense_atb(
+            cache.eigenvectors.view(),
+            head.slice(s![columns, ..]),
+        ));
+        caches.push(cache);
+        offset += design.ncols();
+    }
+    Ok(BlockOrthogonalPrepared {
+        caches,
+        projected_rhs,
+        unpenalized_residual,
+    })
+}
+
+/// One block's closed-form quantities at `rho`, in the block's whitened penalty
+/// eigenbasis: with `c = Vᵀ·head` and the modal kernels `u = t/(1+t)`,
+/// `v = 1/(1+t)` of `t = λδ`, every energy is a sum of non-negative terms,
+/// `βᵀXᵀWy = Σ c²v`, `βᵀλSβ = Σ c²uv`, `(λSβ)ᵀH⁻¹(λSβ) = Σ c²u²v` and the
+/// penalized residual `Σ c²u`, and `log|H| = log|XᵀWX| + Σ log(1+t)`.
 fn block_orthogonal_eval(
-    gram: &Array2<f64>,
-    rhs: &Array2<f64>,
-    penalty: &Array2<f64>,
+    cache: &GaussianRemlEigenCache,
+    projected_rhs: &Array2<f64>,
     rho: f64,
 ) -> Result<BlockOrthogonalEval, EstimationError> {
     let lambda = gam_problem::checked_exp_log_strength(rho)
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     validate_initial_lambda(lambda)?;
-    let scaled_penalty = penalty * lambda;
-    let hessian = canonicalize_penalty((gram + &scaled_penalty).view());
-    let chol = gaussian_reml_cholesky_lower(hessian)?;
-    let beta = solve_spd_from_lower_factor(&chol, rhs)?;
-    let solved_penalty = solve_spd_from_lower_factor(&chol, &scaled_penalty)?;
-    let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
-    let trace = (0..solved_penalty.nrows())
-        .map(|i| solved_penalty[[i, i]])
-        .sum::<f64>();
-    let trace_pair =
-        gam_linalg::utils::trace_of_product(solved_penalty.view(), solved_penalty.view());
-    let fitted_energy = (rhs * &beta).sum_axis(Axis(0));
-    let p_beta = scaled_penalty.dot(&beta);
-    let penalty_energy = (&beta * &p_beta).sum_axis(Axis(0));
-    let solved_p_beta = solve_spd_from_lower_factor(&chol, &p_beta)?;
-    let curvature_energy = (&p_beta * &solved_p_beta).sum_axis(Axis(0));
+    let outputs = projected_rhs.ncols();
+    let mut logdet = cache.logdet_xtwx;
+    let mut trace = 0.0;
+    let mut trace_pair = 0.0;
+    let mut edf = 0.0;
+    let mut fitted_energy = Array1::<f64>::zeros(outputs);
+    let mut penalty_energy = Array1::<f64>::zeros(outputs);
+    let mut curvature_energy = Array1::<f64>::zeros(outputs);
+    let mut penalized_residual = Array1::<f64>::zeros(outputs);
+    let mut shrunk = projected_rhs.clone();
+    let spectrum = PenaltyRangeSpectrum::of(cache);
+    for eig in 0..spectrum.len() {
+        let mode = modal_kernels(rho, spectrum.get(eig));
+        logdet += mode.log_one_plus_t;
+        trace += mode.u;
+        trace_pair += mode.u * mode.u;
+        edf += mode.v;
+        for output in 0..outputs {
+            let c2 = projected_rhs[[eig, output]] * projected_rhs[[eig, output]];
+            fitted_energy[output] += c2 * mode.v;
+            penalty_energy[output] += c2 * mode.w;
+            curvature_energy[output] += c2 * mode.w * mode.u;
+            penalized_residual[output] += c2 * mode.u;
+            shrunk[[eig, output]] *= mode.v;
+        }
+    }
     Ok(BlockOrthogonalEval {
-        beta,
+        beta: dense_ab(cache.coefficient_basis.view(), shrunk.view()),
         logdet,
         trace,
         trace_pair,
         fitted_energy,
         penalty_energy,
         curvature_energy,
-        edf: penalty.nrows() as f64 - trace,
+        penalized_residual,
+        edf,
     })
+}
+
+/// The profiled residual deviance `q_o = r0_o + Σ_b Σ_i c²_{b,i,o}·u_{b,i}`: the
+/// whole design's unpenalized residual plus each block's penalized part, a sum of
+/// non-negative terms.
+///
+/// Its defining form `ywy_o − Σ_b rhs_bᵀ·(G_b + λ_bS_b)⁻¹·rhs_b` is a difference
+/// that loses `≈ γ·tr(H_b)·‖β_b‖²` to the Cholesky backward error, and `‖β_b‖`
+/// grows like `1/σ_min` when the response lies on a block's smallest singular
+/// directions: probe job 1162960 measured it 2.9e3 times a planted `1e-8`
+/// residual at block condition 1e6, and negative at 1e8, where the `q > 0`
+/// refusal then rejected a design whose true residual is `1e-8` (#2280).
+fn block_orthogonal_profiled_residual(
+    evals: &[BlockOrthogonalEval],
+    unpenalized_residual: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut q = unpenalized_residual.to_owned();
+    for eval in evals {
+        q += &eval.penalized_residual;
+    }
+    q
 }
 
 /// Block-orthogonal shared-scale REML objective VALUE together with its
@@ -1715,16 +1796,15 @@ fn block_orthogonal_scale_objective(
 /// analytic score residual, erroring typed if the certificate is never met —
 /// so an iterate returned at this cap never silently becomes the estimator.
 fn solve_block_orthogonal_rho(
-    gram: &Array2<f64>,
-    rhs: &Array2<f64>,
-    penalty: &Array2<f64>,
+    cache: &GaussianRemlEigenCache,
+    projected_rhs: &Array2<f64>,
     rho0: f64,
     scale_precision: ArrayView1<'_, f64>,
     rank: usize,
     max_iter: usize,
 ) -> Result<(f64, BlockOrthogonalEval), EstimationError> {
     let mut rho = rho0;
-    let mut current = block_orthogonal_eval(gram, rhs, penalty, rho)?;
+    let mut current = block_orthogonal_eval(cache, projected_rhs, rho)?;
     for _ in 0..max_iter {
         // Value, ρ-gradient, and ρ-Hessian all come from the SINGLE
         // single-source objective evaluation — they cannot desync.
@@ -1769,7 +1849,8 @@ fn solve_block_orthogonal_rho(
                 if candidate_rho == rho {
                     break None;
                 }
-                if let Ok(candidate_eval) = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)
+                if let Ok(candidate_eval) =
+                    block_orthogonal_eval(cache, projected_rhs, candidate_rho)
                 {
                     let candidate_value = block_orthogonal_scale_objective(
                         &candidate_eval,
@@ -1809,7 +1890,8 @@ fn solve_block_orthogonal_rho(
                 if candidate_rho == rho {
                     break None;
                 }
-                if let Ok(candidate_eval) = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)
+                if let Ok(candidate_eval) =
+                    block_orthogonal_eval(cache, projected_rhs, candidate_rho)
                 {
                     let candidate = block_orthogonal_scale_objective(
                         &candidate_eval,
@@ -1835,14 +1917,10 @@ fn solve_block_orthogonal_rho(
 
 fn block_orthogonal_conditional_scale(
     evals: &[BlockOrthogonalEval],
-    ywy: ArrayView1<'_, f64>,
+    unpenalized_residual: ArrayView1<'_, f64>,
     nu: f64,
 ) -> Result<Array1<f64>, EstimationError> {
-    let mut explained = Array1::<f64>::zeros(ywy.len());
-    for eval in evals {
-        explained += &eval.fitted_energy;
-    }
-    let q = &ywy - &explained;
+    let q = block_orthogonal_profiled_residual(evals, unpenalized_residual);
     if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
@@ -2049,16 +2127,11 @@ fn block_orthogonal_profile_value(
     evals: &[BlockOrthogonalEval],
     rhos: ArrayView1<'_, f64>,
     ranks: &[usize],
-    ywy: ArrayView1<'_, f64>,
+    unpenalized_residual: ArrayView1<'_, f64>,
     nu: f64,
     d: usize,
 ) -> Option<BlockOrthogonalProfileValue> {
-    let mut explained = Array1::<f64>::zeros(ywy.len());
-    for eval in evals {
-        explained += &eval.fitted_energy;
-    }
-    let mut q = ywy.to_owned();
-    q -= &explained;
+    let q = block_orthogonal_profiled_residual(evals, unpenalized_residual);
     if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
         return None;
     }
@@ -2177,18 +2250,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         }
     }
 
-    let mut ywy = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for output in 0..d {
-            ywy[output] += weight[row] * y[[row, output]] * y[[row, output]];
-        }
-    }
-    let mut grams = Vec::with_capacity(designs.len());
-    let mut rhs_blocks = Vec::with_capacity(designs.len());
     let mut penalties_owned = Vec::with_capacity(penalties.len());
-    let mut ranks = Vec::with_capacity(penalties.len());
-    let mut penalty_logdets = Vec::with_capacity(penalties.len());
-    let mut nullity_total = 0_usize;
     for (block, (design, penalty)) in designs.iter().zip(penalties.iter()).enumerate() {
         let penalty_owned = canonicalize_penalty(penalty.view());
         validate_gaussian_reml_design(design.view(), penalty_owned.view(), Some(weight.view()))?;
@@ -2198,17 +2260,20 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
                 design.nrows()
             );
         }
-        let gram = dense_xt_diag_x(design.view(), weight.view());
-        let rhs = dense_xt_diag_y(design.view(), weight.view(), y);
-        let (rank, logdet) = block_penalty_rank_logdet(penalty_owned.view())?;
-        nullity_total += penalty_owned.nrows().saturating_sub(rank);
-        grams.push(canonicalize_penalty(gram.view()));
-        rhs_blocks.push(rhs);
         penalties_owned.push(penalty_owned);
-        ranks.push(rank);
-        penalty_logdets.push(logdet);
     }
     validate_weighted_block_orthogonality(designs, weight.view())?;
+    let prepared = prepare_block_orthogonal(designs, &penalties_owned, weight.view(), y)?;
+    let ranks = prepared
+        .caches
+        .iter()
+        .map(|cache| cache.penalty_rank)
+        .collect::<Vec<_>>();
+    let nullity_total = prepared
+        .caches
+        .iter()
+        .map(|cache| cache.nullity)
+        .sum::<usize>();
     let n_effective = effective_observation_count(weight.view());
     if n_effective <= nullity_total {
         crate::bail_invalid_estim!(
@@ -2227,14 +2292,15 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
     let mut evals = (0..designs.len())
         .map(|block| {
             block_orthogonal_eval(
-                &grams[block],
-                &rhs_blocks[block],
-                &penalties_owned[block],
+                &prepared.caches[block],
+                &prepared.projected_rhs[block],
                 rhos[block],
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut scale_precision = block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
+    let unpenalized_residual = prepared.unpenalized_residual.view();
+    let mut scale_precision =
+        block_orthogonal_conditional_scale(&evals, unpenalized_residual, nu)?;
     // Convergence is certified by the analytic score of the joint REML
     // objective, never by the iteration cap (SPEC rule 20). Each outer pass
     // (a) solves every block's 1-D rho Newton at the current scale precisions
@@ -2281,9 +2347,8 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         evals.clear();
         for block in 0..designs.len() {
             let (rho, eval) = solve_block_orthogonal_rho(
-                &grams[block],
-                &rhs_blocks[block],
-                &penalties_owned[block],
+                &prepared.caches[block],
+                &prepared.projected_rhs[block],
                 rhos[block],
                 scale_precision.view(),
                 ranks[block],
@@ -2292,7 +2357,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             rhos[block] = rho;
             evals.push(eval);
         }
-        scale_precision = block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
+        scale_precision = block_orthogonal_conditional_scale(&evals, unpenalized_residual, nu)?;
         let mut measured = measure_block_orthogonal_state(
             &evals,
             rhos.view(),
@@ -2315,7 +2380,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
                     &evals,
                     rhos.view(),
                     &ranks,
-                    ywy.view(),
+                    unpenalized_residual,
                     nu,
                     d,
                 ))
@@ -2338,18 +2403,20 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
                 let candidate = (0..designs.len())
                     .map(|block| {
                         block_orthogonal_eval(
-                            &grams[block],
-                            &rhs_blocks[block],
-                            &penalties_owned[block],
+                            &prepared.caches[block],
+                            &prepared.projected_rhs[block],
                             candidate_rhos[block],
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .ok()
                     .and_then(|candidate_evals| {
-                        let candidate_scale =
-                            block_orthogonal_conditional_scale(&candidate_evals, ywy.view(), nu)
-                                .ok()?;
+                        let candidate_scale = block_orthogonal_conditional_scale(
+                            &candidate_evals,
+                            unpenalized_residual,
+                            nu,
+                        )
+                        .ok()?;
                         let candidate_measured = measure_block_orthogonal_state(
                             &candidate_evals,
                             candidate_rhos.view(),
@@ -2364,7 +2431,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
                                 &candidate_evals,
                                 candidate_rhos.view(),
                                 &ranks,
-                                ywy.view(),
+                                unpenalized_residual,
                                 nu,
                                 d,
                             )
@@ -2445,11 +2512,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
     for (design, coef) in designs.iter().zip(coefficients.iter()) {
         fitted += &fast_ab(&design.view(), &coef.view());
     }
-    let mut explained = Array1::<f64>::zeros(d);
-    for eval in evals.iter() {
-        explained += &eval.fitted_energy;
-    }
-    let q = &ywy - &explained;
+    let q = block_orthogonal_profiled_residual(&evals, unpenalized_residual);
     if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
@@ -2461,9 +2524,10 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
     let edf = Array1::from_iter(evals.iter().map(|eval| eval.edf));
     let logdet_term = evals
         .iter()
+        .zip(prepared.caches.iter())
         .enumerate()
-        .map(|(block, eval)| {
-            eval.logdet - penalty_logdets[block] - (ranks[block] as f64) * rhos[block]
+        .map(|(block, (eval, cache))| {
+            eval.logdet - cache.logdet_penalty_positive - (ranks[block] as f64) * rhos[block]
         })
         .sum::<f64>();
     let scale_term = q
@@ -4210,60 +4274,18 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
 }
 
 fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    // Attempt Cholesky directly; on failure, retry with a tiny diagonal jitter
-    // proportional to the matrix trace. X'WX is symmetric positive semidefinite
-    // by construction, but FP noise (e.g. in a basis whose kernel block is only
-    // FP-orthogonal to its explicit polynomial nullspace columns, as the
-    // periodic Duchon basis is) can push the smallest eigenvalue slightly
-    // negative on adversarial inputs, intermittently failing Cholesky. A
-    // jitter of 1e-12 * trace/p shifts every eigenvalue up by an amount well
-    // below the natural scale of the well-conditioned eigenvalues but well
-    // above f64 FP noise, eliminating the spurious-failure regime.
+    // The cache whitens by X'WX, so X'WX itself must factor. A failed Cholesky
+    // means the unpenalized Gram is numerically singular, which is the same
+    // verdict `weighted_design_qr` reaches from the design. Adding a diagonal
+    // ridge here would build the cache of `X'WX + δI`, a different model whose
+    // `logdet_xtwx` is the log of δ (#3090), so the failure is reported.
     let mut gpu_candidate = xtwx.clone();
     if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
         return Ok(gpu_candidate);
     }
-    if let Ok(chol) = xtwx.cholesky(Side::Lower) {
-        return Ok(chol.lower_triangular());
-    }
-    let p = xtwx.nrows();
-    let trace: f64 = (0..p).map(|i| xtwx[[i, i]]).sum();
-    if !trace.is_finite() || trace <= 0.0 {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-    let schedule = RidgeSchedule::geometric(1e-12 * trace / (p as f64), 6);
-    escalate_ridge(schedule, |jitter| {
-        let mut jittered = xtwx.clone();
-        for i in 0..p {
-            jittered[[i, i]] += jitter;
-        }
-        let mut gpu_candidate = jittered.clone();
-        if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
-            return Some(gpu_candidate);
-        }
-        jittered
-            .cholesky(Side::Lower)
-            .ok()
-            .map(|chol| chol.lower_triangular())
-    })
-    .map(|success| success.value)
-    .map_err(|exhausted| {
-        // Cholesky failed at every escalation. The largest shift actually tried
-        // is one growth factor below the one the schedule would try next, and
-        // X'WX is still not numerically PSD there, so `trace / last_attempted`
-        // is a measured lower bound on the conditioning rather than a blanket
-        // `INFINITY`.
-        let last_attempted = exhausted.next_ridge / schedule.growth;
-        EstimationError::ModelIsIllConditioned {
-            condition_number: if last_attempted > 0.0 && last_attempted.is_finite() {
-                trace / last_attempted
-            } else {
-                f64::INFINITY
-            },
-        }
-    })
+    xtwx.cholesky(Side::Lower)
+        .map(|chol| chol.lower_triangular())
+        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })
 }
 
 fn validate_gaussian_reml_eigen_cache(
@@ -5488,7 +5510,7 @@ fn enumerate_and_select_rho_with_controls(
         stack[top] = (a, ea, pa, mid, emid, pmid, depth + 1);
         top += 1;
     }
-    log::info!(
+    log::debug!(
         "[REML-BNB] certified 1-D rho search over [{}, {}]: {cells_visited} cells, \
          {evaluations} objective evaluations, deepest bisection {deepest}/{}, \
          {unbounded_enclosures} unbounded enclosures",
@@ -5656,17 +5678,6 @@ fn solve_lower_triangular_matrix(
         }
     }
     Ok(out)
-}
-
-/// Solve the SPD system `L Lᵀ X = rhs` for `X` given the lower Cholesky factor
-/// `L` (as returned by [`gaussian_reml_cholesky_lower`]): a forward solve
-/// against `L` followed by a back solve against `Lᵀ`.
-fn solve_spd_from_lower_factor(
-    lower: &Array2<f64>,
-    rhs: &Array2<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    let forward = solve_lower_triangular_matrix(lower, rhs)?;
-    solve_upper_triangular_matrix(&lower.t().to_owned(), &forward)
 }
 
 fn solve_upper_triangular_matrix(
@@ -6731,18 +6742,42 @@ mod tests {
         );
     }
 
+    /// A block's eigen cache and projected response from an algebraic Gram `G = L·Lᵀ`
+    /// and right-hand side `XᵀWy = L·head`, the form a design's Householder factor
+    /// hands [`block_orthogonal_eval`]. Returns them with `‖head‖²` per output, the
+    /// response energy inside the block's column space.
+    fn block_orthogonal_parts_from_gram(
+        gram: &Array2<f64>,
+        rhs: &Array2<f64>,
+        penalty: &Array2<f64>,
+    ) -> (GaussianRemlEigenCache, Array2<f64>, Array1<f64>) {
+        let lower = gaussian_reml_cholesky_lower(gram.clone()).unwrap();
+        let head = solve_lower_triangular_matrix(&lower, rhs).unwrap();
+        let cache = gaussian_reml_eigen_cache_from_lower(
+            lower,
+            penalty.view(),
+            None,
+            matrix_fingerprint(gram.view()),
+        )
+        .unwrap();
+        let projected = dense_atb(cache.eigenvectors.view(), head.view());
+        let energy = head.mapv(|value| value * value).sum_axis(Axis(0));
+        (cache, projected, energy)
+    }
+
     #[test]
     fn block_orthogonal_score_matches_the_objective_derivative() {
         let gram = array![[3.0, 0.4], [0.4, 2.0]];
         let rhs = array![[1.2, -0.3], [0.6, 0.9]];
         let penalty = array![[1.0, 0.2], [0.2, 0.8]];
+        let (cache, projected, _) = block_orthogonal_parts_from_gram(&gram, &rhs, &penalty);
         let scale = array![1.3, 0.8];
         let rho = 0.37;
         let step = 1.0e-6;
-        let eval = block_orthogonal_eval(&gram, &rhs, &penalty, rho).unwrap();
+        let eval = block_orthogonal_eval(&cache, &projected, rho).unwrap();
         let analytic = block_orthogonal_scale_objective(&eval, rho, scale.view(), 2).grad;
         let value_at = |candidate_rho: f64| {
-            let candidate = block_orthogonal_eval(&gram, &rhs, &penalty, candidate_rho).unwrap();
+            let candidate = block_orthogonal_eval(&cache, &projected, candidate_rho).unwrap();
             block_orthogonal_scale_objective(&candidate, candidate_rho, scale.view(), 2).value
         };
         let numerical = (value_at(rho + step) - value_at(rho - step)) / (2.0 * step);
@@ -6770,16 +6805,22 @@ mod tests {
         let ywy = array![8.0, 9.0];
         let nu = 7.0;
         let rhos = array![0.37, -0.21];
+        let parts = (0..2)
+            .map(|block| {
+                block_orthogonal_parts_from_gram(&grams[block], &rhs[block], &penalties[block])
+            })
+            .collect::<Vec<_>>();
+        // The unpenalized residual these algebraic blocks leave of `ywy`.
+        let mut unpenalized_residual = ywy.clone();
+        for (_, _, energy) in &parts {
+            unpenalized_residual -= energy;
+        }
+        // The reference objective forms `q` by its definition, `ywy − Σ rhsᵀβ`.
         let profile_value = |candidate_rhos: ArrayView1<'_, f64>| {
             let evals = (0..2)
                 .map(|block| {
-                    block_orthogonal_eval(
-                        &grams[block],
-                        &rhs[block],
-                        &penalties[block],
-                        candidate_rhos[block],
-                    )
-                    .unwrap()
+                    block_orthogonal_eval(&parts[block].0, &parts[block].1, candidate_rhos[block])
+                        .unwrap()
                 })
                 .collect::<Vec<_>>();
             let mut q = ywy.clone();
@@ -6795,11 +6836,11 @@ mod tests {
         };
         let evals = (0..2)
             .map(|block| {
-                block_orthogonal_eval(&grams[block], &rhs[block], &penalties[block], rhos[block])
-                    .unwrap()
+                block_orthogonal_eval(&parts[block].0, &parts[block].1, rhos[block]).unwrap()
             })
             .collect::<Vec<_>>();
-        let scale = block_orthogonal_conditional_scale(&evals, ywy.view(), nu).unwrap();
+        let scale =
+            block_orthogonal_conditional_scale(&evals, unpenalized_residual.view(), nu).unwrap();
         let analytic =
             block_orthogonal_profile_hessian(&evals, rhos.view(), scale.view(), &ranks, nu)
                 .unwrap();
@@ -6883,21 +6924,30 @@ mod tests {
         .expect("well-posed orthogonal-block fit must certify and mint");
 
         let weight = Array1::<f64>::ones(8);
-        let ywy = (0..8).map(|i| y[[i, 0]] * y[[i, 0]]).sum::<f64>();
         // Full-rank penalties: zero total nullity, so nu = n.
         let nu = 8.0_f64;
-        let mut evals = Vec::new();
-        for (block, design) in [&d1, &d2].into_iter().enumerate() {
-            let gram = canonicalize_penalty(dense_xt_diag_x(design.view(), weight.view()).view());
-            let rhs = dense_xt_diag_y(design.view(), weight.view(), y.view());
-            let pen = canonicalize_penalty(penalties[block].view());
-            evals.push(
-                block_orthogonal_eval(&gram, &rhs, &pen, result.log_lambdas[block])
-                    .expect("block eval at the minted rho"),
-            );
-        }
-        let explained: f64 = evals.iter().map(|eval| eval.fitted_energy[0]).sum();
-        let q = ywy - explained;
+        let canonical_penalties = penalties
+            .iter()
+            .map(|penalty| canonicalize_penalty(penalty.view()))
+            .collect::<Vec<_>>();
+        let prepared = prepare_block_orthogonal(
+            &[d1.clone(), d2.clone()],
+            &canonical_penalties,
+            weight.view(),
+            y.view(),
+        )
+        .expect("the orthogonal blocks factor");
+        let evals = (0..2)
+            .map(|block| {
+                block_orthogonal_eval(
+                    &prepared.caches[block],
+                    &prepared.projected_rhs[block],
+                    result.log_lambdas[block],
+                )
+                .expect("block eval at the minted rho")
+            })
+            .collect::<Vec<_>>();
+        let q = block_orthogonal_profiled_residual(&evals, prepared.unpenalized_residual.view())[0];
         assert!(q > 0.0);
         let scale = Array1::from_vec(vec![nu / q]);
         for (block, eval) in evals.iter().enumerate() {
@@ -6974,6 +7024,154 @@ mod tests {
             "nonorthogonal blocks must fail the decomposed-objective contract: {err}"
         );
         assert!(err.to_string().contains("weighted cross-product"));
+    }
+
+    /// #2280: the block-orthogonal profiled residual `q` resolves a residual its
+    /// defining subtraction `ywy − Σ_b rhs_bᵀ·(G_b + λ_bS_b)⁻¹·rhs_b` loses.
+    ///
+    /// Probe job 1162960's worst shape: two W-orthogonal blocks `U_b·Σ·Vᵀ` over
+    /// disjoint DCT-IV columns, a planted component `ρ·e` outside both, and the
+    /// response on every singular direction (`y = U·1 + ρ·e`), so the unpenalized
+    /// coefficients grow like `1/σ_min`. At `λ = e⁻⁶⁰` the penalized part stays far
+    /// below the planted residual.
+    ///
+    /// The reference is independent of both routes. One SVD `X = U·Σ·Vᵀ` of the
+    /// concatenated design diagonalizes the joint problem under `S = I` in both blocks
+    /// at one `λ`, so `q = ‖y − U·Uᵀy‖² + Σ_k (u_kᵀy)²·λ/(σ_k² + λ)`.
+    ///
+    /// The band is the least-squares residual band of
+    /// `the_unpenalized_residual_survives_a_condition_number_of_1e12_2280`: a backward
+    /// error `γ` on the design and response moves `‖r‖²` by `2‖r‖·γ·(‖X‖_F·‖β‖ + ‖y‖)`
+    /// at first order, and by `γ·κ·‖r‖` inside the column space at second order. The
+    /// penalized part adds `u_max` times the rotation's `2γ·(1 + √p)·‖y‖²`. Both routes
+    /// carry the band, so their difference is allowed it twice.
+    #[test]
+    fn the_block_orthogonal_profiled_residual_survives_a_response_on_the_smallest_directions_2280()
+    {
+        let n = 40usize;
+        let p_block = 4usize;
+        let p = 2 * p_block;
+        let residual_norm = 1.0e-4;
+        let planted = residual_norm * residual_norm;
+        let rho = -60.0_f64;
+        let lambda = rho.exp();
+        let dct = |size: usize, row: usize, col: usize| {
+            (2.0 / size as f64).sqrt()
+                * (std::f64::consts::PI * (row as f64 + 0.5) * (col as f64 + 0.5) / size as f64)
+                    .cos()
+        };
+        let weight = Array1::<f64>::ones(n);
+        let penalties = [Array2::<f64>::eye(p_block), Array2::<f64>::eye(p_block)];
+        for exponent in [6.0_f64, 8.0] {
+            let singular: Vec<f64> = (0..p_block)
+                .map(|k| 10.0_f64.powf(-exponent * k as f64 / (p_block - 1) as f64))
+                .collect();
+            let block = |offset: usize| {
+                Array2::from_shape_fn((n, p_block), |(row, col)| {
+                    (0..p_block)
+                        .map(|k| dct(n, row, offset + k) * singular[k] * dct(p_block, col, k))
+                        .sum::<f64>()
+                })
+            };
+            let designs = [block(0), block(p_block)];
+            let y = Array2::from_shape_fn((n, 1), |(row, _)| {
+                (0..p).map(|k| dct(n, row, k)).sum::<f64>() + residual_norm * dct(n, row, p)
+            });
+            let y_norm = y.iter().map(|value| value * value).sum::<f64>().sqrt();
+
+            let mut concatenated = Array2::<f64>::zeros((n, p));
+            concatenated.slice_mut(s![.., 0..p_block]).assign(&designs[0]);
+            concatenated.slice_mut(s![.., p_block..p]).assign(&designs[1]);
+            let (u, sigma, _) = concatenated.svd(true, false).expect("design SVD");
+            let u = u.expect("left singular vectors");
+            let basis = u.slice(s![.., 0..p]).to_owned();
+            let coordinates = basis.t().dot(&y);
+            let svd_residual = (&y - &basis.dot(&coordinates))
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>();
+            let svd_penalized = (0..p)
+                .map(|k| coordinates[[k, 0]].powi(2) * lambda / (sigma[k] * sigma[k] + lambda))
+                .sum::<f64>();
+            let reference = svd_residual + svd_penalized;
+
+            // The defining subtraction, through a Cholesky factor of each explicit Gram.
+            let ywy = y.iter().map(|value| value * value).sum::<f64>();
+            let mut explained = 0.0_f64;
+            for design in &designs {
+                let gram = dense_xt_diag_x(design.view(), weight.view());
+                let rhs = dense_xt_diag_y(design.view(), weight.view(), y.view());
+                let ridge = Array2::<f64>::eye(p_block) * lambda;
+                let hessian = canonicalize_penalty((&gram + &ridge).view());
+                let lower =
+                    gaussian_reml_cholesky_lower(hessian).expect("the block Hessian factors");
+                let forward = solve_lower_triangular_matrix(&lower, &rhs).unwrap();
+                let beta = solve_upper_triangular_matrix(&lower.t().to_owned(), &forward).unwrap();
+                explained += (&rhs * &beta).sum();
+            }
+            let subtraction = ywy - explained;
+
+            let prepared = prepare_block_orthogonal(&designs, &penalties, weight.view(), y.view())
+                .expect("the orthogonal blocks factor");
+            let evals = (0..2)
+                .map(|block| {
+                    block_orthogonal_eval(
+                        &prepared.caches[block],
+                        &prepared.projected_rhs[block],
+                        rho,
+                    )
+                    .expect("block eval")
+                })
+                .collect::<Vec<_>>();
+            let profiled =
+                block_orthogonal_profiled_residual(&evals, prepared.unpenalized_residual.view())[0];
+
+            let sigma_max = sigma.iter().copied().fold(0.0_f64, f64::max);
+            let sigma_min = sigma.iter().copied().fold(f64::INFINITY, f64::min);
+            let design_frobenius = sigma.iter().map(|value| value * value).sum::<f64>().sqrt();
+            // `‖β‖` of the unpenalized least-squares coefficients, `‖Σ⁻¹·Uᵀy‖`.
+            let beta_norm = (0..p)
+                .map(|k| (coordinates[[k, 0]] / sigma[k]).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let gamma = roundoff_growth(n * p);
+            let residual_scale = svd_residual.sqrt();
+            let along = gamma * (design_frobenius * beta_norm + y_norm);
+            let first_order = 2.0 * along * residual_scale;
+            let second_order = (gamma * (sigma_max / sigma_min) * residual_scale + along).powi(2);
+            let largest_mode = lambda / (sigma_min * sigma_min);
+            let u_max = largest_mode / (1.0 + largest_mode);
+            let penalized_band =
+                u_max * 2.0 * gamma * (1.0 + (p as f64).sqrt()) * y_norm * y_norm;
+            let band = 2.0 * (first_order + second_order + penalized_band);
+            println!(
+                "[2280-block-residual] block_condition=1e{exponent} planted={planted:.9e} \
+                 svd={svd_residual:.9e} reference={reference:.9e} profiled={profiled:.9e} \
+                 subtraction={subtraction:.9e} band={band:.3e}"
+            );
+
+            assert!(
+                band < planted,
+                "the band {band:.3e} must resolve the planted residual {planted:.9e}, or a match \
+                 inside it proves nothing"
+            );
+            assert!(
+                (svd_residual - planted).abs() <= band,
+                "the SVD instrument must recover the planted residual {planted:.9e}: got \
+                 {svd_residual:.9e} (band {band:.3e})"
+            );
+            assert!(
+                (subtraction - reference).abs() > planted,
+                "REGIME: at block condition 1e{exponent} the subtraction {subtraction:.9e} must \
+                 miss the reference {reference:.9e} by more than the planted residual, or this \
+                 fixture does not reach the defect"
+            );
+            assert!(
+                (profiled - reference).abs() <= band,
+                "the profiled residual {profiled:.9e} must match the reference {reference:.9e} \
+                 within the band {band:.3e} at block condition 1e{exponent}"
+            );
+        }
     }
 
     #[test]
@@ -7532,6 +7730,47 @@ mod tests {
                 assert!((a - b).abs() <= 1.0e-12);
             }
         }
+    }
+
+    #[test]
+    fn batched_eigen_cache_rejects_singular_gram_instead_of_ridging_it() {
+        // #3090: a Gram whose Cholesky fails used to be retried at
+        // `X'WX + δI` for a geometric δ schedule, and the cache of that
+        // different model came back as `Ok`. Its `logdet_xtwx` is then the log
+        // of the invented ridge, not of the data. The design-based builder
+        // reports the same design as ill-conditioned, so the batched path
+        // must too, and its well-posed siblings must be unaffected.
+        let singular = array![[1.0, 1.0], [1.0, 1.0]];
+        let regular = array![[4.0, 1.0], [1.0, 3.0]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let design = array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        assert!(matches!(
+            build_gaussian_reml_eigen_cache_with_nullspace_dim(
+                design.view(), penalty.view(), None, None,
+            ),
+            Err(EstimationError::ModelIsIllConditioned { .. })
+        ));
+
+        let batched = build_gaussian_reml_eigen_cache_batched(
+            vec![singular.clone(), regular.clone()],
+            penalty.view(),
+            None,
+        );
+        assert_eq!(batched.len(), 2);
+        match &batched[0] {
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {}
+            Err(other) => panic!("singular Gram gave the wrong error: {other}"),
+            Ok(cache) => panic!(
+                "singular Gram produced a cache with logdet_xtwx={:.6e}",
+                cache.logdet_xtwx
+            ),
+        }
+        let regular_cache = batched[1].as_ref().expect("regular Gram factors");
+        assert!((regular_cache.logdet_xtwx - 11.0_f64.ln()).abs() <= 1.0e-12);
+        assert!(matches!(
+            gaussian_reml_eigen_cache_from_xtwx(singular, penalty.view(), None),
+            Err(EstimationError::ModelIsIllConditioned { .. })
+        ));
     }
 
     /// Deterministic linear-congruential generator (Knuth/MMIX constants) so the

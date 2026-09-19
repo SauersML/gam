@@ -1,14 +1,14 @@
-use coefficient_transforms::{
-    convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix,
-};
-
 pub use error::SmoothError;
 
 use input_standardization::estimate_isotropic_scale;
 
 use shape_constraints::{
-    bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
-    shape_supports_basis, shape_uses_box_reparameterization,
+    ShapeRealization, bspline_shape_cone_chart, plan_shape_realization,
+    replicate_shape_constraints_over_levels, validate_shape_request,
+};
+pub use shape_constraints::{
+    ShapeExpr, ShapeSet, ShapeSpec, parse_shape_expr, parse_shape_spec, resolve_shape_spec,
+    shape_expr_from_json, shape_tensor_margin_count,
 };
 
 pub(crate) fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -139,10 +139,12 @@ pub(crate) const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
 /// `shape=<kind>` option understood by the formula DSL.
 ///
 /// `constraints` pairs the smooth-term text as it appears in the formula
-/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a shape-constraint
-/// spelling accepted by [`parse_shape_constraint`]; comparison is exact after
-/// whitespace removal. A `"none"` constraint is a no-op. Referencing a term not
-/// present in the formula is an error.
+/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a `shape=` value
+/// in the grammar of [`parse_shape_expr`] (an atom, a conjunction
+/// `[monotone_increasing, concave]`, or a per-margin `te()` list); comparison
+/// is exact after whitespace removal. A `"none"` constraint is a no-op.
+/// Referencing a term not present in the formula is an error. The meaning of a
+/// list is resolved against the term when the formula is built.
 ///
 /// This is the single source of truth for the `gamfit.fit(..., constraints=…)`
 /// rewrite — the Python wrapper only marshals the mapping across the FFI and
@@ -159,15 +161,15 @@ pub fn apply_shape_constraints_to_formula(
     let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
 
     // Whitespace-stripped term text -> canonical shape spelling.
-    let mut wanted: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, String> = BTreeMap::new();
     // Whitespace-stripped term text -> original key (for error labels).
     let mut originals: BTreeMap<String, String> = BTreeMap::new();
     for (key, kind_raw) in constraints {
-        let kind = parse_shape_constraint(kind_raw)?;
+        let kind = parse_shape_expr(kind_raw)?;
         let nk = strip_ws(key);
         originals.entry(nk.clone()).or_insert_with(|| key.clone());
-        if kind != ShapeConstraint::None {
-            wanted.insert(nk, kind.dsl_str());
+        if !kind.is_none() {
+            wanted.insert(nk, kind.to_string());
         }
     }
     if wanted.is_empty() {
@@ -409,110 +411,6 @@ pub enum SmoothBasisSpec {
 }
 
 impl SmoothBasisSpec {
-    /// Conservative lower bound on the number of sample rows needed for this
-    /// smooth basis to have a well-posed REML fit.
-    ///
-    /// Each basis kind answers the question for itself, so the workflow does
-    /// not have to know how many columns a B-spline, tensor product, PCA
-    /// projection, or spatial kernel emits. The contract is a *lower bound*:
-    /// returning too small a number is permitted (the inner solver will catch
-    /// any genuine n-vs-rank failure that slips past); returning too large a
-    /// number is a regression because it rejects legitimate fits.
-    ///
-    /// Rationale: B-spline / tensor / PCA bases have a closed-form column
-    /// count, so we use the exact dimension. Radial bases (TPS, Matern,
-    /// Duchon, Sphere) and factor smooths choose their column count from the
-    /// data (e.g. `unique_count`); we fall back to a small
-    /// constant floor because a fit on fewer than five rows cannot stabilise
-    /// any radial smooth regardless of the configured kernel scale.
-    pub fn min_sample_rows(&self) -> usize {
-        // Floor used for data-driven bases whose column count is not known
-        // from the spec alone. Five rows is the minimum at which the inner
-        // pivot/QR + REML smoothing-parameter search has any chance of being
-        // well-posed for a non-parametric smooth.
-        const RADIAL_FLOOR: usize = 5;
-
-        match self {
-            Self::ByVariable { inner, .. } => inner.min_sample_rows(),
-            Self::FactorSumToZero { inner, levels, .. } => {
-                // L-1 independent deviation blocks each carrying the inner
-                // basis dimension. Skip the levels-multiplier if it doesn't
-                // bring more rows; we want the *lower bound* not the rank.
-                let inner_min = inner.min_sample_rows();
-                let lvls = levels.len().saturating_sub(1).max(1);
-                inner_min.saturating_mul(lvls)
-            }
-            Self::BSpline1D { spec, .. } => bspline_basis_min_rows(spec),
-            Self::BySmooth { smooth, .. } => smooth.min_sample_rows(),
-            Self::FactorSmooth { spec } => {
-                // Replicates the marginal once per level; without a known
-                // level count we conservatively require at least the marginal
-                // basis dimension.
-                bspline_basis_min_rows(&spec.marginal)
-            }
-            Self::ThinPlate { .. }
-            | Self::Sphere { .. }
-            | Self::ConstantCurvature { .. }
-            | Self::Matern { .. }
-            | Self::MeasureJet { .. }
-            | Self::Duchon { .. } => RADIAL_FLOOR,
-            Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
-            Self::TensorBSpline { spec, .. } => {
-                // A `te(...)` smooth is *penalized*: each margin carries a
-                // difference (wiggliness) penalty and the tensor inherits a
-                // Kronecker-sum penalty `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I`. The raw
-                // column count is the *product* of the per-marginal column
-                // counts, but that product is the lower bound for an
-                // *unpenalized* tensor regression — it is the number of rows you
-                // would need to identify every interaction column with no
-                // regularization. The penalty regularizes all of those
-                // interaction directions; only the combined penalty *null space*
-                // (the tensor product of the per-margin polynomial trends, a
-                // handful of columns) must be identified by the data, and the
-                // smoothing-parameter search shrinks the rest. The effective
-                // degrees of freedom of the fitted `te()` are therefore a small
-                // fraction of the column product, which is exactly why mgcv
-                // fits a default `te(x, y)` on a couple hundred rows.
-                //
-                // The honest *penalized* lower bound is the **sum** of the
-                // per-marginal column counts, not their product: a row floor of
-                // `Σ_i k_i` still guarantees enough data to identify each
-                // margin's additive main-effect (the largest sub-block the
-                // penalty cannot shrink to zero), while no longer conflating
-                // unpenalized column-count identifiability with penalized
-                // well-posedness. This accepts moderate-`n` penalized tensors
-                // (e.g. a 20×20 default basis on n=200) yet still rejects a
-                // genuinely undersized fit where `n < Σ_i k_i` and even the
-                // additive part is rank-deficient.
-                //
-                // Binary / low-cardinality margins (#724): gam will accept a
-                // `te(x, badh)` whose `badh ∈ {0, 1}` margin nominally requests
-                // more basis columns than `badh` has unique values, where mgcv
-                // refuses the unpenalized term as ill-posed ("badh has
-                // insufficient unique values to support k knots"). This is
-                // correct-by-design, *not* a degenerate fit: the marginal
-                // wiggliness penalty on the `badh` axis has a null space that is
-                // exactly its identifiable trend (the two cell means of a binary
-                // covariate), and the Kronecker-sum penalty shrinks every tensor
-                // column outside that null space toward zero. The resulting fit
-                // is the well-posed "per-level `x` smooth + binary main effect"
-                // that mgcv reaches only after manually collapsing the basis —
-                // gam reaches it automatically because the penalty, not the raw
-                // column count, sets the effective rank. A genuinely
-                // rank-deficient design (penalty null space wider than the data
-                // can support) is still caught downstream by the inner pivoted
-                // factorization, which owns the exact n-vs-rank decision; this
-                // pre-fit gate only refuses the grossly-undersized formula.
-                let mut total: usize = 0;
-                for marginal in &spec.marginalspecs {
-                    let m = bspline_basis_min_rows(marginal);
-                    total = total.saturating_add(m.max(1));
-                }
-                total.max(RADIAL_FLOOR)
-            }
-        }
-    }
-
     /// Stable structural discriminant for warm-start cache keying (#869).
     ///
     /// Two smooths that produce different bases / penalty structures must map
@@ -606,66 +504,6 @@ impl SmoothBasisSpec {
             | Self::Pca { feature_cols, .. }
             | Self::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
         }
-    }
-}
-
-/// Lower bound on the number of sample rows a 1D B-spline smooth needs for a
-/// well-posed *penalized* REML fit. Used as the per-smooth row floor in
-/// [`SmoothBasisSpec::min_sample_rows`].
-///
-/// For a *singly*-penalized smooth the floor is the full column count: the
-/// wiggliness penalty leaves the order-`m` polynomial trend unpenalized, and
-/// gam's original gate conservatively required enough rows for the whole basis.
-/// That conservative floor is kept here unchanged.
-///
-/// A *double*-penalized smooth (mgcv `select=TRUE`) is different: it adds a
-/// second penalty on the wiggliness penalty's null space, so even the
-/// polynomial trend is shrinkable toward zero and *nothing* in the basis
-/// requires unpenalized identification by the data — exactly the reasoning the
-/// `TensorBSpline` arm of [`SmoothBasisSpec::min_sample_rows`] already applies
-/// to a penalized tensor. Its honest floor is therefore a small stabilization
-/// constant, not the column count. This is what lets mgcv (and now gam) fit
-/// several `select=TRUE` smooths on a dataset whose row count is below the
-/// summed basis width (e.g. the n≈30 `wine_gamair` fold, 5 `ps` smooths,
-/// p≈51): the penalties, not the data, set the effective rank. The bounded
-/// outer REML loop still terminates, and the genuine n-vs-rank decision is
-/// owned downstream by the inner pivoted factorization. Without this, gam
-/// rejected the fit outright (or, before the gate existed, the outer REML loop
-/// wandered the flat overparameterized surface until the benchmark wall budget
-/// killed it — #1089).
-pub(crate) fn bspline_basis_min_rows(spec: &crate::basis::BSplineBasisSpec) -> usize {
-    use crate::basis::BSplineKnotSpec;
-    let columns = match &spec.knotspec {
-        BSplineKnotSpec::Generate {
-            num_internal_knots, ..
-        } => *num_internal_knots + spec.degree + 1,
-        BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(k),
-            ..
-        } => *k + spec.degree + 1,
-        BSplineKnotSpec::Automatic {
-            num_internal_knots: None,
-            ..
-        } => {
-            // Knot count is data-derived (`default_internal_knot_count_for_data`).
-            // A minimal cubic basis is `degree + 2` columns; below that the
-            // basis cannot represent a non-parametric smooth.
-            spec.degree + 2
-        }
-        BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1).max(1),
-        // cr basis dimension equals the knot count (no degree offset).
-        BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
-        BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
-    };
-    let columns = columns.max(spec.degree + 2);
-
-    if spec.double_penalty {
-        // Fully shrinkable basis: only a small stabilization floor must be
-        // identified by the data, capped by the actual column count.
-        const DOUBLE_PENALTY_FLOOR: usize = 2;
-        DOUBLE_PENALTY_FLOOR.min(columns).max(1)
-    } else {
-        columns
     }
 }
 
@@ -785,7 +623,7 @@ pub enum TensorBSplinePenaltyDecomposition {
 pub struct SmoothTermSpec {
     pub name: String,
     pub basis: SmoothBasisSpec,
-    pub shape: ShapeConstraint,
+    pub shape: ShapeSpec,
     /// Joint-null absorption rotation captured at fit time. `Some(Q)` means
     /// the fitted coefficient vector lives in `γ`-coordinates with
     /// `β_raw = Q · γ`; prediction must rotate the raw-basis design via
@@ -963,7 +801,7 @@ pub struct SmoothCollectionGauge {
 pub struct SmoothTerm {
     pub name: String,
     pub coeff_range: Range<usize>,
-    pub shape: ShapeConstraint,
+    pub shape: ShapeSpec,
     /// Active local penalty identities. Numerical and semantic channels are
     /// inseparable, including after a preceding candidate is dropped.
     pub active_penalties: Vec<ActivePenalty>,
@@ -1421,6 +1259,45 @@ pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
     pub random_effect_terms: Vec<RandomEffectTermSpec>,
     pub smooth_terms: Vec<SmoothTermSpec>,
+    /// Which part of the design carries the model's constant level. Saved
+    /// before this field existed means the global intercept.
+    #[serde(default)]
+    pub level: ModelLevel,
+}
+
+/// Where a model's constant level lives.
+///
+/// The constant is carried at most once, and always in an unpenalized
+/// direction, so a shift of the response shifts the fit and nothing else. With
+/// the default global intercept it is the unpenalized all-ones column and
+/// every other term is centred against it. A formula that removes the
+/// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
+///
+/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
+///    effect of a factor `by=`), which already spans the constant with its
+///    full dummy coding and is made unpenalized, giving the cell-means model;
+/// 2. else the first pure-indicator interaction (`g:h`), which keeps every
+///    cell, its reference cell included;
+/// 3. else the first B-spline / tensor smooth whose explicit
+///    `identifiability=none` already keeps the constant, or failing that the
+///    first one with the default gauge, whose sum-to-zero centring is
+///    released. Either way it becomes `level_smooth`, and its null-space
+///    ridge is dropped unless `double_penalty=true` was written.
+///
+/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
+/// levels are mean-zero deviations. When no term can carry it the model has
+/// no level: every surviving effect passes through the origin, as a
+/// parametric no-intercept fit does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ModelLevel {
+    #[default]
+    Intercept,
+    NoIntercept {
+        /// Index into `smooth_terms` of the smooth whose centring was released
+        /// to carry the level. Its parametric constraint block omits the
+        /// constant column so the identifiability pass does not re-centre it.
+        level_smooth: Option<usize>,
+    },
 }
 
 pub(crate) fn validate_smooth_basis_frozen(
@@ -1638,13 +1515,14 @@ impl TermCollectionSpec {
             frozen_parametric_residualization: None,
                         name: st.name.clone(),
                         basis: (**inner).clone(),
-                        shape: st.shape,
+                        shape: st.shape.clone(),
                         joint_null_rotation: None,
                     };
                     TermCollectionSpec {
                         linear_terms: Vec::new(),
                         random_effect_terms: Vec::new(),
                         smooth_terms: vec![nested],
+                        level: Default::default(),
                     }
                     .validate_frozen(label)?;
                 }
@@ -1978,9 +1856,10 @@ impl TermCollectionSpec {
             frozen_parametric_residualization: None,
                             name: st.name.clone(),
                             basis: (**smooth).clone(),
-                            shape: st.shape,
+                            shape: st.shape.clone(),
                             joint_null_rotation: None,
                         }],
+                        level: Default::default(),
                     };
                     nested.validate_frozen(label)?;
                 }
@@ -2984,7 +2863,7 @@ impl SpatialLogKappaCoords {
     /// upper]; projecting is the unique closest feasible seed. The user's
     /// length_scale was always a hint for the outer optimizer (the optimizer
     /// is authoritative for κ), not a hard constraint — so clipping preserves
-    /// their intent as far as the geometry allows. Emits `log::info!` when
+    /// their intent as far as the geometry allows. Emits `log::debug!` when
     /// any coordinate moves, so the outside-window case is diagnostically
     /// visible (not silent).
     pub fn clamp_to_bounds(
@@ -3014,7 +2893,7 @@ impl SpatialLogKappaCoords {
             }
         }
         if n_projected > 0 {
-            log::info!(
+            log::debug!(
                 "[spatial-kappa] projected {n_projected}/{} ψ seed coords into data-derived bounds \
                  (worst excess={worst_delta:.3} log units); user length_scale falls outside \
                  the resolvable [sqrt(eps)/r_max, 1/(sqrt(eps)*r_min)] kernel-range window",
@@ -3995,7 +3874,7 @@ pub fn apply_response_aware_anisotropy_seed(
         // `set_spatial_aniso_log_scales` re-centers to Σ η = 0. A term that does
         // not support aniso scales is silently skipped (the seed is optional).
         if let Err(err) = set_spatial_aniso_log_scales(spec, term_idx, nudged) {
-            log::debug!(
+            log::trace!(
                 "[spatial-kappa] response-aware anisotropy seed skipped for term {term_idx}: {err}"
             );
         }
@@ -4057,7 +3936,7 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
                 lines.push_str(&format!("\n  axis {}: eta={:+.4}", a, eta_a));
             }
         }
-        log::info!("{}", lines);
+        log::debug!("{}", lines);
     }
 }
 
@@ -4119,7 +3998,7 @@ pub fn sync_aniso_contrasts_from_metadata(spec: &mut TermCollectionSpec, design:
             && eta.len() > 1
         {
             if let Err(err) = set_spatial_aniso_log_scales(spec, term_idx, eta) {
-                log::debug!(
+                log::trace!(
                     "term {term_idx}: anisotropic log-scale sync skipped, keeping the existing scales: {err}"
                 );
             }
@@ -4583,7 +4462,7 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
             group_key.feature_cols.len(),
         )?;
         let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
-        log::info!(
+        log::debug!(
             "sharing {} spatial centers across {} smooth terms over columns {:?} (requested {} centers)",
             shared_centers.nrows(),
             members.len(),
@@ -5290,7 +5169,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     // it therefore retains mass only (#707). The matching topology gate lives
     // at `DuchonOperatorPenaltySpec::matern_for_smoothness`. The third-order
     // energy is appended below whenever the collocation builder emitted its
-    // Gram (`MaternNu::admits_third_order_operator`, isotropic metric).
+    // Gram (`MaternNu::admits_third_order_operator`, under either metric).
     // `m` and every `min_order` are small half-integers, which f64 represents
     // exactly, so the order gate is an exact comparison.
     let d = penalty_centers.ncols();
@@ -5855,7 +5734,7 @@ pub(crate) fn build_tensor_bspline_basis(
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
-    // marginal difference-penalty construction as standalone smooth terms.
+    // marginal derivative-penalty construction as standalone smooth terms.
     for (dim, (&col, marginalspec)) in feature_cols
         .iter()
         .zip(spec.marginalspecs.iter())
@@ -6589,7 +6468,10 @@ pub struct LocalSmoothTermBuild {
     pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     pub linear_constraints: Option<LinearInequalityConstraints>,
-    pub box_reparam: bool,
+    /// Coordinate lower bounds realizing a single 1-D shape atom's exact cone
+    /// in this build's centred cone chart, in local coefficients (`None` for
+    /// unconstrained smooths and for shapes realized as `linear_constraints`).
+    pub shape_lower_bounds: Option<Array1<f64>>,
 }
 
 #[derive(Clone)]
@@ -7125,6 +7007,74 @@ pub(crate) fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut Sm
     }
 }
 
+/// Whether a B-spline smooth (1-D or tensor) carries its default model-space
+/// centring, the gauge that removes the constant so the smooth cannot compete
+/// with a global intercept. Other bases report `false`: they keep their own
+/// gauge and never take part in the level-carrier rule (see [`ModelLevel`]).
+pub(crate) fn bspline_smooth_is_default_centred(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a B-spline smooth (1-D or tensor) keeps the constant in its span
+/// because its gauge is explicitly unconstrained.
+pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => {
+            matches!(spec.identifiability, BSplineIdentifiability::None)
+        }
+        SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            matches!(spec.identifiability, TensorBSplineIdentifiability::None)
+        }
+        _ => false,
+    }
+}
+
+/// Hand the model's constant level to this smooth when the formula removed
+/// the intercept (the level-carrier rule of [`ModelLevel`]): release the
+/// default model-space centring so the constant stays in the smooth's span.
+///
+/// The level must sit in an unpenalized direction, or the fit would shrink the
+/// whole curve toward zero and change under a shift of the response. The
+/// wiggliness penalty already leaves the constant free (it lies in its null
+/// space); the double-penalty null-space ridge would not, so when
+/// `keep_null_ridge` is false the ridge is dropped and the smooth's null space
+/// (the constant and the polynomials the penalty annihilates) is left
+/// unpenalized, as for a smooth fitted alongside an intercept without a
+/// null-space penalty. An explicit `double_penalty=true` keeps it: the user
+/// asked for the whole null space, level included, to be shrunk. Only a basis
+/// for which [`bspline_smooth_is_default_centred`] or
+/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
+/// basis is left untouched.
+pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
+    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
+            spec.identifiability = TensorBSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
+    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
+        if matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ) {
+            spec.identifiability = BSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, BSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
+    }
+}
+
 /// A continuous `by=` smooth is a varying coefficient `f(x)·z`. Its constant
 /// direction is `z` itself, not the intercept, so the model-space sum-to-zero
 /// centring the inner smooth would otherwise apply removes a genuine
@@ -7214,7 +7164,7 @@ pub(crate) fn build_by_smooth_local(
             frozen_parametric_residualization: None,
         name: term.name.clone(),
         basis: (*smooth).clone(),
-        shape: term.shape,
+        shape: term.shape.clone(),
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7269,6 +7219,13 @@ pub(crate) fn build_by_smooth_local(
             let p = inner.dim;
             let q = n_levels * p;
             let n = data.nrows();
+            let (level_lower_bounds, level_linear_constraints) =
+                replicate_shape_constraints_over_levels(
+                    inner.shape_lower_bounds.as_ref(),
+                    inner.linear_constraints.as_ref(),
+                    p,
+                    n_levels,
+                );
 
             let inner_dense = inner
                 .design
@@ -7350,8 +7307,10 @@ pub(crate) fn build_by_smooth_local(
                     levels: Some(level_bits),
                     ordered: *ordered,
                 },
-                linear_constraints: None,
-                box_reparam: false,
+                // Every level's curve carries the inner term's full shape
+                // realization on its own coefficient block.
+                linear_constraints: level_linear_constraints,
+                shape_lower_bounds: level_lower_bounds,
             })
         }
     }
@@ -7375,90 +7334,125 @@ pub(crate) fn ensure_by_variable_specs_match(
     }
 }
 
-/// Choose a deterministic orthonormal basis for a subspace from its projector.
+/// Function Gram `G = ∫ b bᵀ` and slope energy `D₁ = ∫ b' b'ᵀ` of a factor-smooth
+/// marginal, in the coefficient chart of its design (`b = Tᵀ b_raw` when the
+/// marginal carries an identifiability transform `T`).
 ///
-/// Eigenvectors belonging to a repeated eigenvalue are defined only up to an
-/// arbitrary orthogonal rotation.  That freedom is harmless when consumers use
-/// the whole projector `ZZ^T`, but it changes model semantics when each column
-/// receives its own smoothing parameter.  We remove the eigensolver gauge by
-/// repeatedly projecting coefficient coordinate axes into the subspace and
-/// selecting the largest residual (with stable lowest-index tie breaking).
-/// The result depends only on the subspace projector and the declared
-/// coefficient chart, never on the orientation returned by an eigensolver.
-fn canonical_nullspace_directions(z: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
-    let (coefficient_dim, nullity) = z.dim();
-    if nullity == 0 {
-        return Ok(Array2::zeros((coefficient_dim, 0)));
+/// Both integrate over the marginal's own modeling interval (one period for a
+/// periodic marginal). The slope energy is returned as a thunk because only a
+/// null space of more than one dimension needs it.
+fn factor_smooth_marginal_function_metrics<'a>(
+    metadata: &'a BasisMetadata,
+    fallback_degree: Option<usize>,
+    width: usize,
+    term_name: &'a str,
+) -> Result<
+    (
+        Array2<f64>,
+        impl FnOnce() -> Result<Array2<f64>, BasisError> + 'a,
+    ),
+    BasisError,
+> {
+    enum Marginal<'m> {
+        Open(&'m Array1<f64>, usize),
+        Periodic(f64, f64, usize, usize),
+        Cubic(&'m Array1<f64>),
     }
-    if coefficient_dim < nullity || z.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_basis!(
-            "null-space basis must be finite with rows >= columns, got {}x{}",
-            coefficient_dim,
-            nullity
-        );
-    }
-
-    let tolerance = 128.0 * f64::EPSILON * coefficient_dim.max(1) as f64;
-    let mut canonical = Array2::<f64>::zeros((coefficient_dim, nullity));
-    for accepted in 0..nullity {
-        let mut best_coordinate = usize::MAX;
-        let mut best_norm = 0.0_f64;
-        let mut best = Array1::<f64>::zeros(coefficient_dim);
-
-        for coordinate in 0..coefficient_dim {
-            // `P e_j = Z (Z^T e_j)` without materializing the full projector.
-            let mut candidate = Array1::<f64>::zeros(coefficient_dim);
-            for row in 0..coefficient_dim {
-                candidate[row] = (0..nullity)
-                    .map(|axis| z[[row, axis]] * z[[coordinate, axis]])
-                    .sum();
-            }
-            // Two-pass modified Gram--Schmidt keeps the selected directions
-            // orthogonal even when successive projected coordinates are close.
-            for _ in 0..2 {
-                for axis in 0..accepted {
-                    let direction = canonical.column(axis);
-                    let projection = direction.dot(&candidate);
-                    candidate.scaled_add(-projection, &direction);
+    let (marginal, transform) = match metadata {
+        BasisMetadata::BSpline1D {
+            knots,
+            identifiability_transform,
+            periodic,
+            degree,
+            ..
+        } => {
+            let Some(degree) = degree.or(fallback_degree) else {
+                crate::bail_invalid_basis!(
+                    "factor smooth term '{}': the B-spline marginal records no degree",
+                    term_name
+                );
+            };
+            let marginal = match periodic {
+                Some((start, period, num_basis)) => {
+                    Marginal::Periodic(*start, *period, degree, *num_basis)
                 }
-            }
-            let norm = candidate.dot(&candidate).sqrt();
-            let tie_band = tolerance * best_norm.max(1.0);
-            if best_coordinate == usize::MAX || norm > best_norm + tie_band {
-                best_coordinate = coordinate;
-                best_norm = norm;
-                best = candidate;
-            }
+                None => Marginal::Open(knots, degree),
+            };
+            (marginal, identifiability_transform.as_ref())
         }
-
-        if best_coordinate == usize::MAX || best_norm <= tolerance {
+        BasisMetadata::CubicRegression1D {
+            knots,
+            identifiability_transform,
+        } => (Marginal::Cubic(knots), identifiability_transform.as_ref()),
+        _ => {
             crate::bail_invalid_basis!(
-                "null-space projector exposed only {} of {} independent directions",
-                accepted,
-                nullity
+                "factor smooth term '{}' needs the function metric of its marginal to split the \
+                 null space into function components, but the marginal is neither a B-spline \
+                 nor a cubic regression spline",
+                term_name
             );
         }
-        best.mapv_inplace(|value| value / best_norm);
-        // Fix the remaining sign gauge for reproducible metadata/debug output.
-        let sign_anchor = best
-            .iter()
-            .enumerate()
-            .max_by(|(left_index, left), (right_index, right)| {
-                left.abs()
-                    .partial_cmp(&right.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| right_index.cmp(left_index))
-            })
-            .map(|(_, value)| *value)
-            .unwrap_or(1.0);
-        if sign_anchor < 0.0 {
-            best.mapv_inplace(|value| -value);
+    };
+    let to_chart = move |raw: Array2<f64>| -> Result<Array2<f64>, BasisError> {
+        let chart = match transform {
+            Some(t) => t.t().dot(&raw).dot(t),
+            None => raw,
+        };
+        if chart.dim() != (width, width) {
+            crate::bail_dim_basis!(
+                "factor smooth term '{}': marginal function metric is {:?} but the marginal has {} columns",
+                term_name,
+                chart.dim(),
+                width
+            );
         }
-        canonical.column_mut(accepted).assign(&best);
-    }
-    Ok(canonical)
+        Ok(chart)
+    };
+    let gram = match &marginal {
+        Marginal::Open(knots, degree) => crate::basis::bspline_function_gram(knots, *degree)?,
+        Marginal::Periodic(start, period, degree, num_basis) => {
+            crate::basis::periodic_bspline_function_gram(*start, start + period, *degree, *num_basis)?
+        }
+        Marginal::Cubic(knots) => crate::basis::cubic_regression_function_gram(knots)?,
+    };
+    let gram = to_chart(gram)?;
+    let slope_energy = move || {
+        let raw = match marginal {
+            Marginal::Open(knots, degree) => {
+                crate::basis::bspline_derivative_penalty_matrix(knots.view(), degree, 1)?
+            }
+            Marginal::Periodic(_, period, degree, num_basis) => {
+                crate::basis::cyclic_bspline_derivative_penalty_matrix(degree, num_basis, period, 1)?
+            }
+            Marginal::Cubic(knots) => crate::basis::cubic_regression_slope_energy(knots)?,
+        };
+        to_chart(raw)
+    };
+    Ok((gram, slope_energy))
 }
 
+/// Per-level penalties `GΦ_gΦ_gᵀG` of the marginal null components (see
+/// [`crate::basis::null_function_mass_components`]).
+fn factor_smooth_null_component_penalties(
+    marginal_penalty: &Array2<f64>,
+    metadata: &BasisMetadata,
+    fallback_degree: Option<usize>,
+    term_name: &str,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    let width = marginal_penalty.nrows();
+    let (gram, slope_energy) =
+        factor_smooth_marginal_function_metrics(metadata, fallback_degree, width, term_name)?;
+    let components = crate::basis::null_function_mass_components(
+        marginal_penalty,
+        &gram,
+        slope_energy,
+        "factor-smooth null components",
+    )?;
+    Ok(components
+        .iter()
+        .map(|factor| factor.t().dot(factor))
+        .collect())
+}
 
 /// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
 ///
@@ -7529,7 +7523,7 @@ pub(crate) fn build_factor_smooth(
                 levels: levels.clone(),
                 frozen_global_orthogonality: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeSpec::None,
             joint_null_rotation: None,
         };
         let mut built = build_single_local_smooth_term(data, &sz_term, workspace)?;
@@ -7630,7 +7624,7 @@ pub(crate) fn build_factor_smooth(
             feature_col,
             spec: marginal_spec,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeSpec::None,
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7762,43 +7756,37 @@ pub(crate) fn build_factor_smooth(
     // and curves away from the true per-group line (gam#712 real arm, gam#713;
     // gam#903 sleepstudy forecast ran ~74% over the lme4 BLUP bar).
     //
-    // mgcv's `bs="fs"` fixes this by penalizing each null-space dimension
-    // SEPARATELY (`smooth.construct.fs.smooth.spec` adds one rank-1 penalty per
-    // null coordinate), each replicated block-diagonally across levels under a
-    // single shared smoothing parameter — so REML fits a distinct
-    // random-intercept variance and random-slope variance, the partial pooling
-    // that makes the forecast track lme4's correlated random-effect BLUP. A
-    // single *combined* null penalty (one λ for intercept+slope together) cannot
-    // express the typically very different intercept and slope variances, which
-    // is the residual forecast gap. We mirror mgcv exactly: for each orthonormal
-    // canonical null direction `z_k` of the marginal wiggliness penalty, add
-    // `I_L ⊗ (z_k z_kᵀ)` as its own penalty. The marginal's combined double
-    // penalty was disabled above, so the null space is penalized once, per
-    // dimension. With linear data REML drives the curvature λ up and degrades
-    // `fs` to a linear random slope (edf → ≈2/group); with genuine curvature the
-    // wiggliness λ stays small and the wiggle survives (data-adaptive, not a
-    // cap). Gated by `marginal.double_penalty` (the DSL `double_penalty=`),
-    // which on this flavour means exactly "penalize the null space too".
-    if use_per_dim_null
-        && let Some(Some(z)) = inner
-            .active_penalties
-            .first()
-            .map(|penalty| &penalty.null_eigenvectors)
-        && z.nrows() == p
-    {
-        let z = canonical_nullspace_directions(z)?;
-        for k in 0..z.ncols() {
-            // Rank-1 marginal penalty `z_k z_kᵀ`, replicated block-diagonally
-            // across levels into `I_L ⊗ (z_k z_kᵀ)`. Its own λ is one shared
-            // variance for this null component (intercept or slope) across all
-            // groups — the random-effect structure of mgcv `fs`.
-            let zk = z.column(k);
-            let mut p_k = Array2::<f64>::zeros((p, p));
-            for a in 0..p {
-                for b in 0..p {
-                    p_k[[a, b]] = zk[a] * zk[b];
-                }
-            }
+    // A single *combined* null penalty (one λ for intercept and slope together)
+    // cannot express the typically very different intercept and slope
+    // variances, which is the residual forecast gap, so each null COMPONENT gets
+    // its own penalty, replicated block-diagonally across levels under one
+    // shared smoothing parameter: REML then fits a distinct random-intercept
+    // variance and random-slope variance.
+    //
+    // A null component is a set of functions, so the split is made in function
+    // space (SPEC rule 5), not along coefficient axes: the null space is split
+    // into `L²`-orthonormal functions ordered by slope energy (the constant, the
+    // centred linear function, …), and each component's penalty charges the
+    // `L²` mass of the level's curve along it (`null_function_mass_components`).
+    // Coefficient-axis directions would make "the intercept variance" depend on
+    // how the marginal happens to be parameterized. The marginal's combined
+    // double penalty was disabled above, so the null space is penalized once,
+    // per component. With linear data REML drives the curvature λ up and
+    // degrades `fs` to a linear random slope (edf → ≈2/group); with genuine
+    // curvature the wiggliness λ stays small and the wiggle survives
+    // (data-adaptive, not a cap). Gated by `marginal.double_penalty` (the DSL
+    // `double_penalty=`), which on this flavour means exactly "penalize the null
+    // space too".
+    if use_per_dim_null && let Some(wiggliness) = inner.active_penalties.first() {
+        let components = factor_smooth_null_component_penalties(
+            &wiggliness.matrix,
+            &inner.metadata,
+            Some(spec.marginal.degree),
+            term_name,
+        )?;
+        for p_k in components {
+            // `I_L ⊗ R_k`: one shared variance for this null component across
+            // all groups.
             let mut s_null = Array2::<f64>::zeros((q, q));
             for level in 0..n_levels {
                 let start = level * p;
@@ -7875,7 +7863,7 @@ pub(crate) fn build_factor_smooth(
         dropped_penalties,
         metadata,
         linear_constraints: None,
-        box_reparam: false,
+        shape_lower_bounds: None,
     })
 }
 
@@ -7914,6 +7902,98 @@ pub(crate) fn resolve_factor_smooth_levels(
     Ok(bits)
 }
 
+/// Build a shape-constrained 1-D B-spline directly in its exact cone chart.
+///
+/// The raw clamped basis is built first to realize knots and degree; the cone
+/// chart `β = C δ` from [`bspline_shape_cone_chart`] is then replayed through
+/// the builder as a `FrozenTransform`, so the design, the penalty congruence,
+/// the constrained-chart null ridge, and the prediction-time freeze all share
+/// one transform. Under the default sum-to-zero identifiability the chart drops
+/// the level coordinate — the one the model intercept already carries — and
+/// centres the rest on the fitting rows, which leaves every control-point
+/// difference, and hence the cone, unchanged.
+fn build_shape_cone_bspline_basis_1d(
+    x: ArrayView1<'_, f64>,
+    spec: &BSplineBasisSpec,
+    term: &SmoothTermSpec,
+    atom: ShapeConstraint,
+) -> Result<BasisBuildResult, BasisError> {
+    let centring_weights = match &spec.identifiability {
+        // A frozen spec already carries the realized cone chart.
+        BSplineIdentifiability::FrozenTransform { .. } => {
+            return build_bspline_basis_1d(x, spec);
+        }
+        BSplineIdentifiability::None => None,
+        BSplineIdentifiability::WeightedSumToZero { weights } => Some(weights.clone()),
+        BSplineIdentifiability::RemoveLinearTrend
+        | BSplineIdentifiability::OrthogonalToDesignColumns { .. } => {
+            crate::bail_invalid_basis!(
+                "shape={} on term '{}' supports only sum-to-zero or no identifiability constraint; removing a linear trend or projecting out design columns does not preserve the shape cone",
+                term.shape,
+                term.name
+            );
+        }
+    };
+    let mut raw_spec = spec.clone();
+    raw_spec.identifiability = BSplineIdentifiability::None;
+    let raw = build_bspline_basis_1d(x, &raw_spec)?;
+    let BasisMetadata::BSpline1D {
+        knots,
+        degree: Some(degree),
+        periodic: None,
+        auto_shrink_note,
+        ..
+    } = &raw.metadata
+    else {
+        crate::bail_invalid_basis!(
+            "shape-constrained term '{}' requires realized open B-spline knot and degree metadata",
+            term.name
+        );
+    };
+    let raw_column_means = match centring_weights {
+        None => None,
+        Some(weights) => {
+            let n = raw.design.nrows();
+            let weights = weights.unwrap_or_else(|| Array1::ones(n));
+            if weights.len() != n {
+                crate::bail_dim_basis!(
+                    "sum-to-zero weights for term '{}' have length {} but the basis has {} rows",
+                    term.name,
+                    weights.len(),
+                    n
+                );
+            }
+            let total = weights.sum();
+            if !(total.is_finite() && total > 0.0) {
+                crate::bail_invalid_basis!(
+                    "sum-to-zero weights for term '{}' must have a finite positive total; got {total}",
+                    term.name
+                );
+            }
+            Some(raw.design.transpose_vector_multiply(&weights) / total)
+        }
+    };
+    let chart = bspline_shape_cone_chart(
+        atom,
+        knots.view(),
+        *degree,
+        raw_column_means.as_ref().map(|means| means.view()),
+    )?;
+    let mut chart_spec = spec.clone();
+    chart_spec.knotspec = BSplineKnotSpec::Provided(knots.clone());
+    chart_spec.degree = *degree;
+    chart_spec.identifiability = BSplineIdentifiability::FrozenTransform { transform: chart };
+    let mut built = build_bspline_basis_1d(x, &chart_spec)?;
+    if let BasisMetadata::BSpline1D {
+        auto_shrink_note: note,
+        ..
+    } = &mut built.metadata
+    {
+        *note = auto_shrink_note.clone();
+    }
+    Ok(built)
+}
+
 /// Marginal B-spline spec for a factor-smooth block. The marginal always builds
 /// without an identifiability constraint (the per-level replication, not a
 /// sum-to-zero side constraint, provides identifiability against the parametric
@@ -7932,13 +8012,7 @@ pub fn build_single_local_smooth_term(
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
     term.basis.validate_scale_configuration()?;
-    if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
-        crate::bail_invalid_basis!(
-            "ShapeConstraint::{:?} is unsupported for term '{}'",
-            term.shape,
-            term.name
-        );
-    }
+    validate_shape_request(term)?;
     if let SmoothBasisSpec::ByVariable {
         inner,
         by_col,
@@ -7961,7 +8035,7 @@ pub fn build_single_local_smooth_term(
             frozen_parametric_residualization: None,
             name: term.name.clone(),
             basis: inner_basis,
-            shape: term.shape,
+            shape: term.shape.clone(),
             joint_null_rotation: None,
         };
         let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7997,7 +8071,7 @@ pub fn build_single_local_smooth_term(
             }
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} is unsupported for sum-to-zero factor smooth term '{}'",
+                    "shape={} is unsupported for sum-to-zero factor smooth term '{}'",
                     term.shape,
                     term.name
                 );
@@ -8006,7 +8080,7 @@ pub fn build_single_local_smooth_term(
             frozen_parametric_residualization: None,
                 name: format!("{}::inner", term.name),
                 basis: (**inner).clone(),
-                shape: ShapeConstraint::None,
+                shape: ShapeSpec::None,
                 joint_null_rotation: None,
             };
             let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -8016,13 +8090,23 @@ pub fn build_single_local_smooth_term(
                     term.name
                 );
             }
-            // Capture the marginal penalty's null directions BEFORE the penalty
-            // vector is rebuilt below; the sum-to-zero null-space ridge replicates
-            // these `z_k` into the contrast space (mgcv `bs="fs"` double-penalty).
-            let inner_null_eigenvectors = inner_built
-                .active_penalties
-                .first()
-                .and_then(|penalty| penalty.null_eigenvectors.clone());
+            // Split the marginal penalty's null space into its function
+            // components BEFORE the penalty vector is rebuilt below; the
+            // sum-to-zero null-space ridges replicate these into the contrast
+            // space.
+            let inner_degree = match inner.as_ref() {
+                SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec.degree),
+                _ => None,
+            };
+            let inner_null_components = match inner_built.active_penalties.first() {
+                Some(penalty) => factor_smooth_null_component_penalties(
+                    &penalty.matrix,
+                    &inner_built.metadata,
+                    inner_degree,
+                    &term.name,
+                )?,
+                None => Vec::new(),
+            };
             let base = inner_built
                 .design
                 .try_to_dense_by_chunks("sum-to-zero factor smooth")
@@ -8083,7 +8167,7 @@ pub fn build_single_local_smooth_term(
             // groups and vice-versa — systematic truth-recovery loss even when
             // the pooled total edf matches mgcv's (the observed `sz` 1.23× gap).
             //
-            // We mirror mgcv exactly by splitting the per-marginal penalty
+            // We therefore split the per-marginal penalty
             // `Σ_{k=1}^{L} d_kᵀ S d_k` back into its `L` independent
             // rank-controlled summands BEFORE mapping to the contrast space, each
             // carrying its own λ:
@@ -8138,64 +8222,50 @@ pub fn build_single_local_smooth_term(
                 }
             }
 
-            // Null-space ridge, mirroring the `bs="fs"` double-penalty
-            // construction (#1605, same defect class as #700/#712/#713). The
-            // marginal wiggliness penalty `S` shapes curvature but leaves the
+            // Null-space ridges (#1605, same defect class as #700/#712/#713).
+            // The marginal wiggliness penalty `S` shapes curvature but leaves the
             // {const, linear} null space of each deviation curve COMPLETELY
             // unpenalized. With that null space free, the single combined
             // wiggliness smoothing parameter cannot separate the per-group
             // intercept/slope variance from the curvature variance, so REML
             // parks the wiggliness `λ` high — over-smoothing (under-fitting) the
-            // deviation blocks even when the truth lives in their span (the `sz`
-            // recovery gap vs the `fs` superset). mgcv's `bs="fs"` fixes the
-            // analogous gap by penalizing each null-space dimension SEPARATELY
-            // under its own shared variance; we mirror that here while keeping
-            // the zero-sum reparameterization, so the constraint (and the
-            // identifiability of `sz` vs `fs`) is preserved. For each orthonormal
-            // canonical null direction `z_k` of the marginal penalty, add the
-            // rank-1 marginal penalty `z_k z_kᵀ` mapped into the SAME `(I + 11ᵀ)`
-            // sum-to-zero contrast space, each carrying its own `λ`.
-            if let Some(z) = inner_null_eigenvectors.as_ref()
-                && z.nrows() == p
-            {
-                let z = canonical_nullspace_directions(z)?;
-                for k in 0..z.ncols() {
-                    let zk = z.column(k);
-                    let mut p_k = Array2::<f64>::zeros((p, p));
-                    for a in 0..p {
-                        for b in 0..p {
-                            p_k[[a, b]] = zk[a] * zk[b];
+            // deviation blocks even when the truth lives in their span. Each
+            // function component `R_k` of the marginal null space (the constant,
+            // the centred linear function, …; see `null_function_mass_components`)
+            // gets its own `λ`, mapped into the SAME `(I + 11ᵀ)` sum-to-zero
+            // contrast space, so the constraint (and the identifiability of `sz`
+            // vs `fs`) is preserved. The split is made with the marginal's
+            // function metric, so which deviations each `λ` shrinks does not
+            // depend on the coefficient chart (SPEC rule 5).
+            for p_k in &inner_null_components {
+                // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ R_k` form): each is
+                // one shared variance for that null component of every level's
+                // deviation, the exchangeable random-effect structure; only the
+                // curvature (wiggliness) penalty is split per group above.
+                let stz_pooled_null = {
+                    let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
+                    for a in 0..l_minus_one {
+                        for b in 0..l_minus_one {
+                            let factor = if a == b { 2.0 } else { 1.0 };
+                            let mut block =
+                                s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                            block.assign(&p_k.mapv(|v| v * factor));
                         }
                     }
-                    // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ z_k z_kᵀ` form):
-                    // they govern the per-group intercept/slope shrinkage, which
-                    // mgcv pools under one variance even for `sz`; only the
-                    // curvature (wiggliness) penalty is split per group above.
-                    let stz_pooled_null = {
-                        let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
-                        for a in 0..l_minus_one {
-                            for b in 0..l_minus_one {
-                                let factor = if a == b { 2.0 } else { 1.0 };
-                                let mut block =
-                                    s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
-                                block.assign(&p_k.mapv(|v| v * factor));
-                            }
-                        }
-                        s_big
-                    };
-                    let (s_null, null_scale) =
-                        normalize_penalty_in_constrained_space(&stz_pooled_null);
-                    candidates.push(PenaltyCandidate {
-                        matrix: ConstructiveQuadratic::try_from_dense_psd(
-                            s_null,
-                            "grouped factor-smooth null penalty",
-                        )?,
-                        source: PenaltySource::DoublePenaltyNullspace,
-                        normalization_scale: null_scale,
-                        kronecker_factors: None,
-                        op: None,
-                    });
-                }
+                    s_big
+                };
+                let (s_null, null_scale) =
+                    normalize_penalty_in_constrained_space(&stz_pooled_null);
+                candidates.push(PenaltyCandidate {
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        s_null,
+                        "grouped factor-smooth null penalty",
+                    )?,
+                    source: PenaltySource::DoublePenaltyNullspace,
+                    normalization_scale: null_scale,
+                    kronecker_factors: None,
+                    op: None,
+                });
             }
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
             let mut dropped_penalties = std::mem::take(&mut inner_built.dropped_penalties);
@@ -8218,32 +8288,22 @@ pub fn build_single_local_smooth_term(
                     data.ncols()
                 );
             }
-            let mut spec_local = spec.clone();
-            if term.shape != ShapeConstraint::None {
-                // Shape-constrained B-splines are anchored by construction.
-                // Sum-to-zero side constraints conflict with monotonic/convex cones.
-                spec_local.identifiability = BSplineIdentifiability::None;
+            if let Some(atom) = term.shape.single_atom() {
+                build_shape_cone_bspline_basis_1d(data.column(*feature_col), spec, term, atom)?
+            } else {
+                // A conjunction keeps the spec's own identifiability chart; its
+                // cone rows are mapped through that chart after the build.
+                // Endpoint boundary conditions are structural for B-splines: the
+                // basis builder bakes their homogeneous nullspace transform into
+                // the design, penalties, and stored raw-basis transform.
+                build_bspline_basis_1d(data.column(*feature_col), spec)?
             }
-            // Endpoint boundary conditions are structural for B-splines: the
-            // basis builder bakes their homogeneous nullspace transform into
-            // the design, penalties, and stored raw-basis transform.
-            build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
         }
         SmoothBasisSpec::ThinPlate {
             feature_cols,
             spec,
             input_scale,
         } => {
-            if term.shape != ShapeConstraint::None {
-                if feature_cols.len() != 1 {
-                    crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
-                        term.shape,
-                        term.name,
-                        feature_cols.len()
-                    );
-                }
-            }
             let mut spec_local = spec.clone();
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
@@ -8342,7 +8402,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::Sphere { feature_cols, spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on spherical splines",
+                    "shape={} for term '{}' is not supported on spherical splines",
                     term.shape,
                     term.name
                 );
@@ -8353,7 +8413,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::ConstantCurvature { feature_cols, spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on constant-curvature smooths",
+                    "shape={} for term '{}' is not supported on constant-curvature smooths",
                     term.shape,
                     term.name
                 );
@@ -8374,7 +8434,7 @@ pub fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on measure-jet smooths",
+                    "shape={} for term '{}' is not supported on measure-jet smooths",
                     term.shape,
                     term.name
                 );
@@ -8413,7 +8473,7 @@ pub fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
                     crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
+                        "shape={} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
@@ -8461,7 +8521,7 @@ pub fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
                     crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
+                        "shape={} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
@@ -8570,7 +8630,7 @@ pub fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on Pca basis",
+                    "shape={} for term '{}' is not supported on Pca basis",
                     term.shape,
                     term.name
                 );
@@ -8600,7 +8660,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::FactorSmooth { spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} is unsupported for factor smooth term '{}'",
+                    "shape={} is unsupported for factor smooth term '{}'",
                     term.shape,
                     term.name
                 );
@@ -8632,7 +8692,7 @@ pub fn build_single_local_smooth_term(
 
     if built.affine_offset.is_some() && term.shape != ShapeConstraint::None {
         crate::bail_invalid_basis!(
-            "non-zero endpoint anchors cannot be combined with ShapeConstraint::{:?} on term '{}': the coefficient cone constrains only the homogeneous spline and would not certify the final affine function",
+            "non-zero endpoint anchors cannot be combined with shape={} on term '{}': the coefficient cone constrains only the homogeneous spline and would not certify the final affine function",
             term.shape,
             term.name
         );
@@ -8640,8 +8700,8 @@ pub fn build_single_local_smooth_term(
     let p_local = built.design.ncols();
     let affine_offset = built.affine_offset;
     let mut metadata = built.metadata.clone();
-    let mut design_t = built.design;
-    let mut penalties_t = built.active_penalties;
+    let design_t = built.design;
+    let penalties_t = built.active_penalties;
     let mut dropped_penalties_t = built.dropped_penalties;
     if matches!(
         spatial_identifiability_policy(term),
@@ -8650,91 +8710,12 @@ pub fn build_single_local_smooth_term(
         metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
     }
 
-    let use_box_reparam =
-        term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-    if let Some((order, sign)) = shape_order_and_sign(term.shape)
-        && use_box_reparam
-    {
-        // Order 1 (monotone): the plain first-difference cone θ_{i+1}−θ_i ≥ 0 is
-        // the control-polygon monotonicity criterion, which is independent of
-        // Greville-abscissa spacing (it only fixes the *sign* of consecutive
-        // control-point gaps), so the integer-difference transform is exact.
-        //
-        // Order 2 (convex/concave): the plain second-difference cone is only
-        // correct for evenly spaced Greville abscissae. gam's B-splines are
-        // clamped (and may use quantile knots), so the abscissae are not
-        // uniform and the geometrically-correct cone is the second *divided*
-        // difference. Build the knot-span-scaled transform so γ_{≥2} ≥ 0
-        // certifies convexity of the function, not of the raw coefficient
-        // index. Periodic splines are rejected by the exact-support gate: their
-        // cyclic coefficient chart cannot use this open divided-difference cone.
-        let t = if order == 2 {
-            let (knots, degree) = match &metadata {
-                BasisMetadata::BSpline1D {
-                    knots,
-                    degree: Some(degree),
-                    periodic,
-                    ..
-                } if periodic.is_none() => (knots, *degree),
-                _ => {
-                    crate::bail_invalid_basis!(
-                        "shape-constrained convex/concave term '{}' requires realized open B-spline knot and degree metadata",
-                        term.name
-                    );
-                }
-            };
-            let spans = bspline_first_derivative_control_spans(knots.view(), degree)?;
-            if spans.len() + 1 != p_local {
-                crate::bail_invalid_basis!(
-                    "shape-constraint derivative-control span count {} does not match basis dim {} for term '{}'",
-                    spans.len(),
-                    p_local,
-                    term.name
-                );
-            }
-            convex_derivative_control_transform_matrix(&spans, sign)?
-        } else {
-            cumulative_sum_transform_matrix(p_local, order, sign)
-        };
-        // Coefficient-side transform: wrap the design in an operator that
-        // applies T on the coefficient side, preserving sparsity/operator
-        // structure of the inner design.
-        let inner_dense = match design_t {
-            DesignMatrix::Dense(d) => d,
-            DesignMatrix::Sparse(sp) => gam_linalg::matrix::DenseDesignMatrix::from(
-                sp.try_to_dense_arc("shape-constrained coefficient transform")
-                    .map_err(BasisError::InvalidInput)?,
-            ),
-        };
-        let coeff_op =
-            gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone()).map_err(
-                |e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")),
-            )?;
-        design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-            coeff_op,
-        )));
-        // `β = Tγ` is an invertible change of coefficient chart. Every
-        // physical quadratic functional, including the function-space
-        // null-component penalty, therefore transforms by the same congruence
-        // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
-        // would change the represented functional under this harmless chart
-        // change and violate SPEC 5.
-        for penalty in &mut penalties_t {
-            let tt_s = fast_atb(&t, &penalty.matrix);
-            penalty.matrix = fast_ab(&tt_s, &t);
-            penalty.op = None;
-            penalty.info.kronecker_factors = None;
-            // A declared structural null frame does NOT survive this chart.
-            // `null(Tᵀ S T) = T⁻¹ null(S)`, and `T` is a cumulative-sum /
-            // derivative-control transform — invertible but not orthogonal, so
-            // the image of an orthonormal frame is not orthonormal and the
-            // declaration's own contract cannot carry it. Withdraw it here
-            // rather than ship a frame that no longer spans the null space:
-            // consumers measure when nothing is declared, which is the honest
-            // fallback, whereas a stale frame is a wrong theorem.
-            penalty.info.structural_null_frame = None;
-        }
-    }
+    // The re-filter below numbers its input from zero, and its input is this
+    // build's active penalties, so it hands back their numbering (#2953).
+    let build_numbering: Vec<usize> = penalties_t
+        .iter()
+        .map(|penalty| penalty.info.original_index)
+        .collect();
     let penalty_candidates = penalties_t
         .into_iter()
         .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
@@ -8799,8 +8780,18 @@ pub fn build_single_local_smooth_term(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?;
+    let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?
+        .with_build_numbering(&build_numbering)?;
     dropped_penalties_t.extend(filtered.dropped);
+    // A single 1-D atom was built in its centred cone chart and is realized as
+    // coordinate bounds there; conjunctions and per-margin tensor cones enter
+    // the solver as exact inequality rows mapped into this build's chart.
+    let (shape_lower_bounds, shape_linear_constraints) =
+        match plan_shape_realization(term, &metadata, p_local)? {
+            ShapeRealization::Unconstrained => (None, None),
+            ShapeRealization::Box(bounds) => (Some(bounds), None),
+            ShapeRealization::Linear(constraints) => (None, Some(constraints)),
+        };
     // Joint-null absorption rotation. Fresh fit specs compute Q from the final
     // per-smooth penalty set (after all in-smooth reparameterizations have
     // already been applied). Frozen specs already carry the complete realized
@@ -8821,8 +8812,8 @@ pub fn build_single_local_smooth_term(
         joint_null_rotation,
         dropped_penalties: dropped_penalties_t,
         metadata,
-        linear_constraints: None,
-        box_reparam: use_box_reparam,
+        linear_constraints: shape_linear_constraints,
+        shape_lower_bounds,
     })
 }
 
@@ -8886,11 +8877,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
     for (term, mut built) in planned_terms.iter().zip(local_builds.into_iter()) {
         let p_local = built.dim;
         let col_end = col_start + p_local;
-        let lb_local = if built.box_reparam {
-            shape_lower_bounds_local(term.shape, p_local)
-        } else {
-            None
-        };
+        let lb_local = built.shape_lower_bounds.take();
 
         // Stage-2 joint-null absorption rotation. Fired *before* the
         // penalty / design / global aggregation loops below so that every
@@ -9014,7 +9001,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
             parametric_residualization: None,
             name: term.name.clone(),
             coeff_range: col_start..col_end,
-            shape: term.shape,
+            shape: term.shape.clone(),
             active_penalties: built.active_penalties,
             dropped_penalties: built.dropped_penalties,
             metadata: built.metadata,

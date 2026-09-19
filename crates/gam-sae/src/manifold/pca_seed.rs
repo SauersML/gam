@@ -25,7 +25,8 @@ use rayon::prelude::*;
 /// planes conditioned at `~1e7` enter the phase solve and degrade its accuracy.
 const SURPLUS_DIR_FLOOR: f64 = 1.0e-6;
 
-/// Golden-ratio conjugate `φ⁻¹`. Additive step of a low-discrepancy (mod 1)
+/// Derived (#2469): the golden-ratio conjugate `φ⁻¹ = (√5 − 1)/2`, written to
+/// f64 precision. Additive step of a low-discrepancy (mod 1)
 /// rotation that folds the #976 multi-start retry index into the periodic
 /// `phase_offset`, so successive reseeds place the SAME surplus atom at a
 /// well-spread DISTINCT circle phase. `pc_pair_offset == 0` contributes exactly

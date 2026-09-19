@@ -188,23 +188,62 @@ fn interval_uniformity(
 /// is the exact limiting distribution — NOT a tabulated critical constant — so
 /// the "flagged / not flagged" decision is derived, not tuned. As a check the
 /// series returns `≈ 0.05` at the tabulated 5% point `u = 0.187` and `≈ 0.01` at
-/// the 1% point `u = 0.267` (asserted in the tests). The alternating series
-/// converges geometrically; terms below `1e-14` are negligible.
+/// the 1% point `u = 0.267` (asserted in the tests).
+///
+/// With `a = 2π²u`, Poisson summation (Jacobi's `θ₄ ↔ θ₂` transform)
+/// `Σ_{j∈ℤ} (−1)^j e^{−aj²} = √(π/a) Σ_{k∈ℤ} e^{−π²(k+½)²/a}` gives the dual form
+/// `P = 1 − √(2/(πu)) Σ_{k≥0} e^{−(2k+1)²/(8u)}`. Each form's terms decay by at
+/// least `e^{−π}` per step on its own side of `a = π` (`u = 1/(2π)`), so the
+/// direct series is summed there and above and the dual below. That keeps a
+/// small statistic, a coordinate more uniform than chance, at `P → 1`; the
+/// direct series alone needs about `1/√u` terms to settle there.
+///
+/// Derived (#2469): each sum runs until a term no longer changes it in f64. The
+/// terms decrease, so everything omitted is below half an ulp of the sum (the
+/// direct series alternates, and the dual's positive tail is at most `e^{−2π}`
+/// times its last term). The terms underflow to zero for every finite `u > 0`,
+/// so both loops end.
 pub fn watson_u2_pvalue(u2: f64) -> f64 {
     if !(u2 > 0.0) {
         return 1.0;
     }
-    let two_pi_sq = 2.0 * std::f64::consts::PI * std::f64::consts::PI;
-    let mut sum = 0.0_f64;
-    for j in 1..=100_usize {
-        let jf = j as f64;
-        let term = (-two_pi_sq * jf * jf * u2).exp();
-        sum += if j % 2 == 1 { term } else { -term };
-        if term < 1.0e-14 {
-            break;
-        }
+    if !u2.is_finite() {
+        return 0.0;
     }
-    (2.0 * sum).clamp(0.0, 1.0)
+    let pi = std::f64::consts::PI;
+    if u2 >= 1.0 / (2.0 * pi) {
+        let a = 2.0 * pi * pi * u2;
+        let mut sum = 0.0_f64;
+        let mut j = 1.0_f64;
+        let mut sign = 1.0_f64;
+        loop {
+            let next = sum + sign * (-a * j * j).exp();
+            if next == sum {
+                break;
+            }
+            sum = next;
+            j += 1.0;
+            sign = -sign;
+        }
+        2.0 * sum
+    } else {
+        let mut sum = 0.0_f64;
+        let mut odd = 1.0_f64;
+        loop {
+            let next = sum + (-(odd * odd) / (8.0 * u2)).exp();
+            if next == sum {
+                break;
+            }
+            sum = next;
+            odd += 2.0;
+        }
+        if sum == 0.0 {
+            // Every dual term underflowed: `P` is 1 to working precision, and the
+            // prefactor may itself overflow at a subnormal `u`.
+            return 1.0;
+        }
+        1.0 - (2.0 / (pi * u2)).sqrt() * sum
+    }
 }
 
 /// Watson's `U²` uniformity statistic of coordinates `u` on the unit interval
@@ -299,8 +338,11 @@ fn coordinate_uniformity_impl(
                 hi = hi.max(t);
             }
             let span = hi - lo;
-            let scale = lo.abs().max(hi.abs()).max(1.0);
-            if !(span > 1.0e-12 * scale) {
+            // Derived (#2469): `t − lo` and `hi − lo` are each one rounded subtraction
+            // of exact inputs, so every normalized `(t − lo)/span` is within a few ulps
+            // of its exact value for any positive finite span. Only an empty interval,
+            // every coordinate equal, leaves nothing to normalize.
+            if !(span > 0.0 && span.is_finite()) {
                 return None;
             }
             coords.iter().map(|&t| (t - lo) / span).collect()
@@ -1017,8 +1059,11 @@ fn fold_for_occupancy_weighted(
                 hi = hi.max(t);
             }
             let span = hi - lo;
-            let scale = lo.abs().max(hi.abs()).max(1.0);
-            if !(span > 1.0e-12 * scale) {
+            // Derived (#2469): `t − lo` and `hi − lo` are each one rounded subtraction
+            // of exact inputs, so every normalized `(t − lo)/span` is within a few ulps
+            // of its exact value for any positive finite span. Only an empty interval,
+            // every coordinate equal, leaves nothing to normalize.
+            if !(span > 0.0 && span.is_finite()) {
                 return None;
             }
             let mut folded = Vec::new();
@@ -1987,4 +2032,69 @@ mod coordinate_fidelity_tests {
     // rejected every concentrated coordinate would pass a one-sided test while
     // destroying the `Continuous` rung.
     // ======================================================================
+
+    /// #2469: Watson's p-value sums each series until a term no longer changes
+    /// it, and below `u = 1/(2π)` it sums the Poisson dual. Under the old
+    /// `1e-14` term floor with its 100-term cap, the direct series stopped
+    /// mid-oscillation at a small statistic: `p(10⁻⁶)` came out near `0.02`, so a
+    /// coordinate far more uniform than chance was flagged. The dual form keeps
+    /// it at 1, reproduces the tabulated 10% point, which lies on the dual side,
+    /// and meets the direct series at the switch.
+    #[test]
+    fn watson_pvalue_sums_to_its_fixed_point_and_reads_a_small_statistic_as_uniform_2469() {
+        assert_eq!(
+            watson_u2_pvalue(1.0e-6),
+            1.0,
+            "a statistic far below its null mean must read P = 1"
+        );
+        // 10% critical value 0.152 (Stephens 1970), below the switch.
+        let p10 = watson_u2_pvalue(0.152);
+        assert!((p10 - 0.10).abs() < 5.0e-3, "p(U²=0.152) must be ≈0.10, got {p10}");
+        // At the switch the two forms meet. `dP/du ≈ −1.7` there, so one ulp of
+        // `u` moves `P` by `≈ 5e-17`; the rest is each form's few-ulp rounding.
+        let switch = 1.0 / (2.0 * std::f64::consts::PI);
+        let dual = watson_u2_pvalue(switch.next_down());
+        let direct = watson_u2_pvalue(switch);
+        assert!(
+            (dual - direct).abs() <= 1.0e-15,
+            "the dual ({dual:e}) and direct ({direct:e}) forms must meet at u = 1/(2π)"
+        );
+        // Positive control: the two forms are not trivially equal away from each other.
+        assert!(watson_u2_pvalue(0.05) > dual && dual > watson_u2_pvalue(0.30));
+    }
+
+    /// #2469: an interval chart's coordinates normalize at any positive span.
+    /// `1 + i·2⁻⁴⁵` spans `7·2⁻⁴⁵ ≈ 2e-13`, below the old `1e-12·max(|lo|, |hi|, 1)`
+    /// floor, which refused it; `t − lo` is exact here, so its statistic equals
+    /// that of `0, 1, …, 7` bit for bit. Equal coordinates are still refused.
+    #[test]
+    fn interval_uniformity_normalizes_any_positive_span_2469() {
+        let support = SupportMeasure::from_weights(0, Array1::from_elem(8, 1.0)).unwrap();
+        let reference = Array1::from_shape_fn(8, |i| i as f64);
+        let narrow = Array1::from_shape_fn(8, |i| 1.0 + i as f64 * 2.0_f64.powi(-45));
+        let wide = coordinate_uniformity_weighted(
+            reference.view(),
+            &support,
+            &CanonicalChartTopology::Interval,
+        )
+        .expect("a unit-spaced interval coordinate has a span");
+        let tight = coordinate_uniformity_weighted(
+            narrow.view(),
+            &support,
+            &CanonicalChartTopology::Interval,
+        )
+        .expect("a span of 7·2⁻⁴⁵ must normalize");
+        assert_eq!(
+            tight.statistic.to_bits(),
+            wide.statistic.to_bits(),
+            "an exactly affine rescaling must leave the statistic bit-identical"
+        );
+        assert_eq!(tight.p_value, wide.p_value);
+        let flat = Array1::from_elem(8, 1.0);
+        assert!(
+            coordinate_uniformity_weighted(flat.view(), &support, &CanonicalChartTopology::Interval)
+                .is_none(),
+            "equal coordinates have no span to normalize"
+        );
+    }
 }

@@ -56,6 +56,21 @@ pub fn tail_count(n: usize) -> usize {
         .min(n - 1)
 }
 
+/// Standard error of the REPORTED shape at tail sample `tail_n` and shape `k`:
+/// `√n(1+k)/(n+P)`, with `P` = [`SHAPE_PRIOR_PSEUDO_OBSERVATIONS`].
+///
+/// The generalized-Pareto shape estimate has asymptotic standard error
+/// `(1+k)/√n` at tail sample `n`, and the reported shape is the convex
+/// combination `(n·k_raw + P·SHAPE_PRIOR_MEAN)/(n + P)`, which scales it by
+/// `n/(n + P)`. This is the resolution of every verdict read off `k_hat`: a
+/// grade whose `k_hat` sits within a few of these of a cutoff does not say which
+/// side of the cutoff the true shape is on. Pair it with [`tail_count`] to size
+/// a draw count `M` for a wanted resolution (#2946 T2).
+pub fn shape_standard_error(tail_n: usize, k: f64) -> f64 {
+    let n = tail_n as f64;
+    n.sqrt() * (1.0 + k) / (n + SHAPE_PRIOR_PSEUDO_OBSERVATIONS)
+}
+
 /// Pareto-smooth a non-negative weight vector and report the fitted GPD tail
 /// shape.  Non-tail observations are left bit-identical; only the largest tail
 /// observations are replaced by sorted GPD expected quantiles and then clipped
@@ -392,4 +407,26 @@ mod tests {
         }
     }
 
+    /// #2946 T2: the resolution the rho-posterior module documents for its
+    /// adequacy grade is this function's value at the `0.7` cutoff: `≈ 0.27` at
+    /// the default `M = 64` (tail `8`) and `≈ 0.25` at `M = 512` (tail `23`).
+    /// The error is the asymptotic `(1+k)/√n` scaled by the shrinkage
+    /// `n/(n + P)`, so it vanishes as the tail grows.
+    #[test]
+    fn shape_standard_error_matches_the_documented_resolution_2946() {
+        let at_64 = shape_standard_error(tail_count(64), 0.7);
+        let at_512 = shape_standard_error(tail_count(512), 0.7);
+        assert_eq!((tail_count(64), tail_count(512)), (8, 23));
+        assert!((at_64 - 0.27).abs() < 0.005, "M = 64: {at_64}");
+        assert!((at_512 - 0.25).abs() < 0.005, "M = 512: {at_512}");
+        for n in [8usize, 23, 100, 10_000] {
+            let unshrunk = (1.0 + 0.7) / (n as f64).sqrt();
+            let shrink = n as f64 / (n as f64 + SHAPE_PRIOR_PSEUDO_OBSERVATIONS);
+            let se = shape_standard_error(n, 0.7);
+            // The two routes round at most nine times in all, each by at most
+            // eps/2 relative.
+            assert!((se - unshrunk * shrink).abs() <= 4.5 * f64::EPSILON * se, "n = {n}: {se}");
+        }
+        assert!(shape_standard_error(1_000_000, 0.7) < 0.002);
+    }
 }

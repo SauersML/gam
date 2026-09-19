@@ -22,11 +22,43 @@ impl crate::custom_family::JeffreysArming for LatentSurvivalFamily {
     }
 }
 
+/// The latent-survival Jeffreys information is the observed joint Hessian (trait
+/// default), so its third information derivative is `{D³H[u, v, e_a]}` (#2677).
+impl crate::custom_family::JeffreysThirdInformationDerivative for LatentSurvivalFamily {
+    fn third_directional_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "third_directional_all_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        self.exact_newton_joint_hessian_third_directional_derivative_all_axes_dense(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+        .map(Some)
+    }
+}
+
 impl CustomFamily for LatentSurvivalFamily {
     // The self-limiting Jeffreys/Firth curvature bounds a direction the data do
     // not, but it is armed only when the unarmed fit proves it is needed (#979).
     fn joint_jeffreys_term_required(&self) -> bool {
         self.jeffreys_armed
+    }
+
+    fn jeffreys_third_information_derivative(
+        &self,
+    ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
+        Some(self)
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -411,6 +443,28 @@ impl CustomFamily for LatentSurvivalFamily {
         .map(Some)
     }
 
+    /// Fixed-β second-order terms of a pair of baseline-chart hyper axes (#2677).
+    fn exact_newton_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index_i: usize,
+        psi_index_j: usize,
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_terms: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_index_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_index_j)?;
+        self.baseline_theta_psisecond_order_terms_dense(block_states, &rows, axis_i, axis_j)
+            .map(Some)
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -428,12 +482,44 @@ impl crate::custom_family::JeffreysArming for LatentBinaryFamily {
     }
 }
 
+/// The latent-binary Jeffreys information is the observed joint Hessian (trait
+/// default), so its third information derivative is `{D³H[u, v, e_a]}` (#2677).
+impl crate::custom_family::JeffreysThirdInformationDerivative for LatentBinaryFamily {
+    fn third_directional_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "third_directional_all_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        self.exact_newton_joint_hessian_third_directional_derivative_all_axes_dense(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )
+        .map(Some)
+    }
+}
+
 impl CustomFamily for LatentBinaryFamily {
     // Latent binary fits have a separation regime. The self-limiting
     // Jeffreys/Firth curvature bounds it there, but it is armed only when the
     // unarmed fit proves it is needed (#979).
     fn joint_jeffreys_term_required(&self) -> bool {
         self.jeffreys_armed
+    }
+
+    fn jeffreys_third_information_derivative(
+        &self,
+    ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
+        Some(self)
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
@@ -808,6 +894,28 @@ impl CustomFamily for LatentBinaryFamily {
             d_beta_flat,
         )
         .map(Some)
+    }
+
+    /// Fixed-β second-order terms of a pair of baseline-chart hyper axes (#2677).
+    fn exact_newton_joint_psisecond_order_terms(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index_i: usize,
+        psi_index_j: usize,
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "exact_newton_joint_psisecond_order_terms: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let (rows, axis_i) = self.baseline_theta_family_axis(hyper_layout, psi_index_i)?;
+        let (_, axis_j) = self.baseline_theta_family_axis(hyper_layout, psi_index_j)?;
+        self.baseline_theta_psisecond_order_terms_dense(block_states, &rows, axis_i, axis_j)
+            .map(Some)
     }
 
     fn requires_joint_outer_hyper_path(&self) -> bool {

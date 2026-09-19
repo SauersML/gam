@@ -220,6 +220,22 @@ pub fn forward_substitution_lower_matrix<'l, 'b>(
     out
 }
 
+/// Solve the upper-triangular system `Lᵀ X = B` (multiple right-hand sides) for
+/// `X`, where `L` is supplied as the lower-triangular factor, column by column.
+pub fn back_substitution_lower_transpose_matrix<'l, 'b>(
+    l: impl Into<ArrayView2<'l, f64>>,
+    b: impl Into<ArrayView2<'b, f64>>,
+) -> Array2<f64> {
+    let l = l.into();
+    let b = b.into();
+    let mut out = Array2::<f64>::zeros((l.nrows(), b.ncols()));
+    for c in 0..b.ncols() {
+        let x = back_kernel(l, b.column(c));
+        out.column_mut(c).assign(&x);
+    }
+    out
+}
+
 /// Solve the lower-triangular system `L y = b` for a single right-hand side —
 /// forward substitution only, no back solve.
 ///
@@ -296,6 +312,16 @@ mod tests {
         let expected = back_substitution_lower_transpose(&l, &y);
         let got = cholesky_solve_vector(&l, &b);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn back_substitution_matrix_solves_every_column_of_the_upper_system() {
+        let l = fixture_factor();
+        let x_true = array![[0.5, -1.0], [4.0, 2.0], [-3.0, 0.25]];
+        // Lᵀ X = rhs, exact in binary: every entry of the solve is a dyadic rational.
+        let rhs = l.t().dot(&x_true);
+        let x = back_substitution_lower_transpose_matrix(&l, &rhs);
+        assert_eq!(x, x_true);
     }
 
     #[test]

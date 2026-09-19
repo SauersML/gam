@@ -25,6 +25,7 @@
 // crate root.
 mod event_history_ffi;
 mod ffi;
+mod parameter_decomposition_ffi;
 
 mod inference;
 
@@ -36,6 +37,7 @@ mod manifold;
 
 #[path = "latent/topology_persistence_ffi.rs"]
 mod topology_persistence_ffi;
+mod joint_event_ffi;
 
 // Re-export the foundation modules at the crate root. The concern modules
 // (and the `#[pyfunction]`s in the included fragments) reach the exception

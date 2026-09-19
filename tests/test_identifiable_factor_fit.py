@@ -1,9 +1,9 @@
-"""Smoke test for :func:`gamfit.identifiable_factor_fit`.
+"""Smoke test for :func:`gamfit.identifiability.identifiable_factor_fit`.
 
 Generates a tiny synthetic dataset with a 3-dim auxiliary-conditioned
 latent and a 3-dim free latent, mixes them linearly into a 12-dim
 observation space, then asserts the recipe returns the right shapes and a
-finite evidence score.
+finite profile log-likelihood.
 """
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def test_identifiable_factor_fit_does_not_mutate_global_torch_rng() -> None:
     x, aux = _toy_dataset(seed=17)
     torch.manual_seed(54_321)
     state_before = torch.random.get_rng_state().clone()
-    gamfit.identifiable_factor_fit(
+    gamfit.identifiability.identifiable_factor_fit(
         x,
         aux=aux,
         n_supervised=3,
@@ -97,7 +97,7 @@ def test_identifiable_factor_fit_does_not_mutate_global_torch_rng() -> None:
 
 def test_identifiable_factor_fit_default_auto_weights_issue_790() -> None:
     x, aux = _issue_790_dataset()
-    result = gamfit.identifiable_factor_fit(
+    result = gamfit.identifiability.identifiable_factor_fit(
         x,
         aux=aux,
         n_supervised=2,
@@ -115,7 +115,7 @@ def test_identifiable_factor_fit_default_auto_weights_issue_790() -> None:
 def test_identifiable_factor_fit_smoke() -> None:
     x, aux = _toy_dataset()
     with pytest.warns(UserWarning, match="MechanismSparsity"):
-        result = gamfit.identifiable_factor_fit(
+        result = gamfit.identifiability.identifiable_factor_fit(
             x,
             aux=aux,
             n_supervised=3,
@@ -127,7 +127,7 @@ def test_identifiable_factor_fit_smoke() -> None:
         )
     assert result.T_supervised.shape == (80, 3)
     assert result.T_free.shape == (80, 3)
-    assert math.isfinite(result.evidence)
+    assert math.isfinite(result.profile_log_likelihood)
     assert result.decoder.shape == (12, 6)
     assert result.aux_prior_weight > 0.0
     assert result.mech_sparsity_weight > 0.0
@@ -166,7 +166,7 @@ def test_identifiable_factor_fit_warns_on_constant_aux() -> None:
     x, _ = _toy_dataset(seed=2)
     aux = np.ones((x.shape[0], 1))  # constant aux -> iVAE precondition fails
     with pytest.warns(UserWarning, match="auxiliary covariate variation"):
-        result = gamfit.identifiable_factor_fit(
+        result = gamfit.identifiability.identifiable_factor_fit(
             x,
             aux=aux,
             n_supervised=1,
@@ -192,7 +192,7 @@ def test_identifiability_check_flags_constant_aux() -> None:
     x, _ = _toy_dataset(seed=4)
     aux = np.ones((x.shape[0], 1))
     with pytest.warns(UserWarning):
-        result = gamfit.identifiable_factor_fit(
+        result = gamfit.identifiability.identifiable_factor_fit(
             x,
             aux=aux,
             n_supervised=1,
@@ -210,7 +210,7 @@ def test_identifiability_check_flags_constant_aux() -> None:
     assert "constant" in by_name["iVAE"].reason.lower()
     assert by_name["iVAE"].metric["aux_min_std"] == 0.0
     # Re-running check() against the saved fit reproduces the same verdict.
-    rerun = gamfit.identifiability_check(result)
+    rerun = gamfit.identifiability.check(result)
     assert rerun.status == "fail"
     assert {t.theorem_name for t in rerun.theorems} == {
         "iVAE", "MechanismSparsity", "RandomProjection",
@@ -220,7 +220,7 @@ def test_identifiability_check_flags_constant_aux() -> None:
 def test_identifiable_factor_fit_rejects_unknown_encoder() -> None:
     x, aux = _toy_dataset()
     with pytest.raises(ValueError, match="not a recognized encoder"):
-        gamfit.identifiable_factor_fit(
+        gamfit.identifiability.identifiable_factor_fit(
             x, aux=aux, n_supervised=3, n_free=3,
             mech_sparsity_weight=1.0, aux_prior_weight=1.0,
             encoder="transformer[8]",

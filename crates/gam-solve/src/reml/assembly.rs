@@ -14,7 +14,7 @@ use super::reml_outer_engine::{
     PenaltySubspaceTrace, RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::model_types::ProjectedKktResidual;
-use gam_linalg::faer_ndarray::fast_xt_diag_y;
+use gam_linalg::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
 use ndarray::{Array1, Array2};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -24,11 +24,6 @@ use std::sync::Arc;
 //  Streaming weighted dense-design products
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Dense weighted-product work below this approximate flop count stays on the
-/// caller thread and uses the existing faer GEMM path. Above the threshold we
-/// stream rows through rayon-local accumulation buffers to avoid materializing
-/// weighted n×p design copies at large scale.
-pub(crate) const DENSE_WEIGHTED_PRODUCT_PAR_FLOPS: usize = 8_000_000;
 pub(crate) const DENSE_ROW_SCALE_PAR_CELLS: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
@@ -137,62 +132,14 @@ pub(crate) fn scale_dense_row_values(row_values: &mut [f64], scale: f64, mode: D
     }
 }
 
-pub(crate) fn accumulate_weighted_cross_rows(
-    out: &mut Array2<f64>,
-    left: &Array2<f64>,
-    right: &Array2<f64>,
-    weights: &Array1<f64>,
-    row_start: usize,
-    row_end: usize,
-) {
-    let p = left.ncols();
-    let q = right.ncols();
-    for i in row_start..row_end {
-        let wi = weights[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for a in 0..p {
-            let scaled = wi * left[[i, a]];
-            if scaled == 0.0 {
-                continue;
-            }
-            for b in 0..q {
-                out[[a, b]] += scaled * right[[i, b]];
-            }
-        }
-    }
-}
-
-pub(crate) fn accumulate_xt_diag_x_upper_rows(
-    out: &mut Array2<f64>,
-    x: &Array2<f64>,
-    diag: &Array1<f64>,
-    row_start: usize,
-    row_end: usize,
-) {
-    let p = x.ncols();
-    for i in row_start..row_end {
-        let wi = diag[i];
-        if wi == 0.0 {
-            continue;
-        }
-        for a in 0..p {
-            let scaled = wi * x[[i, a]];
-            if scaled == 0.0 {
-                continue;
-            }
-            for b in a..p {
-                out[[a, b]] += scaled * x[[i, b]];
-            }
-        }
-    }
-}
-
-/// Compute `leftᵀ diag(weights) right` using streamed row-block
-/// accumulation for large products. The parallel path allocates one dense
-/// p×q accumulator per rayon worker/task instead of allocating an n×q weighted
-/// design matrix.
+/// Compute `leftᵀ diag(weights) right` through the shared streamed kernel
+/// ([`fast_xt_diag_y`]), which never materializes a weighted n×q copy.
+///
+/// There is one path at every size and every pool width. The kernel picks its
+/// row split from the shape alone, so the product's bits do not follow
+/// `RAYON_NUM_THREADS`; a separate "parallel" branch here, taken only when the
+/// pool had more than one worker, summed the rows in a different order than the
+/// one-worker GEMM and made every large fit's bits a function of the pool width.
 pub(crate) fn weighted_cross_dense(
     left: &Array2<f64>,
     right: &Array2<f64>,
@@ -200,88 +147,19 @@ pub(crate) fn weighted_cross_dense(
 ) -> Array2<f64> {
     assert_eq!(left.nrows(), right.nrows());
     assert_eq!(left.nrows(), weights.len());
-    let n = weights.len();
-    let p = left.ncols();
-    let q = right.ncols();
-    if n == 0 || p == 0 || q == 0 {
-        return Array2::<f64>::zeros((p, q));
-    }
-
-    let work = n.saturating_mul(p).saturating_mul(q);
-    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
-        return fast_xt_diag_y(left, weights, right);
-    }
-
-    // Deterministic parallel row reduction: the association tree is a pure
-    // function of `n` (length-only pairwise tree over 128-row base blocks),
-    // never of thread count or work stealing — a rayon `fold(..).reduce(..)`
-    // here groups partials by demand-driven splits, which made the accumulated
-    // float result nondeterministic run-to-run (#2228 determinism probe).
-    gam_linalg::pairwise_reduce::par_deterministic_block_fold(
-        n,
-        |range: core::ops::Range<usize>| {
-            let mut local = Array2::<f64>::zeros((p, q));
-            accumulate_weighted_cross_rows(
-                &mut local,
-                left,
-                right,
-                weights,
-                range.start,
-                range.end,
-            );
-            local
-        },
-        |mut a, b| {
-            a += &b;
-            a
-        },
-    )
-    .unwrap_or_else(|| Array2::<f64>::zeros((p, q)))
+    fast_xt_diag_y(left, weights, right)
 }
 
-/// Compute `xᵀ diag(diag) x`. For small products this reuses `weighted` as an
-/// n×p row-scaled scratch and dispatches to faer GEMM. For large products it
-/// streams rows into rayon-local p×p buffers and mirrors the accumulated upper
-/// triangle, avoiding weighted design materialization.
-pub(crate) fn xt_diag_x_dense_into(
-    x: &Array2<f64>,
-    diag: &Array1<f64>,
-    weighted: &mut Array2<f64>,
-) -> Array2<f64> {
-    let (n, p) = x.dim();
-    assert_eq!(diag.len(), n, "diag length must match row count");
-    if n == 0 || p == 0 {
-        return Array2::<f64>::zeros((p, p));
-    }
-
-    let work = n.saturating_mul(p).saturating_mul(p);
-    if rayon::current_num_threads() <= 1 || work < DENSE_WEIGHTED_PRODUCT_PAR_FLOPS {
-        row_scale_dense_into(x, diag, weighted);
-        return gam_linalg::faer_ndarray::fast_atb(x, weighted);
-    }
-
-    // Deterministic parallel row reduction (length-only pairwise tree; see
-    // `weighted_cross_dense` above for why a rayon fold/reduce is not usable
-    // here).
-    let mut out = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
-        n,
-        |range: core::ops::Range<usize>| {
-            let mut local = Array2::<f64>::zeros((p, p));
-            accumulate_xt_diag_x_upper_rows(&mut local, x, diag, range.start, range.end);
-            local
-        },
-        |mut a, b| {
-            a += &b;
-            a
-        },
-    )
-    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
-    for a in 0..p {
-        for b in 0..a {
-            out[[a, b]] = out[[b, a]];
-        }
-    }
-    out
+/// Compute `xᵀ diag(diag) x` through the shared streamed symmetric kernel
+/// ([`fast_xt_diag_x`]), which accumulates the lower triangle and mirrors it, so
+/// the Gram is exactly symmetric: a full GEMM of `xᵀ·(diag·x)` rounds `[a, b]`
+/// and `[b, a]` along different accumulation orders. Signed `diag` is kept
+/// exactly (`Xᵀ·(D·X)`, never a square root). As with [`weighted_cross_dense`],
+/// one path serves every size and pool width, so the bits never depend on
+/// `RAYON_NUM_THREADS`.
+pub(crate) fn xt_diag_x_dense(x: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
+    assert_eq!(diag.len(), x.nrows(), "diag length must match row count");
+    fast_xt_diag_x(x, diag)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -329,6 +207,9 @@ pub struct InnerAssembly<'dp> {
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
     pub active_constraints: Option<Arc<crate::model_types::ActiveLinearConstraintBlock>>,
+    /// The constraint system and KKT gradient the constrained Laplace normalizer reads
+    /// (gam#2765); `None` prices no truncation.
+    pub cone_normalizer: Option<Arc<crate::estimate::reml::reml_outer_engine::ConeNormalizerInput>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
@@ -370,6 +251,7 @@ impl<'dp> InnerAssembly<'dp> {
         builder = builder.barrier_config(self.barrier_config);
         builder = builder.kkt_residual(self.kkt_residual);
         builder = builder.active_constraints(self.active_constraints);
+        builder = builder.cone_normalizer(self.cone_normalizer);
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);
@@ -394,7 +276,7 @@ impl<'dp> InnerAssembly<'dp> {
         rho: &[f64],
         mode: EvalMode,
         prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
-    ) -> Result<RemlLamlResult, String> {
+    ) -> Result<RemlLamlResult, super::reml_outer_engine::RemlLamlError> {
         let solution = self.build();
         // The rho outer audit is a thread-local and a no-op unless armed. This
         // route gets the same fresh window and criterion record as the standard
@@ -412,6 +294,16 @@ impl<'dp> InnerAssembly<'dp> {
                 result.criterion_components.kkt,
             ],
         );
+        crate::estimate::outer_eval_capture::record_certificate_criterion(
+            crate::estimate::outer_eval_capture::CertificateCriterion {
+                cost: result.cost,
+                fixed_beta: result.criterion_components.fixed_beta,
+                logdet_h: result.criterion_components.logdet_h,
+                logdet_s: result.criterion_components.logdet_s,
+                kkt: result.criterion_components.kkt,
+                inner_residual_energy: result.ift_residual_energy,
+            },
+        );
         Ok(result)
     }
 }
@@ -426,7 +318,7 @@ pub fn evaluate_solution(
     rho: &[f64],
     mode: EvalMode,
     prior: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
-) -> Result<RemlLamlResult, String> {
+) -> Result<RemlLamlResult, super::reml_outer_engine::RemlLamlError> {
     reml_laml_evaluate(solution, rho, mode, prior)
 }
 
@@ -546,17 +438,73 @@ mod tests {
         assert_matrix_close(&got, &expected, 5e-10, 5e-12);
     }
 
-    #[test]
-    pub(crate) fn xt_diag_x_dense_into_matches_symmetric_reference_at_large_scale_block_size() {
-        let x = deterministic_matrix(1024, 96, 1.1);
-        let weights = deterministic_weights(x.nrows());
-        let mut scratch = Array2::<f64>::zeros((0, 0));
-        let got = xt_diag_x_dense_into(&x, &weights, &mut scratch);
-        let expected = weighted_cross_reference(&x, &x, &weights);
-        assert_matrix_close(&got, &expected, 3e-10, 5e-12);
+    fn assert_bitwise_symmetric(got: &Array2<f64>) {
         for i in 0..got.nrows() {
-            for j in 0..got.ncols() {
-                assert_relative_eq!(got[[i, j]], got[[j, i]], epsilon = 0.0);
+            for j in 0..i {
+                assert_eq!(
+                    got[[i, j]].to_bits(),
+                    got[[j, i]].to_bits(),
+                    "Gram entry [{i}, {j}] = {:e} differs from its transpose [{j}, {i}] = {:e}",
+                    got[[i, j]],
+                    got[[j, i]]
+                );
+            }
+        }
+    }
+
+    /// Every PIRLS Hessian is formed here, small or large, so the Gram must be
+    /// exactly symmetric on both sides of the row-split threshold.
+    #[test]
+    pub(crate) fn xt_diag_x_dense_is_exactly_symmetric_small_and_large() {
+        for (n, p) in [(768, 96), (40_000, 24)] {
+            let x = deterministic_matrix(n, p, 1.1);
+            let weights = deterministic_weights(x.nrows());
+            let got = xt_diag_x_dense(&x, &weights);
+            let expected = weighted_cross_reference(&x, &x, &weights);
+            assert_matrix_close(&got, &expected, 1e-9, 5e-12);
+            assert_bitwise_symmetric(&got);
+        }
+    }
+
+    /// Observed-information weights are signed; the Gram keeps their sign.
+    #[test]
+    pub(crate) fn xt_diag_x_dense_keeps_signed_weights_at_scale() {
+        let x = deterministic_matrix(40_000, 12, 0.4);
+        let weights = Array1::from_shape_fn(x.nrows(), |i| ((i as f64) * 0.37).sin());
+        let got = xt_diag_x_dense(&x, &weights);
+        let expected = weighted_cross_reference(&x, &x, &weights);
+        assert_matrix_close(&got, &expected, 1e-9, 5e-12);
+    }
+
+    /// The dense weighted products every large fit forms carry the same bits at
+    /// every pool width. A branch that went parallel only when the pool had
+    /// more than one worker summed the rows in a different order from the
+    /// one-worker GEMM, so a fit's bits followed `RAYON_NUM_THREADS`.
+    #[test]
+    pub(crate) fn dense_weighted_products_are_bitwise_identical_across_pool_widths() {
+        let x = deterministic_matrix(60_000, 20, 0.9);
+        let right = deterministic_matrix(60_000, 7, 0.2);
+        let weights = deterministic_weights(x.nrows());
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("test pool")
+                .install(|| {
+                    (
+                        xt_diag_x_dense(&x, &weights),
+                        weighted_cross_dense(&x, &right, &weights),
+                    )
+                })
+        };
+        let (gram_1, cross_1) = run(1);
+        for threads in [2, 3, 8] {
+            let (gram_t, cross_t) = run(threads);
+            for (a, b) in gram_1.iter().zip(gram_t.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "Gram differs at {threads} threads");
+            }
+            for (a, b) in cross_1.iter().zip(cross_t.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "cross differs at {threads} threads");
             }
         }
     }

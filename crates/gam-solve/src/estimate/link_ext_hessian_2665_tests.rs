@@ -113,35 +113,24 @@ fn sas_state<'a>(
 /// the evaluator caches on, so mutating them in place would risk answering from
 /// a bundle cached at the unperturbed point — a finite difference of zero.
 fn theta_gradient(rho: f64, epsilon: f64, log_delta: f64) -> Array1<f64> {
-    let n = 60usize;
-    let x = tiny_design(n);
-    let y = binomial_response(n);
-    let w = Array1::<f64>::ones(n);
-    let offset = Array1::<f64>::zeros(n);
-    let cfg = sas_config_at(epsilon, log_delta);
-    let state = sas_state(&y, &w, &offset, &x, &cfg);
-    let rho_vec = Array1::from_elem(1, rho);
-    let evaluation = state
-        .evaluate_unified_with_link_ext(
-            &rho_vec,
-            crate::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
-        )
-        .expect("the SAS link-ext criterion must evaluate at the probe point");
-    evaluation
-        .gradient
-        .expect("ValueAndGradient must return a gradient")
+    criterion_and_gradient(rho, epsilon, log_delta).1
 }
 
 /// The analytic θ-Hessian of the link-ext criterion at the probe point.
 fn analytic_hessian() -> Array2<f64> {
+    analytic_hessian_at([PROBE_RHO, PROBE_EPSILON, PROBE_LOG_DELTA])
+}
+
+/// The analytic θ-Hessian of the link-ext criterion at `[rho, epsilon, log_delta]`.
+fn analytic_hessian_at(base: [f64; 3]) -> Array2<f64> {
     let n = 60usize;
     let x = tiny_design(n);
     let y = binomial_response(n);
     let w = Array1::<f64>::ones(n);
     let offset = Array1::<f64>::zeros(n);
-    let cfg = sas_config_at(PROBE_EPSILON, PROBE_LOG_DELTA);
+    let cfg = sas_config_at(base[1], base[2]);
     let state = sas_state(&y, &w, &offset, &x, &cfg);
-    let rho_vec = Array1::from_elem(1, PROBE_RHO);
+    let rho_vec = Array1::from_elem(1, base[0]);
     let evaluation = state
         .evaluate_unified_with_link_ext(
             &rho_vec,
@@ -168,7 +157,11 @@ fn analytic_hessian() -> Array2<f64> {
 /// `theta[0]` is ρ, `theta[1]` is ε, `theta[2]` is raw log δ — the same order
 /// the evaluator appends its link coordinates in.
 fn fd_hessian(step: f64) -> Array2<f64> {
-    let base = [PROBE_RHO, PROBE_EPSILON, PROBE_LOG_DELTA];
+    fd_hessian_at([PROBE_RHO, PROBE_EPSILON, PROBE_LOG_DELTA], step)
+}
+
+/// Central finite difference of the θ-gradient at `base`.
+fn fd_hessian_at(base: [f64; 3], step: f64) -> Array2<f64> {
     let dim = base.len();
     let mut out = Array2::<f64>::zeros((dim, dim));
     for i in 0..dim {
@@ -299,4 +292,83 @@ fn link_link_outer_hessian_block_is_not_a_first_order_residue() {
          {rho_rho:e}; that is the signature of the block being assembled from \
          first-order drifts alone"
     );
+}
+
+/// The link-ext criterion value and its analytic θ-gradient at one point.
+fn criterion_and_gradient(rho: f64, epsilon: f64, log_delta: f64) -> (f64, Array1<f64>) {
+    let n = 60usize;
+    let x = tiny_design(n);
+    let y = binomial_response(n);
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let cfg = sas_config_at(epsilon, log_delta);
+    let state = sas_state(&y, &w, &offset, &x, &cfg);
+    let rho_vec = Array1::from_elem(1, rho);
+    let evaluation = state
+        .evaluate_unified_with_link_ext(
+            &rho_vec,
+            crate::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
+        )
+        .expect("the SAS link-ext criterion must evaluate at the probe point");
+    let gradient = evaluation
+        .gradient
+        .expect("ValueAndGradient must return a gradient");
+    (evaluation.cost, gradient)
+}
+
+/// The analytic θ-gradient is the derivative of the criterion it is shipped
+/// with, at the probe point and at the heavy-tailed, small-δ region the
+/// pyGAM-audit SAS reproducer (families.md F4) walks through. A gradient that
+/// disagreed with its own cost there would stall the outer trust region on a
+/// criterion it cannot descend.
+#[test]
+fn link_ext_outer_gradient_is_the_derivative_of_the_criterion() {
+    // Central differences in the raw outer coordinates; the step balances the
+    // O(h²) truncation against the O(ε·|V|/h) rounding of a cost of O(10).
+    let step = 1e-5;
+    for base in [
+        [PROBE_RHO, PROBE_EPSILON, PROBE_LOG_DELTA],
+        [4.8, 0.12, -2.1],
+        [-2.6, 0.12, -2.1],
+        [1.0, 0.0, 0.0],
+        [1.0, -0.5, 1.0],
+    ] {
+        let (_, analytic) = criterion_and_gradient(base[0], base[1], base[2]);
+        for coordinate in 0..3 {
+            let mut plus = base;
+            let mut minus = base;
+            plus[coordinate] += step;
+            minus[coordinate] -= step;
+            let fd = (criterion_and_gradient(plus[0], plus[1], plus[2]).0
+                - criterion_and_gradient(minus[0], minus[1], minus[2]).0)
+                / (2.0 * step);
+            let g = analytic[coordinate];
+            assert!(
+                (g - fd).abs() <= 1e-6 * (1.0 + g.abs()),
+                "θ-gradient coordinate {coordinate} at {base:?}: analytic {g:.10e} vs \
+                 central difference {fd:.10e}"
+            );
+        }
+    }
+}
+
+/// The whole analytic θ-Hessian matches a central difference of the analytic
+/// θ-gradient in the heavy-tailed, small-δ region the families.md F4 SAS
+/// reproducer converges into, not only at the mild probe point. The outer
+/// trust region reads its model curvature from this matrix, so a wrong block
+/// there would make it propose steps the criterion rejects.
+#[test]
+fn link_ext_outer_hessian_matches_finite_difference_at_small_delta() {
+    const BAR: f64 = 1.0e-2;
+    for base in [[4.8, 0.12, -2.1], [-2.6, 0.12, -2.1]] {
+        let analytic = analytic_hessian_at(base);
+        let reference = fd_hessian_at(base, 1.0e-4);
+        let scale = block_frobenius(&reference, (0, 3), (0, 3));
+        let error = block_frobenius(&(&reference - &analytic), (0, 3), (0, 3)) / scale;
+        assert!(
+            error < BAR,
+            "θ-Hessian relative error {error:.3e} at {base:?} exceeds {BAR:.1e}. \
+             Analytic:\n{analytic:?}\nFinite difference:\n{reference:?}"
+        );
+    }
 }

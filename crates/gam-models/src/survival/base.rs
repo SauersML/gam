@@ -56,6 +56,33 @@ impl From<SurvivalError> for String {
     }
 }
 
+impl SurvivalError {
+    /// The fixed category of this refusal, so a fit that stops on it raises the
+    /// class that names what failed (#2937).
+    #[must_use]
+    pub fn failure_category(&self) -> gam_problem::FailureCategory {
+        use gam_problem::FailureCategory;
+        match self {
+            // The one-hazard engine's contract on the arrays it is handed.
+            Self::DimensionMismatch
+            | Self::NonFiniteInput
+            | Self::UnsupportedSpec(_)
+            | Self::InvalidIntegrationSetup
+            | Self::InvalidTimeGrid
+            | Self::InvalidInput { .. }
+            | Self::EventCodeInvalid { .. } => FailureCategory::Input,
+            // The cause-specific blocks are assembled by the fit from one
+            // validated dataset, so their layouts disagreeing is an internal
+            // inconsistency.
+            Self::CauseSpecificDimensionMismatch { .. } => FailureCategory::Invariant,
+            Self::NonMonotoneCumulativeHazard
+            | Self::NonPositiveHazard
+            | Self::NumericalFailure { .. } => FailureCategory::Numerical,
+            Self::CauseSpecificBlock { source, .. } => source.failure_category(),
+        }
+    }
+}
+
 impl From<crate::block_layout::block_count::BlockCountMismatch> for SurvivalError {
     fn from(err: crate::block_layout::block_count::BlockCountMismatch) -> SurvivalError {
         SurvivalError::CauseSpecificDimensionMismatch {
@@ -295,6 +322,13 @@ pub struct CauseSpecificRoystonParmarBlock {
 #[derive(Debug, Clone)]
 pub struct CauseSpecificRoystonParmarFamily {
     blocks: Vec<CauseSpecificRoystonParmarBlock>,
+    /// Each block's inequality system (`time_block_linear_constraint_system`), built
+    /// once at construction and charged on the memory governor's ledger for the life
+    /// of the family. The feasible-step ratio test borrows it on every trial step, and
+    /// the constrained solve's owned copy is taken from it, instead of each call copying
+    /// the block's `n × p` derivative design again (#2900 row 10.3).
+    constraint_systems:
+        Vec<std::sync::Arc<gam_runtime::resource::Governed<LinearInequalityConstraints>>>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
     /// on the unarmed fit's own evidence, through
     /// `fit_custom_family_arming_on_evidence_with_rho_prior` (#979).
@@ -318,8 +352,30 @@ impl CauseSpecificRoystonParmarFamily {
                 .to_string()
             })?;
         }
+        let mut constraint_systems = Vec::with_capacity(blocks.len());
+        for (idx, block) in blocks.iter().enumerate() {
+            let cols = block.x_derivative.ncols();
+            let rows = block.x_derivative.nrows() + block.structural_time_columns.min(cols);
+            let charge = gam_runtime::resource::MemoryGovernor::global()
+                .try_reserve_dense_f64(
+                    rows,
+                    cols,
+                    "cause-specific survival time-block constraint system",
+                )
+                .map_err(|error| {
+                    format!(
+                        "cause-specific survival block {}: refusing the {rows}x{cols} constraint \
+                         system: {error}",
+                        idx + 1
+                    )
+                })?;
+            constraint_systems.push(std::sync::Arc::new(
+                charge.bind(time_block_linear_constraint_system(block)),
+            ));
+        }
         Ok(Self {
             blocks,
+            constraint_systems,
             jeffreys_armed: true,
         })
     }
@@ -908,8 +964,10 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
             }
             .into());
         }
+        // The constrained solve takes an owned system; it is copied from the one built
+        // and charged at construction.
         Ok(Some(ConstraintSet::Dense(
-            time_block_linear_constraint_system(block),
+            (**self.constraint_systems[block_idx]).clone(),
         )))
     }
 
@@ -947,9 +1005,13 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         // The same rows the constrained joint Newton solves against, judged by
         // the same contract (unit-row-scaled ratio test at the primal-feasibility
         // tolerance) and landing ON the blocking face so the row can enter the
-        // working face — see `time_block_linear_constraint_system`.
-        let system = time_block_linear_constraint_system(block);
-        crate::marginal_slope_shared::feasible_step_fraction(&system, &state.beta, delta)
+        // working face — see `time_block_linear_constraint_system`. The system is the one
+        // built and charged at construction, borrowed on every trial step.
+        crate::marginal_slope_shared::feasible_step_fraction(
+            &self.constraint_systems[block_idx],
+            &state.beta,
+            delta,
+        )
             .map(Some)
             .map_err(|error| {
                 SurvivalError::InvalidInput {
@@ -1503,6 +1565,8 @@ impl Clone for WorkingModelSurvival {
 }
 
 impl WorkingModelSurvival {
+    /// Derived (#2469): `ln(f64::MAX)`, the largest exponent `exp` returns finite
+    /// for (`f64::ln` is not a `const fn`, so the value is written out).
     const LOG_F64_MAX: f64 = 709.782712893384;
 
     #[inline]
@@ -3250,6 +3314,7 @@ impl WorkingModelSurvival {
         let penalty_quadratic = state.penalty_term;
 
         let mut result = InnerAssembly {
+            cone_normalizer: None,
             log_likelihood: state.log_likelihood,
             penalty_quadratic,
             beta: reparam_inner.beta_transformed,
@@ -3286,7 +3351,22 @@ impl WorkingModelSurvival {
             mode,
             None,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|error| match error {
+            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
+            gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} survival evaluation refused this trial point: {fold}"),
+                }
+            }
+            gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} survival evaluation refused this trial point: {refusal}"),
+                }
+            }
+            gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        })?;
 
         let gradient = result
             .gradient_for_mode(mode, rho.len())
@@ -3379,6 +3459,10 @@ pub struct CompetingRisksCifResult {
 /// serial path. The per-row work (a `n_times`-long prefix-sum recurrence with a
 /// handful of `exp`/`exp_m1` per element) is cheap, so small panels avoid rayon
 /// fan-out overhead; large panels (the #1082 quality-test sizes) amortize it.
+///
+/// Work bound (#2469): result-invariant. Both sides run `assemble_row` for every
+/// subject and collect the rows in index order, so the assembled CIF is identical.
+/// When several subjects fail, which one's error comes back can differ.
 const COMPETING_RISKS_CIF_PARALLEL_ROW_MIN: usize = 256;
 
 pub fn assemble_competing_risks_cif(
@@ -3630,6 +3714,130 @@ fn observed_information_band(dimension: usize, eigenvalues: &Array1<f64>) -> f64
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2, Array3, array, s};
+
+    /// #2937: a fit that stops on a `SurvivalError` raises the class of the
+    /// refusal's category, and a cause-specific wrapper raises its source's.
+    #[test]
+    fn survival_error_failure_categories_2937() {
+        use gam_problem::FailureCategory;
+        let numerical = || SurvivalError::NumericalFailure {
+            reason: "hazard overflow".to_string(),
+        };
+        let cases = [
+            (SurvivalError::DimensionMismatch, FailureCategory::Input),
+            (SurvivalError::NonFiniteInput, FailureCategory::Input),
+            (SurvivalError::UnsupportedSpec("crude"), FailureCategory::Input),
+            (SurvivalError::InvalidIntegrationSetup, FailureCategory::Input),
+            (SurvivalError::InvalidTimeGrid, FailureCategory::Input),
+            (
+                SurvivalError::InvalidInput {
+                    reason: "negative weight".to_string(),
+                },
+                FailureCategory::Input,
+            ),
+            (
+                SurvivalError::EventCodeInvalid {
+                    reason: "multi-cause label 3".to_string(),
+                },
+                FailureCategory::Input,
+            ),
+            (
+                SurvivalError::CauseSpecificDimensionMismatch {
+                    reason: "beta length mismatch".to_string(),
+                },
+                FailureCategory::Invariant,
+            ),
+            (SurvivalError::NonMonotoneCumulativeHazard, FailureCategory::Numerical),
+            (SurvivalError::NonPositiveHazard, FailureCategory::Numerical),
+            (numerical(), FailureCategory::Numerical),
+            (
+                SurvivalError::CauseSpecificBlock {
+                    block: 1,
+                    source: Box::new(numerical()),
+                },
+                FailureCategory::Numerical,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.failure_category(), expected, "{error}");
+        }
+    }
+
+    /// #2900 row 10.3 — the family builds each block's inequality system once, on the
+    /// memory governor, and both consumers read it. The constrained solve's rows must be
+    /// `[x_derivative ; I_s | 0]` with `b = [floor − offset ; 0]`, and the feasible-step
+    /// fraction must equal the ratio test over those explicit rows on a step a row clips.
+    #[test]
+    fn constraint_system_built_once_matches_the_explicit_rows_2900() {
+        let (n, p, structural) = (6usize, 3usize, 2usize);
+        let x_derivative =
+            Array2::from_shape_fn((n, p), |(i, j)| 0.2 + 0.1 * ((i + 2 * j) % 5) as f64);
+        let offset_derivative = Array1::from_shape_fn(n, |i| 0.05 * i as f64);
+        let floor = 1.0e-3;
+        let block = CauseSpecificRoystonParmarBlock {
+            age_entry: Array1::zeros(n),
+            age_exit: Array1::ones(n),
+            event_target: Array1::from_shape_fn(n, |i| u8::from(i % 2 == 0)),
+            sampleweight: Array1::ones(n),
+            x_entry: Arc::new(Array2::ones((n, p))),
+            x_exit: Arc::new(Array2::ones((n, p))),
+            x_derivative: Arc::new(x_derivative.clone()),
+            offset_eta_entry: Array1::zeros(n),
+            offset_eta_exit: Array1::zeros(n),
+            offset_derivative_exit: offset_derivative.clone(),
+            derivative_floor: floor,
+            structural_time_columns: structural,
+        };
+        let family =
+            CauseSpecificRoystonParmarFamily::new(vec![block]).expect("cause-specific family");
+        let spec = crate::custom_family::ParameterBlockSpec {
+            name: "time_cause_1".to_string(),
+            design: gam_linalg::matrix::DesignMatrix::from(Array2::<f64>::ones((n, p))),
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 0,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let states = vec![ParameterBlockState {
+            beta: array![0.5, 0.4, 0.3],
+            eta: Array1::zeros(n),
+        }];
+
+        let mut a = Array2::<f64>::zeros((n + structural, p));
+        a.slice_mut(s![..n, ..]).assign(&x_derivative);
+        for j in 0..structural {
+            a[[n + j, j]] = 1.0;
+        }
+        let mut b = Array1::<f64>::zeros(n + structural);
+        for i in 0..n {
+            b[i] = floor - offset_derivative[i];
+        }
+        let Some(ConstraintSet::Dense(shared)) = family
+            .block_linear_constraints(&states, 0, &spec)
+            .expect("time-block constraints")
+        else {
+            panic!("the time block must carry explicit rows");
+        };
+        assert_eq!(shared.a, a, "the solve's rows must be [x_derivative ; I_s | 0]");
+        assert_eq!(shared.b, b, "the solve's bounds must be [floor − offset ; 0]");
+
+        let delta = array![-0.9, -0.1, 0.2];
+        let explicit = LinearInequalityConstraints { a, b };
+        let expected =
+            crate::marginal_slope_shared::feasible_step_fraction(&explicit, &states[0].beta, &delta)
+                .expect("explicit ratio test");
+        let got = family
+            .max_feasible_step_size(&states, 0, &delta)
+            .expect("family ratio test")
+            .expect("a step fraction");
+        assert_eq!(got, expected, "the step fraction must come from the same rows");
+        assert!(expected < 1.0, "a row must clip this step, got fraction {expected}");
+    }
 
     #[test]
     fn saved_cause_specific_alo_matches_independent_closed_form() {
