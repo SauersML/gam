@@ -957,10 +957,6 @@ fn symmetrized(mut matrix: Array2<f64>) -> Array2<f64> {
 /// [`SmoothLrSelectionReplay::generalized`] documents.
 fn ascending(mut values: Vec<f64>) -> Vec<f64> {
     values.sort_by(|a, b| a.partial_cmp(b).expect("finite generalized spectrum"));
-    /// The family profiles its scale, but the model's penalized rank is smaller
-    /// than the tested term's own, so the residual deviance the profiled
-    /// selection is driven by has no consistent law to draw from.
-    ProfileInconsistent,
     values
 }
 
@@ -973,7 +969,6 @@ fn ascending(mut values: Vec<f64>) -> Vec<f64> {
 /// by elimination. Every one of these is a statement about the FIT, not about
 /// the arithmetic: a term with nothing to select legitimately has no replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-            SmoothLrSelectionDecline::ProfileInconsistent => "profile_inconsistent",
 pub enum SmoothLrSelectionDecline {
     /// No penalty component reached the driver for this term: it is unpenalized,
     /// or every component's `λ̂` was zero or non-finite, or the components sit
@@ -1006,6 +1001,10 @@ pub enum SmoothLrSelectionDecline {
     /// by the replay's selection rule — and a replay whose observation is
     /// selected by a different rule than its draws is not a reference for it.
     ObservedScoreUnusable,
+    /// The family profiles its scale, but the model's penalized rank is smaller
+    /// than the tested term's own, so the residual deviance the profiled
+    /// selection is driven by has no consistent law to draw from.
+    ProfileInconsistent,
 }
 
 impl SmoothLrSelectionDecline {
@@ -1019,6 +1018,7 @@ impl SmoothLrSelectionDecline {
             SmoothLrSelectionDecline::GridRefused => "grid_refused",
             SmoothLrSelectionDecline::SelectionUnresolved => "selection_unresolved",
             SmoothLrSelectionDecline::ObservedScoreUnusable => "observed_score_unusable",
+            SmoothLrSelectionDecline::ProfileInconsistent => "profile_inconsistent",
         }
     }
 }
@@ -3772,8 +3772,10 @@ pub fn smooth_term_lr_inference_forspec(
         // whose working weight already carries the dispersion reads it off the
         // reporting likelihood directly; the profiled Gaussian's score is
         // `X_jᵀ W (y − μ̂₀)` (unit `φ`), and dividing by `√(D_f / E[V])` puts
-        // it on the scale the selection threshold `expm1((W − B)/n)·E[V]` is
-        // expressed in — the same `D_f/E[V]` that threshold divides out.
+        // it on the unit scale the replay's draws are on. The profiled
+        // criterion's argmin is invariant to that common scale, so all it has
+        // to do is put the score and the observed penalized deviance in the
+        // same units.
         let mut observed_penalized_deviance = None;
         let observed_score = match null_outcome.as_ref() {
             Some(gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null)) => {
@@ -4851,7 +4853,7 @@ mod selection_replay_tests {
         AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
         SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
         SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
-        SmoothLrSelectionReplay, split_mix64,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, split_mix64, stratified_chi_square,
     };
     use ndarray::Array2;
 
