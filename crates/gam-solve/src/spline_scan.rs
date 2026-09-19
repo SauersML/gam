@@ -4040,7 +4040,7 @@ fn concentrated_criterion_enclosure(
         ("right", right_certificate.weakened_anchor()),
     ] {
         if let Some((curvature_source, third_source)) = weakened {
-            log::debug!(
+            log::trace!(
                 "spline scan enclosure: {side} endpoint curvature anchored by \
                  {curvature_source:?}, third order by {third_source:?}. A global-bound \
                  anchor keeps the search CERTIFIED and widens its tail cells -- half rate \
@@ -4922,7 +4922,7 @@ pub fn fit_spline_scan(
                 })
                 .flatten();
                 match boundary_flat {
-                    Some(region) => log::debug!(
+                    Some(region) => log::trace!(
                         "spline scan: boundary KKT sign is below the evaluator's derivative \
                          resolution ({:?}); accepting the certified resolution-flat optimum on \
                          {:?} (maximum score excess {:e} <= comparison resolution {:e})",
@@ -4947,7 +4947,7 @@ pub fn fit_spline_scan(
             max_score_gap,
             score_resolution,
         } => {
-            log::debug!(
+            log::trace!(
                 "spline scan: accepting certified resolution-flat REML optimum on \
                  {bracket:?}; maximum score excess {max_score_gap:e} <= comparison \
                  resolution {score_resolution:e}"

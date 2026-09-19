@@ -470,7 +470,7 @@ fn multinomial_formula_penalized_separation_evidence(
         crate::multinomial_reml::measured_penalty_nullspace(&reduced_penalty).map_err(|error| {
             format!("multinomial separation certificate could not measure ker(S_lambda): {error}")
         })?;
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: {}/{} identifiable direction(s) are unreached by \
          any smoothing parameter (S_lambda v = 0)",
         unreached.ncols(),
@@ -498,7 +498,7 @@ fn multinomial_formula_penalized_separation_evidence(
     // estimand on the support of a smoothing device is the same category error
     // as choosing one on a cost cap.
     let (unreached_min, unreached_max) = plan.information_extrema();
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: on the unreached subspace H+S_lambda lies in \
          [{unreached_min:e}, {unreached_max:e}], gate weight {:e}, under_identified={}, \
          singular={}",
@@ -619,7 +619,7 @@ fn multinomial_formula_penalized_separation_evidence(
                      subspace of H+S_lambda: {error}"
                 )
             })?;
-    log::info!(
+    log::debug!(
         "multinomial separation certificate: the armed term acts on {}/{} identifiable \
          direction(s) holding under one observation-equivalent of curvature in H+S_lambda at \
          the certified mode, of which {} are unreached by any smoothing parameter",
@@ -1706,7 +1706,7 @@ pub struct MultinomialSavedModel {
     /// truth-RMSE cost on interior data. A consumer scoring calibration, a
     /// reader comparing two fits, and the CLI summary all need to know which
     /// objective produced the numbers in front of them, and until #2612 the
-    /// decision existed only in a `log::info!` line the caller never sees.
+    /// decision existed only in a `log::debug!` line the caller never sees.
     ///
     /// The string is the certificate itself, not a flag: a verdict that carries
     /// the spectrum it was taken on can be checked, and one that carries only a
@@ -2988,7 +2988,7 @@ fn build_formula_design_for_multinomial(
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
     let y_kind = crate::fit_orchestration::response_column_kind(data, y_col);
-    let mut inference_notes: Vec<String> = Vec::new();
+    let mut inference_notes = crate::fit_orchestration::FitNotes::default();
     let spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
@@ -3791,7 +3791,7 @@ pub fn fit_penalized_multinomial_formula(
                         firth_family.with_joint_initial_log_lambdas(log_lambdas.to_vec());
                 }
             }
-            log::info!(
+            log::debug!(
                 "multinomial REML: arming the Jeffreys/Firth proper prior — separation evidence: \
              {evidence}"
             );
@@ -3870,7 +3870,7 @@ pub fn fit_penalized_multinomial_formula(
                 None => {
                     // Fit existence proves both optimization layers certified; no
                     // post-hoc convergence flag is needed.
-                    log::info!(
+                    log::debug!(
                         "multinomial REML: unbiased criterion accepted (no separation evidence; \
                          Jeffreys/Firth prior disarmed)"
                     );

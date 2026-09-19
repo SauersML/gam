@@ -344,26 +344,29 @@ def _exact_sparse_support_summary(
 
 
 def _install_solver_log(level: str) -> None:
-    """Set the NATIVE solver log level inside the process that will do the fit.
+    """Route the native solver's records to stderr inside the process that fits.
 
-    Each rung fits in a `spawn` child, so a level set in the parent never
-    reaches the solver: `gamfit._rust.set_log_level` is programmatic (RUST_LOG
-    is inert through the wheel) and the child re-imports `gamfit` at its quiet
-    `warn` default. Every profile of this example has therefore had to report
-    "still inside the native fit, no first event" rather than naming a phase —
-    the trace did not exist, not because the solver is silent but because the
-    process that could have asked for it is not the process that fits.
+    Each rung fits in a `spawn` child, so a logging configuration made in the
+    parent never reaches the solver: the child re-imports `gamfit`, whose
+    `gamfit` logger is silent by default. Every profile of this example has
+    therefore had to report "still inside the native fit, no first event"
+    rather than naming a phase — the trace did not exist, not because the
+    solver is silent but because the process that could have asked for it is
+    not the process that fits.
 
-    `warn` is the default and a deliberate no-op: that stream carries real
-    per-evaluation compute (eigendecompositions), so quieting it is a
-    measurement choice, not only a tidiness one. Raise it for diagnosis runs,
-    not for the run you are timing.
+    `off` is the default: the stream carries real per-evaluation compute
+    (eigendecompositions), so quieting it is a measurement choice, not only a
+    tidiness one. Raise it for diagnosis runs, not for the run you are timing.
     """
-    if level == "warn":
+    if level == "off":
         return
-    import gamfit
+    import logging
+    import sys
 
-    gamfit._rust.set_log_level(level)
+    solver_log = logging.getLogger("gamfit")
+    solver_log.addHandler(logging.StreamHandler(sys.stderr))
+    # The engine's trace records arrive at half of `logging.DEBUG`.
+    solver_log.setLevel(logging.DEBUG if level == "debug" else logging.DEBUG // 2)
 
 
 def _manifold_fit_worker(
@@ -803,11 +806,11 @@ def main() -> None:
     )
     ap.add_argument(
         "--solver-log",
-        choices=("off", "error", "warn", "info", "debug", "trace"),
-        default="warn",
+        choices=("off", "debug", "trace"),
+        default="off",
         help=(
-            "native solver log level INSIDE each fit child (default 'warn', the "
-            "library default and a no-op). 'info' emits the [SAE-REFINE] / "
+            "native solver log level INSIDE each fit child (default 'off', the "
+            "library default and a no-op). 'debug' emits the [SAE-REFINE] / "
             "[SAE-NEWTON] / [OUTER] trace and the process-monitor stall report, "
             "which is the only way to see inside a rung that is not returning; "
             "it also costs real compute, so do not time a run that raises it"

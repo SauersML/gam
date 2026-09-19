@@ -1234,9 +1234,9 @@ impl CanonicalPenalty {
 /// `block_dim = 10`), so nothing rides on where in that gap the bar falls.
 ///
 /// Logging policy, `delta`-denominated throughout:
-/// - `delta <= sqrt(m) * EPSILON` → `log::warn!` with `[PENALTY-REDUNDANCY]`.
+/// - `delta <= sqrt(m) * EPSILON` → `log::debug!` with `[PENALTY-REDUNDANCY]`.
 ///   Only their combination `lambda_i + c*lambda_j` is identified.
-/// - `sqrt(m) * EPSILON < delta <= 1e-1` → `log::info!` with
+/// - `sqrt(m) * EPSILON < delta <= 1e-1` → `log::debug!` with
 ///   `[PENALTY-SIMILARITY]`, carrying `delta`. At large scale (`k > 64`) only
 ///   the three smallest-`delta` such pairs are logged to bound log volume.
 ///
@@ -1317,7 +1317,7 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
 
     // Always emit every exact redundancy — these are structural model errors.
     for &(i, j, defect) in &redundant {
-        log::warn!(
+        log::debug!(
             "[PENALTY-REDUNDANCY] penalties i={i} j={j} are proportional to the arithmetic \
              that formed them (relative defect min_c ||S_{j} - c S_{i}||_F / ||S_{i}||_F = \
              {defect:.6e}) — only their COMBINATION is identified, so the criterion is exactly \
@@ -1336,7 +1336,7 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
         similar.truncate(TOP_SIMILARITY_PAIRS);
     }
     for (i, j, defect, scale) in similar {
-        log::info!(
+        log::debug!(
             "[PENALTY-SIMILARITY] penalties i={i} j={j} are close but MEASURABLY distinct \
              (relative defect {defect:.6e} at the best scale c={scale:.6e}) — the outer Hessian \
              may be ill-conditioned along their antisymmetric direction, and the criterion \
@@ -1456,7 +1456,7 @@ pub fn canonicalize_penalty_spec(
     })?;
 
     if analysis.rank == 0 {
-        log::debug!(
+        log::trace!(
             "Dropped inactive penalty block idx={idx} reason={}",
             if analysis.iszero {
                 "ZeroMatrix"
@@ -1507,7 +1507,7 @@ pub fn canonicalize_penalty_spec(
     // is a real geometric fact (e.g. high-d Duchon kernels) the operator
     // should be able to see.
     if classes.is_indefinite() {
-        log::debug!(
+        log::trace!(
             "{context}: penalty block idx={idx} carries {} negative-curvature \
              eigendirection(s) below -tol={tolerance:e}; dropped from the canonical \
              root and NOT counted as null space (rank={rank_k}, nullity={})",
@@ -2676,7 +2676,7 @@ pub fn stable_reparameterizationwith_invariant(
         }
         if let Some(reason) = svd_refusal.as_deref() {
             if rescued_by_r_svd {
-                log::warn!(
+                log::debug!(
                     "penalized-block rotation: stacked-root SVD {reason}. Recovered the SAME \
                      right-singular basis from the Householder QR of `E` followed by the SVD \
                      of its triangular factor `R`: `EᵀE = RᵀR`, so no accuracy is given up."
@@ -2685,7 +2685,7 @@ pub fn stable_reparameterizationwith_invariant(
                 // The accuracy downgrade is observable rather than silent: the
                 // Gram route resolves a recessive penalized eigenvalue only down
                 // to `O(ε·d_max)`, where the SVD of `E` reaches `O(ε²·d_max)`.
-                log::warn!(
+                log::debug!(
                     "penalized-block rotation: stacked-root SVD {reason}, and so did the R-SVD \
                      of its Householder QR factor. Recomputing it from the Gram `Σₖ λₖ Sₖ`, \
                      which squares the condition number: recessive eigenvalues are resolved to \

@@ -1574,7 +1574,7 @@ pub fn fit_from_formula(
 /// authoritative materialization pass.
 pub struct FormulaFitResult {
     pub result: FitResult,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms the training rows could not identify, removed before the fit.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 }
@@ -1590,7 +1590,10 @@ pub fn fit_from_formula_with_notes(
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
         let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
             formula.to_string(), data, config)?;
-        return Ok(FormulaFitResult { inference_notes: payload.inference_notes.clone(),
+        return Ok(FormulaFitResult { inference_notes: FitNotes {
+                                        advisories: payload.inference_notes.clone(),
+                                        informational: payload.informational_notes.clone(),
+                                    },
                                     unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
                                     result: FitResult::Ctn(Box::new(payload)) });
     }
@@ -1621,7 +1624,7 @@ pub(crate) fn fit_materialized_standard_with_notes(
     data: &Dataset,
     config: &FitConfig,
     request: StandardFitRequest<'_>,
-    inference_notes: Vec<String>,
+    inference_notes: FitNotes,
 ) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
@@ -1966,7 +1969,7 @@ fn fit_from_formula_once_with_notes(
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
             result: FitResult::Standard(result),
-            inference_notes: Vec::new(),
+            inference_notes: FitNotes::default(),
             unidentified_scalar_terms: Vec::new(),
         });
     }
@@ -2077,7 +2080,7 @@ fn fit_materialized_once_with_notes(
 fn attach_basis_adequacy(
     result: FitResult,
     covariate_frame: Option<StandardFitData<'_>>,
-    mut inference_notes: Vec<String>,
+    mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
     let FitResult::Standard(mut standard) = result else {
@@ -2094,7 +2097,7 @@ fn attach_basis_adequacy(
             &standard.resolvedspec,
             &standard.fit,
         );
-        inference_notes.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
+        inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,
         ));
     }

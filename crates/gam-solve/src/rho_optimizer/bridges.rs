@@ -631,7 +631,7 @@ impl CostStallGuard {
             return None;
         }
         let rho = self.best_rho.clone()?;
-        log::info!(
+        log::debug!(
             "[OUTER] stopping at an unprogressing stall: the window filled again at \
              value={:.6e} |Pg|={:.3e} after {} accepted outer iteration(s), with no resolved \
              descent and no contraction of the projected gradient since the last one; the \
@@ -941,7 +941,7 @@ impl CostStallGuard {
                 self.best_iterate_or(rho, value, grad_norm);
             let incumbent = EscapeIncumbent::new(&best_rho, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
                      (hessian_psd=NO at best-so-far, value={:.6e}; {}): refusing to certify \
                      the saddle and returning control to cubic regularization to exploit the \
@@ -956,7 +956,7 @@ impl CostStallGuard {
             // The replay is proven: the run stops at its incumbent, and no saddle
             // licence reopens it (#2817).
             self.replay_proven = true;
-            log::info!(
+            log::debug!(
                 "[OUTER] ARC strict-saddle stall refusal cut at escape {}: the previous \
                  refusal reopened a full {}-step window and left the incumbent \
                  bit-identical (best={:.9e}, |g|={:.3e}), so refusing again replays the \
@@ -1002,7 +1002,7 @@ impl CostStallGuard {
             // sigma, shrink the step, and exploit the known negative curvature.
             self.infeasible_streak = 0;
             self.no_improve_streak = 0;
-            log::warn!(
+            log::debug!(
                 "[OUTER] ARC infeasible-probe run reached a strict-saddle incumbent ({}); \
                  refusing the stall and returning control to cubic regularization",
                 self.best_curvature_note(),
@@ -1235,7 +1235,7 @@ impl CostStallGuard {
         if non_stationary_stall && previous_escape_replayed {
             // The replay is proven, so nothing continues past this stall (#2817).
             self.replay_proven = true;
-            log::info!(
+            log::debug!(
                 "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full                  {}-step window and left the incumbent bit-identical (best={:.9e}, |g|={:.3e}),                  so reopening it again replays the same window from the same state; halting.",
                 self.stuck_escapes,
                 self.stuck_escapes,
@@ -1620,14 +1620,14 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
             .find(|entry| same_outer_point(&entry.rho, x))
         {
             let outcome_label = value_probe_outcome_label(&entry.outcome);
-            log::info!(
+            log::debug!(
                 "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (first-order bridge, eval={}, cached=true)",
                 x.len(),
                 trial_rho_distance,
                 self.first_order_evals
             );
             match &entry.outcome {
-                CachedValueProbeOutcome::Cost(cost) => log::info!(
+                CachedValueProbeOutcome::Cost(cost) => log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}, cached=true)",
                     stage_start.elapsed().as_secs_f64(),
                     cost,
@@ -1635,7 +1635,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     self.first_order_evals
                 ),
                 CachedValueProbeOutcome::Recoverable(_) | CachedValueProbeOutcome::Fatal(_) => {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] outer eval end order=Value elapsed={:.3}s outcome={} trial_rho_distance={:.3e} (first-order bridge, eval={}, cached=true)",
                         stage_start.elapsed().as_secs_f64(),
                         outcome_label,
@@ -1646,7 +1646,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
             }
             return cached_value_probe_result(&entry.outcome);
         }
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (first-order bridge, eval={})",
             x.len(),
             trial_rho_distance,
@@ -1676,7 +1676,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 // isolated refusals on other directions are normal line-search
                 // noise, not a globally-infeasible neighbourhood.
                 self.consecutive_probe_refusals = 0;
-                log::info!(
+                log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
                     cost,
@@ -1692,7 +1692,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 // the trail reads "outcome=recoverable" a hundred times and
                 // names nothing. `ObjectiveEvalError: Display` already carries
                 // the originating error's own message, so this costs one field.
-                log::info!(
+                log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=recoverable trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={} reason={}",
                     stage_start.elapsed().as_secs_f64(),
                     trial_rho_distance,
@@ -1713,7 +1713,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                         } => {
                             // #1426: best feasible iterate carries a residual far
                             // above tolerance — not a flat valley. Keep going.
-                            log::warn!(
+                            log::debug!(
                                 "[OUTER] cost-stall STUCK (infeasible BFGS probes, NOT a flat \
                                  valley): residual |g|={:.3e} far above the certified-stationary \
                                  band (escape threshold {:.3e}); refusing \
@@ -1735,7 +1735,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                             }
                         }
                         CostStallVerdict::Converged => {
-                            log::info!(
+                            log::debug!(
                                 "[OUTER] cost-stall convergence (infeasible BFGS probes): {} \
                                  consecutive infeasible probes after a finite seed/iterate; \
                                  accepting best-so-far as a stationary optimum (value={:.6e}).",
@@ -1746,7 +1746,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                         }
                         CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                             if left_stratum && guard.off_stratum_streak == guard.infeasible_streak {
-                                log::warn!(
+                                log::debug!(
                                     "[OUTER] stratum boundary (#2939): the last {} trials all keep \
                                      a rank other than the {} this search started on, so the search \
                                      is pinned where its rank ends; halting at the incumbent with \
@@ -1760,7 +1760,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                                     guard.best_value,
                                 );
                             } else {
-                                log::warn!(
+                                log::debug!(
                                     "[OUTER] cost-stall halt (infeasible BFGS probes): {} \
                                      consecutive infeasible probes after a finite seed/iterate; \
                                      halting at best-so-far with residual |g|={:.3e} \
@@ -1800,7 +1800,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     PROBE_REFUSAL_FATAL_THRESHOLD
                 };
                 if self.first_order_evals == 0 && self.consecutive_probe_refusals >= threshold {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
                          infeasible cost probes with no accepted gradient step \
                          (nan_seed={}); escalating to Fatal to abort this seed \
@@ -1817,7 +1817,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 }
             }
             Err(_err) => {
-                log::info!(
+                log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s outcome=fatal trial_rho_distance={:.3e} (first-order bridge, eval={})",
                     stage_start.elapsed().as_secs_f64(),
                     trial_rho_distance,
@@ -1871,7 +1871,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     ),
                     None => "no-history".to_string(),
                 };
-                log::info!(
+                log::debug!(
                     "[OUTER schedule] inner-PIRLS cap transition accepted_iter={} eval_count={} g_ratio={} {} prev={} new={} ({})",
                     accepted_iter,
                     self.first_order_evals,
@@ -1884,7 +1884,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             }
         }
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=ValueAndGradient dim={} (first-order bridge, eval={})",
             x.len(),
             self.first_order_evals
@@ -1907,7 +1907,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         let eval = match evaluated {
             Ok(eval) => eval,
             Err(err) => {
-                log::info!(
+                log::debug!(
                     "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s outcome={} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={} reason={}",
                     stage_start.elapsed().as_secs_f64(),
                     if err.is_recoverable() {
@@ -1938,7 +1938,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         self.consecutive_probe_refusals = 0;
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, eval={}) theta={} g={}",
             stage_start.elapsed().as_secs_f64(),
             eval.cost,
@@ -2071,7 +2071,7 @@ impl OuterFirstOrderBridge<'_> {
                         break;
                     }
                 }
-                None => log::debug!(
+                None => log::trace!(
                     "[OUTER] accepted outer step {} (step_norm={:.3e}, actual_decrease={:.3e}) \
                      matched none of the {} first-order evaluations since the last accept; \
                      the cost-stall guard skips it rather than fold a point opt did not accept",
@@ -2193,7 +2193,7 @@ impl OuterFirstOrderBridge<'_> {
                         feedback.cap.store(0, Ordering::Relaxed);
                         feedback.force_cold.store(true, Ordering::Relaxed);
                     }
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved \
                          < {:.3e} (relative) over {} accepted outer steps but the projected \
                          gradient is FAR above the certified-stationary band \
@@ -2224,7 +2224,7 @@ impl OuterFirstOrderBridge<'_> {
                     // band at the incumbent's value (#2817). Printing only the raw
                     // tolerance made a band acceptance read as an arithmetic
                     // impossibility in the log.
-                    log::info!(
+                    log::debug!(
                         "[OUTER] cost-stall convergence: REML objective improved < {:.3e} \
                          (relative) over {} consecutive accepted outer steps AND the projected \
                          gradient cleared a stationarity band (|g|={:.3e}; bound {}); accepting \
@@ -2238,7 +2238,7 @@ impl OuterFirstOrderBridge<'_> {
                     return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                 }
                 CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] cost-stall FLAT-VALLEY STALL: REML objective improved < {:.3e} \
                          (relative) over {} consecutive accepted outer steps but the projected \
                          gradient is still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); \
@@ -2453,7 +2453,7 @@ if let Some(feedback) = outer_inner_cap {
             ),
             None => "no-history".to_string(),
         };
-        log::info!(
+        log::debug!(
             "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} {} prev={} new={} ({})",
             arc_iter,
             ratio_str,
@@ -2539,7 +2539,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e}",
             x.len(),
             trial_rho_distance
@@ -2549,7 +2549,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
             .eval_with_order(x, OuterEvalOrder::Value)
             .map_err(|err| into_line_search_value_probe_error("outer eval_cost failed", err))?;
         let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e}",
             stage_start.elapsed().as_secs_f64(),
             cost,
@@ -2568,7 +2568,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             self.g_norm_initial,
         );
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=ValueAndGradient dim={}",
             x.len()
         );
@@ -2586,13 +2586,13 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
             eval.cost,
             g_norm,
         );
-        log::info!(
+        log::debug!(
             "[OUTER] eval#{n} (grad) cost={cost:.6e} |g|={gnorm:.3e} rho=[{rho}]",
             n = self.eval_count,
             cost = eval.cost,
@@ -2708,7 +2708,7 @@ impl OuterSecondOrderBridge<'_> {
                     feedback.cap.store(0, Ordering::Relaxed);
                     feedback.force_cold.store(true, Ordering::Relaxed);
                 }
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved \
                      < {:.3e} (relative) over {} outer steps but the projected gradient is FAR \
                      above the certified-stationary band (|g|={:.3e} > escape threshold \
@@ -2731,7 +2731,7 @@ impl OuterSecondOrderBridge<'_> {
                 adjudicate_second_order = true;
             }
             CostStallVerdict::Converged => {
-                log::info!(
+                log::debug!(
                     "[OUTER] ARC finite cost stall deferred to exact second-order convergence: \
                      REML objective improved < {:.3e} (relative) over {} consecutive outer \
                      steps and the stored best projected gradient is small (|g|={:.3e}; bound \
@@ -2747,7 +2747,7 @@ impl OuterSecondOrderBridge<'_> {
                 adjudicate_second_order = true;
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC finite cost stall deferred: REML objective improved < {:.3e} \
                      (relative) over {} consecutive outer steps but the stored best projected \
                      gradient remains above tolerance (|g|={:.3e} > {:.3e}). Returning the \
@@ -2874,7 +2874,7 @@ impl OuterSecondOrderBridge<'_> {
             return None;
         }
         let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
-        log::info!(
+        log::debug!(
             "[OUTER] ARC stopping at the point its own certificate accepts: \
              Newton ½gᵀH⁻¹g={decrement:.3e} ≤ criterion resolution \
              {tolerance:.3e} (= {floor:.3e}·(1+|V|) at |V|={cost:.6e}); reduced Hessian \
@@ -2972,7 +2972,7 @@ impl OuterSecondOrderBridge<'_> {
                 smallest_step,
                 ..
             } => {
-                log::info!(
+                log::debug!(
                     "[OUTER] ARC stopping at the strict-saddle incumbent its own certificate \
                      accepts: the criterion CONTRADICTS the reported negative curvature \
                      ({curvature_note}; {probed} trial(s) down to step {smallest_step:.3e} lowered \
@@ -3000,12 +3000,12 @@ impl OuterSecondOrderBridge<'_> {
             }
             other => {
                 if let super::run::SaddleAdjudication::Declined(reason) = &other {
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: adjudication declined -- {reason}; the escape stands."
                     );
                 }
                 if let Err(err) = self.obj.eval_cost(x) {
-                    log::warn!(
+                    log::debug!(
                         "[OUTER] {context}: failed to restore the objective to the ARC iterate \
                          after adjudicating the incumbent: {err}"
                     );
@@ -3031,7 +3031,7 @@ impl OuterSecondOrderBridge<'_> {
             } => {
                 // #1426: best feasible iterate carries a residual far above
                 // tolerance — not a flat valley. Keep ARC descending.
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC cost-stall STUCK (infeasible run, NOT a flat valley): best \
                      feasible residual |g|={:.3e} far above the certified-stationary band \
                      (escape threshold {:.3e}); refusing to \
@@ -3044,7 +3044,7 @@ impl OuterSecondOrderBridge<'_> {
                 None
             }
             CostStallVerdict::Converged => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC infeasible-probe stall: {} consecutive infeasible λ→0 trials \
                      after the best feasible iterate. Its stored projected gradient is small \
                      (|g|={:.3e}; bound {}) and its synchronized reduced Hessian does not \
@@ -3059,7 +3059,7 @@ impl OuterSecondOrderBridge<'_> {
                 Some(ObjectiveEvalError::fatal(ARC_INFEASIBLE_STALL_SENTINEL.to_string()))
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
-                log::warn!(
+                log::debug!(
                     "[OUTER] ARC cost-stall halt (infeasible run): {} consecutive infeasible \
                      λ→0 trials after the best feasible iterate, whose projected gradient is \
                      still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting at the best \
@@ -3085,7 +3085,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             self.g_norm_initial,
         );
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={}",
             x.len()
         );
@@ -3128,13 +3128,13 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
             stage_start.elapsed().as_secs_f64(),
             eval.cost,
             g_norm,
         );
-        log::info!(
+        log::debug!(
             "[OUTER] eval#{n} (hess) cost={cost:.6e} |g|={gnorm:.3e} rho=[{rho}]",
             n = self.eval_count,
             cost = eval.cost,
@@ -3571,7 +3571,7 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=Value dim={} trial_rho_distance={:.3e} (operator bridge)",
             x.len(),
             trial_rho_distance
@@ -3581,7 +3581,7 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
             .eval_with_order(x, OuterEvalOrder::Value)
             .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
         let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (operator bridge)",
             stage_start.elapsed().as_secs_f64(),
             cost,
@@ -3639,7 +3639,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             }
         }
         let stage_start = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
             x.len(),
         );
@@ -3660,7 +3660,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         if let Some(stop) = self.observe_unprogressing_stall(x, eval.cost, &eval.gradient) {
             return Err(stop);
         }
-        log::info!(
+        log::debug!(
             "[STAGE] outer eval end elapsed={:.3}s cost={:.6e} |g|={:.3e} (operator bridge)",
             stage_start.elapsed().as_secs_f64(),
             eval.cost,
@@ -4355,7 +4355,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             Err(err @ EstimationError::GradientUnavailable { .. })
                 if self.obj.capability().gradient == Derivative::Analytic =>
             {
-                log::warn!(
+                log::debug!(
                     "[STAGE] EFS -> gradient fallback: gradient unavailable at \
                      fixed-point dispatch; retrying with fixed-point disabled \
                      (rho_dim={}, psi_dim={}, n_params={})",
@@ -4532,7 +4532,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             if let Ok(mut slot) = self.recurrent_incumbent_exit.lock() {
                 *slot = Some(restores);
             }
-            log::info!(
+            log::debug!(
                 "[OUTER] fixed-point convergence by recurrent restored incumbent: \
                  consecutive_restores={} cost={current_cost:.6e} rho_dim={} psi_dim={}",
                 restores,
@@ -4556,7 +4556,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             if let Ok(mut slot) = self.unprogressing_exit.lock() {
                 *slot = Some(evaluations);
             }
-            log::info!(
+            log::debug!(
                 "[OUTER] fixed-point walk stopping at an unprogressing stall after \
                  {evaluations} evaluation(s): a window bought no resolved improvement of the \
                  incumbent and no contraction of its step since the previous one; the terminal \
@@ -4648,13 +4648,13 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                     self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?
             {
                 self.consecutive_psi_zero_iters = self.consecutive_psi_zero_iters.saturating_add(1);
-                log::info!(
+                log::debug!(
                     "[HYBRID-EFS] full-vector backtrack exhausted; ρ/τ-only step \
                          accepted. Consecutive ψ-zero iters = {}",
                     self.consecutive_psi_zero_iters,
                 );
                 if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
                              {} consecutive ψ-zero iterations after exhausted backtracking \
                              (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
@@ -4683,7 +4683,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             }
             // ρ/τ-only backtracking also failed — surface the typed
             // joint-solver request so the runner abandons EFS for this attempt.
-            log::info!(
+            log::debug!(
                 "[STAGE] HybridEFS -> joint gradient fallback: ρ/τ-only step also \
                  failed all {} halvings (rho_dim={}, psi_dim={}, n_params={}, \
                  cost={:.6e})",
@@ -4709,7 +4709,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         // Pure-EFS path with full backtracking exhausted: there is no ψ block
         // to escape to. Surface the same typed request so the runner switches
         // to a gradient-based solver instead of looping.
-        log::info!(
+        log::debug!(
             "[STAGE] EFS -> gradient fallback: no α ∈ {{1, …, 2^-{}}} decreased the \
              cost (rho_dim={}, n_params={}, cost={:.6e})",
             MAX_EFS_BACKTRACK,
@@ -4763,7 +4763,7 @@ impl OuterFixedPointBridge<'_> {
                 let cost = match self.obj.eval_cost(&trial) {
                     Ok(cost) => cost,
                     Err(error) if error.is_trial_point_infeasible() => {
-                        log::info!(
+                        log::debug!(
                             "[EFS] backtrack α=2^-{bt}={alpha:.4e}: trial refused ({error}), halving",
                             bt = bt - 1,
                         );
@@ -4789,7 +4789,7 @@ impl OuterFixedPointBridge<'_> {
         Ok(accepted.map(|step| {
             let halvings = bt - 1;
             if halvings > 0 {
-                log::debug!(
+                log::trace!(
                     "[EFS] backtrack accepted at α=2^-{halvings}={alpha:.4e} \
                      after {halvings} halvings (cost: {current_cost:.6e} → {c:.6e})",
                     alpha = step.step,

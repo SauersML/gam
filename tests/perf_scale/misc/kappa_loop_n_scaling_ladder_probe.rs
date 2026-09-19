@@ -119,7 +119,7 @@ struct LadderTrace {
 
 impl log::Log for LadderTrace {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Debug
+        metadata.level() <= log::Level::Trace
     }
     fn log(&self, record: &log::Record) {
         use std::io::Write;
@@ -162,7 +162,7 @@ fn install_trace() {
         ),
     });
     drop(log::set_logger(logger));
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Trace);
 }
 
 /// One rung: the certificate the fit minted, or the refusal it died on.
@@ -218,7 +218,7 @@ fn probe_2760_pg_and_bound_at_every_rung() {
     install_trace();
     for &n in &[1_000usize, 2_000, 4_000, 8_000, 16_000] {
         eprintln!("[2760-ladder] ==== rung n={n} ====");
-        log::info!("[KAPPA-RUNG] ================ n={n} ================");
+        log::debug!("[KAPPA-RUNG] ================ n={n} ================");
         let t0 = std::time::Instant::now();
         match rung(n) {
             Ok(line) => eprintln!(

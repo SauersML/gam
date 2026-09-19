@@ -224,13 +224,13 @@ fn usable_penalized_hessian<'a>(
     let (active_dim, lift) = match gauge {
         Some(gauge) => {
             if let Err(reason) = gauge.validate() {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian behind an invalid coefficient gauge: {reason}"
                 );
                 return None;
             }
             if gauge.raw_total() != expected_dim {
-                log::warn!(
+                log::debug!(
                     "{label}: ignoring penalized Hessian whose coefficient gauge lifts to {} \
                      coefficients; expected {expected_dim}",
                     gauge.raw_total()
@@ -243,7 +243,7 @@ fn usable_penalized_hessian<'a>(
     };
     let hessian = fit.penalized_hessian()?;
     if hessian.nrows() != active_dim || hessian.ncols() != active_dim {
-        log::warn!(
+        log::debug!(
             "{label}: ignoring penalized Hessian with shape {}x{}; expected {}x{}",
             hessian.nrows(),
             hessian.ncols(),
@@ -253,7 +253,7 @@ fn usable_penalized_hessian<'a>(
         return None;
     }
     if !hessian.iter().any(|value| value.abs() > 0.0) {
-        log::warn!("{label}: ignoring zero penalized Hessian placeholder");
+        log::debug!("{label}: ignoring zero penalized Hessian placeholder");
         return None;
     }
     Some((hessian, lift))
@@ -304,7 +304,7 @@ fn conditional_prediction_backend<'a>(
                     covariance.view(),
                 )));
             }
-            Err(reason) => log::warn!("{label}: ignoring invalid conditional {reason}"),
+            Err(reason) => log::debug!("{label}: ignoring invalid conditional {reason}"),
         }
     }
     if let Some((hessian, gauge_lift)) = usable_penalized_hessian(fit, expected_dim, label) {
@@ -340,7 +340,7 @@ fn conditional_prediction_backend<'a>(
         }) {
             Ok(backend) => return Ok(Some(backend)),
             Err(err) => {
-                log::warn!(
+                log::debug!(
                     "{label}: failed to build factorized prediction precision backend: {err}"
                 );
             }
@@ -2760,7 +2760,7 @@ where
     // within-support edge effect.
     let ood_inflation_active = options.ood_inflation && options.extrapolation_variance.is_none();
     if options.ood_inflation && !ood_inflation_active {
-        log::warn!(
+        log::debug!(
             "predict_gamwith_uncertainty: ood_inflation is enabled but an additive \
             extrapolation_variance is supplied; skipping the multiplicative OOD \
             inflation to avoid double-counting off-support uncertainty"

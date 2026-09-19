@@ -976,7 +976,7 @@ fn certified_reduced_face_candidate(
             // tolerance, and certificate below is untouched, and no
             // uncertified point is ever returned. Erroring instead ends the
             // entire fit on one trial point (gam#2600).
-            log::warn!(
+            log::debug!(
                 "[gam#2600 reduced-face] declining a cycled active-set exchange \
                  (face_rows={}, visited_faces={}); the general constrained QP \
                  owns this subproblem",
@@ -986,7 +986,7 @@ fn certified_reduced_face_candidate(
             return Ok(None);
         }
         if seen_faces.len() > exchange_budget {
-            log::warn!(
+            log::debug!(
                 "[gam#2600 reduced-face] declining an exchange that outran its own \
                  rebuild budget (face_rows={}, visited_faces={}, budget={exchange_budget} \
                  = ambient_dim {p} + warm_rows {}); the general constrained QP owns \
@@ -1060,7 +1060,7 @@ fn certified_reduced_face_candidate(
                 // the same face. That is survivable here — the row space is
                 // what the affine solve uses — but it is the signature that
                 // located gam#2600, so say it rather than absorb it.
-                log::debug!(
+                log::trace!(
                     "[gam#2600 reduced-face] the reduced face carries {} redundant row(s) \
                      (face_rows={}, rank={}, sigma_max={:.6e}, sigma_min_retained={:.6e}); \
                      solving on its row space",
@@ -1087,7 +1087,7 @@ fn certified_reduced_face_candidate(
                 // violated contract, so decline exactly as a cycled exchange
                 // does and let the caller's general constrained QP own the
                 // subproblem instead of ending the fit on this trial point.
-                log::warn!(
+                log::debug!(
                     "[gam#2600 reduced-face] declining an inconsistent equality face \
                      (face_rows={}, rank={}, residual_inf={:.6e}, tolerance={:.6e}); \
                      the general constrained QP owns this subproblem",
@@ -1170,7 +1170,7 @@ fn certified_reduced_face_candidate(
             // ordinary conditional-transformation-normal fit with one smooth
             // covariate unfittable (gam#2600, measured
             // `minimum_face_norm_sq = 3.745717e1` against `radius_sq = 1`).
-            log::warn!(
+            log::debug!(
                 "[gam#2600 reduced-face] declining a face that does not intersect the trust \
                  ball (face_rows={}, minimum_face_norm_sq={:.6e}, radius_sq={:.6e}); \
                  the general constrained QP owns this subproblem",
@@ -1190,7 +1190,7 @@ fn certified_reduced_face_candidate(
                 // Again a statement about the face and the radius rather than
                 // about the problem, and again the general constrained QP is
                 // the designed owner (gam#2600).
-                log::warn!(
+                log::debug!(
                     "[gam#2600 reduced-face] declining a face that touches the trust ball with \
                      a nonzero tangent (face_rows={}, tangent_dim={}, \
                      minimum_face_norm_sq={:.6e}, radius_sq={:.6e}); the general constrained QP \
@@ -1415,7 +1415,7 @@ fn certified_reduced_face_candidate(
                 // conditional-transformation-normal fit with one smooth covariate
                 // unfittable: `projected_residual_inf = 9.736333e-1` against
                 // `tolerance = 1.162291e-6` at `active_rows = 1` (gam#2600).
-                log::warn!(
+                log::debug!(
                     "[gam#2600 reduced-face] declining a chord-repaired candidate that fails \
                      its own first-order KKT (face_rows={}, chord_repair={:.6e}, \
                      projected_residual_inf={:.6e}, tolerance={:.6e}, trust_shift={:.6e}); \
@@ -1457,7 +1457,7 @@ fn certified_reduced_face_candidate(
         ) {
             TrustBallVerdict::Admitted => {}
             TrustBallVerdict::DeclinedChordRepair => {
-                log::warn!(
+                log::debug!(
                     "[gam#2959 reduced-face] declining a chord-repaired candidate whose trust shift \
                      is not complementary to its norm (face_rows={}, chord_repair={:.6e}, \
                      metric_norm={trust_norm:.6e}, radius={trust_radius:.6e}, trust_shift={:.6e}, \
@@ -1511,7 +1511,7 @@ fn certified_reduced_face_candidate(
         // decline path already reports its own count; without the same number
         // on the SUCCESS path the two cannot be compared, and a cost bound for
         // the exchange cannot be sized from anything but a guess (gam#2600).
-        log::debug!(
+        log::trace!(
             "[gam#2600 reduced-face] certified after {} visited face(s) \
              (face_rows={}, ambient_dim={p}, kind={kind:?})",
             seen_faces.len(),
@@ -2685,7 +2685,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         .iter()
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
-    log::info!(
+    log::debug!(
         "[979-MODE-HESSIAN] eig(M_true_tangent_whitened)=[{minimum_whitened_eigenvalue:.6e},{maximum_whitened_eigenvalue:.6e}] numerical_floor={:.6e} tangent_dim={}",
         spectrum.numerical_floor,
         certificate_matrix.nrows(),
@@ -2991,7 +2991,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
             weakly_identified_decrement,
             decrement_resolution,
         ) {
-            log::info!(
+            log::debug!(
                 "[PIRLS/joint-Newton mode certificate] constrained returned beta has PSD face curvature (lambda_min={lambda_min:.6e}, floor={numerical_floor:.6e}) but does not settle: residual={tentative_residual:.3e}/{tentative_residual_target:.3e}, decrement={newton_decrement:.3e}, weak={weakly_identified_decrement:.3e} against the resolution {:.3e}, weak resolution {:.3e}; iterating on",
                 decrement_resolution.identified,
                 decrement_resolution.weakly_identified,
@@ -3002,7 +3002,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
                 decrement_resolution,
             });
         }
-        log::info!(
+        log::debug!(
             "[PIRLS/joint-Newton mode certificate] constrained returned beta certified from fresh exact curvature: lambda_min={lambda_min:.6e}, floor={numerical_floor:.6e}, decrement={newton_decrement:.3e}, weak={weakly_identified_decrement:.3e}",
         );
         return Ok(ConstrainedModeResolution::Certified {
@@ -3208,7 +3208,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
         && magnitude < decrease_floor
         && face_exchanges < MAX_ESCAPE_FACE_EXCHANGES
     {
-        log::info!(
+        log::debug!(
             "[PIRLS/joint-Newton saddle-escape exchange] lambda_min={lambda_min:.6e} \
              feasible_cap={feasible_cap:.6e} < decrease_floor={decrease_floor:.6e}; \
              moving blocking row {row} onto the certified face (exchange {})",
@@ -3249,7 +3249,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
     // Which of the three terms BINDS is the whole diagnosis when an escape
     // fails to escape, and it is not recoverable from `alpha` alone (#2587 cost
     // a measurement cycle to establish that `decrease_floor` was binding).
-    log::info!(
+    log::debug!(
         "[PIRLS/joint-Newton saddle-escape sizing] lambda_min={lambda_min:.6e} \
          locality_cap={locality_cap:.6e} decrease_floor={decrease_floor:.6e} \
          feasible_cap={feasible_cap:.6e} widening={escape_widening:.1} \
@@ -3320,7 +3320,7 @@ fn seat_inner_start_inside_block_constraints<F: CustomFamily + Clone + Send + Sy
                 specs[b].name
             ))
         })?;
-        log::info!(
+        log::debug!(
             "[PIRLS/inner start] block '{}' seed lies outside this evaluation's constraints \
              ({infeasible}); seated strictly inside them before the first evaluation (#2714)",
             specs[b].name
@@ -3436,7 +3436,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     const INNER_PRELUDE_LOG_MIN_N: usize = 100_000;
     let prelude_log = total_joint_n >= INNER_PRELUDE_LOG_MIN_N;
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=buildblock_states+refresh_etas elapsed={:.3}s n={} p={} blocks={}",
             inner_started.elapsed().as_secs_f64(),
             total_joint_n,
@@ -3637,7 +3637,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     let s_lambdas_launch_elapsed = s_lambdas_launch_started.elapsed();
     let s_lambdas = s_lambdas_par_iter.collect::<Result<Vec<_>, CustomFamilyError>>()?;
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=s_lambdas par_iter launch={:.3}s collect={:.3}s blocks={} (since inner-start={:.3}s)",
             s_lambdas_launch_elapsed.as_secs_f64(),
             s_lambdas_collect_started.elapsed().as_secs_f64(),
@@ -3671,7 +3671,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     if let Some(cached) = warm_start.and_then(|seed| seed.cached_inner.as_ref())
         && cached.objective_state.jeffreys_strength() != objective_state.jeffreys_strength()
     {
-        log::info!(
+        log::debug!(
             "[PIRLS/joint-Newton warm-start] cached inner mode is not this objective's: Jeffreys \
              augmentation strength {:.17e} -> {:.17e} at an unchanged smoothing state; correcting \
              rather than reusing (#2612)",
@@ -3747,7 +3747,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                         let numerical_floor = certificate.numerical_floor;
                         certified_workspace = certificate.workspace;
                         if !cached_mode_acceptable {
-                            log::warn!(
+                            log::debug!(
                                 "[PIRLS/joint-Newton warm-start] refused cached same-rho inner mode: fresh returned-mode curvature lambda_min={:.6e} < -floor={:.6e}; retaining beta only as an uncertified solver seed",
                                 minimum_whitened_eigenvalue,
                                 numerical_floor,
@@ -3757,14 +3757,14 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     Err(error) => {
                         cached_mode_acceptable = false;
                         certified_workspace = None;
-                        log::warn!(
+                        log::debug!(
                             "[PIRLS/joint-Newton warm-start] refused cached same-rho inner mode because fresh returned-mode curvature could not be certified ({error}); retaining beta only as an uncertified solver seed"
                         );
                     }
                 }
             }
             if cached_mode_acceptable {
-                log::info!(
+                log::debug!(
                     "[PIRLS/joint-Newton warm-start] reused cached same-rho inner mode | cycles={} product={product:?} logdet_h={:?} logdet_s={:?}",
                     cached.cycles,
                     cached.block_logdet_h,
@@ -3818,7 +3818,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     seat_inner_start_inside_block_constraints(family, specs, &mut states)?;
     let load_joint_started = std::time::Instant::now();
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=load_joint_gradient_evaluation begin use_joint_newton={} joint_workspace_requested={} (since inner-start={:.3}s)",
             use_joint_newton,
             joint_workspace_requested,
@@ -3842,7 +3842,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             (log_likelihood, Some(eval), None, None)
         };
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=load_joint_gradient_evaluation end elapsed={:.3}s log_likelihood={:.6e} has_gradient={} has_workspace={}",
             load_joint_started.elapsed().as_secs_f64(),
             current_log_likelihood,
@@ -3887,7 +3887,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         None
     };
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=validate_block_hessians_finite elapsed={:.3}s checked={}",
             validate_started.elapsed().as_secs_f64(),
             cached_eval.is_some() || cached_joint_hessian_source.is_some(),
@@ -3901,7 +3901,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         Some(specs),
     );
     if prelude_log {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS/inner step=total_quadratic_penalty elapsed={:.3}s penalty={:.6e} (prelude_total={:.3}s)",
             penalty_started.elapsed().as_secs_f64(),
             current_penalty,
@@ -4044,7 +4044,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         // iterations from CI logs when a benchmark hangs inside the first
         // outer-eval. Emitted at info-level: same rationale as the joint-Newton
         // sibling above — silent-grind diagnosis without debug logs.
-        log::info!(
+        log::debug!(
             "[PIRLS/blockwise coord] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
             cycle,
             inner_max_cycles,
@@ -4148,7 +4148,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 block_quadratic_penalty(&beta_old, s_lambda);
             let step_beta_inf = delta.iter().copied().map(f64::abs).fold(0.0, f64::max);
             max_proposed_beta_step = max_proposed_beta_step.max(step_beta_inf);
-            log::debug!(
+            log::trace!(
                 "[PIRLS/blockwise step] block={b} |delta|inf={step_beta_inf:.6e} \
                  metric_norm={step_metric_norm:.6e} cap={block_cap:.6e} \
                  hit_boundary={step_hit_trust_boundary} \
@@ -4221,7 +4221,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     match family.log_likelihood_only_with_options(&states, &line_search_options) {
                         Ok(value) => value,
                         Err(reason) => {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS/blockwise trial] block={b} bt={bt} alpha={alpha:.6e} \
                                  LIKELIHOOD REFUSED: {reason}"
                             );
@@ -4231,7 +4231,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                         }
                     };
                 let trialobjective = -trial_ll + trial_penalty;
-                log::debug!(
+                log::trace!(
                     "[PIRLS/blockwise trial] block={b} bt={bt} alpha={alpha:.6e} \
                      -trial_ll={:.9e} trial_penalty={:.9e} trialobjective={:.9e} \
                      prev={:.9e} margin={:.3e}",
@@ -4488,7 +4488,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         // and startup seed. Break unconverged so the outer optimizer rejects
         // this point immediately instead of burning the budget.
         if !objective.is_finite() || !cached_eval.log_likelihood.is_finite() {
-            log::warn!(
+            log::debug!(
                 "[PIRLS/blockwise convergence] cycle {:>3} | divergence guard: non-finite inner state (objective={:.3e}, -loglik={:.3e}); returning unconverged so the outer optimizer rejects this ρ evaluation instead of running to inner_max_cycles.",
                 cycle,
                 objective,
@@ -4549,7 +4549,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         } else {
             true
         };
-        log::info!(
+        log::debug!(
             "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
             cycle,
             max_proposed_beta_step,
@@ -4603,7 +4603,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         if frozen_verdict == gam_solve::loop_guard::LoopVerdict::Plateaued
             && clamped_step_in_frozen_run
         {
-            log::warn!(
+            log::debug!(
                 "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (trust-boundary hit observed in frozen run) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                 cycle,
                 -cached_eval.log_likelihood,
@@ -5019,7 +5019,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
                 minimum_whitened_eigenvalue, numerical_floor,
             )));
         }
-        log::info!(
+        log::debug!(
             "[PIRLS/blockwise mode certificate] returned beta certified from fresh exact curvature: lambda_min={:.6e}, floor={:.6e}",
             minimum_whitened_eigenvalue,
             numerical_floor,

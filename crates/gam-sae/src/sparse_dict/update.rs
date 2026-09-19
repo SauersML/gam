@@ -779,7 +779,7 @@ pub(super) fn run_seeded(
     // (log::warn survives the RUST_LOG=warn harnesses that drop log::info), so a
     // multi-hour host fit is never silent. Emitted at seed / initial-route /
     // per-epoch cadence only — never per row or per minibatch.
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] seeded decoder N={n} P={p} K={k} s={s} \
          seed_s={:.1} (route + refresh follow)",
         fit_start.elapsed().as_secs_f64(),
@@ -851,7 +851,7 @@ fn run_from_decoder(
         config.score_mode,
         Some(&mut score_route_stats),
     )?;
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] initial route done: minibatches={} device={} cpu={} \
          route_s={:.1} elapsed_s={:.1}",
         score_route_stats.minibatches,
@@ -1098,7 +1098,7 @@ fn run_from_decoder(
         // silent). A hang in the refresh or route is visible at round cadence,
         // and the CG certificate (giant component size, the a-priori κ bound,
         // any typed non-convergence) is on the same line.
-        log::warn!(
+        log::debug!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
              routing_resid={:.3e} births={} revived={} live={}/{} \
              refresh_s={:.2} route_s={:.2} elapsed_s={:.1} \
@@ -1214,7 +1214,7 @@ fn run_from_decoder(
             let (candidate_loss, candidate_band) =
                 penalized_objective(x, candidate.view(), &candidate_codes, config.code_ridge);
             if candidate_loss + candidate_band < plain_loss - plain_band {
-                log::warn!(
+                log::debug!(
                     "[SAE epoch {epochs_run}] Aitken step adopted: penalized loss \
                      {plain_loss:.9e} -> {candidate_loss:.9e}"
                 );
@@ -1324,7 +1324,7 @@ fn continue_linear_fast_kernel(
     let p = x.ncols();
     let k = unified.n_atoms;
     let s = unified.active.min(k).max(1);
-    log::warn!(
+    log::debug!(
         "[SAE sparse_dict] continued prior decoder N={n} P={p} K={k} s={s} \
          (fresh route at rho={shared_rho:.6e} follows)"
     );
@@ -1653,7 +1653,7 @@ fn run_linear_reml_schedule_with_recycle(
         let log_change = (rho_new.ln() - rho.ln()).abs();
         // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
         // harnesses), at outer-loop cadence only — never per row or minibatch.
-        log::warn!(
+        log::debug!(
             "[SAE reml-schedule iter {}] rho={:.6e} rho_new={:.6e} log_change={:.3e} \
              edof={:.2} rss={:.6e} penalty_energy={:.6e} tol={:.3e}",
             outer_iterations,
@@ -1863,7 +1863,7 @@ fn split_decoder_seed(
                 match super::single_atom::profiled_direction(residuals.view(), &local, direction) {
                     Ok(spread) => spread,
                     Err(reason) => {
-                        log::debug!("[SAE sparse_dict] atom {atom} is not split: {reason}");
+                        log::trace!("[SAE sparse_dict] atom {atom} is not split: {reason}");
                         return None;
                     }
                 };
@@ -3020,7 +3020,7 @@ pub(super) fn solve_decoder_with_routability_gate_recycled(
             // debugger: `n < threshold` because the mean amplitude cannot yet
             // clear the `z_alpha * residual_scale` charge floor by the required
             // `margin` (see `routability_gate_decisions`).
-            log::debug!(
+            log::trace!(
                 "[SAE routability] atom {} deferred: firings={} mean_amplitude={:.4} \
                  z_alpha={:.4} margin={:.4} standard_error={:.4} threshold={:.4}",
                 decision.atom,
@@ -3280,7 +3280,7 @@ fn solve_decoder_recycled(
     // makes the percolating-regime diagnosis (and any ill-conditioned block)
     // readable without a debugger — the co-firing graph is one giant component
     // at scale, so the exact-solve threshold `⌈K^{2/3}⌉` is expected to bind.
-    log::debug!(
+    log::trace!(
         "[SAE percolation] K={k} mean_degree={:.4} giant_fraction={:.4} \
          components={} max_component={} max_component_nnz={} operator_build_s={:.3} \
          graph_build_s={:.3} precond_s={:.3} cg_solve_s={:.3} block_sweeps={} \
@@ -3828,7 +3828,7 @@ fn solve_component(
                 } else {
                     0.0
                 };
-                log::warn!(
+                log::debug!(
                     "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
                      rel_residual={:.3e} residual_tolerance={:.3e} \
                      kappa_bound={:.3e} cap={cap}",

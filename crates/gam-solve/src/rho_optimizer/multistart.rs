@@ -203,7 +203,7 @@ impl OuterProblem {
             released: std::sync::Condvar::new(),
             most_live: AtomicUsize::new(0),
         };
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: multistart searches all {} generated seeds on {concurrency} lanes \
              ({working_set_bytes} bytes predicted per search, {} remaining in the memory budget, \
              {} bytes available before launch)",
@@ -290,7 +290,7 @@ impl OuterProblem {
             let (outcome, payload, seconds) =
                 joined.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             match &outcome {
-                Ok(certified) => log::info!(
+                Ok(certified) => log::debug!(
                     "[OUTER] {context}: multistart seed {index} rho={:?} certified value={:?} at \
                      rho={:?} after {} iterations in {seconds:.3}s",
                     seeds[index].to_vec(),
@@ -298,7 +298,7 @@ impl OuterProblem {
                     certified.rho().to_vec(),
                     certified.iterations(),
                 ),
-                Err(error) => log::info!(
+                Err(error) => log::debug!(
                     "[OUTER] {context}: multistart seed {index} rho={:?} did not certify in \
                      {seconds:.3}s: {error}",
                     seeds[index].to_vec(),
@@ -308,7 +308,7 @@ impl OuterProblem {
         }
         let winner = multistart_winner(&runs);
         match winner {
-            Some(index) => log::info!(
+            Some(index) => log::debug!(
                 "[OUTER] {context}: multistart winner is seed {index} of {} (value={:.9e}) \
                  after {:.3}s",
                 runs.len(),
@@ -319,7 +319,7 @@ impl OuterProblem {
                     .unwrap_or(f64::NAN),
                 started.elapsed().as_secs_f64(),
             ),
-            None => log::warn!(
+            None => log::debug!(
                 "[OUTER] {context}: no multistart seed certified ({} runs, {:.3}s)",
                 runs.len(),
                 started.elapsed().as_secs_f64(),

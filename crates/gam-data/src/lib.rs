@@ -772,7 +772,7 @@ fn load_delimited_inferred(
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     if open_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_open+headers | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
             p,
@@ -818,7 +818,7 @@ fn load_delimited_inferred(
 
     let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
     if stream_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_stream | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
             p,
@@ -844,7 +844,7 @@ fn load_delimited_inferred(
             .iter()
             .filter(|k| matches!(k, ColumnKindTag::Categorical))
             .count();
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_convert+infer | n_cols={} | n_cat={} | {:.1}ms",
             p,
             n_cat,
@@ -937,7 +937,7 @@ fn load_delimited_inferred(
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
     if assemble_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_assemble_array2 | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
             p,
@@ -1201,7 +1201,7 @@ fn load_delimited_with_schema(
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     if open_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_schema_open+headers | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
             p,
@@ -1308,7 +1308,7 @@ fn load_delimited_with_schema(
         })?;
         let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
         if stream_ms > 100.0 {
-            log::info!(
+            log::debug!(
                 "[DATA-LOAD] delim_schema_direct | n_rows={} | n_cols={} | {:.1}ms",
                 total_rows,
                 p,
@@ -1367,7 +1367,7 @@ fn load_delimited_with_schema(
     let stream_ms = t_stream.elapsed().as_secs_f64() * 1000.0;
     if stream_ms > 100.0 {
         let n_inf = needs_inference.iter().filter(|x| **x).count();
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_schema_stream | n_rows={} | n_cols={} | n_inf={} | {:.1}ms",
             total_rows,
             p,
@@ -1392,7 +1392,7 @@ fn load_delimited_with_schema(
     }
     let finalize_ms = t_finalize.elapsed().as_secs_f64() * 1000.0;
     if finalize_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_schema_finalize | n_cols={} | {:.1}ms",
             p,
             finalize_ms
@@ -1493,7 +1493,7 @@ fn load_delimited_with_schema(
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
     if assemble_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] delim_schema_assemble | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
             p,
@@ -2156,7 +2156,7 @@ fn load_parquet_inferred(
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     if open_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] parquet_open+meta | n_headers={} | n_proj={} | {:.1}ms",
             all_headers.len(),
             p,
@@ -2235,7 +2235,7 @@ fn load_parquet_inferred(
     }
     let batches_ms = t_batches.elapsed().as_secs_f64() * 1000.0;
     if batches_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] parquet_batches_decode | n_rows={} | n_cols={} | {:.1}ms",
             total_rows,
             p,
@@ -2282,7 +2282,7 @@ fn load_parquet_inferred(
             .iter()
             .filter(|k| matches!(k, ColumnKindTag::Categorical))
             .count();
-        log::info!(
+        log::debug!(
             "[DATA-LOAD] parquet_finalize_schema | n_cols={} | n_cat={} | {:.1}ms",
             p,
             n_cat,

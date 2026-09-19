@@ -21,6 +21,7 @@ use crate::basis::{
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     select_r_uniform_subsample_centers, thin_plate_penalty_order,
 };
+use crate::fit_notes::FitNoteSink;
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
     option_usize_any, option_usize_any_strict, option_usize_strict, parsed_term_column_names,
@@ -379,7 +380,7 @@ pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
     col_map: &HashMap<String, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut impl FitNoteSink,
 ) -> Result<TermCollectionSpec, TermBuilderError> {
     // Generic ingestion deliberately preserves missing cells because it runs
     // before a formula exists. This is the first layer that knows the complete
@@ -844,7 +845,7 @@ pub fn build_termspec(
                         coefficient_max: None,
                         frozen_function_mass: None,
                     });
-                    inference_notes.push(format!(
+                    inference_notes.inform(format!(
                         "wired linear interaction `{}` as product of numeric columns",
                         vars.join(":")
                     ));
@@ -934,7 +935,7 @@ pub fn build_termspec(
                     } else {
                         "marginality-aware (full dummy / saturated)"
                     };
-                    inference_notes.push(format!(
+                    inference_notes.inform(format!(
                         "wired factor-aware linear interaction `{}` as {} {} cell column(s)",
                         vars.join(":"),
                         n_cells,
@@ -956,11 +957,9 @@ pub fn build_termspec(
     // are inference notes: recorded here, once, for every front end and every
     // model class that lowers a formula (the CLI prints them, Python raises
     // them as `GamInferenceWarning`s, and the saved model carries them).
-    inference_notes.extend(crate::smooth::collect_smooth_structure_warnings(
-        &spec,
-        &ds.headers,
-        "model",
-    ));
+    for warning in crate::smooth::collect_smooth_structure_warnings(&spec, &ds.headers, "model") {
+        inference_notes.advise(warning);
+    }
     Ok(spec)
 }
 
@@ -2268,7 +2267,7 @@ pub(crate) fn build_smooth_basis(
     cols: &[usize],
     options: &BTreeMap<String, String>,
     ds: &Dataset,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
     smooth_coordinate_count: usize,
 ) -> Result<SmoothBasisSpec, String> {
     // Strip the internal by-level sizing carrier before any per-kind option
@@ -2859,7 +2858,7 @@ pub(crate) fn build_smooth_basis(
                     ));
                 }
                 note.push_str(" Override with knots=... or k=....");
-                inference_notes.push(note);
+                inference_notes.inform(note);
             }
             let boundary_conditions =
                 if periodic_axes[0] && bspline_boundary_declares_periodic_axis(options) {
@@ -3829,7 +3828,7 @@ pub(crate) fn build_smooth_basis(
                 }
             }
             if k_inferred {
-                inference_notes.push(format!(
+                inference_notes.inform(format!(
                     "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
                      (dimension-aware tensor budget: total ∏k kept near the mgcv-te default \
                      and within the data support, distributed geometrically across margins and \
@@ -3903,7 +3902,7 @@ pub(crate) fn build_smooth_basis(
                 let n_distinct_axis = unique_count_column(ds.values.column(c));
                 let k_axis = k_requested.min(n_distinct_axis).max(2);
                 if k_axis < k_requested {
-                    log::info!(
+                    log::debug!(
                         "tensor smooth: margin axis {axis} requested k={k_requested}, but the \
                          covariate has only {n_distinct_axis} distinct value(s); reducing this \
                          margin to k={k_axis} (mgcv-style data-support cap on the per-axis basis)."
@@ -4422,12 +4421,12 @@ fn capped_cr_marginal_knotspec(
     col: ArrayView1<'_, f64>,
     k_cr_requested: usize,
     label: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<Option<BSplineKnotSpec>, String> {
     let n_distinct = unique_count_column(col);
     let k_cr = k_cr_requested.min(n_distinct);
     if k_cr < CR_MIN_KNOTS {
-        inference_notes.push(format!(
+        inference_notes.advise(format!(
             "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis requested k={k_cr_requested}, \
              but the covariate has only {n_distinct} distinct value(s) — too few to support a cubic \
              regression spline (needs >= {CR_MIN_KNOTS} distinct values). Degraded to the linear \
@@ -4436,7 +4435,7 @@ fn capped_cr_marginal_knotspec(
         return Ok(None);
     }
     if k_cr < k_cr_requested {
-        inference_notes.push(format!(
+        inference_notes.advise(format!(
             "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis reduced from k={k_cr_requested} \
              to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (mgcv-style \
              data-support cap; a cr basis cannot place more value-knots than the data has)."

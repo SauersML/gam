@@ -225,17 +225,20 @@ fn run_canonical_standard_fit(
     fit_config: &FitConfig,
 ) -> Result<(), String> {
     let phase_start = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit start n={}",
         dataset.values.nrows()
     );
     let outcome = fit_from_formula_with_notes(formula, dataset, fit_config)
         .map_err(canonical_standard_fit_error)?;
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&outcome.inference_notes);
+    print_inference_summary(
+        &outcome.inference_notes.advisories,
+        &outcome.inference_notes.informational,
+    );
 
     match outcome.result {
         FitResult::Standard(mut result) => {
@@ -388,18 +391,18 @@ fn run_library_formula_fit(
     let dataset = load_fit_dataset_with_roles(&args.data, &requested_columns, parsed, false)?;
     require_dataset_rows("fit", &args.data, dataset.values.nrows())?;
     let phase_start = std::time::Instant::now();
-    log::info!("[PHASE] formula fit start n={}", dataset.values.nrows());
+    log::debug!("[PHASE] formula fit start n={}", dataset.values.nrows());
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,
         &dataset,
         fit_config,
     )
     .map_err(|error| format!("formula fit failed: {error}"))?;
-    log::info!(
+    log::debug!(
         "[PHASE] formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&payload.inference_notes);
+    print_inference_summary(&payload.inference_notes, &payload.informational_notes);
     if let Some(fit) = payload.fit_result.as_ref() {
         cli_out!(
             "{} fit | status={} | iterations={} | loglik={:.6e} | reml_score={} | raw_reml_score={}",

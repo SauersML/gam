@@ -80,7 +80,7 @@ pub use gam_problem::{ConstraintSet, KhatriRaoConeConstraints, PlacedConstraintB
 
 pub(crate) use gam_linalg::utils::{array_is_finite, inf_norm, row_chunk_for_byte_budget};
 
-// `log` is used as a path (`log::debug!`), so re-export the crate itself.
+// `log` is used as a path (`log::trace!`), so re-export the crate itself.
 pub(crate) use log;
 
 #[cfg(test)]

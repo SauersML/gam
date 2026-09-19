@@ -396,7 +396,7 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     ) {
         Ok(reservation) => Some(reservation),
         Err(error) => {
-            log::info!(
+            log::debug!(
                 "Dense covariance/influence bundle not reserved; using factorized inference: {error}"
             );
             None
@@ -495,7 +495,7 @@ fn reserve_factorized_inference_state(
     ) {
         Ok(reservation) => Some(reservation),
         Err(error) => {
-            log::info!("Factorized inference state could not be fully reserved: {error}");
+            log::debug!("Factorized inference state could not be fully reserved: {error}");
             None
         }
     }
@@ -1035,12 +1035,12 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         if let Err(error) =
             reml_state.compute_cost_with_ext_count(anchor, external_hyper_count)
         {
-            log::debug!("[OUTER] nuisance anchor candidate rejected: {error:?}");
+            log::trace!("[OUTER] nuisance anchor candidate rejected: {error:?}");
             continue;
         }
         let bits = frozen.load(Ordering::Relaxed);
         if bits != 0 {
-            log::info!(
+            log::debug!(
                 "[OUTER] {family} λ-search freeze anchored at ρ=[{}] before any warm start (#2363): \
                  value {:.6e}; the outer criterion is now a function of the data and the model spec alone",
                 anchor
@@ -1059,7 +1059,7 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
         // is about to try the same points and will report its own refusal;
         // leaving the freeze unset keeps the pre-existing capture path rather
         // than converting a seed-cascade failure into a different error here.
-        log::warn!(
+        log::debug!(
             "[OUTER] no deterministic anchor converged for the {family} λ-search freeze; \
              the outer criterion cannot be pinned before the seed cascade"
         );
@@ -1115,7 +1115,7 @@ where
         DesignMatrix::Dense(_) => "dense",
         DesignMatrix::Sparse(_) => "sparse",
     };
-    log::info!(
+    log::debug!(
         "[GAM fit] n={} p={} k={} fam={:?} link={:?} X={} reml_iter={} firth={}",
         y.len(),
         p,
@@ -1673,7 +1673,7 @@ where
                     // cheapest point with the eventual fit: Gaussian sends every
                     // unique finite analytic candidate through a certified full
                     // solve below and keeps the best converged REML value.
-                    log::info!(
+                    log::debug!(
                         "[OUTER] standard REML analytic-start ranking: {:?} -> {:?} \
                          (scored: {scored_report}; bounds {:.3}..{:.3})",
                         base.as_slice().unwrap_or(&[]),
@@ -2068,7 +2068,7 @@ where
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
                 let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
-                log::debug!(
+                log::trace!(
                     "[outer-eval {eval_idx}] theta_dim={} aux_dim={} unified_link_ext time_sec={:.3}",
                     theta_dim,
                     aux_dim,
@@ -2299,7 +2299,7 @@ where
                         rho_gradient,
                     ));
                 outer_result.final_grad_norm = Some(rho_residual);
-                log::debug!(
+                log::trace!(
                     "[OUTER] negative-binomial joint optimum certified after {} round(s): \
                      rho KKT residual {:.3e} <= {:.3e}, theta residual {:.3e} <= {:.3e}",
                     negbin_alternation_round + 1,
@@ -2342,7 +2342,7 @@ where
             // fixed. No secant/grid extrapolation and no unreported answer cap.
             let theta_next =
                 pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view())?;
-            log::info!(
+            log::debug!(
                 "[OUTER] negative-binomial joint round {} not yet certified: \
                  rho residual {:.3e}/{:.3e}, theta residual {:.3e}/{:.3e}; \
                  updating theta {:.6e} -> {:.6e} and resuming from rho checkpoint",
@@ -2629,7 +2629,7 @@ where
                         dense,
                         penalty_rank_total,
                     )?;
-                    log::info!(
+                    log::debug!(
                         "[#2901 V22] the penalized Hessian is singular on {} of {p_dim} \
                          coefficient directions (strict factorization: {reason}); inference is \
                          taken on its identified {}-dimensional subspace",
@@ -3264,7 +3264,7 @@ where
                         &railed,
                     ) {
                         Ok((certificate, step_radius)) => {
-                            log::info!(
+                            log::debug!(
                                 "[#2901 V22] identified rank {} of {} is certified constant over \
                                  the certificate's Newton step {step_radius:.3e}: smallest \
                                  identified eigenvalue {:.3e}, rounding band {:.3e}",
@@ -3290,7 +3290,7 @@ where
                         {
                             let reason =
                                 crate::model_types::RankConstancyNotEvaluated::RootScalePricedRank;
-                            log::info!(
+                            log::debug!(
                                 "[#2959 D1] root-priced rank {} of {}; its constancy over the \
                                  certificate's step was not evaluated: {}",
                                 spectrum.rank(),
@@ -3305,7 +3305,7 @@ where
                 (reason, ..) => {
                     let reason = reason
                         .unwrap_or(crate::model_types::RankConstancyNotEvaluated::NoOuterHessian);
-                    log::info!(
+                    log::debug!(
                         "[#2901 V22] identified rank {} of {}; its constancy over the \
                          certificate's step was not evaluated: {}",
                         spectrum.rank(),
@@ -3488,7 +3488,7 @@ where
             // out `H`: `max|H − Hᵀ| = 0.000e0` there). Report both asymmetries
             // at the one place that holds `s_mat`. `debug!` so it costs nothing
             // without a backend installed, and O(p²) beside the O(p³) work above.
-            if log::log_enabled!(log::Level::Debug) {
+            if log::log_enabled!(log::Level::Trace) {
                 let asym = |m: &ndarray::Array2<f64>| {
                     let mut worst = 0.0_f64;
                     for i in 0..m.nrows() {
@@ -3499,7 +3499,7 @@ where
                     worst
                 };
                 let scale = xwx.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                log::debug!(
+                log::trace!(
                     "[WPS-GRAM #2668] max|H-H^T|={:.3e} max|S-S^T|={:.3e} \
                      max|H-S|={:.3e} (the stored gram is symmetrize(H-S); a \
                      non-zero S asymmetry is absorbed here and surfaces as \
@@ -3735,7 +3735,7 @@ where
                             "exact smoothing-corrected covariance unavailable: {reason:?}"
                         )));
                     }
-                    log::info!(
+                    log::debug!(
                         "[SMOOTHING-CORRECTION] typed-unavailable on a {} fit ({reason:?}); \
                          shipping the plug-in covariance without a smoothing correction",
                         if rail_certified { "rail-certified" } else { "non-analytic-outer-Hessian" }
@@ -3971,7 +3971,7 @@ where
                         Some(corrected)
                     }
                     Err(reason) => {
-                        log::warn!(
+                        log::debug!(
                             "[CONSTRAINED-Vp] the smoothing-corrected covariance could not be \
                              truncated to the feasible set ({reason}); publishing the typed \
                              absence rather than an untruncated marginal, which would over-state \

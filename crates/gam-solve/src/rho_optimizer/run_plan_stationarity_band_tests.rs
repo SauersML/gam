@@ -47,7 +47,7 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
         .try_init()
         .is_err()
     {
-        log::debug!("zz_measure #2613: a logger was already installed by another test");
+        log::trace!("zz_measure #2613: a logger was already installed by another test");
     }
 
     let calls = Arc::new(Mutex::new(Vec::<(char, f64, f64, f64)>::new()));

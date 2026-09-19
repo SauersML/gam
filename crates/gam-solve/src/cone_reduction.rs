@@ -440,7 +440,7 @@ pub(crate) fn cone_properness_certificate(
         match copositive_simplex_minimum(reduced.view()) {
             Ok((minimum, point)) => (Some(minimum), Some(point)),
             Err(out_of_range) => {
-                log::debug!("[cone properness] exact copositivity not enumerated: {out_of_range}");
+                log::trace!("[cone properness] exact copositivity not enumerated: {out_of_range}");
                 (None, None)
             }
         };

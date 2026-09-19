@@ -540,6 +540,7 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         // fabricated "certified" block here would be the exact confusion
         // #2411 exists to remove.
         convergence: None,
+        notes: summary_notes(model),
     }
 }
 
@@ -685,6 +686,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
         coefficient_se_source: display_uncertainty.map(|view| view.definition.as_str().to_string()),
         convergence: Some(summary_convergence(&fit)),
+        notes: summary_notes(model),
     })
 }
 
@@ -897,6 +899,23 @@ pub struct SummaryPayload {
     /// (the O(n) spline scan).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub convergence: Option<SummaryConvergence>,
+    /// The notes the fit recorded, advisories (`inference_notes`: the model
+    /// differs from the literal request) first, then informational notes
+    /// (`informational_notes`: defaults chosen on the user's behalf). Empty
+    /// when the fit recorded none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Every note the fit recorded, advisories first.
+fn summary_notes(model: &FittedModel) -> Vec<String> {
+    let payload = model.payload();
+    payload
+        .inference_notes
+        .iter()
+        .chain(&payload.informational_notes)
+        .cloned()
+        .collect()
 }
 
 /// How the optimization that produced this fit terminated.

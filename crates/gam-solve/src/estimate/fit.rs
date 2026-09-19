@@ -127,7 +127,7 @@ where
     // caller who has chosen it should not be blocked. What was missing is that
     // the resulting collapse looked identical to a healthy fit.
     if x.ncols() >= x.nrows() {
-        log::warn!(
+        log::debug!(
             "saturated design: {} coefficients for {} observations (p >= n). The \
              restricted likelihood has no residual degrees of freedom here, so REML \
              lambda-selection is degenerate and may prefer maximum smoothing -- a \

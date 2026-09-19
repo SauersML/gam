@@ -277,7 +277,7 @@ impl<'a> RemlState<'a> {
         // DECLINE the splice — value AND gradient together — rather than
         // approximate.
         if n_ext > 0 {
-            log::debug!(
+            log::trace!(
                 "[#784] block-local fallback declined before the skewness diagnostic: \
                  {n_ext} external (ψ) coordinate(s) present and the ψ-exact gradient \
                  channels are not implemented; splicing a ψ-truncated gradient would \
@@ -293,7 +293,7 @@ impl<'a> RemlState<'a> {
             reml_spec(&self.config.likelihood).response,
             ResponseFamily::Beta { .. }
         ) {
-            log::debug!(
+            log::trace!(
                 "[#784] block-local fallback declined before the skewness diagnostic: \
                  Beta family has no exponential-family score identity for the exact \
                  gradient channels"
@@ -335,7 +335,7 @@ impl<'a> RemlState<'a> {
         if latched_block_dim.is_none() && !verdict.fallback_required() {
             if *self.block_correction_decision_guard() == BlockCorrectionDecision::DecidingAtOptimum
             {
-                log::info!(
+                log::debug!(
                     "[#784] block-local correction DECLINED for this fit at its certified Laplace \
                      optimum: max|γ|={:.4e} against τ={:.4e} (#1082)",
                     verdict.max_abs_skewness,
@@ -571,7 +571,7 @@ impl<'a> RemlState<'a> {
                     },
                 });
             }
-            log::info!(
+            log::debug!(
                 "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
                  #2748): paired Gauss-Hermite error {:.4e} does not resolve \
                  min(|Δ_b|, 1/n_eff²)={resolution_target:.4e} (|Δ_b|={abs_value:.4e}, m={m}, \
@@ -601,7 +601,7 @@ impl<'a> RemlState<'a> {
                 *decision = BlockCorrectionDecision::AdmittedAtOptimum;
             }
             drop(decision);
-            log::info!(
+            log::debug!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m} and \
                  axis orders {:?} are now the model's, and the tau={:.3} activation no longer \
                  switches the criterion on and off along the outer search (#2748, #2623)",
@@ -610,7 +610,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        log::info!(
+        log::debug!(
             "[#784] deterministic block-local Gauss-Hermite correction ENGAGED: \
              m={m}, max|γ|={:.3}, τ={:.3}, Δ_b={:.4e}, axis orders={:?}, nodes={} \
              [paired-rule error={:.4e}, error/|Δ_b|={:.3e}, 1/n_eff={:.3e}]",

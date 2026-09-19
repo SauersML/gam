@@ -127,7 +127,7 @@
 //! that carries the answer back out of those coordinates cannot be formed at
 //! all when `W` is numerically singular. The alternatives are therefore a
 //! subset-truncated posterior or none, not a subset-truncated posterior or an
-//! exact one. Which rows survived is reported (`log::info!`) whenever the
+//! exact one. Which rows survived is reported (`log::debug!`) whenever the
 //! whole-face check dropped anything, so the choice is visible on the fit that
 //! made it rather than inferable from this file.
 
@@ -1666,7 +1666,7 @@ pub(crate) fn constrained_posterior_correction(
             // not about the solve — the dropped rows are within `O(θ)` of the
             // span of the retained ones, but "within `O(θ)`" is a claim the
             // reader is entitled to see stated on their own fit.
-            log::info!(
+            log::debug!(
                 "[CONSTRAINED-FACE] {} of {} candidate constraint row(s) retained after \
                  dropping {} nearly dependent direction(s) over {faces_tried} face(s); the \
                  retained lift satisfies its identity to {departure:.3e}",
@@ -1773,7 +1773,7 @@ fn render_ladder(ladder: &[LadderRung], candidates: usize) -> String {
 /// produced `W` costs three quarters of an hour to reach this line on the
 /// #2714 witness. Printing it there turns that refusal into a unit fixture.
 fn log_refused_face(face: &RefusedFace, departure: f64, excluded: usize) {
-    if !log::log_enabled!(log::Level::Warn) {
+    if !log::log_enabled!(log::Level::Debug) {
         return;
     }
     let q = face.rows.len();
@@ -1783,7 +1783,7 @@ fn log_refused_face(face: &RefusedFace, departure: f64, excluded: usize) {
             rendered.push_str(&format!("{:.17e},", face.w[[i, j]]));
         }
     }
-    log::warn!(
+    log::debug!(
         "[CONSTRAINED-FACE] refused excluded={excluded} departure={departure:.6e} \
          q={q} rows={:?} w=[{rendered}]",
         face.rows
@@ -2335,7 +2335,7 @@ fn box_truncated_moments(
         .map(|_| OrthantAccumulator::new(q))
         .collect();
     let certified = certified_orthant_moments(&rule, covariance, &mut sinks)?;
-    log::debug!(
+    log::trace!(
         "[orthant-cubature] q={q} certified at {} nodes over {ORTHANT_MOMENT_REPLICATES} \
          replicate lattices: replicate standard error {:.3e} (target \
          {ORTHANT_MOMENT_RELATIVE_TOLERANCE:.1e}), proposal efficiency {:.3}%, tilt {}",
@@ -3327,7 +3327,7 @@ impl OrthantRule {
         let face = ordered_face(mean, upper, covariance)?;
         let (tilt, tilt_status) = saddle_point_tilt(&face.mean, &face.upper, &face.factor);
         if let TiltStatus::Untilted { reason } = &tilt_status {
-            log::debug!("[orthant-cubature] q={q} runs untilted: {reason}");
+            log::trace!("[orthant-cubature] q={q} runs untilted: {reason}");
         }
         Ok(Self::from_face(face, tilt, tilt_status, tangent_dimension))
     }
@@ -3596,7 +3596,7 @@ impl OrthantRule {
         for (position, &original) in self.face.order.iter().enumerate() {
             original_mean[original] = self.face.mean[position];
         }
-        log::debug!(
+        log::trace!(
             "[orthant-face] q={q} mean={:?} covariance={:?}",
             original_mean.as_slice().map(<[f64]>::to_vec),
             covariance.as_slice().map(<[f64]>::to_vec),

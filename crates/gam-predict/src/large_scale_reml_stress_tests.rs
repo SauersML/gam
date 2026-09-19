@@ -462,7 +462,7 @@ fn gaussian_identity_posterior_mean_interval(
 
 #[test]
 fn large_scale_reml_stress_main() {
-    // The phase clocks and the geometry decision are `log::info!` lines; a
+    // The phase clocks and the geometry decision are `log::debug!` lines; a
     // test binary without a logger prints none of them.
     gam_runtime::test_support::install_diagnostic_logger();
     let (x_train, y_train, _y_true_train) = simulate(N_TRAIN, PC_DIM, SEED_BASE);
@@ -787,7 +787,7 @@ fn report_coverage_diagnostics(z: &[f64], resid: &[f64], se: &[f64], radius: &[f
 #[test]
 fn large_scale_reml_stress_coverage() {
     // The outer loop's seed ledger (ARC budget exhaustion, #2748 exhausted-seed
-    // records) and the phase clocks are `log::warn!`/`log::info!` lines; a test
+    // records) and the phase clocks are `log::debug!`/`log::debug!` lines; a test
     // binary without a logger prints none of them.
     gam_runtime::test_support::install_diagnostic_logger();
     // ── The in-model mean function ──────────────────────────────────────

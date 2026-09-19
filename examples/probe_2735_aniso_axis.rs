@@ -279,7 +279,7 @@ fn production_fit(
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -292,7 +292,7 @@ static LOGGER: StderrInfoLogger = StderrInfoLogger;
 
 fn main() {
     if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(6000);

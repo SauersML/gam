@@ -1204,7 +1204,7 @@ def fit(
     # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
     # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
     # basis the fit silently adjusted is never silent to the caller (#1543).
-    emit_inference_warnings(model.notes)
+    emit_inference_warnings(model._fit_notes()[0])
     return model
 
 
@@ -1334,7 +1334,7 @@ def fit_array(
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
-    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    emit_inference_warnings(model._fit_notes()[0])  # see fit(): never silently adjust a basis (#1543)
     return model
 
 

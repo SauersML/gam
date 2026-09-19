@@ -124,7 +124,7 @@ mod tests {
             .split_whitespace()
             .filter(|token| token.starts_with("--"))
             .collect();
-        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--log-level", "--help"]
+        let expected: BTreeSet<&str> = ["--request", "--tensor", "--out", "--verbose", "--help"]
             .into_iter()
             .collect();
         assert_eq!(

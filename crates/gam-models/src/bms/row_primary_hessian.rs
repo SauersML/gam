@@ -698,7 +698,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] build start n={} context_rows={} p={} flex={}",
                 n,
                 context_row_count,
@@ -713,7 +713,7 @@ impl BernoulliMarginalSlopeFamily {
             self.preseed_intercept_warm_starts(block_states)?;
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] preseed done n={} context_rows={} elapsed={:.3}s",
                 n,
                 context_row_count,
@@ -753,7 +753,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
                                 done,
                                 context_row_count,
@@ -790,7 +790,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS exact-cache] row-context progress rows={}/{} elapsed={:.3}s",
                                 done,
                                 context_row_count,
@@ -807,21 +807,21 @@ impl BernoulliMarginalSlopeFamily {
             .filter(|ctx| ctx.intercept_fast_path)
             .count();
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] row-context done rows={} fast_path_rows={} elapsed={:.3}s",
                 context_row_count,
                 fast_path_rows,
                 context_started.elapsed().as_secs_f64()
             );
         } else {
-            log::debug!(
+            log::trace!(
                 "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
                 fast_path_rows,
                 n
             );
         }
         if flex_active {
-            log::info!(
+            log::debug!(
                 "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
                 stats.cached_short_circuit.load(Ordering::Relaxed),
                 stats.closed_form_short_circuit.load(Ordering::Relaxed),
@@ -838,7 +838,7 @@ impl BernoulliMarginalSlopeFamily {
             let (cell_hits, cell_misses, cell_hit_rate) = self
                 .cell_moment_cache_stats
                 .hit_rate_delta(cell_cache_before);
-            log::info!(
+            log::debug!(
                 "[BMS cell-moment LRU] cycle hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
                 cell_hits,
                 cell_misses,
@@ -848,7 +848,7 @@ impl BernoulliMarginalSlopeFamily {
                 self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
             );
             let tail_stats = exact_kernel::tail_cell_moment_cache_stats();
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] affine tail-cell memo: hits={} misses={} entries={} hit_rate={:.3}%",
                 tail_stats.hits,
                 tail_stats.misses,
@@ -873,7 +873,7 @@ impl BernoulliMarginalSlopeFamily {
             None
         };
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} forest={} elapsed={:.3}s",
                 n,
                 row_cell_mask.map_or(n, <[usize]>::len),
@@ -889,10 +889,10 @@ impl BernoulliMarginalSlopeFamily {
             let (ladder_hist, ladder_terminal) = exact_kernel::non_affine_ladder_cert_histogram();
             let (forest_hits, forest_fallbacks) =
                 crate::cell_moment_family::forest_coverage_counts();
-            log::info!(
+            log::debug!(
                 "[BMS ladder/forest stats] ladder_cert_by_rung={ladder_hist:?} ladder_terminal_384={ladder_terminal} forest_covered_rows={forest_hits} forest_fallback_rows={forest_fallbacks}"
             );
-            log::info!(
+            log::debug!(
                 "[BMS exact-cache] build done n={} context_rows={} p={} flex={} elapsed={:.3}s",
                 n,
                 context_row_count,
@@ -973,7 +973,7 @@ impl BernoulliMarginalSlopeFamily {
             match CellFamilyForest::partition(&a_rows, &b_rows, &score_breaks, &link_breaks) {
                 Ok(forest) => forest,
                 Err(reason) => {
-                    log::debug!("[BMS cell-family-forest] partition skipped: {reason}");
+                    log::trace!("[BMS cell-family-forest] partition skipped: {reason}");
                     return Ok(None);
                 }
             };
@@ -1008,7 +1008,7 @@ impl BernoulliMarginalSlopeFamily {
                 Ok(left)
             })?;
         forest.build_families(demands);
-        log::info!(
+        log::debug!(
             "[BMS cell-family-forest] built n={} leaves={} eligible={} elapsed={:.3}s",
             n,
             forest.total_leaves(),
@@ -1058,7 +1058,7 @@ impl BernoulliMarginalSlopeFamily {
             RowCellMomentsBundle::estimated_resident_bytes(n, max_n_cells, max_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
         if upper_bound_bytes > limit_bytes {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] skip precompute n={} selected_rows={} max_cells_per_row={} degree={} upper_bound_bytes={} limit_bytes={}",
                 n,
                 selected_row_count,
@@ -1074,7 +1074,7 @@ impl BernoulliMarginalSlopeFamily {
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] partition start n={} selected_rows={} degree={}",
                 n,
                 selected_row_count,
@@ -1099,7 +1099,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|(_, cells)| cells.len())
             .sum::<usize>();
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] partition done n={} selected_rows={} cells={} elapsed={:.3}s",
                 n,
                 selected_n,
@@ -1110,7 +1110,7 @@ impl BernoulliMarginalSlopeFamily {
         let estimated_bytes =
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, max_degree);
         if estimated_bytes > limit_bytes {
-            log::warn!(
+            log::debug!(
                 "[BMS row-cell-moments] skip precompute n={} selected_rows={} cells={} degree={} estimated_bytes={} limit_bytes={}",
                 n,
                 selected_n,
@@ -1152,7 +1152,7 @@ impl BernoulliMarginalSlopeFamily {
             rows[row] = Some(moments);
         }
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] precomputed n={} selected_rows={} cells={} degree={} estimated_bytes={} elapsed={:.3}s",
                 n,
                 selected_n,
@@ -1197,7 +1197,7 @@ impl BernoulliMarginalSlopeFamily {
             RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, required_degree);
         let limit_bytes = self.policy.max_operator_cache_bytes;
         if estimated_bytes > limit_bytes {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] skip upgrade n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} limit_bytes={}",
                 n,
                 base.selected_rows,
@@ -1241,7 +1241,7 @@ impl BernoulliMarginalSlopeFamily {
             })
             .collect::<Result<Vec<_>, String>>()?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-cell-moments] upgraded n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} elapsed={:.3}s",
                 n,
                 base.selected_rows,
@@ -1833,7 +1833,7 @@ impl BernoulliMarginalSlopeFamily {
             let backend = crate::bms::gpu::flex::BmsFlexGpuBackend::probe()
                 .map_err(|err| format!("BMS FLEX GPU backend probe failed: {err}"))?;
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS row-primary-hessian-cache] gpu_backend_ready: {}",
                     backend.describe()
                 );
@@ -1853,7 +1853,7 @@ impl BernoulliMarginalSlopeFamily {
                     plan.bytes, BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS, plan.global_pin_budget_bytes
                 ));
                 if log_exact_work(n) {
-                    log::info!(
+                    log::debug!(
                         "[BMS row-primary-hessian-cache] decision=tile need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} tile_rows={} n={} r={} expected_reuse_passes={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                         plan.bytes,
                         plan.runtime_available_bytes,
@@ -1888,7 +1888,7 @@ impl BernoulliMarginalSlopeFamily {
                     row_start = row_end;
                 }
                 if log_exact_work(n) {
-                    log::info!(
+                    log::debug!(
                         "[BMS row-primary-hessian-cache] tiled build done n={} r={} tiles={} bytes={} elapsed={:.3}s",
                         n,
                         r,
@@ -1906,7 +1906,7 @@ impl BernoulliMarginalSlopeFamily {
                 )));
             }
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                     plan.bytes,
                     plan.runtime_available_bytes,
@@ -1933,7 +1933,7 @@ impl BernoulliMarginalSlopeFamily {
             plan.bytes, plan.single_cache_budget_bytes, plan.global_pin_budget_bytes
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-primary-hessian-cache] decision=materialize need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                 plan.bytes,
                 plan.runtime_available_bytes,
@@ -2001,7 +2001,7 @@ impl BernoulliMarginalSlopeFamily {
                                 format!("BMS FLEX device-resident row launch failed: {err}")
                             })?;
                         if log_exact_work(n) {
-                            log::info!(
+                            log::debug!(
                                 "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
                                 n,
                                 r,
@@ -2016,7 +2016,7 @@ impl BernoulliMarginalSlopeFamily {
             let outputs = crate::bms::gpu::row::launch_bms_flex_row_kernel(owned.as_borrowed())
                 .map_err(|err| format!("BMS FLEX row launch failed: {err}"))?;
             if log_exact_work(n) {
-                log::info!(
+                log::debug!(
                     "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
                     n,
                     r,
@@ -2049,7 +2049,7 @@ impl BernoulliMarginalSlopeFamily {
             plan.bytes,
         )?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS row-primary-hessian-cache] build done n={} r={} elapsed={:.3}s",
                 n,
                 r,
@@ -2156,7 +2156,7 @@ impl BernoulliMarginalSlopeFamily {
                         if log_exact_work(n) {
                             let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                             if done == n || done % progress_step == 0 {
-                                log::info!(
+                                log::debug!(
                                     "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
                                     done,
                                     n,
@@ -7639,7 +7639,7 @@ impl BernoulliMarginalSlopeFamily {
             "row-stream"
         };
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS dense-H] build start n={} p={} source={} route=workspace-dense",
                 n,
                 slices.total,
@@ -7786,7 +7786,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == n_chunks || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
@@ -7808,7 +7808,7 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         let dense = acc.to_dense(slices);
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS dense-H] build done n={} p={} source={} route=workspace-dense elapsed={:.3}s",
                 n,
                 slices.total,
@@ -7859,7 +7859,7 @@ impl BernoulliMarginalSlopeFamily {
             slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS fused exact-gradient+dense-H] eval start n={} p={} source=cache row_primary_hessian_cache={}",
                 n,
                 slices.total,
@@ -8095,7 +8095,7 @@ impl BernoulliMarginalSlopeFamily {
                     if log_exact_work(n) {
                         let done = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == n_chunks || done % progress_step == 0 {
-                            log::info!(
+                            log::debug!(
                                 "[BMS fused exact-gradient+dense-H] progress chunks={}/{} rows={}/{} elapsed={:.3}s",
                                 done,
                                 n_chunks,
@@ -8136,7 +8136,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let hessian = hessian_acc.to_dense(slices);
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS fused exact-gradient+dense-H] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 slices.total,
@@ -8178,7 +8178,7 @@ impl BernoulliMarginalSlopeFamily {
             cache.slices.total
         ));
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-loglik] eval start n={} p={} source=cache",
                 n,
                 cache.slices.total
@@ -8213,7 +8213,7 @@ impl BernoulliMarginalSlopeFamily {
             );
         let log_likelihood = total?;
         if log_exact_work(n) {
-            log::info!(
+            log::debug!(
                 "[BMS exact-loglik] eval done n={} p={} source=cache elapsed={:.3}s",
                 n,
                 cache.slices.total,

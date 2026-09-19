@@ -22,7 +22,7 @@ use crate::bms::{
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, FitConfig, FitRequest, FitResult, StandardFitResult,
+    DispersionLocationScaleFitResult, FitConfig, FitNotes, FitRequest, FitResult, StandardFitResult,
     WorkflowError, expectile_tau_for_config, fit_expectile_if_requested,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
@@ -331,7 +331,7 @@ fn standard_conformal_substrates(
     ) {
         Ok(substrate) => Some(substrate),
         Err(reason) => {
-            log::debug!("exact full-conformal substrate unavailable: {reason}");
+            log::trace!("exact full-conformal substrate unavailable: {reason}");
             None
         }
     }
@@ -1131,7 +1131,7 @@ fn new_royston_parmar_survival_payload(
     frailty: crate::survival::lognormal_kernel::FrailtySpec,
 ) -> Result<FittedModelPayload, String> {
     if let Some(decline) = fit_result.posterior_moment_decline() {
-        log::warn!(
+        log::debug!(
             "[survival saved-model assembly] saving the converged constrained mode; posterior \
              moments are unavailable at the boundary: {}",
             decline.summary()
@@ -1498,11 +1498,12 @@ pub fn assemble_latent_window_payload(
 pub fn apply_request_metadata(
     payload: &mut FittedModelPayload,
     fit_config: &FitConfig,
-    inference_notes: Vec<String>,
+    notes: FitNotes,
 ) {
     payload.group_metadata = fit_config.group_metadata.clone();
     payload.training_table_kind = fit_config.training_table_kind.clone();
-    payload.inference_notes = inference_notes;
+    payload.inference_notes = notes.advisories;
+    payload.informational_notes = notes.informational;
 }
 
 /// One authoritative "formula fit → saved payload" service: materialize once,
@@ -1549,7 +1550,7 @@ pub fn fit_formula_to_payload(
         })?;
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
-        apply_request_metadata(&mut payload, fit_config, Vec::new());
+        apply_request_metadata(&mut payload, fit_config, FitNotes::default());
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:

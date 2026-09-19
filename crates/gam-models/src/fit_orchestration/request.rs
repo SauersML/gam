@@ -831,7 +831,7 @@ pub struct UnidentifiedScalarTerm {
 /// The result of materializing a formula + config against a dataset.
 pub struct MaterializedModel<'a> {
     pub request: FitRequest<'a>,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms materialization removed as unidentified. Empty for every
     /// request that does not prune scalar terms.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,

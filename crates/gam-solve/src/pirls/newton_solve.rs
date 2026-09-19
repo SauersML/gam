@@ -230,7 +230,7 @@ impl DenseOuterState {
 
         if !parallelize {
             accumulate_outer_upper(&mut self.xtwx_dense, x_t, weights, 0..n);
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS dense XᵀWX assembly (serial) n={} p={} flops~{} elapsed={:.3}s",
                 n,
                 p,
@@ -264,7 +264,7 @@ impl DenseOuterState {
         for buf in &self.thread_buffers {
             self.xtwx_dense += buf;
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS dense XᵀWX assembly (parallel, threads={}) n={} p={} flops~{} elapsed={:.3}s",
             rayon::current_num_threads(),
             n,
@@ -551,7 +551,7 @@ pub(super) fn descent_curvature(
             }
         }
     }
-    log::debug!(
+    log::trace!(
         "[PIRLS] Newton curvature not positive definite (λ_min={:.3e}, ‖H‖₂={spectral_radius:.3e}): \
          descent direction taken on the Gill–Murray modification floored at {floor:.3e}",
         eigenvalues.iter().copied().fold(f64::INFINITY, f64::min)
@@ -636,7 +636,7 @@ pub(super) fn solve_newton_direction_dense(
         direction_out.assign(&solved.column(0));
         direction_out.mapv_inplace(|v| -v);
         if array_is_finite(direction_out) {
-            log::info!(
+            log::debug!(
                 "[STAGE] PIRLS dense newton solve backend=CUDA p={} flops~{} elapsed={:.3}s route=\"cuSOLVER potrf/potrs\"",
                 p,
                 (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
@@ -675,7 +675,7 @@ pub(super) fn solve_newton_direction_dense(
         )));
     }
     if array_is_finite(direction_out) {
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
             p,
             (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
@@ -793,7 +793,7 @@ pub(super) fn solve_newton_direction_from_root_with_firth_hessian(
             direction_out,
         )?;
     }
-    log::info!(
+    log::debug!(
         "[STAGE] PIRLS dense newton solve backend=CPU p={} rows={} route=\"Householder QR of PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
         p,
         root.nrows(),
@@ -994,7 +994,7 @@ impl TallSkinnyQrLeastSquares {
                 direction_out,
             )?;
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS tall-skinny newton solve backend=CPU p={} rows={} route=\"blocked Householder QR of sparse PSD root\" backward_error={:.3e} damped_decrement_sq={:.3e}",
             self.p,
             self.total_rows,
@@ -1352,7 +1352,7 @@ where
             },
         ));
     }
-    log::info!(
+    log::debug!(
         "[STAGE] PIRLS implicit (PCG) newton solve p={} dense_pens={} op_pens={} elapsed={:.3}s",
         p,
         dense_penalties.len(),
@@ -1729,7 +1729,7 @@ pub(crate) fn estimate_sparse_native_decision(
                 start = end;
             }
         }
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS row-chunk generation chunks={} n={} p={} nnz={} elapsed={:.3}s",
             chunks_processed,
             n,

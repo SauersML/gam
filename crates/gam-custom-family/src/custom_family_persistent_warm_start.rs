@@ -279,10 +279,10 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
                     .any(|b| b.iter().any(|v| !v.is_finite()))
                 || result.block_beta.len() != specs.len()
             {
-                log::debug!("[fit-artifact] cross-fit transfer skipped: non-finite warm iterate");
+                log::trace!("[fit-artifact] cross-fit transfer skipped: non-finite warm iterate");
                 return None;
             }
-            log::info!(
+            log::debug!(
                 "[CACHE] beta-warm action=projected source=cross-fit descriptor={key_hex} \
                  terms={} rho_warm={n_rho} beta_projected={n_beta}",
                 new_terms.len(),
@@ -295,7 +295,7 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
             })
         }
         Err(err) => {
-            log::debug!("[CACHE] beta-warm action=cold-fallback reason={err:?}");
+            log::trace!("[CACHE] beta-warm action=cold-fallback reason={err:?}");
             None
         }
     }
@@ -518,7 +518,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
             "partial"
         }
     });
-    log::info!(
+    log::debug!(
         "[warm-start-cache] restored custom-family persistent warm start key={key} inner={inner_status}"
     );
     (

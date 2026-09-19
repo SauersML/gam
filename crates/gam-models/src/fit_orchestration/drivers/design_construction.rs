@@ -2194,7 +2194,7 @@ impl CustomFamily for BoundedLinearFamily {
         // width IS the desynchronisation this declaration exists to prevent, and
         // `Structural` is the safe answer to it too.
         if block_index != 0 || block_spec.design.ncols() != self.designzeroed.ncols() {
-            log::debug!(
+            log::trace!(
                 "bounded linear family: coefficient coordinate asked for block {block_index} \
                  at spec width {} ({} block state(s) supplied) while this family carries one \
                  block of width {}; the coordinate is structural either way",
@@ -3731,7 +3731,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
                 // because the caller turns this into "spatial kappa
                 // optimization is unavailable for one or more eligible spatial
                 // terms", which names none of them.
-                log::warn!(
+                log::debug!(
                     "[spatial-kappa] term {term_idx}: enrolled for per-axis ψ but its per-axis \
                      derivative producer declined; the joint κ route is unavailable for this fit"
                 );
@@ -3741,7 +3741,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
         else {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: isotropic ψ derivative producer declined; the \
                  joint κ route is unavailable for this fit"
             );
@@ -3900,7 +3900,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 ..
             } = &smooth_term.metadata
             else {
-                log::warn!(
+                log::debug!(
                     "[spatial-kappa] term {term_idx}: per-axis ψ declined -- a Duchon spec whose \
                      realized design does not carry Duchon metadata"
                 );
@@ -3940,7 +3940,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         0
     };
     if d == 0 {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the producer reported zero \
              axes (no implicit operator and no dense design list)"
         );
@@ -3950,7 +3950,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         .smooth_term_penalty_range(term_idx)
         .map_err(EstimationError::InvalidInput)?
     else {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the realized design exposes \
              no penalty range for this term"
         );
@@ -3984,7 +3984,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     let producer_emits_active_list = matches!(&termspec.basis, SmoothBasisSpec::Duchon { .. });
     let keep: Vec<usize> = if producer_emits_active_list {
         if emitted != smooth_term.active_penalties.len() {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the Duchon producer \
                  emitted {emitted} active penalty block(s) but the realized design carries {} \
                  ({:?}); the term falls back to its isotropic axis",
@@ -4006,7 +4006,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             .collect()
     };
     if keep.is_empty() || keep.iter().any(|&index| index >= emitted) {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- candidate→fitted map \
              {keep:?} does not index the {emitted} emitted block(s)"
         );
@@ -4038,7 +4038,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             .rotated_by_joint_null(rotation)
             .map_err(EstimationError::from)?
         else {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the realized design \
                  carries a joint-null rotation of {} coefficients that the per-axis derivative \
                  blocks do not admit",

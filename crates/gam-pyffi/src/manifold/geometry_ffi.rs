@@ -4463,37 +4463,13 @@ fn identifiability_check_json(input: &str) -> PyResult<String> {
     gam::identifiability::precondition::identifiability_check_json(input).map_err(py_value_error)
 }
 
-/// Set the solver's stderr log verbosity at runtime from Python.
-///
-/// The extension installs the logger at the quiet `warn` default on import
-/// (#1688), so the per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`,
-/// the `[#1271-diag]` REML logdet dump, etc.) is suppressed — that stream also
-/// carries real per-evaluation compute (eigendecompositions), not just I/O, so
-/// quieting it speeds fits as well as silencing them. Call
-/// `gam._rust.set_log_level("info")` (or `debug`/`trace`) to opt back into the
-/// full trace; `off`/`error`/`warn` quiet it further. The accepted spellings
-/// are the standard `log` level names (case-insensitive); an unrecognized value
-/// raises `ValueError`.
-#[pyfunction]
-fn set_log_level(level: &str) -> PyResult<()> {
-    match gam::solver::progress_log::parse_level_directive(level) {
-        Some(filter) => {
-            gam::solver::progress_log::init_logging_at(filter);
-            Ok(())
-        }
-        None => Err(py_value_error(format!(
-            "unrecognized log level {level:?}; expected one of off|error|warn|info|debug|trace"
-        ))),
-    }
-}
-
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
-    // Install the same stderr logger used by the CLI so long-running Rust
-    // solver phases (including survival marginal-slope joint-Newton cycles)
-    // are visible from Python without requiring a separate shell.
-    gam::solver::progress_log::init_logging();
+    // Engine diagnostics go to Python `logging` (the `gamfit` logger), never
+    // straight to stderr: silent by default, shown by
+    // `logging.getLogger("gamfit").setLevel(logging.DEBUG)`.
+    crate::ffi::python_log::install();
     // Background process monitor: emits a `[process-monitor] elapsed=… rss=…`
     // line every 60s for the life of the process, so silent stretches
     // inside long PIRLS line-searches still surface a process-alive
@@ -4772,7 +4748,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_column_name, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
-    module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::ffi::python_log::sync_log_level_from_python,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_defaults, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_ranges, module)?)?;
@@ -4809,7 +4788,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
-    module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_notes_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
@@ -6917,9 +6896,8 @@ fn fit_dataset_impl(
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
     warm_start: Option<(&[u8], &str)>,
 ) -> Result<Vec<u8>, WorkflowError> {
-    // The stderr `[OUTER step]` log stream (installed by `progress_log::
-    // init_logging` at module import) carries solver progress for the Python
-    // bindings; the former always-on TUI session lane has been removed.
+    // Solver progress (`[OUTER step]`, …) reaches Python as `debug` records on
+    // the `gamfit` logger (`ffi::python_log`).
     let mut fit_config = parse_fit_config(config_json)?;
     // `warm_start_from`: the saved model's certified outer point, staged under the
     // caller's scratch directory for this one fit.

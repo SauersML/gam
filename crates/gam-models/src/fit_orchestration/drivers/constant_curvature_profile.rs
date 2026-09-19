@@ -749,7 +749,7 @@ fn constant_curvature_range_only_optimum(
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
     let (eta_hat, _, outcome) = profile.minimize_over_eta(pinned_kappa)?;
     let length_scale_hat = eta_hat.exp();
-    log::info!(
+    log::debug!(
         "[spatial-kappa] pinned kappa={pinned_kappa:.6}: range profiled to \
          length_scale_hat={length_scale_hat:.6} ({outcome:?}) for term {term_idx}",
     );
@@ -935,7 +935,7 @@ fn constant_curvature_kappa_profile_optimum(
         RangeSolveOutcome::EvaluabilityWall => "at the evaluability wall",
         RangeSolveOutcome::Uncertified => "UNCERTIFIED (no stationarity claim)",
     };
-    log::info!(
+    log::debug!(
         "[spatial-kappa] continuous likelihood-profile optimum kappa_hat={:.6} \
          length_scale_hat={:.6} ({range_support}) \
          (negative_log_evidence={:.6e}, projected_gradient={}) for term {term_idx}",

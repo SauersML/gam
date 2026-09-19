@@ -9,7 +9,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     let noise_formula = config
         .noise_formula

@@ -1081,19 +1081,31 @@ class Model:
 
     @property
     def notes(self) -> list[str]:
-        """Inference advisories recorded while this model was fit.
+        """Notes recorded while this model was fit, advisories first.
 
-        Each note is an mgcv-style advisory that the fitted model differs from
-        what was literally requested — e.g. ``"... basis reduced from k=10 to
-        k=3 to match the covariate's 3 distinct value(s)"`` when a cubic-
-        regression marginal is capped to the data support, or a basis-
-        degradation note when a low-cardinality covariate cannot support the
-        requested smooth. :func:`gamfit.fit` also emits these as
-        :class:`gamfit.GamInferenceWarning` at fit time; this property lets a
-        caller inspect them after the fact (or after loading a saved model).
-        Empty when the fit used exactly the requested configuration.
+        An *advisory* says the fitted model differs from what was literally
+        requested — e.g. ``"... basis reduced from k=10 to k=3 to match the
+        covariate's 3 distinct value(s)"`` when a cubic-regression marginal is
+        capped to the data support, or a basis-degradation note when a
+        low-cardinality covariate cannot support the requested smooth.
+        :func:`gamfit.fit` also emits each advisory as a
+        :class:`gamfit.GamInferenceWarning` at fit time.
+
+        An *informational* note records a default the engine chose on the
+        caller's behalf — e.g. the internal-knot count of a default B-spline
+        smooth. These are not warnings; they are listed here and in
+        :meth:`summary` so the choice stays inspectable (also after loading a
+        saved model).
+
+        Empty when the fit used exactly the requested configuration and chose
+        no defaults worth recording.
         """
-        return list(rust_module().inference_notes_from_model(self._model_bytes))
+        advisories, informational = self._fit_notes()
+        return [*advisories, *informational]
+
+    def _fit_notes(self) -> tuple[list[str], list[str]]:
+        advisories, informational = rust_module().fit_notes_from_model(self._model_bytes)
+        return list(advisories), list(informational)
 
     @property
     def used_device(self) -> bool:

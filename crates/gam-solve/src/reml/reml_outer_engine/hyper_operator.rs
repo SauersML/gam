@@ -469,7 +469,7 @@ pub(crate) fn dense_spectral_trace_logdet_operators_batched(
     if operators.is_empty() {
         return Vec::new();
     }
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         let start = std::time::Instant::now();
         let out =
             trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache);

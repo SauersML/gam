@@ -320,14 +320,14 @@ impl SaeManifoldTerm {
         }
         .map_err(|refusal| format!("reconstruction_dispersion: {refusal}"))?;
         match response.estimator {
-            FittedResponseDivergenceEstimator::ExactSpectral => log::debug!(
+            FittedResponseDivergenceEstimator::ExactSpectral => log::trace!(
                 "[SAE-DISPERSION] exact spectral fitted-response divergence {:.6e}, residual dof \
                  {:.6e} likelihood / {:.6e} raw",
                 response.divergence,
                 response.likelihood_residual_dof,
                 response.raw_residual_dof
             ),
-            FittedResponseDivergenceEstimator::Hutchinson { likelihood, raw } => log::debug!(
+            FittedResponseDivergenceEstimator::Hutchinson { likelihood, raw } => log::trace!(
                 "[SAE-DISPERSION] Hutchinson fitted-response divergence {:.6e} (standard error \
                  {:.3e}); residual dof {:.6e} (standard error {:.3e}) likelihood from {} probes, \
                  {:.6e} (standard error {:.3e}) raw from {} probes",

@@ -53,6 +53,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "group_metadata",
     "deployment_extensions",
     "convergence",
+    "notes",
 )
 
 
@@ -286,6 +287,12 @@ class Summary:
         gauge, so a caller can impose a tolerance of their own without reading a
         log. ``None`` for routes that certify no optimizer (the O(n) spline
         scan).
+    notes : list of str
+        The notes the fit recorded, as in :attr:`gamfit.Model.notes`:
+        advisories (the model differs from the literal request, also raised as
+        :class:`gamfit.GamInferenceWarning`) first, then informational notes
+        on defaults the engine chose (e.g. the knot count of a default
+        B-spline smooth). Empty when the fit recorded none.
     extras : dict
         Any keys returned by the Rust engine that are not in the typed
         schema. Kept so newer engine versions can add fields without
@@ -360,6 +367,9 @@ class Summary:
     #: ``kind``, ``gradient_norm``, ``projected_gradient_norm``,
     #: ``stationarity_bound``, ``hessian_psd`` and ``lambdas_railed``.
     convergence: dict[str, Any] | None = None
+    #: The fit's notes, advisories first, then informational notes on defaults
+    #: the engine chose (see :attr:`gamfit.Model.notes`).
+    notes: list[str] = field(default_factory=list)
     extras: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -493,6 +503,9 @@ class Summary:
         n_coef = len(self.coefficients)
         if n_coef:
             lines.append(f"  Coefficients: {n_coef}")
+        if self.notes:
+            lines.append("  Notes:")
+            lines.extend(f"    - {note}" for note in self.notes)
         return "\n".join(lines)
 
     def __repr__(self) -> str:

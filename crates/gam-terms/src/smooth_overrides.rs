@@ -36,6 +36,7 @@ use crate::basis::{
     MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
     SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
+use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
     TermCollectionSpec, parse_shape_constraint,
@@ -51,7 +52,7 @@ pub fn apply_smooth_overrides(
     spec: &mut TermCollectionSpec,
     overrides: &JsonValue,
     data: &Dataset,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut impl FitNoteSink,
 ) -> Result<(), String> {
     let registry = overrides
         .as_object()
@@ -111,7 +112,7 @@ fn apply_by_variable(
     symbol: &str,
     data: &Dataset,
     column_index: &HashMap<&str, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     let by_name = match descriptor.get("by") {
         None => return Ok(()),
@@ -160,7 +161,7 @@ fn apply_by_variable(
                 kind: BySmoothKind::Numeric,
                 by: ByVariableSpec::Numeric,
             };
-            inference_notes.push(format!(
+            inference_notes.inform(format!(
                 "smooths[{symbol:?}] gated by numeric column {by_name:?} (by·s(x))",
             ));
             Ok(())
@@ -265,7 +266,7 @@ fn apply_one_override(
     kind: &str,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     // Push the descriptor's optional `name` into the term name for downstream
     // diagnostics (purely cosmetic — the term identity is its feature_cols).
@@ -288,7 +289,7 @@ fn apply_one_override(
 
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
 
-    inference_notes.push(format!(
+    inference_notes.inform(format!(
         "smooths[{symbol:?}] descriptor (kind={kind}) merged onto formula-built term",
     ));
     Ok(())

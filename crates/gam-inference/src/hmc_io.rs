@@ -827,7 +827,7 @@ impl NutsPosterior {
         let (ll, mut grad_ll_beta) = match self.family_logp_and_grad_into(&eta, residual) {
             Ok(value) => value,
             Err(error) => {
-                log::warn!("[NUTS] likelihood target is unrepresentable: {error}");
+                log::debug!("[NUTS] likelihood target is unrepresentable: {error}");
                 grad.fill(0.0);
                 return f64::NEG_INFINITY;
             }
@@ -841,7 +841,7 @@ impl NutsPosterior {
                     grad_ll_beta += &grad_beta_firth;
                 }
                 Err(err) => {
-                    log::warn!(
+                    log::debug!(
                         "[NUTS/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
@@ -4825,7 +4825,7 @@ pub(crate) fn run_nuts_sampling(
         "NUTS sampling failed",
         Array1::zeros(dim),
     )?;
-    log::info!("NUTS sampling complete: {}", run_stats);
+    log::debug!("NUTS sampling complete: {}", run_stats);
 
     Ok(result)
 }
@@ -5097,7 +5097,7 @@ where
         "rho-posterior NUTS sampling failed",
         mode.clone(),
     )?;
-    log::info!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
+    log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }
 
@@ -6022,7 +6022,7 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         &self,
         step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
     ) {
-        log::info!("[#784] block quadrature order search: {step}");
+        log::debug!("[#784] block quadrature order search: {step}");
     }
 
     /// `block_quadrature_marginal_correction` refuses the order past this one as
@@ -6707,7 +6707,7 @@ mod survival_hmc {
             match self.compute_logp_and_grad_into(position, grad) {
                 Ok(logp) => logp,
                 Err(e) => {
-                    log::warn!("Survival posterior evaluation failed: {}", e);
+                    log::debug!("Survival posterior evaluation failed: {}", e);
                     grad.fill(0.0);
                     f64::NEG_INFINITY
                 }
@@ -6781,7 +6781,7 @@ mod survival_hmc {
             Array1::zeros(dim),
         )?;
 
-        log::info!("Survival NUTS sampling complete: {}", run_stats);
+        log::debug!("Survival NUTS sampling complete: {}", run_stats);
 
         Ok(result)
     }

@@ -4114,7 +4114,7 @@ pub trait LinearOperator {
         if !solution.iter().all(|value| value.is_finite()) {
             return Err("matrix-free PCG produced a non-finite solution".to_string());
         }
-        log::debug!(
+        log::trace!(
             "[matrix-free PCG] solved: p={p} ridge={baseridge:.3e} iters={} rel_resid={:.3e} elapsed={:.3}s",
             info.iterations,
             info.relative_residual_norm,
@@ -4214,13 +4214,13 @@ pub trait LinearOperator {
                     && let Some((solution, info)) = self
                         .solve_system_matrix_free_pcg_within(weights, rhs, penalty, ridge, products)?
                 {
-                    log::debug!(
+                    log::trace!(
                         "[normal-equations] route=pcg p={p} cg_iterations={} budget={products}",
                         info.iterations
                     );
                     return Ok(solution);
                 }
-                log::debug!("[normal-equations] route=dense p={p} budget={products}");
+                log::trace!("[normal-equations] route=dense p={p} budget={products}");
             }
         }
         let mut system = self.diag_xtw_x(weights)?;
