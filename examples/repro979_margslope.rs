@@ -103,11 +103,13 @@ fn build(
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("f_pc", centers, kappa_auto)],
+        level: Default::default(),
     };
     let slopespec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![matern_smooth("ls_pc", centers, kappa_auto)],
+        level: Default::default(),
     };
     let spec = BernoulliMarginalSlopeTermSpec {
         y,

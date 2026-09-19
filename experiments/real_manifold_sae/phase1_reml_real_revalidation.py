@@ -102,7 +102,7 @@ def run_config(z: np.ndarray, cfg: dict) -> dict:
     out = dict(cfg)
     t0 = time.time()
     try:
-        model = gamfit.sae_manifold_fit(
+        model = gamfit.sae.sae_manifold_fit(
             z,
             K=cfg["K"],
             d_atom=cfg.get("d_atom", 1),

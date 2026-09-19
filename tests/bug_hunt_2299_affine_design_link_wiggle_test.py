@@ -63,9 +63,9 @@ def _linear_predictor(model, data) -> np.ndarray:
     return np.asarray(prediction["linear_predictor_plugin"], dtype=float)
 
 
-def _assert_affine_identity(model, data, expected_frame: str) -> gamfit.AffineDesign:
+def _assert_affine_identity(model, data, expected_frame: str) -> gamfit.results.AffineDesign:
     affine = model.design_matrix(data)
-    assert isinstance(affine, gamfit.AffineDesign)
+    assert isinstance(affine, gamfit.results.AffineDesign)
     assert affine.coefficient_frame == expected_frame
     assert affine.coefficient_start == 0
     assert affine.coefficient_stop == affine.coefficients.shape[0]
@@ -260,7 +260,7 @@ def test_design_matrix_array_returns_the_same_typed_affine_contract() -> None:
     model = gamfit.fit_array(x, y, formula="y ~ x0 + x1", family="gaussian")
 
     affine = model.design_matrix_array(x)
-    assert isinstance(affine, gamfit.AffineDesign)
+    assert isinstance(affine, gamfit.results.AffineDesign)
     assert affine.coefficient_frame == "full"
     reconstructed = affine.offset + affine.matrix @ affine.coefficients
     expected = _linear_predictor(

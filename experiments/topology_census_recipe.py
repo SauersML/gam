@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Run an honest unsupervised topology census with full-pipeline controls.
 
-The runner delegates to ``gamfit.run_shape_controlled_census``, which calls one
+The runner delegates to ``gamfit.sae.run_shape_controlled_census``, which calls one
 user-supplied census function three times: once on the observed activation
 matrix, once on a per-dimension shuffle, and once on a covariance-exact
 randomized Hadamard control. The callable and its seed are identical across all
@@ -201,7 +201,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the full-pipeline runner requires a gamfit build exposing "
             "run_shape_controlled_census"
         ) from exc
-    controlled_census = gamfit.run_shape_controlled_census(
+    controlled_census = gamfit.sae.run_shape_controlled_census(
         loaded,
         _load_pipeline(args.pipeline),
         pipeline_seed=args.pipeline_seed,

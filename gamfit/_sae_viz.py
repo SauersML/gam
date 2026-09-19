@@ -8,6 +8,8 @@ from collections.abc import Mapping
 
 import numpy as np
 
+from ._matplotlib import pyplot
+
 
 def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     """Plot one SAE manifold atom in its leading decoder SVD subspace.
@@ -15,7 +17,7 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     Parameters
     ----------
     fit
-        A fitted :class:`gamfit.ManifoldSAE`-like object with ``atoms``.
+        A fitted :class:`gamfit.sae.ManifoldSAE`-like object with ``atoms``.
     k
         Atom index.
     ax
@@ -41,7 +43,7 @@ def plot_atom(fit: Any, k: int, ax: Any = None) -> Any:
     active = _active_weights(fit, atom, k, token_proj.shape[0])
 
     if ax is None:
-        from matplotlib import pyplot as plt
+        plt = pyplot()
 
         fig = plt.figure(figsize=(5.2, 4.2))
         if plot_dim == 3:
@@ -65,7 +67,7 @@ def plot_fit(fit: Any) -> Any:
     if not atoms:
         raise ValueError("plot_fit requires fit.atoms to contain at least one atom")
 
-    from matplotlib import pyplot as plt
+    plt = pyplot()
 
     n_atoms = len(atoms)
     ncols = min(3, max(1, ceil(sqrt(n_atoms))))
@@ -97,7 +99,7 @@ def plot(target: Any, atom: int | None = None, *, ax: Any = None, color_by: str 
 
 
 def _plot_standalone_atom(atom: Any, *, ax: Any = None, color_by: str = "assignment") -> Any:
-    from matplotlib import pyplot as plt
+    plt = pyplot()
 
     coords = _as_2d(_atom_field(atom, "coords"), "coords")
     assignments = np.asarray(_atom_field(atom, "assignments"), dtype=float).reshape(-1)
@@ -157,9 +159,13 @@ def _as_2d(value: Any, name: str) -> np.ndarray:
 def _geometry_plan_for(fit: Any, k: int) -> Mapping[str, Any]:
     plans = fit.geometry_plans
     idx = int(k)
-    if idx < 0 or idx >= len(plans) or not isinstance(plans[idx], Mapping):
-        raise ValueError(f"geometry_plans must contain a mapping for atom {idx}")
-    return plans[idx]
+    missing = f"geometry_plans must contain a mapping for atom {idx}"
+    if idx < 0 or idx >= len(plans):
+        raise ValueError(missing)
+    plan = plans[idx]
+    if not isinstance(plan, Mapping):
+        raise ValueError(missing)
+    return plan
 
 
 def _basis_for(fit: Any, k: int) -> str:
@@ -258,7 +264,8 @@ def _project(points: np.ndarray, projector: np.ndarray) -> np.ndarray:
         aligned = np.zeros((points.shape[0], projector.shape[0]), dtype=float)
         aligned[:, :width] = points[:, :width]
         points = aligned
-    return points @ projector
+    projected: np.ndarray = points @ projector
+    return projected
 
 
 def _active_weights(fit: Any, atom: Any, k: int, n: int) -> np.ndarray | None:

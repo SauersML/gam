@@ -1,14 +1,10 @@
-use coefficient_transforms::{
-    convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix,
-};
-
 pub use error::SmoothError;
 
 use input_standardization::estimate_isotropic_scale;
 
 use shape_constraints::{
-    bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
-    shape_supports_basis, shape_uses_box_reparameterization,
+    bspline_shape_cone_chart, shape_chart_keeps_level, shape_lower_bounds_local,
+    shape_supports_basis,
 };
 
 pub(crate) fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -459,7 +455,7 @@ impl SmoothBasisSpec {
             Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
             Self::TensorBSpline { spec, .. } => {
                 // A `te(...)` smooth is *penalized*: each margin carries a
-                // difference (wiggliness) penalty and the tensor inherits a
+                // derivative (wiggliness) penalty and the tensor inherits a
                 // Kronecker-sum penalty `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I`. The raw
                 // column count is the *product* of the per-marginal column
                 // counts, but that product is the lower bound for an
@@ -1455,6 +1451,45 @@ pub struct TermCollectionSpec {
     pub linear_terms: Vec<LinearTermSpec>,
     pub random_effect_terms: Vec<RandomEffectTermSpec>,
     pub smooth_terms: Vec<SmoothTermSpec>,
+    /// Which part of the design carries the model's constant level. Saved
+    /// before this field existed means the global intercept.
+    #[serde(default)]
+    pub level: ModelLevel,
+}
+
+/// Where a model's constant level lives.
+///
+/// The constant is carried at most once, and always in an unpenalized
+/// direction, so a shift of the response shifts the fit and nothing else. With
+/// the default global intercept it is the unpenalized all-ones column and
+/// every other term is centred against it. A formula that removes the
+/// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
+///
+/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
+///    effect of a factor `by=`), which already spans the constant with its
+///    full dummy coding and is made unpenalized, giving the cell-means model;
+/// 2. else the first pure-indicator interaction (`g:h`), which keeps every
+///    cell, its reference cell included;
+/// 3. else the first B-spline / tensor smooth whose explicit
+///    `identifiability=none` already keeps the constant, or failing that the
+///    first one with the default gauge, whose sum-to-zero centring is
+///    released. Either way it becomes `level_smooth`, and its null-space
+///    ridge is dropped unless `double_penalty=true` was written.
+///
+/// A genuine random effect (`group(g)`, `re(g)`) never carries the level: its
+/// levels are mean-zero deviations. When no term can carry it the model has
+/// no level: every surviving effect passes through the origin, as a
+/// parametric no-intercept fit does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ModelLevel {
+    #[default]
+    Intercept,
+    NoIntercept {
+        /// Index into `smooth_terms` of the smooth whose centring was released
+        /// to carry the level. Its parametric constraint block omits the
+        /// constant column so the identifiability pass does not re-centre it.
+        level_smooth: Option<usize>,
+    },
 }
 
 pub(crate) fn validate_smooth_basis_frozen(
@@ -1679,6 +1714,7 @@ impl TermCollectionSpec {
                         linear_terms: Vec::new(),
                         random_effect_terms: Vec::new(),
                         smooth_terms: vec![nested],
+                        level: Default::default(),
                     }
                     .validate_frozen(label)?;
                 }
@@ -2015,6 +2051,7 @@ impl TermCollectionSpec {
                             shape: st.shape,
                             joint_null_rotation: None,
                         }],
+                        level: Default::default(),
                     };
                     nested.validate_frozen(label)?;
                 }
@@ -5892,7 +5929,7 @@ pub(crate) fn build_tensor_bspline_basis(
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
-    // marginal difference-penalty construction as standalone smooth terms.
+    // marginal derivative-penalty construction as standalone smooth terms.
     for (dim, (&col, marginalspec)) in feature_cols
         .iter()
         .zip(spec.marginalspecs.iter())
@@ -6644,7 +6681,9 @@ pub struct LocalSmoothTermBuild {
     pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     pub linear_constraints: Option<LinearInequalityConstraints>,
-    pub box_reparam: bool,
+    /// Coordinate lower bounds realizing the exact shape cone in this build's
+    /// coefficient chart (`None` for unconstrained smooths).
+    pub shape_lower_bounds: Option<Array1<f64>>,
 }
 
 #[derive(Clone)]
@@ -7180,6 +7219,74 @@ pub(crate) fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut Sm
     }
 }
 
+/// Whether a B-spline smooth (1-D or tensor) carries its default model-space
+/// centring, the gauge that removes the constant so the smooth cannot compete
+/// with a global intercept. Other bases report `false`: they keep their own
+/// gauge and never take part in the level-carrier rule (see [`ModelLevel`]).
+pub(crate) fn bspline_smooth_is_default_centred(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ),
+        SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a B-spline smooth (1-D or tensor) keeps the constant in its span
+/// because its gauge is explicitly unconstrained.
+pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
+    match basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => {
+            matches!(spec.identifiability, BSplineIdentifiability::None)
+        }
+        SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            matches!(spec.identifiability, TensorBSplineIdentifiability::None)
+        }
+        _ => false,
+    }
+}
+
+/// Hand the model's constant level to this smooth when the formula removed
+/// the intercept (the level-carrier rule of [`ModelLevel`]): release the
+/// default model-space centring so the constant stays in the smooth's span.
+///
+/// The level must sit in an unpenalized direction, or the fit would shrink the
+/// whole curve toward zero and change under a shift of the response. The
+/// wiggliness penalty already leaves the constant free (it lies in its null
+/// space); the double-penalty null-space ridge would not, so when
+/// `keep_null_ridge` is false the ridge is dropped and the smooth's null space
+/// (the constant and the polynomials the penalty annihilates) is left
+/// unpenalized, as for a smooth fitted alongside an intercept without a
+/// null-space penalty. An explicit `double_penalty=true` keeps it: the user
+/// asked for the whole null space, level included, to be shrunk. Only a basis
+/// for which [`bspline_smooth_is_default_centred`] or
+/// [`bspline_smooth_spans_constant`] holds is ever handed the level; any other
+/// basis is left untouched.
+pub(crate) fn release_model_centring_for_level(basis: &mut SmoothBasisSpec, keep_null_ridge: bool) {
+    if let SmoothBasisSpec::TensorBSpline { spec, .. } = basis {
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) {
+            spec.identifiability = TensorBSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
+    } else if let SmoothBasisSpec::BSpline1D { spec, .. } = basis {
+        if matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        ) {
+            spec.identifiability = BSplineIdentifiability::None;
+        }
+        if matches!(spec.identifiability, BSplineIdentifiability::None) {
+            spec.double_penalty &= keep_null_ridge;
+        }
+    }
+}
+
 /// A continuous `by=` smooth is a varying coefficient `f(x)·z`. Its constant
 /// direction is `z` itself, not the intercept, so the model-space sum-to-zero
 /// centring the inner smooth would otherwise apply removes a genuine
@@ -7406,7 +7513,7 @@ pub(crate) fn build_by_smooth_local(
                     ordered: *ordered,
                 },
                 linear_constraints: None,
-                box_reparam: false,
+                shape_lower_bounds: None,
             })
         }
     }
@@ -7930,7 +8037,7 @@ pub(crate) fn build_factor_smooth(
         dropped_penalties,
         metadata,
         linear_constraints: None,
-        box_reparam: false,
+        shape_lower_bounds: None,
     })
 }
 
@@ -7969,6 +8076,97 @@ pub(crate) fn resolve_factor_smooth_levels(
     Ok(bits)
 }
 
+/// Build a shape-constrained 1-D B-spline directly in its exact cone chart.
+///
+/// The raw clamped basis is built first to realize knots and degree; the cone
+/// chart `β = C δ` from [`bspline_shape_cone_chart`] is then replayed through
+/// the builder as a `FrozenTransform`, so the design, the penalty congruence,
+/// the constrained-chart null ridge, and the prediction-time freeze all share
+/// one transform. Under the default sum-to-zero identifiability the chart drops
+/// the level coordinate — the one the model intercept already carries — and
+/// centres the rest on the fitting rows, which leaves every control-point
+/// difference, and hence the cone, unchanged.
+fn build_shape_cone_bspline_basis_1d(
+    x: ArrayView1<'_, f64>,
+    spec: &BSplineBasisSpec,
+    term: &SmoothTermSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    let centring_weights = match &spec.identifiability {
+        // A frozen spec already carries the realized cone chart.
+        BSplineIdentifiability::FrozenTransform { .. } => {
+            return build_bspline_basis_1d(x, spec);
+        }
+        BSplineIdentifiability::None => None,
+        BSplineIdentifiability::WeightedSumToZero { weights } => Some(weights.clone()),
+        BSplineIdentifiability::RemoveLinearTrend
+        | BSplineIdentifiability::OrthogonalToDesignColumns { .. } => {
+            crate::bail_invalid_basis!(
+                "ShapeConstraint::{:?} on term '{}' supports only sum-to-zero or no identifiability constraint; removing a linear trend or projecting out design columns does not preserve the shape cone",
+                term.shape,
+                term.name
+            );
+        }
+    };
+    let mut raw_spec = spec.clone();
+    raw_spec.identifiability = BSplineIdentifiability::None;
+    let raw = build_bspline_basis_1d(x, &raw_spec)?;
+    let BasisMetadata::BSpline1D {
+        knots,
+        degree: Some(degree),
+        periodic: None,
+        auto_shrink_note,
+        ..
+    } = &raw.metadata
+    else {
+        crate::bail_invalid_basis!(
+            "shape-constrained term '{}' requires realized open B-spline knot and degree metadata",
+            term.name
+        );
+    };
+    let raw_column_means = match centring_weights {
+        None => None,
+        Some(weights) => {
+            let n = raw.design.nrows();
+            let weights = weights.unwrap_or_else(|| Array1::ones(n));
+            if weights.len() != n {
+                crate::bail_dim_basis!(
+                    "sum-to-zero weights for term '{}' have length {} but the basis has {} rows",
+                    term.name,
+                    weights.len(),
+                    n
+                );
+            }
+            let total = weights.sum();
+            if !(total.is_finite() && total > 0.0) {
+                crate::bail_invalid_basis!(
+                    "sum-to-zero weights for term '{}' must have a finite positive total; got {total}",
+                    term.name
+                );
+            }
+            Some(raw.design.transpose_vector_multiply(&weights) / total)
+        }
+    };
+    let chart = bspline_shape_cone_chart(
+        term.shape,
+        knots.view(),
+        *degree,
+        raw_column_means.as_ref().map(|means| means.view()),
+    )?;
+    let mut chart_spec = spec.clone();
+    chart_spec.knotspec = BSplineKnotSpec::Provided(knots.clone());
+    chart_spec.degree = *degree;
+    chart_spec.identifiability = BSplineIdentifiability::FrozenTransform { transform: chart };
+    let mut built = build_bspline_basis_1d(x, &chart_spec)?;
+    if let BasisMetadata::BSpline1D {
+        auto_shrink_note: note,
+        ..
+    } = &mut built.metadata
+    {
+        *note = auto_shrink_note.clone();
+    }
+    Ok(built)
+}
+
 /// Marginal B-spline spec for a factor-smooth block. The marginal always builds
 /// without an identifiability constraint (the per-level replication, not a
 /// sum-to-zero side constraint, provides identifiability against the parametric
@@ -7989,7 +8187,7 @@ pub fn build_single_local_smooth_term(
     term.basis.validate_scale_configuration()?;
     if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
         crate::bail_invalid_basis!(
-            "ShapeConstraint::{:?} is unsupported for term '{}'",
+            "ShapeConstraint::{:?} is unsupported for term '{}': shape constraints require an open 1-D B-spline basis without periodic, cubic-regression, or endpoint boundary conditions",
             term.shape,
             term.name
         );
@@ -8273,32 +8471,20 @@ pub fn build_single_local_smooth_term(
                     data.ncols()
                 );
             }
-            let mut spec_local = spec.clone();
             if term.shape != ShapeConstraint::None {
-                // Shape-constrained B-splines are anchored by construction.
-                // Sum-to-zero side constraints conflict with monotonic/convex cones.
-                spec_local.identifiability = BSplineIdentifiability::None;
+                build_shape_cone_bspline_basis_1d(data.column(*feature_col), spec, term)?
+            } else {
+                // Endpoint boundary conditions are structural for B-splines: the
+                // basis builder bakes their homogeneous nullspace transform into
+                // the design, penalties, and stored raw-basis transform.
+                build_bspline_basis_1d(data.column(*feature_col), spec)?
             }
-            // Endpoint boundary conditions are structural for B-splines: the
-            // basis builder bakes their homogeneous nullspace transform into
-            // the design, penalties, and stored raw-basis transform.
-            build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
         }
         SmoothBasisSpec::ThinPlate {
             feature_cols,
             spec,
             input_scale,
         } => {
-            if term.shape != ShapeConstraint::None {
-                if feature_cols.len() != 1 {
-                    crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
-                        term.shape,
-                        term.name,
-                        feature_cols.len()
-                    );
-                }
-            }
             let mut spec_local = spec.clone();
             let frame = term.basis.scale_contract().normalize_euclidean_frame(
                 select_columns(data, feature_cols)?,
@@ -8695,8 +8881,8 @@ pub fn build_single_local_smooth_term(
     let p_local = built.design.ncols();
     let affine_offset = built.affine_offset;
     let mut metadata = built.metadata.clone();
-    let mut design_t = built.design;
-    let mut penalties_t = built.active_penalties;
+    let design_t = built.design;
+    let penalties_t = built.active_penalties;
     let mut dropped_penalties_t = built.dropped_penalties;
     if matches!(
         spatial_identifiability_policy(term),
@@ -8705,91 +8891,6 @@ pub fn build_single_local_smooth_term(
         metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
     }
 
-    let use_box_reparam =
-        term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-    if let Some((order, sign)) = shape_order_and_sign(term.shape)
-        && use_box_reparam
-    {
-        // Order 1 (monotone): the plain first-difference cone θ_{i+1}−θ_i ≥ 0 is
-        // the control-polygon monotonicity criterion, which is independent of
-        // Greville-abscissa spacing (it only fixes the *sign* of consecutive
-        // control-point gaps), so the integer-difference transform is exact.
-        //
-        // Order 2 (convex/concave): the plain second-difference cone is only
-        // correct for evenly spaced Greville abscissae. gam's B-splines are
-        // clamped (and may use quantile knots), so the abscissae are not
-        // uniform and the geometrically-correct cone is the second *divided*
-        // difference. Build the knot-span-scaled transform so γ_{≥2} ≥ 0
-        // certifies convexity of the function, not of the raw coefficient
-        // index. Periodic splines are rejected by the exact-support gate: their
-        // cyclic coefficient chart cannot use this open divided-difference cone.
-        let t = if order == 2 {
-            let (knots, degree) = match &metadata {
-                BasisMetadata::BSpline1D {
-                    knots,
-                    degree: Some(degree),
-                    periodic,
-                    ..
-                } if periodic.is_none() => (knots, *degree),
-                _ => {
-                    crate::bail_invalid_basis!(
-                        "shape-constrained convex/concave term '{}' requires realized open B-spline knot and degree metadata",
-                        term.name
-                    );
-                }
-            };
-            let spans = bspline_first_derivative_control_spans(knots.view(), degree)?;
-            if spans.len() + 1 != p_local {
-                crate::bail_invalid_basis!(
-                    "shape-constraint derivative-control span count {} does not match basis dim {} for term '{}'",
-                    spans.len(),
-                    p_local,
-                    term.name
-                );
-            }
-            convex_derivative_control_transform_matrix(&spans, sign)?
-        } else {
-            cumulative_sum_transform_matrix(p_local, order, sign)
-        };
-        // Coefficient-side transform: wrap the design in an operator that
-        // applies T on the coefficient side, preserving sparsity/operator
-        // structure of the inner design.
-        let inner_dense = match design_t {
-            DesignMatrix::Dense(d) => d,
-            DesignMatrix::Sparse(sp) => gam_linalg::matrix::DenseDesignMatrix::from(
-                sp.try_to_dense_arc("shape-constrained coefficient transform")
-                    .map_err(BasisError::InvalidInput)?,
-            ),
-        };
-        let coeff_op =
-            gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone()).map_err(
-                |e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")),
-            )?;
-        design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-            coeff_op,
-        )));
-        // `β = Tγ` is an invertible change of coefficient chart. Every
-        // physical quadratic functional, including the function-space
-        // null-component penalty, therefore transforms by the same congruence
-        // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
-        // would change the represented functional under this harmless chart
-        // change and violate SPEC 5.
-        for penalty in &mut penalties_t {
-            let tt_s = fast_atb(&t, &penalty.matrix);
-            penalty.matrix = fast_ab(&tt_s, &t);
-            penalty.op = None;
-            penalty.info.kronecker_factors = None;
-            // A declared structural null frame does NOT survive this chart.
-            // `null(Tᵀ S T) = T⁻¹ null(S)`, and `T` is a cumulative-sum /
-            // derivative-control transform — invertible but not orthogonal, so
-            // the image of an orthonormal frame is not orthonormal and the
-            // declaration's own contract cannot carry it. Withdraw it here
-            // rather than ship a frame that no longer spans the null space:
-            // consumers measure when nothing is declared, which is the honest
-            // fallback, whereas a stale frame is a wrong theorem.
-            penalty.info.structural_null_frame = None;
-        }
-    }
     // The re-filter below numbers its input from zero, and its input is this
     // build's active penalties, so it hands back their numbering (#2953).
     let build_numbering: Vec<usize> = penalties_t
@@ -8869,6 +8970,23 @@ pub fn build_single_local_smooth_term(
     // coefficient chart in their `FrozenTransform`; recomputing Q there would
     // rotate an already-frozen chart a second time and desynchronize value
     // rebuilds from derivative operators.
+    let shape_lower_bounds = if term.shape == ShapeConstraint::None {
+        None
+    } else {
+        let chart = match &metadata {
+            BasisMetadata::BSpline1D {
+                identifiability_transform: Some(chart),
+                ..
+            } if chart.ncols() == p_local => chart,
+            _ => {
+                crate::bail_invalid_basis!(
+                    "shape-constrained term '{}' did not realize its {p_local}-column cone chart",
+                    term.name
+                );
+            }
+        };
+        shape_lower_bounds_local(term.shape, p_local, shape_chart_keeps_level(chart))
+    };
     let joint_null_rotation = match term.joint_null_rotation.clone() {
         Some(persisted) => Some(persisted),
         None if smooth_has_frozen_identifiability(term) => None,
@@ -8884,7 +9002,7 @@ pub fn build_single_local_smooth_term(
         dropped_penalties: dropped_penalties_t,
         metadata,
         linear_constraints: None,
-        box_reparam: use_box_reparam,
+        shape_lower_bounds,
     })
 }
 
@@ -8948,11 +9066,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
     for (term, mut built) in planned_terms.iter().zip(local_builds.into_iter()) {
         let p_local = built.dim;
         let col_end = col_start + p_local;
-        let lb_local = if built.box_reparam {
-            shape_lower_bounds_local(term.shape, p_local)
-        } else {
-            None
-        };
+        let lb_local = built.shape_lower_bounds.take();
 
         // Stage-2 joint-null absorption rotation. Fired *before* the
         // penalty / design / global aggregation loops below so that every

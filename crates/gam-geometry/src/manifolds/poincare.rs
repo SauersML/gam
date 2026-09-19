@@ -9,7 +9,7 @@
 //! never let a coordinate touch the edge.
 //!
 //! This module provides the pure-Rust primitives backing the Python wrapper
-//! `gamfit.PoincareAtoms`. Everything user-visible there — Möbius addition,
+//! `gamfit.torch.PoincareAtoms`. Everything user-visible there — Möbius addition,
 //! geodesic distance, ball projection, log/exp at the origin, the tangent-
 //! space atom-mixing decoder, and the Lorentz-model equivalents — lives
 //! here so it is reachable from the gam library, the CLI, and any other

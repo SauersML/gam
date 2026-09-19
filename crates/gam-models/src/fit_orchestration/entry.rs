@@ -203,16 +203,18 @@ pub(crate) fn resolved_resource_policy(
 }
 
 /// Parse, materialize, and fit a model in one call.
-/// Resolve the expectile asymmetry `τ` requested by `config`, if any.
+/// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(τ))` when `config.family` is `"expectile"` (optionally with
-/// an inline asymmetry, `"expectile(0.9)"`), `Ok(None)` for every other family,
-/// and `Err` when an expectile request carries an out-of-range `τ`. The inline
-/// form takes precedence over the explicit [`FitConfig::expectile_tau`] field
-/// only when both are present and disagree is rejected as a contradiction; when
-/// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
-/// the default.
-pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
+/// Returns `Ok(Some(levels))` when `config.family` is `"expectile"` (optionally
+/// with inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`),
+/// `Ok(None)` for every other family, and `Err` when an expectile request is
+/// malformed: a level outside `(0, 1)`, levels that are not strictly
+/// increasing, or inline levels that contradict [`FitConfig::expectile_tau`].
+/// When neither spelling pins the levels, the single median level `[0.5]` (the
+/// ordinary mean fit) is the default.
+pub fn expectile_levels_for_config(
+    config: &FitConfig,
+) -> Result<Option<Vec<f64>>, WorkflowError> {
     let Some(raw) = config.family.as_deref() else {
         return Ok(None);
     };
@@ -222,40 +224,110 @@ pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>
         return Ok(None);
     }
     let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline asymmetry: `expectile(0.9)`.
-    let inline_tau = if let Some(rest) = lower.strip_prefix("expectile(") {
+    // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
+    let inline_levels = if let Some(rest) = lower.strip_prefix("expectile(") {
         let inner = rest.strip_suffix(')').ok_or_else(|| {
             invalid(format!(
-                "expectile family asymmetry must be written as `expectile(τ)`; got `{trimmed}`"
+                "expectile family levels must be written as `expectile(τ)` or \
+                 `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
             ))
         })?;
-        let value: f64 = inner.trim().parse().map_err(|_| {
-            invalid(format!(
-                "expectile asymmetry `{}` is not a finite number",
-                inner.trim()
-            ))
-        })?;
-        Some(value)
+        let levels = inner
+            .split(',')
+            .map(|item| {
+                item.trim().parse::<f64>().map_err(|_| {
+                    invalid(format!(
+                        "expectile level `{}` is not a finite number",
+                        item.trim()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<f64>, _>>()?;
+        Some(levels)
     } else {
         None
     };
-    let tau = match (inline_tau, config.expectile_tau) {
-        (Some(a), Some(b)) if (a - b).abs() > 0.0 => {
+    let levels = match (inline_levels, config.expectile_tau.clone()) {
+        (Some(a), Some(b)) if a != b => {
             return Err(invalid(format!(
-                "expectile asymmetry given both inline (`expectile({a})`) and via expectile_tau \
-                 ({b}); supply exactly one"
+                "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
+                 ({b:?}); supply exactly one"
             )));
         }
         (Some(a), _) => a,
         (None, Some(b)) => b,
-        (None, None) => 0.5,
+        (None, None) => vec![0.5],
     };
-    if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+    if levels.is_empty() {
+        return Err(invalid(
+            "expectile_tau must name at least one expectile level".to_string(),
+        ));
+    }
+    for &tau in &levels {
+        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+            return Err(invalid(format!(
+                "expectile level τ must be finite and strictly in (0, 1); got {tau}"
+            )));
+        }
+    }
+    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(invalid(format!(
-            "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
+            "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
         )));
     }
-    Ok(Some(tau))
+    Ok(Some(levels))
+}
+
+/// Prior-weighted empirical `τ`-expectile of `z` in closed form.
+///
+/// The expectile is the unique root `c` of the strictly decreasing, piecewise
+/// linear estimating function
+/// `g(c) = τ·Σ_{zᵢ>c} pᵢ(zᵢ − c) − (1 − τ)·Σ_{zᵢ≤c} pᵢ(c − zᵢ)`.
+/// Sorting `z` and carrying the prefix sums `A = Σ p`, `B = Σ p·z` over the
+/// rows below the root's segment, `g` is linear on that segment and vanishes
+/// exactly at `c = [τ(Z − B) + (1 − τ)B] / [τ(P − A) + (1 − τ)A]` with totals
+/// `P`, `Z`. The segment is the first one whose right sorted endpoint has
+/// `g ≤ 0`; no iteration or tolerance is involved.
+fn weighted_empirical_expectile(z: &[f64], p: &[f64], tau: f64) -> Result<f64, String> {
+    if z.len() != p.len() || z.is_empty() {
+        return Err(format!(
+            "weighted expectile needs matching non-empty inputs; got {} values and {} weights",
+            z.len(),
+            p.len()
+        ));
+    }
+    if z.iter().any(|v| !v.is_finite()) || p.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(
+            "weighted expectile needs finite values and finite non-negative weights".to_string(),
+        );
+    }
+    let mut order: Vec<usize> = (0..z.len()).collect();
+    order.sort_by(|&a, &b| z[a].total_cmp(&z[b]));
+    let total_p: f64 = p.iter().sum();
+    let total_z: f64 = z.iter().zip(p).map(|(v, w)| v * w).sum();
+    if !(total_p > 0.0) {
+        return Err("weighted expectile needs a positive total weight".to_string());
+    }
+    let root = |below_p: f64, below_z: f64| {
+        (tau * (total_z - below_z) + (1.0 - tau) * below_z)
+            / (tau * (total_p - below_p) + (1.0 - tau) * below_p)
+    };
+    let (mut below_p, mut below_z) = (0.0_f64, 0.0_f64);
+    for &i in &order {
+        let at = z[i];
+        let (upto_p, upto_z) = (below_p + p[i], below_z + p[i] * z[i]);
+        let g = tau * ((total_z - upto_z) - at * (total_p - upto_p))
+            - (1.0 - tau) * (at * upto_p - upto_z);
+        if g <= 0.0 {
+            // The root lies on the segment ending at `at`, whose lower set is
+            // the rows strictly before this one.
+            return Ok(root(below_p, below_z).min(at));
+        }
+        below_p = upto_p;
+        below_z = upto_z;
+    }
+    // Unreachable for positive total weight: g at the largest value is ≤ 0.
+    Ok(root(below_p, below_z))
 }
 
 /// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
@@ -391,7 +463,7 @@ fn expectile_kkt_residual(
 
 #[cfg(test)]
 mod expectile_convergence_tests {
-    use super::{ExpectileSignCycle, expectile_kkt_residual};
+    use super::{ExpectileSignCycle, expectile_kkt_residual, weighted_empirical_expectile};
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::array;
 
@@ -454,6 +526,70 @@ mod expectile_convergence_tests {
         )
         .expect("scaled KKT audit");
         assert!((base_kkt - scaled_kkt).abs() <= f64::EPSILON.sqrt());
+    }
+
+    /// `g(c)` from the doc comment of `weighted_empirical_expectile`.
+    fn expectile_estimating_function(z: &[f64], p: &[f64], tau: f64, c: f64) -> f64 {
+        z.iter()
+            .zip(p)
+            .map(|(&v, &w)| {
+                if v > c {
+                    tau * w * (v - c)
+                } else {
+                    -(1.0 - tau) * w * (c - v)
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn weighted_expectile_is_the_exact_root_of_the_estimating_function() {
+        let z = [0.3, -1.7, 2.4, 0.3, -0.2, 5.1, -3.3];
+        let p = [1.0, 0.5, 2.0, 0.0, 1.5, 0.25, 1.0];
+        for tau in [0.02, 0.1, 0.3, 0.5, 0.7, 0.9, 0.98] {
+            let c = weighted_empirical_expectile(&z, &p, tau).expect("expectile");
+            let scale: f64 = z.iter().zip(&p).map(|(v, w)| w * v.abs()).sum();
+            let g = expectile_estimating_function(&z, &p, tau, c);
+            assert!(g.abs() <= 1.0e-13 * scale, "tau={tau}: g(c)={g:e}");
+        }
+    }
+
+    #[test]
+    fn weighted_expectile_at_one_half_is_the_weighted_mean() {
+        let z = [4.0, -2.0, 1.0, 7.5];
+        let p = [1.0, 3.0, 0.5, 2.0];
+        let mean = z.iter().zip(&p).map(|(v, w)| v * w).sum::<f64>() / p.iter().sum::<f64>();
+        let c = weighted_empirical_expectile(&z, &p, 0.5).expect("expectile");
+        assert!((c - mean).abs() <= 1.0e-14 * mean.abs().max(1.0));
+    }
+
+    #[test]
+    fn weighted_expectile_is_strictly_increasing_in_the_level() {
+        let z = [0.9, -0.4, 1.3, -2.2, 0.1, 3.0];
+        let p = [1.0; 6];
+        let levels = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let values: Vec<f64> = levels
+            .iter()
+            .map(|&tau| weighted_empirical_expectile(&z, &p, tau).expect("expectile"))
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "expectiles not strictly increasing: {values:?}"
+        );
+        assert!(values[0] > -2.2 && values[values.len() - 1] < 3.0);
+    }
+
+    #[test]
+    fn weighted_expectile_ignores_zero_weight_rows_and_rejects_bad_input() {
+        let with_dead = weighted_empirical_expectile(&[1.0, 100.0, 3.0], &[1.0, 0.0, 1.0], 0.8)
+            .expect("expectile");
+        let without = weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
+        assert!((with_dead - without).abs() <= 1.0e-15);
+        assert!(weighted_empirical_expectile(&[], &[], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[0.0, 0.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, f64::NAN], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[1.0, -1.0], 0.5).is_err());
     }
 }
 
@@ -1581,7 +1717,26 @@ pub struct FormulaFitResult {
 /// Resolve, materialize, and fit a formula without making front ends repeat any
 /// model construction. Unlike `fit_from_formula`, this service also returns the
 /// materializer's user-facing advisories for CLI/Python presentation.
+///
+/// An automatic `.` term is expanded against `data` first; its notes (the
+/// first of which spells out the fitted formula) lead the returned notes.
 pub fn fit_from_formula_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
+    let automatic = expand_automatic_fit_formula(formula, data, config)?;
+    if automatic.notes.is_empty() {
+        return fit_expanded_formula_with_notes(formula, data, config);
+    }
+    let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
+    let mut notes = automatic.notes;
+    notes.append(&mut outcome.inference_notes);
+    outcome.inference_notes = notes;
+    Ok(outcome)
+}
+
+fn fit_expanded_formula_with_notes(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
@@ -1964,7 +2119,7 @@ fn fit_from_formula_once_with_notes(
     // `family = "expectile"`. Every other family falls through unchanged.
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
-            result: FitResult::Standard(result),
+            result: result.into_fit_result(),
             inference_notes: Vec::new(),
             unidentified_scalar_terms: Vec::new(),
         });
@@ -2126,11 +2281,225 @@ pub(crate) fn fit_expectile_if_requested(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
-    match expectile_tau_for_config(config)? {
-        Some(tau) => Ok(Some(fit_expectile_laws(formula, data, config, tau)?)),
-        None => Ok(None),
+) -> Result<Option<ExpectileFit>, WorkflowError> {
+    let Some(levels) = expectile_levels_for_config(config)? else {
+        return Ok(None);
+    };
+    match levels.as_slice() {
+        [tau] => Ok(Some(ExpectileFit::Single(fit_expectile_laws(
+            formula, data, config, *tau,
+        )?))),
+        _ => Ok(Some(ExpectileFit::Joint(fit_expectile_location_scale(
+            formula, data, config, levels,
+        )?))),
     }
+}
+
+/// The two shapes an expectile request resolves to.
+pub(crate) enum ExpectileFit {
+    /// One level: the LAWS fit of that level alone.
+    Single(StandardFitResult),
+    /// Several levels: one joint non-crossing location-scale fit.
+    Joint(ExpectileLocationScaleFitResult),
+}
+
+impl ExpectileFit {
+    pub(crate) fn into_fit_result(self) -> FitResult {
+        match self {
+            Self::Single(result) => FitResult::Standard(result),
+            Self::Joint(result) => FitResult::ExpectileLocationScale(result),
+        }
+    }
+}
+
+/// The log-σ formula of a joint expectile fit: the caller's `noise_formula`, or
+/// else the mean formula's right-hand side, so `σ(x)` is as flexible as `μ(x)`.
+pub(crate) fn expectile_noise_formula(
+    formula: &str,
+    config: &FitConfig,
+) -> Result<String, WorkflowError> {
+    match config.noise_formula.as_deref() {
+        Some(noise) => Ok(noise.to_string()),
+        None => formula
+            .split_once('~')
+            .map(|(_, rhs)| rhs.trim().to_string())
+            .ok_or_else(|| WorkflowError::InvalidConfig {
+                reason: format!("expectile formula `{formula}` has no `~`"),
+            }),
+    }
+}
+
+/// Joint non-crossing multi-level expectile fit.
+///
+/// Fitting each level on its own lets the curves cross: nothing ties the
+/// separately penalized surfaces together, and under heteroscedasticity their
+/// slopes differ, so they meet as soon as the data (or an extrapolation) is far
+/// enough from the centre. The joint model is the location-scale expectile
+///
+/// ```text
+///   e_τ(x) = μ(x) + c_τ·σ(x),     y = μ(x) + σ(x)·ε,  ε ⟂ x,
+/// ```
+///
+/// under which every conditional expectile of `y | x` has exactly this form,
+/// with `c_τ` the `τ`-expectile of `ε`. `μ` and `σ` are the Gaussian
+/// location-scale GAM (`noise_formula`, defaulting to the mean formula's
+/// right-hand side), so both surfaces carry their own function penalties and
+/// REML/LAML-selected smoothing and come only from a certified fit. `c_τ` is the
+/// prior-weighted empirical `τ`-expectile of the standardized residuals
+/// `(yᵢ − μᵢ)/E[σᵢ]`, solved in closed form.
+///
+/// The expectile of a fixed sample is strictly increasing in `τ`, and
+/// `σ(x) > 0` everywhere (the link has a positive floor), so for `τ₁ < τ₂`
+/// `e_τ₂(x) − e_τ₁(x) = (c_τ₂ − c_τ₁)·σ(x) > 0` at *every* `x`, extrapolation
+/// included. Ordering is a property of the construction, never a post-hoc sort.
+///
+/// `σ` enters as its posterior mean `E[σ] = f + exp(m + v/2)` under the log-σ
+/// block's conditional Gaussian posterior `N(m, v)` — the same functional the
+/// predictor evaluates — and `μ` is identity-linked, so its plug-in is its
+/// posterior mean.
+fn fit_expectile_location_scale(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    levels: Vec<f64>,
+) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
+    use gam_linalg::matrix::DenseDesignOperator;
+    use gam_problem::BlockRole;
+
+    if config.frailty.is_active() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
+                .to_string(),
+        });
+    }
+    let noise_formula = expectile_noise_formula(formula, config)?;
+    let location_scale_config = FitConfig {
+        family: Some("gaussian".to_string()),
+        link: Some("identity".to_string()),
+        expectile_tau: None,
+        frailty: FrailtySpec::None,
+        noise_formula: Some(noise_formula),
+        ..config.clone()
+    };
+    let mat = materialize(formula, data, &location_scale_config)?;
+    let FitRequest::GaussianLocationScale(request) = mat.request else {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "joint expectile regression is only defined for a Gaussian location-scale \
+                     response (non-survival, non-latent)"
+                .to_string(),
+        });
+    };
+    if request.wiggle.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support flexible-link wiggle".to_string(),
+        });
+    }
+    let y = request.spec.y.clone();
+    let prior_weights = request.spec.weights.clone();
+    let mean_offset = request.spec.mean_offset.clone();
+    let log_sigma_offset = request.spec.log_sigma_offset.clone();
+    let FitResult::GaussianLocationScale(location_scale) =
+        fit_model(FitRequest::GaussianLocationScale(request))?
+    else {
+        return Err(raised_fit_failure(
+            FailureCategory::Invariant,
+            "joint expectile: the Gaussian location-scale request returned another fit kind"
+                .to_string(),
+        ));
+    };
+
+    let invariant = |reason: String| {
+        raised_fit_failure(FailureCategory::Invariant, format!("joint expectile: {reason}"))
+    };
+    let fit = &location_scale.fit;
+    let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)
+        .ok_or_else(|| invariant("fit has no location block".to_string()))?;
+    let beta_sigma = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.clone())
+        .ok_or_else(|| invariant("fit has no scale block".to_string()))?;
+    let mu = fit
+        .mean_design
+        .apply(beta_mu.view())
+        .map_err(|error| invariant(format!("could not evaluate the mean design: {error}")))?
+        + &mean_offset;
+    let eta_sigma = fit
+        .noise_design
+        .apply(beta_sigma.view())
+        .map_err(|error| invariant(format!("could not evaluate the log-σ design: {error}")))?
+        + &log_sigma_offset;
+    let n = y.len();
+    if mu.len() != n || eta_sigma.len() != n || prior_weights.len() != n {
+        return Err(invariant(format!(
+            "row counts disagree: y={n}, μ={}, η_σ={}, weights={}",
+            mu.len(),
+            eta_sigma.len(),
+            prior_weights.len()
+        )));
+    }
+    // Posterior variance of η_σ per row from the Scale block of the joint
+    // conditional covariance (coefficient layout `[mean | scale]`).
+    let p_mu = beta_mu.len();
+    let p_sigma = beta_sigma.len();
+    let log_sigma_variance = match fit.fit.beta_covariance() {
+        Some(covariance) => {
+            if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
+                return Err(invariant(format!(
+                    "covariance is {}x{}, smaller than the {} location-scale coefficients",
+                    covariance.nrows(),
+                    covariance.ncols(),
+                    p_mu + p_sigma
+                )));
+            }
+            let scale_block = covariance
+                .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
+                .to_owned();
+            fit.noise_design
+                .design
+                .quadratic_form_diag(&scale_block)
+                .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?
+        }
+        None => Array1::zeros(n),
+    };
+    let sigma_floor =
+        location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+    let standardized: Vec<f64> = (0..n)
+        .map(|i| {
+            let sigma = gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
+                sigma_floor,
+                eta_sigma[i],
+                log_sigma_variance[i],
+            );
+            (y[i] - mu[i]) / sigma
+        })
+        .collect();
+    let prior_weights = prior_weights.to_vec();
+    let standardized_expectiles = levels
+        .iter()
+        .map(|&tau| weighted_empirical_expectile(&standardized, &prior_weights, tau))
+        .collect::<Result<Vec<f64>, String>>()
+        .map_err(|reason| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {reason}"))
+        })?;
+    if standardized_expectiles
+        .windows(2)
+        .any(|pair| !(pair[0] < pair[1]))
+    {
+        return Err(raised_fit_failure(
+            FailureCategory::Input,
+            format!(
+                "joint expectile: the standardized residual expectiles {standardized_expectiles:?} \
+                 at levels {levels:?} are not strictly increasing — the standardized residuals \
+                 carry no spread to order the levels by"
+            ),
+        ));
+    }
+    Ok(ExpectileLocationScaleFitResult {
+        location_scale,
+        levels,
+        standardized_expectiles,
+    })
 }
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
@@ -2149,9 +2518,9 @@ pub(crate) fn fit_expectile_if_requested(
 /// the current asymmetric weights. The returned fit is an ordinary
 /// [`FitResult::Standard`] whose coefficients ARE the penalized τ-expectile —
 /// every downstream consumer (predict, posterior bands, persistence) works
-/// unchanged. The reported scale is the asymmetric working variance, so
-/// expectile standard errors are the sandwich-free Gaussian-form bands of the
-/// converged weighted problem (a deliberate first-rung choice; see #1100).
+/// unchanged. Its published coefficient covariance is the penalized
+/// Newey–Powell sandwich of [`publish_expectile_sandwich_covariance`], never
+/// the Gaussian working-model `φ̂·H⁻¹` of the last inner solve.
 fn fit_expectile_laws(
     formula: &str,
     data: &Dataset,
@@ -2335,6 +2704,14 @@ fn fit_expectile_laws(
         })?;
         let kkt_bound = options.tol;
         if kkt <= kkt_bound {
+            let mut result = result;
+            publish_expectile_sandwich_covariance(
+                &mut result.fit,
+                &result.design.design,
+                residual.view(),
+                weights.view(),
+                tau,
+            )?;
             return Ok(result);
         }
         last_kkt = (kkt, kkt_bound);
@@ -2369,6 +2746,140 @@ fn fit_expectile_laws(
             last_kkt.0, last_kkt.1,
         ),
     ))
+}
+
+/// Replace the working-model covariance of a certified LAWS fixed point with
+/// the penalized Newey–Powell sandwich.
+///
+/// The expectile is an M-estimator, not a likelihood fit: `β̂` solves
+/// `ψ(β) = Xᵀ(w ∘ r) − S_λβ = 0` with `wᵢ = baseᵢ·|τ − 1[rᵢ < 0]|`, whose
+/// Jacobian is `−H`, `H = XᵀWX + S_λ` — the unscaled penalized Hessian the
+/// last inner solve already factored. The inner fit publishes
+/// `Vb = φ̂·H⁻¹`, which is correct only if `Var(wᵢrᵢ) = φ̂·wᵢ`, i.e. only if
+/// the asymmetric weights were inverse variances. They are not: they are the
+/// loss asymmetry, and under heteroscedastic noise the working model
+/// under-covers wherever the noise is large (τ = 0.05/0.95 bands covered
+/// 0.81/0.73 at nominal 0.95).
+///
+/// Newey & Powell (1987, Thm 3) give the unpenalized law
+/// `√n(β̂ − β) → N(0, A⁻¹BA⁻¹)`, `A = E[w xxᵀ]`, `B = E[w²r² xxᵀ]`, with no
+/// dispersion factor anywhere: the scale lives in `r` itself. The penalized
+/// analogue keeps the smoothing prior `β ~ N(0, φ̂·S_λ⁻)` that makes `Vb`
+/// Bayesian (Wahba 1983; Nychka 1988), so the published covariance is the
+/// prior-inclusive sandwich
+///
+///   `V = H⁻¹ (c·Xᵀ diag(w²r²) X + φ̂·S_λ) H⁻¹`,   `c = n₊ / (n₊ − edf)`,
+///
+/// the Bayesian ("penalty as prior") form of the Huber–White sandwich.
+/// Three limits pin every constant:
+///
+/// * `S_λ → 0` recovers the Newey–Powell `A⁻¹BA⁻¹` exactly (up to `c`).
+/// * Under the working model, `E[c·w²r²] = φ̂·w` row by row, so `V → Vb`: the
+///   sandwich changes nothing where the Gaussian form was already right.
+/// * `c` is the HC1 degrees-of-freedom correction, the same `n₊ − edf` the
+///   inner fit's `φ̂ = Σwr² / (n₊ − edf)` divides by (mgcv `gam.scale`), so the
+///   meat and the prior term are debiased on one scale; `n₊` counts the rows
+///   with positive weight, exactly as `φ̂` does.
+///
+/// `φ̂` enters only through the prior term, where it is the posterior
+/// variance's own scale; it never multiplies the meat.
+///
+/// Because `φ̂·S_λ = φ̂·H − φ̂·XᵀWX`, the sandwich is an exact rank-`n`
+/// correction of the published `Vb` that needs neither `S_λ` nor `H`:
+///
+///   `V = Vb + Vb Xᵀ diag(d) X Vb`,   `dᵢ = c·wᵢ²rᵢ²/φ̂² − wᵢ/φ̂`.
+///
+/// It holds verbatim for a constraint-projected `Vb = φ̂·Z(ZᵀHZ)⁻¹Zᵀ`, so the
+/// identifiability and active-constraint gauge the fit already chose carries
+/// over. The correction is added to the conditional AND smoothing-corrected
+/// stores through the one seam that keeps them consistent, so the
+/// smoothing-parameter uncertainty term `Vp − Vb` survives and every consumer
+/// — predict bands, posterior draws, summary SEs, the CLI, Python — reads the
+/// same matrix. A fit on the zero-dispersion boundary (`φ̂ = 0`, every
+/// residual zero) has a zero meat and nothing to correct.
+///
+/// A fit with no dense `Vb` (the memory governor refused it and published only
+/// a factorized diagonal, or inference was off) cannot carry the sandwich, so
+/// its covariance is declined with a typed reason instead of leaving the
+/// working-model diagonal or Hessian to be read under the expectile's name.
+fn publish_expectile_sandwich_covariance(
+    fit: &mut gam_solve::estimate::UnifiedFitResult,
+    design: &gam_linalg::matrix::DesignMatrix,
+    residual: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    tau: f64,
+) -> Result<(), WorkflowError> {
+    let invariant = |reason: String| {
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("expectile sandwich covariance (tau={tau}): {reason}"),
+        )
+    };
+    let Some(vb) = fit.covariance_conditional.clone() else {
+        // The declination is also what stops every Hessian reconstruction
+        // (summary, predict, sampling) from rebuilding the working-model `Vb`.
+        let declined = gam_solve::estimate::CovarianceDeclined::
+            ExpectileSandwichRequiresDenseCovariance {
+                coefficients: fit.beta.len(),
+            };
+        log::warn!("[expectile] {}", declined.explain());
+        fit.covariance_corrected = None;
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.factorized_standard_errors = None;
+        }
+        fit.artifacts.covariance_declined = Some(declined);
+        return Ok(());
+    };
+    let n = design.nrows();
+    if residual.len() != n || weights.len() != n {
+        return Err(invariant(format!(
+            "design rows={n}, residual={}, weights={}",
+            residual.len(),
+            weights.len()
+        )));
+    }
+    let phi = fit
+        .coefficient_covariance_scale()
+        .map_err(|error| invariant(error.to_string()))?;
+    if !(phi.is_finite() && phi >= 0.0) {
+        return Err(invariant(format!(
+            "coefficient covariance scale must be finite and non-negative, got {phi:?}"
+        )));
+    }
+    if phi == 0.0 {
+        return Ok(());
+    }
+    let edf = fit.edf_total().ok_or_else(|| {
+        invariant("a fit that publishes a covariance must carry its effective degrees of freedom".to_string())
+    })?;
+    let n_positive = weights.iter().filter(|&&w| w > 0.0).count() as f64;
+    let residual_df = n_positive - edf;
+    if !(residual_df.is_finite() && residual_df > 0.0) {
+        return Err(invariant(format!(
+            "residual degrees of freedom n₊ − edf = {n_positive} − {edf} must be positive"
+        )));
+    }
+    let hc1 = n_positive / residual_df;
+    let row_correction = Array1::from_shape_fn(n, |i| {
+        let score = weights[i] * residual[i];
+        hc1 * score * score / (phi * phi) - weights[i] / phi
+    });
+    let certified = gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&row_correction)
+        .map_err(invariant)?;
+    let middle = gam_linalg::matrix::xt_diag_x_signed(design, certified)
+        .map_err(invariant)?
+        .to_dense();
+    if middle.dim() != vb.dim() {
+        return Err(invariant(format!(
+            "design Gram is {:?} but the published covariance is {:?}",
+            middle.dim(),
+            vb.dim()
+        )));
+    }
+    let mut correction = vb.dot(&middle).dot(&vb);
+    gam_linalg::matrix::symmetrize_in_place(&mut correction);
+    fit.add_coefficient_covariance_correction(&correction)
+        .map_err(|error| invariant(error.to_string()))
 }
 /// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
 ///

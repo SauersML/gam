@@ -2,7 +2,7 @@
 data (different numbers of observations), returning a confident but meaningless
 winner driven purely by the sample size.
 
-``gamfit.compare_models([m_a, m_b])`` ranks fits by the conditional AIC
+``gamfit.compare_models([m_a, m_b])`` ranked fits by the conditional AIC
 ``score = −2·loglik + 2·edf`` and reports a "winner" plus a Bayes-factor
 column. AIC / REML evidence are only comparable across models fit to the **same
 response on the same observations** — ``−2·loglik`` grows with the number of
@@ -15,7 +15,7 @@ of *different families* raises a clear error
     "compare_models: cannot compare fits of different response families ...
      Compare models fit to the same response under the same family."
 
-(see ``crates/gam-solve/src/evidence.rs`` ``compare_reml_fits`` and the FFI in
+(see ``crates/gam-solve/src/evidence.rs`` ``compare_models`` and the FFI in
 ``crates/gam-pyffi/src/model/model_ffi.rs``). But the same routine carries no
 observation-count guard: ``RemlCandidate`` stores ``score``, ``edf``,
 ``log_lik`` and ``family`` but never ``n``, so a mismatch in ``n`` cannot be

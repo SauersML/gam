@@ -3,8 +3,12 @@ from __future__ import annotations
 import importlib
 from functools import lru_cache
 from types import ModuleType
+from typing import TYPE_CHECKING, cast
 
 from ._cuda import assert_no_cuda_library_conflicts, cuda_diagnostics, prepare_cuda_libraries
+
+if TYPE_CHECKING:
+    from ._rust_module import RustModule
 
 
 class RustExtensionUnavailableError(ImportError):
@@ -22,7 +26,7 @@ class RustExtensionUnavailableError(ImportError):
     --------
     >>> try:
     ...     gamfit.fit(df, "y ~ s(x)")
-    ... except gamfit.RustExtensionUnavailableError as exc:
+    ... except gamfit.errors.RustExtensionUnavailableError as exc:
     ...     print("build the extension first:", exc)
     """
 
@@ -44,7 +48,7 @@ def _normalize_rust_exception_modules(module: ModuleType) -> None:
 
 
 @lru_cache(maxsize=1)
-def rust_module() -> ModuleType:
+def rust_module() -> RustModule:
     prepare_cuda_libraries()
     assert_no_cuda_library_conflicts("importing gamfit._rust")
     try:
@@ -55,7 +59,7 @@ def rust_module() -> ModuleType:
         ) from exc
     _normalize_rust_exception_modules(module)
     assert_no_cuda_library_conflicts("using gamfit._rust")
-    return module
+    return cast("RustModule", module)
 
 
 def extension_status() -> dict[str, object]:

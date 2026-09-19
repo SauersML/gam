@@ -1,6 +1,6 @@
 """Centroid circular-ordering diagnostic: are candidate centers ordered on a ring?
 
-Companion to ``gamfit.adjudicate_atom_shape``. The production race now owns
+Companion to ``gamfit.sae.adjudicate_atom_shape``. The production race now owns
 discrete cyclic structure through its ``ring_clusters`` class, and its
 ``circle_wins`` flag compares the combined stacking mass of the smooth-circle
 and ring-of-clusters candidates against the combined non-circular mass. This

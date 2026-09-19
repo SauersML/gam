@@ -84,6 +84,7 @@ fn empty_termspec() -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     }
 }
 

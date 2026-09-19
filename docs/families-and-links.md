@@ -40,7 +40,8 @@ gamfit.fit(df, "count ~ s(x)", family="poisson", link="log")  # explicit
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
 `"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`,
-`"beta"`, `"gamma"`, `"tweedie"`, `"royston-parmar"`, and
+`"beta"`, `"gamma"`, `"tweedie"`, `"royston-parmar"`,
+`"expectile"` (see [Expectile regression](#expectile-regression)), and
 `"multinomial"` / `"softmax"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
 and Bernoulli marginal-slope families are selected via `Surv(...)` or
@@ -116,6 +117,67 @@ softmax model. The Python API returns a `MultinomialModel`; scalar
 `gamfit.fit(..., family="multinomial")` dispatches to the dedicated
 multinomial formula path. `gamfit.validate_formula(...)` uses the scalar
 materialization preflight, so it is not a multinomial validator.
+
+### Expectile regression
+
+`family="expectile"` fits the conditional `tau`-expectile `e_tau(x)`: the
+minimiser of the asymmetric squared loss `sum_i |tau - 1[y_i < f(x_i)]| (y_i -
+f(x_i))^2` plus the usual smoothing penalties. `tau = 0.5` is the conditional
+mean; `tau` near 0 or 1 tracks the lower or upper tail.
+
+```python
+gamfit.fit(df, "y ~ s(x)", family="expectile", expectile_tau=0.9)
+gamfit.fit(df, "y ~ s(x)", family="expectile(0.9)")      # same fit
+```
+
+CLI: `gam fit data.csv 'y ~ s(x)' --family expectile --expectile-tau 0.9`.
+
+The fit is least asymmetrically weighted squares (LAWS): each inner solve is a
+penalized weighted least-squares fit with weights `|tau - 1[r_i < 0]|`, and the
+smoothing parameters are re-selected by REML at every weight update. A fit is
+returned only once the weight pattern is a fixed point certified by the KKT
+residual of the penalized asymmetric loss, so the published coefficients are
+the exact penalized expectile, not an approximation.
+
+**Uncertainty.** Expectile regression has no likelihood, so the Gaussian
+working-model covariance `phi * H^-1` of the last weighted least-squares solve
+is not the variance of the estimator: it ignores that the noise scale varies
+with `x` and that the asymmetric weights inflate the score variance in the tail.
+The published coefficient covariance is the penalized Newey–Powell sandwich at
+the certified fixed point,
+
+```
+H = X' W X + S_lambda,   meat = n/(n - edf) * X' diag(w_i^2 r_i^2) X
+V = H^-1 (meat + phi * S_lambda) H^-1
+```
+
+It reduces to the Newey–Powell asymptotic covariance as the penalty vanishes
+and to `phi * H^-1` when the working model is exact; the `phi * S_lambda` term
+keeps the penalty as a prior (a Bayesian band, as for every other family) and
+`n/(n - edf)` is the HC1 degrees-of-freedom correction. The same covariance
+feeds `predict(..., interval=...)` bands, `sample_posterior`, `summary()`
+standard errors and the CLI, and the smoothing-parameter uncertainty correction
+is added on top of it. Under heteroscedastic noise the Gaussian working
+covariance under-covers badly in the tails (about 0.66 for a nominal-95% band
+at `tau = 0.95` where the noise is largest); the sandwich brings that to about
+0.87 there and to 0.91–0.975 over the whole range for `tau` in
+{0.05, 0.5, 0.9, 0.95} (the calibration gate is
+`tests/quality/misc/quality_expectile_band_coverage_heteroscedastic.rs`).
+
+`model.family_name` and the summary header report the estimator, e.g.
+`Expectile(tau=0.9)`, not the Gaussian working family used internally.
+
+**Conditional quantiles.** An expectile is not a quantile. For conditional
+quantiles use the transformation-normal family (`transformation_normal=True`;
+CLI `--transformation-normal`): it models the whole conditional distribution
+`F(y | x) = Phi(h(y | x))` with `h` strictly increasing in `y`, so every
+quantile `h^-1(Phi^-1(p) | x)` is analytic and quantiles at different `p` can
+never cross. They are returned by `predict(..., observation_interval=True)`; see
+[predictions.md](predictions.md#transformation-normal-observation-intervals).
+gamfit deliberately has no pyGAM-style `fit_quantile`, which searches for the
+expectile `tau` whose in-sample coverage matches a target quantile: that search
+is a per-quantile bisection with no joint model, and the resulting curves can
+cross.
 
 ### `sas`
 

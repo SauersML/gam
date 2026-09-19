@@ -7,7 +7,7 @@ binomial-cloglog/bernoulli-cloglog/cloglog, latent-cloglog-binomial, \
 poisson, poisson-log, gamma, gamma-log, beta/beta-regression, \
 beta-logit/beta-regression-logit, tweedie/tw, tweedie-log, \
 negative-binomial/negbin/nb, negative-binomial-log/negbin-log, \
-royston-parmar, transformation-normal";
+student-t/t, royston-parmar, transformation-normal";
 
 /// Project an ingest-layer [`ColumnKindTag`] (plus the column's level table)
 /// onto the [`ResponseColumnKind`] consumed by the family layer.
@@ -55,7 +55,9 @@ pub fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind 
 /// it accepts no link override here.
 fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool {
     match response {
-        ResponseFamily::Gaussian => matches!(link, LinkFunction::Identity),
+        ResponseFamily::Gaussian | ResponseFamily::StudentT { .. } => {
+            matches!(link, LinkFunction::Identity)
+        }
         ResponseFamily::Poisson
         | ResponseFamily::Gamma
         | ResponseFamily::Tweedie { .. }
@@ -193,6 +195,24 @@ pub struct FamilyNuisanceOverrides {
     pub tweedie_power: Option<f64>,
     /// Beta-regression precision. `None` is the neutral 1.0.
     pub beta_phi: Option<f64>,
+}
+
+/// Spellings (after lowercasing and `_` → `-`) that name the vector-response
+/// multinomial-logit family.
+const MULTINOMIAL_FAMILY_NAMES: &[&str] = &[
+    "multinomial",
+    "multinomial-logit",
+    "categorical",
+    "categorical-logit",
+    "softmax",
+];
+
+/// Whether `name` denotes the multinomial-logit family. The one predicate the
+/// CLI, the Python `fit` entry point and the latent fitters route on, so every
+/// surface accepts the same spellings.
+pub fn is_multinomial_family_name(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase().replace('_', "-");
+    MULTINOMIAL_FAMILY_NAMES.contains(&lowered.as_str())
 }
 
 /// Resolve a scalar family NAME to its likelihood spec, plus whether the name
@@ -444,6 +464,20 @@ pub fn scalar_family_from_name(
             ),
             true,
         ),
+        // The Student-t scale σ and degrees of freedom ν are LAML
+        // hyperparameters: the optimizer replaces this placeholder with its
+        // data-derived seed (σ = weighted MAD of y, ν = 1) before the first
+        // evaluation, so the values written here never reach a fit.
+        "student-t" | "t" => (
+            LikelihoodSpec::new(
+                ResponseFamily::StudentT {
+                    sigma: 1.0,
+                    nu: 1.0,
+                },
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            false,
+        ),
         "gamma" => (
             LikelihoodSpec::new(
                 ResponseFamily::Gamma,
@@ -502,8 +536,7 @@ pub fn scalar_family_from_name(
             ),
             true,
         ),
-        "multinomial" | "multinomial-logit" | "categorical" | "categorical-logit"
-        | "softmax" => {
+        head if MULTINOMIAL_FAMILY_NAMES.contains(&head) => {
             // Multinomial-logit is a vector-response family with K-1
             // active linear predictors and a per-row dense Fisher
             // block — it cannot be represented by the scalar
@@ -515,18 +548,17 @@ pub fn scalar_family_from_name(
             // which routes the canonical
             // `MultinomialLogitLikelihood: VectorLikelihood` through
             // `gam_solve::pirls::dense_block_xtwx` in output-major
-            // coefficient ordering. The forthcoming
-            // `gamfit.fit_multinomial(...)` Python entry exposes that
-            // path with formula → design wiring; until that wrapper
-            // lands, callers reach the driver directly through the
-            // FFI surface.
+            // coefficient ordering. The table fit entry points (CLI
+            // `fit`, Python `fit_table`) route these names there via
+            // `is_multinomial_family_name` before reaching this scalar
+            // resolver.
             return Err(WorkflowError::InvalidConfig {
                 reason: format!(
-                    "family '{name}' is a vector-response family; use \
-                     the dedicated multinomial entry point \
-                     (`crate::multinomial::fit_penalized_multinomial` \
-                     in Rust, or `gamfit.fit_multinomial(...)` in Python) \
-                     rather than the scalar `fit(family=...)` path"
+                    "family '{name}' is a vector-response family; fit it \
+                     from a table (`gamfit.fit(data, formula, \
+                     family='multinomial')`, or `gam fit --family \
+                     multinomial`) so it reaches the multinomial driver \
+                     rather than the scalar family resolver"
                 ),
             }
             .into());

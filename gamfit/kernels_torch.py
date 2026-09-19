@@ -10,7 +10,7 @@ is not installed.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -24,6 +24,9 @@ except ImportError as exc:  # pragma: no cover
         "'pip install torch'."
     ) from exc
 
+if TYPE_CHECKING:
+    from numpy.typing import ArrayLike
+
 
 class _SinkhornBarycenterFn(torch.autograd.Function):
     """Differentiable Sinkhorn-barycenter ``torch.autograd.Function``.
@@ -33,7 +36,14 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, atoms, weights, cost, eps, n_iter):
+    def forward(
+        ctx: Any,
+        atoms: torch.Tensor,
+        weights: torch.Tensor,
+        cost: torch.Tensor | ArrayLike,
+        eps: float,
+        n_iter: int,
+    ) -> torch.Tensor:
         atoms_np = atoms.detach().cpu().double().numpy()
         weights_np = weights.detach().cpu().double().numpy()
         cost_np = cost.detach().cpu().double().numpy() if isinstance(cost, torch.Tensor) else np.asarray(cost, dtype=np.float64)
@@ -49,7 +59,9 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
         return torch.from_numpy(bary_np).to(device=atoms.device, dtype=atoms.dtype)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx: Any, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None, None, None]:
         atoms, weights = ctx.saved_tensors
         atoms_np = atoms.cpu().double().numpy()
         weights_np = weights.cpu().double().numpy()
@@ -87,7 +99,8 @@ def sinkhorn_barycenter(
         cost = torch.from_numpy(_kernels.circular_cost(m)).to(
             device=atoms.device, dtype=atoms.dtype
         )
-    return _SinkhornBarycenterFn.apply(atoms, weights, cost, eps, n_iter)
+    out: torch.Tensor = _SinkhornBarycenterFn.apply(atoms, weights, cost, eps, n_iter)
+    return out
 
 
 __all__ = ["sinkhorn_barycenter"]

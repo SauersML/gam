@@ -1,9 +1,9 @@
-"""Bug hunt: ``gamfit.gaussian_reml_fit_latent_backward``'s ``grad_t`` is not the
+"""Bug hunt: ``gamfit.reml.gaussian_reml_fit_latent_backward``'s ``grad_t`` is not the
 gradient of the ``reml_score`` its own forward returns -- it is not even a
 descent direction.
 
 ``gaussian_reml_fit_latent`` is the differentiable inner solve behind
-``gamfit.LatentCoord`` and the manifold-SAE decoder: it builds ``Phi(t)`` at the
+``gamfit.smooth.LatentCoord`` and the manifold-SAE decoder: it builds ``Phi(t)`` at the
 per-row latent coordinate ``t`` and solves ``beta`` / ``lambda`` by REML.
 ``gaussian_reml_fit_latent_backward`` documents ``grad_t`` as "the latent
 gradient ... with shape ``(n_obs, latent_dim)``", and
@@ -35,7 +35,7 @@ gradient the same steps give ``-2.25e-03 / -2.24e-05``, as they should.
 
 Root cause (a two-builder mismatch, the Rust-side sibling of gam#2097):
 
-The design the latent forward actually fits is *not* ``gamfit.duchon_basis(t,
+The design the latent forward actually fits is *not* ``gamfit.basis.duchon_basis(t,
 centers, m)``.  Recovering it from the forward's own outputs (fit ``dy = K``
 independent responses, then ``Phi_int = fitted @ inv(coefficients)``) gives
 
@@ -106,7 +106,7 @@ def _score(
     weights: npt.NDArray[np.float64],
 ) -> float:
     n, latent_dim = t.shape
-    fit = gamfit.gaussian_reml_fit_latent(
+    fit = gamfit.reml.gaussian_reml_fit_latent(
         np.asarray(t).ravel(),
         y,
         n,
@@ -127,7 +127,7 @@ def _analytic_grad_t(
     weights: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
     n, latent_dim = t.shape
-    back = gamfit.gaussian_reml_fit_latent_backward(
+    back = gamfit.reml.gaussian_reml_fit_latent_backward(
         np.asarray(t).ravel(),
         y,
         n,
@@ -157,7 +157,7 @@ def test_grad_t_matches_central_differences_of_its_own_reml_score(
         seed, n, latent_dim, n_centers, n_outputs
     )
 
-    fit = gamfit.gaussian_reml_fit_latent(
+    fit = gamfit.reml.gaussian_reml_fit_latent(
         t.ravel(), y, n, latent_dim, centers, penalty, m=_M, weights=weights
     )
     # The lambda re-optimisation is first-order irrelevant: the profile is

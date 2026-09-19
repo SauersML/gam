@@ -1,4 +1,4 @@
-"""Callable-basis contract for :class:`gamfit.Matern`."""
+"""Callable-basis contract for :class:`gamfit.smooth.Matern`."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import gamfit
 def test_shapes_and_autograd_nu_2_5() -> None:
     rng = np.random.default_rng(0)
     centers = rng.standard_normal((8, 2))
-    spec = gamfit.Matern(centers=centers, nu=2.5, length_scale=1.0)
+    spec = gamfit.smooth.Matern(centers=centers, nu=2.5, length_scale=1.0)
     B = 6
     x = torch.as_tensor(rng.standard_normal(B), dtype=torch.float64)
     y = torch.as_tensor(rng.standard_normal(B), dtype=torch.float64)
@@ -42,7 +42,7 @@ def test_shapes_and_autograd_nu_2_5() -> None:
 def test_hessian_shape() -> None:
     rng = np.random.default_rng(0)
     centers = rng.standard_normal((4, 2))
-    spec = gamfit.Matern(centers=centers, nu=1.5, length_scale=0.5)
+    spec = gamfit.smooth.Matern(centers=centers, nu=1.5, length_scale=0.5)
     x = torch.as_tensor(rng.standard_normal(5), dtype=torch.float64)
     y = torch.as_tensor(rng.standard_normal(5), dtype=torch.float64)
     H = spec.hessian(x, y)
