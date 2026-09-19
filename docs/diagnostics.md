@@ -58,6 +58,30 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
 
+### Fit notes, warnings, and solver logs
+
+A fit records two kinds of notes, both listed in `model.notes` and
+`summary().notes` (and printed under `Notes:` in the text summary):
+
+- **advisories** — the fitted model differs from the literal request (a `k`
+  capped to the covariate's distinct values, a basis too small for the
+  residuals). These are also raised as `gamfit.errors.GamInferenceWarning`, attributed
+  to your calling line; the CLI prints them to stderr.
+- **informational notes** — a default the engine chose for you, such as the
+  internal-knot count of a default `s(x)`. These are never warned.
+
+A default fit writes nothing to stdout or stderr. The engine's solver trace
+(`[OUTER …]`, `[PIRLS …]`, …) goes to the `gamfit` Python logger at `DEBUG`
+(finer records below that), which is silent unless you opt in:
+
+```python
+import logging
+logging.basicConfig()
+logging.getLogger("gamfit").setLevel(logging.DEBUG)
+```
+
+The CLI equivalent is `gam -v …` (`-vv` for the finer records).
+
 ### Shape-constrained smooths have no significance p-value
 
 A smooth with `shape=monotone_increasing` (or `monotone_decreasing`, `convex`,

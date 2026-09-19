@@ -424,6 +424,304 @@ pub(crate) fn write_gamma_log_working_state(
     )
 }
 
+/// Exponential-dispersion family with power variance `V(μ) = μ^p` and an
+/// estimated or fixed dispersion `φ`: the families whose legal links include a
+/// reciprocal power `μ = η^(−a)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PowerVarianceEdm {
+    /// `V(μ) = 1`, `d = (y − μ)²`.
+    Gaussian,
+    /// `V(μ) = μ²`, `d/2 = r − 1 − ln r` with `r = y/μ`.
+    Gamma,
+    /// `V(μ) = μ³`, `d/2 = (y − μ)² / (2 y μ²)`.
+    InverseGaussian,
+}
+
+impl PowerVarianceEdm {
+    /// The power `p` of `V(μ) = μ^p`.
+    #[inline]
+    pub(crate) fn variance_power(self) -> f64 {
+        match self {
+            Self::Gaussian => 0.0,
+            Self::Gamma => 2.0,
+            Self::InverseGaussian => 3.0,
+        }
+    }
+
+    #[inline]
+    fn response_quantity(self) -> &'static str {
+        match self {
+            Self::Gaussian => "Gaussian response",
+            Self::Gamma => "Gamma response",
+            Self::InverseGaussian => "inverse-Gaussian response",
+        }
+    }
+
+    /// The response support: finite for the Gaussian, finite and strictly
+    /// positive for the Gamma and inverse Gaussian (whose densities, and whose
+    /// unit deviances `ln y` / `1/y`, are undefined at `y ≤ 0`).
+    #[inline]
+    pub(crate) fn certify_response(self, row: usize, eta: f64, y: f64) -> Result<(), EstimationError> {
+        let in_support = match self {
+            Self::Gaussian => y.is_finite(),
+            Self::Gamma | Self::InverseGaussian => y.is_finite() && y > 0.0,
+        };
+        if in_support {
+            Ok(())
+        } else {
+            Err(EstimationError::pirls_row_geometry_unrepresentable(
+                row,
+                self.response_quantity(),
+                eta,
+                y,
+            ))
+        }
+    }
+}
+
+/// The reciprocal-power link carried by `inverse_link`, with its exponent `a`
+/// in `μ = η^(−a)` (the inverse link `a = 1`, the inverse-squared link
+/// `a = ½`), or `None` for every other link.
+#[inline]
+pub fn reciprocal_power_link(inverse_link: &InverseLink) -> Option<(StandardLink, f64)> {
+    match inverse_link {
+        InverseLink::Standard(StandardLink::Inverse) => Some((StandardLink::Inverse, 1.0)),
+        InverseLink::Standard(StandardLink::InverseSquared) => {
+            Some((StandardLink::InverseSquared, 0.5))
+        }
+        _ => None,
+    }
+}
+
+/// A reciprocal-power link is defined only on `η > 0` (where `μ > 0`).
+///
+/// Outside it the row reports [`EstimationError::InverseLinkDomainViolation`].
+/// The inner solver classifies that error as an infeasible trial step
+/// (`is_lm_retriable_candidate_error`) and damps the step — step-halving back
+/// to feasibility — instead of projecting `η` or flooring `μ`, so every
+/// accepted iterate evaluates the exact likelihood.
+#[inline]
+pub fn require_reciprocal_link_domain(
+    link: StandardLink,
+    eta: f64,
+) -> Result<(), EstimationError> {
+    if eta.is_finite() && eta > 0.0 {
+        return Ok(());
+    }
+    Err(EstimationError::InverseLinkDomainViolation {
+        link: link.name(),
+        eta,
+        lower: 0.0,
+        upper: f64::MAX,
+    })
+}
+
+#[inline]
+fn certify_dispersion(phi: f64) -> Result<(), EstimationError> {
+    if phi.is_finite() && phi > 0.0 {
+        Ok(())
+    } else {
+        crate::bail_invalid_estim!("dispersion phi must be finite and > 0; got {phi}")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReciprocalLinkRow {
+    mu: f64,
+    weight: f64,
+    c: f64,
+    d: f64,
+    h1: f64,
+    h2: f64,
+    h3: f64,
+}
+
+#[inline]
+fn finite_row_value(row: usize, quantity: &'static str, eta: f64, value: f64) -> Result<f64, EstimationError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(EstimationError::pirls_row_geometry_unrepresentable(row, quantity, eta, value))
+    }
+}
+
+/// Exact Fisher row geometry of a power-variance family under `μ = η^(−a)`.
+///
+/// With `μ′ = −a μ/η` the Fisher weight `w μ′²/(φ V(μ))` collapses to a pure
+/// power of `η`:
+///
+/// ```text
+/// W = (w a²/φ) η^k,   k = −a(2 − p) − 2,
+/// ∂W/∂η = k W/η,      ∂²W/∂η² = k(k − 1) W/η².
+/// ```
+///
+/// (Gaussian-inverse `k = −4`, Gamma-inverse `k = −2`, inverse-Gaussian
+/// `1/μ²` `k = −3/2`.) `W` is formed from its logarithm so a representable row
+/// never overflows through an intermediate `μ^p`.
+#[inline]
+fn reciprocal_link_row(
+    family: PowerVarianceEdm,
+    link: StandardLink,
+    exponent: f64,
+    phi: f64,
+    row: usize,
+    eta: f64,
+    prior_weight: f64,
+) -> Result<ReciprocalLinkRow, EstimationError> {
+    require_reciprocal_link_domain(link, eta)?;
+    if !(prior_weight.is_finite() && prior_weight >= 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "prior weight", eta, prior_weight));
+    }
+    let a = exponent;
+    let log_eta = eta.ln();
+    let mu = (-a * log_eta).exp();
+    if !(mu.is_finite() && mu > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "reciprocal-link mean", eta, mu));
+    }
+    let mu_over_eta = (-a * log_eta - log_eta).exp();
+    let h1 = finite_row_value(row, "dmu/deta", eta, -a * mu_over_eta)?;
+    let h2 = finite_row_value(row, "d2mu/deta2", eta, a * (a + 1.0) * mu_over_eta / eta)?;
+    let h3 = finite_row_value(
+        row,
+        "d3mu/deta3",
+        eta,
+        -a * (a + 1.0) * (a + 2.0) * mu_over_eta / (eta * eta),
+    )?;
+    if prior_weight == 0.0 {
+        return Ok(ReciprocalLinkRow { mu, weight: 0.0, c: 0.0, d: 0.0, h1, h2, h3 });
+    }
+    let k = -a * (2.0 - family.variance_power()) - 2.0;
+    let weight = (prior_weight.ln() + 2.0 * a.ln() - phi.ln() + k * log_eta).exp();
+    if !(weight.is_finite() && weight > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Fisher weight", eta, weight));
+    }
+    let c = finite_row_value(row, "dW/deta", eta, k * weight / eta)?;
+    let d = finite_row_value(row, "d2W/deta2", eta, k * (k - 1.0) * weight / (eta * eta))?;
+    Ok(ReciprocalLinkRow { mu, weight, c, d, h1, h2, h3 })
+}
+
+/// Working state for a power-variance family (Gaussian, Gamma, inverse
+/// Gaussian) under a reciprocal-power link `μ = η^(−a)`: exact `μ`, Fisher
+/// weight (including `1/φ`), working response `z = η + (y − μ)/μ′`, and the
+/// optional curvature/link-jet carriers. Every row is certified before any
+/// output buffer is written.
+pub(crate) fn write_reciprocal_link_working_state(
+    family: PowerVarianceEdm,
+    link: StandardLink,
+    exponent: f64,
+    phi: f64,
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) -> Result<(), EstimationError> {
+    certify_dispersion(phi)?;
+    let rows: Vec<Result<(ReciprocalLinkRow, f64), EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let geometry =
+                reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i])?;
+            let z = if geometry.weight == 0.0 {
+                eta[i]
+            } else {
+                family.certify_response(i, eta[i], y[i])?;
+                // (y − μ)/μ′ = −η (y/μ − 1)/a.
+                let z = eta[i] * (1.0 - (y[i] / geometry.mu - 1.0) / exponent);
+                finite_row_value(i, "working response", eta[i], z)?
+            };
+            Ok((geometry, z))
+        })
+        .collect();
+    let rows: Vec<(ReciprocalLinkRow, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+    for (i, (row, z_row)) in rows.iter().enumerate() {
+        mu[i] = row.mu;
+        weights[i] = row.weight;
+        z[i] = *z_row;
+    }
+    if let Some(derivs) = derivatives {
+        for (i, (row, _)) in rows.iter().enumerate() {
+            derivs.c[i] = row.c;
+            derivs.d[i] = row.d;
+            derivs.dmu_deta[i] = row.h1;
+            derivs.d2mu_deta2[i] = row.h2;
+            derivs.d3mu_deta3[i] = row.h3;
+        }
+    }
+    Ok(())
+}
+
+/// The curvature carriers of [`write_reciprocal_link_working_state`] alone, for
+/// outer-derivative reconstruction.
+pub(crate) fn write_reciprocal_link_eta_curvature(
+    family: PowerVarianceEdm,
+    link: StandardLink,
+    exponent: f64,
+    phi: f64,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    buffers: WorkingDerivativeBuffersMut<'_>,
+) -> Result<(), EstimationError> {
+    certify_dispersion(phi)?;
+    let rows: Vec<Result<ReciprocalLinkRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| reciprocal_link_row(family, link, exponent, phi, i, eta[i], priorweights[i]))
+        .collect();
+    let rows: Vec<ReciprocalLinkRow> = rows.into_iter().collect::<Result<_, _>>()?;
+    for (i, row) in rows.iter().enumerate() {
+        buffers.c[i] = row.c;
+        buffers.d[i] = row.d;
+        buffers.dmu_deta[i] = row.h1;
+        buffers.d2mu_deta2[i] = row.h2;
+        buffers.d3mu_deta3[i] = row.h3;
+    }
+    Ok(())
+}
+
+/// The log-link rule for the inverse Gaussian: `V(μ) = μ³`, `μ = e^η`, so the
+/// Fisher weight is `w/(φ μ)` and `∂W/∂η = −W`, `∂²W/∂η² = W`.
+#[inline]
+pub(super) fn inverse_gaussian_log_link_rule(phi: f64) -> log_link_working_state::LogLinkRule {
+    log_link_working_state::LogLinkRule {
+        weight: log_link_working_state::WorkingWeight::PowerVariance { p: 3.0, phi },
+        curvature: log_link_working_state::WorkingCurvature::Proportional {
+            c_ratio: -1.0,
+            d_ratio: 1.0,
+        },
+    }
+}
+
+/// Working state for the inverse Gaussian with a log link.
+pub(crate) fn write_inverse_gaussian_log_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    phi: f64,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) -> Result<(), EstimationError> {
+    certify_dispersion(phi)?;
+    for i in 0..y.len() {
+        if priorweights[i] > 0.0 {
+            PowerVarianceEdm::InverseGaussian.certify_response(i, eta[i], y[i])?;
+        }
+    }
+    log_link_working_state::write_log_link_working_state(
+        &inverse_gaussian_log_link_rule(phi),
+        y,
+        eta,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
+}
+
 #[inline]
 pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
@@ -734,7 +1032,7 @@ pub(crate) fn write_tweedie_log_working_state(
     let exponent = 2.0 - p;
     log_link_working_state::write_log_link_working_state(
         &log_link_working_state::LogLinkRule {
-            weight: log_link_working_state::WorkingWeight::TweediePower { p, phi },
+            weight: log_link_working_state::WorkingWeight::PowerVariance { p, phi },
             curvature: log_link_working_state::WorkingCurvature::Proportional {
                 c_ratio: exponent,
                 d_ratio: exponent * exponent,

@@ -322,7 +322,7 @@ fn best_effort<T: Default>(
             T::default()
         }
         Err(error @ (PersistentStoreError::Encode(_) | PersistentStoreError::Rejected(_))) => {
-            log::warn!(
+            log::debug!(
                 "[warm-start-cache] persistence defect operation={} explicit_root={}: {}",
                 operation,
                 store.root().display(),

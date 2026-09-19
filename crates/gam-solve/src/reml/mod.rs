@@ -17,6 +17,7 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
 // #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
@@ -5566,10 +5567,14 @@ pub(crate) enum BlockCorrectionDecision {
 /// The #784 block quadrature latched beside the admission (#2623): the
 /// Gauss–Hermite order of each block axis, and whether the block marginal is
 /// integrated axis by axis with the analytic mixed-axis term, or as one tensor
-/// rule over the whole block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// rule over the whole block. Beside them sit the paired-rule errors measured
+/// at that admission: the certificate every later evaluation at those orders
+/// carries, since the paired error no longer switches anything once the
+/// orders are latched (#2748).
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
 }
 
@@ -5803,6 +5808,13 @@ pub(crate) struct RemlState<'a> {
     /// final reported fit still Pearson-refreshes `phi` at the converged η. Reset
     /// on `reset_surface`.
     pub(crate) frozen_beta_phi: Arc<AtomicU64>,
+
+    /// Gaussian (non-identity link) / inverse Gaussian dispersion `phi` frozen
+    /// for the λ search, bit-packed `f64`; `0` means "not yet frozen". Captured
+    /// once as the converged-η MLE `Σwd/Σw` and applied via
+    /// `GlmLikelihoodSpec::with_dispersion_phi_frozen_for_search`, exactly like
+    /// [`Self::frozen_tweedie_phi`]; the final reported fit refreshes it.
+    pub(crate) frozen_dispersion_phi: Arc<AtomicU64>,
 
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where

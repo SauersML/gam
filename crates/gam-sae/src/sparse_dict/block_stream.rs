@@ -1356,7 +1356,7 @@ impl BlockSparseStreamState {
         // stalled shard stops advancing this line; under `RUST_LOG=info` a route
         // that never returns is diagnosable immediately rather than after a whole
         // silent epoch.
-        log::info!(
+        log::debug!(
             "[SAE block shard] rows={} total_rows={} rss={:.6e} alive_blocks={}/{} \
              shard_s={:.2}",
             shard.nrows(),

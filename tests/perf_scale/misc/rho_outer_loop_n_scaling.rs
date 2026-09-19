@@ -45,7 +45,7 @@ struct RhoPhaseLogger;
 
 impl log::Log for RhoPhaseLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Debug
+        metadata.level() <= log::Level::Trace
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -69,7 +69,7 @@ fn install_rho_phase_logger() {
     // first, in which case its filter — not ours — is the one that governs its
     // output, and stomping it would change that test's behaviour.
     if log::set_logger(&RHO_PHASE_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Trace);
     }
 }
 
@@ -112,7 +112,7 @@ fn bspline_smooth(name: &str, col: usize) -> SmoothTermSpec {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }

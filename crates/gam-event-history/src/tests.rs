@@ -1281,7 +1281,7 @@ static STDOUT_LOGGER: StdoutLogger = StdoutLogger;
 
 fn install_test_logger() {
     if log::set_logger(&STDOUT_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 
