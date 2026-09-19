@@ -102,7 +102,7 @@ impl fmt::Display for ShapeMismatch {
 
 impl std::error::Error for ShapeMismatch {}
 
-fn check(what: &'static str, expected: usize, found: usize) -> Result<(), ShapeMismatch> {
+pub(super) fn check(what: &'static str, expected: usize, found: usize) -> Result<(), ShapeMismatch> {
     if expected == found {
         Ok(())
     } else {
@@ -276,6 +276,41 @@ impl ExactFactor {
         coordinates *= &mask;
         Ok(coordinates.dot(&self.write.t()))
     }
+
+    /// The pullback of [`Self::apply_masked`]. For a loss `ℓ` of `y = U M R x`
+    /// with row cotangents `ȳ = ∂ℓ/∂y`, it returns each input row's cotangent
+    /// `x̄ = Rᵀ (m ⊙ Uᵀ ȳ)` and the mask cotangent `m̄_c = Σ_rows (Uᵀ ȳ)_c (R x)_c`.
+    /// The map is linear in `x` and in `m`, so both are exact adjoints. Like the
+    /// forward, the pullback never forms `U M R`.
+    pub fn apply_masked_pullback(
+        &self,
+        inputs: ArrayView2<'_, f64>,
+        mask: ArrayView1<'_, f64>,
+        output_cotangent: ArrayView2<'_, f64>,
+    ) -> Result<MaskedFactorCotangents, ShapeMismatch> {
+        check("factor input width", self.read.ncols(), inputs.ncols())?;
+        check("component mask length", self.components(), mask.len())?;
+        check("output cotangent width", self.write.nrows(), output_cotangent.ncols())?;
+        check("output cotangent rows", inputs.nrows(), output_cotangent.nrows())?;
+        let written = output_cotangent.dot(&self.write);
+        let coordinates = inputs.dot(&self.read.t());
+        let mask_cotangent = (&written * &coordinates).sum_axis(ndarray::Axis(0));
+        let mut scaled = written;
+        scaled *= &mask;
+        Ok(MaskedFactorCotangents {
+            inputs: scaled.dot(&self.read),
+            mask: mask_cotangent,
+        })
+    }
+}
+
+/// The cotangents [`ExactFactor::apply_masked_pullback`] returns.
+#[derive(Clone, Debug)]
+pub struct MaskedFactorCotangents {
+    /// `x̄ = Rᵀ (m ⊙ Uᵀ ȳ)` for each input row, `n × d`.
+    pub inputs: Array2<f64>,
+    /// `m̄_c = Σ_rows (Uᵀ ȳ)_c (R x)_c`, one entry per component.
+    pub mask: Array1<f64>,
 }
 
 /// One of the two weights of a residual MLP block.
@@ -379,6 +414,26 @@ impl NativeMlp {
 
     pub fn activation(&self) -> GaussianActivation {
         self.activation
+    }
+
+    /// `W₁`, `H × d`.
+    pub fn read_in(&self) -> ArrayView2<'_, f64> {
+        self.read_in.view()
+    }
+
+    /// `b₁`, length `H`.
+    pub fn bias_in(&self) -> ArrayView1<'_, f64> {
+        self.bias_in.view()
+    }
+
+    /// `W₂`, `d × H`.
+    pub fn write_out(&self) -> ArrayView2<'_, f64> {
+        self.write_out.view()
+    }
+
+    /// `b₂`, length `d`.
+    pub fn bias_out(&self) -> ArrayView1<'_, f64> {
+        self.bias_out.view()
     }
 
     /// The summed input `W₁ x + b₁` for each row `x` of `inputs`.
@@ -579,69 +634,14 @@ impl ComponentMlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parameter_decomposition::test_support::component_mlp::{
+        HIDDEN, READ_IN_COMPONENTS, ROWS, WIDTH, WRITE_OUT_COMPONENTS, bitwise_equal, mask_family,
+        random_block, uniform, uniform_vector,
+    };
     use gam_linalg::roundoff::accumulation_growth;
     use ndarray::{Axis, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-
-    const WIDTH: usize = 4;
-    const HIDDEN: usize = 6;
-    const READ_IN_COMPONENTS: usize = 7;
-    const WRITE_OUT_COMPONENTS: usize = 8;
-    const ROWS: usize = 5;
-
-    fn uniform(rng: &mut StdRng, rows: usize, cols: usize, half_width: f64) -> Array2<f64> {
-        Array2::from_shape_simple_fn((rows, cols), || rng.random_range(-half_width..half_width))
-    }
-
-    fn uniform_vector(rng: &mut StdRng, len: usize, half_width: f64) -> Array1<f64> {
-        Array1::from_shape_simple_fn(len, || rng.random_range(-half_width..half_width))
-    }
-
-    /// A random block with overcomplete reads on both weights, and its inputs.
-    fn random_block(activation: GaussianActivation, seed: u64) -> (ComponentMlp, Array2<f64>) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let native = NativeMlp::new(
-            uniform(&mut rng, HIDDEN, WIDTH, 1.0),
-            uniform_vector(&mut rng, HIDDEN, 1.0),
-            uniform(&mut rng, WIDTH, HIDDEN, 1.0),
-            uniform_vector(&mut rng, WIDTH, 1.0),
-            activation,
-        )
-        .expect("the random block's shapes compose");
-        let read_in = uniform(&mut rng, READ_IN_COMPONENTS, WIDTH, 1.0);
-        let read_in_candidate = uniform(&mut rng, HIDDEN, READ_IN_COMPONENTS, 1.0);
-        let write_out = uniform(&mut rng, WRITE_OUT_COMPONENTS, HIDDEN, 1.0);
-        let write_out_candidate = uniform(&mut rng, WIDTH, WRITE_OUT_COMPONENTS, 1.0);
-        let block = ComponentMlp::new(
-            native,
-            ComponentRead {
-                read: read_in.view(),
-                candidate_write: read_in_candidate.view(),
-            },
-            ComponentRead {
-                read: write_out.view(),
-                candidate_write: write_out_candidate.view(),
-            },
-        )
-        .expect("a random overcomplete read is resolved");
-        let inputs = uniform(&mut rng, ROWS, WIDTH, 2.0);
-        (block, inputs)
-    }
-
-    /// Continuous, binary, signed and algebraically all-on masks.
-    fn mask_family(rng: &mut StdRng, len: usize) -> [(&'static str, Array1<f64>); 4] {
-        let continuous = Array1::from_shape_simple_fn(len, || rng.random_range(0.0..1.0));
-        let binary = Array1::from_shape_fn(len, |component| (component % 2) as f64);
-        let mut signed = Array1::from_shape_simple_fn(len, || rng.random_range(-2.0..2.0));
-        signed[0] = -1.5;
-        [
-            ("continuous", continuous),
-            ("binary", binary),
-            ("signed", signed),
-            ("ones", Array1::ones(len)),
-        ]
-    }
 
     fn edited_tensor(factor: &ExactFactor, mask: ArrayView1<'_, f64>) -> Array2<f64> {
         (&factor.write() * &mask).dot(&factor.read())
@@ -702,14 +702,6 @@ mod tests {
             .zip(band.iter())
             .filter(|(difference, bound)| difference.abs() > **bound)
             .count()
-    }
-
-    fn bitwise_equal(left: &Array2<f64>, right: &Array2<f64>) -> bool {
-        left.dim() == right.dim()
-            && left
-                .iter()
-                .zip(right.iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 
     fn frobenius(matrix: &Array2<f64>) -> f64 {
@@ -972,6 +964,67 @@ mod tests {
                 "the comparison must see the residual, under {mask:?}"
             );
         }
+    }
+
+    /// A hand-built factor in small integers, so every product and sum below is
+    /// exact in floating point. The masked apply is linear in its inputs and in its
+    /// mask, so its pullback must be the exact adjoint: `⟨ȳ, U M R e_{rj}⟩ = x̄_{rj}`
+    /// for every input entry, and `⟨ȳ, U (e_c ⊙ R x)⟩ = m̄_c` for every component.
+    #[test]
+    fn masked_factor_pullback_is_the_exact_adjoint_of_the_masked_apply() {
+        let factor = ExactFactor {
+            write: array![[1.0, 2.0, -1.0], [0.0, 3.0, 1.0]],
+            read: array![[2.0, 1.0], [-1.0, 1.0], [1.0, 3.0]],
+            resolution_margin: f64::INFINITY,
+        };
+        let mask = array![2.0, -1.0, 3.0];
+        let inputs = array![[1.0, -2.0], [3.0, 1.0]];
+        let output_cotangent = array![[1.0, -1.0], [2.0, 1.0]];
+        let pairing = |left: &Array2<f64>, right: &Array2<f64>| (left * right).sum();
+
+        let mut adjoint_inputs = Array2::<f64>::zeros(inputs.raw_dim());
+        for row in 0..inputs.nrows() {
+            for column in 0..inputs.ncols() {
+                let mut direction = Array2::<f64>::zeros(inputs.raw_dim());
+                direction[[row, column]] = 1.0;
+                let pushed = factor
+                    .apply_masked(direction.view(), mask.view())
+                    .expect("forward along an input direction");
+                adjoint_inputs[[row, column]] = pairing(&output_cotangent, &pushed);
+            }
+        }
+        let mut adjoint_mask = Array1::<f64>::zeros(factor.components());
+        for component in 0..factor.components() {
+            let mut indicator = Array1::<f64>::zeros(factor.components());
+            indicator[component] = 1.0;
+            let pushed = factor
+                .apply_masked(inputs.view(), indicator.view())
+                .expect("forward along one component");
+            adjoint_mask[component] = pairing(&output_cotangent, &pushed);
+        }
+
+        let cotangents = factor
+            .apply_masked_pullback(inputs.view(), mask.view(), output_cotangent.view())
+            .expect("pullback shapes compose");
+        assert_eq!(
+            cotangents.inputs, adjoint_inputs,
+            "the input cotangent must be the exact adjoint of the masked apply"
+        );
+        assert_eq!(
+            cotangents.mask, adjoint_mask,
+            "the mask cotangent must be the exact derivative of the pairing along each component"
+        );
+
+        // Positive control: pulled back under the all-ones mask, the input cotangent
+        // is not the adjoint under `m`, so the check sees the mask.
+        let ones = Array1::<f64>::ones(factor.components());
+        let unmasked = factor
+            .apply_masked_pullback(inputs.view(), ones.view(), output_cotangent.view())
+            .expect("all-ones pullback");
+        assert_ne!(
+            unmasked.inputs, adjoint_inputs,
+            "the adjoint check must distinguish the mask"
+        );
     }
 
     /// A hand-built exact factor in small integers, so every operation is exact in

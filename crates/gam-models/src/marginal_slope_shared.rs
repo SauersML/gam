@@ -40,7 +40,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 /// Canonical inner-cache `beta_seed` validator passed to the generic
-/// outer-engine (`optimize_spatial_length_scale_exact_joint`).
+/// outer-engine (`optimize_spatial_length_scale_exact_joint_typed`).
 ///
 /// The outer solver hands back the converged inner `beta` at each accepted
 /// ρ-step so the next inner solve can warm-start from it. This guards that
@@ -310,19 +310,8 @@ pub(crate) fn observed_denested_cell_partials(
     beta_w: Option<&Array1<f64>>,
     scale: f64,
 ) -> Result<ObservedDenestedCellPartials, String> {
-    let zero_score_span = zero_local_span_cubic();
-    let zero_link_span = zero_local_span_cubic();
-    let u_obs = a + b * z_obs;
-    let score_span_obs = if let (Some(runtime), Some(beta_h)) = (score_warp, beta_h) {
-        runtime.local_cubic_at(beta_h.view(), z_obs)?
-    } else {
-        zero_score_span
-    };
-    let link_span_obs = if let (Some(runtime), Some(beta_w)) = (link_dev, beta_w) {
-        runtime.local_cubic_at(beta_w.view(), u_obs)?
-    } else {
-        zero_link_span
-    };
+    let (score_span_obs, link_span_obs) =
+        observed_denested_spans(z_obs, a, b, score_warp, beta_h, link_dev, beta_w)?;
     let coeff = scale_coeff4(
         cubic_cell_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
         scale,
@@ -345,6 +334,61 @@ pub(crate) fn observed_denested_cell_partials(
         dc_dabb: scale_coeff4(dc_dabb, scale),
         dc_dbbb: scale_coeff4(dc_dbbb, scale),
     })
+}
+
+/// The observed score-warp span at `z_obs` and link-deviation span at `a + b·z_obs`,
+/// with the zero cubic standing in for an absent deviation.
+fn observed_denested_spans(
+    z_obs: f64,
+    a: f64,
+    b: f64,
+    score_warp: Option<&crate::bms::DeviationRuntime>,
+    beta_h: Option<&Array1<f64>>,
+    link_dev: Option<&crate::bms::DeviationRuntime>,
+    beta_w: Option<&Array1<f64>>,
+) -> Result<(LocalSpanCubic, LocalSpanCubic), String> {
+    let u_obs = a + b * z_obs;
+    let score_span_obs = if let (Some(runtime), Some(beta_h)) = (score_warp, beta_h) {
+        runtime.local_cubic_at(beta_h.view(), z_obs)?
+    } else {
+        zero_local_span_cubic()
+    };
+    let link_span_obs = if let (Some(runtime), Some(beta_w)) = (link_dev, beta_w) {
+        runtime.local_cubic_at(beta_w.view(), u_obs)?
+    } else {
+        zero_local_span_cubic()
+    };
+    Ok((score_span_obs, link_span_obs))
+}
+
+/// `(coeff, dc_da, dc_daa)` of [`observed_denested_cell_partials`], the three channels a
+/// calibration Newton step reads, from the same spans and kernels and so bit-identical
+/// to those fields, without the slope and third partials that step discards.
+pub(crate) fn observed_denested_calibration_newton_coefficients(
+    z_obs: f64,
+    a: f64,
+    b: f64,
+    score_warp: Option<&crate::bms::DeviationRuntime>,
+    beta_h: Option<&Array1<f64>>,
+    link_dev: Option<&crate::bms::DeviationRuntime>,
+    beta_w: Option<&Array1<f64>>,
+    scale: f64,
+) -> Result<([f64; 4], [f64; 4], [f64; 4]), String> {
+    let (score_span_obs, link_span_obs) =
+        observed_denested_spans(z_obs, a, b, score_warp, beta_h, link_dev, beta_w)?;
+    let coeff = scale_coeff4(
+        cubic_cell_kernel::denested_cell_coefficients(score_span_obs, link_span_obs, a, b),
+        scale,
+    );
+    let (dc_da_raw, _) =
+        cubic_cell_kernel::denested_cell_coefficient_partials(score_span_obs, link_span_obs, a, b);
+    let (dc_daa_raw, _, _) =
+        cubic_cell_kernel::denested_cell_second_partials(score_span_obs, link_span_obs, a, b);
+    Ok((
+        coeff,
+        scale_coeff4(dc_da_raw, scale),
+        scale_coeff4(dc_daa_raw, scale),
+    ))
 }
 
 pub(crate) fn add_two_surface_psi_outer(

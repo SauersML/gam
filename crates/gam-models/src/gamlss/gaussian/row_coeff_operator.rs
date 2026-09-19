@@ -7,6 +7,42 @@ use super::*;
 pub(crate) struct RowCoeffChannel {
     pub(crate) block: usize,
     pub(crate) design: Arc<Array2<f64>>,
+    /// The identity of the [`SharedDesign`] this channel reads.
+    pub(crate) identity: u64,
+}
+
+/// An immutable row design shared by every operator its owner builds, under an identity the
+/// owner mints once. The pair-gram cache keys on that identity, never on the allocation's
+/// address: an address is reused once its design is freed, so a table keyed on it can be read
+/// back for a different design. Two owners holding identical content mint different identities
+/// and miss each other's tables, which is the safe direction (#2940, #2515).
+#[derive(Clone)]
+pub(crate) struct SharedDesign {
+    matrix: Arc<Array2<f64>>,
+    identity: u64,
+}
+
+impl SharedDesign {
+    /// The design. There is no mutable access: a changed design is a new `SharedDesign` with a
+    /// new identity, so an identity always names one content.
+    pub(crate) fn matrix(&self) -> &Arc<Array2<f64>> {
+        &self.matrix
+    }
+
+    /// Own `matrix` under a fresh identity.
+    pub(crate) fn new(matrix: Array2<f64>) -> Self {
+        Self::from_arc(Arc::new(matrix))
+    }
+
+    /// Give an already shared design a fresh identity. An owner calls this once and hands the
+    /// result to every operator it builds.
+    pub(crate) fn from_arc(matrix: Arc<Array2<f64>>) -> Self {
+        static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            matrix,
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 /// Symmetric pair coefficients `c_{ab}` for `a ≤ b`. The operator adds
@@ -61,13 +97,17 @@ impl RowCoeffOperator {
     /// pool so the first warm `mul_vec` call skips allocation.
     pub(crate) fn from_directions(
         block_widths: Vec<usize>,
-        channels: Vec<(usize, Arc<Array2<f64>>)>,
+        channels: Vec<(usize, SharedDesign)>,
         pairs: Vec<(usize, usize, Array1<f64>)>,
         nrows: usize,
     ) -> Self {
         let channels: Vec<RowCoeffChannel> = channels
             .into_iter()
-            .map(|(block, design)| RowCoeffChannel { block, design })
+            .map(|(block, design)| RowCoeffChannel {
+                block,
+                design: design.matrix,
+                identity: design.identity,
+            })
             .collect();
         let pair_coeffs: Vec<RowCoeffPair> = pairs
             .into_iter()
@@ -174,7 +214,7 @@ impl RowCoeffOperator {
         self.pair_coeffs.len().hash(&mut hasher);
         for (idx, ch) in self.channels.iter().enumerate() {
             idx.hash(&mut hasher);
-            (Arc::as_ptr(&ch.design) as usize).hash(&mut hasher);
+            ch.identity.hash(&mut hasher);
             ch.block.hash(&mut hasher);
             ch.design.nrows().hash(&mut hasher);
             ch.design.ncols().hash(&mut hasher);
@@ -673,6 +713,10 @@ pub(crate) struct GaussianLocationScaleHessianWorkspace {
     pub(crate) block_states: Vec<ParameterBlockState>,
     pub(crate) xmu: Arc<Array2<f64>>,
     pub(crate) x_ls: Arc<Array2<f64>>,
+    /// `xmu` and `x_ls` under the identities every directional operator of this workspace
+    /// shares (#2940).
+    pub(crate) xmu_design: SharedDesign,
+    pub(crate) x_ls_design: SharedDesign,
     pub(crate) coeff_mm: Array1<f64>,
     pub(crate) coeff_ml: Array1<f64>,
     pub(crate) coeff_ll: Array1<f64>,
@@ -693,11 +737,15 @@ impl GaussianLocationScaleHessianWorkspace {
         // (mm=w, ml=2κm, ll=κ'(a−n)+2κ²n; #1561). Reading the same coefficients
         // as the dense path makes cross-block drift structurally impossible.
         let (coeff_mm, coeff_ml, coeff_ll) = gaussian_locscale_observed_joint_row_coeffs(&rows);
+        let xmu = Arc::new(xmu);
+        let x_ls = Arc::new(x_ls);
         Ok(Self {
             family,
             block_states,
-            xmu: Arc::new(xmu),
-            x_ls: Arc::new(x_ls),
+            xmu_design: SharedDesign::from_arc(xmu.clone()),
+            x_ls_design: SharedDesign::from_arc(x_ls.clone()),
+            xmu,
+            x_ls,
             coeff_mm,
             coeff_ml,
             coeff_ll,
@@ -879,8 +927,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         // differentiate the old Fisher block (cross ≡ 0) while the LAML value
         // factorized the observed Hessian — an objective/gradient split (#1561).
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
-            self.xmu.clone(),
-            self.x_ls.clone(),
+            self.xmu_design.clone(),
+            self.x_ls_design.clone(),
             c_mm,
             c_ml,
             c_ll,
@@ -939,8 +987,8 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         // carry d²(2κm)[u,v], exactly as the dense path does. Otherwise the
         // analytic outer Hessian is not the second derivative of its value.
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
-            self.xmu.clone(),
-            self.x_ls.clone(),
+            self.xmu_design.clone(),
+            self.x_ls_design.clone(),
             c_mm,
             c_ml,
             c_ll,
@@ -956,15 +1004,15 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
 /// assembly emitted by `gaussian_joint_hessian_from_designs` (Gaussian path)
 /// and the `xt_diag_*` block writers (binomial path).
 pub(crate) fn make_two_block_row_coeff_operator(
-    x_a: Arc<Array2<f64>>,
-    x_b: Arc<Array2<f64>>,
+    x_a: SharedDesign,
+    x_b: SharedDesign,
     c_aa: Array1<f64>,
     c_ab: Array1<f64>,
     c_bb: Array1<f64>,
     nrows: usize,
 ) -> RowCoeffOperator {
-    let pa = x_a.ncols();
-    let pb = x_b.ncols();
+    let pa = x_a.matrix.ncols();
+    let pb = x_b.matrix.ncols();
     RowCoeffOperator::from_directions(
         vec![pa, pb],
         vec![(0, x_a), (1, x_b)],
@@ -1006,6 +1054,123 @@ pub(crate) fn make_two_block_design_row_coeff_operator(
 }
 
 #[cfg(test)]
+mod pair_gram_identity_tests {
+    use super::*;
+
+    fn design(n: usize, p: usize, salt: usize) -> Array2<f64> {
+        Array2::from_shape_fn((n, p), |(i, j)| ((i * 7 + j * 3 + salt * 5) % 11) as f64 - 5.0)
+    }
+
+    fn operator(x_a: SharedDesign, x_b: SharedDesign, n: usize, scale: f64) -> RowCoeffOperator {
+        let widths = vec![x_a.matrix.ncols(), x_b.matrix.ncols()];
+        RowCoeffOperator::from_directions(
+            widths,
+            vec![(0, x_a), (1, x_b)],
+            vec![
+                (0, 0, Array1::from_elem(n, scale)),
+                (0, 1, Array1::from_elem(n, 0.5 * scale)),
+                (1, 1, Array1::from_elem(n, 2.0 * scale)),
+            ],
+            n,
+        )
+    }
+
+    /// A pair-gram table depends only on the designs and the factor, so every operator one owner
+    /// builds shares one identity, whatever its row coefficients. Two owners of identical content
+    /// mint distinct identities, and miss each other's tables. And an owner built right after
+    /// another is dropped never inherits the dropped owner's identity, even when the allocator
+    /// hands it the freed memory: an allocation-address key fails this last check whenever that
+    /// memory is reused (#2940, #2515).
+    #[test]
+    fn pair_gram_identity_follows_the_owner_not_the_address() {
+        let n = 9;
+        let x_a = SharedDesign::new(design(n, 3, 1));
+        let x_b = SharedDesign::new(design(n, 2, 2));
+        let first = operator(x_a.clone(), x_b.clone(), n, 1.0);
+        let second = operator(x_a.clone(), x_b.clone(), n, -3.0);
+        assert_eq!(
+            first.projected_pair_gram_cache_id(),
+            second.projected_pair_gram_cache_id(),
+            "operators of one owner must share one pair-gram identity"
+        );
+        let twin = operator(
+            SharedDesign::new(design(n, 3, 1)),
+            SharedDesign::new(design(n, 2, 2)),
+            n,
+            1.0,
+        );
+        assert_ne!(
+            first.projected_pair_gram_cache_id(),
+            twin.projected_pair_gram_cache_id(),
+            "two owners of identical content must mint distinct identities"
+        );
+        // Every dropped owner's identity is recorded: freed blocks of one size class can come
+        // back in a different channel order, so reuse may surface an owner or two later.
+        let mut seen = std::collections::HashSet::new();
+        assert!(seen.insert(first.projected_pair_gram_cache_id()));
+        assert!(seen.insert(twin.projected_pair_gram_cache_id()));
+        drop(first);
+        drop(second);
+        drop(twin);
+        drop(x_a);
+        drop(x_b);
+        for salt in 3..1003 {
+            let other = operator(
+                SharedDesign::new(design(n, 3, salt)),
+                SharedDesign::new(design(n, 2, salt + 1)),
+                n,
+                1.0,
+            );
+            let identity = other.projected_pair_gram_cache_id();
+            assert!(
+                seen.insert(identity),
+                "owner {salt} inherited the identity of a dropped owner"
+            );
+            drop(other);
+        }
+    }
+
+    /// The pin an allocation-address key fails deterministically: trace through a cache that
+    /// outlives the operator, then change the design in place at the same address. The rebuilt
+    /// operator's cached trace must be the fresh trace, never the stale table's (#2940).
+    #[test]
+    fn a_design_changed_at_the_same_address_never_reads_the_old_pair_gram_table() {
+        use gam_problem::HyperOperator;
+        let n = 9;
+        let cache = gam_problem::ProjectedFactorCache::default();
+        let factor = Array2::from_shape_fn((5, 2), |(i, j)| ((i + 2 * j) % 5) as f64 - 2.0);
+        let x_b = SharedDesign::new(design(n, 2, 2));
+        let mut x_a = Arc::new(design(n, 3, 1));
+        let original = operator(SharedDesign::from_arc(x_a.clone()), x_b.clone(), n, 1.0);
+        let before = original.trace_projected_factor_cached(&factor, &cache);
+        drop(original);
+        let address = Arc::as_ptr(&x_a);
+        Arc::get_mut(&mut x_a)
+            .expect("dropping the operator leaves the design uniquely owned")
+            .mapv_inplace(|value| 2.0 * value + 1.0);
+        assert_eq!(
+            Arc::as_ptr(&x_a),
+            address,
+            "the control must change the design at the same address"
+        );
+        let rebuilt = operator(SharedDesign::from_arc(x_a.clone()), x_b.clone(), n, 1.0);
+        let fresh = rebuilt.trace_projected_factor(&factor);
+        let cached = rebuilt.trace_projected_factor_cached(&factor, &cache);
+        assert_ne!(
+            before.to_bits(),
+            fresh.to_bits(),
+            "the control needs the changed design to change the trace"
+        );
+        assert_eq!(
+            cached.to_bits(),
+            fresh.to_bits(),
+            "the rebuilt operator read a stale pair-gram table: cached {cached}, fresh {fresh}, \
+             before {before}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod diagonal_exactness_tests {
     use super::*;
     use gam_problem::HyperOperator;
@@ -1021,9 +1186,9 @@ mod diagonal_exactness_tests {
         let mix = |i: usize, j: usize, salt: usize| -> f64 {
             (((i * 31 + j * 17 + salt * 101) % 97) as f64 / 48.5) - 1.0
         };
-        let x_eta = std::sync::Arc::new(Array2::from_shape_fn((n, p0), |(i, j)| mix(i, j, 1)));
-        let basis = std::sync::Arc::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 2)));
-        let basis_d1 = std::sync::Arc::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 3)));
+        let x_eta = SharedDesign::new(Array2::from_shape_fn((n, p0), |(i, j)| mix(i, j, 1)));
+        let basis = SharedDesign::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 2)));
+        let basis_d1 = SharedDesign::new(Array2::from_shape_fn((n, p1), |(i, j)| mix(i, j, 3)));
         let c0 = Array1::from_shape_fn(n, |i| 0.4 + mix(i, 0, 4).abs());
         let c1 = Array1::from_shape_fn(n, |i| mix(i, 0, 5));
         let c2 = Array1::from_shape_fn(n, |i| mix(i, 0, 6));
@@ -1084,8 +1249,8 @@ mod to_dense_direct_1720_tests {
     /// layout `GaussianLocationScaleHessianWorkspace` builds for the outer
     /// Hessian correction.
     fn build_op(n: usize, pa: usize, pb: usize) -> RowCoeffOperator {
-        let x_a = Arc::new(Array2::from_shape_fn((n, pa), |(i, j)| pseudo(i, j, 1)));
-        let x_b = Arc::new(Array2::from_shape_fn((n, pb), |(i, j)| pseudo(i, j, 2)));
+        let x_a = SharedDesign::new(Array2::from_shape_fn((n, pa), |(i, j)| pseudo(i, j, 1)));
+        let x_b = SharedDesign::new(Array2::from_shape_fn((n, pb), |(i, j)| pseudo(i, j, 2)));
         let c_aa = Array1::from_shape_fn(n, |i| 0.5 + 0.25 * pseudo(i, 0, 3).abs());
         let c_ab = Array1::from_shape_fn(n, |i| pseudo(i, 0, 4));
         let c_bb = Array1::from_shape_fn(n, |i| 0.5 + 0.25 * pseudo(i, 0, 5).abs());

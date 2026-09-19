@@ -25,9 +25,10 @@
 //! fewer atoms) than the pure-linear shatter.
 //!
 //! This is a HELD-OUT measurement: the dictionary is fit on a TRAIN split and the
-//! EV is measured on a disjoint TEST split, evaluated with the **frozen** trained
-//! decoder (each trained curved/linear atom re-seated onto the test-row latent
-//! coordinates; the decoder coefficients B_k are never re-fit on the test rows).
+//! EV is measured on a disjoint TEST split through the production frozen-decoder OOS
+//! entry: each test row's coordinates and assignment masses are encoded from the test
+//! data alone under the trained decoders and terminal rho, and B_k is never re-fit on
+//! the test rows.
 //! That makes EV(K) a genuine generalization curve, not an in-sample fit
 //! statistic — the climb-then-flatten shape is the real bias/variance frontier,
 //! not memorization.
@@ -49,7 +50,10 @@ use gam::terms::{
     sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
     sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
     sae::manifold::SaeManifoldOuterObjective, sae::manifold::SaeManifoldRho,
-    sae::manifold::SaeManifoldTerm,
+    sae::manifold::SaeManifoldTerm, sae::manifold::SaeAtomGeometryPlan,
+    sae::manifold::SaeBasisResolution, sae::manifold::SaeOosAssignmentKind,
+    sae::manifold::SaeOosAtomSpec, sae::manifold::SaeOosRegularization, sae::manifold::SaeOosRequest,
+    sae::manifold::SaeReferenceMetricPlan, sae::manifold::run_sae_manifold_oos,
 };
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3, s};
 use std::sync::Arc;
@@ -464,7 +468,7 @@ fn run_production_fit(
     let init_rho = SaeManifoldRho::new(
         SPARSITY.ln(),
         SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(0); k_atoms],
+        vec![Array1::<f64>::zeros(1); k_atoms],
     );
     let init_rho = init_rho.for_assignment(&term.assignment);
     let init_rho_flat = init_rho
@@ -494,95 +498,72 @@ fn run_production_fit(
     (fitted_term, rho)
 }
 
-/// Held-out reconstruction EV: re-seat the FITTED atoms (decoder coefficients
-/// frozen) onto the TEST-row latent coordinates and reconstruct, measuring EV on
-/// the test rows. The decoder is never re-fit on test rows — only the per-row
-/// assignment masses are seeded (the same cold residual-energy ordered independent Beta--Bernoulli routing the
-/// production predict path uses), so this is a genuine generalization measurement
-/// of the trained DECODER.
+/// Held-out reconstruction EV through the production frozen-decoder OOS entry
+/// (`run_sae_manifold_oos`). Each TEST row's coordinates and assignment masses are
+/// encoded from `z_test` alone, under the TRAINED decoders and terminal rho, and
+/// the rows are then reconstructed. Nothing is seeded from the planted test angles,
+/// so the measurement does not depend on the fitted chart's gauge. A planted-angle
+/// map assumed the fitted phase equals the seed phase, and a coordinate prior with
+/// a fixed origin need not keep it (#2822). The decoders are never re-fit on test
+/// rows, so EV(K) is the trained dictionary's encode+decode generalization.
 ///
-/// HONESTY CAVEAT (stated, not hidden): the curved-atom test latent coordinates
-/// are seeded from the planted `theta_test` (plus the same fixed per-slot offset
-/// the train arm uses), not encoded from `z_test` alone — coordinate *recovery*
-/// is deliberately not what this frontier tests, and seeding both arms from the
-/// same planted angles keeps the hybrid-vs-linear contrast apples-to-apples. What
-/// IS held out is the decoder `B_k`: it is frozen from the TRAIN fit and never
-/// sees a test row, so EV(K) measures how well the trained decoder curve
-/// generalizes to fresh draws at known coordinates. The linear-bulk coordinate is
-/// genuinely encoded from `z_test` (projection onto the bulk direction), so the
-/// bulk arm is a full encode+decode generalization; only the curved coordinate is
-/// oracle-seeded.
+/// A trained linear slot is a degree-1 patch. Its persisted plan is the production
+/// degree-1 affine atom (`Linear`, `Polynomial { degree: 1 }`), which builds the
+/// same `EuclideanPatchEvaluator::new(1, 1)` basis the train fit used.
 fn held_out_ev(
     fitted: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
     slots: &[Slot],
-    corpus: &Corpus,
-    theta_test: &[Vec<f64>],
     z_test: &Array2<f64>,
-    n_test: usize,
 ) -> f64 {
-    let k_atoms = slots.len();
-    let basis_sizes: Vec<usize> = slots.iter().map(|s| s.kind.basis_size()).collect();
-    let m_max = basis_sizes.iter().copied().max().unwrap();
-
-    // Test-row geometry (coords + phi) for each slot.
-    let (coords_k, phi_k, jet_k, _bv) =
-        seed_slot_geometry(slots, corpus, theta_test, z_test.view(), n_test);
-
-    // Build held-out atoms: test-row phi/jet, but the FROZEN trained decoder
-    // coefficients B_k. The decoded curve g_k(t) = Φ_test(t) B_k^trained is the
-    // trained atom evaluated at the test coordinates.
-    let mut atoms = Vec::with_capacity(k_atoms);
-    let mut basis_values = Array3::<f64>::zeros((k_atoms, n_test, m_max));
-    for (ai, slot) in slots.iter().enumerate() {
-        let m_k = slot.kind.basis_size();
-        let b = fitted.atoms[ai].decoder_coefficients().clone();
-        for row in 0..n_test {
-            for c in 0..m_k {
-                basis_values[[ai, row, c]] = phi_k[ai][[row, c]];
+    let atoms = slots
+        .iter()
+        .enumerate()
+        .map(|(ai, slot)| {
+            let geometry = match slot.kind {
+                Kind::Circle => SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    SaeBasisResolution::PeriodicHarmonics {
+                        order: (M_CIRCLE - 1) / 2,
+                    },
+                    SaeReferenceMetricPlan::UnitCircle,
+                ),
+                Kind::Linear => SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Linear,
+                    1,
+                    SaeBasisResolution::Polynomial { degree: 1 },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                ),
             }
-        }
-        let atom = SaeManifoldAtom::new_with_provided_function_gram(
-            slot_name(slot, ai),
-            slot.kind.basis_kind(),
-            1,
-            phi_k[ai].clone(),
-            jet_k[ai].clone(),
-            b,
-            Array2::<f64>::eye(m_k),
-        )
-        .unwrap()
-        .with_basis_evaluator(slot.kind.evaluator());
-        atoms.push(atom);
-    }
-
-    // Seed the test-row assignment from the residual energy of the FROZEN
-    // decoded curves (cold routing only — no decoder re-fit).
-    let logits = residual_seed_logits(
-        basis_values.view(),
-        &basis_sizes,
-        z_test.view(),
-        RESIDUAL_SEED_GAIN,
-    );
-    let manifolds: Vec<LatentManifold> = slots.iter().map(|s| s.kind.manifold()).collect();
-    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        logits,
-        coords_k,
-        manifolds,
-        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
-    )
-    .unwrap();
-    let test_term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-    reconstruction_ev(z_test, &test_term.fitted())
-}
-
-fn slot_name(slot: &Slot, ai: usize) -> String {
-    format!(
-        "{}_{ai}",
-        match slot.kind {
-            Kind::Circle => "circle",
-            Kind::Linear => "linear",
-        }
-    )
+            .expect("each slot kind names a valid geometry plan");
+            SaeOosAtomSpec::new(geometry, fitted.atoms[ai].decoder_coefficients().clone())
+                .expect("the trained decoder has its plan's basis width")
+        })
+        .collect();
+    let report = run_sae_manifold_oos(SaeOosRequest {
+        target: z_test.clone(),
+        atoms,
+        assignment: SaeOosAssignmentKind::OrderedBetaBernoulli {
+            learnable_alpha: false,
+        },
+        alpha: ALPHA,
+        tau: TAU,
+        regularization: SaeOosRegularization {
+            log_lambda_sparse: rho.log_lambda_sparse,
+            log_lambda_smooth: rho.log_lambda_smooth.clone(),
+            log_ard: rho.log_ard.iter().map(|block| block.to_vec()).collect(),
+        },
+        max_iter: INNER_MAX_ITER,
+        learning_rate: LEARNING_RATE,
+        ridge_ext_coord: RIDGE_EXT_COORD,
+        initial_logits: None,
+        initial_coords: None,
+        top_k: None,
+        hybrid_linear_images: Vec::new(),
+    })
+    .expect("the frozen-decoder OOS encode runs on the test split");
+    reconstruction_ev(z_test, &report.fitted)
 }
 
 /// Reconstruction explained variance `1 − SSR/SST` (per-column centered),
@@ -702,7 +683,7 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
 
     let corpus = Corpus::new(k_curved, linear_bulk, p);
     let (z_train, theta_train) = corpus.draw(n_train, 0x1026_0001);
-    let (z_test, theta_test) = corpus.draw(n_test, 0x1026_BEEF);
+    let (z_test, _) = corpus.draw(n_test, 0x1026_BEEF);
 
     // The K ladder: powers of two through 2·k_curved so we straddle the
     // structured rank (climb region: K < k_curved; flatten region: K >= k_curved).
@@ -713,7 +694,7 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
 
     for &k in &ks {
         let hslots = hybrid_slots(k, &corpus);
-        let (hfit, _hrho) = run_production_fit(
+        let (hfit, hrho) = run_production_fit(
             &hslots,
             &corpus,
             &theta_train,
@@ -721,11 +702,11 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
             n_train,
             &format!("frontier-hybrid-K{k}"),
         );
-        let h_ev = held_out_ev(&hfit, &hslots, &corpus, &theta_test, &z_test, n_test);
+        let h_ev = held_out_ev(&hfit, &hrho, &hslots, &z_test);
         hybrid_ev.push((k, h_ev));
 
         let lslots = linear_slots(k, &corpus);
-        let (lfit, _lrho) = run_production_fit(
+        let (lfit, lrho) = run_production_fit(
             &lslots,
             &corpus,
             &theta_train,
@@ -733,7 +714,7 @@ fn ev_vs_k_frontier_discriminates_curved_from_linear_and_hybrid_dominates() {
             n_train,
             &format!("frontier-linear-K{k}"),
         );
-        let l_ev = held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test);
+        let l_ev = held_out_ev(&lfit, &lrho, &lslots, &z_test);
         linear_ev.push((k, l_ev));
     }
 
@@ -921,7 +902,7 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
 
     let corpus = Corpus::new(k_curved, linear_bulk, p);
     let (z_train, theta_train) = corpus.draw(n_train, 0x1026_F1A7);
-    let (z_test, theta_test) = corpus.draw(n_test, 0x1026_DEAD);
+    let (z_test, _) = corpus.draw(n_test, 0x1026_DEAD);
 
     let ks = [1usize, 2, 4, 8];
     let mut circle_ev: Vec<(usize, f64)> = Vec::new();
@@ -929,7 +910,7 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
 
     for &k in &ks {
         let cslots = bulk_slots(k, &corpus, Kind::Circle);
-        let (cfit, _) = run_production_fit(
+        let (cfit, crho) = run_production_fit(
             &cslots,
             &corpus,
             &theta_train,
@@ -939,11 +920,11 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
         );
         circle_ev.push((
             k,
-            held_out_ev(&cfit, &cslots, &corpus, &theta_test, &z_test, n_test),
+            held_out_ev(&cfit, &crho, &cslots, &z_test),
         ));
 
         let lslots = bulk_slots(k, &corpus, Kind::Linear);
-        let (lfit, _) = run_production_fit(
+        let (lfit, lrho) = run_production_fit(
             &lslots,
             &corpus,
             &theta_train,
@@ -953,7 +934,7 @@ fn ev_vs_k_frontier_does_not_fire_on_unstructured_linear_corpus() {
         );
         linear_ev.push((
             k,
-            held_out_ev(&lfit, &lslots, &corpus, &theta_test, &z_test, n_test),
+            held_out_ev(&lfit, &lrho, &lslots, &z_test),
         ));
     }
 

@@ -133,3 +133,37 @@ def test_fit_refuses_config_spelling_before_fitting() -> None:
     data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
     with pytest.raises(ValueError, match=r"duplicates the noise_formula= keyword"):
         gamfit.fit(data, "y ~ x", family="gaussian", config={"noise_formula": "x"})
+
+
+def test_solver_tolerances_are_not_request_options() -> None:
+    """Solver tolerances are derived (gam SPEC 18-23), never requested.
+
+    The request document refuses the keys by name, so ``config`` cannot carry
+    one either.
+    """
+
+    pytest.importorskip("gamfit._rust")
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    for key in ("outer_tol", "inner_tol"):
+        with pytest.raises(Exception, match=rf"unknown field `{key}`"):
+            gamfit.fit(data, "y ~ x", family="gaussian", config={key: 1e-8})
+
+
+def test_warm_start_from_takes_a_fitted_model() -> None:
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    with pytest.raises(TypeError, match=r"warm_start_from takes a fitted gamfit.Model"):
+        gamfit.fit(data, "y ~ x", family="gaussian", warm_start_from=object())
+
+
+def test_warm_start_from_a_model_with_no_certified_point_is_refused() -> None:
+    """A standard GAM records no custom-family outer point to resume from.
+
+    The refusal comes from the Rust side, so it proves the model crossed the
+    wire and was read.
+    """
+
+    pytest.importorskip("gamfit._rust")
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    model = gamfit.fit(data, "y ~ x", family="gaussian")
+    with pytest.raises(Exception, match=r"warm_start_from"):
+        gamfit.fit(data, "y ~ x", family="gaussian", warm_start_from=model)

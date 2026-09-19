@@ -120,6 +120,19 @@ pub enum BasisError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// A smooth term's block, placed in its collection's frozen gauge, is not
+    /// orthogonal to the collection's constraint block at the relative bar the
+    /// placement is held to. At a trial length scale where the term's block is
+    /// numerically inside the constraint span, the placement cannot resolve it.
+    #[error(
+        "smooth orthogonality residual too large for term '{term}': {residual:.3e} > {tolerance:.1e}"
+    )]
+    CollectionGaugeNotOrthogonal {
+        term: String,
+        residual: f64,
+        tolerance: f64,
+    },
+
     #[error(
         "Radial basis derivative is undefined at center collision (r = 0) for {kernel} \
          with dim = {dim}, m = {m}: {message}. The first/second derivative of the \
@@ -236,6 +249,7 @@ impl BasisError {
             | Self::DimensionMismatch(_)
             | Self::IndefinitePenalty { .. }
             | Self::InvalidInput(_)
+            | Self::CollectionGaugeNotOrthogonal { .. }
             | Self::DegenerateAtCollision { .. }
             | Self::Other(_) => None,
         }

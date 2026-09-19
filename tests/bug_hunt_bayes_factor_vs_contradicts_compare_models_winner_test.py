@@ -1,6 +1,7 @@
 """Regression test for issue #2079.
 
-``Model.evidence`` and ``Model.bayes_factor_vs`` document AGREEMENT with
+``Model.evidence`` (now ``Model.conditional_aic``, #2946) and ``Model.bayes_factor_vs``
+(now ``Model.evidence_ratio_vs``) document AGREEMENT with
 ``gamfit.compare_models``, but historically they contradicted it. ``compare_models``
 ranks on an Occam-penalised conditional AIC (``-2*loglik + 2*edf``), while
 ``bayes_factor_vs`` / ``evidence`` used the RAW REML/LAML score. On a model
@@ -39,6 +40,6 @@ def test_bayes_factor_vs_and_evidence_agree_with_compare_models_winner():
 
     # If compare_models picks `small`, then the augmented model must NOT be
     # better supported than `small`, and `small` must have the lower (better)
-    # evidence cost. Before the fix these contradicted the declared winner.
+    # conditional-AIC cost. Before the fix these contradicted the declared winner.
     assert big.evidence_ratio_vs(small) <= 1.0
-    assert small.evidence <= big.evidence
+    assert small.conditional_aic <= big.conditional_aic

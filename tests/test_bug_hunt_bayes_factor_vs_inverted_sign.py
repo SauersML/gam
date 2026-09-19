@@ -11,7 +11,7 @@ Root cause: ``reml_score`` is a minimised cost (lower = better marginal
 likelihood). The Python FFI computed ``self.reml_score - other.reml_score``,
 which is negative when ``self`` is the better (lower-cost) model, so its
 exponential fell below 1. The comparator's convention is the opposite
-subtraction. Both now route through ``evidence::log_bayes_factor``.
+subtraction. Both now route through ``evidence::criterion_gap``.
 
 This test anchors that ``s(x)`` is the better fit, then asserts the Bayes
 factor direction and that ``bayes_factor_vs`` agrees with ``compare_models``.
@@ -39,9 +39,9 @@ def _fit_pair() -> tuple["gamfit.Model", "gamfit.Model"]:
 def test_bayes_factor_vs_favours_better_model_not_worse() -> None:
     m_sx, m_null = _fit_pair()
 
-    # Anchor: the smooth model is the better fit. `evidence` is a minimised
+    # Anchor: the smooth model is the better fit. `conditional_aic` is a minimised
     # cost, so the better model has the *lower* value.
-    assert m_sx.evidence < m_null.evidence
+    assert m_sx.conditional_aic < m_null.conditional_aic
 
     # And `compare_models` agrees the smooth model wins.
     comparison = gamfit.compare_models([m_sx, m_null], names=["sx", "null"])

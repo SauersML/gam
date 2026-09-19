@@ -1672,8 +1672,76 @@ impl JointJeffreysExplicitMixedTraceWeights {
 }
 
 impl JointJeffreysPlan {
-    /// Build the exact reduced-information spectrum and conditioning gate once.
+    /// Build the exact reduced-information spectrum and conditioning gate once, for a
+    /// consumer that PRICES the Jeffreys term.
+    ///
+    /// A non-empty span on which no reduced eigenvalue is resolved from zero is refused
+    /// (#979). There the reduced information is indistinguishable from the zero matrix, so
+    /// the term has no information to price: every eigenvalue sits on the floor's linear
+    /// branch, the value is `½·m·(ln floor − 1)` and the score is `1/floor` times the
+    /// information's motion, both set by the floor constant rather than by the data. The
+    /// refusal reaches a custom-family caller as a trial-point refusal, so the outer search
+    /// steps away from that ρ; a seed that refuses refuses the fit.
+    ///
+    /// The resolution band is the eigensolve's own band,
+    /// [`gam_linalg::roundoff::symmetric_spectrum_rounding_band`], plus the rounding the
+    /// formation of `H_id = Z_Jᵀ·(H·Z_J)` left in the matrix it decomposes. Each of the
+    /// two products is an inner product of length `p` and the symmetrization averages
+    /// two computed entries, so every entry is rounded along `2p + 1` operations and
+    /// (Higham, *ASNA* 2nd ed., §3.5)
+    ///
+    /// ```text
+    /// |fl(H_id) − H_id|_ij  ≤  γ_{2p+1} · Σ_ab |z_ai|·|H_ab|·|z_bj|  ≤  γ_{2p+1} · M · ‖z_i‖₁·‖z_j‖₁,
+    /// ```
+    ///
+    /// where `M` is the largest `|H_ab|` with both `a` and `b` in the support of `Z_J`
+    /// (entries outside it multiply a zero `z` and never enter `H_id`). The last bound is
+    /// `M` times the rank-one matrix `u uᵀ` with `u_i = ‖z_i‖₁`, whose Frobenius norm is
+    /// `Σ_i ‖z_i‖₁²`, and the spectral norm of the error is at most that. By Weyl an
+    /// eigenvalue within `γ_{2p+1}·M·Σ_i ‖z_i‖₁²` of zero is not resolved by the formation.
+    /// It costs `O(p·m + |support|²)`, against the `O(p²·m)` of the entrywise bound.
     pub fn prepare(h_joint: ArrayView2<'_, f64>, z_j: ArrayView2<'_, f64>) -> Result<Self, String> {
+        let plan = Self::diagnose(h_joint, z_j)?;
+        if plan.reduced_dim == 0 {
+            return Ok(plan);
+        }
+        let support: Vec<usize> = (0..z_j.nrows())
+            .filter(|&row| z_j.row(row).iter().any(|&value| value != 0.0))
+            .collect();
+        let max_abs_h = support
+            .iter()
+            .flat_map(|&a| support.iter().map(move |&b| h_joint[[a, b]].abs()))
+            .fold(0.0_f64, f64::max);
+        let column_l1_squares = z_j
+            .columns()
+            .into_iter()
+            .map(|column| column.iter().map(|value| value.abs()).sum::<f64>().powi(2))
+            .sum::<f64>();
+        let formation_band = gam_linalg::roundoff::accumulation_growth(2 * h_joint.nrows() + 1)
+            * max_abs_h
+            * column_l1_squares;
+        let resolution_band =
+            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&plan.evals.to_vec())
+                + formation_band;
+        if plan.evals.iter().all(|&lambda| lambda.abs() <= resolution_band) {
+            return Err(format!(
+                "joint_jeffreys_term: the reduced information on the {}-dimensional Jeffreys \
+                 span has no eigenvalue resolved from zero (extrema [{:e}, {:e}] within the \
+                 rounding band {:e} of its formation and eigensolve), so the term has no \
+                 information to price",
+                plan.reduced_dim, plan.lambda_min, plan.lambda_max, resolution_band,
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// The same spectrum as [`Self::prepare`] without its refusal of an unresolved
+    /// reduced information, for a consumer that reads only the identification verdicts
+    /// ([`Self::information_extrema`], [`Self::is_under_identified`],
+    /// [`Self::reduced_information_is_singular`]) and never prices the term. The
+    /// multinomial separation certificate is one: an information indistinguishable from
+    /// zero is the singular, under-identified answer it exists to report.
+    pub fn diagnose(h_joint: ArrayView2<'_, f64>, z_j: ArrayView2<'_, f64>) -> Result<Self, String> {
         let p = h_joint.nrows();
         if h_joint.ncols() != p {
             return Err(format!(
@@ -1754,6 +1822,33 @@ impl JointJeffreysPlan {
     /// (#1082).
     pub fn ambient_eigenbasis(&self) -> Array2<f64> {
         self.z_j.dot(&self.evecs)
+    }
+
+    /// `K = V·diag(g'(λ_i))·Vᵀ` with `g' = floored_inverse`: the floored reduced inverse,
+    /// the `H_id`-gradient of the ungated `U = ½ Σ g(λ_i)` up to the ½, on the span's own
+    /// basis. Both completion forms contract it, `−½·G·⟨Z_J K Z_Jᵀ, H''⟩`.
+    pub fn floored_reduced_inverse(&self) -> Array2<f64> {
+        let m = self.reduced_dim;
+        let mut k_reduced = Array2::<f64>::zeros((m, m));
+        for eig in 0..m {
+            let weight = floored_inverse(self.evals[eig], self.floor);
+            if weight == 0.0 {
+                continue;
+            }
+            for row in 0..m {
+                let wr = weight * self.evecs[[row, eig]];
+                for col in 0..m {
+                    k_reduced[[row, col]] += wr * self.evecs[[col, eig]];
+                }
+            }
+        }
+        k_reduced
+    }
+
+    /// `Z_J·K·Z_Jᵀ`, [`Self::floored_reduced_inverse`] in coefficient space: the trace
+    /// weight a family's contracted completion hook reads.
+    pub fn contracted_trace_weight(&self) -> Array2<f64> {
+        self.z_j.dot(&self.floored_reduced_inverse()).dot(&self.z_j.t())
     }
 
     /// `Φ = G · ½ Σ_i g(λ_i; floor)` — the gated Jeffreys value this spectrum
@@ -3075,65 +3170,22 @@ where
 }
 
 /// The conditioning-gate weight `G` and the floored reduced trace weight
-/// `K + (2/G)·extra_reduced_weight` that both completion forms contract. `None` when the
-/// completion vanishes: an empty span or a closed gate.
+/// `K + (2/G)·extra_reduced_weight` that both completion forms contract, read off the one
+/// [`JointJeffreysPlan`] spectrum. `None` when the completion vanishes: an empty span or a
+/// closed gate.
 fn joint_jeffreys_completion_reduced_weight(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     motion: Option<&JointJeffreysHessianMotion>,
 ) -> Result<Option<(f64, Array2<f64>)>, String> {
     let p = h_joint.nrows();
-    if h_joint.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_second_order_completion: H must be square, got {}x{}",
-            h_joint.nrows(),
-            h_joint.ncols()
-        ));
-    }
-    if z_j.nrows() != p {
-        return Err(format!(
-            "joint_jeffreys_second_order_completion: Z_J has {} rows, expected {p}",
-            z_j.nrows()
-        ));
-    }
-    let m = z_j.ncols();
-    if m == 0 {
+    let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+    if !plan.is_active() {
         return Ok(None);
     }
-
-    let hz = h_joint.dot(&z_j);
-    let h_id = z_j.t().dot(&hz);
-    let mut h_id_sym = h_id;
-    symmetrize_contiguous(&mut h_id_sym);
-    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_second_order_completion: reduced-information eigendecomposition failed: {e}")
-    })?;
-    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-    let gate_weight = {
-        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        conditioning_gate_weight(lambda_min, lambda_max)
-    };
-    if gate_weight == 0.0 {
-        return Ok(None);
-    }
-    let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
-    let mut inv_diag = Array1::<f64>::zeros(m);
-    for (i, &lam) in evals.iter().enumerate() {
-        inv_diag[i] = floored_inverse(lam, floor);
-    }
-    let mut k_reduced = Array2::<f64>::zeros((m, m));
-    for eig in 0..m {
-        let weight = inv_diag[eig];
-        if weight == 0.0 {
-            continue;
-        }
-        for row in 0..m {
-            let wr = weight * evecs[[row, eig]];
-            for col in 0..m {
-                k_reduced[[row, col]] += wr * evecs[[col, eig]];
-            }
-        }
-    }
+    let m = plan.reduced_dim;
+    let gate_weight = plan.gate_weight;
+    let k_reduced = plan.floored_reduced_inverse();
 
     let reduced_weight = match motion {
         Some(motion) => {
@@ -5921,7 +5973,7 @@ mod tests {
             let mut h = Array2::<f64>::zeros((2, 2));
             h[[0, 0]] = lambda_min;
             h[[1, 1]] = lambda_max;
-            JointJeffreysPlan::prepare(h.view(), Array2::<f64>::eye(2).view())
+            JointJeffreysPlan::diagnose(h.view(), Array2::<f64>::eye(2).view())
                 .expect("diagonal reduced information")
         };
 
@@ -5962,9 +6014,69 @@ mod tests {
             "the absolute arm must not be able to clear a relatively singular spectrum"
         );
 
-        // A degenerate spectrum is under-identified, not silently identified.
+        // A degenerate spectrum is under-identified, not silently identified, and it is
+        // singular. It has no information to price, so the priced plan refuses it (#979).
         let degenerate = plan_at(0.0, 0.0);
         assert!(degenerate.is_under_identified() && degenerate.is_active());
+        assert!(degenerate.reduced_information_is_singular());
+        let priced = JointJeffreysPlan::prepare(
+            Array2::<f64>::zeros((2, 2)).view(),
+            Array2::<f64>::eye(2).view(),
+        );
+        assert!(
+            priced.is_err_and(|reason| reason.contains("no eigenvalue resolved from zero")),
+            "an all-zero reduced information must refuse the priced plan"
+        );
+    }
+
+    /// #979: the priced plan refuses a reduced information that no eigenvalue resolves from
+    /// zero, measured against its own formation band, and prices every resolved one however
+    /// small its scale.
+    ///
+    /// - Exact zero on the span, whatever the information off it: refused.
+    /// - A span along which `H` cancels to zero in exact arithmetic, with `|H|` of order
+    ///   `1e8`: the formation band `γ_5·max|H|·‖z‖₁²` is about `1e-7`, and whatever the
+    ///   rounding leaves inside it is refused. The positive control scales the same
+    ///   direction's information to `1e-3`, far outside that band, and it is priced.
+    /// - The resolved-but-tiny census rows (the `_2894` fixture's spectrum sits near
+    ///   `5e-179`, job 1219871) are priced: their band scales with their own entries.
+    #[test]
+    pub(crate) fn an_unresolved_reduced_information_refuses_the_priced_plan_979() {
+        let refused = |h: Array2<f64>, z: Array2<f64>| {
+            let reason = JointJeffreysPlan::prepare(h.view(), z.view())
+                .err()
+                .expect("an unresolved reduced information must refuse the priced plan");
+            assert!(reason.contains("no eigenvalue resolved from zero"), "{reason}");
+            let diagnosed = JointJeffreysPlan::diagnose(h.view(), z.view())
+                .expect("the diagnostic plan never refuses on resolution");
+            assert!(diagnosed.reduced_information_is_singular());
+        };
+        refused(array![[0.0, 0.0], [0.0, 1.0e6]], array![[1.0], [0.0]]);
+
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let cancelling = array![[1.0e8, -1.0e8], [-1.0e8, 1.0e8]];
+        refused(cancelling.clone(), array![[half], [half]]);
+        let mut informative = cancelling;
+        informative[[0, 0]] += 2.0e-3;
+        let priced = JointJeffreysPlan::prepare(informative.view(), array![[half], [half]].view())
+            .expect("an information of 1e-3 far outside a 1e-7 band is priced");
+        let (lambda_min, lambda_max) = priced.information_extrema();
+        assert!(lambda_min > 0.0 && lambda_max < 2.0e-3, "extrema [{lambda_min:e}, {lambda_max:e}]");
+
+        let tiny = array![[5.0e-179, 0.0], [0.0, 2.4e-179]];
+        let priced_tiny = JointJeffreysPlan::prepare(tiny.view(), Array2::<f64>::eye(2).view())
+            .expect("a resolved spectrum is priced at any scale");
+        assert!(priced_tiny.is_active());
+
+        // The band reads only the entries the span's support reaches: a small information
+        // on one coordinate is priced beside a data-rich coordinate the span never touches,
+        // whose `1e8` would put a whole-matrix band near `5e-8`, above the `1e-9` priced.
+        let block = JointJeffreysPlan::prepare(
+            array![[1.0e-9, 0.0], [0.0, 1.0e8]].view(),
+            array![[1.0], [0.0]].view(),
+        )
+        .expect("a resolved span beside an unread data-rich coordinate is priced");
+        assert_eq!(block.information_extrema(), (1.0e-9, 1.0e-9));
     }
 
     /// `jeffreys_subspace_from_penalty` returns `ker(S)`, and its three regimes

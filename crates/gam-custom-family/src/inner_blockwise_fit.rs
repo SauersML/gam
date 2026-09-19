@@ -100,6 +100,10 @@ pub(crate) struct ExactJointModeCurvatureCertificate {
     /// can be a mode; the decrements say how much the local model still promises.
     pub(crate) newton_decrement: f64,
     pub(crate) weakly_identified_decrement: f64,
+    /// The rounding band of each decrement, from the rounding of the
+    /// stationarity system it was formed from (#2977). The settlement raises it
+    /// to the objective's measured resolution.
+    pub(crate) decrement_bands: DecrementResolution,
 }
 
 impl ExactJointModeCurvatureCertificate {
@@ -420,6 +424,96 @@ fn generalized_trust_region_reduced_step(
     })
 }
 
+/// Passes of [`restore_rounding_level_violations`]. Pass `k` steps each row
+/// still outside its wall back onto it and past it by `2^(k + 1 − PASSES)` of
+/// the row's rounding band: the first pass by well under a unit in the last
+/// place of the row's value, the last by the whole band.
+const ROUNDING_RESTORATION_PASSES: i32 = 9;
+
+/// Move a face step's candidate back inside every wall it is outside of only by
+/// the rounding of evaluating that wall, along the wall's normal (gnomon#2359).
+///
+/// The equality face's step satisfies `A_F δ = b_F − A_F β` in real arithmetic,
+/// so `β + δ` as evaluated can sit one rounding step outside a wall the face
+/// holds as an equality, or outside a zero-slack wall the step is tangent to.
+/// The feasible chord from a base ON that wall has no feasible positive step, so
+/// its clip returned the base itself: a zero step at a residual above target,
+/// cycle after cycle. On the gnomon#2359 calibration fit, 88 chord clips were of
+/// equality-held score-warp rows violated by 1.0e-16 to 2.7e-16, and each one
+/// from a base on its wall clipped to `t = 0`, leaving slope_surface, which is
+/// unconstrained, at 8.3e-10 against 3.9e-11.
+///
+/// A row's rounding band is `γ_{p+1}·(Σ|a_j x_j| + |b|)`, the error of
+/// evaluating `a·x − b`; a larger shortfall is a real crossing, and the feasible
+/// chord owns it. The move past the wall is only what the evaluation needs,
+/// escalating from under one unit in the last place, because the face's
+/// multipliers price every unit of slack: a point parked a whole band inside
+/// its walls costs `ν·band` of objective, and near convergence that outweighs
+/// the Newton step's own predicted gain. On the same fit, moving by the
+/// shortfall plus the band made the trust-region model test refuse a 7.1e-9
+/// face step 24 times, which collapsed the radius to 1e-12 and held the
+/// residual at 8.6e-8 for 40 cycles.
+///
+/// `None` when some row is outside its wall by more than its band, or the
+/// passes leave the point infeasible.
+fn restore_rounding_level_violations(
+    constraints: &ConstraintSet,
+    candidate: &Array1<f64>,
+) -> Result<Option<Array1<f64>>, CustomFamilyError> {
+    let growth = gam_linalg::roundoff::accumulation_growth(candidate.len() + 1);
+    let mut restored = candidate.clone();
+    for pass in 0..ROUNDING_RESTORATION_PASSES {
+        let values = constraints.values(restored.view()).map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "rounding-level restoration could not evaluate the constraints: {error}"
+            ))
+        })?;
+        let overshoot_fraction = 2.0_f64.powi(pass + 1 - ROUNDING_RESTORATION_PASSES);
+        let mut moved = false;
+        for (row, value) in values.iter().enumerate() {
+            let bound = constraints.bound(row).map_err(|error| {
+                CustomFamilyError::trial_point(format!(
+                    "rounding-level restoration could not read row {row}'s bound: {error}"
+                ))
+            })?;
+            let shortfall = bound - value;
+            if !(shortfall > 0.0) {
+                continue;
+            }
+            let gathered = constraints.gather_rows(&[row]).map_err(|error| {
+                CustomFamilyError::trial_point(format!(
+                    "rounding-level restoration could not gather row {row}: {error}"
+                ))
+            })?;
+            let normal = gathered.a.row(0);
+            let magnitude = normal
+                .iter()
+                .zip(restored.iter())
+                .map(|(entry, coordinate)| (entry * coordinate).abs())
+                .sum::<f64>()
+                + bound.abs();
+            let band = growth * magnitude;
+            let norm_sq = normal.dot(&normal);
+            if !(shortfall <= band && norm_sq.is_finite() && norm_sq > 0.0) {
+                return Ok(None);
+            }
+            restored.scaled_add((shortfall + overshoot_fraction * band) / norm_sq, &normal);
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    let (violation, _) = constraints
+        .max_scaled_violation(restored.view())
+        .map_err(|error| {
+            CustomFamilyError::trial_point(format!(
+                "rounding-level restoration could not classify its result: {error}"
+            ))
+        })?;
+    Ok((violation.is_finite() && violation <= 0.0).then_some(restored))
+}
+
 /// Upgrade a tolerance-feasible active-set result to a mathematically feasible
 /// point without changing either the quadratic objective or its feasible
 /// reference.
@@ -591,6 +685,60 @@ fn clip_infeasible_candidate_to_certified_feasible_chord(
         )));
     }
     Ok((clipped, blocking_row, certified_step))
+}
+
+/// The trust-ball KKT verdict on a mathematically feasible reduced-face candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustBallVerdict {
+    /// Inside the ball, and complementary at the solver's curvature resolution.
+    Admitted,
+    /// A chord-repaired candidate inside the ball whose shift is not complementary
+    /// to its norm. The shift belongs to the Moré--Sorensen solution the repair
+    /// pulled back along the feasible chord, not to the repaired step, so the
+    /// check fails by construction of the repair, and the caller's general
+    /// constrained QP owns the subproblem, as for a repair failing first-order KKT
+    /// (gam#2600).
+    DeclinedChordRepair,
+    /// The subproblem's own solution violates the trust-ball KKT conditions.
+    Refused,
+}
+
+/// Judge a reduced-face candidate's metric norm against the trust ball its step
+/// was solved in.
+///
+/// Complementarity is judged at the curvature resolution the step solver declined
+/// at. When its hard case declines to fill along an unresolvable negative pole, it
+/// returns the minimum-norm base at `λ_lo = −γ_min`: an interior step with a
+/// positive shift no larger than that resolution. The shift perturbs the model
+/// within resolution into a convex one whose interior Newton step this is, so it
+/// is not a boundary multiplier. Exact zero refused such a step on the 3-D CTN κ
+/// gate (trust_shift=4.978800e-8 for an interior metric_norm=8.794692e-3 against
+/// radius=3.164101e-2, MSI job 440833).
+///
+/// `chord_repair` is the fraction of the solver's step the feasible-chord repair
+/// removed. On the CTN order-0 power-9 κ fixture the repair kept 24.7% of a
+/// boundary step: metric_norm=2.069838e-5 = radius·(1 − chord_repair) against
+/// radius=8.365122e-5, with the boundary shift 1.043848e-7 above the resolution
+/// 4.246907e-13 (gam#2959). Refusing that candidate ended the fit on a heuristic
+/// repair, not on a violated contract.
+fn trust_ball_verdict(
+    trust_norm: f64,
+    trust_radius: f64,
+    trust_tolerance: f64,
+    trust_shift: f64,
+    curvature_resolution: f64,
+    chord_repair: f64,
+) -> TrustBallVerdict {
+    let feasible = trust_norm.is_finite() && trust_norm <= trust_radius + trust_tolerance;
+    let complementary = trust_shift <= curvature_resolution
+        || (trust_norm - trust_radius).abs() <= trust_tolerance;
+    if feasible && complementary {
+        TrustBallVerdict::Admitted
+    } else if feasible && chord_repair > 0.0 {
+        TrustBallVerdict::DeclinedChordRepair
+    } else {
+        TrustBallVerdict::Refused
+    }
 }
 
 /// Solve the physical-H constrained trust-region subproblem on an inequality
@@ -1146,6 +1294,13 @@ fn certified_reduced_face_candidate(
                 ));
                 continue;
             }
+            if let Some(restored) = restore_rounding_level_violations(constraints, &raw_candidate)?
+            {
+                let restored_delta = &restored - beta;
+                let restored_gain = model_gain(&restored_delta);
+                feasible_candidates.push((restored, restored_delta, restored_gain, 0.0));
+                continue;
+            }
             let (clipped, blocker, step) = clip_infeasible_candidate_to_certified_feasible_chord(
                 constraints,
                 &feasible_base,
@@ -1292,26 +1447,38 @@ fn certified_reduced_face_candidate(
         let trust_tolerance = f64::EPSILON.sqrt()
             * (p.max(1) as f64)
             * trust_radius.abs().max(trust_norm.abs()).max(1.0);
-        let trust_feasible = trust_norm <= trust_radius + trust_tolerance;
-        // Complementarity at the curvature resolution the step solver declined at.
-        // When its hard case declines to fill along an unresolvable negative pole,
-        // it returns the minimum-norm base at `λ_lo = −γ_min`: an interior step with
-        // a positive shift no larger than that resolution. The shift perturbs the
-        // model within resolution into a convex one whose interior Newton step this
-        // is, so it is not a boundary multiplier. Exact zero refused such a step on
-        // the 3-D CTN κ gate (trust_shift=4.978800e-8 for an interior
-        // metric_norm=8.794692e-3 against radius=3.164101e-2, MSI job 440833).
-        let trust_complementary = face_step.trust_shift <= face_step.curvature_resolution
-            || (trust_norm - trust_radius).abs() <= trust_tolerance;
-        if !trust_norm.is_finite() || !trust_feasible || !trust_complementary {
-            return Err(CustomFamilyError::trial_point(format!(
-                "physical reduced-face trust-ball KKT failed \
-                 (metric_norm={trust_norm:.6e}, radius={trust_radius:.6e}, \
-                 trust_shift={:.6e}, curvature_resolution={:.6e}, \
-                 tolerance={trust_tolerance:.6e})",
-                face_step.trust_shift,
-                face_step.curvature_resolution,
-            )));
+        match trust_ball_verdict(
+            trust_norm,
+            trust_radius,
+            trust_tolerance,
+            face_step.trust_shift,
+            face_step.curvature_resolution,
+            chord_repair,
+        ) {
+            TrustBallVerdict::Admitted => {}
+            TrustBallVerdict::DeclinedChordRepair => {
+                log::warn!(
+                    "[gam#2959 reduced-face] declining a chord-repaired candidate whose trust shift \
+                     is not complementary to its norm (face_rows={}, chord_repair={:.6e}, \
+                     metric_norm={trust_norm:.6e}, radius={trust_radius:.6e}, trust_shift={:.6e}, \
+                     curvature_resolution={:.6e}); the general constrained QP owns this subproblem",
+                    working_active.len(),
+                    chord_repair,
+                    face_step.trust_shift,
+                    face_step.curvature_resolution,
+                );
+                return Ok(None);
+            }
+            TrustBallVerdict::Refused => {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "physical reduced-face trust-ball KKT failed \
+                     (metric_norm={trust_norm:.6e}, radius={trust_radius:.6e}, \
+                     trust_shift={:.6e}, curvature_resolution={:.6e}, \
+                     tolerance={trust_tolerance:.6e})",
+                    face_step.trust_shift,
+                    face_step.curvature_resolution,
+                )));
+            }
         }
 
         if original_base_violation <= 0.0 {
@@ -1392,6 +1559,90 @@ fn canonical_accepted_active_rows(
 mod exact_face_newton_tests {
     use super::*;
     use ndarray::array;
+
+    /// One half-space `a·x ≥ b` whose bound is `offset` units in the last place
+    /// above `a·point` as the constraint set evaluates it, so `point` is outside
+    /// it by that many.
+    fn wall_above(point: &Array1<f64>, normal: Array2<f64>, offset: usize) -> ConstraintSet {
+        let probe = ConstraintSet::Dense(
+            LinearInequalityConstraints::new(normal.clone(), array![0.0]).expect("one half-space"),
+        );
+        let mut bound = probe.values(point.view()).expect("evaluate the wall")[0];
+        for _ in 0..offset {
+            bound = bound.next_up();
+        }
+        ConstraintSet::Dense(
+            LinearInequalityConstraints::new(normal, array![bound]).expect("one half-space"),
+        )
+    }
+
+    /// gnomon#2359: a candidate outside a wall by one rounding step of that wall
+    /// is moved back inside along its normal, by rounding, not clipped away.
+    #[test]
+    fn a_rounding_level_violation_is_restored_along_its_normal_2359() {
+        let point = array![0.3_f64, 0.1, 0.2];
+        let constraints = wall_above(&point, array![[0.0_f64, 1.0, 1.0]], 1);
+        let (violation, _) = constraints
+            .max_scaled_violation(point.view())
+            .expect("classify the candidate");
+        assert!(violation > 0.0, "fixture premise: one ulp outside the wall");
+        let restored = restore_rounding_level_violations(&constraints, &point)
+            .expect("the restoration evaluates")
+            .expect("a one-ulp violation is rounding");
+        let (restored_violation, _) = constraints
+            .max_scaled_violation(restored.view())
+            .expect("classify the restored point");
+        assert!(
+            restored_violation <= 0.0,
+            "the restored point is feasible as evaluated"
+        );
+        let moved = (&restored - &point)
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            moved > 0.0 && moved <= 8.0 * f64::EPSILON,
+            "moved by rounding: {moved:.3e}"
+        );
+    }
+
+    /// gnomon#2359: the restored point sits within a few units in the last place
+    /// of its wall, not a rounding band inside it. The face's multipliers price
+    /// that slack, and a band's worth outweighed the predicted gain of a
+    /// converging face step, so the trust-region model test refused it. Here the
+    /// band is 35 units in the last place of the wall's value.
+    #[test]
+    fn a_restored_row_stays_on_its_wall_2359() {
+        let point = Array1::from_iter((0..20).map(|j| 1.0 + 0.037 * j as f64));
+        let constraints = wall_above(&point, Array2::ones((1, 20)), 1);
+        let (violation, _) = constraints
+            .max_scaled_violation(point.view())
+            .expect("classify the candidate");
+        assert!(violation > 0.0, "fixture premise: one ulp outside the wall");
+        let restored = restore_rounding_level_violations(&constraints, &point)
+            .expect("the restoration evaluates")
+            .expect("a one-ulp violation is rounding");
+        let value = constraints.values(restored.view()).expect("evaluate")[0];
+        let bound = constraints.bound(0).expect("read the bound");
+        let unit = bound.next_up() - bound;
+        assert!(
+            value >= bound && value - bound <= 4.0 * unit,
+            "restored {:.1} units in the last place inside the wall",
+            (value - bound) / unit
+        );
+    }
+
+    /// A crossing larger than the wall's rounding is a real one, and stays the
+    /// feasible chord's to repair.
+    #[test]
+    fn a_real_crossing_is_left_to_the_feasible_chord_2359() {
+        let point = array![0.3_f64, 0.1, 0.2];
+        let constraints = wall_above(&point, array![[0.0_f64, 1.0, 1.0]], 1 << 20);
+        assert!(
+            restore_rounding_level_violations(&constraints, &point)
+                .expect("the restoration evaluates")
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_face_the_trust_metric_makes_singular_is_still_solved_2600() {
@@ -1533,6 +1784,62 @@ mod exact_face_newton_tests {
                 .to_string()
                 .contains("dimension/metric contract failed"),
             "unexpected reduced-face diagnostic: {error}"
+        );
+    }
+
+    #[test]
+    fn a_chord_repaired_candidate_that_fails_complementarity_declines_2959() {
+        // The CTN order-0 power-9 κ fixture's refused candidate (lane probe job
+        // 1213300): a boundary Moré--Sorensen step, shift 1.043848e-7 above the
+        // resolution 4.246907e-13, pulled back by the feasible-chord repair to
+        // 24.7% of its length, inside the ball and not complementary.
+        let radius = 8.365122e-5_f64;
+        let chord_repair = 7.525634e-1_f64;
+        let norm = radius * (1.0 - chord_repair);
+        let tolerance = 1.192093e-6_f64;
+        let shift = 1.043848e-7_f64;
+        let resolution = 4.246907e-13_f64;
+        assert_eq!(
+            trust_ball_verdict(norm, radius, tolerance, shift, resolution, chord_repair),
+            TrustBallVerdict::DeclinedChordRepair,
+            "a repaired step is not the solution its shift was computed for"
+        );
+        // The same norm and shift from an unrepaired step is the subproblem's own
+        // solution violating complementarity.
+        assert_eq!(
+            trust_ball_verdict(norm, radius, tolerance, shift, resolution, 0.0),
+            TrustBallVerdict::Refused
+        );
+        // A repaired step outside the ball is still refused: the repair only
+        // shortens a step, so leaving the ball is not its construction.
+        assert_eq!(
+            trust_ball_verdict(2.0 * radius, radius, tolerance, shift, resolution, chord_repair),
+            TrustBallVerdict::Refused
+        );
+        assert_eq!(
+            trust_ball_verdict(f64::NAN, radius, tolerance, shift, resolution, chord_repair),
+            TrustBallVerdict::Refused
+        );
+    }
+
+    #[test]
+    fn trust_ball_verdict_admits_boundary_and_within_resolution_interior_steps_2959() {
+        let radius = 3.164101e-2_f64;
+        let tolerance = 1.192093e-6_f64;
+        // A boundary step carries a positive multiplier.
+        assert_eq!(
+            trust_ball_verdict(radius, radius, tolerance, 4.978800e-8, 1.0e-12, 0.0),
+            TrustBallVerdict::Admitted
+        );
+        // An interior step whose shift is within the curvature resolution.
+        assert_eq!(
+            trust_ball_verdict(8.794692e-3, radius, tolerance, 4.978800e-8, 1.0e-7, 0.0),
+            TrustBallVerdict::Admitted
+        );
+        // A complementary repaired step is admitted like any other.
+        assert_eq!(
+            trust_ball_verdict(8.794692e-3, radius, tolerance, 4.978800e-8, 1.0e-7, 0.5),
+            TrustBallVerdict::Admitted
         );
     }
 
@@ -2296,7 +2603,10 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
             {
                 rhs += score;
             }
-            Some(rhs)
+            let gradient_inf = likelihood_gradient
+                .iter()
+                .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+            Some((rhs, gradient_inf))
         }
         _ => None,
     };
@@ -2335,6 +2645,10 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
                     negative_curvature_direction: None,
                     newton_decrement: 0.0,
                     weakly_identified_decrement: 0.0,
+                    decrement_bands: DecrementResolution {
+                        identified: 0.0,
+                        weakly_identified: 0.0,
+                    },
                 });
             }
             ActiveConstraintTangentGeometry::Tangent(z) => {
@@ -2355,8 +2669,8 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         None => (hessian, metric, None),
     };
     let certificate_rhs = match (stationarity_rhs.as_ref(), tangent.as_ref()) {
-        (Some(rhs), Some(z)) => z.t().dot(rhs),
-        (Some(rhs), None) => rhs.clone(),
+        (Some((rhs, _)), Some(z)) => z.t().dot(rhs),
+        (Some((rhs, _)), None) => rhs.clone(),
         (None, _) => Array1::<f64>::zeros(certificate_matrix.nrows()),
     };
     let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
@@ -2411,6 +2725,27 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
     } else {
         None
     };
+    // The decrements' own rounding band on this face (#2977): the stationarity
+    // system's band per coefficient, through `|Z|ᵀ` onto the face and into this
+    // spectrum's whitened eigenbasis. Without a joint gradient there are no
+    // decrements to band.
+    let decrement_bands = match stationarity_rhs.as_ref() {
+        Some((_, gradient_inf)) => exact_joint_fit::spectrum_decrement_resolution(
+            &spectrum,
+            tangent.as_ref(),
+            workspace.as_ref(),
+            *gradient_inf,
+            joint_observation_count(states),
+            s_lambdas,
+            states,
+            joint_bundle,
+            0.0,
+        )?,
+        None => DecrementResolution {
+            identified: f64::NAN,
+            weakly_identified: f64::NAN,
+        },
+    };
     Ok(ExactJointModeCurvatureCertificate {
         workspace,
         minimum_whitened_eigenvalue,
@@ -2427,6 +2762,7 @@ pub(crate) fn exact_joint_mode_curvature_certificate<
         } else {
             f64::NAN
         },
+        decrement_bands,
     })
 }
 
@@ -2481,6 +2817,8 @@ enum ConstrainedModeResolution {
     Unresolved {
         newton_decrement: f64,
         weakly_identified_decrement: f64,
+        /// The resolution the decrements were judged against.
+        decrement_resolution: DecrementResolution,
     },
 }
 
@@ -2490,21 +2828,38 @@ enum ConstrainedModeResolution {
 /// constrained head. The stationarity residual
 /// measured at the returned state must be within the target computed at that
 /// same state, and the Newton decrement the local model still promises, over the
-/// identified and the weakly identified modes, must be within the objective's
-/// resolution. Each site passes the decrements of its own spectrum.
+/// identified and the weakly identified modes, must be within its resolution.
+/// Each site passes the decrements of its own spectrum and their resolution
+/// ([`exact_joint_fit::spectrum_decrement_resolution`]).
+///
+/// Its two arms have one owner each, and the sites that mark a state tentative
+/// ask the same ones (#2977): the residual arm is [`joint_inner_kkt_converged`],
+/// which every mark asks of the residual and target it records, and the
+/// decrement arm is [`joint_newton_decrements_at_resolution`], which both
+/// decrement certificates ask.
 fn returned_mode_settles(
     residual: f64,
     residual_target: f64,
     newton_decrement: f64,
     weakly_identified_decrement: f64,
-    decrement_resolution: f64,
+    decrement_resolution: DecrementResolution,
 ) -> bool {
-    residual.is_finite()
-        && residual <= residual_target
-        && newton_decrement.is_finite()
-        && newton_decrement <= decrement_resolution
-        && weakly_identified_decrement.is_finite()
-        && weakly_identified_decrement <= decrement_resolution
+    joint_inner_kkt_converged(residual, residual_target)
+        && joint_newton_decrements_at_resolution(
+            newton_decrement,
+            weakly_identified_decrement,
+            decrement_resolution,
+        )
+}
+
+/// The change one evaluation of the objective at `objective` resolves, with the
+/// solve's own measurement `measured_resolution` when it has one (#2695): a
+/// correction promising less than this is none the trust region can referee.
+/// One owner for the two settling heads and the two decrement certificates
+/// that mark states for them (#2977), which raise each decrement's own rounding
+/// band to it.
+fn returned_mode_objective_resolution(objective: f64, measured_resolution: f64) -> f64 {
+    joint_objective_roundoff_slack(objective, objective, measured_resolution)
 }
 
 /// Second-order certification of a constrained first-order KKT point, with a
@@ -2527,7 +2882,7 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
     saddle_escapes_used: usize,
     previous_escape_lambda_min: Option<f64>,
     objective_tol: f64,
-    decrement_resolution: f64,
+    objective_resolution: f64,
     tentative_residual: f64,
     tentative_residual_target: f64,
     jeffreys_completion_calls: &mut usize,
@@ -2564,7 +2919,7 @@ fn resolve_constrained_converged_mode<F: CustomFamily + Clone + Send + Sync + 's
         saddle_escapes_used,
         previous_escape_lambda_min,
         objective_tol,
-        decrement_resolution,
+        objective_resolution,
         tentative_residual,
         tentative_residual_target,
         jeffreys_completion_calls,
@@ -2591,7 +2946,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
     saddle_escapes_used: usize,
     previous_escape_lambda_min: Option<f64>,
     objective_tol: f64,
-    decrement_resolution: f64,
+    objective_resolution: f64,
     tentative_residual: f64,
     tentative_residual_target: f64,
     jeffreys_completion_calls: &mut usize,
@@ -2624,7 +2979,11 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
         // decrease the objective can resolve. Without the decrement here,
         // warm-started probes of the #2904 FD pin certified with a pending
         // correction and priced the rho 0 LAML slope at 6.954 against the analytic
-        // 0.7520.
+        // 0.7520. The decrements settle within their own rounding band on this
+        // face, or within the objective's resolution (#2977).
+        let decrement_resolution = certificate
+            .decrement_bands
+            .with_objective_resolution(objective_resolution);
         if !returned_mode_settles(
             tentative_residual,
             tentative_residual_target,
@@ -2633,11 +2992,14 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
             decrement_resolution,
         ) {
             log::info!(
-                "[PIRLS/joint-Newton mode certificate] constrained returned beta has PSD face curvature (lambda_min={lambda_min:.6e}, floor={numerical_floor:.6e}) but does not settle: residual={tentative_residual:.3e}/{tentative_residual_target:.3e}, decrement={newton_decrement:.3e}, weak={weakly_identified_decrement:.3e} against the objective resolution {decrement_resolution:.3e}; iterating on",
+                "[PIRLS/joint-Newton mode certificate] constrained returned beta has PSD face curvature (lambda_min={lambda_min:.6e}, floor={numerical_floor:.6e}) but does not settle: residual={tentative_residual:.3e}/{tentative_residual_target:.3e}, decrement={newton_decrement:.3e}, weak={weakly_identified_decrement:.3e} against the resolution {:.3e}, weak resolution {:.3e}; iterating on",
+                decrement_resolution.identified,
+                decrement_resolution.weakly_identified,
             );
             return Ok(ConstrainedModeResolution::Unresolved {
                 newton_decrement,
                 weakly_identified_decrement,
+                decrement_resolution,
             });
         }
         log::info!(
@@ -2872,7 +3234,7 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
             saddle_escapes_used,
             previous_escape_lambda_min,
             objective_tol,
-            decrement_resolution,
+            objective_resolution,
             tentative_residual,
             tentative_residual_target,
             jeffreys_completion_calls,
@@ -3013,6 +3375,44 @@ pub(crate) fn inner_blockwise_coefficient_mode<
     )
 }
 
+/// Refuse a workspace-source family whose declared dense joint curvature carries a
+/// non-finite entry at the spec seed state (gam#1088, #979).
+///
+/// An inner solve of a workspace-source family consumes the workspace's source, not
+/// the dense matrix the family declares through `exact_newton_joint_hessian_with_specs`,
+/// so the solve examines only what it consumes: its prevalidation forms that source
+/// through `exact_newton_joint_hessian_source_from_workspace`, which refuses a non-finite
+/// dense build or operator diagonal as a `NumericalFailure` naming the inner-solve boundary.
+/// This examines the declaration itself, once per fit, at the state `buildblock_states`
+/// builds from the specs' `initial_beta`, with the canonical message the per-solve probe
+/// of a no-workspace family raises. A family answering `false` to
+/// `has_explicit_joint_hessian` materializes nothing here, and a family with no HVP
+/// workspace is examined by each of its inner solves instead.
+///
+/// Every fit entry calls this. A route that searches through the joint-hyper evaluators
+/// without entering one, such as the spatial exact-joint drivers BMS flex uses, reaches
+/// it at its owned-mode finish. During that search each solve's prevalidation refuses a
+/// non-finite entry in the source it consumes; an entry present only in the declaration
+/// is refused at the finish.
+pub(crate) fn refuse_non_finite_declared_joint_curvature<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+) -> Result<(), CustomFamilyError> {
+    if !(family.inner_coefficient_hessian_hvp_available(specs) && family.has_explicit_joint_hessian()) {
+        return Ok(());
+    }
+    let mut states = buildblock_states(family, specs)?;
+    refresh_all_block_etas(family, specs, &mut states)?;
+    match family.exact_newton_joint_hessian_with_specs(&states, specs)? {
+        Some(joint_hessian) => crate::joint_newton::joint_hessian_source_finite_check(
+            &crate::joint_newton::JointHessianSource::Dense(joint_hessian),
+        ),
+        None => Ok(()),
+    }
+}
+
 fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -3063,53 +3463,41 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // concentrated coupled likelihoods. The `_with_specs` path subsumes the
     // spec-less one for every family (single-block / uncoupled delegate
     // identically), so it is the correct probe here.
-    // The DECLARED dense joint curvature, when the family commits to one.
+    // The DECLARED dense joint curvature is examined where it is consumed (gam#1088).
     //
-    // gam#1088's loud arm is a statement about what the family declares as its
-    // analytic second derivative at the starting β — not about whichever
-    // representation the solver happens to consume. Those two differed, and the
-    // gap had no guard on either side of it. A family supplying BOTH a dense
-    // `exact_newton_joint_hessian` and an HVP sets `has_workspace_source`, so
-    // this probe short-circuited to `true` without looking at the dense
-    // curvature at all; the workspace path's own check then probes the
-    // `JointHessianSource::Operator` variant, whose finiteness test is its
-    // ASSEMBLED DIAGONAL (the full operator is never materialised there). A
-    // non-finite entry present in the declared dense curvature and absent from
-    // the HVP was therefore examined by neither. Measured on
-    // `TwoBlockNonFiniteCurvatureFamily`, which declares `[[NaN, 0.25], [0.25,
-    // 1.0]]`: `inner_blockwise_fit` returned `Ok` — a fit minted from a
-    // curvature that does not exist, where the contract is a typed failure.
+    // gam#1088's loud arm is a statement about the family's analytic second
+    // derivative before the solve begins: a non-finite entry is a contract
+    // violation and a typed failure, never a fit. Which state each examination
+    // reads:
     //
-    // `has_explicit_joint_hessian()` is the family's own statement that it
-    // materialises a dense p×p, so consulting the declaration here costs an
-    // HVP-only family nothing: such a family answers `false` and never
-    // materialises anything.
-    let declared_dense_joint = if has_workspace_source && !family.has_explicit_joint_hessian() {
-        None
-    } else {
-        family.exact_newton_joint_hessian_with_specs(&states, specs)?
-    };
-    let declares_dense_joint = declared_dense_joint.is_some();
-    if let Some(joint_hessian) = declared_dense_joint {
-        crate::joint_newton::joint_hessian_source_finite_check(
-            &crate::joint_newton::JointHessianSource::Dense(joint_hessian),
-        )?;
-    }
-    // A family reaches the joint-exact route either through its HVP workspace
-    // or through a declared dense joint curvature; both were previously
-    // answered here, but only the second had its finiteness examined, and the
-    // check above now covers both. The materialisation the old branch performed
-    // is the same one `declared_dense_joint` performs, so nothing is evaluated
-    // twice.
+    // - A family with no HVP workspace consumes the dense curvature it declares,
+    //   so this solve examines it here, at the spec seed state `buildblock_states`
+    //   built above from each spec's `initial_beta`. A warm-started solve starts
+    //   from another β, which this probe does not read.
+    // - A workspace-source family does not consume its declared dense matrix in
+    //   this solve. A joint-Newton solve consumes the workspace's source, which
+    //   the prevalidation below forms through
+    //   `exact_newton_joint_hessian_source_from_workspace`, refusing a non-finite
+    //   dense build or operator diagonal; a block-separable solve consumes, and
+    //   that prevalidation checks, the block Hessians. An entry present only in
+    //   the declaration is examined once per fit, at the spec seed of the fit's
+    //   specs, by [`refuse_non_finite_declared_joint_curvature`], which every fit
+    //   entry calls. Materializing the declaration here built one dense p×p per inner
+    //   solve at one unchanging state, on every solve of a BMS flex search (#979).
     //
-    // gam#1088 scopes the loud arm to exactly this point: "a non-finite entry
-    // in the family's analytic joint curvature at the starting beta is a
-    // contract violation against the family's second derivative -- the solve
-    // cannot even begin". A non-finite entry that only emerges after the
-    // coupled loop has driven beta to an overflowing operating point is a
-    // genuine rho-degeneracy and still exits gracefully through the in-loop
-    // guard.
-    let has_joint_exacthessian = has_workspace_source || declares_dense_joint;
+    // A non-finite entry that only emerges after the coupled loop has driven β to
+    // an overflowing operating point is a genuine ρ-degeneracy and still exits
+    // gracefully through the in-loop guard.
+    let has_joint_exacthessian = has_workspace_source
+        || match family.exact_newton_joint_hessian_with_specs(&states, specs)? {
+            Some(joint_hessian) => {
+                crate::joint_newton::joint_hessian_source_finite_check(
+                    &crate::joint_newton::JointHessianSource::Dense(joint_hessian),
+                )?;
+                true
+            }
+            None => false,
+        };
     // When the family declares its likelihood blocks UNCOUPLED
     // (`∂²L/∂β_a∂β_b = 0` for every a ≠ b) the joint penalized objective is
     // fully separable across blocks: the joint Hessian is exactly
@@ -3383,6 +3771,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     cached.block_logdet_s,
                 );
                 return Ok(BlockwiseInnerResult {
+                    cone_normalizer: None,
                     solved_inner_tol: cached.solved_inner_tol,
                     block_states: states,
                     terminal_working_sets: cached.terminal_working_sets.clone(),
@@ -4688,6 +5077,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
     };
 
     Ok(BlockwiseInnerResult {
+        cone_normalizer: None,
         solved_inner_tol: options.inner_tol,
         block_states: states,
         terminal_working_sets: Some(cached_eval.blockworking_sets.clone()),

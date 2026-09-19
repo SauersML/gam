@@ -1809,7 +1809,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                     // keep the mode under one typed decline that carries the
                     // certificate and the rows the mode binds; every covariance
                     // consumer refuses by that decline's summary.
-                    let decline =
+                    let mut decline =
                         gam_solve::constrained_posterior::ConePosteriorMomentDecline::at_converged_mode(
                             precision.view(),
                             &constraints,
@@ -1839,7 +1839,11 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                             specs,
                             states,
                         )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| {
+                            gam_solve::constrained_posterior::BoundaryModeRefusal::from(
+                                error.to_string(),
+                            )
+                        })
                         .and_then(|likelihood_score| {
                             let penalized_gradient =
                                 &penalty_score - &likelihood_score - &jeffreys_gradient;
@@ -1851,11 +1855,11 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                             )
                         })
                     } else {
-                        Err(
+                        Err(gam_solve::constrained_posterior::BoundaryModeRefusal::from(
                             "the cone-truncated posterior is not proved improper, so its \
                              truncated Gaussian is the estimand"
                                 .to_string(),
-                        )
+                        ))
                     };
                     match approximation {
                         Ok(approximation) => {
@@ -1899,6 +1903,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                                  approximation: {refusal}",
                                 decline.summary()
                             );
+                            decline.boundary_approximation_refusal = Some(refusal);
                         }
                     }
                     let constrained =

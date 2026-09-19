@@ -366,7 +366,7 @@ fn measure(
 /// A declared empirical latent law that is NOT standard normal: a 41-node
 /// discretisation of a scaled Student-t-like density (heavier tails, unit
 /// variance to first order), so the anchor `a(q, b)` is a genuine root solve.
-fn heavy_tailed_grid() -> EmpiricalZGrid {
+pub(crate) fn heavy_tailed_grid() -> EmpiricalZGrid {
     let nodes: Vec<f64> = (0..41).map(|i| -4.0 + 0.2 * i as f64).collect();
     let raw: Vec<f64> = nodes
         .iter()

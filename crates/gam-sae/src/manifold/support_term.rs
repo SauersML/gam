@@ -483,6 +483,69 @@ impl SupportBetaOperator {
             }
         }
     }
+
+    /// Guaranteed upper bounds on `‖H_tβ^(r)‖₂` of [`Self::htbeta_forward`], which is
+    /// `jacobian_r · J_r` for the gather `J_r` over the row's basis blocks (#2627):
+    /// `‖jacobian_r‖_F · √(‖J_r‖_∞·‖J_r‖₁)`, with the gather factor from
+    /// [`super::kronecker::gather_norm_squared_upper_bound`].
+    fn row_norm_bounds(&self) -> Arc<[f64]> {
+        let width = self.output_dim;
+        let bounds: Vec<f64> = self
+            .rows
+            .iter()
+            .map(|row| {
+                let mut support: Vec<(usize, f64)> = row
+                    .blocks
+                    .iter()
+                    .flat_map(|block| {
+                        block
+                            .phi
+                            .iter()
+                            .enumerate()
+                            .map(move |(basis, &phi)| (block.beta_offset + basis * width, phi))
+                    })
+                    .collect();
+                let gather_squared =
+                    super::kronecker::gather_norm_squared_upper_bound(&mut support, width);
+                let mut jacobian_squares = 0.0_f64;
+                for &value in row.jacobian.iter() {
+                    jacobian_squares += value * value;
+                }
+                let depth = (row.jacobian.len() + 1) + (2 * support.len() + 2) + 1;
+                gam_solve::arrow_schur::guaranteed_norm_upper_bound(
+                    jacobian_squares.sqrt() * gather_squared.sqrt(),
+                    depth,
+                )
+            })
+            .collect();
+        Arc::from(bounds.into_boxed_slice())
+    }
+
+    /// The cross block's declaration for `set_row_htbeta_operator` (#2627):
+    /// [`Self::row_norm_bounds`] and the apply depth. [`Self::htbeta_forward`] gathers over
+    /// the row's basis blocks (`b_r` terms per channel) and applies the Jacobian
+    /// (`output_dim` terms), so its depth is `b_r + output_dim`.
+    /// [`Self::htbeta_transpose`] accumulates `jacobianᵀ v` (`d_r` terms) and scatters
+    /// `φ·output` into each β entry once per covering basis (at most `b_r` additions after
+    /// the product), so its depth is `d_r + b_r + 1`.
+    fn htbeta_declaration(&self) -> gam_solve::arrow_schur::RowHtbetaDeclaration {
+        let widest_basis = self
+            .rows
+            .iter()
+            .map(|row| row.blocks.iter().map(|block| block.phi.len()).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        let widest_latent = self
+            .rows
+            .iter()
+            .map(|row| row.jacobian.nrows())
+            .max()
+            .unwrap_or(0);
+        gam_solve::arrow_schur::RowHtbetaDeclaration {
+            row_norm_bounds: self.row_norm_bounds(),
+            apply_depth: widest_basis + self.output_dim.max(widest_latent) + 1,
+        }
+    }
 }
 
 /// #2576: the support `H_ββ` states its own blocks and diagonal. Behind the
@@ -621,6 +684,59 @@ impl gam_solve::arrow_schur::BetaPenaltyOp for SupportBetaOperator {
                 hasher.write_f64(value);
             }
         }
+    }
+
+    /// `M = Σ_r |J_r|ᵀ|J_r| + ⊕_k |λ_k|·max(|S_k|, |S_k|ᵀ) ⊗ I_P` (#2627): the data
+    /// Gram's gather and scatter read `|φ|`, and each smoothing block reads its own
+    /// majorant, so `M ≥ |P|` and `M` is symmetric.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let width = self.output_dim;
+        let mut slot = vec![0.0_f64; width];
+        let mut widest_row = 0usize;
+        let mut total_basis = 0usize;
+        for row in &self.rows {
+            slot.fill(0.0);
+            let row_basis: usize = row.blocks.iter().map(|block| block.phi.len()).sum();
+            widest_row = widest_row.max(row_basis);
+            total_basis += row_basis;
+            for block in &row.blocks {
+                for basis in 0..block.phi.len() {
+                    let weight = block.phi[basis].abs();
+                    let base = block.beta_offset + basis * width;
+                    for channel in 0..width {
+                        slot[channel] += weight * x[base + channel];
+                    }
+                }
+            }
+            for block in &row.blocks {
+                for basis in 0..block.phi.len() {
+                    let weight = block.phi[basis].abs();
+                    let base = block.beta_offset + basis * width;
+                    for channel in 0..width {
+                        out[base + channel] += weight * slot[channel];
+                    }
+                }
+            }
+        }
+        let mut widest_penalty = 0usize;
+        for atom in 0..self.penalties.len() {
+            let lambda = self.lambda_smooth[atom].abs();
+            let m = self.basis_sizes[atom];
+            widest_penalty = widest_penalty.max(m);
+            let offset = self.beta_offsets[atom];
+            let penalty = &self.penalties[atom];
+            for left in 0..m {
+                for channel in 0..width {
+                    let mut acc = 0.0_f64;
+                    for right in 0..m {
+                        acc += penalty[[left, right]].abs().max(penalty[[right, left]].abs())
+                            * x[offset + right * width + channel];
+                    }
+                    out[offset + left * width + channel] += lambda * acc;
+                }
+            }
+        }
+        widest_row + total_basis + widest_penalty + 4
     }
 }
 
@@ -3368,6 +3484,7 @@ impl SaeSupportSparseTerm {
         system.set_row_htbeta_operator(
             move |row, vector, out| forward.htbeta_forward(row, vector, out),
             move |row, vector, out| transpose.htbeta_transpose(row, vector, out),
+            operator.htbeta_declaration(),
         );
         let block_offsets: Arc<[Range<usize>]> = self
             .atoms
@@ -3528,6 +3645,112 @@ impl SaeSupportSparseTerm {
             })
         }
     }
+
+    /// `Σ_m Σ_p ∂²φ_m/∂t_a∂t_b · B_mp · r_p` for one slot of one row: the second
+    /// derivative of the slot's decoder output contracted with the row residual.
+    /// The exact coordinate block carries it with a minus sign.
+    fn support_outer_residual_second_derivative(
+        &self,
+        row: &SupportOuterDifferentialRow,
+        slot: &SupportOuterDifferentialSlot,
+        axis_a: usize,
+        axis_b: usize,
+    ) -> f64 {
+        let atom = &self.atoms[slot.atom];
+        let decoder = atom.decoder_coefficients();
+        let mut residual_second = 0.0_f64;
+        for basis in 0..atom.basis_size() {
+            let coefficient = slot.second_jet[[basis, axis_a, axis_b]];
+            for output in 0..self.output_dim {
+                residual_second += coefficient * decoder[[basis, output]] * row.residual[output];
+            }
+        }
+        residual_second
+    }
+
+    /// Row factors of the preconditioner for the solves against the exact `A`: the
+    /// Newton displacement (#2933 F08) and the reduced-logdet adjoint. Each row block
+    /// is the majorizer block `B_i` plus the positive part of the exact block's excess
+    /// over it, `B_i + (A_i − B_i)_+` ([`Self::support_exact_a_preconditioner_rows`]).
+    fn support_exact_a_preconditioner(
+        &self,
+        system: &ArrowSchurSystem,
+        rows: &[SupportOuterDifferentialRow],
+    ) -> Result<ArrowFactorSlab, String> {
+        let preconditioner_rows = self.support_exact_a_preconditioner_rows(system, rows)?;
+        CpuBatchedBlockSolver
+            .factor_blocks(&preconditioner_rows, 0.0, system.d, true)
+            .map_err(|error| format!("support exact-A preconditioner row factorization: {error}"))
+    }
+
+    /// `B_i + (A_i − B_i)_+` for every row block.
+    ///
+    /// `B` majorizes the prior's signed curvature, not the residual curvature
+    /// `−Σ_p r_p ∂²f_p` that `A` adds, which is positive wherever the decoder curves
+    /// toward the row's residual. Where a coordinate's decoder tangent vanishes and
+    /// its periodic prior sits at the antipode, `B_i` keeps no curvature while `A_i`
+    /// does. On the two-circle Tier-2 witness one row had `B_i = 5.8e-14` against
+    /// `A_i = 12.4` (lane probe 1249076), so `B⁻¹` amplified that coordinate by
+    /// 7.65e13 and flexible GMRES could not represent the gradient in the span it
+    /// built. `B_i + (A_i − B_i)_+` majorizes `A_i`, equals `B_i` wherever `B_i`
+    /// already does, and is positive definite wherever `A_i` has positive curvature.
+    /// It changes how fast the solve converges, never what it certifies: flexible
+    /// GMRES certifies the physical residual `‖rhs − AΔ‖`.
+    fn support_exact_a_preconditioner_rows(
+        &self,
+        system: &ArrowSchurSystem,
+        rows: &[SupportOuterDifferentialRow],
+    ) -> Result<Vec<ArrowRowBlock>, String> {
+        if rows.len() != system.rows.len() {
+            return Err(format!(
+                "support Newton preconditioner: {} differential rows for {} system rows",
+                rows.len(),
+                system.rows.len()
+            ));
+        }
+        system
+            .rows
+            .iter()
+            .zip(rows)
+            .map(|(block, row)| {
+                let q = block.htt.nrows();
+                let mut excess = Array2::<f64>::zeros((q, q));
+                for slot in &row.slots {
+                    let offset = slot.coordinate_offset;
+                    let d = self.atoms[slot.atom].latent_dim();
+                    for axis_a in 0..d {
+                        for axis_b in 0..d {
+                            excess[[offset + axis_a, offset + axis_b]] -= self
+                                .support_outer_residual_second_derivative(row, slot, axis_a, axis_b);
+                        }
+                        excess[[offset + axis_a, offset + axis_a]] +=
+                            row.prior_hessian_remainder[offset + axis_a];
+                    }
+                }
+                let symmetric = (&excess + &excess.t()) * 0.5;
+                let (values, vectors) = symmetric.eigh(Side::Lower).map_err(|error| {
+                    format!("support Newton preconditioner: row excess eigendecomposition: {error}")
+                })?;
+                let mut htt = block.htt.clone();
+                for (index, &value) in values.iter().enumerate() {
+                    if value > 0.0 {
+                        let direction = vectors.column(index);
+                        for left in 0..q {
+                            for right in 0..q {
+                                htt[[left, right]] += value * direction[left] * direction[right];
+                            }
+                        }
+                    }
+                }
+                Ok(ArrowRowBlock {
+                    htt,
+                    htbeta: Array2::<f64>::zeros((q, 0)),
+                    gt: Array1::<f64>::zeros(q),
+                })
+            })
+            .collect()
+    }
+
     fn support_outer_exact_hessian_apply(
         &self,
         system: &ArrowSchurSystem,
@@ -3551,15 +3774,9 @@ impl SaeSupportSparseTerm {
                 for axis_a in 0..d {
                     let mut correction = 0.0_f64;
                     for axis_b in 0..d {
-                        let mut residual_second = 0.0_f64;
-                        for basis in 0..m {
-                            let coefficient = slot.second_jet[[basis, axis_a, axis_b]];
-                            for output in 0..self.output_dim {
-                                residual_second += coefficient
-                                    * atom.decoder_coefficients()[[basis, output]]
-                                    * row.residual[output];
-                            }
-                        }
+                        let residual_second = self.support_outer_residual_second_derivative(
+                            row, slot, axis_a, axis_b,
+                        );
                         correction -= residual_second * local_t[axis_b];
                     }
                     // Exact coordinate-decoder residual cross block.
@@ -3595,8 +3812,21 @@ impl SaeSupportSparseTerm {
     }
 
     /// The symmetrized dense exact Hessian `A` and majorizer `B` of the support
-    /// stationarity pencil, materialized column by column from their matrix-free
-    /// applies. Every dense consumer reads the pencil through this seam.
+    /// stationarity pencil. Every dense consumer reads the pencil through this seam.
+    ///
+    /// #2576: assembled from the arrow's blocks, not probed column by column. A column
+    /// probe applies both operators to a unit vector, so each of the `dim` columns paid a
+    /// full pass over every row and over the whole `H_ββ` operator, twice. At 3000x48
+    /// (`dim` 19680) job 1190710's stack samples of its 12-14 min terminal certificates sat
+    /// in that probe loop. Here each entry is the one term its probe reads,
+    /// accumulated in the order the probe's sums take it:
+    /// - `H_ββ` from the installed penalty operator's `to_dense`, the operator
+    ///   `assemble_arrow_schur` installs in lock-step with `hbb_matvec`;
+    /// - each row's `H_tt`, and its `H_tβ` row from the same transpose apply the probe of
+    ///   that coordinate reads;
+    /// - the exact residual corrections of `support_outer_exact_hessian_apply`, row-local.
+    /// The matrices are the probe's bit for bit
+    /// (`dense_pencil_assembly_is_its_column_probes_2576`).
     fn support_outer_dense_hessian_matrices(
         &self,
         system: &ArrowSchurSystem,
@@ -3610,32 +3840,109 @@ impl SaeSupportSparseTerm {
         if dim == 0 {
             return Err("support outer Hessian pencil has zero dimension".to_string());
         }
-        let mut exact = Array2::<f64>::zeros((dim, dim));
-        let mut majorizer = Array2::<f64>::zeros((dim, dim));
-        for column in 0..dim {
-            let mut unit = SaeArrowVector {
-                t: Array1::zeros(t_len),
-                beta: Array1::zeros(beta_len),
-            };
-            if column < t_len {
-                unit.t[column] = 1.0;
-            } else {
-                unit.beta[column - t_len] = 1.0;
+        if rows.len() != system.rows.len()
+            || *system.row_offsets.last().unwrap_or(&0) != t_len
+            || system.k != beta_len
+        {
+            return Err(format!(
+                "support outer Hessian pencil: {} differential rows, coordinate length {t_len} and \
+                 beta length {beta_len} do not describe the arrow system ({} rows, {}, {})",
+                rows.len(),
+                system.rows.len(),
+                system.row_offsets.last().unwrap_or(&0),
+                system.k,
+            ));
+        }
+        let hbb = match (system.hbb_matvec.as_ref(), system.penalty_op.as_ref()) {
+            (Some(_), Some(operator)) => operator.to_dense(),
+            (Some(_), None) => {
+                return Err(
+                    "support outer Hessian pencil: H_betabeta operator installed without its \
+                     penalty operator"
+                        .to_string(),
+                );
             }
-            let applied = self.support_outer_exact_hessian_apply(system, rows, &unit)?;
-            exact
-                .slice_mut(ndarray::s![..t_len, column])
-                .assign(&applied.t);
-            exact
-                .slice_mut(ndarray::s![t_len.., column])
-                .assign(&applied.beta);
-            let applied_b = support_arrow_majorizer_apply(system, &unit)?;
+            (None, _) if system.hbb.dim() == (beta_len, beta_len) => system.hbb.clone(),
+            (None, _) => {
+                return Err(format!(
+                    "support outer Hessian pencil: H_betabeta shape {:?} != ({beta_len}, \
+                     {beta_len}) and no operator is installed",
+                    system.hbb.dim(),
+                ));
+            }
+        };
+        if hbb.dim() != (beta_len, beta_len) {
+            return Err(format!(
+                "support outer Hessian pencil: dense H_betabeta shape {:?} != ({beta_len}, \
+                 {beta_len})",
+                hbb.dim(),
+            ));
+        }
+        let mut majorizer = Array2::<f64>::zeros((dim, dim));
+        majorizer.slice_mut(ndarray::s![t_len.., t_len..]).assign(&hbb);
+        drop(hbb);
+        let mut cross = Array1::<f64>::zeros(beta_len);
+        for row in 0..system.rows.len() {
+            let start = system.row_offsets[row];
+            let q = system.row_offsets[row + 1] - start;
+            let htt = &system.rows[row].htt;
+            if htt.dim() != (q, q) {
+                return Err(format!(
+                    "support outer Hessian pencil: row {row} H_tt shape {:?} != ({q}, {q})",
+                    htt.dim(),
+                ));
+            }
             majorizer
-                .slice_mut(ndarray::s![..t_len, column])
-                .assign(&applied_b.t);
-            majorizer
-                .slice_mut(ndarray::s![t_len.., column])
-                .assign(&applied_b.beta);
+                .slice_mut(ndarray::s![start..start + q, start..start + q])
+                .assign(htt);
+            let mut unit = Array1::<f64>::zeros(q);
+            for axis in 0..q {
+                unit[axis] = 1.0;
+                cross.fill(0.0);
+                support_arrow_cross_transpose_add(system, row, unit.view(), &mut cross)?;
+                unit[axis] = 0.0;
+                majorizer
+                    .slice_mut(ndarray::s![start + axis, t_len..])
+                    .assign(&cross);
+                majorizer
+                    .slice_mut(ndarray::s![t_len.., start + axis])
+                    .assign(&cross);
+            }
+        }
+        let mut exact = majorizer.clone();
+        for (row_index, row) in rows.iter().enumerate() {
+            let row_start = system.row_offsets[row_index];
+            for slot in &row.slots {
+                let atom = &self.atoms[slot.atom];
+                let d = atom.latent_dim();
+                let m = atom.basis_size();
+                for axis_a in 0..d {
+                    let t_a = row_start + slot.coordinate_offset + axis_a;
+                    // Exact residual curvature `-sum_p r_p d2f_p/dt_a dt_b`, and the
+                    // prior's Hessian remainder on the diagonal.
+                    for axis_b in 0..d {
+                        let residual_second = self.support_outer_residual_second_derivative(
+                            row, slot, axis_a, axis_b,
+                        );
+                        let mut correction = -residual_second;
+                        if axis_a == axis_b {
+                            correction +=
+                                row.prior_hessian_remainder[slot.coordinate_offset + axis_a];
+                        }
+                        exact[[t_a, row_start + slot.coordinate_offset + axis_b]] += correction;
+                    }
+                    // Exact coordinate-decoder residual cross block, both triangles.
+                    for basis in 0..m {
+                        let derivative = slot.jet[[basis, axis_a]];
+                        for output in 0..self.output_dim {
+                            let beta_index =
+                                t_len + slot.beta_offset + basis * self.output_dim + output;
+                            exact[[t_a, beta_index]] -= derivative * row.residual[output];
+                            exact[[beta_index, t_a]] -= row.residual[output] * derivative;
+                        }
+                    }
+                }
+            }
         }
         for row in 0..dim {
             for column in 0..row {
@@ -4086,7 +4393,6 @@ impl SaeSupportSparseTerm {
         self.support_reduced_logdet_adjoint_solves(
             system,
             &rows,
-            &factors,
             std::slice::from_ref(&gamma),
             derivative,
         )?
@@ -4138,7 +4444,6 @@ impl SaeSupportSparseTerm {
         let adjoints = self.support_reduced_logdet_adjoint_solves(
             system,
             &rows,
-            &factors,
             directions,
             bundle,
         )?;
@@ -4204,12 +4509,14 @@ impl SaeSupportSparseTerm {
     /// storage, not a dimension knob. Otherwise flexible GMRES runs, and where the
     /// bundle spans the reduced Schur's inverse exactly
     /// ([`RationalLogdetDerivativeBundle::exact_inverse_vectors`]) its preconditioner
-    /// folds that inverse instead of running a CG per direction (#2576).
+    /// folds that inverse instead of running a CG per direction (#2576). Its row
+    /// factors are the exact-A preconditioner's ([`Self::support_exact_a_preconditioner`]);
+    /// with the folded border inverse they invert the arrow whose row blocks are
+    /// `B_i + (A_i − B_i)_+` and whose reduced Schur is the one the evidence priced.
     fn support_reduced_logdet_adjoint_solves(
         &self,
         system: &ArrowSchurSystem,
         rows: &[SupportOuterDifferentialRow],
-        factors: &ArrowFactorSlab,
         rhs: &[SaeArrowVector],
         derivative: &RationalLogdetDerivativeBundle,
     ) -> Result<Vec<SaeArrowVector>, String> {
@@ -4226,6 +4533,9 @@ impl SaeSupportSparseTerm {
         if full_dim <= derivative_vector_count && dense_workspace <= in_core_budget {
             self.support_outer_dense_pseudoinverse_apply(system, rows, rhs)
         } else {
+            let factors = self
+                .support_exact_a_preconditioner(system, rows)
+                .map_err(|error| format!("support reduced-logdet profile adjoint: {error}"))?;
             rhs.iter()
                 .map(|rhs| {
                     solve_b_preconditioned_gmres_with(
@@ -4234,7 +4544,7 @@ impl SaeSupportSparseTerm {
                         |residual| {
                             support_arrow_majorizer_inverse(
                                 system,
-                                factors,
+                                &factors,
                                 residual,
                                 derivative.exact_inverse_vectors(),
                             )
@@ -4502,10 +4812,11 @@ impl SaeSupportSparseTerm {
     /// along (#2933 F08).
     ///
     /// The solve is the profile adjoint's large-system route: flexible GMRES on the
-    /// exact stationarity Jacobian, right-preconditioned by the majorizer arrow's
-    /// per-row factors and reduced-Schur solve. It adds no dense factorization, and
-    /// it certifies the physical residual rather than a preconditioned proxy. `A` may
-    /// be indefinite; GMRES does not assume otherwise.
+    /// exact stationarity Jacobian, right-preconditioned by the majorizer arrow whose
+    /// row blocks also carry the positive part of the exact row excess
+    /// ([`Self::support_exact_a_preconditioner_rows`]), and its reduced-Schur solve. It
+    /// adds no dense factorization, and it certifies the physical residual rather than
+    /// a preconditioned proxy. `A` may be indefinite; GMRES does not assume otherwise.
     ///
     /// The residual bar is `‖g − AΔ‖ ≤ max(√ε‖g‖, β_g + γ_dim·‖A‖·‖Δ‖)`
     /// ([`solve_b_preconditioned_gmres_to_rounding_floor`]), with `β_g` the gradient's
@@ -4548,9 +4859,9 @@ impl SaeSupportSparseTerm {
                 .assign(&block.gt);
         }
         let rows = self.support_outer_differential_rows(target, ard_precisions, &beta_offsets)?;
-        let factors = CpuBatchedBlockSolver
-            .factor_blocks(&system.rows, 0.0, system.d, true)
-            .map_err(|error| format!("support Newton displacement row factorization: {error}"))?;
+        let factors = self
+            .support_exact_a_preconditioner(&system, &rows)
+            .map_err(|error| format!("support Newton displacement: {error}"))?;
         let gradient_band = self.gradient_rounding_band(target, lambda_smooth, ard_precisions)?;
         let prepared = started.elapsed();
         let (displacement, iterations) = solve_b_preconditioned_gmres_to_rounding_floor(
@@ -7050,7 +7361,7 @@ impl SaeSupportSparseTerm {
 
     /// Alternate exact decoder blocks and direct active-row coordinate Newton
     /// steps until the raw KKT residual AND a full-cycle recurrence agree. A
-    /// budget-exhausted iterate is an error; only converged fits are returned.
+    /// state no cycle can move measurably is refused; only converged fits are returned.
     /// One JOINT Gauss-Newton step over `(T, B)`, Schur-eliminating the per-row
     /// coordinate blocks -- the cure for the alternating map's linear rate
     /// (#2575), safeguarded on the same penalized objective the certificate
@@ -7297,7 +7608,6 @@ impl SaeSupportSparseTerm {
         target: ArrayView2<'_, f64>,
         lambda_smooth: &[f64],
         ard_precisions: &[Vec<f64>],
-        operator_directions_already_budgeted: usize,
     ) -> Result<Option<SupportNegativeCurvatureMode>, String> {
         let (beta_offsets, beta_dim) = self.beta_layout()?;
         let coordinate_dim = self.coordinate_state_len();
@@ -7309,17 +7619,24 @@ impl SaeSupportSparseTerm {
             .saturating_mul(std::mem::size_of::<f64>() as u128)
             .saturating_mul(6);
         let in_core_budget = crate::manifold::sae_host_in_core_budget_bytes().0 as u128;
-        // A terminal second-order audit may not silently turn a matrix-free
-        // fit into more operator work than its complete inner solve.  When the
-        // analytic pencil has at most the number of directions already bought
-        // by that solve and its eigensystem fits the cgroup ledger, dense is the
-        // exact and cheaper certificate.  Larger lanes retain their matrix-free
-        // outer-adjoint refusal rather than materialising an unbounded matrix.
-        if full_dim == 0
-            || full_dim > operator_directions_already_budgeted
-            || dense_workspace > in_core_budget
-        {
+        // #2576: a certified fixed point is stationary AND curvature-audited, so the audit
+        // is never skipped for the work a solve has or has not done; admitting it by a
+        // cycle count let a solve that certified in fewer cycles than the pencil's dimension
+        // certify a saddle. Its one admission is the resource it needs: the dense pencil
+        // runs wherever its workspace fits the cgroup-aware in-core ledger. Where it does
+        // not fit, this lane has no matrix-free curvature certificate, so the stationary
+        // state is refused as unaudited instead of certified.
+        if full_dim == 0 {
             return Ok(None);
+        }
+        if dense_workspace > in_core_budget {
+            return Err(format!(
+                "SaeSupportSparseTerm::solve_fixed_point: curvature not audited: the exact \
+                 stationarity pencil of dimension {full_dim} needs a dense workspace of \
+                 {dense_workspace} bytes against an in-core budget of {in_core_budget} bytes, \
+                 and this lane has no matrix-free curvature certificate, so the stationary \
+                 state is refused instead of certified"
+            ));
         }
         let system = self.assemble_arrow_schur(target, lambda_smooth, ard_precisions)?;
         let rows = self.support_outer_differential_rows(target, ard_precisions, &beta_offsets)?;
@@ -7408,17 +7725,17 @@ impl SaeSupportSparseTerm {
                     // #2576: every CG iterate from zero lowers the majorizer's reduced
                     // quadratic model, and eliminating Δt exactly only adds
                     // −½·g_tᵀH_tt⁻¹g_t, so the full model is negative and gᵀd < 0.
-                    // An iterate that stopped at the iteration cap is therefore a
+                    // An iterate that spent its product budget is therefore a
                     // descent direction the line search below already guards.
                     // Refusing it discarded the direction and re-ran the whole
                     // preconditioner ladder at three more ridges. The derived
                     // tolerance stays the CG's target and the certificate's bar. A
-                    // gauge-pinned solve that exhausts its iterations returns `Err`,
+                    // gauge-pinned solve that spends its budget returns `Err`,
                     // and stays refused.
                     let admissible = matches!(
                         diagnostics.stopping_reason,
                         gam_solve::arrow_schur::PcgStopReason::Converged
-                            | gam_solve::arrow_schur::PcgStopReason::MaxIter
+                            | gam_solve::arrow_schur::PcgStopReason::BudgetExhausted
                     ) && diagnostics.final_relative_residual.is_finite();
                     if admissible {
                         step_pair = Some((delta_t, delta_beta));
@@ -7739,7 +8056,6 @@ impl SaeSupportSparseTerm {
         target: ArrayView2<'_, f64>,
         lambda_smooth: &[f64],
         ard_precisions: &[Vec<f64>],
-        max_iter: usize,
         tolerance: f64,
         trust_radius: f64,
     ) -> Result<SaeSupportFixedPointReport, String> {
@@ -7751,8 +8067,8 @@ impl SaeSupportSparseTerm {
                 self.output_dim
             ));
         }
-        if max_iter == 0 || !(tolerance.is_finite() && tolerance > 0.0) {
-            return Err("SaeSupportSparseTerm::solve_fixed_point requires positive max_iter and finite positive tolerance".into());
+        if !(tolerance.is_finite() && tolerance > 0.0) {
+            return Err("SaeSupportSparseTerm::solve_fixed_point requires a finite positive tolerance".into());
         }
         let mut previous_candidate = false;
         let mut last_max_change = f64::NAN;
@@ -7810,42 +8126,32 @@ impl SaeSupportSparseTerm {
         let mut joint_scaled_step = Vec::with_capacity(self.coordinate_state_len());
         let mut joint_previous_step: Option<SupportJointStepMemory> = None;
         let mut joint_skip_remaining = 0usize;
-        // PHASE. The caller's budget buys the ALTERNATION, and nothing about
-        // that phase changes: no joint system is assembled, no coupled step is
-        // proposed, and a fit that certifies inside `max_iter` takes exactly the
-        // trajectory it has always taken. Only a fit that would otherwise return
-        // the non-recurrence refusal enters phase two, where the coupled step is
-        // armed and the same budget is spent again.
+        // PHASE (#2576). No cycle count phases or stops this loop. The alternation runs
+        // while its cycles measurably move the fit, by the rule a row step is accepted on
+        // (#2469): the objective falls by more than its rounding band, or it ties inside
+        // that band while the raw KKT norm falls by more than both states' gradient
+        // rounding bands. A cycle that does neither, and that the first-order screen does
+        // not pass, is the measurement that the alternation cannot bring this state to its
+        // certificate, and it arms the coupled step. No joint system is assembled before
+        // that, so a fit whose alternation certifies takes exactly the trajectory it always
+        // took.
         //
-        // That ordering is the whole safety argument. A coupled step is a strict
-        // descent on the same objective, but it is still a DIFFERENT trajectory,
-        // and a different trajectory can arrive at a different (better) optimum
-        // that the caller's budget is no longer enough to certify at. Charging
-        // that risk only to fits that were about to fail costs nothing they had,
-        // and refusing is the outcome SPEC's "a fit object must only ever come
-        // from a converged optimization" makes most expensive.
+        // Inside the coupled phase such a cycle forces the coupled step, whatever its skip
+        // schedule says. If that step is refused too, the state is a proven stall: neither
+        // block sweep nor the coupled step moves it measurably, so the next cycle would
+        // start from the same state and take the same decisions. The solve refuses there
+        // instead of spending cycles on it.
         let mut joint_armed = false;
         let mut joint_skip_width = 1usize;
         let mut joint_accepted = 0usize;
-        let total_cycles = max_iter.saturating_mul(2);
-        for iteration in 1..=total_cycles {
-            if iteration > max_iter && !joint_armed {
-                // Phase boundary. The alternation has spent the caller's budget
-                // without certifying, so its rate has already answered the only
-                // question the pace test asks. Arm the coupled step and start
-                // the two-cycle recurrence over: the certificate must be earned
-                // on the new trajectory, never inherited across the boundary.
-                joint_armed = true;
-                accelerator.reset();
-                taken_step.clear();
-                taken_step.resize(self.coordinate_state_len(), 0.0);
-                last_objective = None;
-                previous_candidate = false;
-                log::info!(
-                    "support fixed point: alternation did not recur in {max_iter} cycles; \
-                     arming the coupled (Schur-eliminated joint Newton) phase"
-                );
-            }
+        // What the progress rule knows about the state the last cycle ended in: its raw
+        // KKT norm, and its gradient rounding band where that cycle priced one. Both are
+        // `None` where something moved the state after they were read.
+        let mut last_kkt_norm: Option<f64> = None;
+        let mut last_gradient_band: Option<f64> = None;
+        let mut iteration = 0usize;
+        loop {
+            iteration += 1;
             self.snapshot_coordinates(&mut cycle_start);
             if cycle_start_decoders.len() != self.k_atoms()
                 || cycle_start_decoders
@@ -7900,10 +8206,10 @@ impl SaeSupportSparseTerm {
             // Both sweeps minimise their own block exactly, so a cycle is exact
             // block Gauss-Seidel and the iterate's error contracts by a fixed
             // factor — the cross-block coupling (see `joint_newton_step`). Phase
-            // one having spent the caller's whole budget without certifying IS
-            // the measurement that this factor is too close to one for the
-            // budget, so inside phase two there is nothing left to test: the
-            // coupled step fires every cycle.
+            // one ending on a cycle without measured progress IS the measurement
+            // that this factor is too close to one for the alternation to reach
+            // its certificate, so inside phase two there is nothing left to test:
+            // the coupled step fires every cycle.
             //
             // (An earlier revision re-tested the alternation's pace per cycle
             // and skipped the coupled step while it looked on track. Measured on
@@ -7932,7 +8238,52 @@ impl SaeSupportSparseTerm {
                 parameter_scale,
                 tolerance,
             ) && pre_joint_change <= tolerance * parameter_scale;
-            if joint_armed && joint_skip_remaining > 0 {
+            // #2576: whether this cycle's sweeps measurably moved the fit (see PHASE),
+            // against the state the last cycle ended in. The gradient rounding band is
+            // priced only where the objective ties, the one case that reads it.
+            let kkt_norm = stationarity.decoder_l2.hypot(stationarity.coordinate_l2);
+            let mut gradient_band = None;
+            let swept_progress = match previous_objective {
+                Some(previous) => {
+                    let resolution = self.objective_descent_resolution(previous);
+                    let change = objective - previous;
+                    if change < -resolution {
+                        Some(true)
+                    } else if change.abs() <= resolution {
+                        let band =
+                            self.gradient_rounding_band(target, lambda_smooth, ard_precisions)?;
+                        gradient_band = Some(band);
+                        match (last_kkt_norm, last_gradient_band) {
+                            (Some(previous_norm), Some(previous_band)) => {
+                                Some(kkt_norm < previous_norm - (previous_band + band))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            let stalled = swept_progress == Some(false) && !screened;
+            if stalled && !joint_armed {
+                // Phase boundary: the certificate must be earned on the coupled
+                // trajectory, never inherited across it.
+                joint_armed = true;
+                accelerator.reset();
+                taken_step.clear();
+                taken_step.resize(self.coordinate_state_len(), 0.0);
+                last_objective = None;
+                previous_candidate = false;
+                log::info!(
+                    "support fixed point: cycle {iteration} made no measured progress (objective \
+                     {objective:.9e}, raw KKT norm {kkt_norm:.3e}); arming the coupled \
+                     (Schur-eliminated joint Newton) phase"
+                );
+            }
+            // Whether this cycle ends in the state `kkt_norm` and `gradient_band` describe.
+            let mut end_state_held = true;
+            if joint_armed && joint_skip_remaining > 0 && !stalled {
                 joint_skip_remaining -= 1;
             } else if joint_armed && !screened {
                 match self.joint_newton_step(
@@ -7949,6 +8300,7 @@ impl SaeSupportSparseTerm {
                     Some(_accepted_objective) => {
                         joint_accepted += 1;
                         joint_skip_width = 1;
+                        end_state_held = false;
                         // The coupled step can move along a periodic phase
                         // orbit after the cycle's first canonicalization. Put
                         // it back in the unique ARD-selected phase chart before
@@ -7979,6 +8331,40 @@ impl SaeSupportSparseTerm {
                         parameter_scale = self
                             .parameter_iterate_scale()
                             .map_err(SaeSupportStationarityError::ParameterScale)?;
+                    }
+                    None if stalled => {
+                        // A proven stall (see PHASE): refuse at the state reached.
+                        let last_newton =
+                            last_newton_displacement.as_ref().map(|(value, _)| *value);
+                        return Err(format!(
+                            "SaeSupportSparseTerm::solve_fixed_point stalled at cycle {iteration}: \
+                             neither the block sweeps nor the coupled step moved the state \
+                             measurably (objective {objective:.9e} tied within its rounding band \
+                             {:.3e}; raw KKT norm {kkt_norm:.6e} against {:?} at the last cycle, \
+                             gradient rounding bands {:?} and {gradient_band:?}; raw KKT \
+                             max={:.6e}, relative to objective {:.6e}; per block: decoder \
+                             max={:.6e} l2={:.6e}, coordinate max={:.6e} l2={:.6e}; \
+                             diagonal-scaled residual max={:.6e}, scale={parameter_scale:.6e}, \
+                             relative={:.6e} vs tolerance {tolerance:.6e} (decoder {:.6e}, \
+                             coordinate {:.6e}); that screen schedules the exact Newton \
+                             displacement certificate, last priced at {last_newton:?}; last \
+                             parameter max_change={last_max_change:.6e}, joint Newton steps \
+                             accepted={joint_accepted}, parameter change this \
+                             cycle={pre_joint_change:.6e})",
+                            self.objective_descent_resolution(objective),
+                            last_kkt_norm,
+                            last_gradient_band,
+                            stationarity.max_abs(),
+                            stationarity.max_abs() / kkt_scale,
+                            stationarity.decoder_max_abs,
+                            stationarity.decoder_l2,
+                            stationarity.coordinate_max_abs,
+                            stationarity.coordinate_l2,
+                            stationarity.scaled_max_abs(),
+                            stationarity.scaled_max_abs() / parameter_scale,
+                            stationarity.decoder_scaled_max_abs,
+                            stationarity.coordinate_scaled_max_abs,
+                        ));
                     }
                     None => {
                         joint_skip_remaining = joint_skip_width;
@@ -8185,7 +8571,6 @@ impl SaeSupportSparseTerm {
                     target,
                     lambda_smooth,
                     ard_precisions,
-                    total_cycles,
                 )? {
                     match self.escape_support_negative_curvature(
                         target,
@@ -8453,6 +8838,7 @@ impl SaeSupportSparseTerm {
                     )?;
                     if objective - extrapolated > self.objective_descent_resolution(objective) {
                         accepted_extrapolations += 1;
+                        end_state_held = false;
                         taken_step.extend_from_slice(&proposal);
                         std::mem::swap(&mut fitted_state, &mut trial_fitted);
                     } else {
@@ -8463,6 +8849,14 @@ impl SaeSupportSparseTerm {
                         taken_step.extend_from_slice(&cycle_residual);
                     }
                 }
+            }
+            // The state the next cycle's progress rule compares against (see PHASE).
+            if end_state_held {
+                last_kkt_norm = Some(stationarity.decoder_l2.hypot(stationarity.coordinate_l2));
+                last_gradient_band = gradient_band;
+            } else {
+                last_kkt_norm = None;
+                last_gradient_band = None;
             }
             log::info!(
                 "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
@@ -8494,1291 +8888,9 @@ impl SaeSupportSparseTerm {
                 }
             }
         }
-        let stationarity = self.raw_stationarity(target, lambda_smooth, ard_precisions)?;
-        let objective = self.penalized_objective(target, lambda_smooth, ard_precisions)?;
-        let parameter_scale = self
-            .parameter_iterate_scale()
-            .map_err(SaeSupportStationarityError::ParameterScale)?;
-        // #2517 — report the certificate PER BLOCK, not as one scalar. The two
-        // blocks are different quantities reached by different sweeps: the
-        // decoder block is the exact-PSD-solve's own residual, the coordinate
-        // block is the damped coordinate sweep's. A single `max` over both
-        // cannot say which sweep failed to reach its own stationarity, so every
-        // reader of this refusal has had to guess. Measured across eight shapes
-        // (n 120..480, P 4..8, K 9..24, top_k 1..3, residual 1e-4 and 1e-2)
-        // this refusal fires in EVERY arm at relative KKT 1.5e-3..9.7e-3 while
-        // `max_change` is already ~1e-3, i.e. the iterate has stopped moving
-        // and the certificate has not been reached — the split is what
-        // distinguishes "a sweep is not solving its block" from "the blocks
-        // disagree at the joint point".
-        let last_newton = last_newton_displacement.as_ref().map(|(value, _)| *value);
-        Err(format!(
-            "SaeSupportSparseTerm::solve_fixed_point did not recur within {max_iter} \
-             alternating cycles nor in the {max_iter} coupled cycles that follow \
-             (raw KKT max={:.6e}, relative to objective {:.6e}: {:.6e}; \
-             per block: decoder max={:.6e} l2={:.6e}, coordinate max={:.6e} l2={:.6e}; \
-             diagonal-scaled residual max={:.6e}, scale={parameter_scale:.6e}, relative={:.6e} \
-             vs tolerance {tolerance:.6e} (decoder {:.6e}, coordinate {:.6e}); \
-             that screen schedules the exact Newton displacement certificate, last priced at \
-             {last_newton:?}; \
-             last parameter max_change={last_max_change:.6e}, \
-             joint Newton steps accepted={joint_accepted}, gauge-invariant limbs required)",
-            stationarity.max_abs(),
-            objective,
-            stationarity.max_abs() / objective.abs().max(1.0),
-            stationarity.decoder_max_abs,
-            stationarity.decoder_l2,
-            stationarity.coordinate_max_abs,
-            stationarity.coordinate_l2,
-            stationarity.scaled_max_abs(),
-            stationarity.scaled_max_abs() / parameter_scale,
-            stationarity.decoder_scaled_max_abs,
-            stationarity.coordinate_scaled_max_abs,
-        ))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::assignment_state::SaeAssignmentAtomSpec;
-    use ndarray::array;
-
-    /// Three atoms of two bases over two channels, with every atom shared by two
-    /// rows so the scatter has a real accumulation order to preserve.
-    fn beta_operator_fixture() -> SupportBetaOperator {
-        let width = 2usize;
-        let basis_sizes = vec![2usize, 2, 2];
-        let beta_offsets = vec![0usize, 4, 8];
-        // Deliberately not round: partial sums of these are not exactly
-        // representable, so a reassociated sum would differ in the low bits.
-        let phi = |a: f64, b: f64| ndarray::Array1::from(vec![a, b]);
-        let mk = |offset: usize, a: f64, b: f64| SupportBasisBlock {
-            beta_offset: offset,
-            phi: phi(a, b),
-        };
-        let third = 1.0_f64 / 3.0;
-        let root = 2.0_f64.sqrt() / 7.0;
-        let rows = vec![
-            SupportLinearizedRow {
-                blocks: vec![mk(0, third, root), mk(4, -root, third * 0.5)],
-                jacobian: ndarray::Array2::zeros((1, 1)),
-            },
-            SupportLinearizedRow {
-                blocks: vec![mk(4, third * 1.7, -root), mk(8, root * 3.1, third)],
-                jacobian: ndarray::Array2::zeros((1, 1)),
-            },
-            SupportLinearizedRow {
-                blocks: vec![mk(0, -third * 0.9, root * 2.3), mk(8, third, -root)],
-                jacobian: ndarray::Array2::zeros((1, 1)),
-            },
-        ];
-        let mut atom_blocks: Vec<Vec<(u32, u32)>> = vec![Vec::new(); 3];
-        for (row_index, row) in rows.iter().enumerate() {
-            for (block_index, block) in row.blocks.iter().enumerate() {
-                let atom = beta_offsets
-                    .iter()
-                    .position(|&o| o == block.beta_offset)
-                    .expect("offset belongs to an atom");
-                atom_blocks[atom].push((row_index as u32, block_index as u32));
-            }
-        }
-        let penalties = vec![
-            array![[2.0, -0.5], [-0.5, 1.25]],
-            array![[1.0, third], [third, 3.0]],
-            array![[0.75, 0.0], [0.0, 0.5]],
-        ];
-        SupportBetaOperator {
-            rows,
-            atom_blocks,
-            beta_offsets,
-            basis_sizes,
-            penalties,
-            lambda_smooth: vec![0.7, 1.9, third],
-            output_dim: width,
-            beta_dim: 12,
-        }
-    }
-
-    /// The serial sweep `apply` replaced, kept here as the reference the fan-out
-    /// has to reproduce exactly.
-    fn beta_operator_apply_serially(
-        op: &SupportBetaOperator,
-        vector: ndarray::ArrayView1<'_, f64>,
-        out: &mut Array1<f64>,
-    ) {
-        out.fill(0.0);
-        let mut output = vec![0.0; op.output_dim];
-        for row in &op.rows {
-            output.fill(0.0);
-            for block in &row.blocks {
-                for basis in 0..block.phi.len() {
-                    let base = block.beta_offset + basis * op.output_dim;
-                    for channel in 0..op.output_dim {
-                        output[channel] += block.phi[basis] * vector[base + channel];
-                    }
-                }
-            }
-            for block in &row.blocks {
-                for basis in 0..block.phi.len() {
-                    let base = block.beta_offset + basis * op.output_dim;
-                    for channel in 0..op.output_dim {
-                        out[base + channel] += block.phi[basis] * output[channel];
-                    }
-                }
-            }
-        }
-        for atom in 0..op.penalties.len() {
-            let lambda = op.lambda_smooth[atom];
-            let m = op.basis_sizes[atom];
-            let offset = op.beta_offsets[atom];
-            for left in 0..m {
-                for right in 0..m {
-                    let weight = lambda * op.penalties[atom][[left, right]];
-                    for channel in 0..op.output_dim {
-                        out[offset + left * op.output_dim + channel] +=
-                            weight * vector[offset + right * op.output_dim + channel];
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn beta_operator_fan_out_is_bit_identical_to_the_serial_sweep() {
-        let op = beta_operator_fixture();
-        let vector = Array1::from(
-            (0..12)
-                .map(|i| ((i as f64) * 0.37).sin() + (i as f64) / 7.0)
-                .collect::<Vec<f64>>(),
-        );
-
-        let mut expected = Array1::<f64>::zeros(12);
-        beta_operator_apply_serially(&op, vector.view(), &mut expected);
-        let mut actual = Array1::<f64>::zeros(12);
-        op.apply(vector.view(), &mut actual);
-
-        for index in 0..12 {
-            // EXACT: reassociating the sum would move the low bits, and moving
-            // them is precisely what this test exists to forbid.
-            assert_eq!(
-                actual[index].to_bits(),
-                expected[index].to_bits(),
-                "entry {index}: fan-out {} is not bit-identical to serial {}",
-                actual[index],
-                expected[index]
-            );
-        }
-        // Guard against a fixture that made the assertion trivial.
-        assert!(
-            expected.iter().any(|v| v.abs() > 1e-6),
-            "fixture produced an all-zero reference, so the comparison proves nothing"
-        );
-    }
-
-    #[test]
-    fn beta_operator_fan_out_is_stable_across_repeated_application() {
-        // rayon may split the work differently between calls; the result must
-        // not depend on how it happened to schedule.
-        let op = beta_operator_fixture();
-        let vector = Array1::from((0..12).map(|i| 1.0 / (i as f64 + 1.3)).collect::<Vec<f64>>());
-        let mut first = Array1::<f64>::zeros(12);
-        op.apply(vector.view(), &mut first);
-        for _ in 0..8 {
-            let mut again = Array1::<f64>::zeros(12);
-            op.apply(vector.view(), &mut again);
-            for index in 0..12 {
-                assert_eq!(again[index].to_bits(), first[index].to_bits());
-            }
-        }
-    }
-
-    #[test]
-    fn beta_operator_blocks_diagonal_and_dense_match_column_probes() {
-        // #2576: the block-Jacobi build reads these instead of probing `apply`, so
-        // they must equal the probed columns. They add the same terms in the same
-        // order, so the comparison is exact.
-        use gam_solve::arrow_schur::{BetaBlockId, BetaPenaltyOp};
-        let op = beta_operator_fixture();
-        let k = op.beta_dim;
-        let mut probed = Array2::<f64>::zeros((k, k));
-        for column in 0..k {
-            let mut unit = Array1::<f64>::zeros(k);
-            unit[column] = 1.0;
-            let mut applied = Array1::<f64>::zeros(k);
-            op.apply(unit.view(), &mut applied);
-            probed.column_mut(column).assign(&applied);
-        }
-        let mut diagonal = vec![0.0_f64; k];
-        op.diagonal(&mut diagonal);
-        for index in 0..k {
-            assert_eq!(diagonal[index], probed[[index, index]], "diagonal entry {index}");
-        }
-        // Each atom's own range, then one range that spans atoms 0, 1 and 2.
-        let ranges = vec![0..4, 4..8, 8..12, 2..10];
-        for id in 0..ranges.len() {
-            let range = ranges[id].clone();
-            let width = range.end - range.start;
-            let mut block = Array2::<f64>::zeros((width, width));
-            op.block(BetaBlockId(id), &ranges, &mut block);
-            for bi in 0..width {
-                for bj in 0..width {
-                    assert_eq!(
-                        block[[bi, bj]],
-                        probed[[range.start + bi, range.start + bj]],
-                        "range {range:?} entry ({bi}, {bj})"
-                    );
-                }
-            }
-        }
-        let dense = op.to_dense();
-        for i in 0..k {
-            for j in 0..k {
-                assert_eq!(dense[[i, j]], probed[[i, j]], "dense entry ({i}, {j})");
-            }
-        }
-        // The spanning range has to hold a cross-atom coupling, or it checks
-        // nothing the per-atom ranges do not.
-        assert!(
-            (2..4).any(|i| (4..10).any(|j| probed[[i, j]] != 0.0)),
-            "fixture has no cross-atom coupling inside the spanning range"
-        );
-    }
-
-    /// `S` is rank 2 with null direction `e3`; `G` is full rank.
-    fn penalized_solve_fixture() -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-        let penalty = array![[2.0, -1.0, 0.0], [-1.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
-        let gram = array![[3.0, 1.0, 0.5], [1.0, 4.0, 0.25], [0.5, 0.25, 2.0]];
-        let rhs = array![[1.0], [2.0], [3.0]];
-        (gram, penalty, rhs)
-    }
-
-    #[test]
-    fn penalized_solve_survives_the_smoothing_fellner_schall_actually_produces() {
-        let (gram, penalty, rhs) = penalized_solve_fixture();
-        // The magnitude Fellner-Schall reaches when an atom's roughness goes to
-        // zero -- the ladder picking the linear rung, not a divergence.
-        let lambda = 2.2e16;
-
-        // The old route: assemble `G + lambda*S` and solve it. This must FAIL,
-        // or the fix below is answering a question nobody asked.
-        let mut assembled = &penalty * lambda;
-        assembled += &gram;
-        let assembled_result = SaeSupportSparseTerm::solve_psd_minimum_norm(
-            &assembled,
-            &rhs,
-            "assembled",
-        );
-        assert!(
-            assembled_result.is_err(),
-            "assembling G + lambda*S was expected to lose null(S) to its own rank floor, \
-             but it returned {assembled_result:?}"
-        );
-
-        let solved = SaeSupportSparseTerm::solve_penalized_normal_equations(
-            &gram, &penalty, lambda, &rhs, "penalized",
-        )
-        .expect("the lambda-free scaling must solve what the assembled matrix could not");
-
-        // Exact limit, by hand: the penalty annihilates everything outside
-        // null(S) = span(e3), so beta = e3 * (rhs_3 / G_33) = e3 * 3/2.
-        assert!(solved[[0, 0]].abs() < 1e-9, "range(S) must be driven to zero, got {}", solved[[0, 0]]);
-        assert!(solved[[1, 0]].abs() < 1e-9, "range(S) must be driven to zero, got {}", solved[[1, 0]]);
-        assert!(
-            (solved[[2, 0]] - 1.5).abs() < 1e-9,
-            "null(S) must keep its unpenalised least squares value 1.5, got {}",
-            solved[[2, 0]]
-        );
-    }
-
-    #[test]
-    fn penalized_solve_agrees_with_the_assembled_matrix_where_that_is_conditioned() {
-        let (gram, penalty, rhs) = penalized_solve_fixture();
-        // Stability at 1e16 is worthless if it moved the answer at lambdas that
-        // were never in trouble.
-        for lambda in [0.0, 1e-3, 1.0, 25.0, 1e4] {
-            let mut assembled = &penalty * lambda;
-            assembled += &gram;
-            let reference =
-                SaeSupportSparseTerm::solve_psd_minimum_norm(&assembled, &rhs, "reference")
-                    .expect("well-conditioned assembled solve");
-            let solved = SaeSupportSparseTerm::solve_penalized_normal_equations(
-                &gram, &penalty, lambda, &rhs, "penalized",
-            )
-            .expect("well-conditioned scaled solve");
-            for index in 0..3 {
-                let gap = (solved[[index, 0]] - reference[[index, 0]]).abs();
-                assert!(
-                    gap < 1e-9 * reference[[index, 0]].abs().max(1.0),
-                    "lambda={lambda} entry {index}: scaled {} vs assembled {}",
-                    solved[[index, 0]],
-                    reference[[index, 0]]
-                );
-            }
-        }
-    }
-    use std::sync::Arc;
-
-    fn atom(
-        name: &str,
-        kind: SaeAtomBasisKind,
-        d: usize,
-        evaluator: Arc<dyn SaeBasisSecondJet>,
-        coords: &[f64],
-        decoder: Array2<f64>,
-    ) -> SaeManifoldAtom {
-        let coord = Array2::from_shape_vec((1, d), coords.to_vec()).expect("coords");
-        let (phi, jet) = evaluator.evaluate(coord.view()).expect("evaluate");
-        let m = phi.ncols();
-        SaeManifoldAtom::new_with_provided_function_gram(
-            name,
-            kind,
-            d,
-            phi,
-            jet,
-            decoder,
-            Array2::eye(m),
-        )
-        .expect("atom")
-        .with_basis_second_jet(evaluator)
-    }
-
-    /// #2469: a frozen-decoder sweep that moves no coordinate while the certificate fails
-    /// repeats forever, so the solve refuses instead of sweeping on. One row on a linear
-    /// chart with slope `1.6e-8` sits at `t = 0` against target `1.3`, with no prior. Its
-    /// gradient, `1.3 · 1.6e-8 ≈ 2.1e-8`, is above the certificate's bar
-    /// `tol · max(1, |f|) = tol` (|f| = 0.845, tol ≈ 1.49e-8) and at or below the row skip's
-    /// `tol · (1 + |f|)`, so every sweep skips the row and the second sweep proves the stall.
-    #[test]
-    fn frozen_decoder_solve_refuses_a_motionless_sweep_2469() {
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        let atoms = vec![atom(
-            "motionless-line",
-            SaeAtomBasisKind::Linear,
-            1,
-            evaluator,
-            &[0.0],
-            array![[0.0], [1.6e-8]],
-        )];
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            1,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]],
-            vec![vec![1.0]],
-            vec![vec![0.0]],
-        )
-        .expect("state");
-        let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let target = array![[1.3_f64]];
-        let ard = vec![vec![0.0_f64]];
-        let tolerance = term.fixed_point_tolerance();
-        let error = term
-            .solve_coordinates_fixed_decoder(target.view(), &ard, tolerance, 1.0)
-            .expect_err("a row the sweep never moves cannot certify");
-        assert!(
-            error.contains("stalled at sweep 2"),
-            "the second motionless sweep proves the stall; got: {error}"
-        );
-    }
-
-    /// #2469 (SPEC rule 23): the frozen-decoder solve has no sweep budget. One row on a
-    /// linear chart, decode `f(t) = t`, starts at `t = 0` against target `4`, and a trust
-    /// radius of `1e-2` moves it at most `1e-2` per sweep. It cannot come near the
-    /// minimizer before sweep 400, so it must certify well past the 256 sweeps the engine
-    /// budget used to allow.
-    #[test]
-    fn frozen_decoder_solve_certifies_a_slow_row_past_256_sweeps_2469() {
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        let atoms = vec![atom(
-            "slow-line",
-            SaeAtomBasisKind::Linear,
-            1,
-            evaluator,
-            &[0.0],
-            array![[0.0], [1.0]],
-        )];
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            1,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]],
-            vec![vec![1.0]],
-            vec![vec![0.0]],
-        )
-        .expect("state");
-        let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let target = array![[4.0_f64]];
-        let ard = vec![vec![1.0e-6_f64]];
-        let tolerance = term.fixed_point_tolerance();
-        let report = term
-            .solve_coordinates_fixed_decoder(target.view(), &ard, tolerance, 1.0e-2)
-            .expect("a row that crawls without stalling must certify");
-        assert!(report.recurred, "the solve returns only a recurred state");
-        assert!(
-            report.iterations > 256,
-            "a row limited to 1e-2 per sweep needs over 400 sweeps to reach t near 4; \
-             certified at sweep {}",
-            report.iterations
-        );
-    }
-
-    /// #2576: where the evidence lane takes the dense reduced Schur's complete spectrum, the
-    /// profile adjoint's majorizer inverse folds over the bundle's vectors instead of running
-    /// a √ε CG. The fold is that inverse only if the bundle priced the SAME reduced Schur the
-    /// adjoint eliminates against: one assembled system and the same undamped row factors.
-    /// On a resolved positive definite fixture the fold must solve the majorizer arrow
-    /// `B x = r` to the backward error of a backward-stable dense solve, `dim²·ε` (the γ bound
-    /// of the Householder tridiagonalisation the eigensystem rests on). A bundle priced at
-    /// another λ, a stale operator, must miss that bar by orders of magnitude, or the bar
-    /// discriminates nothing.
-    #[test]
-    fn majorizer_inverse_folds_the_dense_spectrum_bundle_into_the_arrow_inverse_2576() {
-        let periodic: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
-        let patch: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(2, 1).expect("patch"));
-        let atoms = vec![
-            atom(
-                "circle",
-                SaeAtomBasisKind::Periodic,
-                1,
-                periodic,
-                &[0.05],
-                array![[0.2, -0.3], [1.1, 0.4], [-0.4, 0.9]],
-            ),
-            atom(
-                "plane",
-                SaeAtomBasisKind::Linear,
-                2,
-                patch,
-                &[0.1, -0.2],
-                array![[0.3, 0.1], [2.0, -0.7], [-1.0, 1.3]],
-            ),
-        ];
-        let specs = vec![
-            SaeAssignmentAtomSpec {
-                latent_dim: 1,
-                manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
-                retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
-            },
-            SaeAssignmentAtomSpec::euclidean(2),
-        ];
-        // Rows fire both atoms, the circle alone, or the plane alone, so both constant
-        // columns are identified separately and the decoder gram spans every coefficient
-        // without leaning on the penalties' rank.
-        let n_obs = 9usize;
-        let mut indices = Vec::with_capacity(n_obs);
-        let mut gates = Vec::with_capacity(n_obs);
-        let mut coords = Vec::with_capacity(n_obs);
-        let mut target = Array2::<f64>::zeros((n_obs, 2));
-        for row in 0..n_obs {
-            let s = row as f64;
-            let phase = 0.18 * (0.7 * s + 0.3).sin();
-            let plane = [0.8 * (1.3 * s).cos(), 0.2 * s - 0.8];
-            match row % 3 {
-                0 => {
-                    indices.push(vec![0u32, 1]);
-                    gates.push(vec![1.0, 1.0]);
-                    coords.push(vec![phase, plane[0], plane[1]]);
-                }
-                1 => {
-                    indices.push(vec![0u32]);
-                    gates.push(vec![1.0]);
-                    coords.push(vec![phase]);
-                }
-                _ => {
-                    indices.push(vec![1u32]);
-                    gates.push(vec![1.0]);
-                    coords.push(plane.to_vec());
-                }
-            }
-            target[[row, 0]] = (0.9 * s).sin() + 0.3;
-            target[[row, 1]] = (0.5 * s).cos() - 0.1 * s;
-        }
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            n_obs, 2, 2, specs, indices, gates, coords,
-        )
-        .expect("state");
-        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let ard = vec![vec![1.0], vec![1.0, 1.0]];
-        let lambda = vec![0.4, 2.2];
-        let system = term
-            .assemble_arrow_schur(target.view(), &lambda, &ard)
-            .expect("assemble");
-        let dense_bundle = |system: &ArrowSchurSystem| {
-            let mut lane =
-                gam_solve::arrow_schur::SurrogateLaneState::new(sae_surrogate_lane_config());
-            lane.request_logdet_derivative_bundle();
-            let options = gam_solve::arrow_schur::ArrowSolveOptions::inexact_pcg()
-                .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
-            gam_solve::arrow_schur::matrix_free_arrow_evidence_evaluation(
-                system,
-                0.0,
-                0.0,
-                &options,
-                gam_solve::arrow_schur::SCHUR_SLQ_LOGDET_PROBES,
-                gam_solve::arrow_schur::SCHUR_SLQ_LOGDET_LANCZOS_STEPS,
-                gam_solve::arrow_schur::SCHUR_SLQ_LOGDET_SEED,
-                &mut lane,
-                true,
-            )
-            .expect("dense evidence evaluation");
-            lane.take_logdet_derivative_bundle()
-                .expect("the evaluation emits its derivative bundle")
-        };
-        let bundle = dense_bundle(&system);
-        let vectors = bundle
-            .exact_inverse_vectors()
-            .expect("a dense spectrum bundle spans the inverse it priced");
-        assert_eq!(vectors.len(), system.k, "one vector per reduced-Schur mode");
-        let factors = CpuBatchedBlockSolver
-            .factor_blocks(&system.rows, 0.0, system.d, true)
-            .expect("row factors");
-
-        let coordinate_dim = *system.row_offsets.last().unwrap_or(&0);
-        let dim = coordinate_dim + system.k;
-        let mut majorizer = Array2::<f64>::zeros((dim, dim));
-        for column in 0..dim {
-            let mut unit = SaeArrowVector {
-                t: Array1::zeros(coordinate_dim),
-                beta: Array1::zeros(system.k),
-            };
-            if column < coordinate_dim {
-                unit.t[column] = 1.0;
-            } else {
-                unit.beta[column - coordinate_dim] = 1.0;
-            }
-            let applied = support_arrow_majorizer_apply(&system, &unit).expect("majorizer apply");
-            majorizer
-                .slice_mut(ndarray::s![..coordinate_dim, column])
-                .assign(&applied.t);
-            majorizer
-                .slice_mut(ndarray::s![coordinate_dim.., column])
-                .assign(&applied.beta);
-        }
-        let symmetric = (&majorizer + &majorizer.t()) * 0.5;
-        let (spectrum, _) = symmetric.eigh(Side::Lower).expect("majorizer spectrum");
-        let lowest = spectrum.iter().copied().fold(f64::INFINITY, f64::min);
-        let highest = spectrum.iter().copied().fold(0.0_f64, f64::max);
-        // The reduced Schur's spectrum lies inside B's, so a B resolved above √ε·‖B‖ leaves
-        // no mode for the evidence to pin, and the bundle must be the plain inverse.
-        assert!(
-            lowest > f64::EPSILON.sqrt() * highest,
-            "the fixture must be resolved positive definite: spectrum [{lowest:.3e}, {highest:.3e}]"
-        );
-
-        let rhs = SaeArrowVector {
-            t: Array1::from_shape_fn(coordinate_dim, |i| (0.37 * i as f64).sin() + 0.1),
-            beta: Array1::from_shape_fn(system.k, |i| (0.61 * i as f64).cos() - 0.2),
-        };
-        let mut rhs_flat = Array1::<f64>::zeros(dim);
-        rhs_flat
-            .slice_mut(ndarray::s![..coordinate_dim])
-            .assign(&rhs.t);
-        rhs_flat
-            .slice_mut(ndarray::s![coordinate_dim..])
-            .assign(&rhs.beta);
-        let backward_error = |solved: &SaeArrowVector| {
-            let mut flat = Array1::<f64>::zeros(dim);
-            flat.slice_mut(ndarray::s![..coordinate_dim])
-                .assign(&solved.t);
-            flat.slice_mut(ndarray::s![coordinate_dim..])
-                .assign(&solved.beta);
-            let residual = &rhs_flat - &majorizer.dot(&flat);
-            residual.dot(&residual).sqrt()
-                / (highest * flat.dot(&flat).sqrt() + rhs_flat.dot(&rhs_flat).sqrt())
-        };
-
-        let folded = support_arrow_majorizer_inverse(&system, &factors, &rhs, Some(vectors))
-            .expect("folded majorizer inverse");
-        let iterated = support_arrow_majorizer_inverse(&system, &factors, &rhs, None)
-            .expect("CG majorizer inverse");
-        let folded_error = backward_error(&folded);
-        let iterated_error = backward_error(&iterated);
-        let bar = (dim * dim) as f64 * f64::EPSILON;
-        assert!(
-            folded_error <= bar,
-            "the dense-spectrum fold must invert the majorizer arrow: backward error \
-             {folded_error:.3e} > dim²·ε = {bar:.3e} (the √ε CG route reaches {iterated_error:.3e})"
-        );
-
-        let stale_lambda = vec![lambda[0] * 16.0, lambda[1] / 16.0];
-        let stale_system = term
-            .assemble_arrow_schur(target.view(), &stale_lambda, &ard)
-            .expect("stale assemble");
-        let stale_bundle = dense_bundle(&stale_system);
-        let stale = support_arrow_majorizer_inverse(
-            &system,
-            &factors,
-            &rhs,
-            stale_bundle.exact_inverse_vectors(),
-        )
-        .expect("stale fold");
-        let stale_error = backward_error(&stale);
-        assert!(
-            stale_error > f64::EPSILON.sqrt(),
-            "a bundle priced at another λ must not invert this arrow, or the bar above \
-             discriminates nothing: backward error {stale_error:.3e}"
-        );
-    }
-
-    /// #2634: the positive-definite certificate that spares the saddle classifier
-    /// its eigensystems decides in both directions at its own band. `S₀` is
-    /// planted with a unit diagonal and `λ_min(S₀) = t`: the block
-    /// `[[1, 1 − t], [1 − t, 1]]` (eigenvalues `t` and `2 − t`) beside an identity,
-    /// so the certificate's scaling is exact to rounding and its band is
-    /// `δ = (3n² + n + 2)·ε·‖S₀‖_F`. With `A = S₀ + τ·I` and `B = I`, `A − τ·B = S₀`
-    /// for either sign of `τ`.
-    #[test]
-    fn shifted_pd_certificate_decides_at_its_band_in_both_directions_2634() {
-        let dim = 6usize;
-        let planted = |t: f64, tau: f64| {
-            let mut a = Array2::<f64>::eye(dim);
-            a[[0, 1]] = 1.0 - t;
-            a[[1, 0]] = 1.0 - t;
-            for index in 0..dim {
-                a[[index, index]] += tau;
-            }
-            a
-        };
-        let identity = Array2::<f64>::eye(dim);
-        let n = dim as f64;
-        let delta = (3.0 * n * n + n + 2.0) * f64::EPSILON * (n + 2.0).sqrt();
-        for tau in [-0.5 * support_outer_curvature_floor(), 0.3] {
-            let certified =
-                certify_shifted_pd(planted(2.0 * delta, tau).view(), identity.view(), tau)
-                    .expect("λ_min(S₀) = 2δ is certified");
-            assert_eq!(certified.dim, dim);
-            assert_eq!(certified.tau, tau);
-            assert!(
-                matches!(certified.band, BandProvenance::Dense { scaled_frobenius } if scaled_frobenius > 0.0),
-                "{:?}",
-                certified.band
-            );
-            assert!(
-                (certified.delta - delta).abs() <= 1.0e-6 * delta,
-                "band {} against the planted {delta}",
-                certified.delta
-            );
-            for t in [0.5 * delta, -delta] {
-                let refusal = certify_shifted_pd(planted(t, tau).view(), identity.view(), tau)
-                    .expect_err("λ_min(S₀) inside or below the band is refused");
-                assert!(
-                    matches!(refusal, ShiftedPdRefusal::CholeskyFailed { pivot: Some(_), .. }),
-                    "λ_min(S₀) = {t:e} at τ = {tau:e}: {refusal:?}"
-                );
-            }
-        }
-        let mut indefinite = Array2::<f64>::eye(dim);
-        indefinite[[3, 3]] = -1.0;
-        assert_eq!(
-            certify_shifted_pd(indefinite.view(), identity.view(), 0.0),
-            Err(ShiftedPdRefusal::NonPositiveDiagonal {
-                index: 3,
-                value: -1.0
-            })
-        );
-    }
-
-    /// #2634 second-order gate: a periodic chart can be first-order attracted
-    /// to a blockwise fixed point whose exact joint curvature is negative.  The
-    /// generalized mode has arbitrary sign, so the escape must test both signs,
-    /// choose an actual objective decrease, and leave the ordinary fixed-point
-    /// solver in a certifiable minimum basin.
-    #[test]
-    fn exact_generalized_mode_escapes_a_periodic_saddle_2634() {
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
-        // At t=1/2 the von-Mises prior has curvature -1.  A small sine decoder
-        // contributes only (0.1*2pi)^2 through Gauss--Newton, so the exact
-        // coordinate curvature remains resolved negative while the majorizer
-        // pencil is strictly positive and therefore classifiable.
-        let atoms = vec![atom(
-            "periodic-saddle",
-            SaeAtomBasisKind::Periodic,
-            1,
-            evaluator,
-            &[0.5],
-            array![[0.0], [0.1], [0.0]],
-        )];
-        let specs = vec![SaeAssignmentAtomSpec {
-            latent_dim: 1,
-            manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
-            retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
-        }];
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            1,
-            1,
-            1,
-            specs,
-            vec![vec![0]],
-            vec![vec![1.0]],
-            vec![vec![0.5]],
-        )
-        .expect("state");
-        let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let target = array![[0.0_f64]];
-        let lambda = vec![1.0_f64];
-        let ard = vec![vec![1.0_f64]];
-        let system = term
-            .assemble_arrow_schur(target.view(), &lambda, &ard)
-            .expect("arrow system");
-        let (beta_offsets, _) = term.beta_layout().expect("beta layout");
-        let rows = term
-            .support_outer_differential_rows(target.view(), &ard, &beta_offsets)
-            .expect("exact differential rows");
-        let mode = term
-            .support_outer_negative_curvature_mode(&system, &rows)
-            .expect("curvature classification")
-            .expect("the planted saddle has a resolved negative mode");
-        assert!(
-            mode.curvature < -f64::EPSILON.sqrt(),
-            "planted generalized curvature must be resolved negative, got {}",
-            mode.curvature,
-        );
-
-        let before = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("saddle objective");
-        let escaped = term
-            .escape_support_negative_curvature(
-                target.view(),
-                &lambda,
-                &ard,
-                &mode,
-                before,
-                1.0,
-                &mut Vec::new(),
-                &mut Vec::new(),
-            )
-            .expect("exact saddle escape")
-            .expect("one orientation must descend exact negative curvature");
-        assert!(escaped < before, "escape must strictly lower the objective");
-
-        let report = term
-            .solve_fixed_point(target.view(), &lambda, &ard, 64, 1.0e-8, 1.0)
-            .expect("escaped state converges to a minimum basin");
-        assert!(report.recurred && report.objective < before);
-    }
-
-    /// #2634 — the support first-order screen accepts the same two currencies as
-    /// the dense manifold lane. Replicating rows makes the raw decoder gradient
-    /// extensive while its diagonal curvature grows by the identical factor;
-    /// only the componentwise diagonal-scaled limb remains invariant. The screen
-    /// schedules the exact Newton displacement certificate (#2933 F08).
-    #[test]
-    fn support_first_order_screen_survives_raw_global_refusal_2634() {
-        let rows = 1_024usize;
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        let atoms = vec![atom(
-            "replicated-line",
-            SaeAtomBasisKind::Linear,
-            1,
-            evaluator,
-            &[0.0],
-            array![[0.0], [10.0]],
-        )];
-        let coordinates: Vec<Vec<f64>> = (0..rows)
-            .map(|row| vec![if row % 2 == 0 { -10.0 } else { 10.0 }])
-            .collect();
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            rows,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]; rows],
-            vec![vec![1.0]; rows],
-            coordinates,
-        )
-        .expect("state");
-        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let fitted = term.reconstruct().expect("fitted");
-        let target = fitted.mapv(|value| value + 1.0e-4);
-        let lambda = vec![0.0];
-        let ard = vec![vec![0.0]];
-        let stationarity = term
-            .raw_stationarity(target.view(), &lambda, &ard)
-            .expect("stationarity");
-        let objective = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-        let objective_scale = objective.abs().max(1.0);
-        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
-        let tolerance = 1.0e-5;
-
-        assert!(
-            stationarity.max_abs() > tolerance * objective_scale,
-            "the replicated raw/global certificate must refuse"
-        );
-        assert!(
-            stationarity.scaled_max_abs() <= tolerance * parameter_scale,
-            "the componentwise diagonal-scaled screen must be intensive"
-        );
-        assert!(stationarity.first_order_screen(
-            objective_scale,
-            parameter_scale,
-            tolerance
-        ));
-
-        let error = accumulate_parameter_scaled_gradient(
-            &mut 0.0,
-            1.0,
-            0.0,
-            SaeInnerKktScaleBlock::SharedDecoder,
-            0,
-        )
-        .expect_err("zero curvature cannot scale a nonzero gradient");
-        assert!(matches!(
-            error,
-            SaeInnerKktScaleError::InvalidCurvature { .. }
-        ));
-    }
-
-    /// #2576 — a linear atom's affine gauge is profiled to the prior-selected
-    /// representative: the fit is unchanged, the penalized objective strictly
-    /// decreases, the routed coordinates are centered, and a second profile finds
-    /// nothing left to install.
-    #[test]
-    fn linear_affine_gauge_profile_lowers_the_prior_at_a_fixed_fit_2576() {
-        let rows = 8usize;
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        let probe = Array2::from_shape_vec((1, 1), vec![0.0]).expect("probe");
-        let (phi, jet) = evaluator.evaluate(probe.view()).expect("evaluate");
-        let atoms = vec![
-            SaeManifoldAtom::new_with_provided_function_gram(
-                "offset-line",
-                SaeAtomBasisKind::Linear,
-                1,
-                phi,
-                jet,
-                array![[0.3, -0.2], [2.0, 0.5]],
-                array![[0.0, 0.0], [0.0, 1.0]],
-            )
-            .expect("atom")
-            .with_basis_second_jet(evaluator),
-        ];
-        let coordinates: Vec<Vec<f64>> = (0..rows)
-            .map(|row| vec![5.0 + 3.0 * (row as f64 - 3.5) / 3.5])
-            .collect();
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            rows,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]; rows],
-            vec![vec![1.0]; rows],
-            coordinates,
-        )
-        .expect("state");
-        let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let before = term.reconstruct().expect("fitted");
-        let target = before.mapv(|value| value + 1.0e-3);
-        let lambda = vec![0.5];
-        let ard = vec![vec![1.0]];
-        let objective_before = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-
-        assert_eq!(
-            term.profile_linear_affine_gauges(&lambda, &ard)
-                .expect("profile"),
-            1,
-            "an offset, unscaled linear atom must be profiled"
-        );
-        let after = term.reconstruct().expect("fitted");
-        let scale = before.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
-        assert!(
-            before
-                .iter()
-                .zip(after.iter())
-                .all(|(left, right)| (left - right).abs() <= 1.0e-10 * scale),
-            "the affine gauge must leave the reconstruction unchanged"
-        );
-        let objective_after = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-        assert!(
-            objective_after < objective_before,
-            "profiling must lower the penalized objective: {objective_before} -> {objective_after}"
-        );
-        let mean = (0..rows)
-            .map(|row| term.assignment.coords_for_slot(row, 0)[0])
-            .sum::<f64>()
-            / rows as f64;
-        assert!(mean.abs() <= 1.0e-12, "profiled coordinates must be centered, mean {mean}");
-        assert_eq!(
-            term.profile_linear_affine_gauges(&lambda, &ard)
-                .expect("profile"),
-            0,
-            "a profiled atom is already at its prior-selected representative"
-        );
-    }
-
-    /// #2576 — the degree-2 patch counterpart: profiling an offset, unscaled patch
-    /// atom leaves the fit unchanged and strictly lowers the penalized objective,
-    /// and a further profile never raises it.
-    #[test]
-    fn euclidean_patch_affine_gauge_profile_lowers_the_prior_at_a_fixed_fit_2576() {
-        let rows = 8usize;
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 2).expect("patch"));
-        let probe = Array2::from_shape_vec((1, 1), vec![0.0]).expect("probe");
-        let (phi, jet) = evaluator.evaluate(probe.view()).expect("evaluate");
-        // The flat Dirichlet Gram over reference rows [-1, 0, 1]: the sum of
-        // `∇φ(r)∇φ(r)ᵀ` with `∇φ = [0, 1, 2r]`, zero on the constant.
-        let atoms = vec![
-            SaeManifoldAtom::new_with_provided_function_gram(
-                "offset-patch",
-                SaeAtomBasisKind::EuclideanPatch,
-                1,
-                phi,
-                jet,
-                array![[0.3, -0.2], [2.0, 0.5], [0.4, 0.1]],
-                array![[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 8.0]],
-            )
-            .expect("atom")
-            .with_basis_second_jet(evaluator),
-        ];
-        let coordinates: Vec<Vec<f64>> = (0..rows)
-            .map(|row| vec![2.5 + 1.5 * (row as f64 - 3.5) / 3.5])
-            .collect();
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            rows,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]; rows],
-            vec![vec![1.0]; rows],
-            coordinates,
-        )
-        .expect("state");
-        let mut term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let before = term.reconstruct().expect("fitted");
-        let target = before.mapv(|value| value + 1.0e-3);
-        let lambda = vec![0.5];
-        let ard = vec![vec![1.0]];
-        let objective_before = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-
-        assert_eq!(
-            term.profile_euclidean_patch_affine_gauges(&lambda, &ard)
-                .expect("profile"),
-            1,
-            "an offset, unscaled patch atom must be profiled"
-        );
-        let after = term.reconstruct().expect("fitted");
-        let scale = before.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
-        assert!(
-            before
-                .iter()
-                .zip(after.iter())
-                .all(|(left, right)| (left - right).abs() <= 1.0e-9 * scale),
-            "the affine gauge must leave the reconstruction unchanged"
-        );
-        let objective_after = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-        assert!(
-            objective_after < objective_before,
-            "profiling must lower the penalized objective: {objective_before} -> {objective_after}"
-        );
-        term.profile_euclidean_patch_affine_gauges(&lambda, &ard)
-            .expect("profile");
-        let objective_again = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-        assert!(
-            objective_again <= objective_after,
-            "a further profile must not raise the objective: {objective_after} -> {objective_again}"
-        );
-    }
-
-    /// #2933 F08 fixture: one degree-1 patch atom `f(t) = β₀ + β₁t` over eight rows
-    /// at `t₀ = ±1`, penalty `S = I`, ARD precision `α` and smoothing `λ = α`. The
-    /// fit is invariant along the scale orbit `(s·t₀, β₁*/s)`, so only the priors
-    /// curve it, `V(s) = ½αTs² + ½λβ₁*²s⁻²` with `T = Σt₀² = 8`, stationary at `s = 1`
-    /// when `β₁*² = αT/λ = T`. The target `y = (β₁* + α/β₁*)·t₀` leaves the residual
-    /// `r = α·t₀/β₁*`. That residual balances every coordinate's prior pull, and
-    /// because `Σt₀ = 0` and `Σt₀r = αT/β₁* = λβ₁*` it balances both decoder
-    /// gradients too. Neither affine profiler touches a degree-1 patch, so the orbit
-    /// is left to the solve.
-    fn scale_orbit_fixture_2933(
-        alpha: f64,
-        orbit_scale: f64,
-    ) -> (SaeSupportSparseTerm, Array2<f64>, Vec<f64>, Vec<Vec<f64>>, f64) {
-        let rows = 8usize;
-        let base: Vec<f64> = (0..rows)
-            .map(|row| if row % 2 == 0 { -1.0 } else { 1.0 })
-            .collect();
-        let slope = (rows as f64).sqrt();
-        let evaluator: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
-        let atoms = vec![atom(
-            "scale-orbit",
-            SaeAtomBasisKind::EuclideanPatch,
-            1,
-            evaluator,
-            &[0.0],
-            array![[0.0], [slope / orbit_scale]],
-        )];
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            rows,
-            1,
-            1,
-            vec![SaeAssignmentAtomSpec::euclidean(1)],
-            vec![vec![0]; rows],
-            vec![vec![1.0]; rows],
-            base.iter().map(|&t| vec![orbit_scale * t]).collect(),
-        )
-        .expect("state");
-        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        let target =
-            Array2::from_shape_fn((rows, 1), |(row, _)| (slope + alpha / slope) * base[row]);
-        (term, target, vec![alpha], vec![vec![alpha]], slope)
-    }
-
-    /// #2933 F08 — a diagonal-scaled gradient is not the remaining Newton
-    /// displacement. Five percent along the scale orbit (`α = 1e-6`) the state is
-    /// `β₁* − β₁*/1.05 ≈ 0.135` from the optimum in the slope and `0.05` in every
-    /// coordinate, yet the first-order screen passes on its diagonal limb: the
-    /// gradient is small only because the orbit's curvature is. The exact Newton
-    /// displacement recovers both distances to first order and refuses. At the
-    /// stationary point itself it certifies.
-    #[test]
-    fn exact_newton_displacement_sees_the_orbit_the_diagonal_misses_2933_f08() {
-        let alpha = 1.0e-6;
-        let orbit_scale = 1.05;
-        let (term, target, lambda, ard, slope) = scale_orbit_fixture_2933(alpha, orbit_scale);
-        let tolerance = term.fixed_point_tolerance();
-        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
-        let objective = term
-            .penalized_objective(target.view(), &lambda, &ard)
-            .expect("objective");
-        let stationarity = term
-            .raw_stationarity(target.view(), &lambda, &ard)
-            .expect("stationarity");
-        assert!(
-            stationarity.scaled_max_abs() <= tolerance * parameter_scale
-                && stationarity.first_order_screen(
-                    objective.abs().max(1.0),
-                    parameter_scale,
-                    tolerance
-                ),
-            "the fixture must hide the orbit from the diagonal: scaled {:.3e} vs bound {:.3e}",
-            stationarity.scaled_max_abs(),
-            tolerance * parameter_scale,
-        );
-        let (displacement, _) = term
-            .exact_newton_solve(target.view(), &lambda, &ard)
-            .expect("exact Newton displacement");
-        let slope_distance = slope - slope / orbit_scale;
-        let coordinate_distance = orbit_scale - 1.0;
-        assert!(
-            displacement.decoder_max_abs >= 0.5 * slope_distance
-                && displacement.decoder_max_abs <= 2.0 * slope_distance,
-            "decoder displacement {:.6e} must recover the slope distance {slope_distance:.6e}",
-            displacement.decoder_max_abs,
-        );
-        assert!(
-            displacement.coordinate_max_abs >= 0.5 * coordinate_distance
-                && displacement.coordinate_max_abs <= 2.0 * coordinate_distance,
-            "coordinate displacement {:.6e} must recover the coordinate distance \
-             {coordinate_distance:.6e}",
-            displacement.coordinate_max_abs,
-        );
-        assert!(!displacement.certifies(parameter_scale, tolerance));
-
-        let (optimum, target, lambda, ard, _) = scale_orbit_fixture_2933(alpha, 1.0);
-        let optimum_scale = optimum.parameter_iterate_scale().expect("parameter scale");
-        let (at_optimum, _) = optimum
-            .exact_newton_solve(target.view(), &lambda, &ard)
-            .expect("exact Newton displacement at the optimum");
-        assert!(
-            at_optimum.certifies(optimum_scale, tolerance),
-            "the stationary point must certify: displacement {:.3e} vs bound {:.3e}",
-            at_optimum.max_abs(),
-            tolerance * optimum_scale,
-        );
-    }
-
-    /// #2933 F08 — `solve_fixed_point` returns only a state whose exact Newton
-    /// displacement is within tolerance, and that state is the optimum. Started five
-    /// percent along the scale orbit with `α = 1e-7`, the alternation moves along the
-    /// orbit by about `α/2` of its remaining distance per cycle. So the objective
-    /// recurrence, the state recurrence and the diagonal-scaled screen all pass
-    /// while the slope is still `0.135` from `β₁* = √8`. The analytic optimum, not
-    /// the certificate's own number, is the oracle.
-    #[test]
-    fn fixed_point_certifies_the_orbit_optimum_not_its_crawl_2933_f08() {
-        let alpha = 1.0e-7;
-        let (mut term, target, lambda, ard, slope) = scale_orbit_fixture_2933(alpha, 1.05);
-        let tolerance = term.fixed_point_tolerance();
-        let report = term
-            .solve_fixed_point(target.view(), &lambda, &ard, 64, tolerance, 1.0)
-            .expect("the orbit optimum is certifiable");
-        assert!(report.recurred);
-        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
-        assert!(
-            report.newton_displacement.certifies(parameter_scale, tolerance),
-            "returned displacement {:.3e} vs bound {:.3e}",
-            report.newton_displacement.max_abs(),
-            tolerance * parameter_scale,
-        );
-        let fitted_slope = term.atoms[0].decoder_coefficients()[[1, 0]];
-        assert!(
-            (fitted_slope - slope).abs() <= 1.0e-4 * slope,
-            "certified slope {fitted_slope:.9e} must be the orbit optimum {slope:.9e}",
-        );
-        for row in 0..term.n_obs() {
-            let expected = if row % 2 == 0 { -1.0 } else { 1.0 };
-            let coordinate = term.assignment.coords_for_slot(row, 0)[0];
-            assert!(
-                (coordinate - expected).abs() <= 1.0e-4,
-                "row {row}: certified coordinate {coordinate:.9e} must be the orbit optimum \
-                 {expected}",
-            );
-        }
-    }
-
-    /// `support_outer`'s two-row fixture: a periodic harmonic atom and a degree-1 plane
-    /// patch, one row each, `P = 1`, with a residual that does not vanish.
-    fn support_outer_fixture_2933() -> (SaeSupportSparseTerm, Array2<f64>, Vec<f64>, Vec<Vec<f64>>) {
-        let periodic_eval: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
-        let patch_eval: Arc<dyn SaeBasisSecondJet> =
-            Arc::new(EuclideanPatchEvaluator::new(2, 1).expect("patch"));
-        let atoms = vec![
-            atom(
-                "circle",
-                SaeAtomBasisKind::Periodic,
-                1,
-                periodic_eval,
-                &[0.3],
-                array![[0.2], [1.1], [-0.4]],
-            ),
-            atom(
-                "plane",
-                SaeAtomBasisKind::Linear,
-                2,
-                patch_eval,
-                &[0.1, -0.2],
-                array![[0.3], [2.0], [-1.0]],
-            ),
-        ];
-        let specs = vec![
-            SaeAssignmentAtomSpec {
-                latent_dim: 1,
-                manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
-                retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
-            },
-            SaeAssignmentAtomSpec::euclidean(2),
-        ];
-        let state = SaeAssignmentState::from_topk_support_heterogeneous(
-            2,
-            2,
-            1,
-            specs,
-            vec![vec![0], vec![1]],
-            vec![vec![9.0], vec![-4.0]],
-            vec![vec![0.1], vec![3.0, 1.0]],
-        )
-        .expect("state");
-        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
-        (
-            term,
-            array![[1.4], [4.3]],
-            vec![0.35, 2.8],
-            vec![vec![1.0], vec![1.0, 1.0]],
-        )
-    }
-
-    /// #2933 F08 — a support fit driven to round-off certifies. `support_outer`'s
-    /// objective asks this fixture's fixed point for `1e-9`, below the fixture's
-    /// resolution `fixed_point_tolerance()` (≈ 2.3e-8 at six cells), so the fixed point
-    /// runs on to a state whose gradient is round-off. There `‖g − AΔ‖ ≤ √ε‖g‖` is
-    /// unreachable: with the floor removed, `support_penalized_deviance_derivative_
-    /// equals_penalty_energy` (same fixture and tolerance) refused at ‖g‖ 3.2e-15 against
-    /// a rounding band of 1.7e-15, relative residual 3.3e-3 (job 1117261). Only the
-    /// rounding floor `β_g + γ_dim·‖A‖·‖Δ‖` certifies that state. At
-    /// `fixed_point_tolerance()` the certificate already passed above round-off, so this
-    /// test passed with the floor removed and did not pin it (same job).
-    #[test]
-    fn fixed_point_certifies_a_state_converged_to_roundoff_2933_f08() {
-        let (mut term, target, lambda, ard) = support_outer_fixture_2933();
-        // `support_outer`'s inner tolerance, which drives this fixture to round-off.
-        let tolerance = 1.0e-9;
-        assert!(
-            tolerance < term.fixed_point_tolerance(),
-            "the control must ask for less than the fixture resolves, or it never reaches round-off",
-        );
-        let report = term
-            .solve_fixed_point(target.view(), &lambda, &ard, 5000, tolerance, 1.0)
-            .expect("a support fit converged to round-off must certify");
-        assert!(report.recurred);
-        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
-        assert!(
-            report.newton_displacement.certifies(parameter_scale, tolerance),
-            "returned displacement {:.3e} vs bound {:.3e}",
-            report.newton_displacement.max_abs(),
-            tolerance * parameter_scale,
-        );
-    }
-
-    /// #2933 F08 — the round-off floor does not certify a displaced state. At the
-    /// analytic optimum of the scale-orbit fixture with `α = 1` the displacement
-    /// certifies. Moving the slope by `offset` puts the state, to first order, `offset`
-    /// from its root in the slope alone, so the decoder displacement must read back
-    /// `offset` there and the certificate must refuse. The planted offset is the oracle.
-    #[test]
-    fn planted_decoder_offset_refuses_under_the_roundoff_floor_2933_f08() {
-        let (mut term, target, lambda, ard, _) = scale_orbit_fixture_2933(1.0, 1.0);
-        let tolerance = term.fixed_point_tolerance();
-        let optimum_scale = term.parameter_iterate_scale().expect("parameter scale");
-        let (at_optimum, _) = term
-            .exact_newton_solve(target.view(), &lambda, &ard)
-            .expect("exact Newton displacement at the optimum");
-        assert!(
-            at_optimum.certifies(optimum_scale, tolerance),
-            "the optimum must certify: displacement {:.3e} vs bound {:.3e}",
-            at_optimum.max_abs(),
-            tolerance * optimum_scale,
-        );
-
-        let offset = 1.0e-3;
-        let mut decoder = term.atoms[0].decoder_coefficients().clone();
-        decoder[[1, 0]] += offset;
-        term.atoms[0]
-            .set_decoder_coefficients(decoder)
-            .expect("plant the slope offset");
-        let displaced_scale = term.parameter_iterate_scale().expect("parameter scale");
-        let (displaced, _) = term
-            .exact_newton_solve(target.view(), &lambda, &ard)
-            .expect("exact Newton displacement at the displaced state");
-        let (beta_offsets, _) = term.beta_layout().expect("beta layout");
-        // `offset(atom) + basis · P + channel` for basis 1, channel 0.
-        let slope_index = beta_offsets[0] + term.output_dim;
-        assert!(
-            (displaced.decoder[slope_index] - offset).abs() <= 0.5 * offset,
-            "the slope displacement {:.6e} must read back the planted offset {offset:.3e}",
-            displaced.decoder[slope_index],
-        );
-        assert!(
-            displaced.max_abs() <= 2.0 * offset,
-            "no parameter may be displaced beyond the planted offset: {:.6e}",
-            displaced.max_abs(),
-        );
-        assert!(
-            !displaced.certifies(displaced_scale, tolerance),
-            "a planted offset {offset:.3e} must not certify against bound {:.3e}",
-            tolerance * displaced_scale,
-        );
-    }
-}
+#[path = "support_term_tests.rs"]
+mod tests;

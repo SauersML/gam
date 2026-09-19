@@ -167,7 +167,7 @@ fn decoder_repulsion_conditions_collapse_direction_1026() {
     let rho = SaeManifoldRho::new(
         (1.0e-3_f64).ln(),
         (1.0e-3_f64).ln(),
-        vec![Array1::<f64>::zeros(0); 2],
+        vec![Array1::<f64>::zeros(1); 2],
     );
 
     let mut term_col = build_two_atom_term(dec0_col, dec1_col);
@@ -229,7 +229,7 @@ fn collinear_two_atom_assembly_is_finite_and_well_formed_1026() {
     dec[[2, 0]] = 1.0;
     let mut term = build_two_atom_term(dec.clone(), dec);
     let target = Array2::<f64>::zeros((8, P));
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); 2]);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); 2]);
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .expect("collinear assembly must succeed (no panic / no degenerate refusal)");

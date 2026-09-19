@@ -440,6 +440,10 @@ pub enum FaerLinalgError {
     SelfAdjointEigen(solvers::EvdError),
     #[error("General eigendecomposition failed: {0:?}")]
     GeneralEigen(solvers::EvdError),
+    #[error(
+        "General eigendecomposition certificate refused: {arm} at slot {slot} measured {measured:.3e} against band {band:.3e}"
+    )]
+    GeneralEigenCertificateRefused { arm: &'static str, slot: usize, measured: f64, band: f64 },
     #[error("Cholesky factorization failed: {0:?}")]
     Cholesky(solvers::LltError),
     #[error("LDLT factorization failed: {0:?}")]
@@ -613,6 +617,20 @@ impl FaerLdlt {
     }
 }
 
+/// The inertia of a symmetric matrix read off its Bunch–Kaufman factor (#2901).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SymmetricInertia {
+    pub negative: usize,
+    pub zero: usize,
+    pub positive: usize,
+    /// The smallest eigenvalue of the factor's 1×1 and 2×2 pivot blocks: NaN when any
+    /// pivot is not finite, `+∞` for an empty matrix.
+    pub smallest_pivot: f64,
+    /// `‖L̂‖_F²·‖B̂‖_∞`, a bound on `‖ |L̂||B̂||L̂ᵀ| ‖₂`, the factors' term in the
+    /// factorization's backward error.
+    pub factor_magnitude: f64,
+}
+
 /// `P A Pᵀ = L B Lᵀ` (Bunch-Kaufman) of a symmetric matrix at
 /// [`decomposition_parallelism`].
 #[derive(Clone)]
@@ -659,6 +677,69 @@ impl FaerLblt {
             b_subdiag,
             perm,
         }
+    }
+
+    /// The inertia of the factored matrix, read off `B` (#2901).
+    ///
+    /// `P A Pᵀ = L B Lᵀ` with `L` unit lower triangular is a congruence, so by
+    /// Sylvester's law of inertia `A` has as many negative, zero and positive
+    /// eigenvalues as `B`. `B` is block diagonal: a nonzero subdiagonal entry at `k`
+    /// opens a 2×2 block on `k, k + 1`, and every other index is a 1×1 block. The
+    /// eigenvalues of `B` are those of its blocks.
+    pub fn inertia(&self) -> SymmetricInertia {
+        let n = self.l.nrows();
+        let b_diag = self.b_diag.as_ref();
+        let b_subdiag = self.b_subdiag.as_ref();
+        let mut inertia = SymmetricInertia {
+            negative: 0,
+            zero: 0,
+            positive: 0,
+            smallest_pivot: f64::INFINITY,
+            factor_magnitude: 0.0,
+        };
+        let mut finite = true;
+        let mut block_norm = 0.0_f64;
+        let mut count = |value: f64, inertia: &mut SymmetricInertia| {
+            if !value.is_finite() {
+                finite = false;
+            } else if value < 0.0 {
+                inertia.negative += 1;
+            } else if value > 0.0 {
+                inertia.positive += 1;
+            } else {
+                inertia.zero += 1;
+            }
+            inertia.smallest_pivot = inertia.smallest_pivot.min(value);
+        };
+        let mut k = 0;
+        while k < n {
+            let a = b_diag[k];
+            if k + 1 < n && b_subdiag[k] != 0.0 {
+                let c = b_subdiag[k];
+                let d = b_diag[k + 1];
+                let mean = 0.5 * (a + d);
+                let radius = (0.5 * (a - d)).hypot(c);
+                count(mean - radius, &mut inertia);
+                count(mean + radius, &mut inertia);
+                block_norm = block_norm.max((a.abs() + c.abs()).max(c.abs() + d.abs()));
+                k += 2;
+            } else {
+                count(a, &mut inertia);
+                block_norm = block_norm.max(a.abs());
+                k += 1;
+            }
+        }
+        if !finite {
+            inertia.smallest_pivot = f64::NAN;
+        }
+        let mut lower_frobenius_sq = 0.0_f64;
+        for j in 0..n {
+            for i in j..n {
+                lower_frobenius_sq += self.l[(i, j)] * self.l[(i, j)];
+            }
+        }
+        inertia.factor_magnitude = lower_frobenius_sq * block_norm;
+        inertia
     }
 
     /// The dimension of the factored matrix.
@@ -2991,17 +3072,20 @@ fn frobenius_trace_and_diagonal_mass(a: MatRef<'_, f64>) -> (f64, f64, f64) {
 
 /// The measured backward error `‖Av − λv‖₂ / ((‖A‖_F + |λ|)·‖v‖₂)` of every
 /// slot's eigenpair, with a conjugate pair's two slots carrying the same value.
-/// `None` when a pair is not adjacent with equal real parts and negated imaginary
-/// parts. An exact zero residual measures zero whatever the denominator.
-/// `vectors` holds faer's right eigenvectors: a real eigenvalue's in its own
-/// column, and for `λ = re[i] + i·im[i]` of a conjugate pair,
-/// `col(i) + i·col(i + 1)`.
+/// It bounds each eigenvalue's backward error from above. An exact zero residual
+/// measures zero, whatever the denominator. `vectors` holds faer's right
+/// eigenvectors: a real eigenvalue's in its own column, and for
+/// `λ = re[i] + i·im[i]` of a conjugate pair, `col(i) + i·col(i + 1)`.
+///
+/// `Err((slot, gap))` when the pair starting at `slot` is not adjacent with equal
+/// real parts and negated imaginary parts. `gap` is `|re[i+1] − re[i]| + |im[i+1] + im[i]|`,
+/// or `|im[i]|` when the pair has no second slot.
 fn general_eigenpair_backward_errors(
     a: MatRef<'_, f64>,
     re: &Array1<f64>,
     im: &Array1<f64>,
     vectors: MatRef<'_, f64>,
-) -> Option<Array1<f64>> {
+) -> Result<Array1<f64>, (usize, f64)> {
     let n = a.nrows();
     let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
     let frobenius = frobenius_sq.sqrt();
@@ -3018,8 +3102,11 @@ fn general_eigenpair_backward_errors(
             errors[i] = relative(residual_sq.sqrt(), (frobenius + lambda.abs()) * column_sq(i).sqrt());
             i += 1;
         } else {
-            if i + 1 >= n || re[i + 1] != re[i] || im[i + 1] != -im[i] {
-                return None;
+            if i + 1 >= n {
+                return Err((i, im[i].abs()));
+            }
+            if re[i + 1] != re[i] || im[i + 1] != -im[i] {
+                return Err((i, (re[i + 1] - re[i]).abs() + (im[i + 1] + im[i]).abs()));
             }
             // A(x + iy) = (a + ib)(x + iy) is Ax = a·x − b·y and Ay = b·x + a·y.
             let (real, imag) = (re[i], im[i]);
@@ -3036,7 +3123,79 @@ fn general_eigenpair_backward_errors(
             i += 2;
         }
     }
-    Some(errors)
+    Ok(errors)
+}
+
+/// The exact backward error of the eigenvalue `λ = re + i·im` of `A`, as
+/// `(σ_min(A − λI) / (‖A‖_F + |λ|), band)`, singular values only, at
+/// [`decomposition_parallelism`].
+///
+/// `σ_min(A − λI)` is the norm of the smallest `E` for which `λ` is an eigenvalue
+/// of `A + E`, so it does not depend on how well an eigenvector is determined.
+/// faer's eigenvectors are not evidence at a semisimple repeated eigenvalue. Its
+/// shifted 2×2 quasi-triangular solve computes `adj(M)·r / det(M)` with
+/// `M = B₁ − λI` singular, so the second copy's vector is wrong by an O(1) factor
+/// while the eigenvalue is exact (#2627/#2951, probe job 1209094).
+///
+/// The band charges three things:
+/// - the reduction's backward error: `λ` is an eigenvalue of `A + E` with
+///   `‖E‖₂ ≤ η_A·‖A‖_F` ([`general_eigen_reduction_band`]);
+/// - the SVD's own backward stability ([`crate::roundoff::factor_singular_band`]);
+/// - forming `A − λI`, one rounded subtraction per diagonal entry.
+fn general_eigenvalue_singular_backward_error(
+    a: MatRef<'_, f64>,
+    re: f64,
+    im: f64,
+    reduction: f64,
+) -> Result<(f64, f64), svd::SvdError> {
+    let n = a.nrows();
+    let par = decomposition_parallelism();
+    let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
+    let magnitude = re.hypot(im);
+    let scale = frobenius_sq.sqrt() + magnitude;
+    let diagonal_max = (0..n).fold(0.0_f64, |largest, j| largest.max(a[(j, j)].abs()));
+    let (sigma_min, sigma_max) = if im == 0.0 {
+        let mut shifted = a.to_owned();
+        for j in 0..n {
+            shifted[(j, j)] -= re;
+        }
+        let mut s = Diag::<f64>::zeros(n);
+        let mut mem = MemBuffer::new(svd::svd_scratch::<f64>(
+            n,
+            n,
+            ComputeSvdVectors::No,
+            ComputeSvdVectors::No,
+            par,
+            Default::default(),
+        ));
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1], s.as_ref().column_vector()[0])
+    } else {
+        let lambda = faer::c64::new(re, im);
+        let shifted = Mat::<faer::c64>::from_fn(n, n, |i, j| {
+            let value = faer::c64::new(a[(i, j)], 0.0);
+            if i == j { value - lambda } else { value }
+        });
+        let mut s = Diag::<faer::c64>::zeros(n);
+        let mut mem = MemBuffer::new(svd::svd_scratch::<faer::c64>(
+            n,
+            n,
+            ComputeSvdVectors::No,
+            ComputeSvdVectors::No,
+            par,
+            Default::default(),
+        ));
+        svd::svd(shifted.as_ref(), s.as_mut(), None, None, par, MemStack::new(&mut mem), Default::default())?;
+        (s.as_ref().column_vector()[n - 1].re, s.as_ref().column_vector()[0].re)
+    };
+    if scale == 0.0 {
+        return Ok((0.0, 0.0));
+    }
+    let absolute_band = reduction * frobenius_sq.sqrt()
+        + crate::roundoff::factor_singular_band(n, n, sigma_max)
+        + crate::roundoff::UNIT_ROUNDOFF * (diagonal_max + magnitude);
+    let relative = if sigma_min == 0.0 { 0.0 } else { sigma_min / scale };
+    Ok((relative, absolute_band / scale))
 }
 
 /// Certificate (i)'s band, `η = η_A + 2·γ_{n+1}`, over the reduction's counted
@@ -3047,37 +3206,66 @@ fn general_eigen_pair_band(n: usize, reduction: f64) -> f64 {
     reduction + 2.0 * crate::roundoff::accumulation_growth(n + 1)
 }
 
-/// Certificate (ii), the trace, of [`real_general_eigenvalues`]. The computed
-/// spectrum is exactly that of `A + E` with `‖E‖_F ≤ η_A·‖A‖_F`, so
-/// `Σλ = tr A + tr E` with `|tr E| ≤ √n·‖E‖_F`. Both sums are charged their
-/// accumulation bands.
+/// Whether certificate (ii)'s trace arm holds ([`general_spectrum_trace_measure`]).
 fn general_spectrum_trace_consistent(a: MatRef<'_, f64>, re: &Array1<f64>, reduction: f64) -> bool {
+    let (gap, band) = general_spectrum_trace_measure(a, re, reduction);
+    gap <= band
+}
+
+/// Certificate (ii), the trace, of [`real_general_spectrum`], as
+/// `(|Σ re − tr A|, band)`. The computed spectrum is exactly that of `A + E` with
+/// `‖E‖_F ≤ η_A·‖A‖_F`, so `Σλ = tr A + tr E` with `|tr E| ≤ √n·‖E‖_F`. Both sums
+/// are charged their accumulation bands.
+fn general_spectrum_trace_measure(a: MatRef<'_, f64>, re: &Array1<f64>, reduction: f64) -> (f64, f64) {
     let n = a.nrows();
     let (frobenius_sq, trace, diagonal_mass) = frobenius_trace_and_diagonal_mass(a);
     let sum_re: f64 = re.iter().sum();
     let re_mass: f64 = re.iter().map(|value| value.abs()).sum();
     let band = (n as f64).sqrt() * reduction * frobenius_sq.sqrt()
         + crate::roundoff::accumulation_growth(n.saturating_sub(1)) * (diagonal_mass + re_mass);
-    (sum_re - trace).abs() <= band
+    ((sum_re - trace).abs(), band)
 }
 
-/// Certificate (ii), Schur's inequality, of [`real_general_eigenvalues`]:
-/// `Σ|λ|² ≤ ‖A + E‖_F² ≤ (1 + η_A)²·‖A‖_F²`. `‖A‖_F²` is charged the rounding of
-/// its `n²` squares and `Σ|λ|²` that of its `2n`. An unconverged slot that
-/// inflates a magnitude breaks it.
+/// Whether certificate (ii)'s Schur arm holds ([`general_spectrum_schur_measure`]).
 fn general_spectrum_within_schur_bound(
     a: MatRef<'_, f64>,
     re: &Array1<f64>,
     im: &Array1<f64>,
     reduction: f64,
 ) -> bool {
+    let (magnitude_sq, bound) = general_spectrum_schur_measure(a, re, im, reduction);
+    magnitude_sq <= bound
+}
+
+/// Certificate (ii), Schur's inequality, of [`real_general_spectrum`], as
+/// `(Σ|λ|², bound)`: `Σ|λ|² ≤ ‖A + E‖_F² ≤ (1 + η_A)²·‖A‖_F²`. `‖A‖_F²` is charged
+/// the rounding of its `n²` squares and `Σ|λ|²` that of its `2n`. An unconverged
+/// slot that inflates a magnitude breaks it.
+fn general_spectrum_schur_measure(
+    a: MatRef<'_, f64>,
+    re: &Array1<f64>,
+    im: &Array1<f64>,
+    reduction: f64,
+) -> (f64, f64) {
     use crate::roundoff::accumulation_growth;
     let n = a.nrows();
     let (frobenius_sq, _, _) = frobenius_trace_and_diagonal_mass(a);
     let magnitude_sq: f64 = re.iter().zip(im.iter()).map(|(r, j)| r * r + j * j).sum();
-    magnitude_sq
-        <= (1.0 + reduction).powi(2) * frobenius_sq * (1.0 + accumulation_growth(n * n))
-            + accumulation_growth(2 * n) * magnitude_sq
+    let bound = (1.0 + reduction).powi(2) * frobenius_sq * (1.0 + accumulation_growth(n * n))
+        + accumulation_growth(2 * n) * magnitude_sq;
+    (magnitude_sq, bound)
+}
+
+/// #2627 — which measurement certified a slot's eigenvalue in
+/// [`real_general_spectrum`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EigenvalueBackwardErrorSource {
+    /// The residual `‖Av − λv‖` of faer's right eigenvector, an upper bound on the
+    /// eigenvalue's backward error.
+    VectorResidual,
+    /// The exact backward error `σ_min(A − λI)`. It is measured only where faer's
+    /// eigenvector does not certify the eigenvalue, e.g. at a semisimple repeat.
+    SingularValue,
 }
 
 /// #2627 — a real square matrix's certified spectrum ([`real_general_spectrum`])
@@ -3089,15 +3277,21 @@ pub struct CertifiedGeneralSpectrum {
     pub re: Array1<f64>,
     /// Imaginary parts, `0.0` exactly for a real eigenvalue.
     pub im: Array1<f64>,
-    /// Per slot, the measured backward error of its eigenpair,
-    /// `‖Av − λv‖₂ / ((‖A‖_F + |λ|)·‖v‖₂)`. A conjugate pair's two slots carry
+    /// Per slot, the measured backward error of its eigenvalue relative to
+    /// `‖A‖_F + |λ|`, from the source in `sources`. A conjugate pair's two slots carry
     /// the same value.
     pub backward_errors: Array1<f64>,
-    /// The band every backward error was certified against,
-    /// `η = η_A + 2·γ_{n+1}` ([`general_eigen_reduction_band`]). It counts faer's
-    /// iteration cap, not the iterations run, so it grows like `60·n³·u`. A decision
-    /// that needs tighter evidence reads `backward_errors`.
-    pub band: f64,
+    /// Per slot, the band its backward error was certified against.
+    /// - A `VectorResidual` slot's band is `η = η_A + 2·γ_{n+1}`
+    ///   ([`general_eigen_pair_band`]).
+    /// - A `SingularValue` slot's band is `η_A` plus the SVD's and the shift's rounding
+    ///   ([`general_eigenvalue_singular_backward_error`]).
+    ///
+    /// `η_A` counts faer's iteration cap, not the iterations run, so it grows like
+    /// `60·n³·u`. A decision that needs tighter evidence reads `backward_errors`.
+    pub bands: Array1<f64>,
+    /// Per slot, which measurement certified it.
+    pub sources: Vec<EigenvalueBackwardErrorSource>,
 }
 
 /// #2627 — the eigenvalues of a real square matrix at [`evd_parallelism`],
@@ -3111,20 +3305,38 @@ pub struct CertifiedGeneralSpectrum {
 /// Schur QR iteration (`linalg::evd::evd_imp`, mod.rs:1083-1094 in 0.24.0 and
 /// 0.24.4). An iteration that exhausts its cap leaves shift estimates in the
 /// undeflated slots and still returns `Ok(())`, and the iteration itself is
-/// `pub(crate)` in faer. So the helper computes the right eigenvectors internally
-/// and refuses as `GeneralEigen(EvdError::NoConvergence)` unless both hold:
-/// - (i) every eigenpair's measured backward error
-///   ([`general_eigenpair_backward_errors`]) is within the reduction's counted
-///   band plus the vectors' and the residual's rounding
-///   ([`general_eigen_pair_band`]);
-/// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_consistent`]), and
+/// `pub(crate)` in faer. So the helper computes the right eigenvectors internally.
+/// It refuses as `GeneralEigenCertificateRefused`, naming the arm, the slot, the
+/// measured value and the band, unless all of these hold:
+/// - (i) every eigenvalue's backward error is within its band. First the
+///   residual of faer's eigenvector ([`general_eigenpair_backward_errors`]) is
+///   compared with `η` ([`general_eigen_pair_band`]); it bounds the backward error
+///   from above. Where it does not certify, faer's vector is not evidence either
+///   way, so the exact backward error `σ_min(A − λI)` is measured instead
+///   ([`general_eigenvalue_singular_backward_error`]), one singular-values-only SVD
+///   per such eigenvalue.
+/// - (ii) `Σ re` agrees with `tr A` ([`general_spectrum_trace_measure`]), and
 ///   Schur's inequality `Σ|λ|² ≤ ‖A‖_F²` holds
-///   ([`general_spectrum_within_schur_bound`]), each within its band.
+///   ([`general_spectrum_schur_measure`]), each within its band.
+/// - Conjugate pairs are adjacent with equal real parts and negated imaginary parts.
 ///
-/// An undeflated slot's residual is O(1) relative, far outside the band.
+/// faer's own failures stay `GeneralEigen(EvdError)` and `SvdNoConvergence`.
+///
+/// An undeflated slot has an O(1) relative backward error, far outside the band.
+///
+/// **Semisimple repeats.** At a repeated eigenvalue with a full eigenspace, faer's
+/// second eigenvector is wrong by an O(1) factor while the eigenvalue is exact, so
+/// that slot is certified by `σ_min`.
+///
+/// **What it does not refuse.** Eigenvalues of a defective or nearly defective
+/// matrix, such as a Jordan block with or without a 1e-12 perturbation, are
+/// backward-exact: each is an exact eigenvalue of a matrix within the band of `A`.
+/// They certify, though their forward error can be far larger than the band. A
+/// consumer that needs forward accuracy needs a condition estimate, which this
+/// certificate is not.
 ///
 /// **Known limit.** A multiplicity error with a correct eigenvalue sum passes
-/// both checks: two slots on one eigenvalue while another is missing.
+/// every arm: two slots on one eigenvalue while another is missing.
 ///
 /// **faer dependency.** This reads faer's info-discarding `evd_imp`, its
 /// iteration cap, and its conjugate-pair eigenvector convention. Like
@@ -3144,7 +3356,8 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
             re: Array1::zeros(0),
             im: Array1::zeros(0),
             backward_errors: Array1::zeros(0),
-            band: 0.0,
+            bands: Array1::zeros(0),
+            sources: Vec::new(),
         });
     }
     if owned.iter().any(|value| !value.is_finite()) {
@@ -3158,7 +3371,8 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
             re: Array1::from_elem(1, owned[[0, 0]]),
             im: Array1::zeros(1),
             backward_errors: Array1::zeros(1),
-            band: general_eigen_pair_band(1, general_eigen_reduction_band(1)),
+            bands: Array1::from_elem(1, general_eigen_pair_band(1, general_eigen_reduction_band(1))),
+            sources: vec![EigenvalueBackwardErrorSource::VectorResidual],
         });
     }
     let view = FaerArrayView::new(&owned);
@@ -3169,15 +3383,72 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         .map_err(FaerLinalgError::GeneralEigen)?;
     let reduction = general_eigen_reduction_band(n);
     let band = general_eigen_pair_band(n, reduction);
-    let refused = || FaerLinalgError::GeneralEigen(solvers::EvdError::NoConvergence);
-    let backward_errors = match general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()) {
-        Some(errors) if errors.iter().all(|error| *error <= band) => errors,
-        _ => return Err(refused()),
-    };
-    if !(general_spectrum_trace_consistent(view.as_ref(), &re, reduction)
-        && general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction))
-    {
-        return Err(refused());
+    let mut backward_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref())
+        .map_err(|(slot, gap)| FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "conjugate pairing",
+            slot,
+            measured: gap,
+            band: 0.0,
+        })?;
+    let mut bands = Array1::from_elem(n, band);
+    let mut sources = vec![EigenvalueBackwardErrorSource::VectorResidual; n];
+    // One SVD per distinct failing eigenvalue. For a real A, σ_min(A − λI) = σ_min(A − λ̄I), so a value and its
+    // conjugate share one measurement, keyed on (re, |im|).
+    let mut measured_shifts: Vec<((f64, f64), (f64, f64))> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let width = if im[i] == 0.0 { 1 } else { 2 };
+        if !(backward_errors[i] <= band) {
+            let key = (re[i], im[i].abs());
+            let (measured, singular_band) = match measured_shifts.iter().find(|(shift, _)| *shift == key) {
+                Some(&(_, outcome)) => outcome,
+                None => {
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        general_eigenvalue_singular_backward_error(view.as_ref(), re[i], im[i], reduction)
+                    }))
+                    .map_err(|_| FaerLinalgError::FactorizationFailed {
+                        context: "general eigenvalue backward-error SVD panic boundary",
+                    })?
+                    .map_err(|_| FaerLinalgError::SvdNoConvergence {
+                        context: "general eigenvalue backward error sigma_min(A - lambda I)",
+                    })?;
+                    measured_shifts.push((key, outcome));
+                    outcome
+                }
+            };
+            if !(measured <= singular_band) {
+                return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+                    arm: "eigenvalue backward error sigma_min(A - lambda I)",
+                    slot: i,
+                    measured,
+                    band: singular_band,
+                });
+            }
+            for k in i..i + width {
+                backward_errors[k] = measured;
+                bands[k] = singular_band;
+                sources[k] = EigenvalueBackwardErrorSource::SingularValue;
+            }
+        }
+        i += width;
+    }
+    if !general_spectrum_trace_consistent(view.as_ref(), &re, reduction) {
+        let (gap, trace_band) = general_spectrum_trace_measure(view.as_ref(), &re, reduction);
+        return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "trace",
+            slot: 0,
+            measured: gap,
+            band: trace_band,
+        });
+    }
+    if !general_spectrum_within_schur_bound(view.as_ref(), &re, &im, reduction) {
+        let (magnitude_sq, schur_bound) = general_spectrum_schur_measure(view.as_ref(), &re, &im, reduction);
+        return Err(FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "Schur inequality",
+            slot: 0,
+            measured: magnitude_sq,
+            band: schur_bound,
+        });
     }
     let mut im = im;
     let mut i = 0;
@@ -3188,7 +3459,7 @@ pub fn real_general_spectrum<S: Data<Elem = f64>>(
         }
         i += if im[i] == 0.0 { 1 } else { 2 };
     }
-    Ok(CertifiedGeneralSpectrum { re, im, backward_errors, band })
+    Ok(CertifiedGeneralSpectrum { re, im, backward_errors, bands, sources })
 }
 
 /// #2627 — the eigenvalues `(re, im)` of [`real_general_spectrum`], for callers
@@ -5346,7 +5617,7 @@ mod general_eigenvalues_2627_tests {
         let eta = general_eigen_pair_band(n, reduction);
         let within_band = |re: &Array1<f64>, im: &Array1<f64>| {
             general_eigenpair_backward_errors(view.as_ref(), re, im, vectors.as_ref())
-                .is_some_and(|errors| errors.iter().all(|error| *error <= eta))
+                .is_ok_and(|errors| errors.iter().all(|error| *error <= eta))
         };
         assert!(within_band(&re, &im));
         assert!(general_spectrum_trace_consistent(view.as_ref(), &re, reduction));
@@ -5362,6 +5633,14 @@ mod general_eigenvalues_2627_tests {
         assert!(
             !within_band(&moved, &im),
             "an eigenvalue moved by {shift:.3e} must fail the backward-error arm"
+        );
+        // The fallback must not rescue it: the exact backward error sigma_min(A - lambda I) of the moved
+        // eigenvalue is outside its own band too.
+        let (measured, singular_band) =
+            general_eigenvalue_singular_backward_error(view.as_ref(), moved[0], im[0], reduction).expect("SVD");
+        assert!(
+            measured > singular_band,
+            "a moved eigenvalue must fail sigma_min too: measured {measured:.3e} against band {singular_band:.3e}"
         );
 
         let mut first_pair = None;
@@ -5404,22 +5683,21 @@ mod general_eigenvalues_2627_tests {
     }
 
     /// The measured backward errors a consumer reads beside the spectrum. Each is
-    /// finite and within the certified band, a conjugate pair's two slots carry one
-    /// value, and `real_general_eigenvalues` returns exactly the spectrum's
-    /// `(re, im)`.
+    /// finite and within its slot's band, and a conjugate pair's two slots carry one
+    /// measurement, one band and one source. `real_general_eigenvalues` returns
+    /// exactly the spectrum's `(re, im)`. These well-separated hashed spectra are
+    /// certified by faer's eigenvector residuals alone, with no SVD.
     #[test]
     fn real_general_spectrum_reports_measured_backward_errors_within_its_band_2627() {
         for &n in &[1_usize, 2, 5, 17, 40] {
             let a = hashed_matrix(n, 11);
             let spectrum = real_general_spectrum(&a).expect("certified spectrum");
-            assert_eq!(spectrum.backward_errors.len(), n);
-            assert!(spectrum.band.is_finite() && spectrum.band > 0.0, "n={n}: band {}", spectrum.band);
-            for (k, error) in spectrum.backward_errors.iter().enumerate() {
-                assert!(
-                    error.is_finite() && *error <= spectrum.band,
-                    "n={n}: slot {k} backward error {error:e} against band {:e}",
-                    spectrum.band
-                );
+            assert_eq!((spectrum.backward_errors.len(), spectrum.bands.len(), spectrum.sources.len()), (n, n, n));
+            for k in 0..n {
+                let (error, band) = (spectrum.backward_errors[k], spectrum.bands[k]);
+                assert!(band.is_finite() && band > 0.0, "n={n}: slot {k} band {band}");
+                assert!(error.is_finite() && error <= band, "n={n}: slot {k} backward error {error:e} against band {band:e}");
+                assert_eq!(spectrum.sources[k], EigenvalueBackwardErrorSource::VectorResidual, "n={n}: slot {k}");
             }
             let mut i = 0;
             while i < n {
@@ -5428,7 +5706,8 @@ mod general_eigenvalues_2627_tests {
                     continue;
                 }
                 assert_eq!(
-                    spectrum.backward_errors[i], spectrum.backward_errors[i + 1],
+                    (spectrum.backward_errors[i], spectrum.bands[i], spectrum.sources[i]),
+                    (spectrum.backward_errors[i + 1], spectrum.bands[i + 1], spectrum.sources[i + 1]),
                     "n={n}: the pair at {i} carries two different measurements"
                 );
                 i += 2;
@@ -5437,5 +5716,152 @@ mod general_eigenvalues_2627_tests {
             assert_eq!(re, spectrum.re, "n={n}: the convenience returns other real parts");
             assert_eq!(im, spectrum.im, "n={n}: the convenience returns other imaginary parts");
         }
+    }
+
+    /// mpd-schur's exact-dyadic n = 8 fixture: T = G·B·G⁻¹ with G = I + N (ones on
+    /// the first superdiagonal, minus ones on the second) and
+    /// B = diag(R(0.5, 0.75), R(0.5, 0.75), 2, −1, R(−0.625, 0.25)),
+    /// R(a, b) = [[a, −b], [b, a]]. T·G = G·B holds bitwise.
+    fn semisimple_fixture() -> (Array2<f64>, Array2<f64>) {
+        let n = 8;
+        let mut g = Array2::<f64>::eye(n);
+        for i in 0..n {
+            if i + 1 < n {
+                g[[i, i + 1]] = 1.0;
+            }
+            if i + 2 < n {
+                g[[i, i + 2]] = -1.0;
+            }
+        }
+        let mut g_inverse = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            for i in (0..n).rev() {
+                let mut s = if i == j { 1.0 } else { 0.0 };
+                for k in i + 1..n {
+                    s -= g[[i, k]] * g_inverse[[k, j]];
+                }
+                g_inverse[[i, j]] = s;
+            }
+        }
+        let mut b = Array2::<f64>::zeros((n, n));
+        for (o, re, im) in [(0_usize, 0.5_f64, 0.75_f64), (2, 0.5, 0.75), (6, -0.625, 0.25)] {
+            b[[o, o]] = re;
+            b[[o, o + 1]] = -im;
+            b[[o + 1, o]] = im;
+            b[[o + 1, o + 1]] = re;
+        }
+        b[[4, 4]] = 2.0;
+        b[[5, 5]] = -1.0;
+        assert_eq!(g.dot(&g_inverse), Array2::<f64>::eye(n), "G⁻¹ must be exact");
+        let t = g.dot(&b).dot(&g_inverse);
+        assert_eq!(t.dot(&g), g.dot(&b), "T·G = G·B must hold bitwise");
+        (t, g)
+    }
+
+    /// A semisimple repeated pair certifies (#2627/#2951). faer's eigenvector for the
+    /// repeat is wrong by an O(1) factor, so its residual refuses; that is the control
+    /// showing the fixture exercises the fallback. The exact backward error
+    /// `σ_min(T − λI)` certifies the exact eigenvalue instead. Every returned eigenvalue
+    /// is within `κ₂(G)·‖E‖₂` of a planted one (Bauer–Fike for the diagonalizable
+    /// `T = (G·W)·D·(G·W)⁻¹`, with `W` the unitary 2×2 block rotations). `‖E‖₂` is the
+    /// slot's band times `‖T‖_F + |λ|`.
+    #[test]
+    fn real_general_spectrum_certifies_a_semisimple_repeated_pair_2627() {
+        let (t, g) = semisimple_fixture();
+        let n = t.nrows();
+        let view = FaerArrayView::new(&t);
+        let (re, im, vectors) = general_evd(view.as_ref()).expect("faer eigendecomposition");
+        let vector_band = general_eigen_pair_band(n, general_eigen_reduction_band(n));
+        let vector_errors = general_eigenpair_backward_errors(view.as_ref(), &re, &im, vectors.as_ref()).expect("pairing");
+        assert!(
+            vector_errors.iter().any(|error| *error > vector_band),
+            "the fixture must defeat faer's eigenvector residual, or this pin does not reach sigma_min: {vector_errors:?}"
+        );
+
+        let spectrum = real_general_spectrum(&t).expect("a semisimple repeated pair certifies");
+        let singular: Vec<usize> =
+            (0..n).filter(|&k| spectrum.sources[k] == EigenvalueBackwardErrorSource::SingularValue).collect();
+        assert!(!singular.is_empty(), "no slot was certified by sigma_min: {:?}", spectrum.sources);
+        for k in 0..n {
+            assert!(
+                spectrum.backward_errors[k] <= spectrum.bands[k],
+                "slot {k}: {:e} against band {:e} ({:?})",
+                spectrum.backward_errors[k],
+                spectrum.bands[k],
+                spectrum.sources[k]
+            );
+        }
+
+        let (_, g_singular, _) = g.svd(false, false).expect("G's singular values");
+        let condition = g_singular.iter().fold(0.0_f64, |m, s| m.max(*s)) / g_singular.iter().fold(f64::INFINITY, |m, s| m.min(*s));
+        let scale = frobenius(&t);
+        let mut planted = vec![(0.5, 0.75), (0.5, 0.75), (2.0, 0.0), (-1.0, 0.0), (-0.625, 0.25)];
+        let mut i = 0;
+        while i < n {
+            let found = (spectrum.re[i], spectrum.im[i]);
+            let bar = condition * spectrum.bands[i] * (scale + found.0.hypot(found.1));
+            let position = planted
+                .iter()
+                .position(|&(pr, pi)| (pr - found.0).hypot(pi - found.1) <= bar)
+                .unwrap_or_else(|| panic!("eigenvalue {found:?} is within {bar:.3e} of no planted one: {planted:?}"));
+            planted.remove(position);
+            i += if spectrum.im[i] == 0.0 { 1 } else { 2 };
+        }
+        assert!(planted.is_empty(), "planted eigenvalues left unrecovered: {planted:?}");
+    }
+
+    /// Jordan blocks certify. A 4×4 Jordan block, and the same block with 1e-12 added
+    /// at (3, 0), have computed eigenvalues that are exact eigenvalues of a matrix
+    /// within the band, so no backward-error certificate refuses them, whatever their
+    /// forward error. The perturbed block's eigenvalues split by about 1e-3
+    /// (probe job 1209094). A consumer that needs forward accuracy needs a condition
+    /// estimate, not this certificate.
+    #[test]
+    fn real_general_spectrum_certifies_backward_exact_jordan_blocks_2627() {
+        let mut jordan = Array2::<f64>::zeros((4, 4));
+        for i in 0..4 {
+            jordan[[i, i]] = 1.0;
+            if i + 1 < 4 {
+                jordan[[i, i + 1]] = 1.0;
+            }
+        }
+        let mut perturbed = jordan.clone();
+        perturbed[[3, 0]] = 1.0e-12;
+        for (label, a) in [("jordan", &jordan), ("perturbed jordan", &perturbed)] {
+            let spectrum = real_general_spectrum(a).unwrap_or_else(|error| panic!("{label}: {error}"));
+            for k in 0..4 {
+                assert!(spectrum.backward_errors[k] <= spectrum.bands[k], "{label}: slot {k}");
+            }
+        }
+        let refusal = FaerLinalgError::GeneralEigenCertificateRefused {
+            arm: "eigenvalue backward error sigma_min(A - lambda I)",
+            slot: 2,
+            measured: 4.5e-2,
+            band: 4.7e-12,
+        };
+        let text = refusal.to_string();
+        assert!(text.contains("sigma_min") && text.contains("slot 2"), "the refusal names its arm and slot: {text}");
+    }
+}
+
+#[cfg(test)]
+mod lblt_inertia_2901_tests {
+    use super::*;
+
+    /// #2901: the inertia counts a 2×2 pivot block by its eigenvalues. `[[0, 1], [1, 0]]`
+    /// admits no 1×1 pivot and has eigenvalues ±1, and `diag(3, −2, 0)` has one
+    /// eigenvalue of each sign.
+    #[test]
+    fn the_bunch_kaufman_inertia_counts_each_pivot_block_by_its_eigenvalues_2901() {
+        let swap = Mat::<f64>::from_fn(2, 2, |i, j| if i == j { 0.0 } else { 1.0 });
+        let inertia = FaerLblt::new(swap.as_ref(), Side::Lower).inertia();
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 0, 1), "{inertia:?}");
+        assert!((inertia.smallest_pivot + 1.0).abs() <= 4.0 * f64::EPSILON, "{inertia:?}");
+
+        let diagonal = [3.0, -2.0, 0.0];
+        let mixed = Mat::<f64>::from_fn(3, 3, |i, j| if i == j { diagonal[i] } else { 0.0 });
+        let inertia = FaerLblt::new(mixed.as_ref(), Side::Lower).inertia();
+        assert_eq!((inertia.negative, inertia.zero, inertia.positive), (1, 1, 1), "{inertia:?}");
+        assert_eq!(inertia.smallest_pivot, -2.0, "{inertia:?}");
     }
 }

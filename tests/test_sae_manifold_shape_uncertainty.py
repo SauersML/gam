@@ -20,7 +20,6 @@ def _fit_circle(n: int = 400, noise: float = 0.18, seed: int = 0, n_iter: int = 
         atom_topology="circle",
         assignment="softmax",
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=n_iter,

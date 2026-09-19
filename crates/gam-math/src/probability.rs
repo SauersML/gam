@@ -1,4 +1,12 @@
 use libm::{erf, erfc};
+use crate::double_double::SMALLEST_SUBNORMAL;
+use crate::roundoff::{UNIT_ROUNDOFF, inflated};
+
+mod normal_table;
+pub use normal_table::{
+    NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, NORMAL_SCALED_TAIL_RELATIVE_ERROR, normal_cdf_and_pdf,
+    normal_scaled_tail,
+};
 use statrs::function::{
     beta::{beta_reg, inv_beta_reg, ln_beta},
     gamma::gamma_ur,
@@ -276,24 +284,85 @@ fn square_residual(x: f64, rounded_square: f64) -> f64 {
     x.mul_add(x, -rounded_square)
 }
 
+/// `1/√(2π)` rounded to a double: `0.563u` from the exact value, checked at 60 digits. The density's head and the owner's
+/// `R = Q/INV_SQRT_2PI` read it.
+const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+
+/// `φ(x)`'s pieces before its fused correction: `fl(x²)`, the exponential `libm::exp(−½·fl(x²))` and the head
+/// `fl(e/√(2π))`. [`normal_pdf`] finishes them and [`normal_pdf_bounded`] bounds the same computation, so its bound
+/// covers `normal_pdf`'s value bit for bit. [`normal_cdf_and_pdf`] reuses the same exponential for `Φ`, so `φ` is
+/// computed once there and agrees with `normal_pdf` bit for bit.
+#[derive(Clone, Copy)]
+struct NormalDensityParts {
+    rounded_square: f64,
+    exponential: f64,
+    head: f64,
+}
+
+/// The libm crate's `exp` is called explicitly, not the platform's `f64::exp`, so that [`normal_pdf_bounded`]'s cited
+/// contract covers the value [`normal_pdf`] publishes.
+#[inline]
+fn normal_density_parts(x: f64) -> NormalDensityParts {
+    let rounded_square = x * x;
+    let exponential = libm::exp(-0.5 * rounded_square);
+    NormalDensityParts {
+        rounded_square,
+        exponential,
+        head: INV_SQRT_2PI * exponential,
+    }
+}
+
+/// `head·(1 − ½e)` with the exact square residual `e`, fused. Where the density underflowed or `x` was `±∞` (head
+/// `0`), or `x` was NaN, no relative correction applies, and `±∞` would feed the residual `∞ − ∞`, so the head stands.
+#[inline]
+fn finish_normal_density(x: f64, parts: NormalDensityParts) -> f64 {
+    if parts.head == 0.0 || parts.head.is_nan() {
+        return parts.head;
+    }
+    let residual = square_residual(x, parts.rounded_square);
+    parts.head.mul_add(-0.5 * residual, parts.head)
+}
+
 /// Standard normal PDF phi(x).
 ///
 /// The squared argument is carried exactly (see `square_residual`); without
 /// that, `exp(-½·fl(x*x))` degrades like `x²·ε/2` and reaches `5.7e-14`
 /// relative before `φ` underflows, against the `3.3e-16` it holds with.
+/// The exponential is `libm::exp`, so [`normal_pdf_bounded`]'s cited bound
+/// covers this value bit for bit.
 #[inline]
 pub fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    let rounded_square = x * x;
-    let head = INV_SQRT_2PI * (-0.5 * rounded_square).exp();
-    if head == 0.0 || head.is_nan() {
-        // The pdf underflowed or `x` was `±∞` (head `0`), or `x` was `NaN`.
-        // Neither admits a relative correction, and `±∞` would feed the
-        // residual an `∞ − ∞`; return the limit the plain form gives.
-        return head;
+    finish_normal_density(x, normal_density_parts(x))
+}
+
+/// [`normal_pdf`]`(x)` and a rigorous bound on its absolute error.
+///
+/// The computation is `fl(x²)` with its exact fused remainder `e` (`|e| ≤ u·x²`), the exact `−½·fl(x²)`, the
+/// exponential `libm::exp`, the product with `1/√(2π)`, and the fused correction `head·(1 − ½e)`.
+/// - **The exponential** errs by less than one ulp, so by less than `2u` relative. This is a CITED contract, and it
+///   covers `libm::exp` only: libm 0.2.16, `src/math/exp.rs:58-60`, "according to an error analysis, the error is always
+///   less than 1 ulp", resting on the Remez bound `2**-59` at `:30`. `libm_version_matches_the_cited_error_analysis` fails
+///   once Cargo.lock moves libm off that version.
+/// - **The constant.** The double `0.398_942_280_401_432_7` lies `0.563u` from `1/√(2π)`.
+/// - **The product and the fused correction** each round by `u`.
+/// - **The dropped term.** The correction drops `exp(−½e) − (1 − ½e) ≤ (½e)²·(1 + ε)/2 ≤ u²x⁴/8` of `φ`.
+///
+/// Near underflow the rounded steps add at most `2η` absolute, with `η = 2⁻¹⁰⁷⁴`, and an underflowed density is zero
+/// within that. So `φ` errs by at most `(5u + u²x⁴/8)·φ + 2η`. The charged `u·φ̂` in place of `u·φ`, and the bound's own
+/// evaluation, are absorbed by `1 + γ_{m+3}`, with `m = 11`: ten rounded operations and one charged magnitude.
+pub fn normal_pdf_bounded(x: f64) -> (f64, f64) {
+    let parts = normal_density_parts(x);
+    let density = finish_normal_density(x, parts);
+    if density.is_nan() {
+        return (density, density);
     }
-    let residual = square_residual(x, rounded_square);
-    head.mul_add(-0.5 * residual, head)
+    if parts.head == 0.0 {
+        // The density underflowed, or the argument is infinite: the exact φ lies below η.
+        return (density, 2.0 * f64::from_bits(1));
+    }
+    let square = parts.rounded_square;
+    let relative = 5.0 * UNIT_ROUNDOFF + UNIT_ROUNDOFF * UNIT_ROUNDOFF * square * square / 8.0;
+    (density, inflated(relative * density + 2.0 * f64::from_bits(1), 11))
 }
 
 /// Standard normal CDF Phi(x) evaluated via the exact special-function identity
@@ -1293,6 +1362,13 @@ struct MillsCorrectionDerivatives {
 /// continued fraction rather than from `erfcx`. Equivalently `t = −x ≥ 4`.
 const LEFT_CONTINUED_FRACTION_SWITCH: f64 = -4.0;
 
+/// Levels of the Laplace continued fraction for the left-tail Mills correction, read by
+/// [`mills_correction_continued_fraction`] and [`normal_left_tail_ratios`].
+const LEFT_CONTINUED_FRACTION_DEPTH: u32 = 64;
+
+/// An upper bound on `√(π/2) = 1.2533…`, the largest Mills ratio `R(t)` over `t ≥ 0`.
+const HALF_PI_ROOT_UPPER: f64 = 1.26;
+
 /// The Laplace continued-fraction **correction** to the left-tail Mills ratio,
 ///
 /// `q(t) = λ(−t) − t = 1/(t + 2/(t + 3/(...)))`,   `λ(x) = φ(x)/Φ(x)`,
@@ -1344,7 +1420,7 @@ fn mills_correction_continued_fraction(t: f64) -> MillsCorrectionDerivatives {
     // 12 at `t = 20`) that one constant sized for the edge is safe everywhere
     // above it. The extra levels are pure convergence — every step divides
     // positive quantities — so they cannot destabilise a large `t`.
-    for n in (1..=64).rev() {
+    for n in (1..=LEFT_CONTINUED_FRACTION_DEPTH).rev() {
         let denominator = t + q.value;
         let inv_denominator = denominator.recip();
         let value = f64::from(n) / denominator;
@@ -1374,6 +1450,77 @@ fn normal_logcdf_derivatives_left_tail(x: f64) -> [f64; 5] {
         q.second,
         -q.third,
     ]
+}
+
+/// Why [`normal_left_tail_ratios`] refused its arguments.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NormalLeftTailError {
+    /// The argument is NaN or infinite.
+    NonFiniteArgument { value: f64 },
+    /// The argument, within its rounding, may lie right of the origin, outside the left tail these ratios describe.
+    PositiveArgument { value: f64 },
+    /// The argument's rounding bound is negative, NaN or infinite.
+    InvalidArgumentRounding { bound: f64 },
+}
+
+/// The left tail's two Mills ratios at `x ≤ 0`, each with a rigorous bound on its absolute error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormalLeftTailRatios {
+    /// `Φ(x)/φ(x) = 1/λ(x)` with `λ = φ/Φ`: Mills' ratio `R` at `−x`.
+    pub cdf_over_density: f64,
+    /// Bound on the absolute error of `cdf_over_density`.
+    pub cdf_over_density_rounding: f64,
+    /// `E[(x + E)₊]/φ(x) = 1 + x·Φ(x)/φ(x) = q(x)/λ(x)`, with `q = λ + x` and `E ~ N(0, 1)`.
+    pub positive_part_over_density: f64,
+    /// Bound on the absolute error of `positive_part_over_density`.
+    pub positive_part_over_density_rounding: f64,
+}
+
+/// `Φ(x)/φ(x)` and `E[(x + E)₊]/φ(x)` for `x ≤ 0`, each without subtracting nearly equal quantities and with a
+/// rigorous bound on its absolute error. No libm call enters either ratio, and every bound rests on IEEE-754 semantics.
+/// Write `t = −x`, `R = 1/λ` and `N = q/λ = 1 − t·R`.
+///
+/// Both come from the table route (see [`normal_scaled_tail`] and `normal_table::positive_part_ratio`): `R = √(2π)·Q`
+/// and `N` from its own table, so `1 − t·R` is never formed. Their bounds are the published proven constants
+/// [`NORMAL_SCALED_TAIL_RELATIVE_ERROR`] and `POSITIVE_PART_RATIO_RELATIVE_ERROR` times the values, plus the constant's
+/// and the quotient's rounding. The proofs run in `normal_table`'s tests against certified double-double moments.
+///
+/// **Argument rounding.** `x_rounding` bounds the computed argument's error, and the interval it spans must stay in
+/// `x ≤ 0`. There `|∂_x R| = N ≤ 1`, `|N′| ≤ R ≤ √(π/2)` and `|R′| = |zR − 1| ≤ 1`, so `1/λ` moves by at most
+/// `(N + √(π/2)·δ)·δ` and `q/λ` by at most `(R + δ)·δ`.
+pub fn normal_left_tail_ratios(x: f64, x_rounding: f64) -> Result<NormalLeftTailRatios, NormalLeftTailError> {
+    if !x.is_finite() {
+        return Err(NormalLeftTailError::NonFiniteArgument { value: x });
+    }
+    if !(x_rounding.is_finite() && x_rounding >= 0.0) {
+        return Err(NormalLeftTailError::InvalidArgumentRounding { bound: x_rounding });
+    }
+    if x + x_rounding > 0.0 {
+        return Err(NormalLeftTailError::PositiveArgument { value: x });
+    }
+    let t = -x;
+    // R = √(2π)·Q, divided by the density's constant 0.398_942_280_401_432_7, which lies 0.563u from 1/√(2π). Past
+    // t ≈ 2⁵¹¹ N = s·K_N lands among the subnormals, where it errs by up to η beyond its relative band.
+    let tail = normal_table::scaled_tail(t);
+    let reciprocal = tail / INV_SQRT_2PI;
+    let reciprocal_rounding =
+        inflated((NORMAL_SCALED_TAIL_RELATIVE_ERROR + 1.57 * UNIT_ROUNDOFF) * reciprocal, 4);
+    let ratio = normal_table::positive_part_ratio(t);
+    let ratio_rounding =
+        inflated(normal_table::POSITIVE_PART_RATIO_RELATIVE_ERROR * ratio, 1) + 2.0 * SMALLEST_SUBNORMAL;
+    // `m = 11` for each argument term: the upper values, the products and the sums, plus the charged magnitudes.
+    Ok(NormalLeftTailRatios {
+        cdf_over_density: reciprocal,
+        cdf_over_density_rounding: inflated(
+            reciprocal_rounding + (ratio + ratio_rounding + HALF_PI_ROOT_UPPER * x_rounding) * x_rounding,
+            11,
+        ),
+        positive_part_over_density: ratio,
+        positive_part_over_density_rounding: inflated(
+            ratio_rounding + (reciprocal + reciprocal_rounding + x_rounding) * x_rounding,
+            11,
+        ),
+    })
 }
 
 #[inline]
@@ -1764,6 +1911,80 @@ mod tests {
     use super::*;
 
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn normal_left_tail_ratios_refuse_what_they_do_not_describe() {
+        assert_eq!(
+            normal_left_tail_ratios(0.5, 0.0),
+            Err(NormalLeftTailError::PositiveArgument { value: 0.5 })
+        );
+        // An argument whose rounding reaches past the origin is refused, not extrapolated.
+        assert_eq!(
+            normal_left_tail_ratios(-1.0e-17, 1.0e-16),
+            Err(NormalLeftTailError::PositiveArgument { value: -1.0e-17 })
+        );
+        assert!(matches!(
+            normal_left_tail_ratios(f64::NAN, 0.0),
+            Err(NormalLeftTailError::NonFiniteArgument { .. })
+        ));
+        assert_eq!(
+            normal_left_tail_ratios(f64::NEG_INFINITY, 0.0),
+            Err(NormalLeftTailError::NonFiniteArgument { value: f64::NEG_INFINITY })
+        );
+        assert_eq!(
+            normal_left_tail_ratios(-1.0, -1.0e-16),
+            Err(NormalLeftTailError::InvalidArgumentRounding { bound: -1.0e-16 })
+        );
+        // Positive control: the origin is inside the domain, where N = q/λ = 1 exactly and 1/λ = √(π/2) within its
+        // bound.
+        let origin = normal_left_tail_ratios(0.0, 0.0).expect("the origin is in the left tail's domain");
+        let half_pi_root = (0.5 * std::f64::consts::PI).sqrt();
+        assert!(
+            (origin.positive_part_over_density - 1.0).abs() <= origin.positive_part_over_density_rounding,
+            "q/λ(0) = {} against 1 within {:e}",
+            origin.positive_part_over_density,
+            origin.positive_part_over_density_rounding
+        );
+        assert!(
+            (origin.cdf_over_density - half_pi_root).abs()
+                <= origin.cdf_over_density_rounding + UNIT_ROUNDOFF * half_pi_root,
+            "1/λ(0) = {} against √(π/2) = {half_pi_root} within {:e}",
+            origin.cdf_over_density,
+            origin.cdf_over_density_rounding
+        );
+    }
+
+    #[test]
+    fn libm_version_matches_the_cited_error_analysis() {
+        // normal_pdf_bounded computes with libm::exp and cites libm 0.2.16's exp error analysis
+        // (src/math/exp.rs:58-60). A lockfile that moves libm off that version invalidates the citation until it is
+        // re-read.
+        let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"));
+        let versions = |package: &str| {
+            let header = format!("name = \"{package}\"");
+            let mut found = Vec::new();
+            let mut lines = lock.lines();
+            while let Some(line) = lines.next() {
+                if line == header {
+                    if let Some(version) = lines
+                        .next()
+                        .and_then(|next| next.strip_prefix("version = \""))
+                        .and_then(|rest| rest.strip_suffix('"'))
+                    {
+                        found.push(version);
+                    }
+                }
+            }
+            found
+        };
+        // Positive control: the parser finds this crate's own entry at its own version.
+        assert_eq!(versions("gam-math"), vec![env!("CARGO_PKG_VERSION")]);
+        assert_eq!(
+            versions("libm"),
+            vec!["0.2.16"],
+            "Cargo.lock's libm moved off the version normal_pdf_bounded cites"
+        );
+    }
 
     #[test]
     fn normal_log_quantile_remains_finite_for_extreme_log_probabilities() {
@@ -3067,6 +3288,116 @@ mod tests {
                      rel {rel:.3e} >= 1e-11"
                 );
             }
+        }
+    }
+
+    /// The same tower in both tails, which the table above does not reach (#932):
+    /// its bound floors the reference at `1e-3`, so a right-tail entry of `1e-12` or
+    /// less passes it unexamined. Every entry here is held to that table's `1e-11`
+    /// relative contract with no floor, across the continued-fraction left tail,
+    /// the origin, and the signed log-magnitude right tail. mpmath 1.3, 100 decimal
+    /// digits, independently differentiating `log(ncdf(x))` on MSI; the same run
+    /// reproduced the table above at `x = −4, −2, 2` digit for digit.
+    #[test]
+    fn normal_logcdf_derivatives_match_high_precision_reference_in_both_tails_932() {
+        let refs: &[(f64, [f64; 5])] = &[
+            (
+                -100.0,
+                [
+                    -5005.5242086942050886,
+                    100.00999800099926071,
+                    -0.99990005995005173655,
+                    1.9976029958623432462e-6,
+                    5.9880209627737542408e-8,
+                ],
+            ),
+            (
+                -20.0,
+                [
+                    -203.91715537109726394,
+                    20.049753068527850542,
+                    -0.9975367383849478364,
+                    2.4272657893584202383e-4,
+                    3.5703551588456591599e-5,
+                ],
+            ),
+            (
+                -8.0,
+                [
+                    -35.013437159914549896,
+                    8.1213681122361126807,
+                    -0.98567511655665908982,
+                    3.2918765663441355071e-3,
+                    1.1052920954551626932e-3,
+                ],
+            ),
+            (
+                0.0,
+                [
+                    -0.69314718055994530942,
+                    0.79788456080286535588,
+                    -0.63661977236758134308,
+                    0.21801361414499016069,
+                    0.11477068205421885765,
+                ],
+            ),
+            (
+                8.0,
+                [
+                    -6.2209605742717860585e-16,
+                    5.0522710835368954309e-15,
+                    -4.0418168668295188973e-14,
+                    3.1829307826282502476e-13,
+                    -2.4655082887660163036e-12,
+                ],
+            ),
+            (
+                20.0,
+                [
+                    -2.7536241186062773386e-89,
+                    5.5209483621597631896e-88,
+                    -1.1041896724319526379e-86,
+                    2.2028583965017455126e-85,
+                    -4.3836329995548519725e-84,
+                ],
+            ),
+        ];
+        let rows: Vec<(f64, usize, f64, f64, f64)> = refs
+            .iter()
+            .flat_map(|&(x, reference)| {
+                let got = normal_logcdf_derivatives(x);
+                (0..5).map(move |order| {
+                    let (g, r) = (got[order], reference[order]);
+                    (x, order, g, r, (g - r).abs() / r.abs())
+                })
+            })
+            .collect();
+        for &(x, order, g, r, rel) in &rows {
+            eprintln!("[932 logcdf tails] x={x} order={order} got={g:.17e} ref={r:.17e} rel={rel:.3e}");
+        }
+        for &(x, order, g, r, rel) in &rows {
+            assert!(
+                rel < 1.0e-11,
+                "normal_logcdf_derivatives({x})[{order}] = {g:.17e}, reference {r:.17e}, \
+                 rel {rel:.3e} >= 1e-11"
+            );
+        }
+        // At x = 38.6 the value and first derivative round to zero, while the
+        // polynomially weighted second through fourth stay subnormal. A 450-digit
+        // reference holds them to the fifth's four subnormal ulps.
+        let got = normal_logcdf_derivatives(38.6);
+        for (order, reference) in [
+            (2, -4.43398523103014815e-323_f64),
+            (3, 1.7103695983405827434e-321),
+            (4, -6.5931586791325890931e-320),
+        ] {
+            eprintln!("[932 logcdf tails] x=38.6 order={order} got={:e} ref={reference:e}", got[order]);
+            assert!(got[order].signum() == reference.signum() && got[order] != 0.0);
+            assert!(
+                (got[order] - reference).abs() <= 4.0 * f64::from_bits(1),
+                "normal_logcdf_derivatives(38.6)[{order}] = {:e}, reference {reference:e}",
+                got[order]
+            );
         }
     }
 

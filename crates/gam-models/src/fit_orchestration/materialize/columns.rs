@@ -54,6 +54,7 @@ pub fn fit_required_columns(
         required.extend(formula_columns(&parsed_slope)?);
     }
     required.extend(config.z_column.iter().cloned());
+    required.extend(config.residual_columns.iter().cloned());
     required.extend(config.weight_column.iter().cloned());
     required.extend(config.offset_column.iter().cloned());
     required.extend(config.noise_offset_column.iter().cloned());

@@ -17,10 +17,6 @@ pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub(crate) use std::ops::Range;
 pub(crate) use std::sync::Arc;
 
-pub(crate) const DIRECT_SOLVE_MAX_K: usize = 2_000;
-
-pub(crate) const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
-
 pub(crate) const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 
 /// Absolute floor on the Steihaug-CG residual stopping threshold.
@@ -43,9 +39,9 @@ pub(crate) const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 /// The ladder is only ever escalated on a REJECTED step and never lowered, so
 /// this rung's job is to be small enough that an accepted first attempt is
 /// effectively the undamped Newton step, while still being nonzero so
-/// `DEFAULT_PROXIMAL_RIDGE_GROWTH` has something to multiply. Its reach is
-/// what is actually derived: `1e-8 · 10^21 ≈ 1e14`, on
-/// `DEFAULT_PROXIMAL_MAX_ATTEMPTS`.
+/// `DEFAULT_PROXIMAL_RIDGE_GROWTH` has something to multiply. The ladder's reach
+/// is not a count: it climbs until a rung is certified factorable or promises no
+/// representable decrease (`certified_shift`, #2627).
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
 
 pub(crate) const F32_UNIT_ROUNDOFF: f64 = (f32::EPSILON as f64) * 0.5;
@@ -62,21 +58,10 @@ pub(crate) const MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER: f64 = 64.0;
 /// User-supplied kappa margins above this are no stricter than the unit gate.
 pub(crate) const MIXED_PRECISION_KAPPA_MARGIN_CEILING: f64 = 1.0;
 /// Geometric ratio between consecutive proximal-ridge rungs, and the `Default`
-/// for `ArrowSolveOptions::ridge_growth`. One decade per rejection, which is
-/// what fixes the ladder's reach at
-/// `DEFAULT_PROXIMAL_INITIAL_RIDGE · 10^(DEFAULT_PROXIMAL_MAX_ATTEMPTS − 1)`;
-/// see `DEFAULT_PROXIMAL_MAX_ATTEMPTS` for why that reach is the requirement.
+/// for `ArrowSolveOptions::ridge_growth`. One decade per rejection. It is a cost
+/// trade-off, not a derivation: it changes how many rungs a ladder takes to reach
+/// its structural stop, never which rung certifies (#2627).
 pub(crate) const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
-
-/// Number of geometric proximal-ridge escalations the adaptive correction
-/// attempts before giving up. Raised from 16 to 22 so the ridge can climb from
-/// `1e-8` to `~1e14` (`1e-8 · 10^21`): when the penalised Hessian curvature
-/// along the gradient exceeds `~1e9`, the damped Newton step at ridge `1e9`
-/// still overshoots, and the extra decades let the step length collapse far
-/// enough to either find descent or reach the near-stationary resolution floor
-/// that triggers the convergence exit. The cost of the extra attempts is paid
-/// only on configs that would otherwise have failed.
-pub(crate) const DEFAULT_PROXIMAL_MAX_ATTEMPTS: usize = 22;
 
 /// Armijo sufficient-decrease constant — sourced from the shared optimizer
 /// constants so the workspace has exactly one `c₁`.

@@ -31,9 +31,12 @@
 //!    no Monte Carlo, and is the defect stated in its own terms: the number was
 //!    3309.
 //! 2. **The two published objects agree in magnitude.** The cubature
-//!    correction and the first-order `J·V_ρ·Jᵀ` estimate the SAME quantity; a
-//!    refinement that differs from what it refines by orders of magnitude is
-//!    not a refinement. The measured ratio of traces was 9993 before the fix.
+//!    correction is `E_ρ[φ̂·H(ρ)⁻¹] − φ̂·H(ρ̂)⁻¹ + Cov_ρ[β̂(ρ)]`, and the
+//!    first-order `J·V_ρ·Jᵀ` is the leading term of `Cov_ρ[β̂(ρ)]`. The first
+//!    difference is `½·A″:V_ρ` to the same order and carries no sign, so the
+//!    cubature trace may be negative. A refinement cannot differ from what it
+//!    refines by orders of MAGNITUDE, though: the measured ratio of traces was
+//!    9993 before the fix.
 //! 3. **Calibration against the truth.** With `X` held fixed and only the
 //!    Gaussian noise redrawn, the Monte-Carlo spread of `x'β̂` over refits is
 //!    exactly what the covariance claims to be, with no misspecification in the
@@ -329,12 +332,17 @@ fn corrected_covariance_nodes_are_criterion_calibrated_2728() {
         .smoothing_correction_first_order()
         .expect("the first-order correction is retained alongside the cubature one");
     let (tr_cubature, tr_first_order) = (trace(cubature), trace(first_order));
+    // `J·V_ρ·Jᵀ` is a Gram, so its trace is positive. The cubature adds
+    // `E_ρ[φ̂·H(ρ)⁻¹] − φ̂·H(ρ̂)⁻¹`, which has no sign: on this fixture the node
+    // traces average 9.915 against 9.994 at ρ̂, so that term is −0.079 and the
+    // cubature trace is −0.0749 (sw4l lane probe 1255647 at 95115c8a1f). Only
+    // the MAGNITUDE of the refinement is bounded against what it refines.
     assert!(
-        tr_first_order > 0.0 && tr_cubature > 0.0,
-        "both corrections must carry positive variance: cubature={tr_cubature:.6e}, \
-         first_order={tr_first_order:.6e}"
+        tr_first_order > 0.0 && tr_cubature.is_finite(),
+        "the first-order correction must carry positive variance and the cubature one must be \
+         finite: cubature={tr_cubature:.6e}, first_order={tr_first_order:.6e}"
     );
-    let trace_ratio = tr_cubature / tr_first_order;
+    let trace_ratio = tr_cubature.abs() / tr_first_order;
     assert!(
         (CORRECTION_TRACE_RATIO_LO..=CORRECTION_TRACE_RATIO_HI).contains(&trace_ratio),
         "the cubature correction refines the first-order one, so their traces cannot differ \

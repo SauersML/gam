@@ -64,8 +64,8 @@ The formula front doors are `fit`, `fit_array`, `validate_formula`, and
 `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`,
 `baseline_makeham`, `z_column`, `link`, `slope_formula`, `frailty_kind`,
 `frailty_sd`, `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
-`noise_offset`, `flexible_link`, `precision_hyperpriors`, `constraints`,
-`response_geometry`, `response_columns`, `response_coordinates`,
+`noise_offset`, `flexible_link`, `warm_start_from`, `precision_hyperpriors`,
+`constraints`, `response_geometry`, `response_columns`, `response_coordinates`,
 `response_reference`, `fisher_rao_w`, `latents`, `penalties`, `smooths`, and
 `config`.
 
@@ -74,7 +74,7 @@ The fitted `Model` public workflow methods/properties are `predict`,
 `smoothing_parameters`, `check`, `curvature`, `smooth_significance`,
 `basis_check`, `debiased_functional`, `report`, `sample`, `sample_replicates`,
 `iter_replicates`, `design_matrix`, `design_matrix_array`, `difference_smooth`,
-`partial_dependence`, `variance_share`, `evidence`, `evidence_ratio_vs`,
+`partial_dependence`, `variance_share`, `conditional_aic`, `evidence_ratio_vs`,
 `diagnose`, `plot`, persistence methods, group extension, and model metadata.
 `MultinomialModel` exposes classes, deviance/iterations, prediction and standard
 errors, posterior prediction, smooth significance, summary, and persistence.

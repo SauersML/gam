@@ -37,7 +37,7 @@ use gam::gpu::GpuRuntime;
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, DeviceSaeFrameData,
-    DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+    DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, resolve_arrow_route,
     solve_arrow_newton_step_with_options,
 };
 use gam::solver::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
@@ -185,7 +185,11 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
         smooth_ranks.push(ranks[k]);
     }
 
-    let n = 400usize;
+    // The offload predicate amortizes the row staging over the CG budget an InexactPCG
+    // request resolves to, the dense route's price (#2900 row 6.15): about
+    // k·(k + q)/(2k + q) = 54 products at k = 108, q = 4. n = 1200 rows puts the solve's
+    // n·(4qk + q²)·54 = 1.13e8 flops over the default 1e8 launch floor.
+    let n = 1200usize;
     let q = 4usize;
     let mut sys = ArrowSchurSystem::new(n, q, border_dim);
     let mut row_htbeta = Vec::new();
@@ -248,6 +252,10 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
     // `sys.rows[i].htbeta`; with it installed the system matches the production
     // matrix-free shape.
     let slabs = row_htbeta.clone();
+    let row_norm_bounds: std::sync::Arc<[f64]> = slabs
+        .iter()
+        .map(|slab| gam_solve::arrow_schur::frobenius_norm_upper_bound(slab.iter().copied()))
+        .collect();
     let fwd_slabs = slabs.clone();
     let bd = border_dim;
     let qd = q;
@@ -274,6 +282,12 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
                     out_s[c] += slab[base + c] * vr;
                 }
             }
+        },
+        // The forward accumulates `border_dim` terms per latent coordinate; the transpose
+        // adds `q` terms into each border entry.
+        gam_solve::arrow_schur::RowHtbetaDeclaration {
+            row_norm_bounds,
+            apply_depth: border_dim.max(q) + 1,
         },
     );
 
@@ -358,17 +372,17 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     // reduced_schur_matvec_should_offload(n, k, d, cg_iters)`) admits this
     // production-shaped fixture. The predicate is a pure function of shape and
     // `const` thresholds (device-memory independent), so `GpuDispatchPolicy::
-    // default()` returns the same verdict the live seam would. cg_iters is
-    // derived EXACTLY as the seam derives it from the Direct options. With every
+    // default()` returns the same verdict the live seam would. cg_iters is the
+    // budget an InexactPCG request resolves to on this system, the one the offload
+    // gate reads (#2900 row 6.15); Direct carries no PCG budget. With every
     // shape gate satisfied, the ONLY thing that declines the device on this host
     // is typed GPU absence (CPU-only) — i.e. on a CUDA host
     // this same fixture is SELECTED for the device (the on-GPU engagement test
     // below asserts it then runs).
-    let seam_options = direct_options();
-    let cg_iters = seam_options
-        .pcg
-        .max_iterations
-        .min(seam_options.trust_region.max_iterations);
+    let cg_iters = resolve_arrow_route(&sys, &ArrowSolveOptions::inexact_pcg())
+        .pcg_budget
+        .map(gam::solver::arrow_schur::ArrowPcgBudget::products)
+        .expect("a resolved InexactPCG request carries its product budget");
     let q_depth = sys.rows.first().map(|r| r.htt.nrows()).unwrap_or(0);
     assert!(
         GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(

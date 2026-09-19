@@ -28,12 +28,6 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path):
         geometry["correction"] = None
         fit["covariance_conditional"] = None
         fit["covariance_corrected"] = None
-        # The inference block mirrors both covariances and their standard errors;
-        # a fit that published no covariance carries none of the mirrors either,
-        # or loading refuses the inconsistent artifact before prediction is asked.
-        for mirror in ("beta_covariance", "beta_standard_errors",
-                       "beta_covariance_corrected", "beta_standard_errors_corrected"):
-            fit["inference"][mirror] = None
     with pytest.raises(gamfit.GamError, match="posterior-mean"):
         gamfit.loads(json.dumps(declined).encode()).transformation_score(data)
 

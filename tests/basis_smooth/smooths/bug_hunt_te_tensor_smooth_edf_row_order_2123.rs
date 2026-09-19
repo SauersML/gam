@@ -94,11 +94,9 @@ fn fit_te(data: &gam::data::EncodedDataset) -> FitSummary {
     };
     let fit = &res.fit;
     let inference = fit.inference.as_ref().expect("inference present");
-    let se_sum = inference
-        .beta_covariance
-        .as_ref()
+    let se_sum = fit
+        .beta_covariance()
         .map(|cov| {
-            let cov = cov.as_array();
             (0..cov.nrows())
                 .map(|j| cov[[j, j]].max(0.0).sqrt())
                 .sum::<f64>()

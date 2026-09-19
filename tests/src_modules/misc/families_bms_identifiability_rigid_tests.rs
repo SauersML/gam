@@ -73,6 +73,7 @@ fn test_family_with_dense_designs(
 ) -> BernoulliMarginalSlopeFamily {
     BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
@@ -105,6 +106,8 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
     let empty_design = dense_design(Array2::zeros((0, 0)));
     BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
+        search: None,
         y: Arc::new(Array1::zeros(0)),
         weights: Arc::new(Array1::zeros(0)),
         z: Arc::new(Array1::zeros(0)),
@@ -121,6 +124,23 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         intercept_warm_starts: None,
         auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         auto_subsample_last_rho: Arc::new(std::sync::Mutex::new(None)),
+    }
+}
+
+#[test]
+fn bernoulli_marginal_slope_declares_its_certified_multistart_levels() {
+    // Every declared start gets its own full certified search in a parallel
+    // multistart (gnomon#2359); the family names them, nothing ranks them.
+    let family = default_test_family();
+    let search = family
+        .independent_outer_search()
+        .expect("the Bernoulli marginal-slope family runs each outer search on its own member");
+    let levels = search.additional_outer_start_levels();
+    for anchor in [2.0, 4.0] {
+        assert!(
+            levels.contains(&anchor),
+            "missing symmetric GLM startup level rho={anchor}: {levels:?}"
+        );
     }
 }
 
@@ -203,6 +223,7 @@ fn flex_hessian_matvec_fixture(
         build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)?;
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
         ..test_family_with_dense_designs(y, weights, z.clone(), design.clone(), design)
@@ -263,6 +284,7 @@ fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBloc
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
         ..test_family_with_intercept_designs(y.clone(), weights.clone(), z.clone())
@@ -312,6 +334,7 @@ fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
     ];
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         score_warp: Some(prepared.runtime.clone()),
         ..test_family_with_zero_primary_designs(
             array![0.0, 1.0, 0.0, 1.0, 0.0],
@@ -348,6 +371,7 @@ fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
     ];
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         link_dev: Some(prepared.runtime.clone()),
         ..test_family_with_zero_primary_designs(
             array![0.0, 1.0, 0.0, 1.0, 0.0],
@@ -866,10 +890,12 @@ fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
         build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "link-wiggle deviation block", e));
 
-    let cache = new_intercept_warm_start_cache(n);
+    let cache = new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
+        .expect("an intercept cache on the standard-normal law");
     let make_family =
         |cache: Option<Arc<BernoulliInterceptWarmStartCache>>| BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
@@ -961,6 +987,7 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "link-wiggle deviation block", e));
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
@@ -1082,6 +1109,8 @@ fn base_spec(
         link_dev: None,
         latent_z_policy: LatentZPolicy::default(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     }
 }
 
@@ -2345,6 +2374,8 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
         link_dev: None,
         latent_z_policy: LatentZPolicy::default(),
         score_influence_jacobian: None,
+        residual: None,
+        declared_latent_law: None,
     };
     let err = validate_spec(design.to_dense().view(), &spec)
         .expect_err("non-probit marginal-slope link should be rejected");
@@ -2400,6 +2431,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.1 * (idx as f64 + 1.0)));
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         link_dev: Some(prepared.runtime.clone()),
         ..test_family_with_zero_primary_designs(
             Array1::zeros(seed.len()),
@@ -2513,10 +2545,14 @@ fn zero_deviation_intercept_fast_path_matches_denested_calibration() {
     let n = seed.len();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         gaussian_frailty_sd: Some(0.65),
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
-        intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
+        intercept_warm_starts: Some(
+            new_intercept_warm_start_cache_on_law(&LatentMeasureKind::StandardNormal, n)
+                .expect("an intercept cache on the standard-normal law"),
+        ),
         ..test_family_with_zero_primary_designs(Array1::zeros(n), Array1::ones(n), seed.clone())
     };
     let marginal_eta = 0.35;
@@ -2580,6 +2616,7 @@ fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "build link deviation block", e));
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -2645,6 +2682,7 @@ fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         .len();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -2702,6 +2740,7 @@ fn post_update_block_beta_clamps_infeasible_score_warp_step_to_the_feasible_segm
     let score_dim = prepared.block.design.ncols();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -3297,6 +3336,7 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(array![0.0, 1.0, 1.0]),
             weights: Arc::new(array![1.0, 0.7, 1.3]),
             z: Arc::new(z.clone()),
@@ -3487,6 +3527,7 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(array![0.0, 1.0, 0.0]),
             weights: Arc::new(Array1::ones(3)),
             z: Arc::new(seed.clone()),
@@ -3630,6 +3671,7 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "score warp block", e));
     let flex_family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(3)),
         z: Arc::new(seed.clone()),
@@ -3660,6 +3702,7 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
 fn rigid_fast_path_matches_loglik_finite_differences() {
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![1.0]),
         weights: Arc::new(array![1.2]),
         z: Arc::new(array![0.3]),
@@ -3788,6 +3831,7 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -3884,6 +3928,7 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -3992,6 +4037,7 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -4138,6 +4184,7 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -4237,6 +4284,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -4343,6 +4391,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
 
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
@@ -5797,6 +5846,7 @@ fn w_only_gradient_matches_loglik_finite_differences() {
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
@@ -5905,6 +5955,7 @@ fn h_only_gradient_matches_loglik_finite_differences() {
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
@@ -6022,6 +6073,7 @@ fn flexible_denested_gradient_matches_loglik_finite_differences() {
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
@@ -6165,6 +6217,7 @@ fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
     let family =
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
+            residual: None,
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
@@ -6293,6 +6346,7 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
     let slope_x = array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.5], [1.0, -1.0]];
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
@@ -6438,105 +6492,104 @@ fn latent_z_normalization_rejects_extreme_non_gaussian_scores() {
     assert!(err.contains("approximately latent N(0,1)"));
 }
 
-/// Under P4, bad-normal but continuous latent z routes through a
-/// rank-INT calibration (weighted mid-distribution ranks → `Φ⁻¹`)
-/// instead of the legacy local-/global-empirical grid. Rank-INT is a
-/// modeling choice (the affine rigid model is respecified on the
-/// calibrated axis), and the standard-normal closed-form kernel is
-/// admitted only because the calibrated sample itself passes the
-/// standard-normal adequacy gate — which a distinct-valued sample's
-/// mid-rank normal scores do. This test pins that routing.
+fn decide_latent_law(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    latent_measure: LatentMeasureSpec,
+    conditioning: Option<ArrayView2<'_, f64>>,
+) -> Result<LatentMeasureDecision, String> {
+    let policy = LatentZPolicy {
+        check_mode: LatentZCheckMode::Off,
+        normalization: LatentZNormalizationMode::None,
+        latent_measure,
+        ..LatentZPolicy::default()
+    };
+    build_latent_measure_decision(
+        z,
+        weights,
+        &policy,
+        conditioning,
+        None,
+        EmpiricalLatentMeasureSupport::Available,
+        "rigid latent-law test",
+    )
+}
+
+/// gam#2926: a skewed latent score is anchored on its own estimated law by
+/// default — nothing makes it look Gaussian. A Gaussian declaration on it is
+/// fitted, because its conditional law does not move, and it carries the failing
+/// adequacy ledger and the estimated law its excess anchoring loss is measured
+/// under: the shape screen warns a declaration, it does not refuse one.
 #[test]
-fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
-    // Exponential quantiles: strongly skewed (the raw pooled gate fails on
-    // mean/skew), but all values are distinct, so the calibrated mid-rank
-    // normal scores pass the gate and keep the standard-normal kernel.
+fn auto_latent_measure_anchors_a_skewed_score_on_its_estimated_law() {
+    // Exponential quantiles: strongly skewed, every value distinct.
     let n = 100usize;
     let z = Array1::from_iter((1..=n).map(|i| -f64::ln(1.0 - (i as f64 - 0.5) / n as f64)));
     let weights = Array1::from_elem(n, 1.0);
-    let policy = LatentZPolicy {
-        check_mode: LatentZCheckMode::Off,
-        normalization: LatentZNormalizationMode::None,
-        latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
-        ..LatentZPolicy::default()
+    let decision = decide_latent_law(&z, &weights, LatentMeasureSpec::Auto { grid_size: 5 }, None)
+        .unwrap_or_else(|e| panic!("auto latent law failed: {e}"));
+    let LatentMeasureKind::GlobalEmpirical { grid } = &decision.kind else {
+        panic!("a skewed score must be anchored on its estimated law, got {:?}", decision.kind)
     };
-    let (measure, calibration, _) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto latent measure", e));
     assert!(
-        matches!(measure, LatentMeasureKind::StandardNormal),
-        "bad-normal latent z must route through rank-INT to the standard-normal kernel"
+        matches!(decision.calibration, LatentMeasureCalibration::None),
+        "the score must reach the kernel as given"
     );
-    match calibration {
-        LatentMeasureCalibration::RankInverseNormal(cal) => {
-            // Knot table is non-empty and the transformed sample is
-            // (approximately) N(0,1) by construction.
-            assert!(
-                !cal.sorted_z.is_empty(),
-                "rank-INT knot table must be non-empty"
-            );
-            assert_eq!(cal.sorted_z.len(), cal.weighted_cdf.len());
-            // Strictly increasing knots and strictly increasing CDF.
-            for w in cal.sorted_z.windows(2) {
-                assert!(w[0] < w[1], "sorted_z must be strictly increasing");
-            }
-            for w in cal.weighted_cdf.windows(2) {
-                assert!(
-                    w[0] <= w[1],
-                    "weighted_cdf must be non-decreasing (got {} -> {})",
-                    w[0],
-                    w[1]
-                );
-            }
-            // Post-mean near 0, post-sd not wildly off 1.
-            assert!(
-                cal.post_mean.abs() < 0.5,
-                "rank-INT post-mean too far from 0: {}",
-                cal.post_mean
-            );
-            assert!(
-                cal.post_sd > 0.0 && cal.post_sd.is_finite(),
-                "rank-INT post-sd must be positive finite, got {}",
-                cal.post_sd
-            );
-        }
-        LatentMeasureCalibration::None => {
-            panic!("bad-normal latent z must produce a RankInverseNormal calibration")
-        }
-        LatentMeasureCalibration::ConditionalLocationScale(_) => {
-            panic!(
-                "conditioning=None cannot fire the E[z|C]/Var(z|C) Rao gate, so the \
-                 calibration must never be ConditionalLocationScale here"
-            )
-        }
+    assert!(matches!(
+        decision.consumed,
+        LatentLawConsumed::EstimatedGlobal { .. }
+    ));
+    // The law sits on the score's own axis: its first two moments are the
+    // sample's, not the standardised grid's.
+    let sample_mean = z.sum() / n as f64;
+    let sample_var = z.iter().map(|v| (v - sample_mean).powi(2)).sum::<f64>() / n as f64;
+    let law_mean: f64 = grid.pairs().map(|(u, w)| w * u).sum();
+    let law_var: f64 = grid.pairs().map(|(u, w)| w * (u - law_mean).powi(2)).sum();
+    assert!(
+        (law_mean - sample_mean).abs() < 1e-10 && (law_var - sample_var).abs() < 1e-10,
+        "the estimated law must keep the score's location and scale: law mean {law_mean} var \
+         {law_var} vs sample mean {sample_mean} var {sample_var}"
+    );
+
+    let declared = decide_latent_law(&z, &weights, LatentMeasureSpec::StandardNormal, None)
+        .unwrap_or_else(|e| {
+            panic!("a Gaussian declaration whose conditional law does not move must be fitted: {e}")
+        });
+    assert!(matches!(declared.kind, LatentMeasureKind::StandardNormal));
+    match &declared.consumed {
+        LatentLawConsumed::DeclaredGaussian {
+            adequacy: Some(adequacy),
+            residual: None,
+            ..
+        } => assert!(
+            !adequacy.passes(),
+            "an exponential score must fail the adequacy screen; ledger {}",
+            adequacy.ledger()
+        ),
+        other => panic!("the declaration must carry its failing adequacy ledger, got {other:?}"),
     }
+    assert!(
+        declared.certificate_law.is_some(),
+        "the declaration's excess anchoring loss is measured under the estimated law"
+    );
 }
 
-/// Rank-INT cannot Gaussianize a heavily tied sample: the calibrated law
-/// stays discrete (here four of six observations share one atom), so the
-/// standard-normal adequacy re-check on the calibrated scale fails and the
-/// Auto path must fall back to the mathematically exact global-empirical
-/// latent measure instead of running the closed-form standard-normal
-/// kernel on a non-Gaussian score.
+/// A heavily tied score has a discrete law, and the default anchors on that law
+/// as it is; there is no Gaussianising step for the ties to defeat.
 #[test]
-fn auto_latent_measure_falls_back_to_empirical_when_rank_int_cannot_gaussianize() {
+fn auto_latent_measure_anchors_a_tied_score_on_its_discrete_law() {
     let z = array![0.0, 0.0, 0.0, 0.0, 10.0, -10.0];
     let weights = Array1::from_elem(6, 1.0);
-    let policy = LatentZPolicy {
-        check_mode: LatentZCheckMode::Off,
-        normalization: LatentZNormalizationMode::None,
-        latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
-        ..LatentZPolicy::default()
-    };
-    let (measure, calibration, _) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto latent measure", e));
+    let decision = decide_latent_law(&z, &weights, LatentMeasureSpec::Auto { grid_size: 5 }, None)
+        .unwrap_or_else(|e| panic!("auto latent law failed: {e}"));
     assert!(
-        matches!(measure, LatentMeasureKind::GlobalEmpirical { .. }),
-        "tied latent z whose rank-INT output fails the adequacy gate must use the \
-         global-empirical latent measure, got {measure:?}"
+        matches!(decision.kind, LatentMeasureKind::GlobalEmpirical { .. }),
+        "a tied score must be anchored on its estimated law, got {:?}",
+        decision.kind
     );
     assert!(
-        matches!(calibration, LatentMeasureCalibration::None),
-        "the empirical fallback models the raw score directly; no rank-INT map applies"
+        matches!(decision.calibration, LatentMeasureCalibration::None),
+        "the estimated law models the raw score directly; no map applies"
     );
 }
 
@@ -6663,6 +6716,7 @@ fn empirical_rigid_fd_fixture() -> (
         .grid;
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(array![1.0, 0.0, 1.0]),
         weights: Arc::new(array![1.0, 0.7, 1.3]),
         z: Arc::new(array![0.3, -0.8, 1.6]),
@@ -7164,82 +7218,162 @@ fn conditional_latent_gate_silent_without_conditional_structure() {
     );
 }
 
-/// #905: the Auto path routes a conditional shift to the conditional
-/// location-scale calibration when a conditioning span is supplied, but falls
-/// back to the pooled-marginal path when none is (the no-CTN raw-z gap the
-/// issue names is closed only when the marginal-index span is available).
+/// #905/gam#2926: a conditional shift on the span makes the default a moving law —
+/// refused by name when no context covariates are supplied — fitted first on the
+/// location-scale Gaussian arm and certified against the Gaussian, location-scale
+/// empirical and local arms, whose local law tracks the shift by context; and the
+/// declared conditional location-scale law routes the same score to the
+/// conditional correction with an empirical residual law.
 #[test]
-fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
+fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declaration() {
     let n = 400usize;
     let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
     let z = Array1::from_iter((0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }));
     let weights = Array1::ones(n);
     let a_block = c.insert_axis(ndarray::Axis(1));
+
+    match decide_latent_law(
+        &z,
+        &weights,
+        LatentMeasureSpec::Auto { grid_size: 5 },
+        Some(a_block.view()),
+    ) {
+        Ok(_) => panic!("a moving conditional law with no context covariates must be refused"),
+        Err(refusal) => assert!(
+            refusal.contains("conditional law moves on the marginal-index span")
+                && refusal.contains("conditional-location-scale"),
+            "the refusal must say why and name the explicit alternatives; got {refusal}"
+        ),
+    }
+
+    // With the covariate as context the default fits the location-scale Gaussian
+    // arm first, carrying the certificate's candidates, and its local arm tracks
+    // the conditional mean `0.8·c` across the span.
     let policy = LatentZPolicy {
         check_mode: LatentZCheckMode::Off,
         normalization: LatentZNormalizationMode::None,
         latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
         ..LatentZPolicy::default()
     };
-
-    let (measure, calibration, _) =
-        build_latent_measure_with_geometry(&z, &weights, &policy, Some(a_block.view()))
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{} failed: {:?}",
-                    "auto latent measure with conditioning", e
-                )
-            });
-    // The residual measure is the EMPIRICAL one, not the standard normal, and on
-    // this fixture that is the correct answer rather than a regression. `z` is
-    // `0.8·c ± 0.35` with the sign alternating, so once the conditional
-    // location-scale correction removes `m(C)` and `√v(C)` the residual `ζ` is a
-    // TWO-POINT law — exactly the case `build_latent_measure_with_geometry`
-    // documents at its `residual_is_standard_normal` gate: matching the first two
-    // conditional moments does not make `ζ` Gaussian, and a two-point residual
-    // survives location-scale correction unchanged in shape. Admitting the
-    // closed-form standard-normal kernel there would be the defect.
-    //
-    // This assertion read `matches!(measure, LatentMeasureKind::StandardNormal)`,
-    // written before that gate existed, so it pinned the behaviour the gate was
-    // added to prevent (#2597). What #905 is actually about — that a conditional
-    // shift WITH a conditioning span routes to the conditional correction — is the
-    // next assertion, and it is unchanged.
-    assert!(
-        matches!(measure, LatentMeasureKind::GlobalEmpirical { .. }),
-        "a two-point conditional residual must keep an empirical latent measure, \
-         not the closed-form standard normal"
-    );
+    let context = estimated_latent_law::LocalLawContext {
+        features: a_block.view(),
+        feature_cols: vec![0],
+    };
+    let provisional = build_latent_measure_decision(
+        &z,
+        &weights,
+        &policy,
+        Some(a_block.view()),
+        Some(&context),
+        EmpiricalLatentMeasureSupport::Available,
+        "rigid latent-law test",
+    )
+    .unwrap_or_else(|e| panic!("moving latent law failed: {e}"));
+    assert!(matches!(provisional.kind, LatentMeasureKind::StandardNormal));
     assert!(
         matches!(
-            calibration,
+            provisional.calibration,
             LatentMeasureCalibration::ConditionalLocationScale(_)
         ),
-        "a conditional shift with a conditioning span must route to the conditional correction"
+        "a moving conditional mean must be fitted first on the location-scale Gaussian arm"
+    );
+    assert!(matches!(
+        provisional.consumed,
+        LatentLawConsumed::EstimatedMovingLaw {
+            arm: MovingLawArm::LocationScaleGaussian,
+            certificate: None,
+            ..
+        }
+    ));
+    let candidates = provisional
+        .moving_law
+        .as_ref()
+        .unwrap_or_else(|| panic!("a provisional moving law must carry its certificate's candidates"));
+    assert_eq!(
+        candidates.arms(),
+        &[
+            MovingLawArm::Gaussian,
+            MovingLawArm::LocationScaleGaussian,
+            MovingLawArm::LocationScaleEmpirical,
+            MovingLawArm::Local,
+        ]
+    );
+    let local = candidates
+        .decision_for(MovingLawArm::Local, None)
+        .unwrap_or_else(|e| panic!("local arm failed: {e}"));
+    let LatentMeasureKind::LocalEmpirical {
+        centers,
+        train_row_mixtures,
+        ..
+    } = &local.kind
+    else {
+        panic!("the local arm must be local by context, got {:?}", local.kind)
+    };
+    assert!(centers.len() >= 2, "a local law needs at least two contexts");
+    assert_eq!(train_row_mixtures.len(), n, "every training row carries its mixture");
+    assert!(matches!(local.calibration, LatentMeasureCalibration::None));
+    let row_law_mean = |row: usize| -> f64 {
+        local
+            .kind
+            .empirical_grid_for_training_row(row)
+            .unwrap_or_else(|e| panic!("row {row} law: {e}"))
+            .unwrap_or_else(|| panic!("row {row} has no law"))
+            .pairs()
+            .map(|(u, w)| w * u)
+            .sum()
+    };
+    let spread = row_law_mean(n - 1) - row_law_mean(0);
+    assert!(
+        spread > 0.8,
+        "the local law must follow E[z|c] = 0.8·c (span 1.6 across c ∈ [−1, 1]); law means \
+         differ by {spread:.4} between the two ends"
     );
 
-    // Without the conditioning span the Auto path cannot see the conditional
-    // shift and falls back to the pooled-marginal decision (here: no
-    // calibration, since this z passes the pooled-normal diagnostics well
-    // enough — exactly the leak the issue describes).
-    let (_measure_blind, calibration_blind, _) =
-        build_latent_measure_with_geometry(&z, &weights, &policy, None).unwrap_or_else(|e| {
-            panic!(
-                "{} failed: {:?}",
-                "auto latent measure without conditioning", e
-            )
-        });
+    let declared = decide_latent_law(
+        &z,
+        &weights,
+        LatentMeasureSpec::ConditionalLocationScale { grid_size: 5 },
+        Some(a_block.view()),
+    )
+    .unwrap_or_else(|e| panic!("declared location-scale law failed: {e}"));
+    // The residual is a TWO-POINT law (`± 0.35` once `m(C)` is removed), and a
+    // two-point residual survives location-scale correction unchanged in shape,
+    // so the residual law is empirical, never the closed form.
+    assert!(matches!(
+        declared.kind,
+        LatentMeasureKind::GlobalEmpirical { .. }
+    ));
     assert!(
-        !matches!(
-            calibration_blind,
+        matches!(
+            declared.calibration,
             LatentMeasureCalibration::ConditionalLocationScale(_)
         ),
-        "without a conditioning span the conditional correction cannot be selected"
+        "a conditional shift under the declared location-scale law must route to the conditional \
+         correction"
     );
+    assert!(matches!(
+        declared.consumed,
+        LatentLawConsumed::ConditionalLocationScale {
+            calibrated: true,
+            ..
+        }
+    ));
+    match decide_latent_law(
+        &z,
+        &weights,
+        LatentMeasureSpec::ConditionalLocationScale { grid_size: 5 },
+        None,
+    ) {
+        Ok(_) => panic!("the declared location-scale law needs the span"),
+        Err(refusal) => assert!(refusal.contains("no span is available"), "got {refusal}"),
+    }
 }
 
+/// A standard-normal score passes the Gaussian declaration and reaches the
+/// closed form; by default the same score reaches the closed form by evidence,
+/// with the adequacy statistics recorded (gam#2926).
 #[test]
-fn auto_latent_measure_preserves_standard_normal_fast_path() {
+fn a_standard_normal_score_passes_the_gaussian_declaration() {
     let n = 2001usize;
     let z = Array1::from_iter((0..n).map(|idx| {
         let p = (idx as f64 + 0.5) / n as f64;
@@ -7247,18 +7381,27 @@ fn auto_latent_measure_preserves_standard_normal_fast_path() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e))
     }));
     let weights = Array1::ones(n);
-    let policy = LatentZPolicy {
-        latent_measure: LatentMeasureSpec::Auto { grid_size: 17 },
-        ..LatentZPolicy::default()
-    };
-    let (measure, calibration, _) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "measure", e));
-
-    assert!(matches!(measure, LatentMeasureKind::StandardNormal));
+    let declared = decide_latent_law(&z, &weights, LatentMeasureSpec::StandardNormal, None)
+        .unwrap_or_else(|e| panic!("a standard-normal score must pass the declaration: {e}"));
+    assert!(matches!(declared.kind, LatentMeasureKind::StandardNormal));
+    assert!(matches!(declared.calibration, LatentMeasureCalibration::None));
+    assert!(matches!(
+        declared.consumed,
+        LatentLawConsumed::DeclaredGaussian { .. }
+    ));
+    let estimated = decide_latent_law(&z, &weights, LatentMeasureSpec::Auto { grid_size: 17 }, None)
+        .unwrap_or_else(|e| panic!("auto latent law failed: {e}"));
     assert!(
-        matches!(calibration, LatentMeasureCalibration::None),
-        "well-conditioned standard-normal z must skip rank-INT calibration"
+        matches!(estimated.kind, LatentMeasureKind::StandardNormal),
+        "the default reaches the closed form on a score the evidence cannot tell from N(0, 1)"
     );
+    let LatentLawConsumed::EstimatedGaussianAdequate { adequacy, .. } = &estimated.consumed else {
+        panic!(
+            "the default must record why it chose the closed form, got {:?}",
+            estimated.consumed
+        )
+    };
+    assert!(adequacy.passes(), "the recorded evidence must be the passing ledger");
     let slope = 0.7;
     let scale = 0.85;
     let target_q = 0.4;
@@ -7303,6 +7446,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
     let sigma = 0.7;
     let make_family = |sigma: f64| BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         gaussian_frailty_sd: Some(sigma),
         ..test_family_with_intercept_designs(y.clone(), weights.clone(), z.clone())
     };
@@ -7381,6 +7525,7 @@ fn make_block_psi_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
     });
     BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual: None,
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),

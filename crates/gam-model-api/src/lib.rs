@@ -23,6 +23,9 @@ pub mod families {
     }
 }
 
+/// Versioned JSON documents for saved models, shared by every model kind.
+pub mod saved_model;
+
 // `joint_penalty` and `outer_subsample` are neutral low-layer primitives that
 // live in `gam-problem` (below the `CustomFamily` trait). Re-export the modules
 // and their public types so existing `gam_model_api::{joint_penalty,

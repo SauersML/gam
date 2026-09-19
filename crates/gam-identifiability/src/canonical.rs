@@ -385,6 +385,192 @@ pub fn canonicalize_for_identifiability_with_operating_scalars(
     canonicalize_for_identifiability_inner(specs, coordinates, true, operating_scalars)
 }
 
+/// The converged identifiability verdict of a channel-aware fit, judged through the
+/// pilot's gauge (#2627 finding 9).
+#[derive(Debug)]
+pub struct ConvergedChannelAwareVerdict {
+    /// The pilot audit against the raw specs' channel-aware audit at the converged
+    /// operating scalars.
+    pub drift: crate::audit::AuditDriftSummary,
+    /// The same audit of the canonical reduced specs, whose callbacks compose the pilot's
+    /// gauge, at the converged operating scalars. `None` when the gauge is the identity:
+    /// the reduced problem is then the raw problem, and `drift` already measures it.
+    pub pilot_gauge_reaudit: Option<IdentifiabilityAudit>,
+}
+
+impl ConvergedChannelAwareVerdict {
+    /// The design-structural rank, at convergence, of the problem the fit ran.
+    pub fn pilot_gauge_rank(&self) -> usize {
+        self.pilot_gauge_reaudit
+            .as_ref()
+            .map_or(self.drift.current_rank, |audit| {
+                audit.blocks.iter().map(|block| block.effective_dim).sum()
+            })
+    }
+
+    /// Whether the converged verdict refuses the fit.
+    ///
+    /// The channel-aware audit sheds `p_b − kept_b` columns per block, and that count is
+    /// its rank verdict. Which columns it sheds is a pivoted residual order at the
+    /// operating point, and inside an alias class it moves with the operating scalars. So
+    /// the converged drop set is judged through the pilot's gauge, not by column label.
+    ///
+    /// The verdict refuses when the raw joint rank or fatality changed, or when the
+    /// problem the fit ran has a different rank or fatality at convergence. Under a
+    /// reducing gauge the pilot's reduced problem is full rank, so "a different rank"
+    /// means its re-audit drops a column. Under the identity gauge (the width-preserving
+    /// path) the reduced problem is the raw problem.
+    ///
+    /// A recovered column refuses exactly when it moves a rank. Either the raw rank rose,
+    /// meaning the gauge removed a direction convergence identifies and the solve ran
+    /// over-reduced, or the reduced problem lost one. A column that another member of its
+    /// alias class replaced does neither.
+    pub fn refuses(&self) -> bool {
+        let gauge_fatal = self
+            .pilot_gauge_reaudit
+            .as_ref()
+            .map_or(self.drift.current_fatal, |audit| audit.fatal);
+        self.drift.pilot_rank != self.drift.current_rank
+            || self.drift.pilot_fatal != self.drift.current_fatal
+            || self.pilot_gauge_rank() != self.drift.pilot_rank
+            || gauge_fatal != self.drift.pilot_fatal
+    }
+
+    /// The pivot picked other representatives of the same identified span: the drop
+    /// labels differ, and the verdict does not refuse.
+    pub fn representative_swap(&self) -> bool {
+        !self.refuses()
+            && (!self.drift.newly_dropped.is_empty() || !self.drift.recovered.is_empty())
+    }
+}
+
+/// The converged verdict of a channel-aware fit: the raw specs and the canonical reduced
+/// specs, re-audited at the converged operating scalars with
+/// [`channel_aware_audit_at_operating_scalars`], the audit that produced the pilot
+/// verdict. See [`ConvergedChannelAwareVerdict::refuses`].
+pub fn converged_channel_aware_verdict(
+    raw_specs: &[ParameterBlockSpec],
+    canonical: &CanonicalSpecs,
+    converged_scalars: Arc<dyn std::any::Any + Send + Sync>,
+    beta_relative_change: f64,
+    outer_iter: usize,
+) -> Result<ConvergedChannelAwareVerdict, CustomFamilyError> {
+    let current =
+        channel_aware_audit_at_operating_scalars(raw_specs, Some(Arc::clone(&converged_scalars)))?;
+    let drift = crate::audit::audit_verdict_drift(
+        &canonical.audit,
+        &current,
+        beta_relative_change,
+        outer_iter,
+    );
+    // The gauge is a column selection, so it is the identity exactly when every block
+    // keeps its raw width.
+    let gauge_is_identity = raw_specs
+        .iter()
+        .zip(canonical.reduced_specs.iter())
+        .all(|(raw, reduced)| raw.design.ncols() == reduced.design.ncols());
+    let pilot_gauge_reaudit = if gauge_is_identity {
+        None
+    } else {
+        Some(channel_aware_audit_at_operating_scalars(
+            &canonical.reduced_specs,
+            Some(converged_scalars),
+        )?)
+    };
+    Ok(ConvergedChannelAwareVerdict {
+        drift,
+        pilot_gauge_reaudit,
+    })
+}
+
+/// The channel-aware identifiability audit of multi-output `specs`, with every
+/// `jacobian_callback` block linearized at `operating_scalars` (the zero/init point
+/// when `None`).
+///
+/// It is the one verdict owner for channel-aware families. The pre-fit canonicaliser
+/// takes the pilot verdict from it, and the converged-state drift check re-measures
+/// with it at the converged operating scalars, so both endpoints are ranked by the
+/// same definition: `dropped_columns` and `effective_dim` are the design-structural
+/// rank of the channel-major effective Jacobians, and the penalty decides only
+/// whether a deficiency is fatal. A second rank definition at convergence (the
+/// penalty-augmented flat audit) reports every penalty-covered design alias as
+/// recovered and manufactures a verdict change on an unchanged model.
+pub fn channel_aware_audit_at_operating_scalars(
+    specs: &[ParameterBlockSpec],
+    operating_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> Result<IdentifiabilityAudit, CustomFamilyError> {
+    let n_rows = specs.first().map_or(0, |spec| spec.design.nrows());
+    // All blocks share the common channel count; blocks without a callback get a
+    // single-channel identity adapter zero-padded to it.
+    let k = specs
+        .iter()
+        .map(|spec| {
+            spec.jacobian_callback
+                .as_ref()
+                .map_or(1, |callback| callback.n_outputs())
+        })
+        .max()
+        .unwrap_or(1);
+    let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(specs.len());
+    for spec in specs.iter() {
+        let op: Arc<dyn RowJacobianOperator> = match spec.jacobian_callback.as_ref() {
+            Some(cb) => {
+                // `from_callback` zero-pads the trailing channels for blocks with
+                // fewer outputs than the audit's common k, building the padded
+                // tensor directly.
+                let row_op = BlockJacobianAsRowOp::from_callback(
+                    Arc::clone(cb),
+                    n_rows,
+                    spec.design.ncols(),
+                    k,
+                    &spec.name,
+                    operating_scalars.clone(),
+                )
+                .map_err(|e| CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "canonicalize_for_identifiability_with_operating_scalars: build \
+                                     BlockJacobianAsRowOp for block '{}': {e}",
+                        spec.name,
+                    ),
+                })?;
+                Arc::new(row_op)
+            }
+            None => Arc::new(BlockJacobianAsRowOp::from_flat_design(
+                spec.design.clone(),
+                n_rows,
+                k,
+                &spec.name,
+            )),
+        };
+        operators.push(op);
+    }
+    let row_hess = IdentityRowHessian::new(n_rows, k);
+    let audit_result = audit_identifiability_channel_aware(specs, &operators, &row_hess)
+        .map_err(|reason| CustomFamilyError::DimensionMismatch {
+            reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
+        })?;
+    log::info!(
+        "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} \
+         (flat audit NOT used; effective Jacobians linearized at {})",
+        specs.len(),
+        audit_result
+            .blocks
+            .iter()
+            .map(|b| b.effective_dim)
+            .sum::<usize>(),
+        specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
+        // Which operating point the rank/overlap verdict was measured at — the
+        // decisive fact when a refusal is a false-positive from linearizing a
+        // family whose channel weights depend on β at the collapsed zero point.
+        if operating_scalars.is_some() {
+            "the supplied operating point (family_scalars supplied)"
+        } else {
+            "the zero/init point (beta = 0, no family_scalars)"
+        },
+    );
+    Ok(audit_result)
+}
+
 /// Core canonicalisation worker.
 ///
 /// `orthogonalize` is an INTERNAL recursion-control flag (NOT a user knob): the
@@ -737,68 +923,8 @@ fn canonicalize_for_identifiability_inner(
 
     // ── Run the audit ─────────────────────────────────────────────────────
     let audit = if use_channel_aware {
-        // Determine the common k (all blocks must agree on the channel count;
-        // blocks without a jacobian_callback get a single-channel identity
-        // adapter at k = max_n_outputs).
-        let k = max_n_outputs;
-        let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(specs.len());
-        for spec in specs.iter() {
-            let op: Arc<dyn RowJacobianOperator> = match spec.jacobian_callback.as_ref() {
-                Some(cb) => {
-                    // `from_callback` zero-pads the trailing channels for
-                    // blocks with fewer outputs than the audit's common k,
-                    // building the padded tensor directly.
-                    let row_op = BlockJacobianAsRowOp::from_callback(
-                        Arc::clone(cb),
-                        n_rows,
-                        spec.design.ncols(),
-                        k,
-                        &spec.name,
-                        operating_scalars.clone(),
-                    )
-                    .map_err(|e| CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "canonicalize_for_identifiability_with_operating_scalars: build \
-                                         BlockJacobianAsRowOp for block '{}': {e}",
-                            spec.name,
-                        ),
-                    })?;
-                    Arc::new(row_op)
-                }
-                None => Arc::new(BlockJacobianAsRowOp::from_flat_design(
-                    spec.design.clone(),
-                    n_rows,
-                    k,
-                    &spec.name,
-                )),
-            };
-            operators.push(op);
-        }
-        let row_hess = IdentityRowHessian::new(n_rows, k);
-        let audit_result = audit_identifiability_channel_aware(specs, &operators, &row_hess)
-            .map_err(|reason| CustomFamilyError::DimensionMismatch {
-                reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
-            })?;
-
-        log::info!(
-            "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} \
-             (flat audit NOT used; effective Jacobians linearized at {})",
-            specs.len(),
-            audit_result
-                .blocks
-                .iter()
-                .map(|b| b.effective_dim)
-                .sum::<usize>(),
-            specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
-            // Which operating point the rank/overlap verdict was measured at — the
-            // decisive fact when a refusal is a false-positive from linearizing a
-            // family whose channel weights depend on β at the collapsed zero point.
-            if operating_scalars.is_some() {
-                "the pilot operating point (family_scalars supplied)"
-            } else {
-                "the zero/init point (beta = 0, no family_scalars)"
-            },
-        );
+        let audit_result =
+            channel_aware_audit_at_operating_scalars(specs, operating_scalars.clone())?;
 
         // NOTE: the flat audit (`audit_identifiability`) must NOT be run on
         // multi-output blocks. It re-materialises each block's effective

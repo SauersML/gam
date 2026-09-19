@@ -54,7 +54,7 @@ class WorkflowTasks2623Tests(unittest.TestCase):
                 {"GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_OUTPUT": str(output)},
                 clear=False,
             ):
-                _TASKS.build_matrix("wine_temp_vs_year,papuan_oce4_psperpc_k6")
+                _TASKS.build_matrix("wine_temp_vs_year,papuan_oce4_duchon_k6")
             values = dict(
                 line.split("=", 1)
                 for line in output.read_text().splitlines()
@@ -67,7 +67,7 @@ class WorkflowTasks2623Tests(unittest.TestCase):
                     entry["scenario"]
                     for entry in json.loads(values["parallel_matrix"])["include"]
                 ],
-                ["wine_temp_vs_year", "papuan_oce4_psperpc_k6"],
+                ["wine_temp_vs_year", "papuan_oce4_duchon_k6"],
             )
             with patch.dict(
                 os.environ,

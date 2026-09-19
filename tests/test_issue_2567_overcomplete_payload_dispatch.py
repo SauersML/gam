@@ -6,7 +6,7 @@ pyclass name collision, and ``gamfit.load``'s sniff, which now dispatches on the
 the repair landed inside ``gamfit.load`` while #2502's flagship readers --
 ``experiments/i2502_overcomplete_manifold/{splice_eval,interp_atoms,steer_flagship}.py``
 -- never call it. They hold a pickled ``to_dict()`` payload, not a path, and
-reached straight into ``ManifoldSAE.from_dict``, which is pinned to ``/v6``.
+reached straight into ``ManifoldSAE.from_dict``, which is pinned to ``/v8``.
 
 The symptom is worth stating because it is not obviously a routing bug: a
 support payload handed to the dense parser fails on a *dense* field name
@@ -39,7 +39,7 @@ SUPPORT_PARSER = "ManifoldSAESupport.from_dict"
 DENSE_PARSER = "ManifoldSAE.from_json"
 
 SUPPORT_PAYLOAD = {"schema": "gamfit.ManifoldSAE/support-v2"}
-DENSE_PAYLOAD = {"schema": "gamfit.ManifoldSAE/v7"}
+DENSE_PAYLOAD = {"schema": "gamfit.ManifoldSAE/v10"}
 
 
 def _claiming_parser(fn: Any, payload: Any) -> str:

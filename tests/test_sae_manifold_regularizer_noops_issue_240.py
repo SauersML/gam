@@ -93,8 +93,14 @@ def test_isometry_weight_is_not_a_silent_noop():
     )
 
 
-def test_ard_per_atom_is_not_a_silent_noop():
-    _fit_must_react("ard_per_atom", on_value=False, off_value=True)
+def test_ard_per_atom_is_not_an_accepted_kwarg():
+    """``ard_per_atom=False`` removed the coordinate ARD prior, which is what makes
+    each row's coordinate posterior proper; without it the criterion has no lower
+    bound (#2822). The prior is now mandatory and the kwarg is deleted. Passing it
+    must raise ``TypeError``, so a caller does not silently lose configuration."""
+    X = _data(seed=3)
+    with pytest.raises(TypeError, match="ard_per_atom"):
+        gamfit.sae_manifold_fit(X=X, **_baseline(), ard_per_atom=False)
 
 
 def test_block_orthogonality_weight_is_not_a_silent_noop():
@@ -148,8 +154,8 @@ def test_primitive_names_metadata_is_not_a_substitute_for_effect():
     ``block_orthogonality_weight`` flipped the ``primitive_names`` list but
     left fit arrays bit-identical (silent acceptance of a no-op).
 
-    ``ard_per_atom`` is wired through to Rust (see
-    ``test_ard_per_atom_is_not_a_silent_noop``), and #249 wired Isometry,
+    The coordinate ARD prior is mandatory, with no kwarg to switch it off (see
+    ``test_ard_per_atom_is_not_an_accepted_kwarg``, #2822), and #249 wired Isometry,
     BlockOrthogonality and MechanismSparsity into the Rust SAE row-block
     driver. This test pins that ``isometry_weight=10.0`` with
     ``block_orthogonality_weight=10.0`` produces a fit that visibly differs

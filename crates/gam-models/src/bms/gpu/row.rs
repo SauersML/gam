@@ -1218,6 +1218,8 @@ pub(crate) const REDUCTION_THREADS: u32 = 256;
 /// internal batching width, not a matrix-width limit: wider dense matrices are
 /// materialised in consecutive batches. The CUDA source has four scalar
 /// shared arrays of this length; primary directions are derived on demand.
+/// Structural (#2469): the length of those arrays, `MAX_MULTI_RHS` in
+/// `HVP_KERNEL_SOURCE`.
 #[cfg(target_os = "linux")]
 pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 
@@ -3058,6 +3060,8 @@ pub(crate) fn launch_bms_flex_row_diagonal(
 /// bytes. V100 default per-block shared cap is 48 KiB, so the largest
 /// safe `p_total` here is `sqrt(48 KiB / 8) = 78`. We round down to a
 /// power-of-two-ish multiple of 8 for predictable launch geometry.
+/// Structural (#2469): the largest multiple of 8 not above `sqrt(48 KiB / 8 B) = 78`,
+/// the per-CTA shared-memory accumulator bound.
 #[cfg(target_os = "linux")]
 pub(crate) const DENSE_BLOCK_MAX_P: usize = 72;
 
@@ -3311,6 +3315,8 @@ mod row_kernel_tests {
 
             let family = BernoulliMarginalSlopeFamily {
                 jeffreys_armed: true,
+                residual: None,
+                search: None,
                 y: Arc::new(y),
                 weights: Arc::new(weights),
                 z: Arc::new(z.clone()),

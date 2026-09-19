@@ -1205,29 +1205,63 @@ mod tests {
         // resolution: 0.992, 1.003, 0.997 and 0.995 on four EPYC hosts, wins
         // between 0.13 and 0.93. The 1.56x once measured here was one call per
         // iteration, where the harness's own per-call cost was the arm. The
-        // contract is parity within resolution, `not_slower`, and the
-        // bit-identity pin above is what says the prune reads the same
-        // channels.
+        // contract is parity, `not_slower`, and the bit-identity pin above is
+        // what says the prune reads the same channels.
+        //
+        // After inlining, both arms are one program, so the cell sits at the
+        // instrument's floor. The production arm raced against a copy of itself
+        // read 0.996 at resolution 0.0028 on EPYC 7763 (job 1279199), a loss by
+        // resolution alone. So the cell is graded against the spread of the
+        // production arm's own self-races, run here on the same host and
+        // binary. Each expansion of `self_race!` writes the arm twice, so every
+        // race pits two closures with code of their own, as the prune and the
+        // tower are, and no two races share a pair of copies.
         if cfg!(debug_assertions) {
             return;
         }
+        let production = |nudge: f64| {
+            let (jet_mu, jet_d1, jet_d2, jet_d3, _) = logit_jet(q0 + nudge);
+            let (m1, m2, m3) =
+                binomial_neglog_q_derivatives_from_jet(y, w, jet_mu, jet_d1, jet_d2, jet_d3);
+            m1 + m2 + m3
+        };
+        let seed = 0x9320_09E1_u64;
+        macro_rules! self_race {
+            ($race:expr) => {
+                paired_interleaved(
+                    15,
+                    5_000,
+                    seed.wrapping_add($race),
+                    batched(64, |nudge| production(nudge)),
+                    batched(64, |nudge| production(nudge)),
+                )
+            };
+        }
+        let self_races = [
+            self_race!(1),
+            self_race!(2),
+            self_race!(3),
+            self_race!(4),
+            self_race!(5),
+        ];
         let mut gate = SpeedGate::open("BINOMIAL-Q-PRUNE-932");
         let timing = paired_interleaved(
             15,
             5_000,
-            0x9320_09E1,
-            batched(64, |nudge| {
-                let (jet_mu, jet_d1, jet_d2, jet_d3, _) = logit_jet(q0 + nudge);
-                let (m1, m2, m3) =
-                    binomial_neglog_q_derivatives_from_jet(y, w, jet_mu, jet_d1, jet_d2, jet_d3);
-                m1 + m2 + m3
-            }),
+            seed,
+            batched(64, |nudge| production(nudge)),
             batched(64, |nudge| {
                 let (m1, m2, m3) = tower4_m123(q0 + nudge);
                 m1 + m2 + m3
             }),
         );
-        gate.not_slower("m1..m3", &timing, "production_tower3", "full_tower4");
+        gate.not_slower_than_self_races(
+            "m1..m3",
+            &timing,
+            &self_races,
+            "production_tower3",
+            "full_tower4",
+        );
         gate.finish();
     }
 }

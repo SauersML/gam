@@ -37,7 +37,7 @@ def _fit_circle(n: int = 200, noise: float = 0.15, seed: int = 0, n_iter: int = 
     x = clean + noise * rng.standard_normal((n, 2))
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
-        isometry_weight=0.0, ard_per_atom=True, sparsity_weight=0.01,
+        isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=n_iter, learning_rate=1.0, random_state=seed,
     )
     return fit, x

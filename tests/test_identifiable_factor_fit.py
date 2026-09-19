@@ -3,7 +3,7 @@
 Generates a tiny synthetic dataset with a 3-dim auxiliary-conditioned
 latent and a 3-dim free latent, mixes them linearly into a 12-dim
 observation space, then asserts the recipe returns the right shapes and a
-finite evidence score.
+finite profile log-likelihood.
 """
 from __future__ import annotations
 
@@ -127,7 +127,7 @@ def test_identifiable_factor_fit_smoke() -> None:
         )
     assert result.T_supervised.shape == (80, 3)
     assert result.T_free.shape == (80, 3)
-    assert math.isfinite(result.evidence)
+    assert math.isfinite(result.profile_log_likelihood)
     assert result.decoder.shape == (12, 6)
     assert result.aux_prior_weight > 0.0
     assert result.mech_sparsity_weight > 0.0

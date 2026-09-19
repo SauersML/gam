@@ -1090,35 +1090,34 @@
         use crate::custom_family::custom_family_outer_derivatives;
         use gam_problem::{DeclaredHessianForm, Derivative};
 
-        // Both latent families arm the Jeffreys term and neither implements the
-        // third information derivative. An armed term's exact outer Hessian needs
-        // that derivative (the mode-response completion and the mixed H_Φ drift),
-        // so since 98f431392 the planner declares no Hessian for them at any n,
-        // and the fit searches first-order instead of refusing every trial point.
+        // Both latent families arm the Jeffreys term. An armed term's exact outer
+        // Hessian needs the third information derivative (the mode-response
+        // completion and the mixed H_Φ drift), and since 98f431392 the planner
+        // declares no Hessian without it. Since e56f1f1dab both families supply it
+        // (#2677), so the planner declares the Hessian at any n and records no
+        // absence. The same families with that derivative withheld still get none.
         let options = BlockwiseFitOptions::default();
         let large_n = 50_001;
 
         let survival = learnable_sigma_test_family();
         assert!(survival.joint_jeffreys_term_required());
-        assert!(survival.jeffreys_third_information_derivative().is_none());
+        assert!(survival.jeffreys_third_information_derivative().is_some());
         let survival_specs =
             latent_test_specs(large_n, &[("time", 2), ("mean", 2), ("log_sigma", 1)]);
         let (surv_grad, surv_hess) =
             custom_family_outer_derivatives(&survival, &survival_specs, &options);
         assert_eq!(surv_grad, Derivative::Analytic);
-        assert_eq!(surv_hess, DeclaredHessianForm::Unavailable);
+        assert_eq!(surv_hess, DeclaredHessianForm::Either);
 
         let binary = fixed_sigma_binary_test_family();
         assert!(binary.joint_jeffreys_term_required());
-        assert!(binary.jeffreys_third_information_derivative().is_none());
+        assert!(binary.jeffreys_third_information_derivative().is_some());
         let binary_specs = latent_test_specs(large_n, &[("time", 2), ("mean", 2)]);
         let (bin_grad, bin_hess) =
             custom_family_outer_derivatives(&binary, &binary_specs, &options);
         assert_eq!(bin_grad, Derivative::Analytic);
-        assert_eq!(bin_hess, DeclaredHessianForm::Unavailable);
+        assert_eq!(bin_hess, DeclaredHessianForm::Either);
 
-        // #2677: a fit of either family that selects rho publishes no smoothing correction, and
-        // the reason it records is the armed Jeffreys term without its third derivative.
         for absence in [
             crate::custom_family::custom_family_outer_hessian_absence(
                 &survival,
@@ -1127,6 +1126,63 @@
             ),
             crate::custom_family::custom_family_outer_hessian_absence(
                 &binary,
+                &binary_specs,
+                &options,
+            ),
+        ] {
+            assert_eq!(absence, None);
+        }
+
+        /// A family with its third information derivative withheld and every
+        /// other planner input read from the family it wraps.
+        #[derive(Clone)]
+        struct WithoutThirdInformationDerivative<F>(F);
+        impl<F: CustomFamily + Clone> CustomFamily for WithoutThirdInformationDerivative<F> {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
+                self.0.evaluate(block_states)
+            }
+
+            fn joint_jeffreys_term_required(&self) -> bool {
+                self.0.joint_jeffreys_term_required()
+            }
+
+            fn jeffreys_third_information_derivative(
+                &self,
+            ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
+                None
+            }
+
+            fn exact_newton_outerobjective(&self) -> gam_problem::ExactNewtonOuterObjective {
+                self.0.exact_newton_outerobjective()
+            }
+
+            fn outer_derivative_policy(
+                &self,
+                specs: &[ParameterBlockSpec],
+                options: &BlockwiseFitOptions,
+            ) -> crate::custom_family::OuterDerivativePolicy {
+                self.0.outer_derivative_policy(specs, options)
+            }
+        }
+        let withheld_survival = WithoutThirdInformationDerivative(survival.clone());
+        let withheld_binary = WithoutThirdInformationDerivative(binary.clone());
+        let (_, withheld_survival_hess) =
+            custom_family_outer_derivatives(&withheld_survival, &survival_specs, &options);
+        let (_, withheld_binary_hess) =
+            custom_family_outer_derivatives(&withheld_binary, &binary_specs, &options);
+        assert_eq!(withheld_survival_hess, DeclaredHessianForm::Unavailable);
+        assert_eq!(withheld_binary_hess, DeclaredHessianForm::Unavailable);
+        for absence in [
+            crate::custom_family::custom_family_outer_hessian_absence(
+                &withheld_survival,
+                &survival_specs,
+                &options,
+            ),
+            crate::custom_family::custom_family_outer_hessian_absence(
+                &withheld_binary,
                 &binary_specs,
                 &options,
             ),
@@ -2636,7 +2692,7 @@
             1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0,
             -1.0, 1.0, -1.0, 1.0,
         ];
-        let moments = std::array::from_fn(|index| LatentSignedLog {
+        let moments: [LatentSignedLog; 16] = std::array::from_fn(|index| LatentSignedLog {
             log_abs: log_abs[index],
             sign: signs[index],
         });
@@ -3788,6 +3844,170 @@
         }
     }
 
+    /// #2677: `(V_ij, g_ij, H_ij)` of one baseline-chart axis pair against the
+    /// central `θ_j`-difference of the production first-order hook `(V_i, g_i, H_i)`
+    /// realized at `θ ± h`. The bar is relative above magnitude one and absolute
+    /// `1e-6` below it, so the pair must carry a channel above that absolute floor
+    /// for agreement to say anything.
+    fn assert_psi_pair_matches_central_difference(
+        label: &str,
+        pair: &gam_problem::ExactNewtonJointPsiSecondOrderTerms,
+        plus: &gam_problem::ExactNewtonJointPsiTerms,
+        minus: &gam_problem::ExactNewtonJointPsiTerms,
+        h: f64,
+    ) {
+        let absolute_floor = 1e-6;
+        let close = |analytic: f64, central: f64| {
+            (analytic - central).abs() <= absolute_floor * analytic.abs().max(central.abs()).max(1.0)
+        };
+        let magnitude = std::iter::once(pair.objective_psi_psi)
+            .chain(pair.score_psi_psi.iter().copied())
+            .chain(pair.hessian_psi_psi.iter().copied())
+            .fold(0.0_f64, |worst, value| worst.max(value.abs()));
+        assert!(
+            magnitude > absolute_floor,
+            "{label}: every second-order channel is at most {magnitude:e}, below the bar's absolute floor {absolute_floor:e}"
+        );
+        let central_objective = (plus.objective_psi - minus.objective_psi) / (2.0 * h);
+        assert!(
+            close(pair.objective_psi_psi, central_objective),
+            "{label}: V_ij {} against central difference {central_objective}",
+            pair.objective_psi_psi
+        );
+        let central_score = (&plus.score_psi - &minus.score_psi) / (2.0 * h);
+        for (a, (&analytic, &central)) in
+            pair.score_psi_psi.iter().zip(central_score.iter()).enumerate()
+        {
+            assert!(
+                close(analytic, central),
+                "{label}: g_ij[{a}] {analytic} against central difference {central}"
+            );
+        }
+        let central_information = (&plus.hessian_psi - &minus.hessian_psi) / (2.0 * h);
+        for ((a, b), &analytic) in pair.hessian_psi_psi.indexed_iter() {
+            let central = central_information[[a, b]];
+            assert!(
+                close(analytic, central),
+                "{label}: H_ij[{a},{b}] {analytic} against central difference {central}"
+            );
+        }
+    }
+
+    /// #2677: the baseline-chart hyper axes serve the exact fixed-β second-order
+    /// terms of every axis pair, the θ-derivatives of the first-order terms. The
+    /// family is realized at `θ ± h` through the chart, on a fully loaded Weibull
+    /// chart and on a loaded/unloaded Gompertz-Makeham split whose `ln m` axis moves
+    /// no offset, so the loaded pairs, the `(ln m, loaded)` pairs and `(ln m, ln m)`
+    /// are each checked.
+    #[test]
+    fn baseline_chart_psi_pair_terms_match_central_differences_2677() {
+        let h = 1e-5_f64;
+        let beta = array![-0.60, 0.85, -0.25, 0.40, -0.3_f64];
+        let age_entry = array![0.4, 0.7, 1.1, 0.5];
+        let age_exit = array![1.9, 2.6, 3.4, 4.2];
+        let age_right = array![2.5, 3.2, 4.6, 5.0];
+        let full = full_loading_learned_sigma_family();
+        let weibull = SurvivalBaselineConfig {
+            target: crate::survival::construction::SurvivalBaselineTarget::Weibull,
+            scale: Some(2.0),
+            shape: Some(1.3),
+            rate: None,
+            makeham: None,
+        };
+        let (seed_entry, seed_exit, seed_derivative) =
+            crate::survival::construction::build_survival_baseline_offsets(
+                &age_entry, &age_exit, &weibull,
+            )
+            .expect("seed baseline offsets");
+        let full_chart = crate::survival::construction::LatentSurvivalFrozenOffsetChart::new(
+            &age_entry,
+            &age_exit,
+            None,
+            &weibull,
+            HazardLoading::Full,
+            &seed_entry,
+            &seed_exit,
+            &seed_derivative,
+            &Array1::zeros(full.event_target.len()),
+        )
+        .expect("chart construction")
+        .expect("a Weibull baseline has chart coordinates");
+        let split = loaded_vs_unloaded_learned_sigma_family();
+        let gompertz_makeham = gompertz_makeham_seed();
+        let seed_offsets = crate::survival::construction::build_latent_survival_baseline_offsets(
+            &age_entry,
+            &age_exit,
+            &gompertz_makeham,
+            HazardLoading::LoadedVsUnloaded,
+        )
+        .expect("seed loaded offsets");
+        let seed_right = crate::survival::construction::build_latent_survival_baseline_offsets(
+            &age_entry,
+            &age_right,
+            &gompertz_makeham,
+            HazardLoading::LoadedVsUnloaded,
+        )
+        .expect("seed loaded right offsets");
+        let split_chart = crate::survival::construction::LatentSurvivalFrozenOffsetChart::new(
+            &age_entry,
+            &age_exit,
+            Some(&age_right),
+            &gompertz_makeham,
+            HazardLoading::LoadedVsUnloaded,
+            &seed_offsets.loaded_eta_entry,
+            &seed_offsets.loaded_eta_exit,
+            &seed_offsets.loaded_derivative_exit,
+            &seed_right.loaded_eta_exit,
+        )
+        .expect("chart construction")
+        .expect("a Gompertz-Makeham baseline has chart coordinates");
+        for (label, family, chart) in [
+            ("full Weibull", &full, &full_chart),
+            ("Gompertz-Makeham split", &split, &split_chart),
+        ] {
+            let n = family.event_target.len();
+            let realized = |point: &Array1<f64>| {
+                let geometry = Arc::new(chart.evaluate(point).expect("chart evaluation"));
+                let at_point = family.at_chart_point(Arc::clone(&geometry), None);
+                let mut states = latent_survival_states_from_joint_beta(&at_point, &beta);
+                let eta = &mut states[LatentSurvivalFamily::BLOCK_TIME].eta;
+                eta.slice_mut(s![0..n]).scaled_add(1.0, &geometry.offset_entry);
+                eta.slice_mut(s![n..2 * n]).scaled_add(1.0, &geometry.offset_exit);
+                eta.slice_mut(s![2 * n..3 * n])
+                    .scaled_add(1.0, &geometry.derivative_offset_exit);
+                (geometry, at_point, states)
+            };
+            let theta = chart.initial_theta().clone();
+            let (rows, at_theta, states) = realized(&theta);
+            for i in 0..theta.len() {
+                for j in 0..theta.len() {
+                    let pair = at_theta
+                        .baseline_theta_psisecond_order_terms_dense(&states, &rows, i, j)
+                        .expect("baseline psi pair terms");
+                    let mut plus = theta.clone();
+                    plus[j] += h;
+                    let mut minus = theta.clone();
+                    minus[j] -= h;
+                    let (rows_plus, family_plus, states_plus) = realized(&plus);
+                    let (rows_minus, family_minus, states_minus) = realized(&minus);
+                    let first_plus = family_plus
+                        .baseline_theta_psi_terms_dense(&states_plus, &rows_plus, i)
+                        .expect("baseline psi terms at θ + h");
+                    let first_minus = family_minus
+                        .baseline_theta_psi_terms_dense(&states_minus, &rows_minus, i)
+                        .expect("baseline psi terms at θ − h");
+                    assert_psi_pair_matches_central_difference(
+                        &format!("{label} pair ({i}, {j})"),
+                        &pair,
+                        &first_plus,
+                        &first_minus,
+                        h,
+                    );
+                }
+            }
+        }
+    }
+
     /// #2714: the binary deployment of a loaded/unloaded chart. A survivor's
     /// `ln m` term is the β-free background shift; an event's runs through the
     /// binary chain. Realized at `θ ± h` through the chart, every term must match
@@ -3922,6 +4142,97 @@
                 assert!(
                     close(analytic, central),
                     "axis {axis}: D_β H_θ[u][{a},{b}] {analytic} against central difference {central}"
+                );
+            }
+        }
+    }
+
+    /// #2677: the binary deployment's second-order baseline-chart terms on a
+    /// loaded/unloaded Gompertz-Makeham split. Its event and survivor rows run the
+    /// loaded pairs, the `(ln m, loaded)` pairs and `(ln m, ln m)`, each against the
+    /// central `θ_j`-difference of the first-order hook realized at `θ ± h`.
+    #[test]
+    fn binary_baseline_chart_psi_pair_terms_match_central_differences_2677() {
+        let n = 4;
+        let family = LatentBinaryFamily {
+            event_target: array![1u8, 0u8, 1u8, 0u8],
+            weights: array![1.0, 0.8, 1.1, 1.3],
+            latent_sd: 0.4,
+            hazard_loading: HazardLoading::LoadedVsUnloaded,
+            unloaded_mass_entry: Array1::zeros(n),
+            unloaded_mass_exit: Array1::zeros(n),
+            x_time_entry: array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]],
+            x_time_exit: array![[1.0, 0.35], [1.0, 0.90], [1.0, 1.70], [1.0, 2.60]],
+            x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![
+                [1.0, -0.40],
+                [1.0, 0.15],
+                [1.0, 0.60],
+                [1.0, -0.90]
+            ])),
+            time_linear_constraints: None,
+            quadctx: Arc::new(QuadratureContext::new()),
+            baseline_theta_rows: None,
+            jeffreys_armed: true,
+        };
+        let age_entry = array![0.4, 0.7, 1.1, 0.5];
+        let age_exit = array![1.9, 2.6, 3.4, 4.2];
+        let seed = gompertz_makeham_seed();
+        let seed_offsets = crate::survival::construction::build_latent_survival_baseline_offsets(
+            &age_entry,
+            &age_exit,
+            &seed,
+            HazardLoading::LoadedVsUnloaded,
+        )
+        .expect("seed loaded offsets");
+        let chart = crate::survival::construction::LatentSurvivalFrozenOffsetChart::new(
+            &age_entry,
+            &age_exit,
+            None,
+            &seed,
+            HazardLoading::LoadedVsUnloaded,
+            &seed_offsets.loaded_eta_entry,
+            &seed_offsets.loaded_eta_exit,
+            &seed_offsets.loaded_derivative_exit,
+            &Array1::zeros(n),
+        )
+        .expect("chart construction")
+        .expect("a Gompertz-Makeham baseline has chart coordinates");
+        let beta = array![-0.60, 0.85, -0.25, 0.40_f64];
+        let realized = |point: &Array1<f64>| {
+            let geometry = Arc::new(chart.evaluate(point).expect("chart evaluation"));
+            let at_point = family.at_chart_point(Arc::clone(&geometry), None);
+            let mut states = latent_binary_states_from_joint_beta(&at_point, &beta);
+            let eta = &mut states[LatentBinaryFamily::BLOCK_TIME].eta;
+            eta.slice_mut(s![0..n]).scaled_add(1.0, &geometry.offset_entry);
+            eta.slice_mut(s![n..2 * n]).scaled_add(1.0, &geometry.offset_exit);
+            (geometry, at_point, states)
+        };
+        let theta = chart.initial_theta().clone();
+        let (rows, at_theta, states) = realized(&theta);
+        let h = 1e-5_f64;
+        for i in 0..theta.len() {
+            for j in 0..theta.len() {
+                let pair = at_theta
+                    .baseline_theta_psisecond_order_terms_dense(&states, &rows, i, j)
+                    .expect("binary baseline psi pair terms");
+                let mut plus = theta.clone();
+                plus[j] += h;
+                let mut minus = theta.clone();
+                minus[j] -= h;
+                let (rows_plus, family_plus, states_plus) = realized(&plus);
+                let (rows_minus, family_minus, states_minus) = realized(&minus);
+                let first_plus = family_plus
+                    .baseline_theta_psi_terms_dense(&states_plus, &rows_plus, i)
+                    .expect("binary baseline psi terms at θ + h");
+                let first_minus = family_minus
+                    .baseline_theta_psi_terms_dense(&states_minus, &rows_minus, i)
+                    .expect("binary baseline psi terms at θ − h");
+                assert_psi_pair_matches_central_difference(
+                    &format!("binary Gompertz-Makeham split pair ({i}, {j})"),
+                    &pair,
+                    &first_plus,
+                    &first_minus,
+                    h,
                 );
             }
         }

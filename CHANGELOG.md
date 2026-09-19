@@ -1,5 +1,37 @@
 ## Unreleased
 
+- **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
+  accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
+  `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`
+  normalized their rows silently. Both now apply one rule: `|‖p‖² − 1|` may not exceed the
+  band an f64 normalization leaves, `γ_{2d+6}` (about `1.3e-15` for `d = 3`). A wider
+  point is refused with the measured defect and the fix, and is never normalized. This
+  deliberately refuses points normalized in f32 or rounded to about six digits.
+  **Migration:** normalize each point in f64 before passing it, e.g. `p / np.linalg.norm(p)`.
+  The sphere exponential now normalizes its output, so iterates stay inside that band
+  however many steps they take.
+- **The Bernoulli marginal-slope Jeffreys prior uses the expected Fisher information** (#2922).
+  The binary marginal-slope family priced its Jeffreys/Firth term from the observed
+  joint Hessian. Away from the mode that matrix is indefinite (smallest eigenvalue down
+  to −4.5 on a 50-row flexible fit), and the term's value jumped between trust-region
+  trials whose likelihood barely moved. The term now uses the expected information
+  `Σ w·∇p∇pᵀ/(p(1 − p))`, the matrix the custom-family contract asks of a non-canonical
+  Bernoulli likelihood, for its value and every coefficient, design-hyperparameter and
+  learned frailty-scale derivative. Fits whose Jeffreys term is armed get different
+  coefficients and EDF. A flexible fit with a learned frailty scale and an armed Jeffreys
+  term refuses on the frailty-scale axis, as its observed frailty-scale derivatives
+  already did.
+- Rust: `CustomFamily` gains `joint_jeffreys_information_psi_derivative`,
+  `joint_jeffreys_information_psi_derivative_all_axes`,
+  `joint_jeffreys_information_psi_second_derivative`,
+  `joint_jeffreys_information_psi_second_derivative_all_axes` and
+  `joint_jeffreys_information_psi_directional_second_all_axes`: the design-hyperparameter
+  motion of a Jeffreys information that is not the observed joint Hessian. The explicit-ψ
+  Jeffreys terms used to substitute the observed Hessian's motion for such a family; a
+  family that supplies none of its own now gets a typed `UnsupportedConfiguration`
+  refusal. The binomial location-scale and location-scale-wiggle families declare the
+  expected information and supply none yet, so their armed fits with a design
+  hyperparameter refuse.
 - **A failed fit raises the class of what failed, not `IntegrationError`** (#2937).
   Every fit-solver failure used to reach Python as `IntegrationError`, so a
   refused start, a stalled outer search and a numerical refusal could not be
@@ -30,7 +62,88 @@
   `CustomFamilyError::FitEndedWithoutCertifiedInnerMode` wraps the refusal a fit
   ended with, and `fit_ended_without_certified_inner_mode` is its only
   constructor; inside a trial the refusal stays `InnerSolveNotConverged`, which
-  the outer search steps away from.
+  the outer search steps away from. `CustomFamilyError::OuterSmoothingFailed`
+  gains `search_inner_refusal`, the search's most recent uncertified inner
+  solve, which the fit boundary names even when finite trials ran after it;
+  `last_refusal` stays the last evaluation's refusal, which Jeffreys arming reads.
+- **The raw REML/LAML score-table ratio is no longer called a Bayes factor** (#2946).
+  `compare_models`'s `score_table` key `bayes_factor_best_over_model` is now
+  `reml_criterion_ratio_best_over_model`. It is `exp(delta_reml)`, the exp of the raw
+  criterion gap: a restricted-evidence ratio only at plug-in λ with normalized evidence
+  over a fixed-effect space the candidates share, and never a prior-integrated Bayes
+  factor. **Migration:** read `reml_criterion_ratio_best_over_model`.
+- Rust: `ScoreRow.bayes_factor_best_over_model` is renamed to match, and
+  `evidence::log_bayes_factor(a, b)` is now `criterion_gap(a, b)` (`b − a`). The same gap
+  measures the conditional-AIC ranking delta, where "Bayes" was wrong as well.
+- **`Model.evidence` is now `Model.conditional_aic`** (#2946). The property has returned
+  the conditional AIC `−2·loglik + 2·edf` that `compare_models` ranks on since #2079. That
+  is a cost on the −2·log scale, not a marginal likelihood or evidence. No alias is kept.
+  **Migration:** read `Model.conditional_aic`. `Model.evidence_ratio_vs` keeps its name,
+  since it is the Akaike evidence ratio of that cost.
+- **The Tier-0 ρ-posterior diagnostic is an adequacy grade, not a certificate** (#2946).
+  Its PSIS tail shape `k̂` is fitted to `⌈√M⌉` excesses. At the default `M = 64` it has a
+  standard error of about `0.27` at the `0.7` cutoff, so the grade certifies nothing.
+  Rust: `RhoCertificate` is now `RhoProposalAdequacy` (`PlugInCertified` → `PlugInAdequate`),
+  `RhoPosteriorCertificate` is now `RhoPosteriorAdequacy` (field `certificate` → `adequacy`),
+  `RhoPosteriorOutcome::Certified` is now `Assessed`, `PLUG_IN_CERTIFIED_K_HAT` is now
+  `PLUG_IN_ADEQUATE_K_HAT`, and `rho_posterior_certificate` is now `rho_posterior_adequacy`.
+  New `gam_solve::psis::shape_standard_error` and
+  `inference::rho_posterior::k_hat_standard_error` give the grade's resolution.
+  **Saved models:** new payloads write only the new tokens. A payload written earlier still
+  reads, because the old tokens are accepted as read-only aliases.
+- **Marginal-slope fits anchor on the estimated law of the score by default**
+  (#2926). Both families test the score's conditional law on the
+  marginal-index span. Where that law does not move and the score passes the
+  standard-normal adequacy screen, the fit uses the closed form, kept at the
+  converged fit only when the rows' anchoring residuals under the estimated
+  law say it is expected to be at least as accurate as that law's own anchor
+  (`D̂ = Σ w (r² − 2·se²)/(π(1−π)) ≤ 0`), and records it as
+  `estimated-gaussian-adequate`; otherwise the fit is re-solved on the
+  estimated law (`estimated-global-by-residual`). Otherwise it anchors the index on
+  one estimated finite law, or on local laws by context where the law moves,
+  with the score on its own axis. The rank inverse-normal and automatic
+  conditional standardisation are gone from the default.
+- The standard-normal adequacy screen's bounds are the null quantiles of its
+  own statistics at the sample's effective size, at level 0.05 split over its
+  eight clauses (the KS bound is Kolmogorov's critical value, about
+  `1.70/√n`), instead of fixed skewness, kurtosis, KS, tail and `|z|`
+  constants. An exactly Gaussian score fails it at most 5% of the time at any
+  `n` (by Kolmogorov's law the fixed KS bound of 0.025 failed about 16% of
+  them at n = 2000), and a departure fails it once `n` resolves it (the fixed
+  bound passed KS up to 0.025 at any `n`).
+- `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain declare
+  the Gaussian closed form. A declaration is refused when the score's
+  conditional law moves on the span; when the pooled score fails the
+  adequacy screen it is fitted with a warning, and the model records the
+  ledger and the declaration's excess anchoring loss `D̂`.
+  `latent_measure="conditional-location-scale"`
+  keeps the location-scale law on the span as an explicit choice, and
+  `declared_latent_law` now serves the Bernoulli family too.
+- Saved models record which law the fit consumed in `latent_law_consumed`.
+  Models saved earlier replay their old calibration unchanged.
+- Fits that anchor on an estimated law are slower than the closed form until
+  the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
+  score took 199 s where the closed form took 4.6 s, and on a moving law
+  1 031 s where the previous default refused. A closed form the certificate
+  keeps costs what it did (5.1 s against 5.3 s on a Gaussian score).
+- Survival configurations whose kernel is closed-form only (flex blocks, an
+  influence absorber, time-wiggle, follow-up-varying slope) keep the closed
+  form and certify it by `D̂`. Where it prefers the estimated law, which
+  nothing there can re-solve on yet (#2948), the fit keeps the closed form,
+  recorded `gaussian-uncertified` with that certificate. A fit on
+  any of them whose law departs or moves records `gaussian-uncertified` with
+  a warning naming what is missing.
+- Several survival scores anchor on their joint law where some score departs
+  from the standard normal. Where a score's law moves, every score keeps the
+  closed form as `gaussian-uncertified`, naming that score (#2949). A closed
+  form the screen chose for several scores is certified by `D̂` on their joint
+  law, and where `D̂ > 0` re-solved on it, or recorded `gaussian-uncertified`
+  with `D̂` where nothing can re-solve on it.
+- **`AtomCore.evidence` is removed** (#2946). It copied the fit's `penalized_loss_score`
+  into every atom under a label that claimed a per-atom marginal likelihood. It was
+  neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
+  `penalized_loss_score`. The `ManifoldSAE` artifact schema is now `v10`, without the
+  per-atom `evidence`. A `v9` artifact still loads and drops that copy on read.
 
 ## gamfit 0.1.268 (2026-09-11)
 

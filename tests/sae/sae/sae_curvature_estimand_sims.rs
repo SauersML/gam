@@ -173,8 +173,6 @@ fn synth_cloud_fills_sphere(dim: usize, k_star: f64, n: usize, seed: u64) -> Arr
 const DIM: usize = 2;
 const SIGMA: f64 = 0.08;
 const LEVEL: f64 = 0.95;
-const FIT_TOL: f64 = 1.0e-12;
-const FIT_ITERS: usize = 256;
 const CHI2_1_95: f64 = 3.841_458_820_694_124; // χ²_{1, 0.95}
 
 /// (1) RECOVERY + INTERIOR + MONOTONICITY across the full κ⋆ grid.
@@ -217,7 +215,7 @@ fn response_curvature_recovers_and_is_monotone_across_kappa_grid() {
         // Recompute the bracket the estimator uses so the rail check matches the
         // estimator's own bounds (chart-validity + spherical conjugate cap).
         let (kmin, kmax) = bracket_via_criterion(values.view());
-        let fit = fit_response_curvature(values.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+        let fit = fit_response_curvature(values.view(), DIM, LEVEL)
             .expect("response curvature fit");
         k_hats.push(fit.kappa_hat);
 
@@ -309,7 +307,7 @@ fn response_curvature_profile_ci_covers_at_nominal_rate() {
             let seed = 0xC0_0E_44_00_0000_0000
                 ^ (((ti as u64) << 40) | ((r as u64).wrapping_mul(0x9E37_79B9) + 1));
             let values = synth_cloud(DIM, k_star, n, SIGMA, seed);
-            let fit = fit_response_curvature(values.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+            let fit = fit_response_curvature(values.view(), DIM, LEVEL)
                 .expect("response curvature fit");
             if fit.profile_ci.ci_lo <= k_star && k_star <= fit.profile_ci.ci_hi {
                 covered += 1;
@@ -362,7 +360,7 @@ fn response_curvature_flatness_test_holds_size_and_has_power() {
     for r in 0..replicates {
         let seed = 0x512E_0000_0000_0000 ^ ((r as u64).wrapping_mul(0x9E37_79B9) + 1);
         let values = synth_cloud(DIM, 0.0, n, SIGMA, seed);
-        let fit = fit_response_curvature(values.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+        let fit = fit_response_curvature(values.view(), DIM, LEVEL)
             .expect("response curvature fit (flat)");
         if fit.flatness.lr_stat > CHI2_1_95 {
             rejections += 1;
@@ -387,7 +385,7 @@ fn response_curvature_flatness_test_holds_size_and_has_power() {
                 ^ (((k_star.is_sign_negative() as u64) << 48)
                     | ((r as u64).wrapping_mul(0x9E37_79B9) + 1));
             let values = synth_cloud(DIM, k_star, n, SIGMA, seed);
-            let fit = fit_response_curvature(values.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+            let fit = fit_response_curvature(values.view(), DIM, LEVEL)
                 .expect("response curvature fit (curved)");
             if fit.flatness.lr_stat > CHI2_1_95 {
                 detections += 1;
@@ -420,12 +418,12 @@ fn response_curvature_kappa_hat_is_unit_covariant_under_rescaling() {
         let n = 3000usize;
         let seed = 0x5CA1_E000_0000_0000 ^ ((idx as u64) + 1);
         let values = synth_cloud(DIM, k_star, n, SIGMA, seed);
-        let fit = fit_response_curvature(values.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+        let fit = fit_response_curvature(values.view(), DIM, LEVEL)
             .expect("base response curvature fit");
 
         for &alpha in &[0.5_f64, 1.5, 2.0] {
             let scaled = values.mapv(|v| alpha * v);
-            let fit_scaled = fit_response_curvature(scaled.view(), DIM, LEVEL, FIT_TOL, FIT_ITERS)
+            let fit_scaled = fit_response_curvature(scaled.view(), DIM, LEVEL)
                 .expect("scaled response curvature fit");
             let expected = fit.kappa_hat / (alpha * alpha);
             let tol = 0.06 + 0.06 * expected.abs();
@@ -472,7 +470,7 @@ fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
     let seed = 0x1104_0000_DEAD_BEEF_u64; // distinct deterministic seed
     let values = synth_cloud_fills_sphere(dim, k_star, n, seed);
 
-    let fit = fit_response_curvature(values.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+    let fit = fit_response_curvature(values.view(), dim, LEVEL)
         .expect("response curvature fit on high-curvature-relative-to-spread cloud");
 
     println!(
@@ -525,7 +523,7 @@ fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
     // at the SAME κ⋆ must NOT rail — the flag is specific to the unresolvable
     // regime, not always-on.
     let interior = synth_cloud(dim, k_star, n, 0.04, seed ^ 0xABCD);
-    let fit_in = fit_response_curvature(interior.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+    let fit_in = fit_response_curvature(interior.view(), dim, LEVEL)
         .expect("interior fit");
     assert!(
         !fit_in.railed_at_resolution_limit,
@@ -647,7 +645,7 @@ fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
                 ^ ((sigma.to_bits()).rotate_left(17))
                 ^ ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) + 1);
             let values = synth_cloud(dim, k_star, n, sigma, seed);
-            let fit = fit_response_curvature(values.view(), dim, LEVEL, FIT_TOL, FIT_ITERS)
+            let fit = fit_response_curvature(values.view(), dim, LEVEL)
                 .expect("response curvature fit on hyperbolic cloud");
 
             sum_abs_kr2 += fit.kappa_r2.abs();

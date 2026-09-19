@@ -334,10 +334,26 @@ jobs:
             res_line=$(grep -aE '^test result:' "$log" | tail -1)
             sub_passed=$(printf '%s' "$res_line" | grep -oaE '[0-9]+ passed' | grep -oaE '[0-9]+' | head -1); sub_passed=${sub_passed:-0}
             sub_failed=$(printf '%s' "$res_line" | grep -oaE '[0-9]+ failed' | grep -oaE '[0-9]+' | head -1); sub_failed=${sub_failed:-0}
-            # ALL numeric quality figures emitted by the test, un-truncated. The
-            # full log keeps everything regardless; this column is the structured,
+            # ALL numeric quality figures THE TEST printed, un-truncated. The full
+            # log keeps everything regardless; this column is the structured,
             # greppable distillation of every metric the test printed.
-            metric=$(grep -hoaE '(R2|r2|rmse|mae|rel_l2|l2|auc|deviance|nll|loglik|crps|acc|accuracy|logloss|concordance|c_index|seam|edf|pearson|spearman|coverage|width|bias|frechet|distance|geodesic|rho|ess|rhat|kl|wasserstein|calibration|brier|ci_|se_)[^ ,;)]*[=: ]+-?[0-9][0-9.eE+-]*' "$log" 2>/dev/null | tr '\n' ' ')
+            #
+            # Two filters keep it to the test's own figures. Run 35301501610's
+            # PASS row gam_multinomial_smooth_by_factor_recovers_truth captured
+            # 176,202 chars of optimizer trace here. That broke the Aggregate
+            # step's csv reader, whose field limit is 131,072.
+            # - gam's logger writes `[INFO] ...`/`[WARN] ...` lines; the quality tests
+            #   print their own figures with println!, untagged. Each line is cut at
+            #   its first logger tag, which drops the per-iteration trace (`loglik=`
+            #   every cycle) and keeps a `test <name> ... ` prefix that precedes it.
+            # - A name must start at a token boundary (not after a letter or digit)
+            #   and end at one (not before a letter), so `ess` no longer matches
+            #   inside `hessian_qp_elapsed=` and `acc` no longer matches inside
+            #   `accepted_step_inf=`. `ci`/`se` cover the `ci_*`/`se_*` names. A
+            #   `_` still counts as a boundary, so `gam_rmse=` still yields `rmse=`.
+            # tests/misc/misc/quality_workflow_classifier_test.rs runs this line on
+            # a fixture log.
+            metric=$(sed -E 's/\[(ERROR|WARN|INFO|DEBUG|TRACE)\] .*$//' "$log" 2>/dev/null | grep -oaE '(^|[^A-Za-z0-9])(R2|r2|rmse|mae|rel_l2|l2|auc|deviance|nll|loglik|crps|acc|accuracy|logloss|concordance|c_index|seam|edf|pearson|spearman|coverage|width|bias|frechet|distance|geodesic|rho|ess|rhat|kl|wasserstein|calibration|brier|ci|se)([^A-Za-z][^ ,;)]*)?[=: ]+-?[0-9][0-9.eE+-]*' | sed -E 's/^[^A-Za-z0-9]//' | tr '\n' ' ')
             # A reference tool failing/missing (R/Python package, system lib,
             # namespace, broken generated script) — this is NOT a gam result.
             # REFERENCE_ENV_MISSING is the harness's own canonical marker for this
@@ -626,7 +642,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          set -uo pipefail
+          # This step reports and does not gate, so `-e` is OFF, as in the run
+          # step. Under GitHub's default `bash -e`, a nonzero aggregator exit ended
+          # the step before `rc=$?`, before the report was printed and before the
+          # exit line. Run 35301501610 failed that way with no output at all; its
+          # traceback survived only in the published quality-aggregate.txt.
+          set +e -u -o pipefail
           OUT=/tmp/quality-report
           if [ ! -d "$OUT/logs" ]; then
             echo "no per-test logs at $OUT/logs — the run step produced nothing to aggregate"
@@ -646,6 +667,9 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "aggregator exit=${rc} (reported, not gated)"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::bench/aggregate_quality_gate_1561.py exited ${rc}; its output is printed above and saved in quality-aggregate.txt"
+          fi
 
       - name: Upload full quality report (always — survives failures)
         if: always()

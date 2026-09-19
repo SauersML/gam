@@ -333,7 +333,6 @@ def _score_manifold(
         assignment="softmax",
         top_k=top_k,
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=max_iter,

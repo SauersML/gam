@@ -2482,11 +2482,10 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             ("duchon", "scale_dims") => {
                 Some("arms fit-time per-axis anisotropy; the cold build is at literal zero")
             }
-            // Measure-jet Ψ (hyperparameter) switches: the representer
-            // length-scale and the τ₀ multiscale threshold are read by the Ψ
-            // learner during the fit, not by the design built at the spec's
-            // own initial values.
-            ("measurejet", "tau" | "learn_length_scale") => {
+            // Measure-jet Ψ (hyperparameter) switch: the representer
+            // length-scale is read by the Ψ learner during the fit, not by the
+            // design built at the spec's own initial values.
+            ("measurejet", "learn_length_scale") => {
                 Some("a Psi-learning switch read during the fit, not at design build")
             }
             _ => None,
@@ -2541,7 +2540,6 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             (_, "nu") => &["1.5"],
             (_, "kappa") => &["0.5"],
             (_, "alpha") => &["0.5"],
-            (_, "tau") => &["0.5"],
             // `s` is the measure-jet's JET ORDER, admissible in (0, 2)
             // with 0.0 as the auto sentinel — not a count, and not the
             // same key as `scales` (the multiscale band count). 1.5 is

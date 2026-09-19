@@ -13,31 +13,53 @@ pub struct SphereManifold {
 }
 
 impl SphereManifold {
-    /// Tolerance on `‖p‖² − 1` for accepting a point as on the unit sphere.
-    const UNIT_TOL: f64 = 1.0e-6;
-
     pub const fn new(intrinsic_dim: usize) -> Self {
         Self { intrinsic_dim }
     }
 
-    /// Reject base points that are not on the unit sphere. This guards the maps
+    /// Reject points that are not on the unit sphere. This guards the maps
     /// that are only meaningful at a genuine manifold point — `log_map`,
     /// `metric_tensor`, `parallel_transport`, `tangent_basis`, `project_tangent`
     /// — where a non-unit `p` makes `v − p(pᵀv)` not even tangent. It is
-    /// deliberately *not* applied to `exp_map` / `exp_map_vjp`, which are the
-    /// honest-ambient forward/adjoint pair used by reverse-mode autodiff: they
-    /// consume `point` verbatim so finite-difference probes can step off the
-    /// sphere (see `exp_map`). The tolerance is loose enough to absorb the float
-    /// drift of on-manifold iterates (retraction renormalizes to ~1e-15) yet
-    /// still rejects genuinely off-manifold inputs.
+    /// deliberately *not* applied to `exp_map` / `exp_map_vjp`, the forward and
+    /// adjoint pair used by reverse-mode autodiff: they accept any nonzero
+    /// ambient `point`, so finite-difference probes can step off the sphere
+    /// (see `exp_map`).
+    ///
+    /// The band is the widest `|‖p‖² − 1|` an f64 normalization leaves
+    /// ([`unit_normalization_band`](gam_math::roundoff::unit_normalization_band)).
+    /// Iterates meet it by construction, because `exp_map` normalizes its
+    /// output, so a larger defect names an input that was not normalized in
+    /// f64. It is refused with the measured defect, never normalized silently.
     fn require_unit(&self, point: ArrayView1<'_, f64>) -> GeometryResult<()> {
         let n2 = dot(point, point);
-        if !n2.is_finite() || (n2 - 1.0).abs() > Self::UNIT_TOL {
-            return Err(GeometryError::InvalidPoint(
-                "sphere operation requires a unit-norm base point",
-            ));
+        let squared_norm_defect = (n2 - 1.0).abs();
+        let band = gam_math::roundoff::unit_normalization_band(point.len());
+        if !(squared_norm_defect <= band) {
+            return Err(GeometryError::PointOffUnitSphere {
+                context: "sphere operation",
+                squared_norm_defect,
+                band,
+            });
         }
         Ok(())
+    }
+
+    /// The geodesic `cos θ·p + (sin θ/θ)·ξ` in ambient coordinates, with
+    /// `ξ = v − (p·v)p` and `θ = ‖ξ‖`, before `exp_map` normalizes it.
+    fn ambient_geodesic(point: ArrayView1<'_, f64>, tangent_vec: ArrayView1<'_, f64>) -> Array1<f64> {
+        let c = dot(point, tangent_vec);
+        let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
+        let theta = norm(xi.view());
+        if Self::geodesic_is_small_angle(theta) {
+            // Numerically-stable evaluation of the geodesic below as θ→0: once
+            // θ² ≤ ε, cos(θ) and sin(θ)/θ both round to within u of 1 (see
+            // `geodesic_is_small_angle`), so the map degenerates to `p + ξ`. This keeps
+            // the geodesic a SINGLE map, bit-identical and C¹ across the branch
+            // boundary, with a matching adjoint in `exp_map_vjp`.
+            return &point + &xi;
+        }
+        point.to_owned() * theta.cos() + xi * (theta.sin() / theta)
     }
 
     /// Whether the geodesic `cos θ·p + (sin θ/θ)·ξ` equals its small-angle form
@@ -113,34 +135,27 @@ impl RiemannianManifold for SphereManifold {
         let m = self.ambient_dim();
         check_len("Sphere point", point.len(), m)?;
         check_len("Sphere tangent", tangent_vec.len(), m)?;
-        // Honest-ambient exponential: `point` is used verbatim and is NOT
-        // required to satisfy ‖p‖ = 1. This is the forward whose reverse mode
-        // [`exp_map_vjp`](Self::exp_map_vjp) differentiates, and the
+        // `point` need not satisfy ‖p‖ = 1: this is the forward whose reverse
+        // mode [`exp_map_vjp`](Self::exp_map_vjp) differentiates, and the
         // finite-difference pins (`tests/sphere_exp_map_vjp_matches_finite_difference.rs`)
-        // step `point` off the unit sphere on purpose to exercise the general
-        // `|p|² ≠ 1` branch — so this map must stay smooth in the raw ambient
-        // coordinates rather than reject them. With `c = p·v`, the tangent
-        // component is `xi = v − c·p` (the orthogonal projection only when
-        // ‖p‖ = 1); `require_unit` is reserved for the maps that genuinely need
-        // a manifold point (`log_map`, `metric_tensor`, `parallel_transport`).
-        let c = dot(point, tangent_vec);
-        let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
-        let theta = norm(xi.view());
-        if Self::geodesic_is_small_angle(theta) {
-            // Numerically-stable evaluation of the geodesic below as θ→0: once
-            // θ² ≤ ε, cos(θ) and sin(θ)/θ both round to within u of 1 (see
-            // `geodesic_is_small_angle`), so the map degenerates to `p + ξ`. This keeps
-            // exp_map a SINGLE geodesic map — bit-identical and C¹ across the
-            // branch boundary, with a matching adjoint in `exp_map_vjp` — rather
-            // than switching to a normalized retraction `normalize(p+ξ)`, a
-            // different map whose derivative disagrees with the geodesic at the
-            // boundary. For a unit base point ξ⟂p, so |p+ξ|=√(1+θ²) rounds to
-            // exactly 1.0 in f64; and the raw (unnormalized) form is what the
-            // honest-ambient contract needs, matching the general branch, which
-            // likewise does not renormalize.
-            return Ok(&point + &xi);
+        // step `point` off the unit sphere on purpose, so the map must stay
+        // smooth in the raw ambient coordinates rather than reject them. With
+        // `c = p·v` the tangent component is `ξ = v − c·p` (the orthogonal
+        // projection only when ‖p‖ = 1).
+        //
+        // The ambient geodesic is then normalized. At a unit `p` it already has
+        // norm 1 in exact arithmetic, so normalizing changes nothing but the
+        // rounding, and it keeps every output inside the f64 normalization band
+        // that `require_unit` enforces: iterates of any length cannot drift off
+        // the sphere one rounding per step.
+        let geodesic = Self::ambient_geodesic(point, tangent_vec);
+        let length = norm(geodesic.view());
+        if !(length > 0.0 && length.is_finite()) {
+            return Err(GeometryError::Singular(
+                "sphere exponential of a point whose ambient geodesic has no direction",
+            ));
         }
-        Ok(point.to_owned() * theta.cos() + xi * (theta.sin() / theta))
+        Ok(geodesic / length)
     }
 
     fn log_map(
@@ -347,21 +362,36 @@ impl RiemannianManifold for SphereManifold {
         check_len("Sphere exp_map_vjp point", point.len(), m)?;
         check_len("Sphere exp_map_vjp tangent", tangent_vec.len(), m)?;
         check_len("Sphere exp_map_vjp grad", grad_output.len(), m)?;
-        // No `require_unit` here: this is the exact adjoint of the honest-ambient
-        // [`exp_map`](Self::exp_map), which uses `point` verbatim. The general
-        // branch below carries the `c(1 − |p|²)` terms, so it is correct for any
-        // ambient `p`; gating on ‖p‖ = 1 would make that branch unreachable and
-        // break the off-sphere finite-difference contract the VJP exists for.
+        // No `require_unit` here: this is the exact adjoint of
+        // [`exp_map`](Self::exp_map), which accepts any nonzero ambient `point`.
+        // The general branch below carries the `c(1 − |p|²)` terms, so it is
+        // correct for any ambient `p`; gating on ‖p‖ = 1 would make that branch
+        // unreachable and break the off-sphere finite-difference contract the VJP
+        // exists for.
+        //
+        // `exp_map` returns `y = ỹ/‖ỹ‖` with `ỹ` the ambient geodesic. The
+        // normalization pulls a cotangent back to `(g − y(y·g))/‖ỹ‖` on `ỹ`, and
+        // the closed form below pulls that back through the geodesic.
+        let geodesic = Self::ambient_geodesic(point, tangent_vec);
+        let length = norm(geodesic.view());
+        if !(length > 0.0 && length.is_finite()) {
+            return Err(GeometryError::Singular(
+                "sphere exponential of a point whose ambient geodesic has no direction",
+            ));
+        }
+        let unit = &geodesic / length;
+        let radial = dot(unit.view(), grad_output);
+        let geodesic_cotangent = (&grad_output.to_owned() - &(&unit * radial)) / length;
 
-        // Forward map: with `xi = (I - p p^T) v`, `theta = |xi|`,
-        //   y = cos(theta) p + (sin(theta)/theta) xi.
+        // Forward geodesic: with `xi = (I - p p^T) v`, `theta = |xi|`,
+        //   ỹ = cos(theta) p + (sin(theta)/theta) xi.
         // We differentiate this closed form and return the transpose-applied
         // (vector–Jacobian) products w.r.t. the base point `p` and the raw
         // (unprojected) tangent input `v`.
         let c = dot(point, tangent_vec); // p · v
         let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
         let theta = norm(xi.view());
-        let g = grad_output;
+        let g = geodesic_cotangent.view();
         let p = point;
         let v = tangent_vec;
 
@@ -438,35 +468,41 @@ pub(crate) fn validate_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+/// The rows of `values` as points on the unit sphere. Each row must already be
+/// unit-norm within the band an f64 normalization leaves
+/// ([`unit_normalization_band`](gam_math::roundoff::unit_normalization_band)).
+/// That is the entry rule `SphereManifold` applies to its points, so `"sphere"`
+/// and `stiefel(k=1)` accept the same data. A row off the sphere is refused
+/// with its measured defect, never normalized silently.
+pub(crate) fn require_unit_sphere_rows(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     validate_sphere_matrix(values)?;
-    let (n, d) = values.dim();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let row_norm = norm(values.row(row));
-        if row_norm <= 0.0 {
-            return Err("spherical rows must have non-zero norm".to_string());
-        }
-        for col in 0..d {
-            out[[row, col]] = values[[row, col]] / row_norm;
+    let band = gam_math::roundoff::unit_normalization_band(values.ncols());
+    for (row, point) in values.outer_iter().enumerate() {
+        let squared_norm_defect = (dot(point, point) - 1.0).abs();
+        if !(squared_norm_defect <= band) {
+            return Err(format!(
+                "spherical row {row} is not unit-norm in f64: |‖y‖² − 1| = \
+                 {squared_norm_defect:.3e} exceeds {band:.3e}, the widest an f64 normalization \
+                 leaves it; normalize each row in f64 before passing it, e.g. y / ‖y‖"
+            ));
         }
     }
-    Ok(out)
+    Ok(values.to_owned())
 }
 
 /// Batched Riemannian log map of each row of `values` at a single `base`, in
-/// ambient tangent coordinates. Inputs are normalized onto the unit sphere
-/// first (unlike the strict [`SphereManifold::log_map`] trait method, which
-/// requires unit inputs); the geodesic angle uses the numerically stable
+/// ambient tangent coordinates. Rows and base must be unit-norm under the same
+/// entry rule as the [`SphereManifold::log_map`] trait method
+/// (`require_unit_sphere_rows`); the geodesic angle uses the numerically stable
 /// `atan2(|u|, p·q)` form. Errors at antipodal points. This is the
 /// response-geometry companion to the trait method.
 pub fn response_sphere_log_map(
     values: ArrayView2<'_, f64>,
     base: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
-    let y = normalize_sphere_matrix(values)?;
+    let y = require_unit_sphere_rows(values)?;
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let b_mat = normalize_sphere_matrix(base2.view())?;
+    let b_mat = require_unit_sphere_rows(base2.view())?;
     let (n, d) = y.dim();
     if d != b_mat.ncols() {
         return Err("spherical values and base point have different dimensions".to_string());
@@ -525,7 +561,8 @@ pub fn response_sphere_log_map(
 }
 
 /// Batched Riemannian exp map of each tangent row at a single `base`, returning
-/// points on the unit sphere. The base is normalized first; the orthogonal
+/// points on the unit sphere. The base must be unit-norm
+/// (`require_unit_sphere_rows`); the orthogonal
 /// component of the tangent drives the geodesic step `cos(r)·p + (sin r / r)·z`.
 /// This is the response-geometry companion to [`SphereManifold::exp_map`].
 pub fn response_sphere_exp_map(
@@ -533,7 +570,7 @@ pub fn response_sphere_exp_map(
     base: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let b_mat = normalize_sphere_matrix(base2.view())?;
+    let b_mat = require_unit_sphere_rows(base2.view())?;
     let (n, d) = tangent.dim();
     if d != b_mat.ncols() {
         return Err("spherical tangent and base point have different dimensions".to_string());
@@ -904,7 +941,7 @@ pub fn sphere_frechet_mean(
     points: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<Vec<f64>, String> {
-    let y = normalize_sphere_matrix(points)?;
+    let y = require_unit_sphere_rows(points)?;
     let w = normalize_weights(y.nrows(), weights)?;
     let mut candidates = sphere_mean_candidates(y.view(), w.view())?;
     if candidates.is_empty() {
@@ -1014,7 +1051,7 @@ mod tests {
         // pi^2/2 attained by e.g. e2 and by e3, and is strictly below the value at
         // an endpoint e1 (which is NOT a minimizer for this data).
         let w = normalize_weights(2, None).unwrap();
-        let y = normalize_sphere_matrix(values.view()).unwrap();
+        let y = require_unit_sphere_rows(values.view()).unwrap();
         let obj_mean = obj_at(y.view(), w.view(), &mean);
         let obj_e3 = obj_at(y.view(), w.view(), &[0.0, 0.0, 1.0]);
         let obj_e1 = obj_at(y.view(), w.view(), &[1.0, 0.0, 0.0]);
@@ -1049,7 +1086,11 @@ mod tests {
     fn non_degenerate_mean_unchanged() {
         // A clearly identifiable cluster must still converge to the ordinary
         // Karcher mean, not the equatorial fallback.
-        let values = array![[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.9, 0.0, 0.1]];
+        let mut values = array![[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.9, 0.0, 0.1]];
+        for mut row in values.outer_iter_mut() {
+            let length = norm(row.view());
+            row.mapv_inplace(|value| value / length);
+        }
         let mean = sphere_frechet_mean(values.view(), None).unwrap();
         // Mean should be close to e1 (dominant direction), not on the equator.
         assert!(mean[0] > 0.9, "expected near-e1 mean, got {mean:?}");
@@ -1116,9 +1157,66 @@ mod tests {
         let u = array![0.0, 1.0, 0.0];
         let v = array![0.0, 0.0, 1.0];
         match m.sectional_curvature(point.view(), (u.view(), v.view())) {
-            Err(GeometryError::InvalidPoint(_)) => {}
-            other => panic!("expected InvalidPoint on non-unit base, got {other:?}"),
+            Err(GeometryError::PointOffUnitSphere {
+                squared_norm_defect,
+                band,
+                ..
+            }) => {
+                // ‖(2, 0, 0)‖² − 1 = 3 exactly.
+                assert_eq!(squared_norm_defect, 3.0);
+                assert_eq!(band, gam_math::roundoff::unit_normalization_band(3));
+            }
+            other => panic!("expected PointOffUnitSphere on non-unit base, got {other:?}"),
         }
+    }
+
+    /// The entry rule is the f64 normalization band. An f64 normalization of an
+    /// arbitrary vector passes. A point 1e-5 off the sphere, the size an f32 or
+    /// 6-digit normalization leaves, is refused with its measured defect, the
+    /// band and the fix. The exponential keeps an iterate inside the band
+    /// through 10000 steps.
+    #[test]
+    fn unit_entry_rule_accepts_f64_normalizations_and_refuses_the_rest() {
+        let m = SphereManifold::new(2);
+        let raw = array![0.3, -1.7, 2.9];
+        let normalized = &raw / norm(raw.view());
+        let tangent = array![0.0, 1.0, 0.0];
+        assert!(m.log_map(normalized.view(), normalized.view()).is_ok());
+
+        let band = gam_math::roundoff::unit_normalization_band(3);
+        // A 1e-5 relative rescale, the size of a 6-digit or f32 normalization.
+        let coarse = &normalized * (1.0 + 1.0e-5);
+        match m.log_map(normalized.view(), coarse.view()) {
+            Err(GeometryError::PointOffUnitSphere {
+                squared_norm_defect,
+                band: reported,
+                ..
+            }) => {
+                assert!(squared_norm_defect > band);
+                assert_eq!(reported, band);
+                let message = GeometryError::PointOffUnitSphere {
+                    context: "sphere operation",
+                    squared_norm_defect,
+                    band,
+                }
+                .to_string();
+                assert!(message.contains("p / ‖p‖"), "{message}");
+            }
+            other => panic!("expected the coarse point to be refused, got {other:?}"),
+        }
+
+        let mut point = array![1.0, 0.0, 0.0];
+        let step = array![0.0, 0.37, -0.21];
+        for _ in 0..10_000 {
+            point = m.exp_map(point.view(), step.view()).expect("exp step");
+        }
+        let squared_norm_defect = (dot(point.view(), point.view()) - 1.0).abs();
+        assert!(
+            squared_norm_defect <= band,
+            "after 10000 exponential steps |‖p‖² − 1| = {squared_norm_defect:.3e} > {band:.3e}"
+        );
+        assert!(m.log_map(point.view(), point.view()).is_ok());
+        assert!(m.project_tangent(point.view(), tangent.view()).is_ok());
     }
 }
 

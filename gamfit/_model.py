@@ -1254,29 +1254,30 @@ class Model:
         return shares
 
     @property
-    def evidence(self) -> float:
+    def conditional_aic(self) -> float:
         """Model-selection cost for this fit, on the same rank scale used by
         ``gamfit.compare_models`` to pick its winner: the Occam-penalised
         conditional AIC (``-2*loglik + 2*edf``). Both the ordinary
         log-likelihood and effective degrees of freedom are required; raw REML /
         LAML is a different estimand and is never used as a fallback (#2079).
         It is a *cost*, so **lower is better** -- the model with the smaller
-        ``evidence`` is the better-supported one, agreeing with the winner
-        reported by ``gamfit.compare_models``. Use :meth:`evidence_ratio_vs` or
-        ``gamfit.compare_models`` for a direct comparison. (The raw,
-        un-penalised REML/LAML evidence headline remains available as
-        ``Summary.reml_score`` / the ``score_table`` column.)
+        ``conditional_aic`` is the better-supported one, agreeing with the
+        winner reported by ``gamfit.compare_models``. It is not a marginal
+        likelihood or evidence (#2946). Use :meth:`evidence_ratio_vs` or
+        ``gamfit.compare_models`` for a direct comparison. (The raw REML/LAML
+        criterion remains available as ``Summary.reml_score`` and the
+        ``score_table`` column of ``gamfit.compare_models``.)
         """
-        return float(rust_module().model_evidence(self._model_bytes))
+        return float(rust_module().model_conditional_aic(self._model_bytes))
 
     def evidence_ratio_vs(self, other: "Model") -> float:
         """Akaike evidence ratio of this fit over ``other``.
 
-        ``exp(-(self.evidence - other.evidence) / 2)``: the relative likelihood
-        of the two fits under the conditional-AIC criterion that
+        ``exp(-(self.conditional_aic - other.conditional_aic) / 2)``: the
+        relative likelihood of the two fits under the conditional-AIC criterion that
         ``gamfit.compare_models`` ranks on (Burnham & Anderson). Returns ``> 1``
         when this fit is better supported than ``other`` (i.e. has the lower
-        :attr:`evidence` cost) and ``< 1`` otherwise, agreeing with the winner
+        :attr:`conditional_aic` cost) and ``< 1`` otherwise, agreeing with the winner
         reported by ``gamfit.compare_models``.
 
         This is **not** a Bayes factor. A Bayes factor is a ratio of

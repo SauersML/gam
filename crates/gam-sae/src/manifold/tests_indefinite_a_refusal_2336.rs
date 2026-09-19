@@ -551,6 +551,12 @@ fn zz_measure_saddle_escape_linesearch_reconverge_2336() {
 /// state unless `streaming_gates_frozen` is already set. This test measures (A) the
 /// gate-induced objective shift at the stepped point, and (B) whether holding the
 /// gates frozen-consistent across probe + re-convergence removes the climb.
+///
+/// Both experiments need a descent along the saddle's negative direction to have a
+/// stepped point at all. When no trial along ±v lowers the objective, each reports
+/// "no descent along the negative direction" instead of stepping, because
+/// `apply_newton_step` refuses a zero step by contract (#2822 census: the fixture
+/// now reaches that outcome).
 #[test]
 fn zz_measure_saddle_gate_desync_2336() {
     use super::{FaerEigh, Side};
@@ -664,7 +670,7 @@ fn zz_measure_saddle_gate_desync_2336() {
     };
 
     // ---- Experiment A: gate-induced objective shift at the stepped point. ----
-    {
+    'experiment_a: {
         let (mut term, target, rho) = ard_saddle_state();
         let (cache, _rf, _loss, _cfp, _opts) = reach_saddle(&mut term, &target, &rho);
         // Freeze the gates AT the saddle (what the line-search probe will price).
@@ -677,6 +683,24 @@ fn zz_measure_saddle_gate_desync_2336() {
             .expect("obj saddle frozen");
         let (obj_min, s_min, negate) =
             line_search(&mut term, &target, &rho, &dir_t, &dir_beta, obj_saddle);
+        if obj_min >= obj_saddle {
+            // `line_search` replaces its seed `(obj_saddle, 0, false)` only on a strict
+            // decrease, so no trial along ±v lowered the objective. There is no stepped point
+            // to price, and `apply_newton_step` refuses a zero step by contract, so the probe
+            // reports that outcome instead of stepping.
+            eprintln!(
+                "2336-GATESHIFT: no descent along the negative direction: min_eig={min_eig:.6e} \
+                 obj_saddle={obj_saddle:.9e} obj_min(ls)={obj_min:.9e} s_min={s_min:.4e}; the gate \
+                 shift is a property of a step that was not taken"
+            );
+            assert!(
+                min_eig.is_finite() && obj_saddle.is_finite() && s_min == 0.0 && !negate,
+                "2336-GATESHIFT: a search that found no descent must return its own finite seed \
+                 (min_eig={min_eig}, obj_saddle={obj_saddle}, obj_min={obj_min}, s_min={s_min}, \
+                 negate={negate})"
+            );
+            break 'experiment_a;
+        }
         let dt = if negate { -&dir_t } else { dir_t.clone() };
         let db = if negate { -&dir_beta } else { dir_beta.clone() };
         term.apply_newton_step(dt.view(), db.view(), s_min)
@@ -724,7 +748,7 @@ fn zz_measure_saddle_gate_desync_2336() {
     }
 
     // ---- Experiment B: re-converge with gates held frozen-consistent. ----
-    {
+    'experiment_b: {
         let (mut term, target, rho) = ard_saddle_state();
         let (cache, mut rho_fixed, mut loss, mut cfp, options) =
             reach_saddle(&mut term, &target, &rho);
@@ -737,8 +761,24 @@ fn zz_measure_saddle_gate_desync_2336() {
         let obj_saddle = term
             .penalized_objective_total(target.view(), &rho, None, 1.0)
             .expect("obj saddle frozen B");
-        let (_om, s_min, negate) =
+        let (obj_min, s_min, negate) =
             line_search(&mut term, &target, &rho, &dir_t, &dir_beta, obj_saddle);
+        if obj_min >= obj_saddle {
+            // Same outcome as Experiment A: no trial along ±v lowered the objective, so
+            // there is no stepped point to re-converge from.
+            eprintln!(
+                "2336-FROZENRECONV: no descent along the negative direction: min_eig0={min_eig:.6e} \
+                 obj_saddle={obj_saddle:.9e} obj_min(ls)={obj_min:.9e} s_min={s_min:.4e}; the \
+                 frozen-gate re-convergence is a property of a step that was not taken"
+            );
+            assert!(
+                min_eig.is_finite() && obj_saddle.is_finite() && s_min == 0.0 && !negate,
+                "2336-FROZENRECONV: a search that found no descent must return its own finite seed \
+                 (min_eig={min_eig}, obj_saddle={obj_saddle}, obj_min={obj_min}, s_min={s_min}, \
+                 negate={negate})"
+            );
+            break 'experiment_b;
+        }
         let dt = if negate { -&dir_t } else { dir_t.clone() };
         let db = if negate { -&dir_beta } else { dir_beta.clone() };
         term.apply_newton_step(dt.view(), db.view(), s_min)

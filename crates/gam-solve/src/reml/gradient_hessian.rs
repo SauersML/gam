@@ -3828,6 +3828,9 @@ impl<'a> RemlState<'a> {
             prev_warm_start_beta: RwLock::new(None),
             prev_warm_start_rho: RwLock::new(None),
             block_correction_admission: AtomicUsize::new(0),
+            block_correction_decision: std::sync::Mutex::new(
+                BlockCorrectionDecision::AtFirstEngagedEvaluation,
+            ),
             block_correction_axis_orders: std::sync::Mutex::new(None),
             ift_quality_runtime: std::sync::Mutex::new(Default::default()),
             ift_mode_response_slot: std::sync::Mutex::new(None),
@@ -6222,6 +6225,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
+            criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: std::sync::OnceLock::new(),
@@ -6367,6 +6371,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
+            criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             // Seeded, not left empty: this bundle's sparse system and its
             // `logdet_s_pos` / `det1_values` were already built from THESE
             // components, and a later consumer re-deriving them would be free

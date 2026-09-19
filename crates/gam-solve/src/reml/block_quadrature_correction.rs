@@ -85,6 +85,12 @@ impl<'a> RemlState<'a> {
     /// admission would contribute a term they do not carry — the same
     /// objective↔gradient desync this site already declines the splice over for
     /// ψ coordinates and for the Beta family.
+    ///
+    /// Where the admission is decided is [`RemlState::block_correction_decision`]
+    /// (#1082). A search decides it once, at its certified Laplace optimum,
+    /// because a latch on the first engaged evaluation made the fitted criterion
+    /// a function of where the search started.
+    ///
     /// Per-bundle-cached wrapper around [`Self::block_local_quadrature_correction_compute`].
     ///
     /// The block-local correction is a deterministic function of this bundle's
@@ -103,6 +109,11 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         n_ext: usize,
     ) -> Result<TkCorrectionTerms, EstimationError> {
+        // A deferred search prices the Laplace criterion, which is not this
+        // bundle's correction once the admission is decided, so it is not cached.
+        if self.block_correction_admission_deferred() {
+            return self.block_local_quadrature_correction_compute(rho, bundle, n_ext);
+        }
         if let Some((cached_ext, terms, audit)) = bundle.block_local_correction.get()
             && *cached_ext == n_ext
         {
@@ -130,6 +141,53 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    fn block_correction_decision_guard(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BlockCorrectionDecision> {
+        self.block_correction_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Price the Laplace criterion until the search certifies its optimum, and
+    /// decide the correction's admission there (#1082,
+    /// [`BlockCorrectionDecision::DeferredToOptimum`]).
+    pub(crate) fn defer_block_correction_admission(&self) {
+        *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
+    }
+
+    pub(crate) fn block_correction_admission_deferred(&self) -> bool {
+        *self.block_correction_decision_guard() == BlockCorrectionDecision::DeferredToOptimum
+    }
+
+    /// Decide the deferred admission once, at the search's certified Laplace
+    /// optimum `rho` (#1082). One criterion evaluation there runs the skewness
+    /// verdict and, when it engages, the order search that latches the block,
+    /// exactly as a first admission does (#2748).
+    ///
+    /// Returns whether the correction was admitted. If it was, `rho` was
+    /// certified under a criterion that is no longer the model's, and the caller
+    /// continues the corrected search from it. A correction refused at `rho` is
+    /// the fit's error: the verdict requires the correction at the point the fit
+    /// would publish, and it cannot be evaluated there.
+    pub(crate) fn decide_block_correction_admission(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<bool, EstimationError> {
+        *self.block_correction_decision_guard() = BlockCorrectionDecision::DecidingAtOptimum;
+        // Every cached evaluation priced the Laplace criterion, and the decision
+        // is taken at the terminal inner mode, not a capped screening one.
+        self.reset_outer_seed_state();
+        self.compute_cost(rho)?;
+        let mut decision = self.block_correction_decision_guard();
+        // An unconditional decline (the family or the hyper-layout) returns
+        // before the verdict, so the decision is still open here.
+        if *decision == BlockCorrectionDecision::DecidingAtOptimum {
+            *decision = BlockCorrectionDecision::DeclinedAtOptimum;
+        }
+        Ok(*decision == BlockCorrectionDecision::AdmittedAtOptimum)
+    }
+
     fn block_local_quadrature_correction_compute(
         &self,
         rho: &Array1<f64>,
@@ -141,6 +199,7 @@ impl<'a> RemlState<'a> {
         // calls them through the neutral `gam_problem` sampler contract instead
         // of a back-edge into the inference SCC. The pure threshold math
         // (`laplace_trustworthiness_from_skewness`) moved down outright.
+        use gam_problem::estimation_error::BlockQuadratureCorrectionStage;
         use gam_problem::laplace_sampler_contract::laplace_trustworthiness_from_skewness;
 
         let n_rho = self.canonical_penalties.len();
@@ -149,6 +208,15 @@ impl<'a> RemlState<'a> {
             gradient: Some(Array1::zeros(n_rho + n_ext)),
             hessian: None,
         };
+
+        // A search deciding at its optimum prices the Laplace criterion until
+        // then, and a correction declined there stays declined for the fit.
+        if matches!(
+            *self.block_correction_decision_guard(),
+            BlockCorrectionDecision::DeferredToOptimum | BlockCorrectionDecision::DeclinedAtOptimum
+        ) {
+            return Ok(zero());
+        }
 
         // Laplace is exact for the Gaussian-identity model: nothing to correct.
         if reml_is_gaussian_identity(&self.config.likelihood) {
@@ -265,6 +333,15 @@ impl<'a> RemlState<'a> {
             .load(std::sync::atomic::Ordering::Relaxed)
             .checked_sub(1);
         if latched_block_dim.is_none() && !verdict.fallback_required() {
+            if *self.block_correction_decision_guard() == BlockCorrectionDecision::DecidingAtOptimum
+            {
+                log::info!(
+                    "[#784] block-local correction DECLINED for this fit at its certified Laplace \
+                     optimum: max|γ|={:.4e} against τ={:.4e} (#1082)",
+                    verdict.max_abs_skewness,
+                    verdict.threshold,
+                );
+            }
             return Ok(zero());
         }
 
@@ -448,13 +525,9 @@ impl<'a> RemlState<'a> {
             ) {
                 Ok(quadrature) => quadrature,
                 Err(refusal) => {
-                    log::info!(
-                        "[#784] block-local correction declined: {refusal} (m={m}, \
-                         max|γ|={:.3}, τ={:.3}, 1/n_eff={laplace_floor:.3e})",
-                        verdict.max_abs_skewness,
-                        verdict.threshold,
-                    );
-                    return Ok(zero());
+                    return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::OrderSearchRefused(refusal),
+                    });
                 }
             },
         };
@@ -488,16 +561,21 @@ impl<'a> RemlState<'a> {
             .iter()
             .all(|&error| error == 0.0 || error < resolution_target);
         if !resolved {
+            if latched_block_dim.is_none() {
+                return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                    stage: BlockQuadratureCorrectionStage::UnresolvedAtAdmission {
+                        quadrature_error: quadrature.quadrature_error,
+                        resolution_target,
+                        axis_orders: quadrature.axis_orders.clone(),
+                        node_count: quadrature.node_count,
+                    },
+                });
+            }
             log::info!(
-                "[#784] block-local correction {}: paired Gauss-Hermite error \
-                 {:.4e} does not resolve min(|Δ_b|, 1/n_eff²)={resolution_target:.4e} \
-                 (|Δ_b|={abs_value:.4e}, m={m}, max|γ|={:.3}, τ={:.3}, axis orders={:?}, \
-                 nodes={}, 1/n_eff={:.3e})",
-                if latched_block_dim.is_some() {
-                    "spliced UNRESOLVED (admission already latched, #2748)"
-                } else {
-                    "declined"
-                },
+                "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
+                 #2748): paired Gauss-Hermite error {:.4e} does not resolve \
+                 min(|Δ_b|, 1/n_eff²)={resolution_target:.4e} (|Δ_b|={abs_value:.4e}, m={m}, \
+                 max|γ|={:.3}, τ={:.3}, axis orders={:?}, nodes={}, 1/n_eff={:.3e})",
                 quadrature.quadrature_error,
                 verdict.max_abs_skewness,
                 verdict.threshold,
@@ -505,9 +583,6 @@ impl<'a> RemlState<'a> {
                 quadrature.node_count,
                 laplace_floor,
             );
-            if latched_block_dim.is_none() {
-                return Ok(zero());
-            }
         }
 
         // Latch the admission on the first evaluation that reaches here with
@@ -521,6 +596,11 @@ impl<'a> RemlState<'a> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(quadrature.axis_orders.clone());
+            let mut decision = self.block_correction_decision_guard();
+            if *decision == BlockCorrectionDecision::DecidingAtOptimum {
+                *decision = BlockCorrectionDecision::AdmittedAtOptimum;
+            }
+            drop(decision);
             log::info!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m} and \
                  axis orders {:?} are now the model's, and the tau={:.3} activation no longer \
@@ -576,9 +656,13 @@ impl<'a> RemlState<'a> {
         // non-differentiability points of the eigenframe; the splice is
         // declined there rather than clamped.
         let Some(moments) = quadrature.moments.as_ref() else {
-            // m > 0 is guaranteed above, so absent moments means every node
-            // carried zero weight — nothing trustworthy to splice.
-            return Ok(zero());
+            // The corrector's contract reserves absent moments for the empty block, and
+            // `block_cols` is non-empty here.
+            return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                stage: BlockQuadratureCorrectionStage::CorrectorReturnedNoMoments {
+                    block_dim: m,
+                },
+            });
         };
         let x = x_dense.as_ref();
         let n_rows = x.nrows();
@@ -635,11 +719,16 @@ impl<'a> RemlState<'a> {
         // `evecs`, so `Q_b`/`Q_c` are built from the same spectrum as the
         // draws — one source of truth for "the direction λ_r".
         if evals.iter().any(|&s| !(s.is_finite() && s > 0.0)) {
-            log::info!(
-                "[#784] block-local fallback declined: H_pen has a non-positive eigenvalue; \
-                 the IFT mode response is undefined"
-            );
-            return Ok(zero());
+            // A NaN eigenvalue is reported as the minimum rather than skipped.
+            let min_eigenvalue = evals
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, |min, s| if s.is_nan() || s < min { s } else { min });
+            return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                stage: BlockQuadratureCorrectionStage::NonPositivePenalizedCurvature {
+                    min_eigenvalue,
+                },
+            });
         }
         // When is `λ_r − σ_q` a MEASUREMENT rather than a rounding residue?
         //
@@ -677,8 +766,11 @@ impl<'a> RemlState<'a> {
             ) {
                 Ok(bounds) => bounds,
                 Err(reason) => {
-                    log::info!("[#784] block-local fallback declined: {reason}");
-                    return Ok(zero());
+                    return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::EigenpairResolutionUnavailable {
+                            reason: reason.to_string(),
+                        },
+                    });
                 }
             };
         let r_tilde = evecs.t().dot(&r_mat); // p × m
@@ -695,18 +787,14 @@ impl<'a> RemlState<'a> {
                 // resolution, whose eigenframe derivative would divide by zero (#2469).
                 let degeneracy_tol = pair_resolution[col_r] + pair_resolution[q];
                 if gap.abs() <= degeneracy_tol {
-                    log::info!(
-                        "[#784] block-local fallback declined: eigenvalue near-degeneracy \
-                         |λ_r − σ_q| = {:.3e} <= {degeneracy_tol:.3e} (λ_r={lam_r:.6e} res_r={:.3e}, \
-                         σ_q={:.6e} res_q={:.3e}, max|H|={:.3e}) — the eigenframe is not \
-                         differentiable on this stratum",
-                        gap.abs(),
-                        pair_resolution[col_r],
-                        evals[q],
-                        pair_resolution[q],
-                        sym_h.iter().copied().map(f64::abs).fold(0.0_f64, f64::max),
-                    );
-                    return Ok(zero());
+                    return Err(EstimationError::BlockQuadratureCorrectionRefused {
+                        stage: BlockQuadratureCorrectionStage::EigenframeNearDegeneracy {
+                            block_eigenvalue: lam_r,
+                            other_eigenvalue: evals[q],
+                            gap: gap.abs(),
+                            tolerance: degeneracy_tol,
+                        },
+                    });
                 }
                 g_mat[(q, jr)] = r_tilde[(q, jr)] / gap;
             }

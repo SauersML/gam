@@ -1545,9 +1545,9 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw_psi_psi = Array2::<f64>::zeros((p * d * d, p));
     // The third-order operator, gated exactly as the forward collocation builder
-    // (`build_matern_collocation_operator_matrices`) gates it, so the derivative
-    // list stays aligned with the forward penalties.
-    let third_order = nu.admits_third_order_operator() && aniso_log_scales.is_none() && d > 0;
+    // (`build_matern_collocation_operator_matrices`) gates it, on (ν, d) alone,
+    // so the derivative list stays aligned with the forward penalties at every η.
+    let third_order = nu.admits_third_order_operator() && d > 0;
     let metric_weights = aniso_log_scales
         .map(centered_aniso_metric_weights)
         .unwrap_or_else(|| vec![1.0; d]);
@@ -1726,7 +1726,23 @@ pub fn build_matern_operator_penalty_psi_derivatives(
                 for c in 0..d {
                     displacement[[j, c]] = centers[[k, c]] - centers[[j, c]];
                 }
-                let r = stable_euclidean_norm(displacement.row(j).iter().copied());
+                // The metric distance, held fixed under ψ like the D₀–D₂ rows'.
+                let r = if let Some(eta) = aniso_log_scales {
+                    aniso_distance_and_components(
+                        centers
+                            .row(k)
+                            .as_slice()
+                            .expect("a row of the standard-layout centers matrix is contiguous"),
+                        centers
+                            .row(j)
+                            .as_slice()
+                            .expect("a row of the standard-layout centers matrix is contiguous"),
+                        eta,
+                    )
+                    .0
+                } else {
+                    stable_euclidean_norm(displacement.row(j).iter().copied())
+                };
                 let ((t, t_psi, t_psi_psi), (t_r, t_r_psi, t_r_psi_psi)) =
                     matern_third_order_psi_scalars(r, length_scale, nu).ok_or_else(|| {
                         BasisError::InvalidInput(format!(
@@ -1749,8 +1765,24 @@ pub fn build_matern_operator_penalty_psi_derivatives(
                     let u_dot_v: f64 = (0..d)
                         .map(|c| displacement[[j, c]] * displacement[[l, c]])
                         .sum();
-                    let pair = |a: ThirdOrderRadial, b: ThirdOrderRadial| {
-                        third_order_gram_pair(a, distance[j], b, distance[l], u_dot_v, d)
+                    // The pair is bilinear in each side's (t, t'), so a ψ-derivative
+                    // at fixed r replaces one side's radial scalars by its own.
+                    let metric = aniso_log_scales.is_some().then(|| {
+                        ThirdOrderMetricPair::new(
+                            displacement.row(j),
+                            displacement.row(l),
+                            &metric_weights,
+                        )
+                    });
+                    let pair = |a: ThirdOrderRadial, b: ThirdOrderRadial| match metric.as_ref() {
+                        Some(metric) => third_order_gram_pair_in_metric(
+                            a,
+                            distance[j],
+                            b,
+                            distance[l],
+                            metric,
+                        ),
+                        None => third_order_gram_pair(a, distance[j], b, distance[l], u_dot_v, d),
                     };
                     let entries = [
                         pair(value[j], value[l]),

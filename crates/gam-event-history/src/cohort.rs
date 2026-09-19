@@ -690,8 +690,12 @@ impl CohortNodes {
 
 /// Gauss-Legendre order per mesh cell for a time smooth of this B-spline
 /// degree: the order that integrates products of the basis exactly on a
-/// cell, so the baseline part of the compensator is resolved to roundoff and
-/// the mesh refinement only has to serve the latent path.
+/// cell no knot crosses. That exactness is for polynomials only. The
+/// compensator integrates `exp(η⁰)`, an exponentiated spline, and a
+/// forecast's sub-density `S(t) λ_d(t)` carries the survival as well; neither
+/// is a polynomial, so no order integrates them exactly. Their resolution is
+/// what refinement checks: the fit's mesh certificate for the likelihood, and
+/// a forecast window's own refinement for what it returns.
 pub(crate) fn quadrature_order_for_degree(degree: usize) -> usize {
     2 * degree + 3
 }

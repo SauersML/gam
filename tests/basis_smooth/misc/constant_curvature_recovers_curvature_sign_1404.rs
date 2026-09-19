@@ -8,8 +8,9 @@
 //! therefore guards the user-visible estimand without substituting either the
 //! deleted plain-RSS profiler or the raw fixed-fit diagnostic.
 //!
-//! Reference-as-truth: the response is generated from gam's own
-//! constant-curvature kernel and every assertion is on gam's fitted κ.
+//! Reference-as-truth: the response is a member of gam's own constant-curvature
+//! span at the true κ (see `curved_response`), and every assertion is on gam's
+//! fitted κ.
 
 use gam::estimate::FitOptions;
 use gam::smooth::{
@@ -19,7 +20,7 @@ use gam::smooth::{
 };
 use gam::terms::basis::{
     CenterStrategy, ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability,
-    constant_curvature_kernel_matrix, realized_constant_curvature_length_scale,
+    build_constant_curvature_basis, realized_constant_curvature_length_scale,
 };
 use gam::types::LikelihoodSpec;
 use ndarray::{Array1, Array2};
@@ -79,24 +80,74 @@ fn disk_points(n: usize, seed: u64) -> Array2<f64> {
     pts
 }
 
-/// A curvature-shaped response: a smooth radial signal whose kernel "shape" is
-/// generated at the TRUE κ (via the geodesic-exponential kernel), plus noise.
-/// The shape — not the amplitude — carries the curvature sign.
-fn curved_response(data: &Array2<f64>, kappa_true: f64, ell: f64, seed: u64) -> Array1<f64> {
-    // A single radial bump centered at the origin under the true geometry.
-    let center = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
-    let k = constant_curvature_kernel_matrix(data.view(), center.view(), kappa_true, ell).unwrap();
+/// The one curvature term the plant and the fit share: a modest farthest-point
+/// center set keeps each analytic likelihood-profile evaluation cheap, and the
+/// range is pinned to the κ = 0 reference length.
+fn curvature_spec(ell_ref: f64) -> ConstantCurvatureBasisSpec {
+    ConstantCurvatureBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+        kappa: 0.0,
+        kappa_fixed: false,
+        length_scale: ell_ref,
+        length_scale_fixed: true,
+        double_penalty: false,
+        identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
+    }
+}
+
+/// A member of the κ⋆ span of the fitted term plus noise: the term's own
+/// columns at the TRUE κ, weighted `w_j = 1/(1+j)` and standardized to unit SD,
+/// so the truth is in the model being estimated and in no other member of the
+/// family.
+///
+/// This fixture used to plant a single kernel section about the chart ORIGIN,
+/// `2·k_κ⋆(d_κ⋆(x, 0)) − 1`. That plant is curvature-BLIND as a function class:
+/// `d_κ(x, 0)` is a strictly monotone reparametrization of the chart radius at
+/// every κ (the argument `constant_curvature_kappa_inference_e2e` gives for its
+/// own generator), so κ is identified only by which radial profiles the 12
+/// centers happen to make. Measured on that plant (lane probe 1246907 at
+/// 95115c8a1f): the fixed-κ REML score and the deviance both fall monotonically
+/// from κ = −4.8 to +4.8 for truths −2, 0 and +2 alike, at 12 and at 48
+/// centers, so every fit rails at the positive chart bound. On this in-span
+/// plant the production route recovers κ⋆ = −2, −0.75, +0.75 and +2 as −2.026,
+/// −0.783, +0.711 and +1.965 (lane probe 1252018).
+fn curved_response(
+    data: &Array2<f64>,
+    spec: &ConstantCurvatureBasisSpec,
+    kappa_true: f64,
+    seed: u64,
+) -> Array1<f64> {
+    let mut truth = spec.clone();
+    truth.kappa = kappa_true;
+    truth.kappa_fixed = true;
+    let basis = build_constant_curvature_basis(data.view(), &truth)
+        .expect("the planted κ⋆ geometry must be inside its own chart");
+    let design = basis.design.to_dense();
+    let n = data.nrows();
+    let mut y = Array1::<f64>::zeros(n);
+    for j in 0..design.ncols() {
+        let w = 1.0 / (1.0 + j as f64);
+        for i in 0..n {
+            y[i] += w * design[(i, j)];
+        }
+    }
+    let mean = y.iter().sum::<f64>() / n as f64;
+    let sd = (y.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64).sqrt();
+    assert!(
+        sd > 0.0,
+        "the planted κ⋆ = {kappa_true} signal collapsed to a constant"
+    );
     let mut st = seed ^ 0xD1B5_4A32;
-    let mut y = Array1::<f64>::zeros(data.nrows());
-    for i in 0..data.nrows() {
-        y[i] = 2.0 * k[[i, 0]] - 1.0 + 0.02 * next_gauss(&mut st);
+    for i in 0..n {
+        y[i] = (y[i] - mean) / sd + 0.02 * next_gauss(&mut st);
     }
     y
 }
 
 /// Fit the free-curvature production model for a given true curvature.
 fn fitted_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
-    let y = curved_response(data, kappa_true, ell_ref, 11);
+    let spec = curvature_spec(ell_ref);
+    let y = curved_response(data, &spec, kappa_true, 11);
     let resolved_spec = TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
@@ -105,17 +156,7 @@ fn fitted_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
             name: "curvature".to_string(),
             basis: SmoothBasisSpec::ConstantCurvature {
                 feature_cols: vec![0, 1],
-                spec: ConstantCurvatureBasisSpec {
-                    // A modest farthest-point center set keeps each analytic
-                    // likelihood-profile evaluation cheap while resolving the signal.
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
-                    kappa: 0.0,
-                    kappa_fixed: false,
-                    length_scale: ell_ref,
-                    length_scale_fixed: true,
-                    double_penalty: false,
-                    identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
-                },
+                spec,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,

@@ -833,8 +833,14 @@ fn build_saved_location_scale_survival_alo_input(
             )?
         }
     };
+    // The fitted likelihood drops `S(entry)` for a row entering at the origin (#2695).
+    let entry_active = age_entry
+        .iter()
+        .map(|&entry| entry > gam::families::survival::ENTRY_AT_ORIGIN_THRESHOLD)
+        .collect::<Vec<_>>();
     let input = gam_predict::SavedLocationScaleSurvivalAloInput::new(
         event,
+        entry_active,
         derivative_guard,
         time_base,
         threshold,
@@ -1055,6 +1061,7 @@ pub(crate) fn run_predict_unified(
         posterior_mean_upper,
         point_covariance,
         uncertainty_covariance,
+        point_provenance,
     ) = (
         columns.linear_predictor_plugin,
         columns.mean_plugin,
@@ -1064,6 +1071,7 @@ pub(crate) fn run_predict_unified(
         columns.posterior_mean_upper,
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
+        columns.point_covariance_provenance,
     );
     let specialised_point = posterior_mean
         .as_ref()
@@ -1140,6 +1148,9 @@ pub(crate) fn run_predict_unified(
         specialised_point.len(),
         covariance_provenance_note(point_covariance, uncertainty_covariance)
     );
+    if let Some(line) = point_covariance_provenance_line(point_provenance.as_ref()) {
+        cli_out!("{line}");
+    }
     Ok(())
 }
 
@@ -2625,6 +2636,10 @@ pub(crate) fn run_predict_survival(
             &derivative_offset_exit,
             &effective_primary_offset,
             &effective_noise_offset,
+            gam::predict::input::build_marginal_slope_local_auxiliary_matrix(
+                model, data, col_map,
+            )
+            .map_err(|error| error.to_string())?,
         )?;
 
         let (eta, mean, eta_se_opt, mean_lo, mean_hi): (

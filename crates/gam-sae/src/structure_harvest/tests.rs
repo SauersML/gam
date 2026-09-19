@@ -1957,6 +1957,64 @@ fn round_driver_ledger_is_byte_deterministic() {
     assert_eq!(a.term.k_atoms(), b.term.k_atoms());
 }
 
+/// #2899 O20: the production structure search refits every candidate, null and
+/// adopted state through the inner joint fit. A refit whose window ends without a
+/// settled exit has not converged, so the search refuses instead of scoring or
+/// returning that state. On this duplicated-activity fixture the fusion
+/// candidate's refit needs more than one iteration.
+#[test]
+fn production_structure_search_refuses_a_refit_that_runs_out_of_iterations_2899() {
+    let n = 24usize;
+    let active: Vec<Vec<bool>> = (0..n)
+        .map(|row| {
+            let dup = row % 3 == 0;
+            vec![dup, dup, row % 2 == 0]
+        })
+        .collect();
+    let (term, rho) = planted_term(&active);
+    let target = term
+        .try_fitted()
+        .expect("a freshly built fixture term carries a fitted state");
+    let mut ledger = gam_terms::inference::structure_evidence::StructureLedger::new();
+    let config = RoundDriverConfig {
+        n_shards: 3,
+        budget: MoveBudget {
+            max_moves: 4,
+            alpha: 0.05,
+        },
+        harvest_params: HarvestParams {
+            max_fusions: 4,
+            max_fissions: 0,
+            max_births: 0,
+        },
+        curl: None,
+    };
+    let one_iteration = ProductionRefitParams {
+        inner_max_iter: 1,
+        learning_rate: 1.0,
+        ridge_ext_coord: 1e-6,
+        ridge_beta: 1e-6,
+    };
+    let error = match run_production_structure_search(
+        term,
+        rho,
+        target.view(),
+        config,
+        one_iteration,
+        &mut ledger,
+    ) {
+        Ok(result) => panic!(
+            "a one-iteration refit window returned a search result over {} round(s)",
+            result.rounds.len()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("certifies no convergence"),
+        "the refusal must name the unconverged refit: {error}"
+    );
+}
+
 /// Estimation/eval split oracle: the split reserves estimation rows and
 /// partitions the remainder into held-out shards that do NOT overlap the
 /// estimation set (the universal-inference contract the gates rely on).
@@ -3216,4 +3274,100 @@ fn collapsed_arcs_earn_no_glue_2280() {
         merging, 0,
         "collapsed coordinates must yield no glue or fusion proposal, got {merging} of {total}"
     );
+}
+
+/// #2822 — a fission child inherits the parent's proper coordinate prior. So a parent
+/// whose ARD block is empty, or missing from ρ, refuses (`duplicate_atom`). It does
+/// not append a child with no coordinate prior. The intact ρ is the positive control:
+/// the same fission succeeds and the child carries the parent's full block.
+#[test]
+fn fission_refuses_a_parent_without_a_proper_coordinate_prior_2822() {
+    let (term, mut rho) = tiled_circle_term(16, 3, &[1.0; 3]);
+    // A block no other atom carries, so inheriting from the wrong atom cannot pass.
+    rho.log_ard[1] = Array1::from_vec(vec![0.75]);
+    match duplicate_atom(&term, &rho, 1) {
+        Ok((child, child_rho)) => {
+            assert_eq!(child.k_atoms(), 4, "the fission appends one atom");
+            assert_eq!(
+                child_rho.log_ard[3],
+                Array1::from_vec(vec![0.75]),
+                "the child inherits the parent's ARD block"
+            );
+        }
+        Err(err) => panic!("a parent with a full ARD block must fission: {err}"),
+    }
+
+    let mut empty_parent = rho.clone();
+    empty_parent.log_ard[1] = Array1::<f64>::zeros(0);
+    match duplicate_atom(&term, &empty_parent, 1) {
+        Ok(_) => panic!("a parent with an empty ARD block must not fission"),
+        Err(err) => assert!(
+            err.contains("no proper coordinate prior"),
+            "unexpected error: {err}"
+        ),
+    }
+
+    let mut missing_parent = rho.clone();
+    missing_parent.log_ard.truncate(2);
+    match duplicate_atom(&term, &missing_parent, 2) {
+        Ok(_) => panic!("a parent with no ARD block in ρ must not fission"),
+        Err(err) => assert!(
+            err.contains("no proper coordinate prior"),
+            "unexpected error: {err}"
+        ),
+    }
+}
+
+/// #2822 — every coordinate atom carries a full ARD block. A ρ built through the
+/// public constructor with one atom's block empty is refused by the first evaluation
+/// that reads the ARD table. Both the system assembly and the penalized criterion
+/// cross `validated_ard_precisions` (construction_ard.rs), and the refusal names the
+/// missing proper coordinate prior. The fixture's full-block ρ assembling is the
+/// positive control.
+#[test]
+fn an_empty_ard_block_is_refused_at_criterion_entry_2822() {
+    let (mut term, rho) = tiled_circle_term(16, 3, &[1.0; 3]);
+    let target = Array2::<f64>::zeros((16, 4));
+    if let Err(err) = term.assemble_arrow_schur(target.view(), &rho, None) {
+        panic!("the fixture's full-block rho must assemble: {err:?}");
+    }
+
+    let empty = SaeManifoldRho::new(
+        0.0,
+        0.0,
+        vec![
+            Array1::<f64>::zeros(1),
+            Array1::<f64>::zeros(0),
+            Array1::<f64>::zeros(1),
+        ],
+    );
+    match term.assemble_arrow_schur(target.view(), &empty, None) {
+        Ok(_) => panic!("an empty ARD block must not assemble"),
+        Err(err) => {
+            let message = format!("{err:?}");
+            assert!(
+                message.contains("proper coordinate prior"),
+                "unexpected assembly error: {message}"
+            );
+        }
+    }
+    match term.penalized_quasi_laplace_criterion_with_cache_refine_policy(
+        target.view(),
+        &empty,
+        None,
+        4,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+        false,
+    ) {
+        Ok(_) => panic!("an empty ARD block must not price a criterion"),
+        Err(err) => {
+            let message = format!("{err:?}");
+            assert!(
+                message.contains("proper coordinate prior"),
+                "unexpected criterion error: {message}"
+            );
+        }
+    }
 }

@@ -60,9 +60,9 @@ def lane_kwargs(lane, top_k):
     """Per-lane validated recipes: support-sparse minimal contract for topk;
     the bench/massive_k_manifold_validate regime for threshold_gate."""
     if lane == "topk":
-        return dict(top_k=top_k, sparsity_weight=0.0, ard_per_atom=True)
+        return dict(top_k=top_k, sparsity_weight=0.0)
     return dict(sparsity_weight=0.01, smoothness_weight=0.01,
-                isometry_weight=0.0, learning_rate=1.0, ard_per_atom=False)
+                isometry_weight=0.0, learning_rate=1.0)
 
 
 def run_arm(out, name, base, fitfn, X_train, X_test):

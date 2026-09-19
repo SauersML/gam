@@ -516,6 +516,128 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         }
     }
 
+    fn contracted_trace_hessian_psi_axes(&self) -> Result<Vec<usize>, String> {
+        let mut served = Vec::new();
+        for psi_index in 0..self.hyper_layout.len() {
+            let available = match self
+                .family
+                .family_hyper_role(&self.hyper_layout, psi_index)?
+            {
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(_)) => self
+                    .family
+                    .baseline_contracted_trace_hessian_psi_available(&self.block_states)?,
+                None => self.family.design_contracted_trace_hessian_psi_available(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                )?,
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => false,
+            };
+            if available {
+                served.push(psi_index);
+            }
+        }
+        Ok(served)
+    }
+
+    fn contracted_trace_hessian_psi(
+        &self,
+        psi_index: usize,
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        match self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+        {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .baseline_contracted_trace_hessian_psi_with_options(
+                    &self.block_states,
+                    axis,
+                    weight,
+                    &self.options,
+                ),
+            None => self
+                .family
+                .design_contracted_trace_hessian_psi_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    weight,
+                    &self.options,
+                ),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => Ok(None),
+        }
+    }
+
+    fn contracted_trace_hessian_psi_directional(
+        &self,
+        psi_index: usize,
+        weight: &Array2<f64>,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        match self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+        {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .baseline_contracted_trace_hessian_psi_directional_with_options(
+                    &self.block_states,
+                    axis,
+                    weight,
+                    d_beta_flat,
+                    &self.options,
+                ),
+            None => self
+                .family
+                .design_contracted_trace_hessian_psi_directional_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    weight,
+                    d_beta_flat,
+                    &self.options,
+                ),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => Ok(None),
+        }
+    }
+
+    fn contracted_trace_hessian_psi_pair(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let axis_i = self.family.family_hyper_role(&self.hyper_layout, psi_i)?;
+        let axis_j = self.family.family_hyper_role(&self.hyper_layout, psi_j)?;
+        match (axis_i, axis_j) {
+            (
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
+            ) => self
+                .family
+                .baseline_contracted_trace_hessian_psi_pair_with_options(
+                    &self.block_states,
+                    axis,
+                    other_axis,
+                    weight,
+                    &self.options,
+                ),
+            (None, None) => self
+                .family
+                .design_contracted_trace_hessian_psi_pair_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_i,
+                    psi_j,
+                    weight,
+                    &self.options,
+                ),
+            _ => Ok(None),
+        }
+    }
+
     fn second_order_hessian_directional_derivative_all_beta_axes(
         &self,
         psi_i: usize,

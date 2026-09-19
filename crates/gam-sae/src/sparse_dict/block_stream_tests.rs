@@ -135,8 +135,25 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
     ];
     // Independent dense projector algebra. All three blocks are selected on
     // nonzero rows; the zero row exercises padded slots without phantom usage.
-    let weights = x.mapv(f64::from).dot(&decoder.mapv(f64::from).t());
-    let total = weights.dot(&decoder.mapv(f64::from));
+    // Each block projects through the orthogonal projector of its stored rows,
+    // `Uᵀ(UUᵀ)⁻¹U` (#2502): its span coordinates are its inner products `x Uᵀ` times
+    // the closed-form inverse of its 2×2 Gram. The f32 row [0.6, 0, 0, 0.8] is not
+    // exactly unit, so `UᵀU` would price a different reconstruction.
+    let decoder64 = decoder.mapv(f64::from);
+    let mut weights = x.mapv(f64::from).dot(&decoder64.t());
+    for block in 0..3 {
+        let frame = decoder64.slice(ndarray::s![block * 2..(block + 1) * 2, ..]);
+        let gram = frame.dot(&frame.t());
+        let det = gram[[0, 0]] * gram[[1, 1]] - gram[[0, 1]] * gram[[1, 0]];
+        let inverse = array![
+            [gram[[1, 1]] / det, -gram[[0, 1]] / det],
+            [-gram[[1, 0]] / det, gram[[0, 0]] / det]
+        ];
+        let mut coordinates = weights.slice_mut(ndarray::s![.., block * 2..(block + 1) * 2]);
+        let solved = coordinates.dot(&inverse);
+        coordinates.assign(&solved);
+    }
+    let total = weights.dot(&decoder64);
     let gamma = 0.37_f32;
     let baseline_gamma = 0.61_f32;
     let residual = x.mapv(f64::from) - &total * gamma as f64;
@@ -801,8 +818,8 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
         let mut searched_coupling = vec![0.0_f64; p * 3 * b];
         let mut searched_data = vec![0.0_f64; p * 3 * b];
         let mut v = vec![0.0_f64; p];
-        let mut coordinates = vec![0.0_f64; b];
-        let mut searched_coordinates = vec![0.0_f64; 5 * b];
+        let mut coordinates = vec![0.0_f64; 2 * b];
+        let mut searched_coordinates = vec![0.0_f64; 6 * b];
         let mut reference_coupling = Array2::<f64>::zeros((p, b));
         let mut reference_data = Array2::<f64>::zeros((p, b));
         let mut merged_coupling = Array2::<f64>::zeros((p, b));
@@ -836,8 +853,15 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
                 &mut searched_data,
             );
 
-            // The loop as it stood before the kernel, with
-            // `decoder[[block * b + axis, c]]` narrowed to this one block's rows.
+            // The indexed loop, with `decoder[[block * b + axis, c]]` narrowed to this
+            // one block's rows. `w` decodes the block's projection; the moments take
+            // the stored rows' inner products `Ux` (#2502), summed in `c` order.
+            let mut inner = vec![0.0; b];
+            for c in 0..p {
+                for (axis, value) in inner.iter_mut().enumerate() {
+                    *value += decoder[[axis, c]] as f64 * xi[c] as f64;
+                }
+            }
             let mut reference_v_coordinates = vec![0.0; b];
             for c in 0..p {
                 let mut own = 0.0;
@@ -846,9 +870,9 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
                 }
                 let value = k as f64 * own - sum[c];
                 let x = xi[c] as f64;
-                for (axis, &weight) in w.iter().enumerate() {
-                    reference_coupling[[c, axis]] += value * weight;
-                    reference_data[[c, axis]] += x * weight;
+                for (axis, &product) in inner.iter().enumerate() {
+                    reference_coupling[[c, axis]] += value * product;
+                    reference_data[[c, axis]] += x * product;
                     reference_v_coordinates[axis] += decoder[[axis, c]] as f64 * value;
                 }
             }
@@ -859,7 +883,7 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
             }
             for c in 0..p {
                 for axis in 0..b {
-                    reference_coupling[[c, axis]] -= k as f64 * xi[c] as f64 * w[axis];
+                    reference_coupling[[c, axis]] -= k as f64 * xi[c] as f64 * inner[axis];
                 }
             }
             // Positive control: the same two coupling terms added as ONE sum per
@@ -871,14 +895,14 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
                     own += weight * decoder[[axis, c]] as f64;
                 }
                 let value = k as f64 * own - sum[c];
-                for (axis, &weight) in w.iter().enumerate() {
+                for (axis, &product) in inner.iter().enumerate() {
                     merged_coupling[[c, axis]] +=
-                        value * weight + xi[c] as f64 * reference_v_coordinates[axis];
+                        value * product + xi[c] as f64 * reference_v_coordinates[axis];
                 }
             }
             for c in 0..p {
                 for axis in 0..b {
-                    merged_coupling[[c, axis]] -= k as f64 * xi[c] as f64 * w[axis];
+                    merged_coupling[[c, axis]] -= k as f64 * xi[c] as f64 * inner[axis];
                 }
             }
         }
@@ -993,16 +1017,34 @@ fn a_row_keeps_its_retained_support_unless_the_routed_support_lowers_its_loss_25
     let routed = route().blocks[0];
     assert!(routed < 2, "the router must pick a duplicate, got block {routed}");
     let duplicate = 1 - routed;
-    let (kept, kept_projection, declined) =
-        super::descend_block_support(x.row(0), decoder.view(), 1.0, 1, 1, route(), &[duplicate]);
+    let spans = crate::sparse_dict::block::stored_spans(decoder.view(), 1)
+        .expect("every block spans one dimension");
+    let (kept, kept_projection, declined) = super::descend_block_support(
+        x.row(0),
+        decoder.view(),
+        &spans,
+        1.0,
+        1,
+        1,
+        route(),
+        &[duplicate],
+    );
     assert_eq!(kept.blocks, vec![duplicate]);
     assert_ne!(kept.gates[0], 0.0);
     assert_eq!(kept_projection.rss, 0.0);
     // The routed duplicate admits a different block and resolves no loss decrease, so
     // it is declined at zero excess.
     assert_eq!(declined, Some(0.0));
-    let (adopted, adopted_projection, adopted_declined) =
-        super::descend_block_support(x.row(0), decoder.view(), 1.0, 1, 1, route(), &[2]);
+    let (adopted, adopted_projection, adopted_declined) = super::descend_block_support(
+        x.row(0),
+        decoder.view(),
+        &spans,
+        1.0,
+        1,
+        1,
+        route(),
+        &[2],
+    );
     assert_eq!(adopted.blocks, vec![routed]);
     assert_eq!(adopted_projection.rss, 0.0);
     assert_eq!(adopted_declined, None);
@@ -1010,6 +1052,7 @@ fn a_row_keeps_its_retained_support_unless_the_routed_support_lowers_its_loss_25
     let (first, _, first_declined) = super::descend_block_support(
         x.row(0),
         decoder.view(),
+        &spans,
         1.0,
         1,
         1,
@@ -1037,4 +1080,463 @@ fn a_pass_that_streams_different_rows_is_refused_2502() {
     shortened.partial_fit(x.slice(ndarray::s![..2, ..])).unwrap();
     let error = shortened.end_epoch().unwrap_err();
     assert!(error.contains("same rows in the same order"), "{error}");
+}
+
+/// A deterministic generator of `f32` block frames, each Gram–Schmidt orthonormalised
+/// and stored as `f32`, as the stream stores them.
+fn stored_frames(blocks: usize, b: usize, p: usize, seed: u64) -> Array2<f32> {
+    let mut bits = seed;
+    let mut decoder = Array2::<f32>::zeros((blocks * b, p));
+    for block in 0..blocks {
+        let mut frame = Array2::from_shape_fn((b, p), |_| {
+            bits = bits
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((bits >> 11) as f64 / (1_u64 << 53) as f64 - 0.5) as f32
+        });
+        crate::sparse_dict::block::gram_schmidt_rows(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * b..(block + 1) * b, ..])
+            .assign(&frame);
+    }
+    decoder
+}
+
+#[test]
+fn a_retained_support_prices_its_stored_span_2502() {
+    // Doubling one stored row is exact in binary floating point and leaves the block's
+    // span bit for bit. A retained support must then price every row to the same loss
+    // and gate, to the bit: the stream's trials priced through `UᵀU` moved with every
+    // f32 rewrite of a frame instead (#2502, lane job 1229606). The positive control is
+    // the `‖Ux‖` gate that pricing used, which the doubling moves.
+    let (b, p, blocks, k) = (2usize, 6usize, 4usize, 3usize);
+    let decoder = stored_frames(blocks, b, p, 0x2502);
+    let mut doubled = decoder.clone();
+    for column in 0..p {
+        doubled[[b, column]] *= 2.0; // block 1's first row
+    }
+    let rows = stored_frames(8, 2, p, 0x2503);
+    let prior = [1_u32, 0, 3];
+    let gamma = 0.8_f32;
+    let price = |frames: &Array2<f32>, row: ndarray::ArrayView1<'_, f32>| {
+        let spans = crate::sparse_dict::block::stored_spans(frames.view(), b)
+            .expect("every block spans two dimensions");
+        let code =
+            super::kept_block_code(row, frames.view(), &spans.inverse_grams, gamma, b, k, &prior);
+        let rss = super::row_projection(row, frames.view(), &code, b, gamma).rss;
+        (code, rss)
+    };
+    let mut gram_free_moved = 0usize;
+    for row in rows.outer_iter() {
+        let (stored, stored_rss) = price(&decoder, row);
+        let (rescaled, rescaled_rss) = price(&doubled, row);
+        assert_eq!(
+            stored_rss.to_bits(),
+            rescaled_rss.to_bits(),
+            "doubling a stored row moved a retained support's loss: {stored_rss:e} vs {rescaled_rss:e}"
+        );
+        for slot in 0..prior.len() {
+            assert_eq!(stored.gates[slot].to_bits(), rescaled.gates[slot].to_bits());
+        }
+        let gram_free_gate = |frames: &Array2<f32>| {
+            (0..b)
+                .map(|axis| {
+                    let s: f64 = row
+                        .iter()
+                        .zip(frames.row(b + axis).iter())
+                        .map(|(&x, &a)| x as f64 * a as f64)
+                        .sum();
+                    s * s
+                })
+                .sum::<f64>()
+                .sqrt()
+        };
+        if gram_free_gate(&decoder).to_bits() != gram_free_gate(&doubled).to_bits() {
+            gram_free_moved += 1;
+        }
+    }
+    assert_eq!(gram_free_moved, rows.nrows(), "the ‖Ux‖ gate must see the doubling on every row");
+}
+
+#[test]
+fn backtracking_ends_at_the_baseline_bits_2502() {
+    // Re-orthonormalising an f32-stored frame need not return its bits. The old
+    // bisection re-orthonormalised every block of every midpoint, so on the Spark
+    // layer-18 fit all 274 trials from epoch 2727 to 3000 were the same rewrite of all
+    // 1024 blocks and backtracking never returned to the baseline (#2502, run 1165180).
+    // Backtracking must leave unmoved blocks' bits alone and end at the baseline.
+    let (b, p, blocks) = (2usize, 16usize, 32usize);
+    let baseline = stored_frames(blocks, b, p, 0x2727);
+    let block_rows = |frames: &Array2<f32>, block: usize| {
+        frames
+            .slice(ndarray::s![block * b..(block + 1) * b, ..])
+            .to_owned()
+    };
+    // Positive control: re-rounding under Gram–Schmidt moves some stored block's bits,
+    // which is what kept the old bisection from ever reaching the baseline.
+    let rerounded = (0..blocks)
+        .filter(|&block| {
+            let stored = block_rows(&baseline, block);
+            let mut again = stored.clone();
+            crate::sparse_dict::block::gram_schmidt_rows(&mut again);
+            again != stored
+        })
+        .count();
+    assert!(
+        rerounded > 0,
+        "no fixture block re-rounds under Gram–Schmidt, so the fixture cannot see the old cycle"
+    );
+    // The proposal moves block 0 by a resolvable step and keeps every other block's bits.
+    let mut proposal = baseline.clone();
+    let mut moved = block_rows(&stored_frames(1, b, p, 0x3000), 0) * 0.3 + block_rows(&baseline, 0);
+    crate::sparse_dict::block::gram_schmidt_rows(&mut moved);
+    proposal
+        .slice_mut(ndarray::s![..b, ..])
+        .assign(&moved);
+    let mut trial = proposal;
+    let mut halvings = 0usize;
+    while trial != baseline {
+        let midpoint = super::bisect_frame_trial(&baseline, &trial, b).expect("bisect the trial");
+        for block in 1..blocks {
+            assert_eq!(
+                block_rows(&midpoint, block),
+                block_rows(&baseline, block),
+                "unmoved block {block} changed its bits at halving {halvings}"
+            );
+        }
+        trial = midpoint;
+        halvings += 1;
+        // A float32 frame halves its displacement at most about 24 times before storage
+        // stops resolving it; far past that, backtracking is cycling.
+        assert!(halvings <= 64, "backtracking did not reach the baseline bits in 64 halvings");
+    }
+    assert!(halvings > 1, "block 0's move must take several halvings to fall below resolution");
+}
+
+#[test]
+fn a_ritz_step_below_storage_resolution_keeps_the_stored_bits_2502() {
+    // H = diag(2, 1, −g, −g) + ε(e1e2ᵀ + e2e1ᵀ) on span[U, R], U = [e0, e1], R = [e2, e3].
+    // The top Ritz pair rotates e1 toward e2 by θ ≈ ε/(1 + g) and raises the surrogate
+    // trace by εθ ≈ θ²g. At θ = 1.2e-7 the stored projector moves by about 0.71θ, below
+    // f32 resolution, while f64 resolves the raise about 65 times over its eigensolver
+    // error ε₆₄·g. So the step takes the raise branch and must keep U's stored bits
+    // (#2502). At θ = 1.2e-5 the move is resolvable and the frame must move.
+    let (b, p) = (2usize, 4usize);
+    let g = 1.0e6_f64;
+    let step = |theta: f64| {
+        let coupling = theta * (1.0 + g);
+        let current = array![[1.0_f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+        let directions = array![
+            [0.0_f32, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0]
+        ];
+        let mut h = Array2::<f64>::zeros((p, p));
+        h[[0, 0]] = 2.0;
+        h[[1, 1]] = 1.0;
+        h[[2, 2]] = -g;
+        h[[3, 3]] = -g;
+        h[[1, 2]] = coupling;
+        h[[2, 1]] = coupling;
+        // H·[U, R, P]: every live basis vector is a coordinate axis, so its image is a
+        // column of H; the two zero search rows have zero images.
+        let mut action = Array2::<f64>::zeros((p, 3 * b));
+        for column in 0..p {
+            action.column_mut(column).assign(&h.column(column));
+        }
+        let mut proposal = Array2::<f32>::zeros((b, p));
+        let mut next = Array2::<f32>::zeros((2 * b, p));
+        crate::sparse_dict::block_frame::ritz_tied_frame_step(
+            current.view(),
+            directions.view(),
+            action.view(),
+            Array2::<f64>::zeros((b, b)).view(),
+            1.0,
+            0.0,
+            proposal.view_mut(),
+            next.view_mut(),
+        )
+        .expect("the Ritz step on a resolved subspace");
+        (current, proposal)
+    };
+    let (current, kept) = step(1.2e-7);
+    assert_eq!(kept, current, "a sub-resolution Ritz step rewrote the stored frame");
+    let (current, stepped) = step(1.2e-5);
+    assert_ne!(stepped, current, "a resolvable Ritz step must move the frame");
+}
+
+#[test]
+fn a_frame_trial_commits_on_its_paired_decrease_over_the_rows_it_changes_2502() {
+    // Ten rows lie on the line (1, 1e-4, 0, 0) and ten thousand lie in the e2-e3 plane
+    // with a large e3 component no block spans. Block 0, a line in the e0-e1 plane, serves
+    // the ten; block 1 = e2 serves the ten thousand; no row admits both. The proposal rotates
+    // block 0 halfway toward the ten rows' line and lowers their loss by about 7.5e-8, inside
+    // the corpus-wide band of about 4.4e-6 that the others' residuals (RSS about 1e8) set.
+    // Those rows admit only the unmoved block 1 in both passes and are priced to the same
+    // bits, so the trial is decided over the ten rows, where the decrease clears its band by
+    // orders of magnitude. The corpus-wide rule refused such steps and cycled the Spark fit
+    // at a frame residual of 1.163e-4 (#2502, lane job 1248199).
+    let mut x = Array2::<f32>::zeros((10_010, 4));
+    for row in 0..10 {
+        x[[row, 0]] = 1.0;
+        x[[row, 1]] = 1.0e-4;
+    }
+    for row in 10..x.nrows() {
+        x[[row, 2]] = 10.0;
+        x[[row, 3]] = 100.0;
+    }
+    let theta = 5.0e-5_f64;
+    let baseline = array![[1.0_f32, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]];
+    let proposal = array![
+        [theta.cos() as f32, theta.sin() as f32, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0]
+    ];
+    let mut config = BlockSparseConfig::new(2, 1);
+    config.block_topk = 2;
+    config.minibatch = 4096;
+    config.aux_k = 0;
+    let mut state = BlockSparseStreamState::new_with_decoder(proposal.clone(), &config).unwrap();
+    state.gamma = 1.0;
+    state.pending_frame = Some(super::PendingFrameTrial {
+        baseline_decoder: baseline,
+        baseline_gamma: 1.0,
+        proposed_decoder: proposal,
+        baseline_rss: 0.0,
+        baseline_gamma_num: 0.0,
+        baseline_gamma_den: 0.0,
+        baseline_rows: 0,
+        baseline_usage: vec![0; 2],
+        baseline_second: vec![Array2::zeros((1, 1)); 2],
+        baseline_supports: Vec::new(),
+        rerouted_rows: 0,
+        moves: super::TrialMoves::default(),
+    });
+    state.partial_fit(x.view()).unwrap();
+    let trial = state
+        .end_epoch()
+        .unwrap()
+        .frame_trial
+        .expect("the pending trial is adjudicated");
+    // Positive control: over the whole corpus the decrease lies inside its band, so a
+    // corpus-wide rule refuses the step.
+    assert!(
+        trial.decrease <= trial.resolution,
+        "the corpus decrease {:e} clears its band {:e}, so the fixture cannot tell the rules apart",
+        trial.decrease,
+        trial.resolution
+    );
+    assert_eq!(trial.moved_rows, 10);
+    assert!(
+        trial.moved_decrease > 1.0e6 * trial.moved_resolution,
+        "paired decrease {:e} against its band {:e}",
+        trial.moved_decrease,
+        trial.moved_resolution
+    );
+    assert!(trial.committed, "a paired decrease far above its band must commit");
+}
+
+#[test]
+fn a_resumed_stream_continues_bit_for_bit_2502() {
+    // A long fit runs as a chain of bounded jobs, each resuming the last one's checkpoint, so a
+    // resumed stream must continue exactly as the uninterrupted one does. Checkpointing and
+    // resuming at EVERY epoch boundary must reproduce every epoch of the straight run bit for
+    // bit. Positive controls: some boundary carries a staged birth and some carries a pending
+    // frame trial, the two transactions a checkpoint must carry across.
+    let mut seed = 2502_u64;
+    let mut sample = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 33) as f32 / 2147483648.0 - 0.5
+    };
+    let x = Array2::from_shape_fn((37, 8), |_| sample());
+    let mut decoder = Array2::from_shape_fn((12, 8), |_| sample());
+    for block in 0..5 {
+        let mut frame = decoder
+            .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
+            .to_owned();
+        crate::sparse_dict::block::gram_schmidt_rows(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * 2..(block + 1) * 2, ..])
+            .assign(&frame);
+    }
+    // A dead block: its zero frame has the zero projector, so no row admits it and a birth
+    // can be staged there.
+    decoder.slice_mut(ndarray::s![10.., ..]).fill(0.0);
+    let mut config = BlockSparseConfig::new(6, 2);
+    config.block_topk = 3;
+    config.minibatch = 13;
+    config.aux_k = 1;
+    let epochs = 8;
+    let record = |state: &BlockSparseStreamState, stats: &super::BlockEpochStats| {
+        (
+            state.decoder.iter().map(|value| value.to_bits()).collect::<Vec<u32>>(),
+            state.gamma.to_bits(),
+            stats.explained_variance.to_bits(),
+            stats.frame_residual.to_bits(),
+            stats.gamma_residual.to_bits(),
+            stats.accepted_births,
+            stats.converged,
+            state.retained_supports.clone(),
+        )
+    };
+    let mut straight = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+    let mut expected = Vec::new();
+    for _ in 0..epochs {
+        straight.partial_fit(x.view()).unwrap();
+        let stats = straight.end_epoch().unwrap();
+        expected.push(record(&straight, &stats));
+    }
+    let path = std::env::temp_dir().join(format!("gam-block-stream-checkpoint-{}.bin", std::process::id()));
+    let mut chained = BlockSparseStreamState::new_with_decoder(decoder, &config).unwrap();
+    let mut births = 0usize;
+    let mut trials = 0usize;
+    for epoch in 0..epochs {
+        chained.partial_fit(x.view()).unwrap();
+        if epoch == 0 {
+            let error = chained.checkpoint(&path).unwrap_err();
+            assert!(error.contains("unfinished pass"), "{error}");
+        }
+        let stats = chained.end_epoch().unwrap();
+        assert_eq!(record(&chained, &stats), expected[epoch], "epoch {epoch} diverged after a resume");
+        births += usize::from(chained.pending_birth.is_some());
+        trials += usize::from(chained.pending_frame.is_some());
+        chained.checkpoint(&path).unwrap();
+        chained = BlockSparseStreamState::resume(&path, &config).unwrap();
+    }
+    assert!(births > 0, "no boundary carried a staged birth, so the checkpoint never had to");
+    assert!(trials > 0, "no boundary carried a pending frame trial, so the checkpoint never had to");
+    let mut other = config;
+    other.tolerance *= 2.0;
+    let error = BlockSparseStreamState::resume(&path, &other)
+        .err()
+        .expect("a checkpoint written under another tolerance must be refused");
+    assert!(error.contains("tolerance"), "{error}");
+    // The epoch cap is the driver's, so a chain may resume under another one.
+    let mut extended = config;
+    extended.max_epochs += 7;
+    assert!(
+        BlockSparseStreamState::resume(&path, &extended).is_ok(),
+        "a stream driven to another epoch cap must resume"
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn a_block_that_meets_the_certificate_bar_keeps_its_stored_bits_2502() {
+    // H = diag(2, 1, −g) + ε(e1e2ᵀ + e2e1ᵀ) on span[U, R], U = [e0, e1], R = [e2]: the top
+    // Ritz pair rotates e1 toward e2 by a resolvable angle, and the stationarity certificate
+    // is ε over the action's norm. A bar at or above that certificate means the block already
+    // passes it, so its step can only shift its neighbors' conditional optima: it must keep
+    // U's stored bits, with its tangent as the next search row. A bar just below it must let
+    // the block move (#2502).
+    let (b, p) = (2usize, 3usize);
+    let g = 10.0_f64;
+    let coupling = 0.05_f64;
+    let current = array![[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let directions = array![[0.0_f32, 0.0, 1.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+    let mut h = Array2::<f64>::zeros((p, p));
+    h[[0, 0]] = 2.0;
+    h[[1, 1]] = 1.0;
+    h[[2, 2]] = -g;
+    h[[1, 2]] = coupling;
+    h[[2, 1]] = coupling;
+    let mut action = Array2::<f64>::zeros((p, 3 * b));
+    for column in 0..p {
+        action.column_mut(column).assign(&h.column(column));
+    }
+    let step = |bar: f64| {
+        let mut proposal = Array2::<f32>::zeros((b, p));
+        let mut next = Array2::<f32>::zeros((2 * b, p));
+        let stationarity = crate::sparse_dict::block_frame::ritz_tied_frame_step(
+            current.view(),
+            directions.view(),
+            action.view(),
+            Array2::<f64>::zeros((b, b)).view(),
+            1.0,
+            bar,
+            proposal.view_mut(),
+            next.view_mut(),
+        )
+        .expect("the Ritz step on a resolved subspace");
+        (stationarity, proposal, next)
+    };
+    let (stationarity, moved, _) = step(0.0);
+    assert!(stationarity > 0.0);
+    assert_ne!(moved, current, "with no bar the resolvable step must move the frame");
+    let (_, kept, next) = step(stationarity);
+    assert_eq!(kept, current, "a block that meets the bar must keep its stored bits");
+    assert_eq!(
+        next.row(1),
+        array![0.0_f32, 0.0, 1.0].view(),
+        "a kept block's next search row is its unit tangent gradient"
+    );
+    let (_, below, _) = step(0.5 * stationarity);
+    assert_ne!(below, current, "a block above the bar must still move");
+}
+
+#[test]
+fn a_rescaled_frame_trial_is_priced_by_its_span_and_descends_2502() {
+    // Block 0 is a line that starts on e0; block 1 is e2; every row admits both. The
+    // proposal rotates block 0 halfway toward the rows' principal axis in the e0-e1 plane,
+    // a real descent. Stored at norm 1 or at norm 2 (doubling is exact, so the span is the
+    // same bits), it must commit with the same paired decrease: the projector
+    // Uᵀ(UUᵀ)⁻¹U is a function of the span. Priced as UᵀU instead, the norm-2 frame
+    // reconstructs every row four times too far along the line and the trial ascends
+    // (#2502).
+    let rows = 16usize;
+    let x = Array2::from_shape_fn((rows, 3), |(row, column)| {
+        let i = row as f64;
+        let angle = std::f64::consts::PI / 6.0 + 0.2 * i.sin();
+        let radius = 1.0 + 0.3 * (3.0 * i).cos();
+        (match column {
+            0 => radius * angle.cos(),
+            1 => radius * angle.sin(),
+            _ => 0.5 + 0.2 * (2.0 * i).sin(),
+        }) as f32
+    });
+    let baseline = array![[1.0_f32, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let theta = std::f64::consts::PI / 12.0;
+    let mut config = BlockSparseConfig::new(2, 1);
+    config.block_topk = 2;
+    config.minibatch = rows;
+    config.aux_k = 0;
+    let trial = |norm: f32| {
+        let proposal = array![
+            [norm * theta.cos() as f32, norm * theta.sin() as f32, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let mut state = BlockSparseStreamState::new_with_decoder(proposal.clone(), &config).unwrap();
+        state.gamma = 1.0;
+        state.pending_frame = Some(super::PendingFrameTrial {
+            baseline_decoder: baseline.clone(),
+            baseline_gamma: 1.0,
+            proposed_decoder: proposal,
+            baseline_rss: 0.0,
+            baseline_gamma_num: 0.0,
+            baseline_gamma_den: 0.0,
+            baseline_rows: 0,
+            baseline_usage: vec![0; 2],
+            baseline_second: vec![Array2::zeros((1, 1)); 2],
+            baseline_supports: Vec::new(),
+            rerouted_rows: 0,
+            moves: super::TrialMoves::default(),
+        });
+        state.partial_fit(x.view()).unwrap();
+        assert_eq!(state.usage, vec![rows, rows], "every row must admit both blocks");
+        state
+            .end_epoch()
+            .unwrap()
+            .frame_trial
+            .expect("the pending trial is adjudicated")
+    };
+    let unit = trial(1.0);
+    let doubled = trial(2.0);
+    assert!(unit.committed && unit.moved_decrease > 0.0, "{unit:?}");
+    assert!(doubled.committed, "the norm-2 frame of a descending step must commit: {doubled:?}");
+    assert!(
+        (doubled.moved_decrease - unit.moved_decrease).abs() <= 1.0e-12 * unit.moved_decrease,
+        "the stored norm moved the priced decrease: {:e} vs {:e}",
+        doubled.moved_decrease,
+        unit.moved_decrease
+    );
 }

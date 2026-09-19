@@ -537,12 +537,15 @@ trait ChunkedDesign {
         // #2228 reduction doctrine: `into_par_iter().fold(..).reduce(..)` groups
         // its per-worker partials by rayon's demand-driven work-stealing, so the
         // `p×p` float accumulation reassociates run-to-run with the thread
-        // schedule. Reduce the fixed row-chunk Grams through the length-only
-        // pairwise tree instead, whose association is a pure function of the
-        // chunk count — bit-reproducible across thread count and scheduling.
+        // schedule. Reduce the fixed row-chunk Grams through the pairwise tree
+        // instead, whose association is a pure function of the chunk count and
+        // the rows each chunk declares — bit-reproducible across thread count and
+        // scheduling, and split on those rows, so a few large chunks still run on
+        // several workers (#979).
         let n_chunks = starts.len();
-        Ok(gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+        Ok(gam_linalg::pairwise_reduce::par_deterministic_block_fold_by_work(
             n_chunks,
+            chunk_rows,
             |range: core::ops::Range<usize>| {
                 let mut acc = Array2::<f64>::zeros((p, p));
                 for ci in range {

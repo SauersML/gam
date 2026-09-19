@@ -703,6 +703,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
         inference: Some(FitInference {
             edf_by_block: vec![0.6, 0.9],
             penalty_block_trace: vec![],
+            edf_rank_bound: Vec::new(),
             edf_total: 1.5,
             smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
             smoothing_correction_method: Some(
@@ -737,10 +738,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             // exists to prevent.
             dispersion: Dispersion::estimated(1.1 * 1.1)
                 .expect("profiled Gaussian phi-hat = sigma-hat^2 is a valid estimate"),
-            beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
-            beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
-            beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
-            beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -774,6 +772,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                 curvature: crate::model_types::CurvatureEvidence::Measured { psd: true },
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             }),
             ..Default::default()
@@ -1068,18 +1067,25 @@ fn unified_fit_decode_validation_rejects_beta_drift_from_blocks() {
 }
 
 #[test]
-fn conditional_covariance_disagreement_is_a_typed_fit_result_invariant_2937() {
-    // gam#1789's landmine: the inference block's conditional covariance drifted
-    // from the top-level one. It is the engine breaking its own contract, and it
-    // must say so in its type rather than as `InvalidInput` (#2937).
+fn a_second_coefficient_uncertainty_store_is_a_typed_fit_result_invariant_2937() {
+    // gam#1789's landmine was a second copy of the conditional covariance that
+    // drifted from the first. With one store (gam#2955) the only other
+    // uncertainty store is the factorized standard errors, which may stand in
+    // for a covariance but never sit beside one. Publishing both is the engine
+    // breaking its own contract, and it must say so in its type rather than as
+    // `InvalidInput` (#2937). Restated from gam-2929's version of this test.
     let mut parts = decode_invariant_test_parts();
+    assert!(
+        parts.covariance_conditional.is_some(),
+        "the fixture publishes a conditional covariance"
+    );
     parts
         .inference
         .as_mut()
         .expect("fixture inference")
-        .beta_covariance = Some(array![[1.0, 0.1], [0.1, 3.0]].into());
+        .factorized_standard_errors = Some(array![1.0, 2.0]);
     let err = UnifiedFitResult::try_from_parts(parts)
-        .expect_err("a drifted inference covariance must be refused");
+        .expect_err("standard errors beside the covariance must be refused");
     assert!(
         matches!(err, EstimationError::FitResultInvariantViolated(_)),
         "unexpected variant: {err}"
@@ -1088,9 +1094,9 @@ fn conditional_covariance_disagreement_is_a_typed_fit_result_invariant_2937() {
     assert_eq!(err.variant_name(), "EstimationError::FitResultInvariantViolated");
     assert_eq!(
         err.to_string(),
-        "Invalid input: UnifiedFitResult inference conditional covariance must match \
-         top-level covariance_conditional",
-        "the refusal keeps the text it had as InvalidInput"
+        "Invalid input: UnifiedFitResult carries factorized standard errors beside a conditional \
+         covariance; the standard errors of a published covariance derive from it",
+        "the refusal names the second store"
     );
 }
 

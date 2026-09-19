@@ -351,10 +351,14 @@ fn fit_bms(
     marginal: &str,
     slope: &str,
     label: &str,
+    latent_measure: Option<&str>,
 ) -> gam::families::bms::BernoulliMarginalSlopeFitResult {
+    // A declared latent law names the marginal-slope family it is declared for.
     let cfg = FitConfig {
+        family: latent_measure.map(|_| "bernoulli-marginal-slope".to_string()),
         slope_formula: Some(slope.to_string()),
         z_column: Some("prs_z".to_string()),
+        latent_measure: latent_measure.map(str::to_string),
         ..FitConfig::default()
     };
     match fit_from_formula(marginal, data, &cfg) {
@@ -372,11 +376,14 @@ fn fit_bms(
 fn bms_publishes_the_corrected_covariance_on_a_global_empirical_measure_2484() {
     gam::init_parallelism();
     let data = prs_pc_confounded_dataset();
+    // gam#2926: the calibrated pair this correction is about is minted only by
+    // the declared conditional location-scale law.
     let out = fit_bms(
         &data,
         MARGINAL_FORMULA_CENTERS6,
         SLOPE_FORMULA_CENTERS6,
         "prs/pc-confounded BMS fit",
+        Some("conditional-location-scale"),
     );
 
     // 1. The point estimates are published. This never stopped being true, and
@@ -435,16 +442,14 @@ fn bms_publishes_the_corrected_covariance_on_a_global_empirical_measure_2484() {
 
     // 4. And the derived surfaces are populated, not just the matrix. A
     //    consumer reads standard errors, not the covariance.
-    if let Some(inference) = out.fit.inference.as_ref() {
-        let ses = inference
-            .beta_standard_errors
-            .as_ref()
-            .expect("gam#2484: standard errors must be published alongside the covariance");
-        assert!(
-            ses.iter().all(|se| se.is_finite() && *se >= 0.0),
-            "gam#2484: published standard errors must be finite and non-negative, got {ses:?}"
-        );
-    }
+    let ses = out
+        .fit
+        .beta_standard_errors()
+        .expect("gam#2484: standard errors must be published alongside the covariance");
+    assert!(
+        ses.iter().all(|se| se.is_finite() && *se >= 0.0),
+        "gam#2484: published standard errors must be finite and non-negative, got {ses:?}"
+    );
 
     // 5. gam#2943: the published standard errors are the published covariance's,
     //    for both pairs. The correction used to reach only the top-level matrices,
@@ -472,25 +477,6 @@ fn bms_publishes_the_corrected_covariance_on_a_global_empirical_measure_2484() {
             }
         }
     }
-
-    // 6. gam#2943: each inference copy equals its top-level matrix bit for bit,
-    //    the condition `UnifiedFitResult::try_from_parts` enforces on every load.
-    if let Some(inference) = out.fit.inference.as_ref() {
-        if let Some(copy) = inference.beta_covariance.as_ref() {
-            assert_eq!(
-                Some(copy.as_array()),
-                out.fit.covariance_conditional.as_ref(),
-                "gam#2943: the inference conditional covariance must equal the top-level matrix"
-            );
-        }
-        if let Some(copy) = inference.beta_covariance_corrected.as_ref() {
-            assert_eq!(
-                Some(copy),
-                out.fit.covariance_corrected.as_ref(),
-                "gam#2943: the inference corrected covariance must equal the top-level matrix"
-            );
-        }
-    }
 }
 
 #[test]
@@ -506,6 +492,7 @@ fn bms_standard_normal_latent_measure_declares_nothing_2718() {
         MARGINAL_FORMULA_CENTERS60,
         SLOPE_FORMULA_CENTERS60,
         "rank-reduced centers=60 BMS fit",
+        None,
     );
 
     assert!(
@@ -583,8 +570,10 @@ fn a_withheld_covariance_names_the_missing_channel_and_survives_the_wire_2718() 
     // And an OLD payload — written before gam#2484 split the reason from the
     // channel — must still load, with the channel simply empty. A hard
     // deserialization failure there would lock consumers out of models they
-    // could previously read.
-    let legacy = r#"{"covariance_declined":{"reason":"bms-generated-regressor-latent-measure-not-standard-normal","latent_measure":"global-empirical"}}"#;
+    // could previously read. The artifacts carry `rho_posterior`, as every
+    // readable payload's do: it persists with no default since payload v18,
+    // and an older payload is refused by version before artifacts are parsed.
+    let legacy = r#"{"rho_posterior":{"NotComputed":"NotFormedOnThisRoute"},"covariance_declined":{"reason":"bms-generated-regressor-latent-measure-not-standard-normal","latent_measure":"global-empirical"}}"#;
     let loaded: gam::estimate::FitArtifacts = serde_json::from_str(legacy)
         .expect("gam#2484: a pre-channel payload must still deserialize");
     match loaded.covariance_declined {
@@ -623,6 +612,7 @@ fn a_published_fit_ships_the_curvature_a_declination_would_be_about_2718() {
         MARGINAL_FORMULA_CENTERS6,
         SLOPE_FORMULA_CENTERS6,
         "prs/pc-confounded BMS fit (persistence arm)",
+        Some("conditional-location-scale"),
     );
 
     assert!(

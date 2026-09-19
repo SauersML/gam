@@ -40,8 +40,10 @@
 //! the lognormal AFT on the `h(t)`-warped clock. The in-Rust path is selected by
 //! `FitConfig{ survival_likelihood: "location-scale", survival_distribution:
 //! "gaussian" }` with a `Surv(...)` response (`materialize_survival` routes the
-//! RHS to the threshold/location `thresholdspec`); the `survmodel(...)` term in
-//! the formula is parsed and carried for documentary fidelity. The fit returns
+//! RHS to the threshold/location `thresholdspec`). The formula's `survmodel(...)`
+//! term is read: `spec` must name the net risk, and its `distribution` sets the
+//! residual law over `survival_distribution`, so it names the same Gaussian law.
+//! The fit returns
 //! `FitResult::SurvivalLocationScale`; the converged `UnifiedFitResult` exposes
 //! the location coefficients via `beta_threshold()` and the log-scale via
 //! `beta_log_sigma()`, and the frozen location design is rebuildable at
@@ -155,9 +157,10 @@ fn gam_lognormal_aft_interaction_recovers_truth() {
 
     // ---- fit with gam: lognormal AFT with the x0:x1 interaction ------------
     // Gaussian-residual survival location-scale == lognormal AFT (see module
-    // doc). The `survmodel(...)` term mirrors the spec verbatim; the
-    // location-scale path + Gaussian residual is what makes this the lognormal
-    // family. No noise_formula => a single constant log-scale (sigma) channel,
+    // doc). `survmodel(spec="net", distribution="gaussian")` names the one-hazard
+    // net risk and the Gaussian residual law, the law this config field also
+    // names; the location-scale path + Gaussian residual is what makes this the
+    // lognormal family. No noise_formula => a single constant log-scale (sigma) channel,
     // matching lifelines' constant `sigma_`.
     let cfg = FitConfig {
         survival_likelihood: Some("location-scale".to_string()),
@@ -181,7 +184,7 @@ fn gam_lognormal_aft_interaction_recovers_truth() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        r#"Surv(t, d) ~ x0 + x1 + x0:x1 + survmodel(spec="transformation", distribution="lognormal")"#,
+        r#"Surv(t, d) ~ x0 + x1 + x0:x1 + survmodel(spec="net", distribution="gaussian")"#,
         &ds,
         &cfg,
     )

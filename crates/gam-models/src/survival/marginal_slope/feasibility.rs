@@ -517,8 +517,28 @@ impl SurvivalMarginalSlopeFamily {
     /// evaluation's slope block from scratch", not "start it somewhere
     /// arbitrary".
     ///
-    /// Returns the retreat fraction actually applied (`0.0` when the seed was
-    /// already interior, in which case nothing is written).
+    /// # Why the retreat stops at the guard, not at the boundary
+    ///
+    /// The time block's seed contract is `q′ ≥ derivative_guard`, not `q′ > 0`,
+    /// and this is the same contract for `η′₁`: the retreat stops at the
+    /// smallest fraction with `min η′₁ ≥ derivative_guard`. The smallest
+    /// fraction with `min η′₁ > 0` is interior by the bisection's resolution
+    /// only, and the likelihood's `−log η′₁` then hands the inner solve a seed
+    /// whose gradient scales as `1/η′₁` and whose curvature scales as `1/η′₁²`.
+    /// Measured on docs/marginal-slope.md:205 (#2627): every seed started at
+    /// `min η′₁ = 1.9e-14`, with gradient `6e13` and curvature `4e27`, and every
+    /// one was refused at the reduced-face first-order KKT check before the
+    /// solver started.
+    ///
+    /// The time seed meets its guard only to the active-set solver's primal
+    /// tolerance, so the origin's `η′₁ = q′·c ≥ q′` can sit a rounding below
+    /// the guard. The retreat asks for no more than the origin provides, which
+    /// keeps its endpoint provably reachable. This moves a seed only: the step
+    /// limiter keeps the `η′₁ > 0` domain, because a guard margin there would be
+    /// a constraint on the whole search that the likelihood does not have.
+    ///
+    /// Returns the retreat fraction actually applied (`0.0` when the seed
+    /// already met the guard, in which case nothing is written).
     pub(crate) fn retreat_seed_into_follow_up_domain(
         &self,
         blocks: &mut [ParameterBlockSpec],
@@ -544,7 +564,7 @@ impl SurvivalMarginalSlopeFamily {
         let Some(margin) = self.follow_up_domain_margin(&states)? else {
             return Ok(0.0);
         };
-        if margin > 0.0 {
+        if margin >= self.derivative_guard {
             return Ok(0.0);
         }
         // The retreat direction: the slope block's own coefficients, pointing
@@ -567,18 +587,21 @@ impl SurvivalMarginalSlopeFamily {
                 .follow_up_domain_margin(&moved)?
                 .expect("the follow-up frame is what this rule is gated on"))
         };
-        if !(margin_at(1.0)? > 0.0) {
+        let origin_margin = margin_at(1.0)?;
+        if !(origin_margin > 0.0) {
             // The origin is interior whenever the time block's own guard holds,
             // so reaching here means the time seed is itself infeasible. That is
             // a different defect and this rule must not paper over it: leave the
             // seed alone and let the row evaluator refuse and name its row.
             log::warn!(
-                "[survival-marginal-slope/follow-up-domain] the slope origin does not                  restore the domain (min η′₁ = {:.6e} there, {margin:.6e} at the seed); the                  time block's derivative guard must be violated at this theta",
-                margin_at(1.0)?,
+                "[survival-marginal-slope/follow-up-domain] the slope origin does not \
+                 restore the domain (min η′₁ = {origin_margin:.6e} there, {margin:.6e} at the \
+                 seed); the time block's derivative guard must be violated at this theta",
             );
             return Ok(0.0);
         }
-        // Smallest retreat that restores the domain. `interior` is always a
+        let target = self.derivative_guard.min(origin_margin);
+        // Smallest retreat that reaches the target. `interior` is always a
         // fraction this rule has EVALUATED, never an interpolated one.
         let mut exterior = 0.0_f64;
         let mut interior = 1.0_f64;
@@ -596,7 +619,7 @@ impl SurvivalMarginalSlopeFamily {
             if midpoint <= exterior || midpoint >= interior {
                 break;
             }
-            if margin_at(midpoint)? > 0.0 {
+            if margin_at(midpoint)? >= target {
                 interior = midpoint;
             } else {
                 exterior = midpoint;
@@ -604,7 +627,10 @@ impl SurvivalMarginalSlopeFamily {
         }
         let retreated = &states[slope].beta * (1.0 - interior);
         log::info!(
-            "[survival-marginal-slope/follow-up-domain] warm-start slope seed was outside              the domain (min η′₁ = {margin:.6e}); retreated {:.4}% toward the block origin",
+            "[survival-marginal-slope/follow-up-domain] warm-start slope seed was short of \
+             the derivative guard (min η′₁ = {margin:.6e}, guard {:.6e}); retreated {:.4}% \
+             toward the block origin",
+            self.derivative_guard,
             100.0 * interior,
         );
         blocks[slope].initial_beta = Some(retreated);

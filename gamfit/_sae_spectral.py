@@ -772,6 +772,34 @@ class ComposedContract:
 
 
 @dataclass(frozen=True)
+class StageContainment:
+    """One stage's entry requirement in a whole-set containment claim.
+
+    Every true and realized trajectory from the initial ball enters the stage
+    within ``required_radius = nominal_offset + nominal_spread + drift`` of the
+    certificate's center; ``contained`` is whether that radius plus its
+    ``rounding_band`` fits the stage's domain radius.
+    """
+
+    nominal_spread: float
+    drift: float
+    nominal_offset: float
+    required_radius: float
+    rounding_band: float
+    contained: bool
+
+
+@dataclass(frozen=True)
+class WholeSetContainment:
+    """A contract chain's shadowing bound checked over a declared ball of inputs."""
+
+    composed: ComposedContract
+    initial_radius: float
+    stages: list[StageContainment]
+    contained: bool
+
+
+@dataclass(frozen=True)
 class HolonomyReport:
     """Net ``O(2)`` element of a closed loop of circle isometries."""
 
@@ -782,15 +810,58 @@ class HolonomyReport:
     angle_tolerance: float
 
 
-def compose_contracts(chain: list[tuple[str, float, float, float]]) -> ComposedContract:
-    """Compose a chain of ``(name, domain_radius, defect, lipschitz)`` contracts
-    into one end-to-end shadowing bound."""
-    stages = [(str(n), float(dr), float(de), float(li)) for n, dr, de, li in chain]
-    payload = rust_module().compose_contracts(stages)
+def _contract_tuples(chain: list[tuple[str, float, float, float]]) -> list[tuple[str, float, float, float]]:
+    return [(str(n), float(dr), float(de), float(li)) for n, dr, de, li in chain]
+
+
+def _composed_contract(payload: dict) -> ComposedContract:
     return ComposedContract(
         total_defect=float(payload["total_defect"]),
         per_stage_contribution=[float(v) for v in payload["per_stage_contribution"]],
         domain_ok=bool(payload["domain_ok"]),
+    )
+
+
+def compose_contracts(chain: list[tuple[str, float, float, float]]) -> ComposedContract:
+    """Compose a chain of ``(name, domain_radius, defect, lipschitz)`` contracts
+    into one end-to-end shadowing bound."""
+    return _composed_contract(rust_module().compose_contracts(_contract_tuples(chain)))
+
+
+def whole_set_containment(
+    chain: list[tuple[str, float, float, float]],
+    initial_radius: float,
+    nominal_offsets: list[float],
+) -> WholeSetContainment:
+    """Check that a ``(name, domain_radius, defect, lipschitz)`` contract chain's
+    shadowing bound holds for every input within ``initial_radius`` of the
+    nominal input, not only at the nominal input.
+
+    ``nominal_offsets[k]`` is stage ``k + 1``'s declared distance from the
+    nominal trajectory to the center of its certified ball (0 when the
+    certificate was built about the nominal trajectory). Every validation
+    happens in Rust.
+    """
+    payload = rust_module().whole_set_containment(
+        _contract_tuples(chain),
+        float(initial_radius),
+        [float(v) for v in nominal_offsets],
+    )
+    return WholeSetContainment(
+        composed=_composed_contract(payload["composed"]),
+        initial_radius=float(payload["initial_radius"]),
+        stages=[
+            StageContainment(
+                nominal_spread=float(stage["nominal_spread"]),
+                drift=float(stage["drift"]),
+                nominal_offset=float(stage["nominal_offset"]),
+                required_radius=float(stage["required_radius"]),
+                rounding_band=float(stage["rounding_band"]),
+                contained=bool(stage["contained"]),
+            )
+            for stage in payload["stages"]
+        ],
+        contained=bool(payload["contained"]),
     )
 
 

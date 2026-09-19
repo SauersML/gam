@@ -332,6 +332,10 @@ impl CertifiedOuterCandidate {
         }
     }
 
+    fn result(&self) -> &OuterResult {
+        &self.0
+    }
+
     fn into_result(self) -> OuterResult {
         self.0
     }
@@ -420,7 +424,7 @@ impl crate::estimate::outer_eval_capture::OuterSeedProbe for RunnerSeedProbe<'_>
     }
 }
 
-/// Execute a single plan attempt (seed generation → solver loop → best result).
+/// Execute a single plan attempt (derived start → solver loop → best result).
 ///
 /// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
 /// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
@@ -453,8 +457,10 @@ pub(crate) fn run_outer_with_plan(
     let mut best: Option<CertifiedOuterCandidate> = None;
     // The evaluated state the search ended on when it did not certify: a
     // refused certification or a budget-exhausted iterate. It is the resume
-    // checkpoint (#2596, #2627).
-    let mut best_checkpoint: Option<OuterResult> = None;
+    // checkpoint, and it is what a certified winner is compared against before
+    // it publishes (#2596, #2627). An earlier plan attempt's lowest state starts
+    // it (#2953).
+    let mut best_checkpoint: Option<OuterResult> = config.carried_checkpoint.clone();
     // Confirmed-tail snapped reseed published by a refused certification
     // (#2348 Inc 2b). Consumed once, after the search, for a single polishing
     // retry pinned at the snapped rail point.
@@ -1302,6 +1308,7 @@ pub(crate) fn run_outer_with_plan(
                         value: seed_eval.cost,
                         gradient: seed_eval.gradient,
                         hessian: seed_hessian,
+                        decrement_bands: None,
                     };
 
                     let mut optimizer = ArcOptimizer::new(seed.clone(), objective)
@@ -2190,6 +2197,9 @@ pub(crate) fn run_outer_with_plan(
                                     // The stall window's evidence travels with the
                                     // result as reported text only (#2817).
                                     result.cost_stall_probe_scale = exit.probe_scale;
+                                    // So does a halt where the search's kept rank
+                                    // ends (#2939).
+                                    result.rank_boundary_stall = exit.rank_boundary;
                                     // The mandatory final analytic certificate
                                     // judges this point by its own ladder, and
                                     // the guard claimed it only inside that
@@ -2402,6 +2412,191 @@ pub(crate) fn run_outer_with_plan(
                 seed_rejections.push(SeedRejection::from_estimation_error(seed_idx, "solver", &e));
             }
         }
+    }
+
+    // #2596, #2627 — a certified winner that an evaluated state of this attempt
+    // beats does not publish.
+    //
+    // A certificate answers "is this ρ stationary?". It does not answer "is this
+    // the best ρ we found?". The two come apart on a face of the declared domain:
+    // the criterion is flat there and the box-KKT projection leaves |Pg|
+    // negligible whatever the criterion scores, so a face seed certifies in zero
+    // iterations while the interior searches that already reached far lower
+    // values end on a refused certificate or an exhausted budget. Publishing the
+    // face shipped an intercept-only fit on #2596 (110.94 over a refused 4.19),
+    // #561 seed 201 (315.15 over 230.68) and the penguins species fit (272.66
+    // over an evaluated 21.44). The warning that named each inversion published
+    // anyway.
+    //
+    // The incumbent is the lowest checkpoint the attempt kept. Its stored value is
+    // where a search stopped, so it is re-evaluated at its own ρ before it can
+    // outrank anything. The gap is judged at the criterion's own rounding
+    // envelope, [`outer_value_agreement_bound`], because two values of one
+    // criterion closer than that cannot be ranked. Beyond it the winner loses.
+    // The search continues once from the incumbent, with the same one-shot reseed
+    // the tail-snap and saddle-escape retries use. If that does not certify, the
+    // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
+    // incumbent is the resume checkpoint. When the objective refuses to
+    // re-evaluate the incumbent, its stored value, the criterion's own evaluation
+    // at that ρ, decides the gap, and no search continues from a point the
+    // objective refuses (#2953).
+    let mut dominance: Option<(f64, f64)> = None;
+    // Why the incumbent could not be re-evaluated at its own ρ, when it could not.
+    let mut reevaluation_refusal: Option<EstimationError> = None;
+    if let (Some(certified), Some(incumbent)) = (best.as_ref(), best_checkpoint.as_ref()) {
+        let winner_value = certified.result().final_value;
+        let cached_band =
+            crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent.final_value);
+        if winner_value.is_finite()
+            && incumbent.final_value.is_finite()
+            && winner_value - incumbent.final_value > cached_band
+        {
+            let incumbent_rho = incumbent.rho.clone();
+            obj.reset();
+            install_matching_initial_inner_seed(obj, config, &incumbent_rho, context)?;
+            let incumbent_value = match obj.eval_cost(&incumbent_rho) {
+                Ok(value) => value,
+                // The stored checkpoint cannot be re-evaluated at its own ρ. Its stored
+                // value is the criterion's evaluation there and beats the winner beyond
+                // the envelope, so the winner is declined on it (#2953).
+                Err(error) if error.is_trial_point_infeasible() => {
+                    log::warn!(
+                        "[OUTER] {context}: certified winner rho={:?} cost={:.6e} sits above a stored \
+                         checkpoint rho={:?} cost={:.6e} by more than the criterion's rounding envelope \
+                         {:.3e}, and re-evaluating that checkpoint was refused ({error}); the winner is \
+                         declined on the stored value, and no search continues from the checkpoint \
+                         (#2953)",
+                        certified.result().rho.to_vec(),
+                        winner_value,
+                        incumbent_rho.to_vec(),
+                        incumbent.final_value,
+                        cached_band,
+                    );
+                    reevaluation_refusal = Some(error);
+                    incumbent.final_value
+                }
+                Err(error) => return Err(error),
+            };
+            obj.reset();
+            let band =
+                crate::rho_optimizer::outer_value_agreement_bound(winner_value, incumbent_value);
+            if incumbent_value.is_finite() && winner_value - incumbent_value > band {
+                dominance = Some((incumbent_value, band));
+            }
+        }
+    }
+    if let Some((incumbent_value, band)) = dominance
+        && let Some(certified) = best.take()
+        && let Some(mut incumbent) = best_checkpoint.take()
+    {
+        let plateau = certified.into_result();
+        incumbent.final_value = incumbent_value;
+        let gap = plateau.final_value - incumbent.final_value;
+        let reevaluated = reevaluation_refusal.is_none();
+        let mut continuation = match reevaluation_refusal {
+            // No search can start from a point the objective refuses.
+            Some(refusal) => DominanceContinuationStop::Failed {
+                error: format!(
+                    "re-evaluating the checkpoint at its own rho was refused: {refusal}"
+                ),
+            },
+            None => {
+                log::warn!(
+                    "[OUTER] {context}: certified winner rho={:?} cost={:.6e} is dominated by an \
+                     evaluated state rho={:?} cost={:.6e} (gap {:.3e} > the criterion's rounding \
+                     envelope {:.3e}); it is not published, and the search continues from that \
+                     state (#2596, #2627)",
+                    plateau.rho.to_vec(),
+                    plateau.final_value,
+                    incumbent.rho.to_vec(),
+                    incumbent.final_value,
+                    gap,
+                    band,
+                );
+                DominanceContinuationStop::NotRun
+            }
+        };
+        if allow_tail_snap_reseed && reevaluated {
+            let mut retry_config = config.clone();
+            // The continuation judges what it certifies against the state it starts from, so it
+            // cannot publish the optimum that state just beat (#2953).
+            retry_config.carried_checkpoint = Some(carried_checkpoint_of(&incumbent));
+            retry_config.initial_rho = Some(incumbent.rho.clone());
+            match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
+                Ok(PlanRunOutcome::Exhausted(retry_checkpoint)) => {
+                    log::warn!(
+                        "[OUTER] {context}: the retry from the dominating incumbent exhausted \
+                         at cost {:.6e} without certifying (#2627)",
+                        retry_checkpoint.final_value,
+                    );
+                    continuation = DominanceContinuationStop::Exhausted {
+                        final_value: retry_checkpoint.final_value,
+                    };
+                    // The whole retry result, not its point and value alone: every
+                    // other field describes the point it stopped at, and a gradient
+                    // left from the incumbent's own point is how the #2953 floor
+                    // certified a non-stationary ρ.
+                    if retry_checkpoint.final_value < incumbent.final_value {
+                        incumbent = retry_checkpoint;
+                    }
+                }
+                Ok(PlanRunOutcome::DominatedPlateau(retry)) => {
+                    log::warn!(
+                        "[OUTER] {context}: the retry from the dominating incumbent ended on \
+                         another dominated plateau at cost {:.6e} (#2627)",
+                        retry.plateau.final_value,
+                    );
+                    continuation = DominanceContinuationStop::DominatedAgain {
+                        plateau_value: retry.plateau.final_value,
+                    };
+                    if retry.incumbent.final_value < incumbent.final_value {
+                        incumbent = retry.incumbent;
+                    }
+                }
+                // The continuation certified under the screening certificate. It publishes
+                // only if the terminal certificate agrees, so the declined optimum rides on
+                // it for the refusal that follows otherwise (#2953).
+                Ok(PlanRunOutcome::Converged(mut retry_result)) => {
+                    retry_result.dominated_plateau = lowest_dominated_plateau(
+                        retry_result.dominated_plateau.take(),
+                        Some(DominatedPlateauRecord {
+                            plateau_rho: plateau.rho,
+                            plateau_value: plateau.final_value,
+                            gap,
+                            band,
+                            continuation: DominanceContinuationStop::Certified {
+                                final_value: retry_result.final_value,
+                            },
+                        }),
+                    );
+                    return Ok(with_enclosing_attempt_ledger(
+                        PlanRunOutcome::Converged(retry_result),
+                        spent_seed_iterations,
+                    ));
+                }
+                Ok(outcome) => {
+                    return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
+                }
+                Err(retry_error) => {
+                    log::warn!(
+                        "[OUTER] {context}: the retry from the dominating incumbent failed \
+                         ({retry_error}); returning the dominated plateau with the incumbent as \
+                         the resume checkpoint (#2627)"
+                    );
+                    continuation = DominanceContinuationStop::Failed {
+                        error: retry_error.to_string(),
+                    };
+                }
+            }
+        }
+        incumbent.iterations = spent_seed_iterations;
+        return Ok(PlanRunOutcome::DominatedPlateau(DominatedPlateau {
+            plateau,
+            incumbent,
+            gap,
+            band,
+            continuation,
+        }));
     }
 
     if let Some(certified) = best {

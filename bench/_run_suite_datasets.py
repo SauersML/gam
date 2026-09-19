@@ -707,41 +707,12 @@ def _survival_eval_horizon(train_df: pd.DataFrame, time_col: str) -> float:
     return horizon
 
 
-def _rust_survival_fit_options_for_scenario(scenario_name: typing.Any) -> typing.Any:
+def _rust_survival_fit_cli_args() -> list[str]:
     # Survival time effects must use a structurally monotone basis so the
-    # fitted cumulative baseline cannot violate survival semantics.
-    if scenario_name in {"icu_survival_death", "icu_survival_los"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 10,
-        }
-    if scenario_name in {"heart_failure_survival", "cirrhosis_survival"}:
-        return {
-            "time_basis": "ispline",
-            "time_degree": 3,
-            "time_num_internal_knots": 8,
-        }
-    return {
-        "time_basis": "ispline",
-        "time_degree": 3,
-        "time_num_internal_knots": 8,
-    }
-
-
-def _rust_survival_fit_cli_args(scenario_name: str) -> list[str]:
-    cfg = _rust_survival_fit_options_for_scenario(scenario_name)
-    args: list[str] = []
-    for key in (
-        "time_basis",
-        "time_degree",
-        "time_num_internal_knots",
-    ):
-        if key not in cfg:
-            continue
-        cli_key = "--" + key.replace("_", "-")
-        args.extend([cli_key, str(cfg[key])])
-    return args
+    # fitted cumulative baseline cannot violate survival semantics. The basis's
+    # degree and knot count are the library's: gam fit has no flags for them
+    # since 9419ed8fa4 (#2899).
+    return ["--time-basis", "ispline"]
 
 
 def _load_lidar_dataset() -> typing.Any:
@@ -1272,7 +1243,7 @@ def _synthetic_geo_disease_eas_dataset(n: typing.Any=6000, seed: typing.Any=2026
 
 def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(
-        r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
+        r"^geo_disease_(eas|eas3)_(tp|duchon|matern)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
         str(name),
     )
     if m is None:
@@ -1281,47 +1252,15 @@ def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 3 if family_code == "eas3" else 16
-    if basis_code == "tp":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "thinplate",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
-    if basis_code == "duchon":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "duchon",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
-    if basis_code == "matern":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "matern",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
+    smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
     return {
-        "smooth_basis": "ps",
-        "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
+        "smooth_basis": smooth_basis,
+        "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
-        "pc_layout": "additive",
     }
 
 
@@ -1353,23 +1292,13 @@ def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
 
 
 def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     is_four_pc = m.group(1) is not None
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 4 if is_four_pc else 16
-    if basis_code == "psperpc":
-        return {
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("papuan_oce", n_pcs)
     return {
@@ -1379,7 +1308,6 @@ def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
-        "pc_layout": "joint",
     }
 
 
@@ -1389,21 +1317,11 @@ def _synthetic_papuan_oce_dataset(n: typing.Any=6000, seed: typing.Any=20260315,
 
 
 def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^geo_subpop16_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     basis_code = m.group(1)
     knots = max(4, int(m.group(2)))
-    if basis_code == "psperpc":
-        return {
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, 17)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": 16,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("geo_subpop16", 16)
     return {
@@ -1413,28 +1331,16 @@ def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 16,
-        "pc_layout": "joint",
     }
 
 
 def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     mode_code = m.group(1)
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
-    if basis_code == "psperpc":
-        return {
-            "mode_code": mode_code,
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, 7)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": 6,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("geo_latlon", 6)
     return {
@@ -1445,7 +1351,6 @@ def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 6,
-        "pc_layout": "joint",
     }
 
 

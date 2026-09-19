@@ -223,7 +223,8 @@ pub struct BlockwiseFitResultParts {
     /// Tuple layout: `(edf_total, edf_by_penalty, block_edf, penalty_trace)`,
     /// where `penalty_trace[k] = λ_k·tr(H⁻¹S_k)` feeds the per-term EDF
     /// decomposition `|coeff_range| − Σ tr_k` (issue #1219).
-    pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
+    pub precomputed_edf:
+        Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)>,
     /// Selected per-component log-smoothing parameters of the full-width JOINT
     /// penalty at ρ* (gam#1587/#561). Surfaced on `FitArtifacts.joint_log_lambdas`
     /// so a joint-penalized family (the multinomial centered metric) can recover
@@ -313,7 +314,10 @@ pub(crate) fn custom_family_blockwise_edf(
     penalized_hessian: &Array2<f64>,
     specs: &[ParameterBlockSpec],
     lambdas: &ndarray::ArrayView1<'_, f64>,
-) -> Result<(f64, Vec<f64>, Vec<f64>, Vec<f64>), CustomFamilyError> {
+) -> Result<
+    (f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>),
+    CustomFamilyError,
+> {
     use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
 
     let p = penalized_hessian.nrows();
@@ -343,12 +347,27 @@ pub(crate) fn custom_family_blockwise_edf(
         format!("custom-family edf: exact penalized-Hessian factorization failed: {error}")
     })?;
 
-    // Raw per-penalty traces and their block ranks, handed to the shared
-    // accounting below. Admission, the non-finite resolution and the
-    // `[mp, p]` floor are stated once in `penalized_edf_bundle` (#2470);
-    // this route previously floored `edf_total` at 0, which permits an
-    // effective dimension below the joint penalty null space.
+    // Per-penalty traces, the rounding band of the solve behind each, each
+    // penalty's rank-bound certificate and their block ranks, handed to the shared
+    // accounting below (#2470, #2901). A custom family's penalized Hessian is the
+    // observed information of an arbitrary likelihood, so `H ⪰ λ_k S_k` is
+    // certified per penalty from the inertia of `H − λ_k S_k` shifted by its rounding
+    // band. The tilted double well of
+    // #2366 traces 2.945 against a rank of 1 at a certified mode and publishes that
+    // trace unclamped. This route previously floored `edf_total` at 0, which permits
+    // an effective dimension below the joint penalty null space.
+    let solve = |values: &mut [f64]| -> Result<(), String> {
+        let solved = factor.solve(&ndarray::Array1::from(values.to_vec()))?;
+        for (slot, value) in values.iter_mut().zip(solved.iter()) {
+            *slot = *value;
+        }
+        Ok(())
+    };
+    let inverse_one_norm = gam_linalg::condition::estimate_inverse_one_norm(p, solve, solve)
+        .map_err(|error| format!("custom-family edf: inverse-norm estimate failed: {error}"))?;
     let mut raw_traces = vec![0.0_f64; expected_rho];
+    let mut trace_bands = vec![0.0_f64; expected_rho];
+    let mut rank_bounds = Vec::with_capacity(expected_rho);
     let mut penalty_ranks = vec![0_usize; expected_rho];
     // `Σ_k S_k` in the joint layout, whose rank gives the null-space floor.
     // Unscaled on purpose: the floor is a structural property of the penalty
@@ -379,19 +398,21 @@ pub(crate) fn custom_family_blockwise_edf(
             // multi-penalty block; consulting `nullspace_dims` here is also
             // incorrect after canonical pullback, which intentionally clears
             // stale pre-transform nullities.
-            let penalty_rank = penalty_matrix_root(&s_local)
-                .map_err(|error| {
-                    format!(
-                        "custom-family edf: penalty {global_k} rank factorization failed: {error}"
-                    )
-                })?
-                .nrows();
+            let root = penalty_matrix_root(&s_local).map_err(|error| {
+                format!("custom-family edf: penalty {global_k} rank factorization failed: {error}")
+            })?;
+            let penalty_rank = root.nrows();
             let mut s_full = Array2::<f64>::zeros((p, p));
+            // The root's rows are its modes (`S_k = RᵀR`); they become the columns
+            // of the right-hand side in the joint layout.
+            let mut root_columns = Array2::<f64>::zeros((p, penalty_rank));
             if s_local.nrows() == p && s_local.ncols() == p {
                 s_full.assign(&s_local);
+                root_columns.assign(&root.t());
             } else if s_local.nrows() == block_cols && s_local.ncols() == block_cols {
                 let r = block_col_start..block_col_start + block_cols;
-                s_full.slice_mut(ndarray::s![r.clone(), r]).assign(&s_local);
+                s_full.slice_mut(ndarray::s![r.clone(), r.clone()]).assign(&s_local);
+                root_columns.slice_mut(ndarray::s![r, ..]).assign(&root.t());
             } else {
                 return Err(CustomFamilyError::trial_point(format!(
                     "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
@@ -399,16 +420,42 @@ pub(crate) fn custom_family_blockwise_edf(
                     s_local.ncols()
                 )));
             }
-            // tr(H⁻¹ S_k) via H Z = S_k, summing the diagonal of Z.
-            let z = factor.solvemulti(&s_full).map_err(|e| {
-                format!("custom-family edf trace solve failed for penalty {global_k}: {e}")
-            })?;
-            let mut trace = 0.0_f64;
-            for d in 0..p {
-                trace += z[[d, d]];
+            // λ_k tr(H⁻¹S_k) = λ_k Σ_c r_cᵀ H⁻¹ r_c over the root columns, priced
+            // against the Hessian the solve represents.
+            if lambda > 0.0 {
+                let solution = factor.solvemulti(&root_columns).map_err(|e| {
+                    format!("custom-family edf trace solve failed for penalty {global_k}: {e}")
+                })?;
+                let (trace, band) = gam_linalg::roundoff::solved_penalty_trace(
+                    lambda,
+                    root_columns.view(),
+                    solution.view(),
+                    penalized_hessian.view(),
+                    inverse_one_norm,
+                )
+                .map_err(|error| {
+                    format!("custom-family edf: penalty {global_k} trace band failed: {error}")
+                })?;
+                raw_traces[global_k] = trace;
+                trace_bands[global_k] = band;
             }
+            // `λ_k S_k` on the block it penalizes: a full-width penalty at the origin, a
+            // local one at this block's columns.
+            let block_start = if s_local.nrows() == p { 0 } else { block_col_start };
+            rank_bounds.push(
+                gam_solve::estimate::numerical_rank_bound(
+                    penalized_hessian.view(),
+                    (&s_local * lambda.max(0.0)).view(),
+                    block_start,
+                    gam_runtime::resource::MemoryGovernor::global(),
+                )
+                .map_err(|error| CustomFamilyError::NumericalFailure {
+                    reason: format!(
+                        "custom-family edf: penalty {global_k} rank certificate failed: {error}"
+                    ),
+                })?,
+            );
             joint_penalty += &s_full;
-            raw_traces[global_k] = if lambda > 0.0 { lambda * trace } else { 0.0 };
             penalty_ranks[global_k] = penalty_rank;
         }
         penalty_offset += spec.penalties.len();
@@ -418,23 +465,39 @@ pub(crate) fn custom_family_blockwise_edf(
     let joint_penalty_rank = penalty_matrix_root(&joint_penalty)
         .map_err(|error| CustomFamilyError::trial_point(format!("custom-family edf: joint penalty rank failed: {error}")))?
         .nrows();
-    let bundle = gam_solve::estimate::penalized_edf_bundle(
+    let bundle = gam_solve::estimate::penalized_edf_bundle_within_bands(
         &raw_traces,
+        &trace_bands,
+        &rank_bounds,
         &penalty_ranks,
         p,
         (p - joint_penalty_rank.min(p)) as f64,
-    );
+    )
+    .map_err(|error| CustomFamilyError::NumericalFailure {
+        reason: format!("custom-family edf: {error}"),
+    })?;
     let edf_by_penalty = bundle.edf_by_block;
     let penalty_trace = bundle.penalty_block_trace;
+    let rank_bound = bundle.rank_bound;
     // A block's edf is its column count minus the trace its penalties spend, so
     // multiple penalties on one block compose. It is built from the ADMITTED
     // traces above, not the raw products, so the block figure and the per-penalty
-    // figures cannot disagree about how much each penalty absorbed.
+    // figures cannot disagree about how much each penalty absorbed. It is clamped
+    // to the block's column count only when every penalty on the block is certified
+    // (#2901).
     let block_edf: Vec<f64> = block_spans
         .iter()
         .map(|&(start, count, block_cols)| {
             let spent: f64 = penalty_trace[start..start + count].iter().sum();
-            (block_cols as f64 - spent).clamp(0.0, block_cols as f64)
+            let raw = block_cols as f64 - spent;
+            if rank_bound[start..start + count]
+                .iter()
+                .all(gam_solve::estimate::EdfRankBound::is_certified)
+            {
+                raw.clamp(0.0, block_cols as f64)
+            } else {
+                raw
+            }
         })
         .collect();
     let edf_total = bundle.edf_total;
@@ -445,7 +508,7 @@ pub(crate) fn custom_family_blockwise_edf(
     {
         return Err(CustomFamilyError::trial_point("custom-family edf: non-finite effective degrees of freedom".to_string()));
     }
-    Ok((edf_total, edf_by_penalty, block_edf, penalty_trace))
+    Ok((edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound))
 }
 
 /// Compute reduced-space effective degrees of freedom for a converged fit,
@@ -463,7 +526,7 @@ pub(crate) fn reduced_blockwise_edf(
     reduced_geometry: Option<&FitGeometry>,
     canonical: &gam_identifiability::canonical::CanonicalSpecs,
     lambdas: &Array1<f64>,
-) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)> {
+) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)> {
     let geom = reduced_geometry?;
     match custom_family_blockwise_edf(
         geom.penalized_hessian.as_array(),
@@ -492,19 +555,18 @@ fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), Cus
     })
 }
 
-/// Assemble the first-order corrected covariance `V_c = V_cond + C` and the
-/// standard errors published beside it (#2346).
+/// Assemble the first-order corrected covariance `V_c = V_cond + C` (#2346).
 ///
-/// The standard errors go through `gam_problem::se_from_covariance` — the same
-/// gate the standard GAM lane, the GAMLSS builders and the penalty path already
-/// use — rather than a local `max(0, ·)` clamp. `V_c` is a *sum*, not a
-/// factorization, so a large negative correction on a weakly identified
-/// coefficient can drive a diagonal materially negative. A clamp publishes that
-/// coefficient with `SE = 0`, i.e. infinite precision and a Wald `p ≈ 0`;
-/// snapping a negative diagonal to zero is legitimate only inside the
-/// dimension-scaled backward-error bound, which is exactly the judgement
-/// `se_from_covariance` owns.
-fn corrected_covariance_and_standard_errors(
+/// Its diagonal goes through `gam_problem::se_from_covariance`, the gate the
+/// published standard errors are derived under (gam#2955), rather than a local
+/// `max(0, ·)` clamp. `V_c` is a *sum*, not a factorization, so a large negative
+/// correction on a weakly identified coefficient can drive a diagonal
+/// materially negative. A clamp publishes that coefficient with `SE = 0`, i.e.
+/// infinite precision and a Wald `p ≈ 0`; snapping a negative diagonal to zero
+/// is legitimate only inside the dimension-scaled backward-error bound, which is
+/// exactly the judgement `se_from_covariance` owns. Refusing here names the
+/// custom-family lane in the error, before the fit is minted.
+fn corrected_covariance(
     smoothing_corrected: Option<&(
         Array2<f64>,
         gam_solve::model_types::SmoothingCorrectionMethod,
@@ -515,31 +577,25 @@ fn corrected_covariance_and_standard_errors(
         Option<Array2<f64>>,
         Option<gam_solve::model_types::SmoothingCorrectionMethod>,
         Option<Array2<f64>>,
-        Option<Array1<f64>>,
     ),
     CustomFamilyError,
 > {
     let (Some((correction, method)), Some(v_cond)) = (smoothing_corrected, covariance_conditional)
     else {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None));
     };
     if correction.dim() != v_cond.dim() {
-        return Ok((None, None, None, None));
+        return Ok((None, None, None));
     }
     let corrected = v_cond + correction;
-    let standard_errors = gam_problem::se_from_covariance(&corrected).map_err(|reason| {
+    gam_problem::se_from_covariance(&corrected).map_err(|reason| {
         CustomFamilyError::NumericalFailure {
             reason: format!(
                 "corrected covariance V_c = V_cond + C has an invalid diagonal: {reason}"
             ),
         }
     })?;
-    Ok((
-        Some(correction.clone()),
-        Some(*method),
-        Some(corrected),
-        Some(standard_errors),
-    ))
+    Ok((Some(correction.clone()), Some(*method), Some(corrected)))
 }
 
 #[cfg(test)]
@@ -558,7 +614,7 @@ mod corrected_covariance_tests {
     fn corrected_standard_errors_are_the_covariance_diagonal_roots() {
         let v_cond = Array2::from_diag(&Array1::from_vec(vec![4.0, 9.0]));
         let correction = Array2::from_diag(&Array1::from_vec(vec![5.0, 7.0]));
-        let (_, _, corrected, se) = corrected_covariance_and_standard_errors(
+        let (_, _, corrected) = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
         )
@@ -566,7 +622,9 @@ mod corrected_covariance_tests {
         let corrected = corrected.expect("corrected covariance is published");
         assert_eq!(corrected[[0, 0]], 9.0);
         assert_eq!(corrected[[1, 1]], 16.0);
-        let se = se.expect("corrected standard errors are published");
+        // The published standard errors are derived from this one matrix (gam#2955).
+        let se = gam_problem::se_from_covariance(&corrected)
+            .expect("the corrected diagonal yields standard errors");
         assert_eq!(se[0], 3.0);
         assert_eq!(se[1], 4.0);
     }
@@ -579,7 +637,7 @@ mod corrected_covariance_tests {
         // is 0 — so the guard is that assembly now fails instead.
         let v_cond = Array2::from_diag(&Array1::from_vec(vec![4.0, 1.0]));
         let correction = Array2::from_diag(&Array1::from_vec(vec![0.0, -3.0]));
-        let error = corrected_covariance_and_standard_errors(
+        let error = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
         )
@@ -595,7 +653,7 @@ mod corrected_covariance_tests {
     fn a_dimension_mismatched_correction_publishes_no_corrected_pair() {
         let v_cond = Array2::from_diag(&Array1::from_vec(vec![4.0, 9.0]));
         let correction = Array2::from_diag(&Array1::from_vec(vec![1.0]));
-        let (correction_out, method, corrected, se) = corrected_covariance_and_standard_errors(
+        let (correction_out, method, corrected) = corrected_covariance(
             Some(&(correction, first_order_method())),
             Some(&v_cond),
         )
@@ -603,7 +661,6 @@ mod corrected_covariance_tests {
         assert!(correction_out.is_none());
         assert!(method.is_none());
         assert!(corrected.is_none());
-        assert!(se.is_none());
     }
 }
 
@@ -678,6 +735,7 @@ mod assembly_convergence_tests {
             curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         let error =
@@ -904,19 +962,25 @@ pub fn blockwise_fit_from_parts(
     // (CTN transformation-normal, Dirichlet, …) reports `edf_total` /
     // per-block `edf` like the standard GAM path, instead of leaving inference
     // unpopulated. Optional row evidence is not part of this calculation.
-    let (edf_total, edf_by_penalty, block_edf, penalty_trace): (f64, Vec<f64>, Vec<f64>, Vec<f64>) =
+    let (edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound): (
+        f64,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<gam_solve::estimate::EdfRankBound>,
+    ) =
         match precomputed_edf {
             // Reduced-space edf supplied by the caller (the principled path:
             // the trace is computed where the Hessian is full rank, then
             // reported on the raw fit — exact because the trace edf is
             // reparameterization-invariant).
-            Some((edf_total, edf_by_penalty, block_edf, penalty_trace)) => {
-                (edf_total, edf_by_penalty, block_edf, penalty_trace)
+            Some((edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound)) => {
+                (edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound)
             }
             // Compute from coefficient precision when the caller did not already
             // supply the basis-invariant reduced-space traces.
             None => {
-                let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
+                let (edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound) =
                     custom_family_blockwise_edf(
                         geom.penalized_hessian.as_array(),
                         specs,
@@ -928,7 +992,7 @@ pub fn blockwise_fit_from_parts(
                             "{reason}; refusing to assemble a fit without EDF/inference"
                         ),
                     })?;
-                (edf_total, edf_by_penalty, block_edf, penalty_trace)
+                (edf_total, edf_by_penalty, block_edf, penalty_trace, rank_bound)
             }
         };
 
@@ -966,29 +1030,17 @@ pub fn blockwise_fit_from_parts(
     // #2346: publish the first-order corrected covariance when the outer ρ
     // curvature supplied one — `V_c = V_cond + C`, with the correction matrix
     // and its typed method provenance carried exactly like the standard lane.
-    let (smoothing_correction, smoothing_correction_method, corrected_cov, corrected_se) =
-        corrected_covariance_and_standard_errors(
+    let (smoothing_correction, smoothing_correction_method, corrected_cov) =
+        corrected_covariance(
             smoothing_corrected.as_ref(),
             covariance_conditional.as_ref(),
         )?;
-    // #2296 moved every display surface onto `display_coefficient_uncertainty()`
-    // (`gam-solve/src/model_types/result_types.rs:4281`), which selects on the
-    // inference block's STANDARD ERRORS and never on the covariance matrices —
-    // deliberately, so a presenter can never pair one definition's SEs with
-    // another definition's matrix. This lane published `covariance_conditional`
-    // to the top-level slot but left both inference-block conditional fields
-    // `None`, so the accessor saw no SEs under either definition, returned
-    // `None`, and `covariance_kind` / `covariance_n` / `covariance_flat` came
-    // back absent on every custom-family fit — a covariance that had been
-    // computed, validated (finite and `(p, p)`, above) and stored, then dropped
-    // at the read boundary. Publish the pair the accessor reads.
-    //
-    // `try_from_parts` requires `inference.beta_covariance` to equal the
-    // top-level `covariance_conditional` bitwise
-    // (`result_types.rs:3759-3769`), so this clones exactly that array and
-    // nothing else; `se_from_covariance` is the same diagonal gate the
-    // corrected pair goes through two lines above.
-    let conditional_se = covariance_conditional
+    // The published standard errors derive from the top-level covariance, the
+    // one store (gam#2955), so `display_coefficient_uncertainty()` (#2296) sees
+    // this lane's pairs whenever the matrices are published. The conditional
+    // diagonal goes through the same gate the corrected pair goes through above,
+    // so a refusal names this lane before the fit is minted (gam-2929).
+    covariance_conditional
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -1000,6 +1052,7 @@ pub fn blockwise_fit_from_parts(
     let inference = Some(gam_solve::model_types::FitInference {
         edf_by_block: edf_by_penalty,
         penalty_block_trace: penalty_trace,
+        edf_rank_bound: rank_bound,
         edf_total,
         // This custom-family lane only ever computes the first-order IFT
         // correction (never a cubature upgrade — see `smoothing_corrected`'s
@@ -1014,12 +1067,7 @@ pub fn blockwise_fit_from_parts(
         penalized_hessian: geom.penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::model_types::Dispersion::UNIT,
-        beta_covariance: covariance_conditional
-            .as_ref()
-            .map(|cov| gam_problem::PhiScaledCovariance::wrap(cov.clone())),
-        beta_standard_errors: conditional_se,
-        beta_covariance_corrected: corrected_cov.clone(),
-        beta_standard_errors_corrected: corrected_se,
+        factorized_standard_errors: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,
@@ -1172,6 +1220,14 @@ pub(crate) struct CustomOuterState {
     /// downstream classifiers inspect exact inner convergence fields without
     /// parsing text.
     pub(crate) last_error: Option<CustomFamilyError>,
+    /// The most recent uncertified inner solve any evaluation of this search
+    /// raised, recorded by [`Self::record_refusal`].
+    ///
+    /// Unlike [`Self::last_error`], no later evaluation, reset or reseed clears
+    /// it. When the search ends uncertified it becomes
+    /// `OuterSmoothingFailed::search_inner_refusal`, which the fit boundary names
+    /// even when finite trials ran after it (#2943).
+    pub(crate) last_inner_refusal: Option<CustomFamilyError>,
     pub(crate) outer_derivative_pilot: Option<OuterDerivativePilotSchedule>,
     /// #2349 — one-shot "re-evaluate COLD" pulse shared with the outer
     /// cost-stall guard (via `OuterProblem::with_stuck_stall_cold_reeval_signal`).
@@ -1198,9 +1254,77 @@ pub(crate) struct CustomOuterState {
     /// Mode of the latest converged first-order evaluation since the last
     /// accepted step, held until the optimizer reports that step accepted.
     pub(crate) pending_first_order_mode: Option<ConstrainedWarmStart>,
+    /// Certified mode of the current walk's latest accepted iterate: the walk's
+    /// starting iterate, then each iterate the optimizer accepts (#2627).
+    pub(crate) walk_iterate: Option<ConstrainedWarmStart>,
+    /// Certified modes of the walks a reset has ended, keyed by the bits of the θ
+    /// each walk last accepted (#2627).
+    ///
+    /// An evaluation at a θ a walk accepted is solved from that iterate's own
+    /// certified mode, the rule `ExactCoefficientModeBranch` applies to the
+    /// exact-joint drivers (gam#2765). The terminal certification resets before
+    /// each of its installations at the winner's θ, and a reset leaves the
+    /// caller's seed. Without this, every one of those installations re-solved
+    /// from that seed the mode the walk had already certified at θ: six identical
+    /// cold 26-cycle solves, about 61 s, on the event-history prior-centred fit
+    /// (job 1212656). Solved from the certified mode, each is a same-ρ reuse, and
+    /// finalize and certify still start from one state (#2334). A filed mode is
+    /// a start, not a value: the inner solve reuses it only when its own same-ρ
+    /// check accepts it under the evaluation's current contract, and otherwise
+    /// seeds β from it. One mode per walk, not per iterate: inside a walk the
+    /// incumbent's own θ is served by `warm_cache`.
+    pub(crate) walk_endpoints: Vec<(Vec<u64>, ConstrainedWarmStart)>,
+    /// The converged mode of the latest value probe, filed under the bits of its θ and
+    /// the identity of the seed it was solved from (#979).
+    ///
+    /// A line search prices a trial θ by value, then asks for the gradient at the same θ,
+    /// and both lanes start from the same seed. The second lane's inner solve therefore
+    /// re-derives this mode: on the n=2000 BMS flex fit, 12 value/gradient pairs at 12 θ,
+    /// every pair with matching cycle counts (job 1244570). The mode is served only at
+    /// bitwise that θ, and only while [`Self::seed_for`] still returns a seed of the same
+    /// identity. So it seeds no other θ (#2668), and a seed that moved never inherits it.
+    /// Like a walk endpoint it is a start, not a value: the inner solve reuses it only
+    /// when its own same-ρ check accepts it.
+    pub(crate) value_probe: Option<ValueProbeMode>,
     /// Kept rank of the criterion the most recent successful evaluation priced (#2765),
     /// published to the outer search through `OuterObjective::criterion_rank`.
     pub(crate) last_criterion_rank: Option<usize>,
+}
+
+fn theta_bits(theta: &Array1<f64>) -> Vec<u64> {
+    theta.iter().map(|value| value.to_bits()).collect()
+}
+
+/// What an inner solve's result depends on in its seed: the bits of the seed's θ, block
+/// coefficients and active sets, and whose objective a carried cached mode was solved
+/// for. Two solves at one θ from seeds of one identity are one deterministic computation.
+#[derive(PartialEq)]
+pub(crate) struct SeedIdentity {
+    theta: Vec<u64>,
+    block_beta: Vec<Vec<u64>>,
+    active_sets: Vec<Option<Vec<usize>>>,
+    cached_objective: Option<crate::assembly::InnerObjectiveState>,
+}
+
+impl SeedIdentity {
+    pub(crate) fn of(seed: Option<&ConstrainedWarmStart>) -> Option<Self> {
+        seed.map(|seed| Self {
+            theta: theta_bits(&seed.rho),
+            block_beta: seed.block_beta.iter().map(theta_bits).collect(),
+            active_sets: seed.active_sets.clone(),
+            cached_objective: seed
+                .cached_inner
+                .as_ref()
+                .map(|cached| cached.objective_state.clone()),
+        })
+    }
+}
+
+/// A converged value probe's mode with the θ it priced and the seed it was solved from.
+pub(crate) struct ValueProbeMode {
+    theta: Vec<u64>,
+    seed: Option<SeedIdentity>,
+    mode: ConstrainedWarmStart,
 }
 
 impl CustomOuterState {
@@ -1215,6 +1339,7 @@ impl CustomOuterState {
             reset_warm_cache: warm_start,
             terminal_mode: None,
             last_error: None,
+            last_inner_refusal: None,
             outer_derivative_pilot: None,
             force_cold_signal,
             force_cold_latched: false,
@@ -1222,8 +1347,52 @@ impl CustomOuterState {
             accepted_steps_adopted,
             incumbent_established: false,
             pending_first_order_mode: None,
+            walk_iterate: None,
+            walk_endpoints: Vec::new(),
+            value_probe: None,
             last_criterion_rank: None,
         }
+    }
+
+    /// The seed of one outer evaluation at `theta`: the certified mode a walk
+    /// accepted at `theta` when there is one, otherwise the incumbent's (#2627,
+    /// #2668).
+    pub(crate) fn seed_for(&self, theta: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
+        let key = theta_bits(theta);
+        let endpoint = self
+            .walk_endpoints
+            .iter()
+            .find(|(bits, _)| *bits == key)
+            .map(|(_, mode)| mode);
+        screened_outer_warm_start(endpoint.or(self.warm_cache.as_ref()), theta)
+    }
+
+    /// The start of one outer evaluation at `theta`: the latest value probe's mode when
+    /// it priced bitwise this θ from a seed of the identity [`Self::seed_for`] returns now,
+    /// otherwise that seed (#979).
+    pub(crate) fn warm_start_for(&self, theta: &Array1<f64>) -> Option<&ConstrainedWarmStart> {
+        let seed = self.seed_for(theta);
+        match &self.value_probe {
+            Some(probe) if probe.theta == theta_bits(theta) && probe.seed == SeedIdentity::of(seed) => {
+                Some(&probe.mode)
+            }
+            _ => seed,
+        }
+    }
+
+    /// File a converged value probe's mode at `theta`, solved from a seed of identity
+    /// `seed` (#979). It replaces the previous probe's.
+    pub(crate) fn record_value_probe(
+        &mut self,
+        theta: &Array1<f64>,
+        seed: Option<SeedIdentity>,
+        mode: ConstrainedWarmStart,
+    ) {
+        self.value_probe = Some(ValueProbeMode {
+            theta: theta_bits(theta),
+            seed,
+            mode,
+        });
     }
 
     /// Observe the shared cold-reeval pulse (consuming it) and the sticky
@@ -1239,7 +1408,8 @@ impl CustomOuterState {
     }
 
     /// Fold in every outer step the optimizer accepted since the previous
-    /// evaluation (#2668). Called at the head of each search evaluation.
+    /// evaluation (#2668). Called at the head of each search evaluation and by
+    /// [`Self::reset`].
     ///
     /// The accept observer fires once the accepted iterate's first-order
     /// evaluation has run, so the pending mode is that iterate's, and it becomes
@@ -1252,8 +1422,13 @@ impl CustomOuterState {
         }
         self.accepted_steps_adopted = reported;
         if let Some(mode) = self.pending_first_order_mode.take() {
-            self.warm_cache = Some(mode);
+            self.accept_iterate(mode);
         }
+    }
+
+    fn accept_iterate(&mut self, mode: ConstrainedWarmStart) {
+        self.walk_iterate = Some(mode.clone());
+        self.warm_cache = Some(mode);
     }
 
     /// Record the inner mode of a converged first-order evaluation (#2668).
@@ -1266,9 +1441,19 @@ impl CustomOuterState {
         if self.incumbent_established {
             self.pending_first_order_mode = Some(mode);
         } else {
-            self.warm_cache = Some(mode);
+            self.accept_iterate(mode);
             self.incumbent_established = true;
         }
+    }
+
+    /// Record the typed refusal of one objective evaluation. An uncertified
+    /// inner solve is also kept as the search's whole-search record, which
+    /// neither a later evaluation nor a reset clears (#2943).
+    pub(crate) fn record_refusal(&mut self, refusal: CustomFamilyError) {
+        if matches!(refusal, CustomFamilyError::InnerSolveNotConverged { .. }) {
+            self.last_inner_refusal = Some(refusal.clone());
+        }
+        self.last_error = Some(refusal);
     }
 
     pub(crate) fn with_outer_derivative_pilot(
@@ -1291,11 +1476,27 @@ impl CustomOuterState {
             self.reset_warm_cache = self.warm_cache.clone();
             self.terminal_mode = None;
             self.last_error = None;
+            // The pilot's certified modes were solved on the sampled measure, so
+            // none of them is the exact stage's certified mode at its θ (#2627).
+            self.walk_endpoints.clear();
+            self.walk_iterate = None;
+            self.pending_first_order_mode = None;
         }
         transitioned
     }
 
     pub(crate) fn reset(&mut self) {
+        // A reset ends the walk. Its last accepted iterate is usually still
+        // pending, because the optimizer reports the final step accepted and then
+        // stops, so no evaluation folds it in (#2627). Fold it in and file the
+        // walk's certified mode under its θ before the caller's seed replaces the
+        // incumbent.
+        self.adopt_accepted_steps();
+        if let Some(mode) = self.walk_iterate.take() {
+            let key = theta_bits(&mode.rho);
+            self.walk_endpoints.retain(|(bits, _)| *bits != key);
+            self.walk_endpoints.push((key, mode));
+        }
         self.warm_cache = self.reset_warm_cache.clone();
         self.terminal_mode = None;
         // The reset seed is the caller's, not an evaluated incumbent, and steps
@@ -1542,5 +1743,87 @@ mod test_support {
                 Arc::new(AtomicUsize::new(0)),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod edf_trace_admission_2901_tests {
+    use super::*;
+    use gam_linalg::matrix::DesignMatrix;
+    use ndarray::array;
+
+    /// #2901: `H ⪰ λS` bounds each penalty's trace by its rank, so a Hessian that
+    /// is certified numerically on a custom family, whose Hessian is observed
+    /// information. `H = 5I` against `λS = 4I` certifies and publishes `8/5`. `H = I`
+    /// against the same penalty has no certified rank bound: its raw trace 8 publishes
+    /// unclamped, where the old clamp published the rank 2. A non-positive-definite
+    /// `H = −I` is not certified either, so its trace −8 below its band publishes raw,
+    /// as the indefinite ambient precision of a cone-constrained mode does (#2635).
+    #[test]
+    fn the_custom_family_edf_certifies_numerically_and_publishes_an_uncertified_negative_trace_2901(
+    ) {
+        let specs = vec![ParameterBlockSpec {
+            name: "rank_two_block".to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((2, 2))),
+            offset: Array1::zeros(2),
+            penalties: vec![PenaltyMatrix::Dense(array![[4.0, 0.0], [0.0, 4.0]])],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.0],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }];
+        let lambdas = array![1.0];
+        let (edf_total, _, _, penalty_trace, rank_bound) = custom_family_blockwise_edf(
+            &Array2::from_diag(&array![5.0, 5.0]),
+            &specs,
+            &lambdas.view(),
+        )
+        .expect("a dominated trace publishes");
+        approx::assert_relative_eq!(penalty_trace[0], 1.6, epsilon = 1e-12);
+        approx::assert_relative_eq!(edf_total, 0.4, epsilon = 1e-12);
+        assert!(
+            matches!(
+                rank_bound[0],
+                gam_solve::estimate::EdfRankBound::Certified(
+                    gam_solve::estimate::EdfRankCertificate::Numerical { .. }
+                )
+            ),
+            "{rank_bound:?}"
+        );
+
+        let (unbounded_total, edf_by_penalty, block_edf, unbounded_trace, unbounded_bound) =
+            custom_family_blockwise_edf(&Array2::eye(2), &specs, &lambdas.view())
+                .expect("an indefinite data curvature publishes its raw trace");
+        assert!(
+            matches!(
+                unbounded_bound[0],
+                gam_solve::estimate::EdfRankBound::Uncertified { smallest_pivot, band }
+                    if smallest_pivot < -band
+            ),
+            "{unbounded_bound:?}"
+        );
+        approx::assert_relative_eq!(unbounded_trace[0], 8.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(edf_by_penalty[0], -6.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(block_edf[0], -6.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(unbounded_total, -6.0, epsilon = 1e-12);
+
+        let (negative_total, negative_by_penalty, negative_block, negative_trace, negative_bound) =
+            custom_family_blockwise_edf(&(-Array2::<f64>::eye(2)), &specs, &lambdas.view())
+                .expect("an uncertified negative trace publishes raw");
+        assert!(
+            matches!(
+                negative_bound[0],
+                gam_solve::estimate::EdfRankBound::Uncertified { smallest_pivot, band }
+                    if smallest_pivot < -band
+            ),
+            "{negative_bound:?}"
+        );
+        approx::assert_relative_eq!(negative_trace[0], -8.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(negative_by_penalty[0], 10.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(negative_block[0], 10.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(negative_total, 10.0, epsilon = 1e-12);
     }
 }

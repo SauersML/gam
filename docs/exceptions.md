@@ -175,7 +175,7 @@ and category after the unchanged engine message:
 
 ```python
 try:
-    model = gamfit.fit(df, "y ~ s(x)", family="bernoulli-marginal-slope", ...)
+    model = gamfit.fit(df, "y ~ s(x)")
 except gamfit.FitSeedError as e:
     print("no admissible start:", e.variant, e.causes[-1])
 except gamfit.FitConvergenceError as e:

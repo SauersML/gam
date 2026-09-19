@@ -932,18 +932,18 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Tier-0 of the exact marginal-smoothing inference stack (#938): the PSIS
-    /// `ρ`-uncertainty certificate, evaluated against THIS live objective.
+    /// Tier-0 of the marginal-smoothing inference stack (#938): the PSIS
+    /// `ρ`-uncertainty adequacy diagnostic, evaluated against THIS live objective.
     ///
     /// This is the objective-lifecycle seam. The marginal posterior factorizes
     /// as `π(β, ρ | y) = π(β | ρ, y) · π(ρ | y)` with
-    /// `π(ρ|y) ∝ exp(−criterion(ρ))`, and the certificate needs to evaluate the
+    /// `π(ρ|y) ∝ exp(−criterion(ρ))`, and the diagnostic needs to evaluate the
     /// outer criterion at a handful of `ρ` near `ρ̂`. The criterion IS
     /// `Self::compute_cost` and the proposal Hessian IS
     /// [`Self::compute_lamlhessian_consistent`] — both `&self` — so a converged
-    /// fit can produce the certificate WITHOUT retaining or rebuilding a
+    /// fit can produce the diagnostic WITHOUT retaining or rebuilding a
     /// separate objective: it runs against the same `RemlState` the fit
-    /// converged on, while it is still in scope. The criterion the certificate
+    /// converged on, while it is still in scope. The criterion the diagnostic
     /// samples is therefore the fit's own criterion bit-for-bit
     /// (`criterion(ρ̂) == reml_score`), so no fingerprint reconciliation is
     /// needed — there is exactly one objective.
@@ -953,20 +953,20 @@ impl<'a> RemlState<'a> {
     /// criterion is infeasible at `ρ̂` — the diagnostic is simply absent, never
     /// an error.
     ///
-    /// The Tier-0 certificate itself is CHEAP — a handful (`M`) of outer-criterion
+    /// The Tier-0 diagnostic itself is CHEAP — a handful (`M`) of outer-criterion
     /// evaluations near `ρ̂` — so it is always produced when available. The
     /// ESCALATION tiers are the expensive part and are gated by `allow_escalation`:
-    /// when the certificate reads [`Escalate`] AND `allow_escalation` is set, the
+    /// when the diagnostic grades the plug-in [`Escalate`] AND `allow_escalation` is set, the
     /// tiers (#938) run HERE, against the same live objective — Tier 1 quadrature
     /// for `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
     /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
     /// rebuild recipe; running at the live seam avoids that entirely. When
     /// `allow_escalation` is `false` the returned escalation is always `None`, so
-    /// ordinary interactive formula/CLI fits emit the cheap certificate WITHOUT
+    /// ordinary interactive formula/CLI fits emit the cheap diagnostic WITHOUT
     /// ever turning into a NUTS-over-ρ sampler benchmark.
     ///
-    /// [`Escalate`]: gam_problem::rho_posterior::RhoCertificate::Escalate
+    /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
@@ -976,17 +976,17 @@ impl<'a> RemlState<'a> {
         gam_problem::rho_posterior::RhoPosteriorOutcome,
         Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
     ) {
-        // DATA types contract-downed to gam-problem (#1521); the certificate /
-        // escalation COMPUTATION (`rho_posterior_certificate`,
+        // DATA types contract-downed to gam-problem (#1521); the adequacy /
+        // escalation COMPUTATION (`rho_posterior_adequacy`,
         // `escalate_rho_posterior`) lives UP in the monolith
         // `inference::rho_posterior` (its Tier-2 NUTS pulls the gam-inference
         // `hmc_io` sampler), so it is called DOWN here through the contract-down
         // `gam_problem::rho_posterior` escalator registry (#1521 trait-inversion
         // — the upward-compute back-edge is gone). Every early exit names why the
-        // certificate was not formed (#2627), and none runs an escalation, so the
+        // diagnostic was not formed (#2627), and none runs an escalation, so the
         // intervals stay plug-in + first-order corrected.
         use gam_problem::rho_posterior::{
-            RhoCertificate, RhoPosteriorNotComputed, RhoPosteriorOutcome,
+            RhoPosteriorNotComputed, RhoPosteriorOutcome, RhoProposalAdequacy,
         };
         if final_rho.is_empty() {
             return (RhoPosteriorOutcome::NotApplicable, None);
@@ -1010,30 +1010,30 @@ impl<'a> RemlState<'a> {
                 );
             }
         };
-        let outcome = match escalator.rho_posterior_certificate(
+        let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
             &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
             n_samples,
         ) {
-            Ok(Some(certificate)) => RhoPosteriorOutcome::Certified(certificate),
+            Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
             Ok(None) => RhoPosteriorOutcome::NotApplicable,
-            // The certificate is a post-fit diagnostic of a fit the outer
+            // The grade is a post-fit diagnostic of a fit the outer
             // optimizer already certified, so a refusal publishes the fit and
             // carries its typed reason with it.
             Err(refusal) => {
-                log::warn!("rho-posterior certificate refused at the converged rho: {refusal}");
+                log::warn!("rho-posterior adequacy diagnostic refused at the converged rho: {refusal}");
                 RhoPosteriorOutcome::Refused(refusal)
             }
         };
         let escalation = match &outcome {
-            // The certificate refuses to certify the plug-in, but escalation
+            // The diagnostic grades the plug-in `Escalate`, but escalation
             // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
             // only run it when the caller opts in. Interactive formula/CLI fits
             // pass `allow_escalation = false`, so they surface the cheap Tier-0
-            // certificate while never launching the sampler.
-            RhoPosteriorOutcome::Certified(certificate)
-                if certificate.certificate == RhoCertificate::Escalate && allow_escalation =>
+            // diagnostic while never launching the sampler.
+            RhoPosteriorOutcome::Assessed(adequacy)
+                if adequacy.adequacy == RhoProposalAdequacy::Escalate && allow_escalation =>
             {
                 // #2450 — THE SAMPLER TARGETS A DISTRIBUTION; THE CRITERION DOES NOT.
                 //
@@ -1056,7 +1056,7 @@ impl<'a> RemlState<'a> {
                 // certificates and every fit's λ̂ are byte-unchanged by
                 // construction rather than by review.
                 //
-                // The Tier-0 certificate above is left on the criterion as the
+                // The Tier-0 diagnostic above is left on the criterion as the
                 // optimizer sees it: it asks whether the PLUG-IN Gaussian is
                 // adequate, which is a question about the object the fit
                 // reports, and moving it is a separate decision recorded on

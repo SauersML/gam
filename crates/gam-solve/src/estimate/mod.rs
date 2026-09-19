@@ -86,7 +86,10 @@ pub use crate::model_types::{
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
-pub use edf_accounting::{EdfBundle, collapsed_to_penalty_null_space, penalized_edf_bundle};
+pub use edf_accounting::{
+    EdfBundle, EdfRankBound, EdfRankCertificate, collapsed_to_penalty_null_space,
+    numerical_rank_bound, penalized_edf_bundle_within_bands, sparse_numerical_rank_bound,
+};
 pub use evaluation::{evaluate_externalcost, evaluate_externalgradient};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
@@ -124,6 +127,8 @@ pub use summary::{
 
 #[cfg(test)]
 mod binomial_reml_outer_cost_1575_tests;
+#[cfg(test)]
+mod inner_residual_charge_2954_tests;
 #[cfg(test)]
 mod ridge_continuity_tests;
 #[cfg(test)]

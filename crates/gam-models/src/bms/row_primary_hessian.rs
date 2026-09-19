@@ -362,10 +362,12 @@ impl BernoulliMarginalSlopeFamily {
             return Ok((rigid_a, rigid_abs_deriv, true));
         }
 
-        let near_zero_bound =
-            self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf);
         let beta_linf_max = beta_h_linf.max(beta_w_linf);
-        if standard_normal_law && near_zero_bound <= abs_tol && beta_linf_max <= f64::EPSILON.sqrt()
+        // The perturbation bound walks every span of every deviation basis column and
+        // only the StandardNormal law reads it, so an empirical-law row never pays for it.
+        if standard_normal_law
+            && beta_linf_max <= f64::EPSILON.sqrt()
+            && self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf) <= abs_tol
         {
             // Numerical guardrail for the conservative perturbation bound: the
             // exact-zero path above avoids all cell machinery, while this
@@ -564,7 +566,7 @@ impl BernoulliMarginalSlopeFamily {
         let (intercept, m_a, intercept_fast_path) = if self.effective_flex_active(block_states)? {
             self.solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, stats)?
         } else {
-            let intercept = match self.latent_measure.empirical_grid_for_training_row(row)? {
+            let intercept = match self.training_row_grid(row)? {
                 None => {
                     rigid_intercept_from_marginal(marginal.q, slope, self.probit_frailty_scale())
                 }
@@ -1807,12 +1809,13 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
-        let runtime_available = runtime_available_memory_bytes();
-        // Fold the live reading into the monotone capacity floor so the
-        // per-shape single-cache budget is stable across workspace rebuilds;
-        // the live reading still drives the global-pin OOM guard.
-        let stable_capacity = observe_capacity_floor(runtime_available);
-        let workspace_pinned = bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire);
+        // On its own, the live reading folded into the monotone capacity floor
+        // keeps the per-shape single-cache budget stable across workspace
+        // rebuilds while the live reading drives the global-pin OOM guard. In a
+        // multistart lane both are the availability read before launch and the
+        // pins are the search's own (`row_primary_cache_memory_readings`).
+        let (runtime_available, stable_capacity, workspace_pinned) =
+            row_primary_cache_memory_readings(self.search.as_deref().map(|member| &*member.lane));
         let plan = decide_row_primary_hessian_cache(
             n,
             r,
@@ -2031,6 +2034,7 @@ impl BernoulliMarginalSlopeFamily {
                 packed_grad,
                 packed_hess,
                 plan.bytes,
+                self.search.as_ref().map(|member| Arc::clone(&member.lane)),
             )));
         }
         let completed_rows = AtomicUsize::new(0);
@@ -2176,6 +2180,7 @@ impl BernoulliMarginalSlopeFamily {
             packed_grad,
             packed_hess,
             bytes,
+            self.search.as_ref().map(|member| Arc::clone(&member.lane)),
         ))
     }
 
@@ -3039,7 +3044,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let r = primary.total;
         scratch.reset(need_hessian);
-        let empirical_grid = self.latent_measure.empirical_grid_for_training_row(row)?;
+        let empirical_grid = self.training_row_grid(row)?;
         if empirical_grid.is_some() {
             if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
                 return Err("non-finite empirical flexible row context in VGH evaluation".into());
@@ -3734,7 +3739,7 @@ impl BernoulliMarginalSlopeFamily {
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
                     let [t3_q, t3_g] = if let Some(grid) =
-                        self.latent_measure.empirical_grid_for_training_row(row)?
+                        self.training_row_grid(row)?
                     {
                         let point = self.primary_point_from_block_states(
                             row,
@@ -3810,7 +3815,7 @@ impl BernoulliMarginalSlopeFamily {
                     e_g[cache.primary.slope] = 1.0;
                     let row_ctx = Self::row_ctx(cache, row);
                     let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] = if let Some(grid) =
-                        self.latent_measure.empirical_grid_for_training_row(row)?
+                        self.training_row_grid(row)?
                     {
                         let point = self.primary_point_from_block_states(
                             row,
@@ -3959,7 +3964,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_third_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
             );
@@ -4544,7 +4549,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_third_trace_gradient(
                 row, primary, q, b, beta_h, beta_w, row_ctx, gram, &grid,
             );
@@ -5842,7 +5847,7 @@ impl BernoulliMarginalSlopeFamily {
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        if let Some(grid) = self.training_row_grid(row)? {
             return self.empirical_flex_row_fourth_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir_u, dir_v, &grid,
             );
@@ -7289,7 +7294,7 @@ impl BernoulliMarginalSlopeFamily {
                 direction_v.len()
             ));
         }
-        let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? else {
+        let Some(grid) = self.training_row_grid(row)? else {
             return direction_pairs
                 .iter()
                 .map(|(direction_u, direction_v)| {

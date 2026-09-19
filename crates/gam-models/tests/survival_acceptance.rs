@@ -2,6 +2,8 @@
 //! The mathematical inference registrations match the public facade's startup;
 //! the CPU lane does not require a GPU dispatch registration.
 
+#[path = "survival_acceptance/covariate_constant_slope_2930.rs"]
+mod covariate_constant_slope_2930;
 #[path = "survival_acceptance/declared_latent_law_2923.rs"]
 mod declared_latent_law_2923;
 #[path = "survival_acceptance/joint_latent_law_2929.rs"]
@@ -20,6 +22,8 @@ mod latent_loaded_vs_unloaded_chart_2714;
 mod location_scale_heteroscedastic_globalization_1569;
 #[path = "survival_acceptance/margslope_face_criterion_fd_2894.rs"]
 mod margslope_face_criterion_fd_2894;
+#[path = "survival_acceptance/moving_law_certificate_2926.rs"]
+mod moving_law_certificate_2926;
 
 fn initialize_cpu_fitting() {
     static INIT: std::sync::Once = std::sync::Once::new();

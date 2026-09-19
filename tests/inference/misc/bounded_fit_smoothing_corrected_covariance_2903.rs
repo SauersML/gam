@@ -168,26 +168,11 @@ fn bounded_fit_publishes_smoothing_corrected_covariance_2903() {
         other => panic!("#2903: expected FirstOrderIdentifiedSubspace provenance, got {other:?}"),
     }
 
-    // (2) Shape and the top-level mirror.
+    // (2) Shape.
     assert_eq!(
         corrected.dim(),
         conditional.dim(),
         "#2903: corrected covariance must match the conditional dimensions"
-    );
-    // `beta_covariance_corrected()` reads the top-level slot first, so the
-    // inference block is read directly to check the mirror.
-    let top_level = fit
-        .covariance_corrected
-        .as_ref()
-        .expect("#2903: the top-level corrected covariance mirror must be populated");
-    let inference_block = fit
-        .inference
-        .as_ref()
-        .and_then(|inference| inference.beta_covariance_corrected.as_ref())
-        .expect("#2903: the inference block must carry the corrected covariance");
-    assert_eq!(
-        top_level, inference_block,
-        "#2903: the top-level mirror must equal the inference block's corrected covariance"
     );
 
     // (3) The correction is PSD, so no corrected variance shrinks, and a selected

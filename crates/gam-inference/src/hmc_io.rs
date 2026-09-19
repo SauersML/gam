@@ -1242,6 +1242,7 @@ mod tests {
             Some(FitInference {
                 edf_by_block: vec![],
                 penalty_block_trace: vec![],
+                edf_rank_bound: Vec::new(),
                 edf_total: 2.0,
                 smoothing_correction: None,
                 smoothing_correction_method: None,
@@ -1251,10 +1252,7 @@ mod tests {
                 penalized_hessian: hessian.clone().into(),
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
-                beta_covariance: None,
-                beta_standard_errors: None,
-                beta_covariance_corrected: None,
-                beta_standard_errors_corrected: None,
+                factorized_standard_errors: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -2605,7 +2603,8 @@ mod tests {
         // standard-normal rule carries unit mass and integrates z⁸ exactly
         // (E[z⁸] = 105), which is the degree-nine exactness the correction's
         // five-node arm always had.
-        let rule = crate::rho_posterior::standard_normal_gh_rule(5).expect("five-node rule");
+        let rule =
+            gam_math::quadrature::standard_normal_gauss_hermite_rule(5).expect("five-node rule");
         let mass: f64 = rule.iter().map(|&(_, weight)| weight).sum();
         let eighth: f64 = rule.iter().map(|&(node, weight)| weight * node.powi(8)).sum();
         assert!((mass - 1.0).abs() < 1e-14, "rule mass {mass}");
@@ -2917,7 +2916,9 @@ mod tests {
         let m = target.block_dim();
         let rules: Vec<Vec<(f64, f64)>> = axis_orders
             .iter()
-            .map(|&order| crate::rho_posterior::standard_normal_gh_rule(order).expect("rule"))
+            .map(|&order| {
+                gam_math::quadrature::standard_normal_gauss_hermite_rule(order).expect("rule")
+            })
             .collect();
         let mut nodes = Vec::new();
         crate::rho_posterior::enumerate_gh_product(
@@ -3093,7 +3094,7 @@ mod tests {
             self.steps.lock().expect("step record").push(step.clone());
         }
         fn max_representable_order(&self) -> usize {
-            super::max_representable_gh_order()
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
         }
     }
 
@@ -3215,7 +3216,7 @@ mod tests {
             assert_eq!(step.axis_orders.len(), 1, "the scripted corrector is one-axis");
         }
         fn max_representable_order(&self) -> usize {
-            super::max_representable_gh_order()
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
         }
     }
 
@@ -3241,52 +3242,91 @@ mod tests {
     }
 
     #[test]
-    fn an_axis_that_never_contracts_is_refused_typed_at_its_first_judged_order_784() {
-        // The paired difference stays at 1e-2 at every order. Order 5 ties the running
-        // minimum, so it is judged, and the minimum did not move: no representable order
-        // resolves the axis. The search refuses typed there, instead of raising the axis until
-        // its rule underflows. The corrector evaluates no rule, so the two requests are the
-        // whole cost, and requests past the script would be refused as exhausted.
-        let (outcome, requests) = scripted_search(vec![1e-2; 3], 1e-6);
-        assert_eq!(requests, vec![vec![4], vec![5]], "requests {requests:?}");
+    fn an_axis_that_never_contracts_is_refused_at_the_largest_representable_order_784() {
+        // The paired difference stays at 1e-2 at every order, so no representable order
+        // resolves the axis. The search raises it one order at a time to the largest
+        // representable order and refuses typed there, measured, without asking for an order
+        // past it. The corrector evaluates no rule, so the requests cost nothing but their
+        // count.
+        let max_order =
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
+        let (outcome, requests) = scripted_search(vec![1e-2; max_order - 3], 1e-6);
+        assert_eq!(requests.len(), max_order - 3, "one request per order 4..={max_order}");
+        assert_eq!(requests.last(), Some(&vec![max_order]), "no request past the ceiling");
         let refusal = outcome.expect_err("a non-contracting axis must be refused");
         assert_eq!(refusal.axis, 0);
-        assert_eq!(refusal.axis_orders, vec![5]);
+        assert_eq!(refusal.axis_orders, vec![max_order]);
         assert!(
             matches!(
                 refusal.cause,
                 super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
-                    order: 5,
-                    contraction_rate,
-                    projected_resolving_order: None,
-                    ..
-                } if contraction_rate == 1.0
+                    order,
+                    running_minimum,
+                    max_representable_order,
+                } if order == max_order
+                    && running_minimum == 1e-2
+                    && max_representable_order == max_order
             ),
-            "typed non-contracting refusal expected, got {refusal}"
+            "typed refusal at order {max_order} expected, got {refusal}"
         );
     }
 
     #[test]
-    fn an_axis_that_contracts_too_slowly_to_resolve_is_refused_typed_784() {
-        // The paired difference contracts by 0.99 per order from 0.5, so resolving 1e-6
-        // needs about ln(0.495/1e-6)/ln(1/0.99) ≈ 1306 more raises. That is past the largest
-        // representable order, so the search refuses typed at order 5 with that projection.
-        let script = vec![0.5, 0.5 * 0.99, 0.5 * 0.99 * 0.99];
+    fn an_axis_that_contracts_too_slowly_to_resolve_is_refused_at_the_largest_representable_order_784()
+    {
+        // The paired difference contracts by 0.99 per order from 0.5, so at the largest
+        // representable order it is still about 1e-2, far above 1e-6. The search raises the
+        // axis to that order and refuses typed there; no rate is extrapolated on the way.
+        let max_order =
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
+        let script: Vec<f64> = (0..max_order - 3)
+            .map(|raise| 0.5 * 0.99_f64.powi(raise as i32))
+            .collect();
+        let smallest = *script.last().expect("the script reaches the ceiling");
         let (outcome, requests) = scripted_search(script, 1e-6);
-        assert_eq!(requests, vec![vec![4], vec![5]], "requests {requests:?}");
+        assert_eq!(requests.len(), max_order - 3, "one request per order 4..={max_order}");
         let refusal = outcome.expect_err("a too-slow axis must be refused");
-        let max_order = super::max_representable_gh_order();
         assert!(
             matches!(
                 refusal.cause,
                 super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
-                    order: 5,
-                    projected_resolving_order: Some(projected),
+                    order,
+                    running_minimum,
                     max_representable_order,
-                    ..
-                } if projected > max_representable_order && max_representable_order == max_order
+                } if order == max_order
+                    && running_minimum == smallest
+                    && max_representable_order == max_order
             ),
-            "typed projection refusal past order {max_order} expected, got {refusal}"
+            "typed refusal at order {max_order} expected, got {refusal}"
+        );
+    }
+
+    #[test]
+    fn an_axis_whose_first_ratio_is_near_one_resolves_instead_of_refusing_784() {
+        // q8's measured decline (job 1208513, q8.log.gz line 76): axis 1 of the m = 6 block
+        // at [5, 5, 4, 4, 4, 4], paired difference 5.9602e-4 against target 1.4005e-6, and
+        // the step 4 → 5 into it at rate 0.98887. A stop that projected from that step put
+        // resolution at order 546, past the ceiling, and refused at order 5. The next step
+        // here contracts ×0.1 per order, inside the ×0.044 to ×0.14 that probe 1215221
+        // measured at 5 → 6 on the q5 axes, and the axis resolves at order 8.
+        let target = 1.4005e-6;
+        let at_five = 5.9602e-4;
+        let script = vec![
+            at_five / 0.98887,
+            at_five,
+            at_five * 1e-1,
+            at_five * 1e-2,
+            at_five * 1e-3,
+        ];
+        let (outcome, requests) = scripted_search(script, target);
+        let marginal = outcome.unwrap_or_else(|refusal| {
+            panic!("an axis that resolves at order 8 must not be refused: {refusal}")
+        });
+        assert_eq!(marginal.axis_orders, vec![8]);
+        assert_eq!(
+            requests,
+            vec![vec![4], vec![5], vec![6], vec![7], vec![8]],
+            "requests {requests:?}"
         );
     }
 
@@ -3306,12 +3346,13 @@ mod tests {
 
     #[test]
     fn an_axis_that_rises_and_never_returns_is_refused_at_the_largest_representable_order_784() {
-        // The paired difference doubles once and stays there, so no order after 4 sets a new
-        // running minimum and the rate never judges the axis. The search raises it one order
-        // at a time to the largest representable order and refuses typed there, without
-        // asking for an order past it. The corrector evaluates no rule, so the requests cost
-        // nothing but their count.
-        let max_order = super::max_representable_gh_order();
+        // The paired difference doubles once and stays there, so the running minimum is the
+        // order-4 value. The search raises the axis one order at a time to the largest
+        // representable order and refuses typed there, naming that minimum, without asking
+        // for an order past it. The corrector evaluates no rule, so the requests cost nothing
+        // but their count.
+        let max_order =
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
         let mut script = vec![1e-2];
         script.resize(max_order - 3, 2e-2);
         let (outcome, requests) = scripted_search(script, 1e-6);
@@ -3321,7 +3362,7 @@ mod tests {
         assert!(
             matches!(
                 refusal.cause,
-                super::BlockQuadratureRefusal::NoNewMinimumThroughRepresentableOrders {
+                super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order,
                     running_minimum,
                     max_representable_order,
@@ -3329,7 +3370,7 @@ mod tests {
                     && running_minimum == 1e-2
                     && max_representable_order == max_order
             ),
-            "typed no-new-minimum refusal at order {max_order} expected, got {refusal}"
+            "typed refusal at order {max_order} expected, got {refusal}"
         );
     }
 
@@ -3365,7 +3406,8 @@ mod tests {
         // The measured ceiling is the boundary block_quadrature_marginal_correction itself
         // enforces: the rule at the ceiling integrates, and one order higher is refused
         // before any node is evaluated.
-        let max_order = super::max_representable_gh_order();
+        let max_order =
+            gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order();
         assert!(max_order > 4, "the ceiling {max_order} must sit above the starting order");
         let target = AnharmonicBlock {
             lambdas: array![2.0],
@@ -4911,7 +4953,7 @@ fn run_conjugate_gaussian_sampling(
 /// feasible region around `ρ̂` instead of a `-inf` cliff.
 const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
 
-/// Tier-2 of the exact marginal-smoothing inference stack (#938): the whitened
+/// Tier-2 of the marginal-smoothing inference stack (#938): the whitened
 /// `ρ`-criterion Hamiltonian target.
 ///
 /// This reuses the module's β-level whitening design ONE LEVEL UP: the target
@@ -5983,36 +6025,12 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         log::info!("[#784] block quadrature order search: {step}");
     }
 
+    /// `block_quadrature_marginal_correction` refuses the order past this one as
+    /// [`BlockQuadratureRefusal::UnrepresentableOrder`], or as an integration refusal when the
+    /// rule cannot be built, because it integrates with the same rule builder.
     fn max_representable_order(&self) -> usize {
-        max_representable_gh_order()
+        gam_math::quadrature::max_representable_standard_normal_gauss_hermite_order()
     }
-}
-
-/// The largest standard-normal Gauss–Hermite order whose rule builds with every weight
-/// positive, where every lower order does too (#784). `block_quadrature_marginal_correction`
-/// refuses the next order, as [`BlockQuadratureRefusal::UnrepresentableOrder`] or, if the
-/// rule cannot be built, as an integration refusal. The search raises one order at a time,
-/// so this is exactly where it would stop.
-///
-/// Measured once per process from this arithmetic and this rule builder, so no order
-/// ceiling is chosen. The scan ends because the extreme weight of an `n`-node rule decays
-/// like `e^{−2n}` and underflows at a few hundred nodes.
-fn max_representable_gh_order() -> usize {
-    static MAX_REPRESENTABLE_ORDER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_REPRESENTABLE_ORDER.get_or_init(|| {
-        let representable = |order: usize| {
-            crate::rho_posterior::standard_normal_gh_rule(order)
-                .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
-        };
-        let mut order = 1usize;
-        while order
-            .checked_add(1)
-            .is_some_and(|next| representable(next))
-        {
-            order += 1;
-        }
-        order
-    })
 }
 
 /// Streaming log-sum-exp of log terms pushed in order, accumulated against a
@@ -6241,7 +6259,11 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
 
     let mut log_rules: Vec<Vec<(f64, f64)>> = Vec::with_capacity(m);
     for (axis, &order) in axis_orders.iter().enumerate() {
-        let rule = crate::rho_posterior::standard_normal_gh_rule(order).map_err(Integration)?;
+        let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(order).map_err(|error| {
+            Integration(format!(
+                "standard-normal Gauss–Hermite rule of order {order}: {error}"
+            ))
+        })?;
         if rule.iter().any(|&(_, weight)| !(weight > 0.0)) {
             return Err(BlockQuadratureRefusal::UnrepresentableOrder { axis, order });
         }
@@ -6252,8 +6274,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     for &order in axis_orders {
         let mut lower = Vec::new();
         for lower_order in (order.saturating_sub(2).max(1)..order).rev() {
-            let rule =
-                crate::rho_posterior::standard_normal_gh_rule(lower_order).map_err(Integration)?;
+            let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(lower_order)
+                .map_err(|error| {
+                    Integration(format!(
+                        "standard-normal Gauss–Hermite rule of order {lower_order}: {error}"
+                    ))
+                })?;
             lower.push((lower_order, log_weight_gh_rule(rule)));
         }
         lower_rules.push(lower);

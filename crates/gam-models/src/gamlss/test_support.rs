@@ -19,7 +19,7 @@ use super::dispersion_family::DispersionFamilyKind;
 /// coordinates — `q = −η_t·e^{−η_ls}` through the algebra's own `exp`, then one
 /// composition with the q-space stack `[−ℓ, m1, m2, m3, m4]` — so it shares
 /// neither the local-coordinate map nor the lowering of the production
-/// `binomial_ls_row_program`.
+/// `binomial_ls_row`.
 #[inline]
 pub(crate) fn binomial_location_scale_nll_tower(
     y: f64,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::fit_orchestration::FitFailure;
 
 pub(crate) fn materialize_survival<'a>(
     parsed: &ParsedFormula,
@@ -952,20 +953,7 @@ pub(crate) fn materialize_survival<'a>(
                 declared_latent_law: config.declared_latent_law_grid()?,
                 score_influence_jacobian: None,
             },
-            options: BlockwiseFitOptions {
-                // The same answer the CLI route gives (`run_survival.rs` sets it
-                // unconditionally): a fit computes its coefficient covariance
-                // unless the caller declined inference. This site hard-coded
-                // `false`, so a library-fitted survival marginal-slope model
-                // carried no covariance, could not be saved for posterior-mean
-                // prediction, and disagreed with the CLI's model of the same
-                // data (gam#2765).
-                compute_covariance: config.compute_covariance.unwrap_or(true),
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                // Robustness (Firth/Jeffreys stabilizer) is the unconditional
-                // default for survival marginal-slope — no flag to thread.
-                ..Default::default()
-            },
+            options: blockwise_fit_options(config),
             kappa_options: config.spatial_optimization.clone(),
         })
     };
@@ -1082,10 +1070,7 @@ pub(crate) fn materialize_survival<'a>(
                     baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
-                options: BlockwiseFitOptions {
-                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                    ..BlockwiseFitOptions::default()
-                },
+                options: blockwise_fit_options(config),
             })
         };
 
@@ -1138,10 +1123,7 @@ pub(crate) fn materialize_survival<'a>(
                     baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
-                options: BlockwiseFitOptions {
-                    persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                    ..BlockwiseFitOptions::default()
-                },
+                options: blockwise_fit_options(config),
             })
         };
 
@@ -1186,15 +1168,27 @@ pub(crate) fn materialize_survival<'a>(
         // typically converges in ≲10 outer evaluations.
         let probit_channel =
             location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
+        // The search takes text, so a candidate's fit failure is kept typed here
+        // (#2937). The outer engine never retries a thrown objective error: it
+        // ends the search, so the kept failure is the one that stopped it.
+        let candidate_failure = std::cell::RefCell::new(None::<FitFailure>);
+        let stop_on = |failure: FitFailure| {
+            let reason = failure.to_string();
+            *candidate_failure.borrow_mut() = Some(failure);
+            reason
+        };
         let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
             &baseline_cfg,
             age_exit.view(),
             "workflow survival location-scale baseline",
             |candidate| {
-                let fit_result = fit_survival_location_scale_model(build_location_scale_request(
-                    candidate,
-                )?)
-                .map_err(|e| format!("survival location-scale fit failed: {e}"))?;
+                // A candidate spec that cannot be built is configuration.
+                let request = build_location_scale_request(candidate).map_err(|reason| {
+                    stop_on(FitFailure::from(WorkflowError::InvalidConfig { reason }))
+                })?;
+                let fit_result = fit_survival_location_scale_model(request).map_err(|failure| {
+                    stop_on(failure.context("survival location-scale fit failed"))
+                })?;
                 // Warm-start the next probe's threshold / log-σ smoothing parameters
                 // at the converged values for this probe.
                 let threshold_rho = fit_result.fit.fit.lambdas_threshold().mapv(f64::ln);
@@ -1208,7 +1202,8 @@ pub(crate) fn materialize_survival<'a>(
                         age_exit.view(),
                         candidate,
                         residuals,
-                    )?
+                    )
+                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
                 } else {
                     baseline_chain_rule_gradient(
                         age_entry.view(),
@@ -1218,11 +1213,13 @@ pub(crate) fn materialize_survival<'a>(
                         age_exit.view(),
                         candidate,
                         residuals,
-                    )?
+                    )
+                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
                 }
                 .ok_or_else(|| {
-                    "workflow survival location-scale baseline unexpectedly has no theta gradient"
-                        .to_string()
+                    stop_on(FitFailure::invariant(
+                        "workflow survival location-scale baseline unexpectedly has no theta gradient",
+                    ))
                 })?;
                 // The envelope-theorem residual contraction is the exact
                 // θ-gradient of the *profile penalized NLL* −ℓ + ½βᵀSβ at
@@ -1239,20 +1236,29 @@ pub(crate) fn materialize_survival<'a>(
                 let profile_cost =
                     -log_likelihood_at_mode + 0.5 * fit_result.fit.fit.stable_penalty_term;
                 if !profile_cost.is_finite() {
-                    return Err(format!(
+                    return Err(stop_on(FitFailure::numerical(format!(
                         "workflow survival location-scale baseline: non-finite profile cost \
                          (log_likelihood_at_mode={}, stable_penalty_term={}, cost={})",
                         log_likelihood_at_mode,
                         fit_result.fit.fit.stable_penalty_term,
                         profile_cost
-                    ));
+                    ))));
                 }
                 Ok((profile_cost, gradient))
             },
         );
         match baseline_outcome {
             Ok(baseline) => baseline,
-            Err(e) => return Err(e.into()),
+            Err(search) => {
+                return Err(match candidate_failure.take() {
+                    // A candidate's fit stopped the search: raise that failure
+                    // under its category.
+                    Some(failure) => WorkflowError::from(failure),
+                    // Otherwise the search's own typed verdict, or its
+                    // configuration refusal, stands.
+                    None => search,
+                });
+            }
         }
     } else {
         // A latent survival or binary fit selects its baseline chart together with

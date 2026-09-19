@@ -133,4 +133,32 @@ impl SurvivalLatentLaw {
             },
         }
     }
+
+    /// The scalar law row `row` anchors on or, where no row is named, the one
+    /// law every row shares. A local law has no shared grid and a joint law has
+    /// no scalar grid, so both are refused by name rather than read as another
+    /// law (gam#2948).
+    pub(crate) fn scalar_grid(&self, row: Option<usize>) -> Result<AnchorGrid<'_>, String> {
+        match (&self.grids, row) {
+            (LawGrids::Global(grid), _) => Ok(grid.view()),
+            (LawGrids::PerRow(grids), Some(row)) => {
+                grids.get(row).map(AnchorGridOwned::view).ok_or_else(|| {
+                    format!(
+                        "survival marginal-slope local latent law has no grid for row {row} of {}",
+                        grids.len()
+                    )
+                })
+            }
+            (LawGrids::PerRow(_), None) => Err(
+                "survival marginal-slope local latent law: a solve that names no row has no \
+                 mixture to anchor on"
+                    .to_string(),
+            ),
+            (LawGrids::Joint(_), _) => Err(
+                "survival marginal-slope joint latent law of K ≥ 2 scores has no scalar law for \
+                 the single-score flex row program to anchor on"
+                    .to_string(),
+            ),
+        }
+    }
 }

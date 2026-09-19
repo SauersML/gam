@@ -173,6 +173,11 @@ struct PredictionPayload {
     /// point is a plug-in that consulted no coefficient covariance.
     #[serde(skip_serializing_if = "Option::is_none")]
     point_covariance_source: Option<String>,
+    /// What a posterior-mean POINT is conditional on when the fit withheld its
+    /// covariance (gam#2985): `PointCovarianceProvenance::explain`. Omitted when
+    /// the point integrates the fit's own covariance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_covariance_note: Option<String>,
 }
 
 /// Typed wire payload for NUTS posterior draws.
@@ -1325,7 +1330,15 @@ fn default_survival_time_grid_from_model(
     )
 }
 
-#[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    headers,
+    rows,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None,
+    warm_start_dir = None
+))]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
@@ -1333,6 +1346,8 @@ fn fit_table(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
+    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
@@ -1346,12 +1361,21 @@ fn fit_table(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-#[pyfunction(signature = (x, y, formula, config_json = None, fisher_rao_w = None))]
+#[pyfunction(signature = (
+    x,
+    y,
+    formula,
+    config_json = None,
+    fisher_rao_w = None,
+    warm_start_model = None,
+    warm_start_dir = None
+))]
 fn fit_array(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f64>,
@@ -1359,6 +1383,8 @@ fn fit_array(
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
+    warm_start_model: Option<Vec<u8>>,
+    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
@@ -1370,6 +1396,7 @@ fn fit_array(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
+            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
@@ -1415,7 +1442,7 @@ fn log_evidence_ratio(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResul
     // directly; returning the un-halved gap made it report `exp(ΔAIC)`, the SQUARE
     // of the intended ratio (issue #2124). Halve here, at the AIC-scale site, so
     // no raw-REML consumer is affected.
-    Ok(0.5 * log_bayes_factor(score_a, score_b))
+    Ok(0.5 * criterion_gap(score_a, score_b))
 }
 
 #[pyfunction]
@@ -3077,87 +3104,15 @@ fn duchon_function_norm_penalty<'py>(
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
-    // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
-    // builder (cylinder/torus chord-distance polyharmonic).
-    if any_periodic {
-        let spec = DuchonBasisSpec {
-            radial_reparam: None,
-            center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-            length_scale: spec_length_scale,
-            power: spec_power,
-            nullspace_order: spec_nullspace,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: Default::default(),
-            periodic: None,
-            boundary: OneDimensionalBoundary::Open,
-        };
-        // Honor an explicit 1D `period` (the domain wrap) instead of
-        // auto-deriving it from the center span, which undershoots on a
-        // half-open grid and produced a non-PSD Gram (gam#580). For d>1 the
-        // per-axis periods are auto-derived in the core.
-        let periods_1d: Option<[f64; 1]> = if d == 1 { period.map(|p| [p]) } else { None };
-        let built = build_duchon_basis_mixed_periodicity_auto(
-            center_matrix.view(),
-            &spec,
-            &periodic_flags,
-            periods_1d.as_ref().map(|p| p.as_slice()),
-        )
-        .map_err(basis_error_to_pyerr)?;
-        // Mixed-periodicity builder emits a single Primary candidate (the
-        // function-norm Gram).
-        let penalty = built
-            .active_penalties
-            .iter()
-            .find(|penalty| {
-                matches!(
-                    penalty.info.source,
-                    gam::terms::basis::PenaltySource::Primary
-                )
-            })
-            .ok_or_else(|| {
-                py_value_error(
-                    "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
-                )
-            })?
-            .matrix
-            .clone();
-        return Ok(penalty.into_pyarray(py).unbind());
-    }
-    let spec = DuchonBasisSpec {
-        radial_reparam: None,
-        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: spec_length_scale,
-        power: spec_power,
-        nullspace_order: spec_nullspace,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: Default::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let built = build_duchon_basis(center_matrix.view(), &spec).map_err(basis_error_to_pyerr)?;
-    // The redesigned non-periodic Euclidean path emits a single native
-    // reproducing-norm Gram as the `Primary` candidate (the function-norm
-    // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
-    // ridge; it no longer ships the mass/tension/stiffness operator triplet.
-    // The function norm is the Primary block.
-    let penalty = built
-        .active_penalties
-        .iter()
-        .find(|penalty| {
-            matches!(
-                penalty.info.source,
-                gam::terms::basis::PenaltySource::Primary
-            )
-        })
-        .ok_or_else(|| {
-            py_value_error(
-                "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
-            )
-        })?
-        .matrix
-        .clone();
+    let penalty = core_duchon_function_norm_penalty(
+        center_matrix.view(),
+        spec_length_scale,
+        spec_nullspace,
+        spec_power,
+        &periodic_flags,
+        period,
+    )
+    .map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
 }
 
@@ -4247,9 +4202,9 @@ fn compare_reml_fits(
 
     // Python-specific work: extract raw diagnostic score plus the required
     // conditional-AIC inputs (log-likelihood and EDF) from each PyAny
-    // fit (which may be a saved-summary dict, a Model object, or any
-    // object exposing .evidence). Then the ranking, delta, Bayes-factor,
-    // and evidence-summary logic is delegated to the pure-Rust core in
+    // fit (which may be a saved-summary mapping, a Model object, or its
+    // saved bytes; see `reml_fit_view`). Then the ranking, delta,
+    // evidence-ratio and evidence-summary logic is delegated to the pure-Rust core in
     // `gam::solver::evidence`, which is identically callable from
     // the CLI binary.
     let mut candidates = Vec::with_capacity(fits.len());
@@ -4289,8 +4244,8 @@ fn compare_reml_fits(
         table_row.set_item("reml_score", row.reml_score)?;
         table_row.set_item("delta_reml", row.delta_reml)?;
         table_row.set_item(
-            "bayes_factor_best_over_model",
-            row.bayes_factor_best_over_model,
+            "reml_criterion_ratio_best_over_model",
+            row.reml_criterion_ratio_best_over_model,
         )?;
         table_row.set_item("effective_dof", row.effective_dof)?;
         score_table.append(table_row)?;
@@ -4365,8 +4320,9 @@ fn with_tierney_kadane_normalizer_from_view(
 
 /// Occam-penalised conditional-AIC ranking score for a saved-model summary
 /// payload, matching `gam::solver::evidence::RemlCandidate::ranking_score`
-/// exactly (`-2·loglik + 2·edf`) so `Model.evidence` and `Model.evidence_ratio_vs`
-/// pick the SAME winner as `gamfit.compare_models` (issue #2079).
+/// exactly (`-2·loglik + 2·edf`) so `Model.conditional_aic` and
+/// `Model.evidence_ratio_vs` pick the SAME winner as `gamfit.compare_models`
+/// (issue #2079).
 ///
 /// Both inputs are required and finite. A raw REML/LAML criterion is a different
 /// estimand, so an incomplete summary is refused rather than ranked on another
@@ -5945,13 +5901,64 @@ fn gaussian_reml_fit_batched_backward<'py>(
     Ok(out.unbind())
 }
 
+/// Read a position fit's `knots_or_centers`: `None`, an integer basis size, or
+/// an explicit float64 vector. [`resolve_position_basis`] owns all three.
+fn position_basis_locations_arg(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PositionBasisLocations> {
+    let Some(value) = value else {
+        return Ok(PositionBasisLocations::Default);
+    };
+    if value.is_instance_of::<PyInt>() && !value.is_instance_of::<PyBool>() {
+        let count: i64 = value.extract()?;
+        let count = usize::try_from(count).map_err(|_| {
+            py_value_error(format!(
+                "knots_or_centers: an integer basis size must be non-negative, got {count}"
+            ))
+        })?;
+        return Ok(PositionBasisLocations::Count(count));
+    }
+    let given: PyReadonlyArray1<'_, f64> = value.extract()?;
+    Ok(PositionBasisLocations::Given(given.as_array().to_owned()))
+}
+
+/// Read a position fit's `penalty`: `None`, the name of the kind's canonical
+/// penalty, or an explicit float64 matrix.
+fn position_penalty_arg(value: Option<&Bound<'_, PyAny>>) -> PyResult<PositionPenaltyRequest> {
+    let Some(value) = value else {
+        return Ok(PositionPenaltyRequest::Canonical);
+    };
+    if value.is_instance_of::<PyString>() {
+        return Ok(PositionPenaltyRequest::Named(value.extract()?));
+    }
+    let given: PyReadonlyArray2<'_, f64> = value.extract()?;
+    Ok(PositionPenaltyRequest::Given(given.as_array().to_owned()))
+}
+
+/// The basis state a forward position fit ran on, returned so a caller can
+/// replay the same basis at predict time.
+fn set_position_basis_items(
+    py: Python<'_>,
+    out: &Bound<'_, PyDict>,
+    basis: ResolvedPositionBasis,
+    periodic: bool,
+) -> PyResult<()> {
+    out.set_item("knots_or_centers", basis.locations.into_pyarray(py))?;
+    out.set_item("penalty", basis.penalty.into_pyarray(py))?;
+    out.set_item("basis_kind", basis.display_kind)?;
+    out.set_item("basis_order", basis.order)?;
+    out.set_item("periodic", periodic)?;
+    out.set_item("period", basis.period)?;
+    Ok(())
+}
+
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -5963,10 +5970,10 @@ fn gaussian_reml_fit_positions<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -5974,23 +5981,31 @@ fn gaussian_reml_fit_positions<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let n_rows = t_values.len();
     let n_outputs = y_values.ncols();
-    let n_coefficients = penalty_values.nrows();
-    let result = detach_py_result(py, "gaussian_reml_fit_positions", move || {
-        let x = position_basis_design(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+        let basis = resolve_position_basis(
             t_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
+        )?;
+        let x = position_basis_design(
+            t_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
         )?;
         let gated_x =
             gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
@@ -6000,42 +6015,44 @@ fn gaussian_reml_fit_positions<'py>(
             by_values.as_ref().map(|b| b.view()),
             x.nrows(),
         )?;
-        match gaussian_reml_multi_closed_form_with_cache(
+        let fit = match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
-            penalty_values.view(),
+            basis.penalty.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
         ) {
-            Ok(fit) => Ok(Some(fit)),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+            Ok(fit) => Some(fit),
+            Err(EstimationError::ModelIsIllConditioned { .. }) => None,
+            Err(err) => return Err(err.to_string()),
+        };
+        Ok((fit, basis))
     })?;
     let out = PyDict::new(py);
     match result {
         Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
         None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
+            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, basis.penalty.nrows())?;
         }
     }
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
 #[pyfunction(signature = (
     t,
     y,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = 0.0,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
     grad_edf = 0.0,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6047,16 +6064,16 @@ fn gaussian_reml_fit_positions_backward<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: f64,
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
     grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6068,24 +6085,33 @@ fn gaussian_reml_fit_positions_backward<'py>(
         .map(gaussian_reml_fit_state_from_pydict)
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
     let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let backward = detach_py_result(py, "gaussian_reml_fit_positions_backward", move || {
-        gaussian_reml_fit_positions_backward_impl(
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        gaussian_reml_fit_positions_backward_impl(
+            t_values.view(),
+            y_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             grad_lambda,
@@ -6116,10 +6142,10 @@ fn gaussian_reml_fit_positions_backward<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
-    basis_order = 3,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6132,10 +6158,10 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
-    basis_order: usize,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6143,32 +6169,44 @@ fn gaussian_reml_fit_positions_batched<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
-        gaussian_reml_fit_positions_batched_impl(
+    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
+        // The basis locations are placed on the concatenated positions of every group.
+        let basis = resolve_position_basis(
             t_values.view(),
-            y_values.view(),
-            row_offset_values.view(),
-            knot_or_center_values.view(),
-            &basis_kind,
+            basis_kind.as_deref(),
+            locations,
+            penalty_request,
             basis_order,
             periodic,
             period,
-            penalty_values.view(),
+        )?;
+        let result = gaussian_reml_fit_positions_batched_impl(
+            t_values.view(),
+            y_values.view(),
+            row_offset_values.view(),
+            basis.locations.view(),
+            basis.kind.engine_name(),
+            basis.order,
+            periodic,
+            basis.period,
+            basis.penalty.view(),
             weight_values.as_ref().map(|w| w.view()),
             init_lambda,
             by_values.as_ref().map(|b| b.view()),
             by_start_col,
-        )
+        )?;
+        Ok((result, basis))
     })?;
     let out = PyDict::new(py);
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
+    set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
 
@@ -6176,16 +6214,16 @@ fn gaussian_reml_fit_positions_batched<'py>(
     t,
     y,
     row_offsets,
-    basis_kind,
-    knots_or_centers,
-    penalty,
+    basis_kind = None,
+    knots_or_centers = None,
+    penalty = None,
     grad_lambda = None,
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
     grad_edf = None,
     forward_state = None,
-    basis_order = 3,
+    basis_order = None,
     periodic = false,
     period = None,
     weights = None,
@@ -6198,16 +6236,16 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     t: PyReadonlyArray1<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     row_offsets: PyReadonlyArray1<'py, usize>,
-    basis_kind: String,
-    knots_or_centers: PyReadonlyArray1<'py, f64>,
-    penalty: PyReadonlyArray2<'py, f64>,
+    basis_kind: Option<String>,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    penalty: Option<&Bound<'py, PyAny>>,
     grad_lambda: Option<PyReadonlyArray1<'py, f64>>,
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
     grad_edf: Option<PyReadonlyArray1<'py, f64>>,
     forward_state: Option<&Bound<'py, PyDict>>,
-    basis_order: usize,
+    basis_order: Option<usize>,
     periodic: bool,
     period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
@@ -6219,11 +6257,11 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
         .transpose()
         .map_err(py_value_error)?;
+    let locations = position_basis_locations_arg(knots_or_centers)?;
+    let penalty_request = position_penalty_arg(penalty)?;
     let t_values = t.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let row_offset_values = row_offsets.as_array().to_owned();
-    let knot_or_center_values = knots_or_centers.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_lambda_values = grad_lambda.as_ref().map(|g| g.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
@@ -6235,16 +6273,25 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         py,
         "gaussian_reml_fit_positions_batched_backward",
         move || {
+            let basis = resolve_position_basis(
+                t_values.view(),
+                basis_kind.as_deref(),
+                locations,
+                penalty_request,
+                basis_order,
+                periodic,
+                period,
+            )?;
             gaussian_reml_fit_positions_batched_backward_impl(
                 t_values.view(),
                 y_values.view(),
                 row_offset_values.view(),
-                knot_or_center_values.view(),
-                &basis_kind,
-                basis_order,
+                basis.locations.view(),
+                basis.kind.engine_name(),
+                basis.order,
                 periodic,
-                period,
-                penalty_values.view(),
+                basis.period,
+                basis.penalty.view(),
                 weight_values.as_ref().map(|w| w.view()),
                 init_lambda,
                 grad_lambda_values.as_ref().map(|g| g.view()),
@@ -6301,547 +6348,6 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 // the inner solver. This is exactly the iVAE / ARD recasting from the
 // proposal §4(c), §4(d).
 
-fn build_latent_duchon_design(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>), String> {
-    if t_flat.len() != n_obs * latent_dim {
-        return Err(format!(
-            "latent t length {} != n_obs * latent_dim = {}",
-            t_flat.len(),
-            n_obs * latent_dim
-        ));
-    }
-    if centers.ncols() != latent_dim {
-        return Err(format!(
-            "centers must have {latent_dim} columns to match latent_dim; got {}",
-            centers.ncols()
-        ));
-    }
-    if m == 0 {
-        return Err("LatentCoord Duchon m must be at least 1".into());
-    }
-    // Materialize t as a (n_obs, latent_dim) matrix.
-    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
-    for n in 0..n_obs {
-        for a in 0..latent_dim {
-            t_mat[[n, a]] = t_flat[n * latent_dim + a];
-        }
-    }
-    let center_matrix = centers.to_owned();
-    // Resolve a fully admissible (nullspace_order, power) for THIS ambient
-    // latent dimension. The pure scale-free polyharmonic kernel exists only
-    // when 2(p + s) > d; with the requested null space alone (s = 0) this
-    // fails whenever 2p <= d — e.g. m = 2 (p = 2) at latent_dim >= 4, which is
-    // exactly issue #875. `resolve_duchon_orders` lifts the spectral power s
-    // (and, if pure-mode CPD requires it, the null-space order) until the
-    // kernel is well-posed for any d, including the even-d `r^{2m-d} log r`
-    // log case. The latent forward design assembles no operator penalties
-    // (`operator_penalties: Default::default()`), so `max_op = 0`: only the
-    // kernel-existence / CPD guards apply, matching every other Duchon entry
-    // point which routes through this same resolver.
-    let (resolved_nullspace, resolved_power) =
-        resolve_duchon_orders(latent_dim, duchon_nullspace_order_from_m(m), 0, None);
-    // When the optimizer retracts the latent coordinates on a PERIODIC manifold
-    // (circle / torus), the decoder MUST be a function on that manifold:
-    // Φ(θ) = Φ(θ + period) per circular axis, with the kernel distance measured
-    // across the seam. We mirror the POSITION periodic-Duchon path exactly —
-    // route through `build_duchon_basis_mixed_periodicity_auto`, which sends the
-    // 1-D circle to the Bernoulli Green's-function builder (the true PSD circle
-    // kernel, gam#580) and a multi-axis torus to the chord-distance polyharmonic
-    // builder. `periodic` carries a per-axis optional period (radians, the chart
-    // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
-    // When `periodic` is `None`/all-open the basis stays byte-identical to the
-    // open Euclidean construction (euclidean / sphere / matern latent fits).
-    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
-        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
-            Some(axes.iter().map(|p| p.is_some()).collect())
-        } else {
-            None
-        }
-    });
-    // The caller's penalty and coefficient adjoints use a fixed coefficient
-    // frame. Re-estimating a data-metric radial chart here would silently move
-    // that frame with the whole latent batch, changing both the represented
-    // prior and the derivative (issue #2833). Freeze the canonical constrained
-    // kernel frame explicitly; its row-local jets then differentiate exactly
-    // the design used by Gaussian, GLM, and latent optimization entrypoints.
-    // Periodic builders already have a fixed frame and do not use this chart.
-    let radial_reparam = if periodic_flags.is_none() {
-        let effective_nullspace =
-            duchon_effective_nullspace_order(centers, resolved_nullspace);
-        let constraint = duchon_kernel_constraint_nullspace(centers, effective_nullspace)
-            .map_err(|err| err.to_string())?;
-        Some(Array2::eye(constraint.ncols()))
-    } else {
-        None
-    };
-    let spec = DuchonBasisSpec {
-        radial_reparam,
-        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: None,
-        power: resolved_power as f64,
-        nullspace_order: resolved_nullspace,
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: Default::default(),
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    let built = if let Some(flags) = periodic_flags {
-        // `periodic` is Some with the same arity (checked above). Each periodic
-        // axis carries an explicit chart period (TAU); non-periodic axes get a
-        // placeholder period (unused by the builder for `!periodic` axes).
-        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
-        let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
-        build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
-            .map_err(|err| {
-                format!("failed to evaluate periodic N-D Duchon basis for LatentCoord: {err}")
-            })?
-    } else {
-        build_duchon_basis(t_mat.view(), &spec)
-            .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?
-    };
-    let design = built
-        .design
-        .try_to_dense_by_chunks("latent_duchon_design")
-        .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
-    Ok((design, t_mat))
-}
-
-/// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
-/// per-manifold forward `build_latent_duchon_design` builds: the 1-D circle
-/// routes through the Bernoulli Green's-function design (gam#580) and the
-/// multi-axis torus through the chord-distance polyharmonic design. Returns
-/// `Ok(None)` when no axis is periodic (the caller then uses the open Euclidean
-/// jet, which is correct for euclidean / sphere / matern latents).
-///
-/// The two branches differentiate the SAME kernel, with the SAME resolved orders
-/// and the SAME constraint nullspace `Z`, as the forward — so the returned jet is
-/// the exact derivative of the forward design column-for-column. Building the
-/// open Euclidean jet here instead (the issue #876 bug) gave a wrong gradient and
-/// a column-count mismatch that nulled the outer gradient and collapsed the
-/// latent.
-fn build_latent_duchon_periodic_jet(
-    t_mat: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<Option<Array3<f64>>, String> {
-    let latent_dim = t_mat.ncols();
-    // Mirror `build_latent_duchon_design`'s gate: a per-axis period descriptor of
-    // the right arity with at least one periodic axis.
-    let axes = match periodic {
-        Some(axes) if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) => axes,
-        _ => return Ok(None),
-    };
-    // Same resolved (nullspace_order, power) the forward design uses for this
-    // ambient latent dimension, so the kernel smoothness order and the Bernoulli
-    // order (`user_m = duchon_p_from_nullspace_order(resolved_nullspace)`) match.
-    let (resolved_nullspace, resolved_power) =
-        resolve_duchon_orders(latent_dim, duchon_nullspace_order_from_m(m), 0, None);
-
-    if latent_dim == 1 {
-        // 1-D circle: the forward routes to `build_periodic_duchon_basis_1d`
-        // (Bernoulli kernel). `create_duchon_basis_1d_derivative_dense` with
-        // `periodic = true, order = 1` differentiates that exact forward — same
-        // collapsed centers, same domain wrap, same constant-only constraint
-        // nullspace — and returns the dense `(n, kernel_cols + 1)` first
-        // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
-        let period = axes.first().copied().flatten().ok_or_else(|| {
-            "periodic one-dimensional latent basis requires a period for its axis".to_string()
-        })?;
-        let dphi_dt = create_duchon_basis_1d_derivative_dense(
-            t_mat.column(0),
-            centers.column(0),
-            resolved_power as f64,
-            resolved_nullspace,
-            true,
-            Some(period),
-            1,
-        )
-        .map_err(|err| format!("failed to evaluate periodic latent Duchon jet: {err}"))?;
-        let n_rows = dphi_dt.nrows();
-        let n_cols = dphi_dt.ncols();
-        let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
-        jet.slice_mut(s![.., .., 0]).assign(&dphi_dt);
-        return Ok(Some(jet));
-    }
-
-    // Multi-axis torus: the forward routes to `build_duchon_basis_mixed_periodicity`
-    // (chord-distance polyharmonic, pure spectrum, constant-only nullspace). The
-    // `build_duchon_basis_design_and_jets` builder reproduces that SAME design and
-    // returns its exact chord-embedding jet, so we take its `J` block. The mixed
-    // periodicity path requires the pure polyharmonic spectrum (`power = 0`); the
-    // resolver returns `power = 0` for the periodic latent configurations, but
-    // assert it so a future order change fails loudly rather than silently
-    // diverging from the forward.
-    if resolved_power != 0 {
-        return Err(format!(
-            "periodic torus latent Duchon requires pure polyharmonic spectrum (power = 0); \
-             resolver returned power = {resolved_power}"
-        ));
-    }
-    let periodic_flags: Vec<bool> = axes.iter().map(|p| p.is_some()).collect();
-    let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
-    let (_phi, jet, _hess) = gam::terms::basis::build_duchon_basis_design_and_jets(
-        t_mat,
-        centers,
-        None,
-        0.0,
-        resolved_nullspace,
-        &periodic_flags,
-        &periods,
-    )
-    .map_err(|err| format!("failed to evaluate periodic torus latent Duchon jet: {err}"))?;
-    Ok(Some(jet))
-}
-
-fn t_matrix_from_flat(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-) -> Result<Array2<f64>, String> {
-    if t_flat.len() != n_obs * latent_dim {
-        return Err(format!(
-            "latent t length {} != n_obs * latent_dim = {}",
-            t_flat.len(),
-            n_obs * latent_dim
-        ));
-    }
-    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
-    for n in 0..n_obs {
-        for a in 0..latent_dim {
-            t_mat[[n, a]] = t_flat[n * latent_dim + a];
-        }
-    }
-    Ok(t_mat)
-}
-
-fn split_tensor_knots_owned(
-    knots_concat: ArrayView1<'_, f64>,
-    knot_offsets: &[usize],
-    n_axes: usize,
-) -> Result<Vec<Array1<f64>>, String> {
-    if knot_offsets.len() != n_axes + 1 {
-        return Err(format!(
-            "tensor B-spline knot_offsets must have length n_axes + 1 = {}, got {}",
-            n_axes + 1,
-            knot_offsets.len()
-        ));
-    }
-    let mut per_axis = Vec::with_capacity(n_axes);
-    for axis in 0..n_axes {
-        let lo = knot_offsets[axis];
-        let hi = knot_offsets[axis + 1];
-        if lo > hi || hi > knots_concat.len() {
-            return Err(format!(
-                "tensor B-spline knot_offsets axis {axis} out of range \
-                 (lo={lo}, hi={hi}, total={})",
-                knots_concat.len()
-            ));
-        }
-        per_axis.push(knots_concat.slice(s![lo..hi]).to_owned());
-    }
-    Ok(per_axis)
-}
-
-fn build_latent_tensor_bspline_design(
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    knots_concat: ArrayView1<'_, f64>,
-    knot_offsets: &[usize],
-    degrees: &[usize],
-) -> Result<(Array2<f64>, Array2<f64>), String> {
-    if degrees.len() != latent_dim {
-        return Err(format!(
-            "tensor B-spline degrees length {} must equal latent_dim {}",
-            degrees.len(),
-            latent_dim
-        ));
-    }
-    let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-    let knots_per_axis = split_tensor_knots_owned(knots_concat, knot_offsets, latent_dim)?;
-    let knot_views = knots_per_axis
-        .iter()
-        .map(|knots| knots.view())
-        .collect::<Vec<_>>();
-    let mut k_per_axis = Vec::<usize>::with_capacity(latent_dim);
-    let mut total_cols = 1usize;
-    for axis in 0..latent_dim {
-        let k = knot_views[axis]
-            .len()
-            .checked_sub(degrees[axis] + 1)
-            .ok_or_else(|| {
-                format!(
-                    "tensor B-spline axis {axis} knot vector too short for degree {}",
-                    degrees[axis]
-                )
-            })?;
-        k_per_axis.push(k);
-        total_cols = total_cols
-            .checked_mul(k)
-            .ok_or_else(|| "tensor B-spline basis size overflow".to_string())?;
-    }
-
-    let mut design = Array2::<f64>::zeros((n_obs, total_cols));
-    let mut values_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
-    let mut scratch: Vec<SplineScratch> = (0..latent_dim)
-        .map(|axis| SplineScratch::new(degrees[axis]))
-        .collect();
-    let mut idx = vec![0usize; latent_dim];
-    for n in 0..n_obs {
-        for axis in 0..latent_dim {
-            evaluate_bspline_basis_scalar(
-                t_mat[[n, axis]],
-                knot_views[axis],
-                degrees[axis],
-                &mut values_per_axis[axis],
-                &mut scratch[axis],
-            )
-            .map_err(|err| {
-                format!("failed to evaluate tensor B-spline latent axis {axis}: {err}")
-            })?;
-        }
-        for col in 0..total_cols {
-            let mut rem = col;
-            for axis in (0..latent_dim).rev() {
-                idx[axis] = rem % k_per_axis[axis];
-                rem /= k_per_axis[axis];
-            }
-            let mut prod = 1.0_f64;
-            for axis in 0..latent_dim {
-                prod *= values_per_axis[axis][idx[axis]];
-            }
-            design[[n, col]] = prod;
-        }
-    }
-    Ok((design, t_mat))
-}
-
-fn latent_periodic_range_from_centers(centers: ArrayView2<'_, f64>) -> Result<(f64, f64), String> {
-    if centers.ncols() != 1 || centers.nrows() == 0 {
-        return Err("periodic B-spline latent design requires one-column centers".to_string());
-    }
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for &value in centers.column(0).iter() {
-        lo = lo.min(value);
-        hi = hi.max(value);
-    }
-    if !(lo.is_finite() && hi.is_finite() && hi > lo) {
-        return Err("periodic B-spline centers must define a finite range".to_string());
-    }
-    Ok((lo, hi))
-}
-
-fn project_latent_jet_columns(
-    raw_jet: &Array3<f64>,
-    transform: ArrayView2<'_, f64>,
-) -> Result<Array3<f64>, String> {
-    let n_rows = raw_jet.shape()[0];
-    let raw_cols = raw_jet.shape()[1];
-    let latent_dim = raw_jet.shape()[2];
-    if transform.nrows() != raw_cols {
-        return Err(format!(
-            "latent jet transform row mismatch: jet has {raw_cols} columns, transform has {} rows",
-            transform.nrows()
-        ));
-    }
-    let mut out = Array3::<f64>::zeros((n_rows, transform.ncols(), latent_dim));
-    for n in 0..n_rows {
-        for j in 0..transform.ncols() {
-            for k in 0..raw_cols {
-                let z = transform[[k, j]];
-                if z == 0.0 {
-                    continue;
-                }
-                for a in 0..latent_dim {
-                    out[[n, j, a]] += raw_jet[[n, k, a]] * z;
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn build_latent_forward_design(
-    basis_kind: &str,
-    t_flat: ArrayView1<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
-    tensor_knot_offsets: Option<&[usize]>,
-    tensor_degrees: Option<&[usize]>,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>, Array3<f64>), String> {
-    let basis_kind = latent_basis_kind(basis_kind)?;
-    let (design, t_mat) = match basis_kind {
-        "duchon" => {
-            let (design, t_mat) =
-                build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?;
-            // On a PERIODIC latent manifold (circle / torus) the forward design is
-            // the periodic Duchon basis (1-D Bernoulli Green's function or the
-            // multi-axis chord-distance polyharmonic) — a DIFFERENT kernel and
-            // column layout than the open Euclidean Duchon. Its input-location
-            // jet must differentiate that SAME periodic forward, not the open
-            // Euclidean basis the generic `latent_input_location_jet` builds.
-            // Routing the periodic forward through the open jet produced both a
-            // wrong gradient direction AND a column-count mismatch (the open jet
-            // carries `d+1` polynomial columns vs. the periodic design's single
-            // constant column), which made `value_and_grad` fail the
-            // design/jet shape check, return `(+∞, None)`, and hand the outer
-            // trust region a zero gradient — so the circle/torus optimizer read
-            // "stationary" at the start and collapsed every row to one latent
-            // coordinate (issue #876). Build the matching periodic jet here and
-            // return early, mirroring the per-manifold forward choice exactly.
-            if let Some(jet) = build_latent_duchon_periodic_jet(t_mat.view(), centers, m, periodic)?
-            {
-                if jet.shape()[1] != design.ncols() {
-                    return Err(format!(
-                        "periodic latent Duchon design/jet column mismatch: design has {}, jet has {}",
-                        design.ncols(),
-                        jet.shape()[1]
-                    ));
-                }
-                return Ok((design, t_mat, jet));
-            }
-            (design, t_mat)
-        }
-        "matern" => {
-            if centers.ncols() != latent_dim {
-                return Err(format!(
-                    "Matérn latent centers must have {latent_dim} columns; got {}",
-                    centers.ncols()
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let spec = MaternBasisSpec {
-                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                length_scale: MaternLengthScale::fixed(1.0),
-                nu: MaternNu::ThreeHalves,
-                include_intercept: false,
-                double_penalty: false,
-                identifiability: MaternIdentifiability::None,
-                aniso_log_scales: None,
-                periodic: None,
-            };
-            let built = build_matern_basis(t_mat.view(), &spec)
-                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
-            let design = built
-                .design
-                .try_to_dense_by_chunks("latent_matern_design")
-                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
-            (design, t_mat)
-        }
-        "sphere" => {
-            if centers.ncols() != latent_dim {
-                return Err(format!(
-                    "sphere latent centers must have {latent_dim} columns; got {}",
-                    centers.ncols()
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let spec = SphericalSplineBasisSpec {
-                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-                penalty_order: m,
-                double_penalty: false,
-                radians: true,
-                method: SphereMethod::Wahba,
-                max_degree: None,
-                wahba_kernel: SphereWahbaKernel::Sobolev,
-                identifiability: SphericalSplineIdentifiability::CenterSumToZero,
-            };
-            let built = build_spherical_spline_basis(t_mat.view(), &spec)
-                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
-            let constraint_transform = match &built.metadata {
-                gam::terms::basis::BasisMetadata::Sphere {
-                    constraint_transform,
-                    ..
-                } => constraint_transform.clone(),
-                _ => None,
-            };
-            let design = built
-                .design
-                .try_to_dense_by_chunks("latent_sphere_design")
-                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
-            let raw_jet = latent_input_location_jet(
-                basis_kind,
-                t_mat.view(),
-                centers,
-                m,
-                tensor_knots_concat,
-                tensor_knot_offsets,
-                tensor_degrees,
-            )?;
-            let jet = match constraint_transform {
-                Some(z) => project_latent_jet_columns(&raw_jet, z.view())?,
-                _ => raw_jet,
-            };
-            if jet.shape()[1] != design.ncols() {
-                return Err(format!(
-                    "sphere latent design/jet column mismatch: design has {}, jet has {}",
-                    design.ncols(),
-                    jet.shape()[1]
-                ));
-            }
-            return Ok((design, t_mat, jet));
-        }
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat
-                .as_ref()
-                .ok_or_else(|| "tensor B-spline latent design requires knots_concat".to_string())?
-                .clone();
-            let offsets = tensor_knot_offsets
-                .ok_or_else(|| "tensor B-spline latent design requires knot_offsets".to_string())?;
-            let degrees = tensor_degrees
-                .ok_or_else(|| "tensor B-spline latent design requires degrees".to_string())?;
-            build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
-        }
-        "periodic_bspline" => {
-            if latent_dim != 1 {
-                return Err(format!(
-                    "periodic B-spline latent design requires latent_dim 1; got {latent_dim}"
-                ));
-            }
-            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-            let range = latent_periodic_range_from_centers(centers)?;
-            let design =
-                periodic_bspline_basis_dense_via_spec(t_mat.column(0), range, m, centers.nrows())?;
-            (design, t_mat)
-        }
-        other => {
-            return Err(format!(
-                "gaussian_reml_fit_latent does not support latent basis_kind {other:?}"
-            ));
-        }
-    };
-    let jet = latent_input_location_jet(
-        basis_kind,
-        t_mat.view(),
-        centers,
-        m,
-        tensor_knots_concat,
-        tensor_knot_offsets,
-        tensor_degrees,
-    )?;
-    if jet.shape()[1] != design.ncols() {
-        return Err(format!(
-            "latent design/jet column mismatch for {basis_kind:?}: design has {}, jet has {}",
-            design.ncols(),
-            jet.shape()[1]
-        ));
-    }
-    Ok((design, t_mat, jet))
-}
-
 #[cfg(test)]
 mod prediction_payload_tests {
     use super::{
@@ -6883,6 +6389,7 @@ mod prediction_payload_tests {
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
             point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: None,
         };
 
         let value = serde_json::to_value(payload).expect("serialize prediction payload");
@@ -6891,6 +6398,43 @@ mod prediction_payload_tests {
                 .get("covariance_source")
                 .and_then(|item| item.as_str()),
             Some("smoothing-corrected")
+        );
+        assert!(
+            value.get("point_covariance_note").is_none(),
+            "a point on the fit's own covariance carries no note"
+        );
+    }
+
+    /// gam#2985: a withheld fit's posterior-mean point reaches Python with the
+    /// typed provenance note beside its covariance source.
+    #[test]
+    fn a_withheld_fit_prediction_payload_carries_its_point_note_2985() {
+        let declined = gam::estimate::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        let note =
+            gam_predict::PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined }.explain();
+        let payload = PredictionPayload {
+            columns: BTreeMap::from([("posterior_mean".to_string(), vec![0.4])]),
+            model_class: "bernoulli marginal-slope".to_string(),
+            point_column: "posterior_mean",
+            point_shape: "estimand_explicit",
+            family: "probit".to_string(),
+            interval_method: None,
+            covariance_source: None,
+            point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: Some(note.clone()),
+        };
+        let value = serde_json::to_value(payload).expect("serialize prediction payload");
+        assert_eq!(
+            value.get("point_covariance_note").and_then(|item| item.as_str()),
+            Some(note.as_str())
+        );
+        assert!(
+            note.contains("conditional on the fitted latent law")
+                && note.contains("the pin's missing channel"),
+            "{note}"
         );
     }
 

@@ -360,31 +360,36 @@ pub fn derive_ivae_aux_scale(aux: ArrayView2<f64>) -> Array2<f64> {
     out
 }
 
-/// Evaluate the fixed-hyperparameter Gaussian profile evidence used by the
-/// identifiable-factor Torch interaction boundary.
+/// Penalized profile log-likelihood of one converged identifiable-factor fit at
+/// fixed hyperparameters, for the identifiable-factor Torch interaction boundary:
+/// the Gaussian likelihood with its scale concentrated out, minus half the
+/// penalty, `−½·n·log(RSS/n) − ½·penalty` (additive constants dropped).
+///
+/// No log-determinant or Occam term enters, so this is not a marginal likelihood
+/// or evidence and it does not price model complexity (#2946).
 ///
 /// This function deliberately evaluates one converged fit. It is not a model
 /// selector and accepts no candidate array: sampled RSS/penalty surfaces do not
 /// contain the analytic derivatives needed to certify a continuous optimum in
 /// two log-weights. A zero residual makes the concentrated Gaussian likelihood
 /// unbounded and is therefore an error rather than a floored finite score.
-pub fn identifiable_factor_log_evidence(
+pub fn identifiable_factor_profile_log_likelihood(
     residual_sum_squares: f64,
     penalty: f64,
     n_obs: usize,
 ) -> Result<f64, String> {
     if n_obs == 0 {
-        return Err("identifiable_factor_log_evidence: n_obs must be > 0".to_string());
+        return Err("identifiable_factor_profile_log_likelihood: n_obs must be > 0".to_string());
     }
     if !(residual_sum_squares.is_finite() && residual_sum_squares > 0.0) {
         return Err(format!(
-            "identifiable_factor_log_evidence: residual_sum_squares must be finite and \
-             positive; got {residual_sum_squares}"
+            "identifiable_factor_profile_log_likelihood: residual_sum_squares must be finite \
+             and positive; got {residual_sum_squares}"
         ));
     }
     if !penalty.is_finite() {
         return Err(format!(
-            "identifiable_factor_log_evidence: penalty must be finite; got {penalty}"
+            "identifiable_factor_profile_log_likelihood: penalty must be finite; got {penalty}"
         ));
     }
     let observations = n_obs as f64;
@@ -4061,15 +4066,15 @@ mod tests {
     }
 
     #[test]
-    fn identifiable_factor_evidence_scores_one_converged_fit() {
-        let score = identifiable_factor_log_evidence(4.0, 1.5, 8).unwrap();
+    fn identifiable_factor_profile_log_likelihood_scores_one_converged_fit() {
+        let score = identifiable_factor_profile_log_likelihood(4.0, 1.5, 8).unwrap();
         let expected = -4.0 * (0.5_f64).ln() - 0.75;
         assert!((score - expected).abs() < f64::EPSILON.sqrt());
     }
 
     #[test]
-    fn identifiable_factor_evidence_rejects_unbounded_zero_residual() {
-        let error = identifiable_factor_log_evidence(0.0, 1.0, 8).unwrap_err();
+    fn identifiable_factor_profile_log_likelihood_rejects_unbounded_zero_residual() {
+        let error = identifiable_factor_profile_log_likelihood(0.0, 1.0, 8).unwrap_err();
         assert!(error.contains("positive"));
     }
 

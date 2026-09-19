@@ -221,9 +221,61 @@ pub(crate) struct DecoderPriorBorderRemainderOp {
     /// cell, border 288) spent 16.1–17.5 s in each polish trial, against 0.86–1.12 s
     /// in job 605564 at `b7945fab1`, before this remainder was composed.
     dense: std::sync::OnceLock<Array2<f64>>,
+    /// #2627 — the operator's norm majorant `max(|E|, |E|ᵀ) + max(|B|, |B|ᵀ)`, built
+    /// once from the dense border forms of its exact leg `E` and majorizer leg `B`.
+    majorant: std::sync::OnceLock<Array2<f64>>,
 }
 
 impl DecoderPriorBorderRemainderOp {
+    /// The exact and majorizer legs of one apply, each on the border.
+    fn apply_pair(&self, v: ArrayView1<'_, f64>) -> (Array1<f64>, Array1<f64>) {
+        match self.projection.as_ref() {
+            Some(projection) => {
+                let lifted = projection.lift_border_vec(v);
+                let (exact, majorizer) = SaeManifoldTerm::decoder_prior_beta_hvp_pair_of_plan(
+                    &self.prepared,
+                    lifted.view(),
+                );
+                (
+                    projection.project_border_vec(exact.view()),
+                    projection.project_border_vec(majorizer.view()),
+                )
+            }
+            None => SaeManifoldTerm::decoder_prior_beta_hvp_pair_of_plan(&self.prepared, v),
+        }
+    }
+
+    /// #2627 — `M = max(|E|, |E|ᵀ) + max(|B|, |B|ᵀ)` over the dense border forms of
+    /// the two legs this operator is the difference of. `|E − B| ≤ |E| + |B|`, so
+    /// `M` majorizes the operator and its transpose without leaning on the legs'
+    /// cancellation. It pays the `border_dim` pair applies `to_dense` pays, once
+    /// per operator. The bound is of the legs' dense forms; the hvp apply reaches
+    /// that operator within its own rounding band.
+    fn abs_majorant(&self) -> &Array2<f64> {
+        self.majorant.get_or_init(|| {
+            use rayon::prelude::*;
+            let width = self.border_dim;
+            let columns: Vec<(Array1<f64>, Array1<f64>)> = (0..width)
+                .into_par_iter()
+                .map(|col| {
+                    let mut unit = Array1::<f64>::zeros(width);
+                    unit[col] = 1.0;
+                    self.apply_pair(unit.view())
+                })
+                .collect();
+            let mut exact = Array2::<f64>::zeros((width, width));
+            let mut majorizer = Array2::<f64>::zeros((width, width));
+            for (col, (exact_column, majorizer_column)) in columns.iter().enumerate() {
+                exact.column_mut(col).assign(exact_column);
+                majorizer.column_mut(col).assign(majorizer_column);
+            }
+            Array2::from_shape_fn((width, width), |(row, col)| {
+                exact[[row, col]].abs().max(exact[[col, row]].abs())
+                    + majorizer[[row, col]].abs().max(majorizer[[col, row]].abs())
+            })
+        })
+    }
+
     fn apply(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         match self.projection.as_ref() {
             Some(projection) => {
@@ -374,6 +426,20 @@ impl gam_solve::arrow_schur::BetaPenaltyOp for DecoderPriorBorderRemainderOp {
             }
             None => hasher.write_bool(false),
         }
+    }
+
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let majorant = self.abs_majorant();
+        for (row, target) in out.iter_mut().enumerate().take(self.border_dim) {
+            let mut acc = 0.0_f64;
+            for (col, &value) in x.iter().enumerate().take(self.border_dim) {
+                acc += majorant[[row, col]] * value;
+            }
+            *target += acc;
+        }
+        // An inner product of length `border_dim`, the addition into `out`, and the
+        // one addition that formed each majorant entry.
+        self.border_dim + 2
     }
 }
 
@@ -2414,6 +2480,7 @@ impl SaeManifoldTerm {
             projection,
             diagonal: std::sync::OnceLock::new(),
             dense: std::sync::OnceLock::new(),
+            majorant: std::sync::OnceLock::new(),
         }))
     }
 

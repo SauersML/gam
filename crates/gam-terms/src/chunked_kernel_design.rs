@@ -233,11 +233,13 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
             return Ok(Array2::<f64>::zeros((p, p)));
         }
         let chunk_starts: Vec<usize> = (0..n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE).collect();
-        // Deterministic parallel reduction over the row chunks: length-only
-        // pairwise tree, so the accumulated XᵀWX never depends on thread count
-        // or rayon's demand-driven fold/reduce grouping (#2228).
-        let xtwx = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+        // Deterministic parallel reduction over the row chunks: the pairwise tree
+        // split on the rows each chunk declares, so the accumulated XᵀWX never
+        // depends on thread count or rayon's demand-driven fold/reduce grouping
+        // (#2228), and a few large chunks still run on several workers (#979).
+        let xtwx = gam_linalg::pairwise_reduce::par_deterministic_block_fold_by_work(
             chunk_starts.len(),
+            KERNEL_OPERATOR_ROW_CHUNK_SIZE,
             |idx_range: core::ops::Range<usize>| {
                 let mut acc = Array2::<f64>::zeros((p, p));
                 for &start in &chunk_starts[idx_range] {

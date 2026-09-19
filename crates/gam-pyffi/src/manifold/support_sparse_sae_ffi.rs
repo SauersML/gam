@@ -7,8 +7,8 @@
 //! any seed allocation.
 
 use gam::terms::sae::manifold::{
-    SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER, SaeSupportFixedPointReport, SaeSupportRehydrateRequest,
-    SaeSupportSparseFit, SaeSupportSparseFitRequest, SaeSupportSparseTerm, SaeSupportStationarity,
+    SaeSupportFixedPointReport, SaeSupportRehydrateRequest, SaeSupportSparseFit,
+    SaeSupportSparseFitRequest, SaeSupportSparseTerm, SaeSupportStationarity,
     fit_sae_support_sparse_with_census, rehydrate_sae_support_term,
 };
 use ndarray::{Array1, Array2, ArrayView2};
@@ -471,7 +471,8 @@ impl SupportSparseManifoldSaeCore {
         if schema != SUPPORT_SCHEMA_TAG {
             return Err(py_value_error(format!(
                 "ManifoldSAESupport.from_dict: schema {schema:?} is not {SUPPORT_SCHEMA_TAG:?}; \
-                 dense payloads tagged gamfit.ManifoldSAE/v7 load with ManifoldSAE.from_dict"
+                 dense payloads tagged {} load with ManifoldSAE.from_dict",
+                crate::manifold::manifold_sae_payload::SCHEMA_TAG
             )));
         }
         let requested_k: usize = required_field(payload, "requested_k")?.extract()?;
@@ -729,10 +730,9 @@ pub(crate) fn fit_support_sparse_manifold_sae(
         atom_dim: request.atom_dim,
         support_k: request.support_k,
         initial_smoothness: request.initial_smoothness,
+        // `max_iter` is the caller's OUTER smoothing-search budget. The inner fixed
+        // point has no budget: it stops on its certificate or on a proven stall (#2576).
         max_outer_iter: request.max_iter,
-        // `max_iter` is the caller's OUTER smoothing-search budget; the inner
-        // fixed point gets the engine's own declaration.
-        max_inner_iter: SAE_SUPPORT_INNER_FIXED_POINT_MAX_ITER,
         trust_radius: request.trust_radius,
         random_state: request.random_state,
     })

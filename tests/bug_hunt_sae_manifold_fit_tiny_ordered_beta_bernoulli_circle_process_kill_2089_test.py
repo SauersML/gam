@@ -42,7 +42,6 @@ _REPRO = textwrap.dedent(
             sparsity_weight=0.01,
             smoothness_weight=0.01,
             isometry_weight=0.1,
-            ard_per_atom=False,
             decoder_incoherence_weight=0.1,
             nuclear_norm_weight=0.0,
             random_state=0,

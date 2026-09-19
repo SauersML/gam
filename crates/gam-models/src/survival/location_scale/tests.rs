@@ -272,6 +272,8 @@ fn test_survival_fit(
         geometry: None,
         penalty_block_trace: Vec::new(),
         edf_by_block: Vec::new(),
+        edf_rank_bound: Vec::new(),
+        coefficient_mode_selection: Default::default(),
     })
     .expect("valid survival test fit")
 }
@@ -320,6 +322,8 @@ fn survival_fit_parts_with_outer_evidence(
         geometry: None,
         penalty_block_trace: Vec::new(),
         edf_by_block: Vec::new(),
+        edf_rank_bound: Vec::new(),
+        coefficient_mode_selection: Default::default(),
     }
 }
 
@@ -401,6 +405,20 @@ fn survival_fit_finalization_preserves_outer_certificate() {
     );
 }
 
+/// gam#2661: finalization carries the inner fit's mode-selection record rather than
+/// defaulting it to `NotRecorded`.
+#[test]
+fn survival_fit_finalization_preserves_the_mode_selection_record_2661() {
+    let selection = gam_solve::model_types::CoefficientModeSelection::AnchoredContinuation {
+        steps: 4,
+        endpoint_discrepancy: 1.0e-9,
+    };
+    let mut parts = survival_fit_parts_with_outer_evidence(0, None);
+    parts.coefficient_mode_selection = selection.clone();
+    let fit = survival_fit_from_parts(parts).expect("a fixed-outer survival fit finalizes");
+    assert_eq!(fit.artifacts.coefficient_mode_selection, selection);
+}
+
 fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
     SurvivalLocationScaleFamily {
         n: 3,
@@ -433,6 +451,7 @@ fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; 3]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     }
@@ -495,16 +514,9 @@ fn survival_ls_total_log_likelihood_with_link(
         if probe.w[i] <= 0.0 {
             continue;
         }
-        let state = probe.row_predictor_state(
-            dynamic.h_entry[i],
-            dynamic.h_exit[i],
-            dynamic.hdot_exit[i],
-            dynamic.q_entry[i],
-            dynamic.q_exit[i],
-            dynamic.qdot_exit[i],
-        );
+        let state = probe.row_predictor_state_at(&dynamic, i);
         if let Some(kernel) = probe.exact_row_kernel(i, state).expect("row kernel") {
-            ll += kernel.log_likelihood();
+            ll += kernel.log_likelihood_at(&state);
         }
     }
     ll
@@ -1076,6 +1088,7 @@ fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; 1]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     }
@@ -1097,11 +1110,11 @@ fn survival_ls_monotonicity_floors_near_cancellation_negative_velocity() {
 
     // A near-cancellation that lands g just barely negative: d_raw and qdot are
     // O(1) and opposite-signed, differing only at the ~1e-7 level — exactly the
-    // boundary-cancellation regime. `row_predictor_state` forms
+    // boundary-cancellation regime. `survival_predictor_state` forms
     // g = compensated_difference(d_raw, -qdot1) = d_raw + qdot1.
     let d_raw = 1.0_f64;
     let qdot1 = -(1.0_f64 + 2.0e-7); // g = d_raw + qdot1 = -2.0e-7, within the guard band
-    let state = family.row_predictor_state(0.1, 0.2, d_raw, -0.3, -0.3, qdot1);
+    let state = survival_predictor_state(0.1, 0.2, d_raw, -0.3, -0.3, qdot1, 0.0, true);
     assert!(
         state.g < 0.0 && state.g.abs() < guard,
         "fixture must produce a tiny-negative velocity inside the guard band: g={}, guard={guard}",
@@ -1136,7 +1149,7 @@ fn survival_ls_monotonicity_floors_near_cancellation_negative_velocity() {
 
     // A genuinely non-monotone state (g negative by far more than the guard)
     // must still be rejected — the floor does not mask real violations.
-    let bad_state = family.row_predictor_state(0.1, 0.2, 1.0, -0.3, -0.3, -1.5);
+    let bad_state = survival_predictor_state(0.1, 0.2, 1.0, -0.3, -0.3, -1.5, 0.0, true);
     assert!(
         bad_state.g < -guard,
         "fixture must produce a large-negative velocity below -guard: g={}",
@@ -1189,6 +1202,7 @@ fn survival_ls_joint_oracle_family(
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     }
@@ -1266,7 +1280,7 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 1.0, 1.0, 0.35];
@@ -1407,9 +1421,9 @@ fn survival_ls_packed_targets_apply_ht_mask_once_932() {
     }
 }
 
-/// #921/#932: the packed 24-pair coefficient lowering must reproduce the
+/// #921/#932: the packed 27-pair coefficient lowering must reproduce the
 /// generic `RowKernel<9>` dense pullback. The two paths share only the canonical
-/// row program: one lowers its 24 structural pairs through grouped X'WX calls,
+/// row program: one lowers its 27 structural pairs through grouped X'WX calls,
 /// while the oracle materializes the generic per-row 9×9 pullback.
 #[test]
 fn survival_ls_row_kernel_matches_packed_coefficient_lowering() {
@@ -1468,16 +1482,9 @@ fn survival_ls_row_kernel_matches_packed_coefficient_lowering_body() {
     let ll_new = row_kernel_log_likelihood(&cache, &RowSet::All);
     let mut ll_old = 0.0;
     for i in 0..n {
-        let state = family.row_predictor_state(
-            dynamic.h_entry[i],
-            dynamic.h_exit[i],
-            dynamic.hdot_exit[i],
-            dynamic.q_entry[i],
-            dynamic.q_exit[i],
-            dynamic.qdot_exit[i],
-        );
+        let state = family.row_predictor_state_at(&dynamic, i);
         if let Some(k) = family.exact_row_kernel(i, state).expect("row kernel") {
-            ll_old += k.log_likelihood();
+            ll_old += k.log_likelihood_at(&state);
         }
     }
     assert!(
@@ -1570,8 +1577,8 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
         [-6.5, 5.6, 1.1, -0.7, -0.3, -0.15, 0.2, 0.4, 0.1],
-        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, -0.25],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, 0.25],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 0.0, 1.0, 0.35];
@@ -1647,16 +1654,9 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         let ll_tower = row_kernel_log_likelihood(&cache, &RowSet::All);
         let mut ll_bespoke = 0.0;
         for i in 0..family.n {
-            let state = family.row_predictor_state(
-                dynamic.h_entry[i],
-                dynamic.h_exit[i],
-                dynamic.hdot_exit[i],
-                dynamic.q_entry[i],
-                dynamic.q_exit[i],
-                dynamic.qdot_exit[i],
-            );
+            let state = family.row_predictor_state_at(&dynamic, i);
             if let Some(k) = family.exact_row_kernel(i, state).expect("row kernel") {
-                ll_bespoke += k.log_likelihood();
+                ll_bespoke += k.log_likelihood_at(&state);
             }
         }
         assert!(
@@ -1707,8 +1707,8 @@ fn survival_ls_block_gradient_tower_body() {
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
         [-6.5, 5.6, 1.1, -0.7, -0.3, -0.15, 0.2, 0.4, 0.1],
-        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, -0.25],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, 0.25],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 0.0, 1.0, 0.35];
@@ -1854,392 +1854,8 @@ fn survival_location_scale_planner_keeps_analytic_hessian_at_large_scale_dimensi
     );
 }
 
-#[test]
-fn time_block_post_update_leaves_beta_unchanged() {
-    // The QP owns feasibility. The post-update hook may validate the
-    // accepted beta, but it must not silently repair a missing constraint
-    // row after the solver has produced a step.
-    let family = survival_exact_newton_test_family();
-    let spec = ParameterBlockSpec {
-        name: "time_transform".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 1)))),
-        offset: Array1::zeros(1),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-
-    let feasible = family
-        .post_update_block_beta(
-            &[ParameterBlockState {
-                beta: array![0.0],
-                eta: array![0.0, 0.0, 0.0],
-            }],
-            SurvivalLocationScaleFamily::BLOCK_TIME,
-            &spec,
-            array![0.5],
-        )
-        .expect("return time beta");
-    assert_eq!(feasible, array![0.5]);
-
-    let err = family
-        .post_update_block_beta(
-            &[ParameterBlockState {
-                beta: array![0.0],
-                eta: array![0.0, 0.0, 0.0],
-            }],
-            SurvivalLocationScaleFamily::BLOCK_TIME,
-            &spec,
-            array![-2.0],
-        )
-        .expect_err("post-update must reject, not repair, infeasible time beta");
-    assert!(
-        err.contains("violates represented linear constraint"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn time_block_feasible_step_stays_inside_derivative_guard() {
-    let family = survival_exact_newton_test_family();
-    let states = vec![
-        ParameterBlockState {
-            beta: array![0.1],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-    ];
-    let alpha = family
-        .max_feasible_step_size(
-            &states,
-            SurvivalLocationScaleFamily::BLOCK_TIME,
-            &array![-2.0],
-        )
-        .expect("time step ceiling")
-        .expect("time step should be bounded");
-    // The guard row is a unit row here, so scaled slack is `0.1` and the scaled
-    // drift of `-2.0` is `-2.0`: the exact fraction to the boundary is `0.05`.
-    // The clipped step stops one primal-feasibility tolerance short of the face
-    // in that metric — an ABSOLUTE retreat, `tol/|scaled drift|`, not a fraction
-    // of the step (gam#2695).
-    assert!(
-        (alpha - 0.05).abs() <= 1e-12,
-        "a clipped step lands on the blocking face: alpha={alpha:.12e}"
-    );
-    let feasible = states[0].beta[0] + alpha * -2.0;
-    // The clipped step lands ON the blocking face, so the row is tight there and
-    // can enter the active-set solver's working face (gam#2695, gam#2714).
-    assert!(
-        feasible.abs() <= 1.0e-12,
-        "the clipped endpoint must sit on the face, got {feasible:.6e}"
-    );
-}
-
-#[test]
-fn latent_time_constraints_use_exact_derivative_guard_rows() {
-    let constraints = structural_time_coefficient_constraints(
-        &DesignMatrix::from(array![[1.0, 1.0], [2.0, -1.0]]),
-        &array![0.25, 0.75],
-        1.0,
-    )
-    .expect("exact derivative guard constraints")
-    .expect("nonzero derivative rows");
-
-    let scale0 = 2.0_f64.sqrt();
-    let scale1 = 5.0_f64.sqrt();
-    let expected_a = array![[1.0 / scale0, 1.0 / scale0], [2.0 / scale1, -1.0 / scale1]];
-    let expected_b = array![0.75 / scale0, 0.25 / scale1];
-    assert!(
-        (&constraints.a - &expected_a)
-            .iter()
-            .all(|v| v.abs() <= 1e-12),
-        "scaled A mismatch: got {:?}, expected {:?}",
-        constraints.a,
-        expected_a
-    );
-    assert!(
-        (&constraints.b - &expected_b)
-            .iter()
-            .all(|v| v.abs() <= 1e-12),
-        "scaled b mismatch: got {:?}, expected {:?}",
-        constraints.b,
-        expected_b
-    );
-}
-
-#[test]
-fn time_block_feasible_step_accepts_zero_beta_when_offset_encodes_guard() {
-    let family = survival_exact_newton_test_family();
-    let states = vec![
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 1e-8],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-    ];
-    let alpha = family
-        .max_feasible_step_size(
-            &states,
-            SurvivalLocationScaleFamily::BLOCK_TIME,
-            &array![0.0],
-        )
-        .expect("zero-step structural state should be valid")
-        .expect("time step should be bounded");
-    assert_eq!(alpha, 1.0);
-}
-
-#[test]
-fn max_feasible_link_wiggle_step_refuses_a_non_finite_direction_2721() {
-    let mut family = survival_exact_newton_test_family();
-    family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0]
-    ])));
-    let beta = array![1.0, 1.0];
-    // Positive control: a finite BINDING direction is evaluated and clipped.
-    let bounded = family
-        .max_feasible_link_wiggle_step(&beta, &array![-2.0, 0.0])
-        .expect("a finite direction must be evaluated")
-        .expect("the linkwiggle step fraction is always reported");
-    assert!(
-        bounded > 0.0 && bounded < 1.0,
-        "a binding finite direction should clip the step, got {bounded}"
-    );
-    // The defect (gam#2721): NaN fails `drift < 0.0`, so this returned Ok(1.0)
-    // -- a step that is not a number, certified as fully feasible.
-    let message = family
-        .max_feasible_link_wiggle_step(&beta, &array![f64::NAN, 0.0])
-        .expect_err("a non-finite direction component must be refused");
-    assert!(
-        message.contains("non-finite"),
-        "the refusal must name the non-finite component, got: {message}"
-    );
-}
-
-/// gam#2719, the witness geometry. The link-wiggle seed sits at `beta == 0`,
-/// exactly on every face of its own cone, and the joint-Newton direction has a
-/// tiny negative component there. The measured drifts on
-/// `survival_location_scale_saved_fit_preserves_linkwiggle_metadata` run down
-/// to `-3.291437e-18`; the old coordinate loop answered `alpha = 0` for every
-/// one of them, and 314 of the 379 refusals it produced were of steps whose
-/// endpoint the solver's own `1e-8` contract calls feasible.
-#[test]
-fn linkwiggle_step_admits_a_sub_tolerance_drift_off_an_active_coefficient() {
-    let mut family = survival_exact_newton_test_family();
-    family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0]
-    ])));
-    let on_the_face = array![0.0, 0.0];
-    let measured_drift = array![-3.291_437e-18, -5.808_407e-18];
-    let alpha = family
-        .max_feasible_link_wiggle_step(&on_the_face, &measured_drift)
-        .expect("an in-band drift keeps a feasible origin")
-        .expect("the linkwiggle step fraction is always reported");
-    assert_eq!(
-        alpha, 1.0,
-        "a drift ten orders below the feasibility contract must not limit the step"
-    );
-    // And the claim that relief rests on: the endpoint really is feasible.
-    let endpoint = &on_the_face + &measured_drift;
-    let cone = crate::wiggle::monotone_wiggle_nonnegative_constraints(endpoint.len())
-        .expect("the block declares its cone");
-    let (violation, _) = cone
-        .max_scaled_violation(endpoint.view())
-        .expect("violation sweep");
-    assert!(violation <= gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL);
-
-    // Positive control on the same face: a drift ABOVE the contract still
-    // blocks, and reports `0.0` as an ANSWER rather than as an error — the
-    // caller must project onto the face, and no smaller step can help.
-    let real_drift = array![-3.961_401e-6, 0.0];
-    let blocked = family
-        .max_feasible_link_wiggle_step(&on_the_face, &real_drift)
-        .expect("a blocked face is an answer, not an error")
-        .expect("the linkwiggle step fraction is always reported");
-    assert_eq!(blocked, 0.0);
-}
-
-/// The barrier hook and the constraint set the blockwise QP enforces must be
-/// the same cone. They are built from one constructor now; this pins that a
-/// step the hook admits is a step the QP's own feasibility metric accepts, for
-/// a spread of directions including the pathological one.
-#[test]
-fn linkwiggle_barrier_hook_agrees_with_the_declared_cone() {
-    let mut family = survival_exact_newton_test_family();
-    family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0]
-    ])));
-    let cone = crate::wiggle::monotone_wiggle_nonnegative_constraints(2).expect("cone");
-    let cases = [
-        (array![0.0_f64, 0.0], array![-1.0e-18_f64, -1.0e-18]),
-        (array![0.0_f64, 0.5], array![-1.0e-6_f64, -1.0]),
-        (array![0.25_f64, 0.5], array![-1.0_f64, 0.25]),
-        (array![2.0_f64, 3.0], array![0.5_f64, 0.5]),
-        (array![0.0_f64, 1.0], array![1.0_f64, -1.0e-12]),
-    ];
-    for (beta, direction) in cases {
-        let alpha = family
-            .max_feasible_link_wiggle_step(&beta, &direction)
-            .unwrap_or_else(|e| panic!("hook refused {beta:?} along {direction:?}: {e}"))
-            .expect("the linkwiggle step fraction is always reported");
-        let endpoint = &beta + &(&direction * alpha);
-        let (violation, row) = cone
-            .max_scaled_violation(endpoint.view())
-            .expect("violation sweep");
-        assert!(
-            violation <= gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
-            "hook admitted alpha={alpha:.6e} from {beta:?} along {direction:?}, \
-             leaving scaled violation {violation:.3e} at row {row:?}"
-        );
-    }
-}
-
-#[test]
-fn linkwiggle_block_post_update_leaves_beta_unchanged() {
-    let mut family = survival_exact_newton_test_family();
-    family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0]
-    ])));
-    family.wiggle_knots = Some(array![-2.0, -2.0, -2.0, -2.0, 2.0, 2.0, 2.0, 2.0]);
-    family.wiggle_degree = Some(3);
-    let spec = ParameterBlockSpec {
-        name: "linkwiggle".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((1, 2)))),
-        offset: Array1::zeros(1),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: Array1::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let returned = family
-        .post_update_block_beta(
-            &[
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.1, 0.2],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-            ],
-            SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
-            &spec,
-            array![0.3, 0.0],
-        )
-        .expect("return linkwiggle beta");
-    assert_eq!(returned, array![0.3, 0.0]);
-
-    let err = family
-        .post_update_block_beta(
-            &[
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.0],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-                ParameterBlockState {
-                    beta: array![0.1, 0.2],
-                    eta: array![0.0, 0.0, 0.0],
-                },
-            ],
-            SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
-            &spec,
-            array![0.3, -0.1],
-        )
-        .expect_err("infeasible link-wiggle beta must be rejected");
-    assert!(
-        err.contains("violates represented nonnegativity"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn linkwiggle_block_feasible_step_stays_nonnegative() {
-    let mut family = survival_exact_newton_test_family();
-    family.x_link_wiggle = Some(DesignMatrix::Dense(DenseDesignMatrix::from(array![
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0]
-    ])));
-    family.wiggle_knots = Some(array![-2.0, -2.0, -2.0, -2.0, 2.0, 2.0, 2.0, 2.0]);
-    family.wiggle_degree = Some(3);
-    let states = vec![
-        ParameterBlockState {
-            beta: array![0.1],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.0],
-            eta: array![0.0, 0.0, 0.0],
-        },
-        ParameterBlockState {
-            beta: array![0.2, 0.4],
-            eta: array![0.0, 0.0, 0.0],
-        },
-    ];
-    let alpha = family
-        .max_feasible_step_size(
-            &states,
-            SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE,
-            &array![-1.0, -0.1],
-        )
-        .expect("linkwiggle step ceiling")
-        .expect("linkwiggle step should be bounded");
-    assert!(alpha > 0.0 && alpha < 1.0);
-    let feasible = &states[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE].beta
-        + &(array![-1.0, -0.1] * alpha);
-    assert!(feasible.iter().all(|&value| value >= 0.0));
-}
+mod derivative_identities;
+mod time_block_identification;
 
 fn survival_exact_newton_test_familywith_inverse_link(
     inverse_link: InverseLink,
@@ -2247,534 +1863,6 @@ fn survival_exact_newton_test_familywith_inverse_link(
     SurvivalLocationScaleFamily {
         inverse_link,
         ..survival_exact_newton_test_family()
-    }
-}
-
-/// #2677: the all-axes third directional derivative of the observed
-/// information is the β-derivative of its second directional derivative. For
-/// every residual distribution with closed-form fifth stacks, a five-point
-/// difference of `I''[u, v]` along each coefficient axis reproduces
-/// `{I'''[u, v, e_a]}` built from the row program's fifth-order contraction,
-/// and the family declares that channel available. LogLog and Cauchit read
-/// their fourth-order stacks from the generic pdf-jet dispatch and their fifth
-/// from the Bernoulli tail kernels (#2903).
-#[test]
-fn survival_ls_third_directional_all_axes_matches_difference_of_second_2677() {
-    use crate::custom_family::CustomFamily;
-    use crate::row_kernel::{RowSet, row_kernel_third_directional_derivative_all_axes};
-
-    let beta = [0.3, -0.4, 0.2];
-    let u = array![0.7, -0.5, 0.9];
-    let v = array![-0.4, 1.1, 0.6];
-    for distribution in [
-        residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-        residual_distribution_inverse_link(ResidualDistribution::Gumbel),
-        residual_distribution_inverse_link(ResidualDistribution::Logistic),
-        InverseLink::Standard(StandardLink::LogLog),
-        InverseLink::Standard(StandardLink::Cauchit),
-    ] {
-        let family = survival_exact_newton_test_familywith_inverse_link(distribution.clone());
-        assert!(
-            family.jeffreys_third_information_derivative().is_some(),
-            "{distribution:?}: a closed-form link must declare the third information derivative"
-        );
-        let states = survival_exact_newton_test_states(&family, beta[0], beta[1], beta[2]);
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        let axes = row_kernel_third_directional_derivative_all_axes(
-            &kernel,
-            &RowSet::All,
-            u.as_slice().expect("contiguous u"),
-            v.as_slice().expect("contiguous v"),
-        )
-        .expect("third directional derivative");
-        assert_eq!(axes.len(), beta.len(), "{distribution:?}: one matrix per axis");
-        let second_at = |axis: usize, t: f64| {
-            let mut moved = beta;
-            moved[axis] += t;
-            let moved_states =
-                survival_exact_newton_test_states(&family, moved[0], moved[1], moved[2]);
-            family
-                .exact_newton_joint_hessian_second_directional_derivative_rescaled(
-                    &moved_states,
-                    &u,
-                    &v,
-                    0.0,
-                )
-                .expect("second directional derivative")
-                .expect("second directional derivative present")
-        };
-        let h = 1.0e-3;
-        let mut largest = 0.0_f64;
-        for axis in 0..beta.len() {
-            let difference = (-second_at(axis, 2.0 * h) + 8.0 * second_at(axis, h)
-                - 8.0 * second_at(axis, -h)
-                + second_at(axis, -2.0 * h))
-                / (12.0 * h);
-            for ((a, b), &want) in difference.indexed_iter() {
-                let got = axes[axis][[a, b]];
-                largest = largest.max(got.abs());
-                assert!(
-                    (got - want).abs() <= 1.0e-6 * (1.0 + want.abs().max(got.abs())),
-                    "{distribution:?} axis {axis} I'''[{a}][{b}]: generated {got:+.15e}, \
-                     difference {want:+.15e}"
-                );
-            }
-        }
-        assert!(
-            largest > 1.0e-3,
-            "{distribution:?}: the third information derivative is too small ({largest:.3e}) \
-             for the agreement to say anything"
-        );
-    }
-}
-
-/// #2668/#2106: the fused Jeffreys contracted trace Hessian is exactly the pairwise
-/// contraction it replaces. Every entry `[∇²_β tr(W · I)][c][d]` must equal
-/// `tr(W · I''[e_c, e_d])` assembled from the family's own second directional
-/// derivative, for each closed-form residual distribution. The weight is signed
-/// and not symmetric, so the linear-in-`W` claim is exercised on the case a
-/// factorizing implementation would get wrong, and the family advertises the
-/// hook on the non-wiggle row kernel.
-#[test]
-fn survival_ls_contracted_trace_hessian_matches_pairwise_second_directional_2668() {
-    use crate::custom_family::CustomFamily;
-    use crate::row_kernel::{RowSet, row_kernel_contracted_trace_hessian};
-
-    let weight = array![[0.9, -0.3, 0.45], [0.2, -1.1, 0.35], [-0.6, 0.25, 0.7]];
-    let p = weight.nrows();
-    for distribution in [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ] {
-        let family = survival_exact_newton_test_familywith_inverse_link(
-            residual_distribution_inverse_link(distribution),
-        );
-        assert!(
-            family.joint_jeffreys_information_contracted_trace_hessian_available(),
-            "{distribution:?}: the non-wiggle row kernel must advertise the fused contraction"
-        );
-        let states = survival_exact_newton_test_states(&family, 0.3, -0.4, 0.2);
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        let fused = row_kernel_contracted_trace_hessian(&kernel, &RowSet::All, &weight)
-            .expect("contracted trace Hessian");
-        assert_eq!(fused.dim(), (p, p), "{distribution:?}: one p×p matrix");
-        let mut largest = 0.0_f64;
-        for c in 0..p {
-            for d in 0..p {
-                let mut e_c = Array1::<f64>::zeros(p);
-                e_c[c] = 1.0;
-                let mut e_d = Array1::<f64>::zeros(p);
-                e_d[d] = 1.0;
-                let second = family
-                    .exact_newton_joint_hessian_second_directional_derivative_rescaled(
-                        &states, &e_c, &e_d, 0.0,
-                    )
-                    .expect("second directional derivative")
-                    .expect("second directional derivative present");
-                // tr(W · H) = Σ_ab W[a][b] · H[b][a].
-                let want = (&weight * &second.t()).sum();
-                let got = fused[[c, d]];
-                largest = largest.max(want.abs());
-                assert!(
-                    (got - want).abs() <= 1.0e-10 * (1.0 + want.abs().max(got.abs())),
-                    "{distribution:?} [{c}][{d}]: fused {got:+.15e}, pairwise {want:+.15e}"
-                );
-            }
-        }
-        assert!(
-            largest > 1.0e-3,
-            "{distribution:?}: the contracted second derivative is too small ({largest:.3e}) \
-             for the agreement to say anything"
-        );
-    }
-}
-
-/// #2668/#2106: the batched all-axes second directional derivative that the Jeffreys
-/// drift consumes is the per-axis hook, not an approximation of it. The dispatcher
-/// builds the geometry once and runs the same row fold per axis, so every matrix
-/// must equal `I''[u, e_a]` from the per-axis hook exactly, for each closed-form
-/// residual distribution.
-#[test]
-fn survival_ls_all_axes_second_directional_is_the_per_axis_hook_2668() {
-    use crate::row_kernel::{RowSet, row_kernel_second_directional_derivative_all_axes};
-
-    let u = array![0.7, -0.5, 0.9];
-    for distribution in [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ] {
-        let family = survival_exact_newton_test_familywith_inverse_link(
-            residual_distribution_inverse_link(distribution),
-        );
-        let states = survival_exact_newton_test_states(&family, 0.3, -0.4, 0.2);
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        let batched = row_kernel_second_directional_derivative_all_axes(
-            &kernel,
-            &RowSet::All,
-            u.as_slice().expect("contiguous u"),
-        )
-        .expect("all-axes second directional derivative");
-        let p = u.len();
-        assert_eq!(batched.len(), p, "{distribution:?}: one matrix per axis");
-        let mut largest = 0.0_f64;
-        for (axis, matrix) in batched.iter().enumerate() {
-            let mut e_a = Array1::<f64>::zeros(p);
-            e_a[axis] = 1.0;
-            let per_axis = family
-                .exact_newton_joint_hessian_second_directional_derivative_rescaled(
-                    &states, &u, &e_a, 0.0,
-                )
-                .expect("per-axis second directional derivative")
-                .expect("per-axis second directional derivative present");
-            largest = largest.max(per_axis.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())));
-            assert_eq!(
-                matrix, &per_axis,
-                "{distribution:?} axis {axis}: the batched matrix must be the per-axis hook's"
-            );
-        }
-        assert!(
-            largest > 1.0e-3,
-            "{distribution:?}: I''[u, e_a] is too small ({largest:.3e}) for equality to say anything"
-        );
-    }
-}
-
-/// #2668: `SurvivalLsRowKernel::second_directional_derivative_all_axes_dense_override`
-/// builds each row's plan, channel rows and `J·u` once and reduces in chunk order. That is
-/// only a valid optimisation if every matrix is the generic per-axis fold's, bit for bit.
-/// The 3-row fixture above never leaves one chunk, so this pin uses `n = 300` rows (the
-/// `ARROW_ROW_CHUNK = 256` reduction spans two tiles), multi-column threshold and log-σ
-/// designs, mixed event and censored rows and non-unit weights. It also asserts that the
-/// full-data dispatcher actually takes the override.
-#[test]
-fn survival_ls_all_axes_second_directional_override_is_the_per_axis_fold_across_chunks_2668() {
-    use crate::row_kernel::{
-        RowKernel, RowSet, row_kernel_second_directional_derivative,
-        row_kernel_second_directional_derivative_all_axes,
-    };
-
-    let n = 300usize;
-    let p_thr = 3usize;
-    let p_ls = 3usize;
-    let x_time_entry = Array2::from_elem((n, 1), 0.7);
-    let x_time_exit =
-        Array2::from_shape_fn((n, 1), |(r, _)| 1.2 + 0.4 * ((r as f64) * 0.37).sin());
-    let x_time_deriv = Array2::from_elem((n, 1), 1.0);
-    let x_threshold = Array2::from_shape_fn((n, p_thr), |(r, j)| {
-        0.3 + 0.5 * ((r as f64) * 0.11 + j as f64).cos() - 0.02 * (j as f64)
-    });
-    let x_log_sigma = Array2::from_shape_fn((n, p_ls), |(r, j)| {
-        0.1 + 0.4 * ((r as f64) * 0.07 - 0.5 * (j as f64)).sin()
-    });
-    let beta_t = array![0.3];
-    let beta_thr = array![-0.4, 0.25, 0.1];
-    let beta_ls = array![0.2, -0.15, 0.05];
-    let u = array![0.7, -0.5, 0.9, 0.3, -0.2, 0.6, -0.4];
-    let u_slice = u.as_slice().expect("contiguous u");
-    let p = u.len();
-
-    for distribution in [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ] {
-        let mut family = survival_exact_newton_test_familywith_inverse_link(
-            residual_distribution_inverse_link(distribution),
-        );
-        family.n = n;
-        family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
-        family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
-        family.x_time_entry = Arc::new(x_time_entry.clone());
-        family.x_time_exit = Arc::new(x_time_exit.clone());
-        family.x_time_deriv = Arc::new(x_time_deriv.clone());
-        family.x_threshold =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_threshold.clone()));
-        family.x_log_sigma =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_log_sigma.clone()));
-        // Stacked time eta layout `[entry; exit; deriv]`, as `survival_exact_newton_test_states`.
-        let mut eta_time = Array1::<f64>::zeros(3 * n);
-        for i in 0..n {
-            eta_time[i] = x_time_entry[[i, 0]] * beta_t[0];
-            eta_time[n + i] = x_time_exit[[i, 0]] * beta_t[0];
-            eta_time[2 * n + i] = x_time_deriv[[i, 0]] * beta_t[0];
-        }
-        let states = vec![
-            ParameterBlockState {
-                beta: beta_t.clone(),
-                eta: eta_time,
-            },
-            ParameterBlockState {
-                beta: beta_thr.clone(),
-                eta: x_threshold.dot(&beta_thr),
-            },
-            ParameterBlockState {
-                beta: beta_ls.clone(),
-                eta: x_log_sigma.dot(&beta_ls),
-            },
-        ];
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        assert!(
-            matches!(
-                kernel.second_directional_derivative_all_axes_dense_override(&RowSet::All, u_slice),
-                Some(Ok(_))
-            ),
-            "{distribution:?}: the full-data dispatcher must take the build-once override"
-        );
-        let batched =
-            row_kernel_second_directional_derivative_all_axes(&kernel, &RowSet::All, u_slice)
-                .expect("all-axes second directional derivative");
-        assert_eq!(batched.len(), p, "{distribution:?}: one matrix per axis");
-        let mut largest = 0.0_f64;
-        for (axis, matrix) in batched.iter().enumerate() {
-            let mut e_a = vec![0.0_f64; p];
-            e_a[axis] = 1.0;
-            let per_axis =
-                row_kernel_second_directional_derivative(&kernel, &RowSet::All, u_slice, &e_a)
-                    .expect("per-axis second directional fold");
-            largest = largest.max(per_axis.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())));
-            assert_eq!(
-                matrix, &per_axis,
-                "{distribution:?} axis {axis}: the override must be the per-axis fold bit for bit"
-            );
-        }
-        assert!(
-            largest > 1.0e-3,
-            "{distribution:?}: I''[u, e_a] is too small ({largest:.3e}) for equality to say anything"
-        );
-    }
-}
-
-/// #2668: the survival location-scale contraction pass `⟨H²dot[u, e_a], K_b⟩`, which the
-/// Jeffreys drift consumes in place of the rotated axis rows, is the dense all-axes matrices
-/// contracted with the same kernels. The pass forms no axis matrix and sums in a different
-/// order, so agreement is to roundoff. It is checked on the `n = 300` two-tile fixture with
-/// multi-column blocks, two directions and non-diagonal symmetric kernels.
-#[test]
-fn survival_ls_second_directional_axis_contractions_are_the_dense_axes_contracted_2668() {
-    use crate::row_kernel::{RowSet, row_kernel_second_directional_derivative_all_axes};
-
-    let n = 300usize;
-    let p_thr = 3usize;
-    let p_ls = 3usize;
-    let x_time_entry = Array2::from_elem((n, 1), 0.7);
-    let x_time_exit =
-        Array2::from_shape_fn((n, 1), |(r, _)| 1.2 + 0.4 * ((r as f64) * 0.37).sin());
-    let x_time_deriv = Array2::from_elem((n, 1), 1.0);
-    let x_threshold = Array2::from_shape_fn((n, p_thr), |(r, j)| {
-        0.3 + 0.5 * ((r as f64) * 0.11 + j as f64).cos() - 0.02 * (j as f64)
-    });
-    let x_log_sigma = Array2::from_shape_fn((n, p_ls), |(r, j)| {
-        0.1 + 0.4 * ((r as f64) * 0.07 - 0.5 * (j as f64)).sin()
-    });
-    let beta_t = array![0.3];
-    let beta_thr = array![-0.4, 0.25, 0.1];
-    let beta_ls = array![0.2, -0.15, 0.05];
-    let directions = vec![
-        array![0.7, -0.5, 0.9, 0.3, -0.2, 0.6, -0.4],
-        array![-0.3, 0.8, 0.1, -0.6, 0.4, 0.2, 0.5],
-    ];
-    let p = directions[0].len();
-    let kernels: Vec<Array2<f64>> = (0..p)
-        .map(|b| {
-            Array2::from_shape_fn((p, p), |(i, j)| {
-                (0.3 * ((b + 1) as f64) * ((i + j) as f64)).cos() + if i == j { 1.0 } else { 0.0 }
-            })
-        })
-        .collect();
-
-    for distribution in [ResidualDistribution::Gaussian, ResidualDistribution::Logistic] {
-        let mut family = survival_exact_newton_test_familywith_inverse_link(
-            residual_distribution_inverse_link(distribution),
-        );
-        family.n = n;
-        family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
-        family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
-        family.x_time_entry = Arc::new(x_time_entry.clone());
-        family.x_time_exit = Arc::new(x_time_exit.clone());
-        family.x_time_deriv = Arc::new(x_time_deriv.clone());
-        family.x_threshold =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_threshold.clone()));
-        family.x_log_sigma =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_log_sigma.clone()));
-        let mut eta_time = Array1::<f64>::zeros(3 * n);
-        for i in 0..n {
-            eta_time[i] = x_time_entry[[i, 0]] * beta_t[0];
-            eta_time[n + i] = x_time_exit[[i, 0]] * beta_t[0];
-            eta_time[2 * n + i] = x_time_deriv[[i, 0]] * beta_t[0];
-        }
-        let states = vec![
-            ParameterBlockState {
-                beta: beta_t.clone(),
-                eta: eta_time,
-            },
-            ParameterBlockState {
-                beta: beta_thr.clone(),
-                eta: x_threshold.dot(&beta_thr),
-            },
-            ParameterBlockState {
-                beta: beta_ls.clone(),
-                eta: x_log_sigma.dot(&beta_ls),
-            },
-        ];
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        let mut contracted: Vec<Option<Array2<f64>>> = vec![None; directions.len()];
-        kernel
-            .second_directional_axis_contractions_each(&directions, &kernels, &mut |index, matrix| {
-                contracted[index] = Some(matrix);
-                Ok(())
-            })
-            .expect("axis contraction pass");
-        for (index, direction) in directions.iter().enumerate() {
-            let axes = row_kernel_second_directional_derivative_all_axes(
-                &kernel,
-                &RowSet::All,
-                direction.as_slice().expect("contiguous direction"),
-            )
-            .expect("dense all-axes second directional derivative");
-            let got = contracted[index]
-                .as_ref()
-                .expect("the pass hands over every direction");
-            assert_eq!(got.dim(), (p, p), "{distribution:?}: one p x p contraction matrix");
-            let mut largest = 0.0_f64;
-            for a in 0..p {
-                for b in 0..p {
-                    let dense: f64 = axes[a].iter().zip(kernels[b].iter()).map(|(x, y)| x * y).sum();
-                    largest = largest.max(dense.abs());
-                    assert!(
-                        (got[[a, b]] - dense).abs() <= 1.0e-10 * (1.0 + dense.abs()),
-                        "{distribution:?} direction {index} axis {a} kernel {b}: contraction {} \
-                         vs dense {dense}",
-                        got[[a, b]]
-                    );
-                }
-            }
-            assert!(
-                largest > 1.0e-3,
-                "{distribution:?} direction {index}: contractions too small ({largest:.3e}) for \
-                 agreement to say anything"
-            );
-        }
-    }
-}
-
-/// #2668: survival location-scale hands the Jeffreys term, its drift base and the gate motion
-/// the rotated first information rows `vec(sym(Uᵀ I'[e_a] U))` from each row's third
-/// contractions and projected channel rows, not from `p` dense axis matrices. They must be the
-/// dense all-axes matrices rotated and symmetrized, to roundoff, on the `n = 300` two-tile
-/// fixture with multi-column blocks, for a full-width basis and a narrower non-orthogonal one.
-#[test]
-fn survival_ls_rotated_first_directional_rows_are_the_dense_axes_rotated_2668() {
-    use crate::row_kernel::{RowSet, row_kernel_directional_derivative_all_axes};
-
-    let n = 300usize;
-    let p_thr = 3usize;
-    let p_ls = 3usize;
-    let x_time_entry = Array2::from_elem((n, 1), 0.7);
-    let x_time_exit =
-        Array2::from_shape_fn((n, 1), |(r, _)| 1.2 + 0.4 * ((r as f64) * 0.37).sin());
-    let x_time_deriv = Array2::from_elem((n, 1), 1.0);
-    let x_threshold = Array2::from_shape_fn((n, p_thr), |(r, j)| {
-        0.3 + 0.5 * ((r as f64) * 0.11 + j as f64).cos() - 0.02 * (j as f64)
-    });
-    let x_log_sigma = Array2::from_shape_fn((n, p_ls), |(r, j)| {
-        0.1 + 0.4 * ((r as f64) * 0.07 - 0.5 * (j as f64)).sin()
-    });
-    let beta_t = array![0.3];
-    let beta_thr = array![-0.4, 0.25, 0.1];
-    let beta_ls = array![0.2, -0.15, 0.05];
-    let p = 1 + p_thr + p_ls;
-    let full = Array2::from_shape_fn((p, p), |(i, j)| {
-        (0.4 * ((i + 2 * j) as f64)).sin() + if i == j { 1.0 } else { 0.0 }
-    });
-    let narrow =
-        Array2::from_shape_fn((p, 3), |(i, j)| (0.3 * (((i + 1) * (j + 2)) as f64)).cos());
-
-    for distribution in [ResidualDistribution::Gaussian, ResidualDistribution::Logistic] {
-        let mut family = survival_exact_newton_test_familywith_inverse_link(
-            residual_distribution_inverse_link(distribution),
-        );
-        family.n = n;
-        family.y = Array1::from_iter((0..n).map(|r| if r % 3 == 0 { 0.0 } else { 1.0 }));
-        family.w = Array1::from_iter((0..n).map(|r| 0.6 + 0.1 * ((r % 7) as f64)));
-        family.x_time_entry = Arc::new(x_time_entry.clone());
-        family.x_time_exit = Arc::new(x_time_exit.clone());
-        family.x_time_deriv = Arc::new(x_time_deriv.clone());
-        family.x_threshold =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_threshold.clone()));
-        family.x_log_sigma =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_log_sigma.clone()));
-        let mut eta_time = Array1::<f64>::zeros(3 * n);
-        for i in 0..n {
-            eta_time[i] = x_time_entry[[i, 0]] * beta_t[0];
-            eta_time[n + i] = x_time_exit[[i, 0]] * beta_t[0];
-            eta_time[2 * n + i] = x_time_deriv[[i, 0]] * beta_t[0];
-        }
-        let states = vec![
-            ParameterBlockState {
-                beta: beta_t.clone(),
-                eta: eta_time,
-            },
-            ParameterBlockState {
-                beta: beta_thr.clone(),
-                eta: x_threshold.dot(&beta_thr),
-            },
-            ParameterBlockState {
-                beta: beta_ls.clone(),
-                eta: x_log_sigma.dot(&beta_ls),
-            },
-        ];
-        let dynamic = family
-            .build_dynamic_geometry(&states)
-            .expect("dynamic geometry");
-        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
-        let axes = row_kernel_directional_derivative_all_axes(&kernel, &RowSet::All)
-            .expect("dense all-axes first directional derivative");
-        assert_eq!(axes.len(), p, "{distribution:?}: one axis matrix per coefficient");
-        for basis in [&full, &narrow] {
-            let r = basis.ncols();
-            let rotated = kernel
-                .directional_derivative_rotated_all_axes(basis.view())
-                .expect("rotated axis rows");
-            assert_eq!(rotated.dim(), (p, r * r), "{distribution:?}: one r x r row per axis");
-            let mut largest = 0.0_f64;
-            for (a, axis) in axes.iter().enumerate() {
-                let reduced = basis.t().dot(axis).dot(basis);
-                for s in 0..r {
-                    for t in 0..r {
-                        let want = 0.5 * (reduced[[s, t]] + reduced[[t, s]]);
-                        let got = rotated[[a, s * r + t]];
-                        largest = largest.max(want.abs());
-                        assert!(
-                            (got - want).abs() <= 1.0e-10 * (1.0 + want.abs()),
-                            "{distribution:?} width {r} axis {a} [{s}][{t}]: rotated {got:+.15e}, \
-                             dense {want:+.15e}"
-                        );
-                    }
-                }
-            }
-            assert!(
-                largest > 1.0e-3,
-                "{distribution:?} width {r}: rotated rows too small ({largest:.3e}) for agreement \
-                 to say anything"
-            );
-        }
     }
 }
 
@@ -2936,864 +2024,6 @@ fn survival_non_probit_test_links() -> Vec<(&'static str, InverseLink)> {
     ]
 }
 
-#[test]
-fn wip_outergradient_testspecs_shape() {
-    let specs = survival_outergradient_testspecs();
-    assert_eq!(specs.len(), 3);
-    assert_eq!(specs[0].name, "time_transform");
-    assert_eq!(specs[1].name, "threshold");
-    assert_eq!(specs[2].name, "log_sigma");
-}
-
-#[test]
-fn identified_time_block_preserves_input_designs() {
-    let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-    let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry.clone()),
-        design_exit: DesignMatrix::from(design_exit.clone()),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(3)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    )
-    .expect("prepare time block");
-    assert_eq!(prepared.design_entry, design_entry);
-    assert_eq!(prepared.design_exit, design_exit);
-    assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
-}
-
-#[test]
-fn identified_time_block_preserves_expected_nullspace_dimension() {
-    let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-    let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry),
-        design_exit: DesignMatrix::from(design_exit),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(3)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    )
-    .expect("prepare time block");
-    let p = time_block.design_entry.ncols();
-
-    assert_eq!(
-        prepared.transform.gauge.raw_total(),
-        p,
-        "identifiability transform must stay in the original coefficient space"
-    );
-    assert_eq!(
-        prepared.transform.gauge.reduced_total(),
-        p,
-        "anchored time basis should keep the full coefficient dimension"
-    );
-    assert_eq!(
-        prepared.design_entry.ncols(),
-        p,
-        "prepared entry design should keep the full anchored basis width"
-    );
-    assert_eq!(
-        prepared.design_exit.ncols(),
-        p,
-        "prepared exit design should keep the full anchored basis width"
-    );
-    assert_eq!(
-        prepared.transform.gauge.block_transform(0),
-        Array2::<f64>::eye(p)
-    );
-    assert_eq!(
-        prepared.transform.gauge.affine_shift,
-        Array1::<f64>::zeros(p)
-    );
-}
-
-#[test]
-fn identified_time_block_can_reduce_to_parametric_penalty_nullspace() {
-    let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-    let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry.clone()),
-        design_exit: DesignMatrix::from(design_exit.clone()),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: Some(array![0.5, 0.2, 9.0]),
-    };
-
-    // log(t_exit) for the unit-log-t warp-slope pin (issue #892).
-    let log_time_entry = array![-1.0_f64, -0.5, 0.0];
-    let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        true,
-        log_time_entry.view(),
-        log_time_exit.view(),
-    )
-    .expect("prepare time block");
-    // Canonical gauge pin (#892): the warp slope is folded into the offset,
-    // so the FREE time block collapses to the single row-constant direction.
-    // The Gauge map is now p×1 (was p×2), with the pinned unit-log-t
-    // warp carried by `Gauge::affine_shift` rather than a free column.
-    assert_eq!(prepared.transform.gauge.raw_total(), 3);
-    assert_eq!(prepared.transform.gauge.reduced_total(), 1);
-    assert_eq!(prepared.transform.gauge.affine_shift.len(), 3);
-    assert!(
-        prepared
-            .transform
-            .gauge
-            .affine_shift
-            .iter()
-            .any(|&v| v.abs() > 1e-9),
-        "pinned warp must contribute a non-zero Gauge affine_shift"
-    );
-    assert_eq!(prepared.design_entry.ncols(), 1);
-    assert_eq!(prepared.design_exit.ncols(), 1);
-    assert_eq!(prepared.design_derivative_exit.ncols(), 1);
-    assert!(prepared.coefficient_lower_bounds.is_none());
-    // The reduced block lives on the penalty null space, so `zᵀ S z` is
-    // exactly zero: there is no curvature left to penalize. An unpenalized
-    // parametric block has no smoothing parameter, so the projected-to-zero
-    // penalties are dropped entirely — the block carries ZERO penalties and
-    // therefore contributes no ρ coordinate to the outer REML search
-    // (issue #736/#735/#721).
-    assert!(
-        prepared.penalties.is_empty(),
-        "reduced parametric time block must be unpenalized (no smoothing parameter), got {} penalties",
-        prepared.penalties.len()
-    );
-    assert!(
-        prepared.nullspace_dims.is_empty(),
-        "reduced parametric time block carries no penalty null-space bookkeeping"
-    );
-}
-
-#[test]
-fn pinned_time_warp_affine_lift_round_trips() {
-    // Golden round-trip (issue #892): on a rank-clean pinned reduced fit the
-    // raw time coefficients must be reconstructed EXACTLY through the
-    // Gauge-owned affine section `β_raw = T · θ + a`. A wrong lift silently
-    // corrupts every reported survival time-coefficient, so this guards the
-    // finalize math directly. Choose a known reduced free coefficient `θ` and
-    // verify the lifted raw coefficient reproduces both the free constant
-    // direction (`θ · z_c`) and the pinned unit-log-t warp (`a`),
-    // and that the design image `X · β_raw` equals
-    // `(X · z_c) θ + X · a` (the free design plus the folded
-    // offset), which is what the geometry actually consumes.
-    let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
-    let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry.clone()),
-        design_exit: DesignMatrix::from(design_exit.clone()),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-    let log_time_entry = array![-1.0_f64, -0.5, 0.0];
-    let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        true,
-        log_time_entry.view(),
-        log_time_exit.view(),
-    )
-    .expect("prepare time block");
-    // Pin fired: single free column + non-zero pinned warp.
-    assert_eq!(prepared.transform.gauge.reduced_total(), 1);
-    let theta = array![0.731_f64];
-    let beta_raw = prepared
-        .transform
-        .gauge
-        .lift_block_betas(&[theta.clone()])
-        .remove(0);
-    // β_raw equals the free contribution plus the pinned warp, exactly.
-    let z_c = prepared.transform.gauge.block_transform(0);
-    let expected_raw =
-        &(&z_c.column(0).to_owned() * theta[0]) + &prepared.transform.gauge.affine_shift;
-    for (got, want) in beta_raw.iter().zip(expected_raw.iter()) {
-        assert!(
-            (got - want).abs() <= 1e-12,
-            "affine lift must reconstruct raw coefficients exactly: got {got}, want {want}"
-        );
-    }
-    // The raw design image matches free-design·θ + augmented offset delta,
-    // i.e. what the solver geometry sees: X·β_raw = (X·z_c)·θ + X·z_t.
-    let raw_image = design_exit.dot(&beta_raw);
-    let folded = &prepared.design_exit.column(0).to_owned() * theta[0]
-        + &(&prepared.offset_exit - &time_block.offset_exit);
-    for (got, want) in raw_image.iter().zip(folded.iter()) {
-        assert!(
-            (got - want).abs() <= 1e-9,
-            "raw design image must equal free image plus folded offset: got {got}, want {want}"
-        );
-    }
-    // The folded exit offset has unit slope vs log t (the canonical gauge).
-    let delta = &prepared.offset_exit - &time_block.offset_exit;
-    let log_mean = log_time_exit.sum() / 3.0;
-    let mut sxx = 0.0_f64;
-    let mut sxy = 0.0_f64;
-    for i in 0..3 {
-        let xc = log_time_exit[i] - log_mean;
-        sxx += xc * xc;
-        sxy += xc * (delta[i] - delta.sum() / 3.0);
-    }
-    assert!(
-        (sxy / sxx - 1.0).abs() <= 1e-9,
-        "pinned warp must have unit data-scale slope vs log t, got {}",
-        sxy / sxx
-    );
-}
-
-#[test]
-fn rank1_reduced_time_warp_removes_warp_and_flags_location_log_time() {
-    // The real survival regime (issue #892): a 1st-difference time penalty
-    // gives a DIMENSION-1 null space — a single monotone log-t column. The
-    // reduce must REMOVE the time warp entirely (zero free columns, empty
-    // designs + p×0 transform, zero value/derivative offsets so `h ≡ 0`, no
-    // constraint, no penalties) and instead FLAG `location_log_time_offset`,
-    // so the caller carries the σ-scaled `log t` baseline on the location `q`
-    // channel (u = inv_sigma·(log t − η_t)). The threshold keeps its intercept
-    // (`pinned_free_row_constant == false`). A penalty `diag(0,1,1)` has the
-    // 1-D null space {e0}; design column 0 is monotone in log t.
-    let design_entry = array![
-        [0.0, 1.0, 0.2],
-        [0.405_465_108, 1.0, 0.5],
-        [0.916_290_731, 1.0, 1.0]
-    ];
-    let design_exit = array![
-        [0.0, 0.5, 0.3],
-        [0.405_465_108, 1.5, 0.8],
-        [0.916_290_731, 2.5, 1.4]
-    ];
-    let design_derivative_exit = array![[1.0, 1.0, 0.2], [0.5, 1.0, 0.3], [0.3, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry.clone()),
-        design_exit: DesignMatrix::from(design_exit.clone()),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-    let log_time_entry = array![-1.0_f64, -0.5, 0.0];
-    let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        true,
-        log_time_entry.view(),
-        log_time_exit.view(),
-    )
-    .expect("prepare time block");
-
-    // Warp removed: zero free columns, empty designs + p×0 transform.
-    assert_eq!(prepared.transform.gauge.reduced_total(), 0);
-    assert_eq!(prepared.transform.gauge.raw_total(), 3);
-    assert_eq!(prepared.design_exit.ncols(), 0);
-    assert_eq!(prepared.design_entry.ncols(), 0);
-    assert_eq!(prepared.design_derivative_exit.ncols(), 0);
-    assert_eq!(prepared.design_exit.nrows(), 3);
-    assert_eq!(prepared.initial_beta, Some(Array1::<f64>::zeros(0)));
-    // No free coefficients → no derivative-guard constraint, no penalties.
-    assert!(prepared.linear_constraints.is_none());
-    assert!(prepared.penalties.is_empty());
-    // `h ≡ 0`: zero value offsets and zero derivative offset (the warp is gone;
-    // the log-t baseline lives on the location channel, not here).
-    assert_eq!(prepared.offset_exit, Array1::<f64>::zeros(3));
-    assert_eq!(prepared.offset_entry, Array1::<f64>::zeros(3));
-    assert_eq!(prepared.derivative_offset_exit, Array1::<f64>::zeros(3));
-    // No affine shift; the location-log-time flag is set.
-    assert!(
-        prepared
-            .transform
-            .gauge
-            .affine_shift
-            .iter()
-            .all(|&v| v.abs() <= 1e-12)
-    );
-    assert!(
-        prepared.location_log_time_offset,
-        "rank-1 reduce must flag the σ-scaled log-t location baseline"
-    );
-    // No free time column → threshold keeps its intercept.
-    assert!(!prepared.pinned_free_row_constant);
-}
-
-#[test]
-fn identified_time_block_uses_structural_coefficient_constraints() {
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]]),
-        design_exit: DesignMatrix::from(array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]]),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(3)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: Some(array![-0.5, 0.2, -1.5]),
-    };
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    )
-    .expect("prepare time block");
-    assert_eq!(
-        prepared.coefficient_lower_bounds,
-        Some(array![f64::NEG_INFINITY, 0.0, 0.0])
-    );
-    let constraints = lower_bound_constraints(
-        prepared
-            .coefficient_lower_bounds
-            .as_ref()
-            .expect("time coefficient lower bounds"),
-    )
-    .expect("time coefficient constraints");
-    assert_eq!(constraints.a, array![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-    assert_eq!(constraints.b, Array1::<f64>::zeros(2));
-    assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0]));
-}
-
-#[test]
-fn identified_time_block_constrains_monotone_timewiggle_tail_coefficients() {
-    let design_derivative_exit = array![
-        [0.0, 1.0, 0.2, 0.0],
-        [0.0, 1.0, 0.3, 0.0],
-        [0.0, 1.0, 0.4, 0.0]
-    ];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(array![
-            [1.0, 0.0, 0.2, 0.0],
-            [1.0, 1.0, 0.5, 0.0],
-            [1.0, 2.0, 1.0, 0.0]
-        ]),
-        design_exit: DesignMatrix::from(array![
-            [1.0, 0.5, 0.3, 0.0],
-            [1.0, 1.5, 0.8, 0.0],
-            [1.0, 2.5, 1.4, 0.0]
-        ]),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(4)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: Some(array![-0.5, 0.2, -1.5, -2.0]),
-    };
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        1,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    )
-    .expect("prepare time block");
-    assert_eq!(
-        prepared.coefficient_lower_bounds,
-        Some(array![f64::NEG_INFINITY, 0.0, 0.0, 0.0])
-    );
-    assert_eq!(prepared.initial_beta, Some(array![-0.5, 0.2, 0.0, 0.0]));
-}
-
-/// #2332 regression: a genuine monotone I-spline SHAPE column whose M-spline
-/// derivative support is inactive at every training row (a tail column beyond
-/// the largest training exit time) must still be bound `β ≥ 0` — the exact
-/// domain-wide monotonicity certificate — because it VARIES IN VALUE across the
-/// observed entry∪exit domain (which is exactly why `keep_cols` retained it).
-/// The old builder decided the sign cone from the training-row DERIVATIVE design
-/// alone, so this column read as all-zero (like the free constant column) and
-/// was left `NEG_INFINITY` (unconstrained); the penalized fit then drove it
-/// negative and produced a non-monotone warp at prediction horizons in its
-/// support. Column 2 below is exactly that tail column: value rises 0 → 0.6
-/// between the last two rows (so it survives `keep_cols`) while its exit-time
-/// derivative is 0 at every training row.
-#[test]
-fn structural_bounds_constrain_derivative_inactive_tail_shape_column() {
-    // col 0: free level/intercept (value-constant [1,1,1], derivative ≡ 0).
-    // col 1: ordinary active shape column (value varies, derivative active).
-    // col 2: TAIL shape column — value varies (0 → 0.6) but derivative ≈ 0 at
-    //        every training exit row (support lands past the largest exit time).
-    let design_entry =
-        DesignMatrix::from(array![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 0.0]]);
-    let design_exit =
-        DesignMatrix::from(array![[1.0, 0.5, 0.0], [1.0, 1.5, 0.0], [1.0, 2.5, 0.6]]);
-    let design_derivative_exit =
-        DesignMatrix::from(array![[0.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
-    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
-
-    let bounds = structural_time_coefficient_lower_bounds(
-        &design_entry,
-        &design_exit,
-        &design_derivative_exit,
-        &derivative_offset_exit,
-        1e-6,
-    )
-    .expect("structural bounds")
-    .expect("some bounds");
-    assert_eq!(bounds, array![f64::NEG_INFINITY, 0.0, 0.0]);
-    // The distinguishing signal is value-variation, NOT derivative activity:
-    // the tail column (col 2) is derivative-inactive at every training row yet
-    // is still bound because its value varies over entry∪exit.
-    assert!(bounds[2] == 0.0, "derivative-inactive tail column must be bound");
-}
-
-/// #2332 corollary: a genuinely value-CONSTANT column (the free level/intercept)
-/// must stay unconstrained even when other columns are shape columns. This pins
-/// the classifier to the `keep_cols` value-variation criterion: only the
-/// value-constant baseline level stays free.
-#[test]
-fn structural_bounds_keep_constant_level_column_free() {
-    // Two value-constant columns (a constant 1 level and a constant 0 pad) plus
-    // one value-varying shape column. Only the shape column is bound.
-    let design_entry =
-        DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 0.0, 0.5], [1.0, 0.0, 1.0]]);
-    let design_exit =
-        DesignMatrix::from(array![[1.0, 0.0, 0.3], [1.0, 0.0, 0.8], [1.0, 0.0, 1.4]]);
-    let design_derivative_exit =
-        DesignMatrix::from(array![[0.0, 0.0, 0.2], [0.0, 0.0, 0.3], [0.0, 0.0, 0.4]]);
-    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
-
-    let bounds = structural_time_coefficient_lower_bounds(
-        &design_entry,
-        &design_exit,
-        &design_derivative_exit,
-        &derivative_offset_exit,
-        1e-6,
-    )
-    .expect("structural bounds")
-    .expect("some bounds");
-    assert_eq!(bounds, array![f64::NEG_INFINITY, f64::NEG_INFINITY, 0.0]);
-}
-
-/// #2332: an all-value-constant time design (no shape column at all — e.g. the
-/// empty-basis `learn_timewiggle` regime with only zero tail placeholders) still
-/// returns `Ok(None)` so the caller's downstream regime handling is preserved.
-#[test]
-fn structural_bounds_no_shape_column_returns_none() {
-    let design_entry = DesignMatrix::from(array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]);
-    let design_exit = DesignMatrix::from(array![[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]);
-    let design_derivative_exit = DesignMatrix::from(array![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]);
-    let derivative_offset_exit = Array1::from_elem(3, 1e-6);
-
-    let bounds = structural_time_coefficient_lower_bounds(
-        &design_entry,
-        &design_exit,
-        &design_derivative_exit,
-        &derivative_offset_exit,
-        1e-6,
-    )
-    .expect("structural bounds");
-    assert!(bounds.is_none(), "no shape column must return Ok(None)");
-}
-
-#[test]
-fn identified_time_block_rejects_offsets_below_derivative_guard() {
-    let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]]),
-        design_exit: DesignMatrix::from(array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]]),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::zeros(3),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(3)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-    let err = match prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    ) {
-        Ok(_) => panic!("offsets below the guard must be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.contains("require derivative offsets to encode the derivative guard"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn prepare_model_accepts_time_initializer_when_offset_completes_guard() {
-    let n = 3usize;
-    let derivative_guard = 5e-10;
-    let derivative_offset_exit = Array1::from_elem(n, 6e-10);
-    let spec = SurvivalLocationScaleSpec {
-        age_entry: Array1::from_elem(n, 1.0),
-        age_exit: Array1::from_elem(n, 5e9),
-        event_target: array![1.0, 0.0, 1.0],
-        weights: Array1::ones(n),
-        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-        derivative_guard,
-        time_block: TimeBlockInput {
-            design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: derivative_offset_exit.clone(),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-            penalties: vec![Array2::zeros((1, 1))],
-            nullspace_dims: vec![1],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        },
-        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        timewiggle_block: None,
-        linkwiggle_block: None,
-        cache_session: None,
-        persistent_warm_start_store: None,
-        cache_mirror_sessions: Vec::new(),
-    };
-
-    let prepared = prepare_survival_location_scale_model(&spec)
-        .expect("offset-supported time initializer should be accepted");
-    let beta_init = prepared.blockspecs[0]
-        .initial_beta
-        .as_ref()
-        .expect("time initializer should be present");
-    let d_raw_init = Array2::ones((n, 1)).dot(beta_init) + &derivative_offset_exit;
-    assert!(
-        d_raw_init.iter().all(|v| *v >= derivative_guard),
-        "initializer must satisfy derivative guard once offsets are included: {d_raw_init:?}"
-    );
-}
-
-#[test]
-fn prepare_model_seeds_structural_time_initializer_when_offset_equals_guard() {
-    let n = 20usize;
-    let p_time = 8usize;
-    let derivative_guard = DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD;
-    let derivative_offset_exit = Array1::from_elem(n, derivative_guard);
-    let age_exit = Array1::from_iter((0..n).map(|i| 4.0 + (i as f64) * 14.0));
-    let mut design_derivative_exit = Array2::<f64>::zeros((n, p_time));
-    for i in 0..n {
-        let t = (i as f64) / ((n - 1) as f64);
-        for j in 0..p_time {
-            let center = (j as f64 + 0.5) / (p_time as f64);
-            let x = 8.0 * (t - center);
-            let sigmoid = 1.0 / (1.0 + (-x).exp());
-            design_derivative_exit[[i, j]] = 8.0 * sigmoid * (1.0 - sigmoid) / age_exit[i];
-        }
-    }
-
-    let spec = SurvivalLocationScaleSpec {
-        age_entry: Array1::from_elem(n, 1e-9),
-        age_exit: age_exit.clone(),
-        event_target: Array1::zeros(n),
-        weights: Array1::ones(n),
-        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-        derivative_guard,
-        time_block: TimeBlockInput {
-            design_entry: DesignMatrix::from(Array2::zeros((n, p_time))),
-            design_exit: DesignMatrix::from(Array2::zeros((n, p_time))),
-            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: derivative_offset_exit.clone(),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-            penalties: vec![Array2::eye(p_time)],
-            nullspace_dims: vec![],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        },
-        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        timewiggle_block: None,
-        linkwiggle_block: None,
-        cache_session: None,
-        persistent_warm_start_store: None,
-        cache_mirror_sessions: Vec::new(),
-    };
-
-    let prepared = prepare_survival_location_scale_model(&spec)
-        .expect("guard-sized derivative offset should still seed time initializer");
-    let beta_init = prepared.blockspecs[0]
-        .initial_beta
-        .as_ref()
-        .expect("time initializer should be present");
-    let d_raw_init = design_derivative_exit.dot(beta_init) + &derivative_offset_exit;
-
-    assert!(beta_init.iter().all(|v| v.is_finite() && *v >= 0.0));
-    assert!(beta_init.iter().any(|v| *v > 0.0));
-    assert!(
-        d_raw_init
-            .iter()
-            .all(|v| v.is_finite() && *v >= derivative_guard),
-        "initializer must satisfy derivative guard once offsets are included: {d_raw_init:?}"
-    );
-}
-
-#[test]
-fn prepare_model_assigns_distinct_descending_gauge_priorities() {
-    // Regression for #366: every location-scale block previously carried
-    // the uniform `gauge_priority: 100`, which made the redundant
-    // intercept direction in the flat joint design un-attributable and
-    // forced the identifiability audit to refuse (`fatal = true`).  The
-    // four blocks must now own strictly descending priorities so the
-    // surplus constant is attributed to the lower-priority block.
-    let n = 4usize;
-    let derivative_guard = 1e-6;
-    let spec = SurvivalLocationScaleSpec {
-        age_entry: Array1::from_elem(n, 1.0),
-        age_exit: Array1::from_iter((0..n).map(|i| 5.0 + i as f64)),
-        event_target: array![1.0, 0.0, 1.0, 1.0],
-        weights: Array1::ones(n),
-        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
-        derivative_guard,
-        time_block: TimeBlockInput {
-            design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: Array1::from_elem(n, 2e-6),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-            penalties: vec![Array2::zeros((1, 1))],
-            nullspace_dims: vec![1],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        },
-        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        timewiggle_block: None,
-        linkwiggle_block: None,
-        cache_session: None,
-        persistent_warm_start_store: None,
-        cache_mirror_sessions: Vec::new(),
-    };
-
-    let prepared =
-        prepare_survival_location_scale_model(&spec).expect("location-scale model prepares");
-
-    let priority = |name: &str| {
-        prepared
-            .blockspecs
-            .iter()
-            .find(|b| b.name == name)
-            .unwrap_or_else(|| panic!("missing block '{name}'"))
-            .gauge_priority
-    };
-    let time = priority("time_transform");
-    let threshold = priority("threshold");
-    let log_sigma = priority("log_sigma");
-    assert_eq!(
-        time, 200,
-        "time_transform must own the highest gauge priority"
-    );
-    assert!(
-        time > threshold && threshold > log_sigma,
-        "gauge priorities must be strictly descending so the redundant \
-             intercept is attributable: time={time}, threshold={threshold}, \
-             log_sigma={log_sigma}"
-    );
-    // The whole point of the fix: no two structural blocks may share a
-    // gauge priority (equal priority is what produced the fatal audit).
-    let mut seen = std::collections::HashSet::new();
-    for block in &prepared.blockspecs {
-        assert!(
-            seen.insert(block.gauge_priority),
-            "blocks must carry distinct gauge priorities; '{}' duplicates {}",
-            block.name,
-            block.gauge_priority,
-        );
-    }
-}
-
-#[test]
-fn prepare_model_fixes_the_constant_log_sigma_the_threshold_scale_aliases() {
-    let n = 4usize;
-    let derivative_guard = 1e-6;
-    let spec = SurvivalLocationScaleSpec {
-        age_entry: Array1::from_elem(n, 1.0),
-        age_exit: Array1::from_iter((0..n).map(|i| 5.0 + i as f64)),
-        event_target: array![1.0, 0.0, 1.0, 1.0],
-        weights: Array1::ones(n),
-        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Logistic),
-        derivative_guard,
-        time_block: TimeBlockInput {
-            design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
-            design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
-            offset_entry: Array1::zeros(n),
-            offset_exit: Array1::zeros(n),
-            derivative_offset_exit: Array1::from_elem(n, 2e-6),
-            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-            penalties: vec![Array2::zeros((1, 1))],
-            nullspace_dims: vec![1],
-            initial_log_lambdas: None,
-            initial_beta: None,
-        },
-        threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::from(Array2::ones((n, 1))),
-            offset: Array1::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: None,
-            initial_beta: None,
-        }),
-        timewiggle_block: None,
-        linkwiggle_block: None,
-        cache_session: None,
-        persistent_warm_start_store: None,
-        cache_mirror_sessions: Vec::new(),
-    };
-
-    // Outside the σ-scaled log-t baseline every row depends on `η_t·e^{−η_σ}`
-    // only, so the constant log-σ is exactly the `(η_t, η_σ) → (c·η_t, η_σ + log c)`
-    // ray: it is fixed and the log-σ block keeps no column.
-    let prepared =
-        prepare_survival_location_scale_model(&spec).expect("location-scale model prepares");
-    assert!(
-        prepared.family.location_log_time.is_none(),
-        "the fixture must not be the σ-scaled log-t regime, where −log σ identifies σ"
-    );
-    assert_eq!(
-        prepared.log_sigma_fixed_cols, 1,
-        "the constant log-sigma is aliased with the threshold's scale and must be fixed"
-    );
-    assert_eq!(prepared.log_sigma_full_ncols, 1);
-    let log_sigma = prepared
-        .blockspecs
-        .iter()
-        .find(|block| block.name == "log_sigma")
-        .expect("prepared model should contain log_sigma block");
-    assert_eq!(log_sigma.design.ncols(), 0);
-
-    // A nonzero threshold offset cannot be rescaled by any c ≠ 1, so σ is
-    // identified and the constant log-σ stays free.
-    let mut offset_spec = spec.clone();
-    if let CovariateBlockKind::Static(block) = &mut offset_spec.threshold_block {
-        block.offset = Array1::from_elem(n, 0.5);
-    }
-    let prepared = prepare_survival_location_scale_model(&offset_spec)
-        .expect("location-scale model with a threshold offset prepares");
-    assert_eq!(prepared.log_sigma_fixed_cols, 0);
-    let log_sigma = prepared
-        .blockspecs
-        .iter()
-        .find(|block| block.name == "log_sigma")
-        .expect("prepared model should contain log_sigma block");
-    assert_eq!(log_sigma.design.ncols(), 1);
-}
-
 fn spec_from_dense_for_test(
     name: &str,
     design: DesignMatrix,
@@ -3816,544 +2046,6 @@ fn spec_from_dense_for_test(
 }
 
 #[test]
-fn identified_time_block_degenerate_entry_preserves_full_dimension() {
-    let design_entry = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-    let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
-    let design_derivative_exit = array![[0.1, 0.1, 0.0], [0.1, 0.1, 0.0], [0.1, 0.1, 0.0]];
-    let time_block = TimeBlockInput {
-        design_entry: DesignMatrix::from(design_entry.clone()),
-        design_exit: DesignMatrix::from(design_exit.clone()),
-        design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
-        offset_entry: Array1::zeros(3),
-        offset_exit: Array1::zeros(3),
-        derivative_offset_exit: Array1::from_elem(3, 1e-6),
-        time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
-        penalties: vec![Array2::eye(3)],
-        nullspace_dims: vec![],
-        initial_log_lambdas: None,
-        initial_beta: None,
-    };
-    let prepared = prepare_identified_time_block(
-        &time_block,
-        1e-6,
-        0,
-        false,
-        array![-1.0_f64, -0.5, 0.0].view(),
-        array![0.0_f64, 0.5, 1.0].view(),
-    )
-    .expect("prepare time block");
-    assert_eq!(prepared.design_entry, design_entry);
-    assert_eq!(prepared.design_exit, design_exit);
-    assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
-}
-
-#[test]
-fn resolve_survival_time_anchor_defaults_to_earliest_entry() {
-    let age_entry = array![5.0, 1.0, 3.0];
-    let anchor =
-        crate::survival::construction::survival_earliest_entry_time_anchor(&age_entry)
-            .expect("resolve default anchor");
-    assert!((anchor - 1.0).abs() <= 1e-12);
-}
-
-#[test]
-fn survival_ratio_derivatives_prefer_correct_signs() {
-    let dists = [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ];
-    let zs = [-1.2, -0.5, 0.4, 0.6, 1.1];
-    let h = 1e-6_f64;
-    let tie_tol = 1e-12_f64;
-    let nondeg_tol = 1e-12_f64;
-    let mut saw_strict_dr = false;
-    let mut saw_strict_ddr = false;
-
-    for &dist in &dists {
-        for &z in &zs {
-            let r = |u: f64| {
-                let f = dist.pdf(u);
-                let s = 1.0 - dist.cdf(u);
-                f / s
-            };
-            let dr_plus = |u: f64| {
-                let f = dist.pdf(u);
-                let s = 1.0 - dist.cdf(u);
-                let fp = dist.pdf_derivative(u);
-                let ratio = f / s;
-                (ratio * ratio) + fp / s
-            };
-            let dr_minus = |u: f64| {
-                let f = dist.pdf(u);
-                let s = 1.0 - dist.cdf(u);
-                let fp = dist.pdf_derivative(u);
-                let ratio = f / s;
-                (ratio * ratio) - fp / s
-            };
-            let ddr_plus = |u: f64| {
-                let f = dist.pdf(u);
-                let s = 1.0 - dist.cdf(u);
-                let fp = dist.pdf_derivative(u);
-                let fpp = dist.pdfsecond_derivative(u);
-                let ratio = f / s;
-                let dr = (ratio * ratio) + fp / s;
-                (2.0 * ratio * dr) + (fpp / s + fp * f / (s * s))
-            };
-            let ddr_minus = |u: f64| {
-                let f = dist.pdf(u);
-                let s = 1.0 - dist.cdf(u);
-                let fp = dist.pdf_derivative(u);
-                let fpp = dist.pdfsecond_derivative(u);
-                let ratio = f / s;
-                let dr = (ratio * ratio) - fp / s;
-                (2.0 * ratio * dr) - (fpp / s + fp * f / (s * s))
-            };
-
-            let drfd = (r(z + h) - r(z - h)) / (2.0 * h);
-            let ddrfd = (dr_plus(z + h) - dr_plus(z - h)) / (2.0 * h);
-            let dr_plus_err = (dr_plus(z) - drfd).abs();
-            let dr_minus_err = (dr_minus(z) - drfd).abs();
-            let ddr_plus_err = (ddr_plus(z) - ddrfd).abs();
-            let ddr_minus_err = (ddr_minus(z) - ddrfd).abs();
-            let f = dist.pdf(z);
-            let s = 1.0 - dist.cdf(z);
-            let fp = dist.pdf_derivative(z);
-            let fpp = dist.pdfsecond_derivative(z);
-            let dr_signal = (fp / s).abs();
-            let ddr_signal = (fpp / s + fp * f / (s * s)).abs();
-
-            if dr_signal > nondeg_tol {
-                saw_strict_dr = true;
-                assert!(
-                    dr_plus_err + tie_tol < dr_minus_err,
-                    "dr sign check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
-                    dist,
-                    z,
-                    dr_plus_err,
-                    dr_minus_err,
-                    dr_signal
-                );
-            } else {
-                // At stationary points (fp≈0), plus/minus formulas coincide to first order.
-                assert!(
-                    (dr_plus_err - dr_minus_err).abs() <= tie_tol,
-                    "dr tie check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
-                    dist,
-                    z,
-                    dr_plus_err,
-                    dr_minus_err,
-                    dr_signal
-                );
-            }
-
-            if ddr_signal > nondeg_tol {
-                saw_strict_ddr = true;
-                assert!(
-                    ddr_plus_err + tie_tol < ddr_minus_err,
-                    "ddr sign check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
-                    dist,
-                    z,
-                    ddr_plus_err,
-                    ddr_minus_err,
-                    ddr_signal
-                );
-            } else {
-                assert!(
-                    (ddr_plus_err - ddr_minus_err).abs() <= tie_tol,
-                    "ddr tie check failed for {:?} at z={}: plus_err={}, minus_err={}, signal={}",
-                    dist,
-                    z,
-                    ddr_plus_err,
-                    ddr_minus_err,
-                    ddr_signal
-                );
-            }
-        }
-    }
-
-    assert!(
-        saw_strict_dr,
-        "expected at least one non-degenerate dr check"
-    );
-    assert!(
-        saw_strict_ddr,
-        "expected at least one non-degenerate ddr check"
-    );
-}
-
-#[test]
-fn neglog_survival_stack_matches_closed_form_ratio_identities() {
-    // The jet-composed `-ln S` stack must reproduce the classical quotient-rule
-    // identities for `r = f/S` — `r' = r² + f'/S`, `r'' = 2rr' + f''/S + f'f/S²` —
-    // and, at fourth order, a central difference of that closed-form `r''`.
-    let dists = [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ];
-    let zs = [-1.4, -0.7, -0.1, 0.3, 0.9, 1.4];
-    let closed_ddr = |dist: &ResidualDistribution, z: f64| -> f64 {
-        let f = dist.pdf(z);
-        let s = 1.0 - dist.cdf(z);
-        let fp = dist.pdf_derivative(z);
-        let fpp = dist.pdfsecond_derivative(z);
-        let r = f / s;
-        let dr = r * r + fp / s;
-        2.0 * r * dr + (fpp / s + fp * f / (s * s))
-    };
-
-    for &dist in &dists {
-        for &z in &zs {
-            let f = dist.pdf(z);
-            let s = 1.0 - dist.cdf(z);
-            let fp = dist.pdf_derivative(z);
-            let fpp = dist.pdfsecond_derivative(z);
-            let fppp = dist.pdfthird_derivative(z);
-
-            let (log_s, r, dr, ddr, dddr) =
-                SurvivalLocationScaleFamily::neglog_survival_stack_from_pdf_jet(s, f, fp, fpp, fppp);
-
-            let r_expected = f / s;
-            let dr_expected = (r_expected * r_expected) + fp / s;
-            let ddr_expected = closed_ddr(&dist, z);
-            let h = 1e-4;
-            let dddr_expected = (closed_ddr(&dist, z + h) - closed_ddr(&dist, z - h)) / (2.0 * h);
-
-            assert!(
-                (log_s - s.ln()).abs() <= 1e-14 * s.ln().abs().max(1.0),
-                "log S mismatch for {dist:?} at z={z}: got {log_s}, expected {}",
-                s.ln()
-            );
-            assert!(
-                (r - r_expected).abs() <= 1e-14 * r_expected.abs().max(1.0),
-                "r mismatch for {dist:?} at z={z}: got {r}, expected {r_expected}"
-            );
-            assert!(
-                (dr - dr_expected).abs() <= 1e-12 * dr_expected.abs().max(1.0),
-                "dr mismatch for {dist:?} at z={z}: got {dr}, expected {dr_expected}"
-            );
-            assert!(
-                (ddr - ddr_expected).abs() <= 1e-10 * ddr_expected.abs().max(1.0),
-                "ddr mismatch for {dist:?} at z={z}: got {ddr}, expected {ddr_expected}"
-            );
-            assert!(
-                (dddr - dddr_expected).abs() <= 1e-6 * dddr_expected.abs().max(1.0),
-                "dddr mismatch for {dist:?} at z={z}: got {dddr}, central difference {dddr_expected}"
-            );
-        }
-    }
-}
-
-#[test]
-fn residual_pdfthird_derivative_matchessecond_derivativefd() {
-    let dists = [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ];
-    let zs = [-1.1, -0.4, 0.2, 0.9];
-    let h = 1e-6_f64;
-
-    for &dist in &dists {
-        for &z in &zs {
-            let fd =
-                (dist.pdfsecond_derivative(z + h) - dist.pdfsecond_derivative(z - h)) / (2.0 * h);
-            let analytic = dist.pdfthird_derivative(z);
-            assert_eq!(
-                analytic.signum(),
-                fd.signum(),
-                "pdf''' sign mismatch for {:?} at z={}: analytic={} fd={}",
-                dist,
-                z,
-                analytic,
-                fd
-            );
-            assert!(
-                (analytic - fd).abs() < 5e-5,
-                "pdf''' mismatch for {:?} at z={}: analytic={} fd={}",
-                dist,
-                z,
-                analytic,
-                fd
-            );
-        }
-    }
-}
-
-/// #932: independent finite-difference witness of the residual-distribution
-/// **fourth** PDF derivative `f''''(z)` for every residual distribution.
-///
-/// `pdfthird_derivative` was directly FD-guarded
-/// (`residual_pdfthird_derivative_matchessecond_derivativefd`) but
-/// `pdffourth_derivative` — the highest-order, most error-dense scalar tower
-/// feeding the survival-LS outer-Hessian `m4` term — was only covered
-/// transitively through the row-kernel oracle, where a sign slip can cancel
-/// against another term. This pins it directly: a Richardson O(h⁴) central
-/// difference of `pdfthird_derivative` (independent of the closed-form fourth)
-/// must match `pdffourth_derivative`, and a planted sign flip must be rejected.
-#[test]
-fn residual_pdffourth_derivative_matches_independent_fd_witness() {
-    let dists = [
-        ResidualDistribution::Gaussian,
-        ResidualDistribution::Gumbel,
-        ResidualDistribution::Logistic,
-    ];
-    let zs = [-1.3_f64, -0.5, 0.3, 1.1];
-    // Richardson-extrapolated central difference of f'''(z): cancels the O(h²)
-    // error of the plain central stencil, giving an O(h⁴) witness independent of
-    // the analytic fourth-derivative code path.
-    let central = |dist: &ResidualDistribution, z: f64, h: f64| {
-        (dist.pdfthird_derivative(z + h) - dist.pdfthird_derivative(z - h)) / (2.0 * h)
-    };
-    for &dist in &dists {
-        for &z in &zs {
-            let h = 1e-3_f64;
-            let coarse = central(&dist, z, h);
-            let fine = central(&dist, z, h * 0.5);
-            let fd = (4.0 * fine - coarse) / 3.0;
-            let analytic = dist.pdffourth_derivative(z);
-            assert!(
-                (analytic - fd).abs() <= 1e-4 * analytic.abs().max(1.0) + 1e-7,
-                "pdf'''' mismatch for {dist:?} at z={z}: analytic={analytic} fd={fd}"
-            );
-            // Planted-corruption tripwire: a sign flip must leave the witness band.
-            if analytic.abs() > 1e-6 {
-                let corrupted = -analytic;
-                assert!(
-                    (corrupted - fd).abs() > 1e-4 * analytic.abs().max(1.0) + 1e-7,
-                    "witness failed to reject a planted pdf'''' sign flip for {dist:?} at z={z}"
-                );
-            }
-        }
-    }
-}
-
-/// #932: independent finite-difference witness of the log-survival and
-/// log-pdf scalar derivative stacks across all residual links.
-///
-/// The survival-LS row oracle (`SurvivalLsJointNllProgram`) seeds its tower
-/// from `exact_survival_neglog_derivatives_fourth_rescaled` /
-/// `exact_log_pdf_derivatives_rescaled`, so it tests the Faà-di-Bruno
-/// composition but TRUSTS those scalar stacks as inputs. Outside the
-/// identity/probit closed-form special cases they had no general independent
-/// witness. This pins each stack's d1..d4 by differencing its OWN value
-/// channel (the value is independently anchored by the closed-form tests):
-/// a Richardson-extrapolated central stencil of `log S(eta)` / `log f(eta)`
-/// must reproduce the analytic derivative channels for logit / probit / cloglog
-/// over a range of eta, and a planted sign flip must be rejected.
-#[test]
-fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
-    // LogLog and Cauchit reach the generic (jet-composed) arm of both stacks,
-    // which the closed-form links never exercise; without them that arm had
-    // no independent witness at all.
-    let links = [
-        InverseLink::Standard(StandardLink::Probit),
-        InverseLink::Standard(StandardLink::Logit),
-        InverseLink::Standard(StandardLink::CLogLog),
-        InverseLink::Standard(StandardLink::LogLog),
-        InverseLink::Standard(StandardLink::Cauchit),
-    ];
-    let etas = [-0.8_f64, -0.2, 0.4, 1.0];
-
-    // Richardson O(h⁴) central stencil of an arbitrary scalar f(eta) to the
-    // requested derivative order (1..=4).
-    fn stencil(order: usize) -> &'static [(i64, f64)] {
-        match order {
-            1 => &[(-1, -0.5), (1, 0.5)],
-            2 => &[(-1, 1.0), (0, -2.0), (1, 1.0)],
-            3 => &[(-2, -0.5), (-1, 1.0), (1, -1.0), (2, 0.5)],
-            4 => &[(-2, 1.0), (-1, -4.0), (0, 6.0), (1, -4.0), (2, 1.0)],
-            _ => panic!("stencil supports derivative orders 1..=4, got {order}"),
-        }
-    }
-    let central = |value: &dyn Fn(f64) -> f64, eta: f64, order: usize, h: f64| -> f64 {
-        let one = |hh: f64| {
-            stencil(order)
-                .iter()
-                .map(|&(off, c)| c * value(eta + (off as f64) * hh))
-                .sum::<f64>()
-                / hh.powi(order as i32)
-        };
-        (4.0 * one(h * 0.5) - one(h)) / 3.0
-    };
-
-    for link in &links {
-        // log S(eta): value = slot 0; analytic derivatives are -r, -dr, -ddr, -dddr.
-        let log_s_value = |eta: f64| {
-            SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                link, eta, 0.0,
-            )
-            .expect("log-survival stack")
-            .0
-        };
-        // log f(eta): value = slot 0; analytic derivatives are d1..d4.
-        let log_pdf_value = |eta: f64| {
-            SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, eta, 0.0)
-                .expect("log-pdf stack")
-                .0
-        };
-        for &eta in &etas {
-            let (_, r, dr, ddr, dddr) =
-                SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-                    link, eta, 0.0,
-                )
-                .expect("log-survival stack");
-            let log_s_analytic = [-r, -dr, -ddr, -dddr];
-            let (_, p1, p2, p3, p4) =
-                SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(link, eta, 0.0)
-                    .expect("log-pdf stack");
-            let log_pdf_analytic = [p1, p2, p3, p4];
-
-            for (k, &analytic) in log_s_analytic.iter().enumerate() {
-                let order = k + 1;
-                let h = match order {
-                    1 | 2 => 1e-3,
-                    3 => 3e-3,
-                    4 => 1e-2,
-                    _ => unreachable!("stencil supports derivative orders 1..=4"),
-                };
-                let fd = central(&log_s_value, eta, order, h);
-                assert!(
-                    (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
-                    "logS d{order} mismatch for {link:?} at eta={eta}: analytic={analytic} fd={fd}"
-                );
-                if analytic.abs() > 1e-5 {
-                    assert!(
-                        (-analytic - fd).abs() > 5e-4 * analytic.abs().max(1.0) + 1e-6,
-                        "witness failed to reject logS d{order} sign flip for {link:?} at eta={eta}"
-                    );
-                }
-            }
-            for (k, &analytic) in log_pdf_analytic.iter().enumerate() {
-                let order = k + 1;
-                let h = match order {
-                    1 | 2 => 1e-3,
-                    3 => 3e-3,
-                    4 => 1e-2,
-                    _ => unreachable!("stencil supports derivative orders 1..=4"),
-                };
-                let fd = central(&log_pdf_value, eta, order, h);
-                assert!(
-                    (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
-                    "logpdf d{order} mismatch for {link:?} at eta={eta}: analytic={analytic} fd={fd}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn exact_log_pdf_derivatives_match_probit_closed_form() {
-    let eta = 3.25;
-    let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-        &InverseLink::Standard(StandardLink::Probit),
-        eta,
-        0.0,
-    )
-    .expect("exact probit log-pdf derivatives");
-    let expected_logf = -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln();
-    assert!((logf - expected_logf).abs() <= 1e-15);
-    assert!((d1 + eta).abs() <= 1e-15);
-    assert!((d2 + 1.0).abs() <= 1e-15);
-    assert_eq!(d3, 0.0);
-    assert_eq!(d4, 0.0);
-}
-
-#[test]
-fn exact_log_pdf_derivatives_rescaled_scale_cloglog_uniformly() {
-    let eta = 501.0;
-    let log_scale = 1.0;
-    let (logf, d1, d2, d3, d4) = SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-        &InverseLink::Standard(StandardLink::CLogLog),
-        eta,
-        log_scale,
-    )
-    .expect("rescaled cloglog log-pdf derivatives");
-    let (unscaled_logf, u1, u2, u3, u4) =
-        SurvivalLocationScaleFamily::exact_log_pdf_derivatives_rescaled(
-            &InverseLink::Standard(StandardLink::CLogLog),
-            eta,
-            0.0,
-        )
-        .expect("unscaled cloglog log-pdf derivatives");
-    let scale = (-log_scale).exp();
-    let expected_d1 = scale * u1;
-    let expected_d2 = scale * u2;
-    let expected_d3 = scale * u3;
-    let expected_d4 = scale * u4;
-
-    assert_eq!(logf, unscaled_logf);
-    assert!((d1 - expected_d1).abs() <= 1e-12 * expected_d1.abs());
-    assert!((d2 - expected_d2).abs() <= 1e-12 * expected_d2.abs());
-    assert!((d3 - expected_d3).abs() <= 1e-12 * expected_d3.abs());
-    assert!((d4 - expected_d4).abs() <= 1e-12 * expected_d4.abs());
-}
-
-#[test]
-fn exact_survival_neglog_derivatives_rescaled_scale_cloglog_uniformly() {
-    // The survival ratio stack must carry the SAME exp(-L) derivative rescale
-    // as the log-pdf stack: the two enter the joint Hessian side by side, and
-    // the logdet correction `logdet(H_exact) = logdet(H_scaled) + p*L` is only
-    // valid if EVERY row's curvature (event, censored, and left-truncated
-    // alike) is scaled uniformly. The log S value channel stays unshifted.
-    let eta = 2.25_f64;
-    let log_scale = 1.5_f64;
-    let raw = eta.exp();
-    let scaled = (eta - log_scale).exp();
-
-    let (log_s, r, dr, ddr, dddr) =
-        SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-            &InverseLink::Standard(StandardLink::CLogLog),
-            eta,
-            log_scale,
-        )
-        .expect("rescaled cloglog survival derivatives");
-
-    assert!((log_s + raw).abs() <= 1e-15 * raw);
-    for (label, actual) in [("r", r), ("dr", dr), ("ddr", ddr), ("dddr", dddr)] {
-        assert!(
-            (actual - scaled).abs() <= 1e-15 * scaled,
-            "CLogLog survival ratio derivative {label} must scale by exp(-L): actual={actual} expected={scaled}"
-        );
-    }
-
-    let ((pair_log_s, pair_r, pair_dr, pair_ddr, pair_dddr), _) =
-        SurvivalLocationScaleFamily::clglog_exit_pair(eta, log_scale);
-    assert!((pair_log_s + raw).abs() <= 1e-15 * raw);
-    for (label, actual) in [
-        ("pair r", pair_r),
-        ("pair dr", pair_dr),
-        ("pair ddr", pair_ddr),
-        ("pair dddr", pair_dddr),
-    ] {
-        assert!(
-            (actual - scaled).abs() <= 1e-15 * scaled,
-            "fused CLogLog survival ratio derivative {label} must scale by exp(-L): actual={actual} expected={scaled}"
-        );
-    }
-}
-
-#[test]
-fn exact_survival_neglog_derivatives_match_identity_closed_form() {
-    let eta = 0.25;
-    let s = 1.0 - eta;
-    let inv = 1.0 / s;
-    let (log_s, r, dr, ddr, dddr) =
-        SurvivalLocationScaleFamily::exact_survival_neglog_derivatives_fourth_rescaled(
-            &InverseLink::Standard(StandardLink::Identity),
-            eta,
-            0.0,
-        )
-        .expect("exact identity survival derivatives");
-    assert!((log_s - s.ln()).abs() <= 1e-15);
-    assert!((r - inv).abs() <= 1e-15);
-    assert!((dr - inv * inv).abs() <= 1e-15);
-    assert!((ddr - 2.0 * inv.powi(3)).abs() <= 1e-15);
-    assert!((dddr - 6.0 * inv.powi(4)).abs() <= 1e-12);
-}
-
-#[test]
 fn survival_log_likelihood_only_matches_sum_of_exact_row_kernels() {
     let family = survival_exact_newton_test_family();
     let states = survival_exact_newton_rebuild_states(&array![0.1], &array![0.2], &array![-0.15]);
@@ -4364,16 +2056,22 @@ fn survival_log_likelihood_only_matches_sum_of_exact_row_kernels() {
 
     let mut row_sum = 0.0;
     for i in 0..family.n {
-        let state = family.row_predictor_state(
-            h0[i],
-            h1[i],
-            d_raw[i],
+        // The scale divides the time transform too (#2695): `u = h·s + q` and
+        // `du1/dt = s1·g` with `g = (d_raw − h1·eta_ls') + qdot`, `s = e^{−eta_ls}`.
+        let s0 = dynamic.inv_sigma_entry[i];
+        let s1 = dynamic.inv_sigma_exit[i];
+        let state = survival_predictor_state(
+            h0[i] * s0,
+            h1[i] * s1,
+            d_raw[i] - h1[i] * dynamic.eta_ls_deriv_exit[i],
             dynamic.q_entry[i],
             dynamic.q_exit[i],
             dynamic.qdot_exit[i],
+            -dynamic.eta_ls_exit[i],
+            family.entry_active[i],
         );
         if let Some(kernel) = family.exact_row_kernel(i, state).expect("exact row kernel") {
-            row_sum += kernel.log_likelihood();
+            row_sum += kernel.log_likelihood_at(&state);
         }
     }
 
@@ -4559,7 +2257,12 @@ fn weighted_crossprod_dense_falls_back_when_row_scaled_product_would_overflow() 
     let right = array![[1.0e200]];
     let weights = array![1.0e200];
 
-    let cross = weighted_crossprod_dense(&left, &weights, &right)
+    let cross = weighted_crossprod_dense_with_parallelism(
+        &left,
+        &weights,
+        &right,
+        gam_linalg::faer_ndarray::pool_parallelism(),
+    )
         .expect("stable weighted cross-product should avoid overflow");
     let expected = 1.0e200;
     let rel_err = ((cross[[0, 0]] - expected) / expected).abs();
@@ -4951,28 +2654,41 @@ fn joint_exact_newton_log_sigma_block_matches_fd_in_far_exp_tail() {
             .expect("eval objective")
             .log_likelihood
     };
+    let score_at = |beta_ls: f64| -> f64 {
+        let eval = family
+            .evaluate(&survival_exact_newton_rebuild_states(
+                &beta_time,
+                &beta_threshold,
+                &array![beta_ls],
+            ))
+            .expect("eval score");
+        match &eval.blockworking_sets[SurvivalLocationScaleFamily::BLOCK_LOG_SIGMA] {
+            BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
+            _ => panic!("expected exact newton log-sigma block"),
+        }
+    };
     let h = 1e-4;
     let ll_plus = objective(&array![beta_log_sigma0 + h]);
-    let ll0 = objective(&array![beta_log_sigma0]);
     let ll_minus = objective(&array![beta_log_sigma0 - h]);
     let score_fd = (ll_plus - ll_minus) / (2.0 * h);
-    let info_fd = -(ll_plus - 2.0 * ll0 + ll_minus) / (h * h);
+    let info_fd = -(score_at(beta_log_sigma0 + h) - score_at(beta_log_sigma0 - h)) / (2.0 * h);
 
-    // The honest (post-#2335) far-tail surface is astronomical, not moderate: at
-    // this fixture row 2 has u0 ≈ u1 ≈ 3.6e150 and the log-sigma score/info are
-    // O(1.76e149) (MSI ground truth `score_fd ≈ 1.759e149`, step-independent).
-    // The original `abs < 1e-8` / `< 1e-5` bounds were written against the
-    // pre-#2335 *fake* cancellation-noise surface (analytic 0.0258) and are
-    // unsatisfiable on the honest one, so compare in RELATIVE form (#2342).
+    // The scale divides the time transform too (#2695), so at this fixture the
+    // far-tail rows are moderate again: row 2 has u0 ≈ u1 ≈ 3.7e150 but its
+    // entry and exit indices differ only by the scaled time gap
+    // `(h1 − h0)·e^{−η_σ} ≈ 5e−154`, and the log-sigma score is O(1)
+    // (≈ −2.168: −0.970 from row 0, −1.198 from row 2, of which the
+    // `u·δu ≈ 1.8e−3` share is what the #2342 regroup must carry). `|ℓ| ≈ 7e2`
+    // comes from the event log-densities' `−η_σ` terms.
     //
-    // Central-difference FD error at h=1e-4 on the locally-exponential
-    // `e^{-0.5·β_ls}` surface: the score truncation is `(0.5h)²/2 ≈ 1.3e-9` plus
-    // subtractive rounding; the info truncation is `(0.5h)²/12 ≈ 2e-10` but its
-    // second-difference numerator cancels three ~3.5e149 operands down to
-    // ~1e141, losing ~8 digits (≈ 4e-8 relative). The bounds sit an order of
-    // magnitude above those. A broken analytic (the fake-surface 0.0258) is off
-    // by ~1e151 relative and is caught by any bound below 1; the sign check is
-    // kept absolute.
+    // Central-difference FD error at h=1e-4: the score's truncation is
+    // `h²/6·|ℓ'''| = O(1e-9)` and its rounding `ε·|ℓ|/h ≈ 1.6e-9`. A second
+    // difference of `ℓ` would lose `ε·|ℓ|/h² ≈ 1.6e-5` to rounding against an
+    // O(3e-2) information, so the information is checked against the central
+    // difference of the analytic score instead (rounding `ε·|score|/h ≈ 5e-12`),
+    // which the first assertion pins to the objective. A score that drops the
+    // regroup's scaled time gap is off by `1.2·u·δu/2 ≈ 1.1e-3` and fails the
+    // first bound by five orders; the sign checks are kept absolute.
     const SCORE_REL_TOL: f64 = 1e-8;
     const INFO_REL_TOL: f64 = 1e-6;
     assert_eq!(
@@ -5322,13 +3038,15 @@ fn row_derivative_identities_hold_for_non_probit_links() {
         let inv_sigma_entry = eta_ls_entry.mapv(exp_sigma_inverse_from_eta_scalar);
 
         for i in 0..family.n {
-            let state = family.row_predictor_state(
+            let state = survival_predictor_state(
                 h0[i],
                 h1[i],
                 d_raw[i],
                 -eta_t_entry[i] * inv_sigma_entry[i] + etaw.map_or(0.0, |w| w[i]),
                 -eta_t_exit[i] * inv_sigma[i] + etaw.map_or(0.0, |w| w[i]),
                 0.0,
+                -eta_ls_exit[i],
+                family.entry_active[i],
             );
             let row = family
                 .row_derivatives(i, state)
@@ -5338,22 +3056,12 @@ fn row_derivative_identities_hold_for_non_probit_links() {
             let ell_h0 = row.grad_time_eta_h0;
             let ell_h1 = row.grad_time_eta_h1;
             let ell_q = row.d1_q0 + row.d1_q1;
-            let ell_h0q = row.h_time_h0;
-            let ell_h1q = row.h_time_h1;
-            let ell_qq = row.d2_q0 + row.d2_q1;
             assert!(
                 (ell_q - ell_h0 - ell_h1).abs() <= 1e-10,
                 "survival {label} row {i} violated ell_q = ell_h0 + ell_h1: q={} h0={} h1={}",
                 ell_q,
                 ell_h0,
                 ell_h1
-            );
-            assert!(
-                (ell_qq - ell_h0q - ell_h1q).abs() <= 1e-10,
-                "survival {label} row {i} violated ell_qq = ell_h0q + ell_h1q: qq={} h0q={} h1q={}",
-                ell_qq,
-                ell_h0q,
-                ell_h1q
             );
         }
     }
@@ -5635,6 +3343,7 @@ fn heart_failure_structural_time_small() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     };
@@ -5765,6 +3474,7 @@ fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     };
@@ -5826,7 +3536,15 @@ fn survival_q0dot_from_base_preserves_far_tail_cancellation() {
     let eta_ls_deriv = 1e10;
     let base = survival_base_q_scalars(eta_t, eta_ls);
 
-    let factorized = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
+    // The location channel's rate carries no scale (#2695): it is the local
+    // cancellation `eta_t·eta_ls' − eta_t'` in one fused multiply-add, and the
+    // scaled `dq0/dt = e^{−eta_ls}·r` is formed from it.
+    let rate = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
+    assert_eq!(
+        rate.to_bits(),
+        eta_t.mul_add(eta_ls_deriv, -eta_t_deriv).to_bits()
+    );
+    let factorized = safe_product(exp_sigma_inverse_from_eta_scalar(eta_ls), rate);
     let expected = safe_product(
         exp_sigma_inverse_from_eta_scalar(eta_ls),
         eta_t.mul_add(eta_ls_deriv, -eta_t_deriv),
@@ -6040,9 +3758,12 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
                 q1w = q1w.add(&bw.mul(&q1.compose_unary([b1[0], b1[1], b1[2], b1[3], 0.0])));
                 m1 = m1.add(&bw.mul(&q1.compose_unary([b1[1], b1[2], b1[3], 0.0, 0.0])));
             }
-            let u0w = p[0].add(&q0w);
-            let u1w = p[1].add(&q1w);
-            let g = p[2].add(&m1.mul(&qdot0));
+            // The scale divides the time transform too (#2695).
+            let u0w = p[0].mul(&inv_sigma_entry).add(&q0w);
+            let u1w = p[1].mul(&inv_sigma_exit).add(&q1w);
+            let g = inv_sigma_exit
+                .mul(&p[2].sub(&p[1].mul(&p[8])))
+                .add(&m1.mul(&qdot0));
 
             let mut nll = u0w
                 .compose_unary(survival_ls_log_survival_stack(
@@ -6171,7 +3892,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 1.0, 1.0, 1.0];
@@ -6219,7 +3940,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         let q0 = vars[4].mul(&inv_sigma_entry).neg();
         let inv_sigma_exit = vars[6].neg().exp();
         let q1 = vars[3].mul(&inv_sigma_exit).neg();
-        let qdot0 = inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5]));
+        let qdot0 = vars[3].mul(&vars[8]).sub(&vars[5]);
         let mut q0w = q0;
         let mut q1w = q1;
         let mut m1 = S::constant(1.0);
@@ -6229,9 +3950,11 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
             q1w = q1w.add(&bw.mul(&q1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
             m1 = m1.add(&bw.mul(&q1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
         }
-        let u0w = vars[0].add(&q0w);
-        let u1w = vars[1].add(&q1w);
-        let g = vars[2].add(&m1.mul(&qdot0));
+        // The scale divides the time transform too (#2695): `du1/dt =
+        // e^{−η_ls}·g`, and the kernel's rate stack is at `g`.
+        let u0w = vars[0].mul(&inv_sigma_entry).add(&q0w);
+        let u1w = vars[1].mul(&inv_sigma_exit).add(&q1w);
+        let g = vars[2].sub(&vars[1].mul(&vars[8])).add(&m1.mul(&qdot0));
         let mut nll = u0w
             .compose_unary([
                 kernel.log_s0,
@@ -6276,7 +3999,8 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                         kernel.d4_log_g,
                     ])
                     .scale(-ew),
-                );
+                )
+                .add(&vars[6].scale(ew));
         }
         nll
     }
@@ -6376,14 +4100,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         for row in 0..n {
             // Per-row primary Hessian from the §13 warp at Order2<9+pw>.
             let pvals = base_kernel.row_primary_values(row);
-            let state = family.row_predictor_state(
-                dynamic.h_entry[row],
-                dynamic.h_exit[row],
-                dynamic.hdot_exit[row],
-                dynamic.q_entry[row],
-                dynamic.q_exit[row],
-                dynamic.qdot_exit[row],
-            );
+            let state = family.row_predictor_state_at(&dynamic, row);
             let kernel = family
                 .exact_row_kernel_rescaled(row, state, 0.0)
                 .expect("exact row kernel")
@@ -6504,7 +4221,7 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 1.0, 1.0, 1.0];
@@ -6603,7 +4320,7 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 1.0, 1.0, 1.0];
@@ -6718,7 +4435,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 1.0, 1.0, 1.0];
@@ -7086,7 +4803,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
 /// single-warp fix). The link warp is a SINGLE warp of the residual index:
 /// `build_dynamic_geometry` composes `q = q0 + Σ βw·B(q0)` ONCE and the family's
 /// direct log-likelihood (`log_likelihood_only`, replicated per-row below via the
-/// production `row_predictor_state` + `exact_row_kernel` at the once-warped
+/// production `row_predictor_state_at` + `exact_row_kernel` at the once-warped
 /// `dynamic.q_exit`) is the correct single-warp objective. The single-source
 /// wiggle jet kernel reconstructs that SAME warp from the UNWARPED base
 /// predictors (`q_base_exit`/`q_base_entry`) with βw a live differentiable
@@ -7100,7 +4817,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
 /// matches the geometry's single warp exactly.
 #[test]
 fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
-    use super::row_kernel::{SurvivalExactRowKernel, SurvivalLsWiggleRowKernel};
+    use super::row_kernel::SurvivalLsWiggleRowKernel;
     use gam_math::jet_scalar::{DynamicJetArena, RuntimeJetScalar};
 
     // Reuse the directional oracle's regime: event rows, moderate-tail primaries
@@ -7110,7 +4827,7 @@ fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 0.0]; // mix event + censored so both loglik arms are pinned
@@ -7169,18 +4886,11 @@ fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
                 .value();
             // Direct single-warp objective: exactly `log_likelihood_only`'s per-row
             // body, reading the geometry's ONCE-warped index `dynamic.q_exit`.
-            let state = family.row_predictor_state(
-                dynamic.h_entry[row],
-                dynamic.h_exit[row],
-                dynamic.hdot_exit[row],
-                dynamic.q_entry[row],
-                dynamic.q_exit[row],
-                dynamic.qdot_exit[row],
-            );
+            let state = family.row_predictor_state_at(&dynamic, row);
             let direct_ll = family
                 .exact_row_kernel(row, state)
                 .expect("exact row kernel")
-                .map_or(0.0, SurvivalExactRowKernel::log_likelihood);
+                .map_or(0.0, |kernel| kernel.log_likelihood_at(&state));
             // kernel value is the row NLL = -log_likelihood; equality proves the
             // reconstructed single warp == the geometry's single warp.
             assert!(
@@ -7251,8 +4961,9 @@ fn validate_linear_constraints_accepts_roundoff_feasible_iterate_1569() {
 /// `D` the joint-Newton globalization whitens by — scales as
 /// `Σ_r exp(−2 η_σ,r) X_{rj}²`. Coefficient 0's metric entry is therefore many
 /// orders of magnitude ABOVE coefficient 1's: the #1569 metric-starvation regime.
-/// (The flexible time baseline `h` has `∂u/∂h = 1` and is scale-free, so it is NOT
-/// the inflated block — hence the floor targets location / log-σ, not time.)
+/// The scale divides the time transform too (#2695), so the time baseline is
+/// small enough that `u = inv_sigma·h` stays moderate on the small-σ rows: a
+/// deep-tail `u` there would flatten the curvature the ratio is built from.
 fn survival_ls_heteroscedastic_two_col_location_family()
 -> (SurvivalLocationScaleFamily, Vec<ParameterBlockState>) {
     // Six rows: the first three sit at very small σ (η_σ ≈ −5, inv_sigma ≈ 148),
@@ -7263,7 +4974,7 @@ fn survival_ls_heteroscedastic_two_col_location_family()
     // the floor genuinely binds — this is the harder-than-the-gate regime #1569
     // targets.
     let n = 6usize;
-    // Benign single-column time baseline (scale-free).
+    // Benign single-column time baseline.
     let x_time = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
     // log-σ design: a single column; with β_ls = 1 the small-σ rows get η_σ = −5
     // and the large-σ rows get η_σ = +3.
@@ -7304,12 +5015,14 @@ fn survival_ls_heteroscedastic_two_col_location_family()
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
+        entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
     };
-    // Block betas: a small time β; zero location β; β_ls = 1 so η_σ realizes the
+    // Block betas: a small time β (so `u = inv_sigma·h` is O(1) where inv_sigma ≈ 148);
+    // zero location β; β_ls = 1 so η_σ realizes the
     // −3 / +1 split above.
-    let beta_t = array![0.2];
+    let beta_t = array![0.005];
     let beta_thr = array![0.0, 0.0];
     let beta_ls = array![1.0];
     let mut eta_time = Array1::<f64>::zeros(3 * n);
@@ -7419,7 +5132,7 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
         .expect("floor computation")
         .expect("strongly heteroscedastic coupled fit must produce a floor");
     assert_eq!(floor.len(), offsets[offsets.len() - 1], "full-width floor");
-    // The floor is zero on the (scale-free) TIME block; positive on the
+    // The floor is zero on the TIME block, which is left unfloored; positive on the
     // scale-coupled location block.
     let (time_start, time_end) = (
         offsets[SurvivalLocationScaleFamily::BLOCK_TIME],
@@ -7428,7 +5141,7 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
     for j in time_start..time_end {
         assert_eq!(
             floor[j], 0.0,
-            "floor must be zero on the scale-free time block at {j}"
+            "floor must be zero on the unfloored time block at {j}"
         );
     }
     for j in loc_start..loc_end {
@@ -7862,7 +5575,7 @@ fn survival_ls_link_wiggle_block_gradient_matches_finite_difference_2695() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 1.0];
@@ -8092,7 +5805,7 @@ fn survival_ls_link_wiggle_real_warp_oracle_2695(knot_half_span: f64) {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 1.0];
@@ -8490,7 +6203,7 @@ fn link_warp_knot_crossing_gap_2695(
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 1.0];
@@ -8659,7 +6372,7 @@ fn probe_2695_joint_hessian_across_an_interior_knot() {
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
         [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
         [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
     ];
     let event = [1.0, 0.0, 1.0, 1.0];
@@ -8787,9 +6500,9 @@ fn probe_2695_joint_hessian_across_an_interior_knot() {
 /// arithmetic:
 ///
 /// ```text
-///   u0 = h0 − eta_t_entry · exp(−eta_ls_entry)            (entry index)
-///   u1 = h1 − eta_t_exit  · exp(−eta_ls_exit)             (exit index)
-///   g  = d_raw + exp(−eta_ls_exit)·(eta_t_exit·eta_ls_deriv − eta_t_deriv)
+///   u0 = (h0 − eta_t_entry) · exp(−eta_ls_entry)          (entry index)
+///   u1 = (h1 − eta_t_exit)  · exp(−eta_ls_exit)           (exit index)
+///   g  = exp(−eta_ls_exit)·(d_raw − eta_t_deriv − (h1 − eta_t_exit)·eta_ls_deriv)
 ///   nll = w·[ log S(u0) − (1−d)·log S(u1) − d·(log f(u1) + log g) ]
 /// ```
 ///
@@ -8835,15 +6548,17 @@ impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_
             return Ok(S::constant(0.0));
         }
 
-        // Entry index: u0 = h0 + q0, q0 = −eta_t_entry · exp(−eta_ls_entry).
+        // Entry index: u0 = (h0 − eta_t_entry) · exp(−eta_ls_entry): the scale
+        // divides the whole residual, time transform included (#2695).
         let inv_sigma_entry = p[7].neg().exp();
-        let u0 = p[0].sub(&p[4].mul(&inv_sigma_entry));
-        // Exit index: u1 = h1 + q1, q1 = −eta_t_exit · exp(−eta_ls_exit).
+        let u0 = p[0].sub(&p[4]).mul(&inv_sigma_entry);
+        // Exit index: u1 = (h1 − eta_t_exit) · exp(−eta_ls_exit).
         let inv_sigma_exit = p[6].neg().exp();
-        let u1 = p[1].sub(&p[3].mul(&inv_sigma_exit));
-        // Event Jacobian: g = d_raw + qdot,
-        // qdot = exp(−eta_ls_exit)·(eta_t_exit·eta_ls_deriv − eta_t_deriv).
-        let g = p[2].add(&inv_sigma_exit.mul(&p[3].mul(&p[8]).sub(&p[5])));
+        let residual_exit = p[1].sub(&p[3]);
+        let u1 = residual_exit.mul(&inv_sigma_exit);
+        // Event Jacobian g = du1/dt
+        //   = exp(−eta_ls_exit)·(d_raw − eta_t_deriv − (h1 − eta_t_exit)·eta_ls_deriv).
+        let g = inv_sigma_exit.mul(&p[2].sub(&p[5]).sub(&residual_exit.mul(&p[8])));
 
         // NLL = w·log S(u0) − w(1−d)·log S(u1) − w·d·(log f(u1) + log g),
         // term-for-term the sign layout of `SurvivalExactRowKernel::
@@ -8962,7 +6677,7 @@ fn survival_ls_packed_directional_matches_dense_tower_932() {
             let primaries: Vec<[f64; SLS_ROW_K]> = vec![
                 [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
                 [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
-                [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+                [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, -0.35],
                 [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
             ];
             let event = [1.0, 0.0, 1.0, 0.35];
@@ -9143,22 +6858,23 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
             //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
             //   [5]=thr_deriv [6]=lσ_exit [7]=lσ_entry [8]=lσ_deriv.
             // These rows drive `u0,u1` deep into the tail and `g` small-positive:
-            //   inv_σ_exit = e^{−p6}, u1 = p1 − p3·inv_σ_exit,
-            //   g = p2 + inv_σ_exit·(p3·p8 − p5)  (must stay > 0 for log g).
+            //   inv_σ_exit = e^{−p6}, u1 = (p1 − p3)·inv_σ_exit,
+            //   du1/dt = inv_σ_exit·g, g = p2 − p5 − (p1 − p3)·p8 (must stay > 0
+            //   for log g). The scale's `−p6` enters `log(du1/dt)` linearly, so
+            //   `g` alone sets the size of the log g jets (#2695).
             let primaries: Vec<[f64; SLS_ROW_K]> = vec![
                 // Large log-σ swing (p6=1.8 ⇒ inv_σ_exit≈0.165; p7=−1.6 ⇒
                 // inv_σ_entry≈4.95), big thresholds ⇒ |u0|,|u1| large.
                 [2.4, -3.1, 0.9, 2.2, 3.5, 0.7, 1.8, -1.6, 0.5],
                 // Deep-tail censored row with a SMALL event-Jacobian-style g build
                 // and a strongly negative exit index.
-                [-2.8, -4.2, 0.35, -2.6, -3.4, 1.3, -1.7, 1.5, -0.9],
-                // Near-degenerate g: p2=0.12, inv_σ_exit=e^{-0.4}≈0.670,
-                // g=0.12+0.670·(1.4·0.6−0.18)=0.562 → still positive but with
-                // large threshold curvature feeding u1.
-                [0.6, 3.8, 0.12, 1.4, 2.1, 0.18, 0.4, -0.5, 0.6],
-                // Tiny g with big tail: p2=0.05, inv_σ_exit=e^{-1.1}≈0.333,
-                // g=0.05+0.333·(0.9·0.4−0.05)=0.153 (small ⇒ huge log g jets).
-                [-1.2, 4.6, 0.05, 0.9, -2.3, 0.05, 1.1, -1.3, 0.4],
+                [-2.8, -4.2, 0.35, -2.6, -3.4, 1.3, -1.7, 1.5, 0.9],
+                // Near-degenerate g: p2=0.12, g=0.12−0.18−2.4·(−0.6)=1.38 → still
+                // positive but with large threshold curvature feeding u1.
+                [0.6, 3.8, 0.12, 1.4, 2.1, 0.18, 0.4, -0.5, -0.6],
+                // Tiny g with big tail: p2=0.05, g=0.05−0.05−3.7·(−0.04)=0.148
+                // (small ⇒ huge log g jets).
+                [-1.2, 4.6, 0.05, 0.9, -2.3, 0.05, 1.1, -1.3, -0.04],
             ];
             let event = [1.0, 0.0, 1.0, 1.0];
             let weight = [1.0, 0.9, 1.2, 0.8];
@@ -9178,8 +6894,8 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
             let mut max_abs_u1 = 0.0_f64;
             for (row, p) in primaries.iter().enumerate() {
                 let inv_sigma_exit = (-p[6]).exp();
-                let u1 = p[1] - p[3] * inv_sigma_exit;
-                let g = p[2] + inv_sigma_exit * (p[3] * p[8] - p[5]);
+                let u1 = (p[1] - p[3]) * inv_sigma_exit;
+                let g = p[2] - p[5] - (p[1] - p[3]) * p[8];
                 assert!(
                     g > 0.0,
                     "fixture row {row} has non-positive event Jacobian g={g:.4e}; log g undefined"
@@ -9285,9 +7001,11 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
                 let dense_fourth_trip = dense_fourth(&*trip_tower, du, dv);
                 let packed_fourth = RowKernel::row_fourth_contracted(&kernel, trip_row, du, dv)
                     .expect("trip packed fourth");
-                // (t_deriv, lσ_exit) = [2][6]: a cross block that genuinely
-                // couples the event-Jacobian and scale channels through g and u1.
-                let (ca, cb) = (2usize, 6usize);
+                // (t_deriv, lσ_deriv) = [2][8]: a cross block that genuinely
+                // couples the event Jacobian's time and scale rates through g.
+                // (`[2][6]` is structurally zero: the scale enters `log(du1/dt)`
+                // as the linear `−lσ_exit`, #2695.)
+                let (ca, cb) = (2usize, 8usize);
                 let want = dense_fourth_trip[ca][cb];
                 assert!(
                     want.abs() > 1e-6,
@@ -9464,8 +7182,11 @@ pub(crate) fn near_wall_wiggle_coordinate_keeps_cross_covariance_in_moments_2390
 /// `q0` — and therefore the I-spline row `b` — a constant, and leaves
 ///
 /// ```text
-///   η = h + q0 + bᵀβ_w,     E[η] = μ_h + q0 + bᵀE_π[β_w],
-///   Var[η] = aᵀΣ_hh a + 2·aᵀΣ_hw b + bᵀΣ_ww b.
+///   η = s·h + q0 + bᵀβ_w,     E[η] = s·μ_h + q0 + bᵀE_π[β_w],
+///   Var[η] = s²·aᵀΣ_hh a + 2s·aᵀΣ_hw b + bᵀΣ_ww b,
+///
+/// with `s = e^{−μ_ls}` deterministic too: the scale divides the time transform
+/// (#2695).
 /// ```
 ///
 /// Production must return `E[S(η)]` and `E[S(η)²]` for THAT scalar Gaussian.
@@ -9579,10 +7300,11 @@ fn nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446() {
     let s_hh = covariance.slice(s![0..2, 0..2]).to_owned();
     let s_hw = covariance.slice(s![0..2, 6..8]).to_owned();
     let s_ww = covariance.slice(s![6..8, 6..8]).to_owned();
+    let scale = exp_sigma_inverse_from_eta_scalar(mu_ls);
     let var_h = a_h.dot(&s_hh.dot(&a_h));
     let cross = a_h.dot(&s_hw.dot(&b));
-    let mean_eta = mu_h + q0 + b.dot(&beta_w);
-    let var_eta = var_h + 2.0 * cross + b.dot(&s_ww.dot(&b));
+    let mean_eta = scale * mu_h + q0 + b.dot(&beta_w);
+    let var_eta = scale * scale * var_h + 2.0 * scale * cross + b.dot(&s_ww.dot(&b));
     assert!(var_h > 0.0 && var_eta > 0.0, "degenerate fixture");
 
     // Non-vacuity 1: the removed clip bound at essentially every latent node.
@@ -9600,9 +7322,9 @@ fn nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446() {
     // Non-vacuity 2: the cross term the clip destroyed is a large share of the
     // variance being asserted, so passing this cannot be a coincidence.
     assert!(
-        2.0 * cross > 0.3 * var_eta,
+        2.0 * scale * cross > 0.3 * var_eta,
         "the cross term {} is too small a share of Var[eta] {var_eta} to gate anything",
-        2.0 * cross
+        2.0 * scale * cross
     );
 
     // Reference: E[S] and E[S^2] for the scalar Gaussian above, by DIRECT
@@ -9641,6 +7363,269 @@ fn nested_response_moment_rule_reproduces_the_scalar_gaussian_law_2446() {
          (mean_eta={mean_eta:.6}, var_eta={var_eta:.6})",
         second[0],
         reference_second
+    );
+}
+
+/// #2695: the scale divides the whole standardized residual, time transform
+/// included, so `log g` carries `−η_σ` and a covariate-dependent σ is identified.
+///
+/// The family's log-likelihood must equal the heteroscedastic Gaussian-residual
+/// likelihood written out here from the textbook form
+/// `u = (h − η_t)/σ`, `g = ḣ/σ`, `ℓ = w·[d(log φ(u1) + log g) + (1−d)·log S(u1) − log S(u0)]`.
+/// The former residual `u = h − η_t·e^{−η_σ}` with `g = ḣ` depended on
+/// `(η_t, η_σ)` only through `η_t·e^{−η_σ}`, so the per-row reparameterization
+/// `(η_t, η_σ) → (c·η_t, η_σ + ln c)` left it exactly unchanged: σ(x) had no
+/// likelihood of its own. The negative control computes that former closed form
+/// and shows it is blind to the reparameterization while the family is not.
+#[test]
+fn the_scale_divides_the_time_transform_so_a_covariate_scale_is_identified_2695() {
+    let family = survival_exact_newton_test_family();
+    let n = family.n;
+    let beta_time = 0.6;
+    let base = survival_exact_newton_test_states(&family, beta_time, 0.0, 0.0);
+    let h_entry: Vec<f64> = (0..n).map(|i| base[0].eta[i]).collect();
+    let h_exit: Vec<f64> = (0..n).map(|i| base[0].eta[n + i]).collect();
+    let hdot: Vec<f64> = (0..n).map(|i| base[0].eta[2 * n + i]).collect();
+    let states_at = |eta_t: &Array1<f64>, eta_ls: &Array1<f64>| {
+        let mut states = base.clone();
+        states[1].eta = eta_t.clone();
+        states[2].eta = eta_ls.clone();
+        states
+    };
+    let log_pdf = |u: f64| -0.5 * u * u - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let log_survival = |u: f64| gam_math::probability::normal_logsf(u);
+    // `scaled == true` is the model; `false` is the former ratio-only residual.
+    let closed_form = |eta_t: &Array1<f64>, eta_ls: &Array1<f64>, scaled: bool| -> f64 {
+        (0..n)
+            .map(|i| {
+                let s = (-eta_ls[i]).exp();
+                let (u0, u1, g) = if scaled {
+                    ((h_entry[i] - eta_t[i]) * s, (h_exit[i] - eta_t[i]) * s, hdot[i] * s)
+                } else {
+                    (h_entry[i] - eta_t[i] * s, h_exit[i] - eta_t[i] * s, hdot[i])
+                };
+                let d = family.y[i];
+                family.w[i]
+                    * (d * (log_pdf(u1) + g.ln()) + (1.0 - d) * log_survival(u1)
+                        - log_survival(u0))
+            })
+            .sum()
+    };
+
+    let eta_t = array![0.3, -0.2, 0.5];
+    let eta_ls = array![0.4, -0.7, 0.9];
+    let c = array![1.7, 0.6, 2.3];
+    let eta_t_moved = &eta_t * &c;
+    let eta_ls_moved = &eta_ls + &c.mapv(f64::ln);
+
+    let family_base = family
+        .log_likelihood_only(&states_at(&eta_t, &eta_ls))
+        .expect("family log-likelihood at the base point");
+    let family_moved = family
+        .log_likelihood_only(&states_at(&eta_t_moved, &eta_ls_moved))
+        .expect("family log-likelihood at the reparameterized point");
+    let model_base = closed_form(&eta_t, &eta_ls, true);
+    let model_moved = closed_form(&eta_t_moved, &eta_ls_moved, true);
+    let former_base = closed_form(&eta_t, &eta_ls, false);
+    let former_moved = closed_form(&eta_t_moved, &eta_ls_moved, false);
+
+    // Agreement to rounding: every term is O(1), so the band is a few ulps of
+    // the magnitudes summed.
+    let band = |a: f64, b: f64| 64.0 * f64::EPSILON * (1.0 + a.abs() + b.abs());
+    assert!(
+        (family_base - model_base).abs() <= band(family_base, model_base),
+        "family {family_base:.17e} vs heteroscedastic closed form {model_base:.17e}"
+    );
+    assert!(
+        (family_moved - model_moved).abs() <= band(family_moved, model_moved),
+        "family {family_moved:.17e} vs heteroscedastic closed form {model_moved:.17e} \
+         at the reparameterized point"
+    );
+    // Negative control: the former residual cannot see the move ...
+    assert!(
+        (former_base - former_moved).abs() <= band(former_base, former_moved),
+        "the ratio-only residual must be invariant under (c·η_t, η_σ + ln c): \
+         {former_base:.17e} vs {former_moved:.17e}"
+    );
+    // ... while the model resolves it far beyond rounding, so σ(x) is identified.
+    assert!(
+        (family_base - family_moved).abs() > 1.0e6 * band(family_base, family_moved),
+        "σ(x) is not identified: the family is blind to (c·η_t, η_σ + ln c): \
+         {family_base:.17e} vs {family_moved:.17e}"
+    );
+}
+
+/// #2695: a row entering at the origin is not left-truncated, so its likelihood
+/// carries no `S(entry)` factor (`survival/base.rs` drops it by the same
+/// `age_entry > ENTRY_AT_ORIGIN_THRESHOLD` predicate). The family's
+/// log-likelihood and the kernel's entry stack must both see the entry term on
+/// the left-truncated row alone. The control conditions every row on its entry
+/// and must differ by far more than rounding, so the fixture's entry term is
+/// live.
+#[test]
+fn a_row_entering_at_the_origin_carries_no_entry_factor_2695() {
+    let active = [false, true, false];
+    let family = SurvivalLocationScaleFamily {
+        entry_active: Arc::from(active.to_vec()),
+        ..survival_exact_newton_test_family()
+    };
+    let control = survival_exact_newton_test_family();
+    let n = family.n;
+    let states = survival_exact_newton_test_states(&family, 0.6, 0.2, -0.3);
+    let h_entry: Vec<f64> = (0..n).map(|i| states[0].eta[i]).collect();
+    let h_exit: Vec<f64> = (0..n).map(|i| states[0].eta[n + i]).collect();
+    let hdot: Vec<f64> = (0..n).map(|i| states[0].eta[2 * n + i]).collect();
+    let log_pdf = |u: f64| -0.5 * u * u - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let log_survival = |u: f64| gam_math::probability::normal_logsf(u);
+    let closed_form = |entry_on: &[bool]| -> f64 {
+        (0..n)
+            .map(|i| {
+                let (eta_t, s) = (states[1].eta[i], (-states[2].eta[i]).exp());
+                let (u0, u1) = ((h_entry[i] - eta_t) * s, (h_exit[i] - eta_t) * s);
+                let d = family.y[i];
+                let entry = if entry_on[i] { log_survival(u0) } else { 0.0 };
+                family.w[i]
+                    * (d * (log_pdf(u1) + (hdot[i] * s).ln()) + (1.0 - d) * log_survival(u1)
+                        - entry)
+            })
+            .sum()
+    };
+    let band = |a: f64, b: f64| 64.0 * f64::EPSILON * (1.0 + a.abs() + b.abs());
+
+    let masked = family.log_likelihood_only(&states).expect("masked log-likelihood");
+    let expected = closed_form(&active);
+    assert!(
+        (masked - expected).abs() <= band(masked, expected),
+        "an origin row must carry no S(entry): family {masked:.17e} vs closed form {expected:.17e}"
+    );
+    let conditioned = control.log_likelihood_only(&states).expect("control log-likelihood");
+    let expected_conditioned = closed_form(&[true, true, true]);
+    assert!(
+        (conditioned - expected_conditioned).abs() <= band(conditioned, expected_conditioned),
+        "control: family {conditioned:.17e} vs closed form {expected_conditioned:.17e}"
+    );
+    assert!(
+        (masked - conditioned).abs() > 1.0e6 * band(masked, conditioned),
+        "the fixture's entry term must be live: {masked:.17e} vs {conditioned:.17e}"
+    );
+
+    // The entry stack of an origin row is exactly zero.
+    let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+    for (row, &on) in active.iter().enumerate() {
+        let state = family.row_predictor_state_at(&dynamic, row);
+        let kernel = family
+            .exact_row_kernel(row, state)
+            .expect("row kernel")
+            .expect("positive-weight row");
+        let entry_stack = [kernel.log_s0, kernel.r0, kernel.dr0, kernel.ddr0, kernel.dddr0];
+        assert_eq!(
+            entry_stack.iter().all(|value| *value == 0.0),
+            !on,
+            "row {row}: entry stack {entry_stack:?} with entry_active={on}"
+        );
+    }
+}
+
+/// #2695: the explicit ψ terms `(V_ψ, g_ψ, H_ψ)` served from the row program are
+/// the ψ-derivatives of the NLL value, coefficient gradient and coefficient
+/// Hessian when ψ moves the threshold and log-σ designs `X → X + ψ·X_ψ`, at a
+/// heteroscedastic point. Central differences of the family's own NLL, gradient
+/// and Hessian at `ψ = ±h` are the second source; the step `ε^(1/3)` and the bound
+/// `64·ε^(2/3)·(1 + |analytic|)` are the central-difference truncation and
+/// roundoff floor.
+#[test]
+fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
+    use crate::custom_family::CustomFamily;
+
+    let (beta_t, beta_thr, beta_ls) = (0.6, 0.35, -0.4);
+    let x_thr_psi = array![[0.7], [-0.2], [0.9]];
+    let x_ls_psi = array![[-0.5], [0.8], [0.3]];
+    let family_at = |psi: f64| {
+        let base = survival_exact_newton_test_family();
+        let thr = base.x_threshold.to_dense() + psi * &x_thr_psi;
+        let ls = base.x_log_sigma.to_dense() + psi * &x_ls_psi;
+        SurvivalLocationScaleFamily {
+            x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(thr)),
+            x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(ls)),
+            ..base
+        }
+    };
+    let nll_terms = |psi: f64| {
+        let family = family_at(psi);
+        let states = survival_exact_newton_test_states(&family, beta_t, beta_thr, beta_ls);
+        let (ll, blocks) = family
+            .evaluate_log_likelihood_and_block_gradients(&states)
+            .expect("value and gradient");
+        let gradient =
+            Array1::from_iter(blocks.iter().flat_map(|block| block.iter().map(|&g| -g)));
+        let hessian = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint Hessian")
+            .expect("joint Hessian present");
+        (-ll, gradient, hessian)
+    };
+
+    let family = family_at(0.0);
+    let states = survival_exact_newton_test_states(&family, beta_t, beta_thr, beta_ls);
+    let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+    let z_thr = x_thr_psi.column(0).mapv(|x| x * beta_thr);
+    let z_ls = x_ls_psi.column(0).mapv(|x| x * beta_ls);
+    let direction = SurvivalJointPsiDirection {
+        x_t_exit_psi: Some(x_thr_psi.clone()),
+        x_t_entry_psi: Some(x_thr_psi.clone()),
+        x_t_deriv_psi: None,
+        x_ls_exit_psi: Some(x_ls_psi.clone()),
+        x_ls_entry_psi: Some(x_ls_psi.clone()),
+        x_ls_deriv_psi: None,
+        z_t_exit_psi: z_thr.clone(),
+        z_t_entry_psi: z_thr,
+        z_t_deriv_psi: Array1::zeros(family.n),
+        z_ls_exit_psi: z_ls.clone(),
+        z_ls_entry_psi: z_ls,
+        z_ls_deriv_psi: Array1::zeros(family.n),
+        x_t_exit_action: None,
+        x_t_entry_action: None,
+        x_t_deriv_action: None,
+        x_ls_exit_action: None,
+        x_ls_entry_action: None,
+        x_ls_deriv_action: None,
+    };
+    let (objective_psi, score_psi, hessian_psi) = survival_ls_joint_psi_first_order_terms(
+        &family, &dynamic, &direction, None, true,
+    )
+    .expect("explicit psi terms");
+    let hessian_psi = hessian_psi.expect("dense psi Hessian");
+
+    let h = f64::EPSILON.cbrt();
+    let (value_plus, gradient_plus, hessian_plus) = nll_terms(h);
+    let (value_minus, gradient_minus, hessian_minus) = nll_terms(-h);
+    let bound = |analytic: f64| 64.0 * f64::EPSILON.powf(2.0 / 3.0) * (1.0 + analytic.abs());
+    let fd_value = (value_plus - value_minus) / (2.0 * h);
+    assert!(
+        (objective_psi - fd_value).abs() <= bound(objective_psi),
+        "V_psi {objective_psi:.12e} vs central difference {fd_value:.12e}"
+    );
+    for a in 0..score_psi.len() {
+        let fd = (gradient_plus[a] - gradient_minus[a]) / (2.0 * h);
+        assert!(
+            (score_psi[a] - fd).abs() <= bound(score_psi[a]),
+            "g_psi[{a}] {:.12e} vs central difference {fd:.12e}",
+            score_psi[a]
+        );
+        for b in 0..score_psi.len() {
+            let fd = (hessian_plus[[a, b]] - hessian_minus[[a, b]]) / (2.0 * h);
+            assert!(
+                (hessian_psi[[a, b]] - fd).abs() <= bound(hessian_psi[[a, b]]),
+                "H_psi[{a}][{b}] {:.12e} vs central difference {fd:.12e}",
+                hessian_psi[[a, b]]
+            );
+        }
+    }
+    // Non-vacuity: ψ moves the scale, which the time coefficient (index 0) now
+    // sees through the scaled time channel, so its ψ score is not zero.
+    assert!(
+        score_psi[0].abs() > 1.0e6 * bound(0.0),
+        "the time coefficient's ψ score must be exercised: {score_psi:?}"
     );
 }
 

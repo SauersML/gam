@@ -148,10 +148,10 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     // ---- fit with gam: parametric Weibull transformation AFT --------------
     // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline
     // (the transformation / Royston-Parmar net model with a single-column linear
-    // time basis `log t` seeded by scale/shape). The formula carries the
-    // explicit `survmodel(spec="transformation", distribution="weibull")` term
-    // to declare intent; the library path resolves the likelihood mode from
-    // FitConfig. The covariate term-collection design carries its own intercept
+    // time basis `log t` seeded by scale/shape). `survmodel(spec="net")` names the
+    // estimand, the one-hazard net risk. The likelihood comes from the config
+    // field, and the Weibull likelihood reads no residual distribution, so none
+    // is named. The covariate term-collection design carries its own intercept
     // (the anchor-centered time block zeroes its own constant column, so the
     // baseline level lives in the covariate intercept), then the two linear
     // covariates x1, x2, so beta = [time0(=shape), intercept,
@@ -180,7 +180,7 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Surv(t, d) ~ x1 + x2 + survmodel(spec=\"transformation\", distribution=\"weibull\")",
+        "Surv(t, d) ~ x1 + x2 + survmodel(spec=\"net\")",
         &data,
         &cfg,
     )
@@ -643,7 +643,7 @@ fn gam_transformation_survival_prediction_grid_matches_scipy_on_real_data() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "Surv(time, status) ~ karno + age + diagtime + survmodel(spec=\"transformation\", distribution=\"weibull\")",
+        "Surv(time, status) ~ karno + age + diagtime + survmodel(spec=\"net\")",
         &train_ds,
         &cfg,
     )

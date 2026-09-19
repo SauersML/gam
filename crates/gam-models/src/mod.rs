@@ -85,6 +85,8 @@ pub(crate) mod fnv1a;
 pub mod gamlss;
 pub mod joint_penalty;
 pub(crate) mod latent_anchor;
+pub mod latent_outer;
+pub(crate) mod latent_law_compression;
 pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;
 pub mod marginal_slope_shared;

@@ -154,7 +154,12 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 mod boundary_mode;
-pub use boundary_mode::{BoundaryModeApproximation, BoundaryModeCertificate};
+pub use boundary_mode::{BoundaryModeApproximation, BoundaryModeCertificate, BoundaryModeRefusal};
+mod cone_normalizer;
+pub use cone_normalizer::{
+    ConeCoordinateMotion, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal, ConePairMotion,
+    OrthantLogMass,
+};
 
 /// Relative accuracy demanded of the orthant-moment cubature, measured against
 /// the PRE-TRUNCATION scale `sd_i = sqrt(W_ii)` so the criterion is invariant
@@ -586,6 +591,11 @@ pub struct ConePosteriorMomentDecline {
     /// persisted before it existed.
     #[serde(default)]
     pub active_rows: Vec<usize>,
+    /// Why no boundary-mode approximation replaced this decline, with the measured
+    /// certificate (such as its overturn tail mass) when it got that far. `None` when no
+    /// approximation was attempted, and on declines persisted before it existed.
+    #[serde(default)]
+    pub boundary_approximation_refusal: Option<boundary_mode::BoundaryModeRefusal>,
 }
 
 impl ConePosteriorMomentDecline {
@@ -624,13 +634,20 @@ impl ConePosteriorMomentDecline {
             ambient_precision_failure,
             properness,
             active_rows,
+            boundary_approximation_refusal: None,
         })
     }
 
     pub fn summary(&self) -> String {
+        let refusal = self
+            .boundary_approximation_refusal
+            .as_ref()
+            .map_or_else(String::new, |refusal| {
+                format!("; no boundary-mode approximation: {refusal}")
+            });
         format!(
             "ambient covariance route declined ({}); {}; the converged mode binds constraint \
-             row(s) {:?}",
+             row(s) {:?}{refusal}",
             self.ambient_precision_failure,
             self.properness.summary(),
             self.active_rows,
@@ -659,6 +676,18 @@ fn validate_decline(
             "constrained posterior moment decline names active rows {:?} that are not \
              unique valid indices for {constraint_count} inequalities",
             decline.active_rows
+        ));
+    }
+    if let Some(certificate) = decline
+        .boundary_approximation_refusal
+        .as_ref()
+        .and_then(|refusal| refusal.certificate.as_ref())
+        && !(0.0..=1.0).contains(&certificate.overturn_tail_mass)
+    {
+        return Err(format!(
+            "constrained posterior moment decline records a boundary-mode refusal whose overturn \
+             tail mass {:e} is not a probability",
+            certificate.overturn_tail_mass
         ));
     }
     decline.properness.validate(dimension, constraint_count)
@@ -2642,12 +2671,21 @@ impl StandardizedCeiling {
             ));
         }
         let mut coefficients = Array1::<f64>::zeros(q);
+        // Each coefficient is an inner product of `q − j` products, known only to
+        // the rounding band of its own summands (#2469). A coefficient inside that
+        // band is not resolved from zero; one above it carries the wall whatever
+        // the other coordinates' magnitudes are.
+        let mut bands = Array1::<f64>::zeros(q);
         for j in 0..q {
             let mut total = 0.0;
+            let mut magnitude = 0.0;
             for k in j..q {
-                total += factor[[k, j]] * normal[k];
+                let term = factor[[k, j]] * normal[k];
+                total += term;
+                magnitude += term.abs();
             }
             coefficients[j] = total;
+            bands[j] = gam_linalg::roundoff::accumulation_band(q - j, magnitude);
         }
         let scale = coefficients
             .iter()
@@ -2658,11 +2696,13 @@ impl StandardizedCeiling {
                  constrains no cubature coordinate"
             ));
         }
-        let floor = 8.0 * f64::EPSILON * scale;
         let pivot = (0..q)
             .rev()
-            .find(|j| coefficients[*j].abs() > floor)
-            .ok_or_else(|| "affine ceiling: no coordinate clears the pivot floor".to_string())?;
+            .find(|j| coefficients[*j].abs() > bands[*j])
+            .ok_or_else(|| {
+                "affine ceiling: no standardized coefficient is resolved above its rounding band"
+                    .to_string()
+            })?;
         let offset = normal.dot(mean);
         if !(bound - offset).is_finite() {
             return Err(format!(
@@ -6534,6 +6574,23 @@ mod affine_ceiling_tests {
             early.pivot, 0,
             "a normal on coordinate 0 cannot reach a later coordinate through a lower-triangular factor"
         );
+    }
+
+    /// #2469: the pivot is the last coefficient resolved above its own inner
+    /// product's rounding band. With `L = diag(1e20, 1)` and `a = (1, 1)`,
+    /// `Lᵀa = (1e20, 1)`. The last coefficient is one exact product, so the wall
+    /// constrains coordinate 1. The `8·ε·max|Lᵀa|` floor this replaced (≈1.8e5)
+    /// called it zero and pivoted on coordinate 0.
+    #[test]
+    fn the_pivot_is_read_at_each_coefficient_rounding_band_not_the_largest_2469() {
+        let mean = array![0.0, 0.0];
+        let factor = diagonal_factor(&array![1.0e20, 1.0]);
+        let wall = StandardizedCeiling::new(&array![1.0, 1.0], 1.0, &mean, factor.view())
+            .expect("both coordinates are touched");
+        assert_eq!(wall.pivot, 1);
+        let tail_only = StandardizedCeiling::new(&array![1.0, 0.0], 1.0, &mean, factor.view())
+            .expect("an exactly-zero last coefficient leaves coordinate 0");
+        assert_eq!(tail_only.pivot, 0);
     }
 }
 

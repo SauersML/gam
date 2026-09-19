@@ -26,6 +26,9 @@ pub struct BernoulliMarginalSlopeSavedAloRowGeometry {
 #[derive(Clone, Debug)]
 pub struct BernoulliMarginalSlopeSavedAloReplay {
     pub rows: Vec<BernoulliMarginalSlopeSavedAloRowGeometry>,
+    /// Width of the residual repair block (gam#2924); its coordinates follow
+    /// the slope coordinate and precede the flex coordinates.
+    pub residual_dimension: usize,
     pub score_warp_dimension: usize,
     pub link_deviation_dimension: usize,
 }
@@ -49,6 +52,12 @@ pub(crate) struct BernoulliMarginalSlopeSavedAloReplayInput<'a> {
     pub link_deviation_runtime: Option<&'a SavedCompiledFlexBlock>,
     pub score_warp_anchor_rows: Option<&'a Array2<f64>>,
     pub link_deviation_anchor_rows: Option<&'a Array2<f64>>,
+    /// The residual repair block (gam#2924): saved geometry, fitted
+    /// coefficients, and the rows' residual features. All three present or
+    /// all three absent.
+    pub residual_geometry: Option<&'a super::residual_repair::ResidualRepairGeometry>,
+    pub residual_beta: Option<&'a Array1<f64>>,
+    pub residual_features: Option<&'a Array2<f64>>,
 }
 
 fn dense_saved_table(
@@ -334,9 +343,61 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
         })
         .transpose()?;
 
+    let residual = match (
+        input.residual_geometry,
+        input.residual_beta,
+        input.residual_features,
+    ) {
+        (None, None, None) => None,
+        (Some(geometry), Some(beta), Some(features)) => {
+            if score_warp.is_some() || link_dev.is_some() {
+                return Err(
+                    super::residual_repair::ResidualRepairRefusal::FlexBlocksUnsupported
+                        .to_string(),
+                );
+            }
+            if beta.len() != geometry.width() {
+                return Err(format!(
+                    "saved BMS ALO residual beta has {} coefficients; the geometry names {}",
+                    beta.len(),
+                    geometry.width()
+                ));
+            }
+            if let Some((coordinate, value)) = beta
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "saved BMS ALO residual beta[{coordinate}] must be finite, got {value}"
+                ));
+            }
+            let a_block = input
+                .marginal_design
+                .try_to_dense_arc("saved BMS ALO residual repair conditioning span")?;
+            Some(Arc::new(
+                super::residual_repair::ResidualBlockRuntime::from_geometry(
+                    geometry.clone(),
+                    features.clone(),
+                    a_block.view(),
+                )?,
+            ))
+        }
+        _ => {
+            return Err(
+                "saved BMS ALO residual repair block requires its geometry, coefficients and \
+                 features together"
+                    .to_string(),
+            );
+        }
+    };
+    let residual_dimension = residual.as_ref().map_or(0, |runtime| runtime.width());
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
+        residual,
+        search: None,
         y: Arc::new(input.response.clone()),
         weights: Arc::new(input.prior_weights.clone()),
         z: Arc::new(input.latent_z.clone()),
@@ -366,6 +427,14 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
             eta: input.slope.clone(),
         },
     ];
+    if let Some(beta) = input.residual_beta.filter(|_| residual_dimension > 0) {
+        block_states.push(ParameterBlockState {
+            beta: beta.clone(),
+            // Like the flex blocks, the residual row program reads the
+            // coefficient vector directly; the block eta is shape-only.
+            eta: Array1::zeros(n),
+        });
+    }
     if let Some(beta) = input.score_warp_beta {
         block_states.push(ParameterBlockState {
             beta: beta.clone(),
@@ -382,6 +451,47 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
         });
     }
     family.validate_exact_block_state_shapes(&block_states)?;
+
+    if residual_dimension > 0 {
+        // gam#2924: the saved row geometry lives in the coordinates
+        // (q, slope, β_1..β_K), pulled back from the five-primary residual
+        // kernel with the curvature of its quadratic primary.
+        let width = 2 + residual_dimension;
+        let kern = super::residual_repair_kernel::ResidualDriveKernel::new(
+            family.clone(),
+            block_states.to_vec(),
+        )?;
+        let mut rows = Vec::with_capacity(n);
+        for row in 0..n {
+            let (negative_log_likelihood, nll_score, observed_hessian) =
+                super::residual_repair_kernel::residual_row_geometry(&kern, row)?;
+            if !negative_log_likelihood.is_finite()
+                || nll_score.iter().any(|value| !value.is_finite())
+                || observed_hessian.iter().any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "saved BMS ALO residual row {row} returned invalid local geometry: nll={negative_log_likelihood}"
+                ));
+            }
+            let mut coordinate_values = Array1::<f64>::zeros(width);
+            coordinate_values[0] = input.marginal_eta[row];
+            coordinate_values[1] = input.slope[row];
+            if let Some(beta) = input.residual_beta {
+                coordinate_values.slice_mut(ndarray::s![2..]).assign(beta);
+            }
+            rows.push(BernoulliMarginalSlopeSavedAloRowGeometry {
+                nll_score,
+                observed_hessian,
+                coordinate_values,
+            });
+        }
+        return Ok(BernoulliMarginalSlopeSavedAloReplay {
+            rows,
+            residual_dimension,
+            score_warp_dimension,
+            link_deviation_dimension,
+        });
+    }
 
     let mut rows = Vec::with_capacity(n);
     for row in 0..n {
@@ -428,6 +538,7 @@ pub(crate) fn replay_saved_bernoulli_marginal_slope_alo(
     }
     Ok(BernoulliMarginalSlopeSavedAloReplay {
         rows,
+        residual_dimension,
         score_warp_dimension,
         link_deviation_dimension,
     })
@@ -533,6 +644,9 @@ mod tests {
                 link_deviation_runtime: None,
                 score_warp_anchor_rows: None,
                 link_deviation_anchor_rows: None,
+                residual_geometry: None,
+                residual_beta: None,
+                residual_features: None,
             })
             .expect("saved empirical-flex row must replay");
         assert_eq!(replay.score_warp_dimension, 1);

@@ -533,6 +533,7 @@ pub(crate) struct IdentifiedRankCertificate {
 /// on ρ.
 pub(crate) fn certify_identified_rank_locally_constant(
     eigenvalues: &[f64],
+    rank: usize,
     penalty_rank: usize,
     bounds: &HessianSpectrumBounds,
 ) -> Result<IdentifiedRankCertificate, EstimationError> {
@@ -544,7 +545,6 @@ pub(crate) fn certify_identified_rank_locally_constant(
             bounds.upper.len()
         )));
     }
-    let rank = DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank);
     let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
     let mut descending = eigenvalues.to_vec();
     descending.sort_by(|left, right| right.total_cmp(left));
@@ -620,13 +620,33 @@ impl FittedHessianSpectrum {
             .map_err(EstimationError::EigendecompositionFailed)?;
         let eigenvalues = eigenvalues.to_vec();
         let rank = DenseSpectralOperator::identified_rank(&eigenvalues, penalty_rank);
-        Ok(Self {
-            hessian: symmetric,
+        Ok(Self::from_eigensystem(
+            symmetric,
             eigenvalues,
             eigenvectors,
             penalty_rank,
             rank,
-        })
+        ))
+    }
+
+    /// The spectrum a criterion builder already decomposed `hessian` into and
+    /// priced at `rank`, for a penalty of rank `penalty_rank` (#2959 D1). The
+    /// certificate then judges the eigenpairs and the rank the criterion priced,
+    /// not a second decomposition and a second call to the predicate.
+    pub(crate) fn from_eigensystem(
+        hessian: Array2<f64>,
+        eigenvalues: Vec<f64>,
+        eigenvectors: Array2<f64>,
+        penalty_rank: usize,
+        rank: usize,
+    ) -> Self {
+        Self {
+            hessian,
+            eigenvalues,
+            eigenvectors,
+            penalty_rank,
+            rank,
+        }
     }
 
     /// The number of identified coefficient directions.
@@ -683,9 +703,9 @@ pub(crate) fn certify_fitted_identified_rank(
     let eigenvalues = &spectrum.eigenvalues;
     let eigenvectors = &spectrum.eigenvectors;
     let penalty_rank = spectrum.penalty_rank;
+    let rank = spectrum.rank;
     let rows = design.nrows();
     let weight_motion = if pirls.solve_c_nontrivial && step_radius > 0.0 {
-        let rank = DenseSpectralOperator::identified_rank(&eigenvalues, penalty_rank);
         let mut order: Vec<usize> = (0..eigenvalues.len()).collect();
         order.sort_by(|&left, &right| eigenvalues[right].total_cmp(&eigenvalues[left]));
         let beta: &Array1<f64> = pirls.beta_transformed.as_ref();
@@ -757,7 +777,7 @@ pub(crate) fn certify_fitted_identified_rank(
         displacement.view(),
         motion,
     )?;
-    certify_identified_rank_locally_constant(eigenvalues, penalty_rank, &bounds)
+    certify_identified_rank_locally_constant(eigenvalues, rank, penalty_rank, &bounds)
         .map(|certificate| (certificate, step_radius))
 }
 
@@ -765,6 +785,20 @@ pub(crate) fn certify_fitted_identified_rank(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// The certificate at the rank the identified-subspace predicate prices.
+    fn certify_at_identified_rank(
+        eigenvalues: &[f64],
+        penalty_rank: usize,
+        bounds: &HessianSpectrumBounds,
+    ) -> Result<IdentifiedRankCertificate, EstimationError> {
+        certify_identified_rank_locally_constant(
+            eigenvalues,
+            DenseSpectralOperator::identified_rank(eigenvalues, penalty_rank),
+            penalty_rank,
+            bounds,
+        )
+    }
 
     /// A rank-2 PSD Hessian in three dimensions, rotated off the axes: the
     /// identified inverse is its Moore–Penrose pseudo-inverse, and a right-hand
@@ -837,7 +871,7 @@ mod tests {
     fn a_resolved_spectrum_certifies_its_rank_over_the_step() {
         let spectrum = [3.0, 1.0, 0.5, 0.0];
         let bounds = diagonal_bounds(&spectrum, &[(&[0.0, 1.0, 0.5, 0.0], 0.1)]);
-        let certificate = certify_identified_rank_locally_constant(&spectrum, 2, &bounds).unwrap();
+        let certificate = certify_at_identified_rank(&spectrum, 2, &bounds).unwrap();
         assert_eq!(certificate.rank, 3);
         assert_eq!(certificate.largest_unidentified, Some(0.0));
     }
@@ -849,14 +883,14 @@ mod tests {
         let band = 3.0 * f64::EPSILON;
         let spectrum = [1.0, 0.3, 0.6 * band];
         let penalty: &[f64] = &[0.0, 0.3, 0.6 * band];
-        let pointwise = certify_identified_rank_locally_constant(
+        let pointwise = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[(penalty, 0.0)]),
         )
         .unwrap();
         assert_eq!(pointwise.rank, 2);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[(penalty, 1.0)]),
@@ -871,6 +905,32 @@ mod tests {
         );
     }
 
+    /// The certificate judges the rank it is handed, the one the criterion priced,
+    /// not the identified-subspace predicate's (#2959 D1). The predicate drops a
+    /// direction under the band, and the dropped set is certified. The same
+    /// spectrum priced at full rank, as the root prices it, keeps that direction,
+    /// and bounds judged at the assembled band cannot hold it above that band.
+    #[test]
+    fn the_certificate_judges_the_rank_the_criterion_priced_2959() {
+        let band = 3.0 * f64::EPSILON;
+        let spectrum = [1.0, 0.3, 0.6 * band];
+        let penalty: &[f64] = &[0.0, 0.3, 0.6 * band];
+        let bounds = diagonal_bounds(&spectrum, &[(penalty, 0.0)]);
+        assert_eq!(DenseSpectralOperator::identified_rank(&spectrum, 2), 2);
+        let dropped = certify_identified_rank_locally_constant(&spectrum, 2, 2, &bounds).unwrap();
+        assert_eq!(dropped.rank, 2);
+        assert_eq!(dropped.largest_unidentified, Some(0.6 * band));
+        let priced_in_full =
+            certify_identified_rank_locally_constant(&spectrum, 3, 2, &bounds).unwrap_err();
+        assert!(
+            matches!(
+                priced_in_full,
+                EstimationError::IdentifiedRankNotLocallyConstant { rank: 3, .. }
+            ),
+            "{priced_in_full}"
+        );
+    }
+
     /// A penalized direction just over the band, above the penalty-rank floor,
     /// is certified at a zero step and refused once its penalty's step can push
     /// it under the band.
@@ -879,14 +939,14 @@ mod tests {
         let band = 3.0 * f64::EPSILON;
         let spectrum = [1.0, 1.5 * band, 0.0];
         let penalty: &[f64] = &[0.0, 1.5 * band, 0.0];
-        let pointwise = certify_identified_rank_locally_constant(
+        let pointwise = certify_at_identified_rank(
             &spectrum,
             1,
             &diagonal_bounds(&spectrum, &[(penalty, 0.0)]),
         )
         .unwrap();
         assert_eq!(pointwise.rank, 2);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             1,
             &diagonal_bounds(&spectrum, &[(penalty, 1.0)]),
@@ -908,7 +968,7 @@ mod tests {
     fn a_railed_penalty_does_not_charge_the_directions_it_does_not_reach() {
         let spectrum = [1.0e15, 5.0e14, 1.0e3, 0.0];
         let bounds = diagonal_bounds(&spectrum, &[(&[1.0e15, 5.0e14, 0.0, 0.0], 0.05)]);
-        let certificate = certify_identified_rank_locally_constant(&spectrum, 2, &bounds).unwrap();
+        let certificate = certify_at_identified_rank(&spectrum, 2, &bounds).unwrap();
         assert_eq!(certificate.rank, 3);
     }
 
@@ -926,11 +986,11 @@ mod tests {
         let spectrum = [4.9713e12, 1.0e5, 132.36];
         let flat: (&[f64], f64) = (&[0.0, 4.68e3, 0.0], 5.48);
         let certificate =
-            certify_identified_rank_locally_constant(&spectrum, 1, &diagonal_bounds(&spectrum, &[flat]))
+            certify_at_identified_rank(&spectrum, 1, &diagonal_bounds(&spectrum, &[flat]))
                 .unwrap();
         assert_eq!(certificate.rank, 3);
         let reaching: (&[f64], f64) = (&[0.0, 0.0, 132.36], 14.66);
-        let refusal = certify_identified_rank_locally_constant(
+        let refusal = certify_at_identified_rank(
             &spectrum,
             2,
             &diagonal_bounds(&spectrum, &[flat, reaching]),
@@ -977,10 +1037,10 @@ mod tests {
             .unwrap()
         };
         let certificate =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&projected)).unwrap();
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(&projected)).unwrap();
         assert_eq!(certificate.rank, 2);
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&leaking)).unwrap_err();
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(&leaking)).unwrap_err();
         assert!(
             matches!(
                 refusal,
@@ -1009,7 +1069,7 @@ mod tests {
             )
             .unwrap()
         };
-        let matching = certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(&[0.0, 0.2]))
+        let matching = certify_at_identified_rank(&spectrum, 1, &bounds_for(&[0.0, 0.2]))
             .unwrap();
         assert_eq!(matching.rank, 2);
         let charged = bounds_for(&[0.0, 0.6]);
@@ -1025,7 +1085,7 @@ mod tests {
             );
         }
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &charged).unwrap_err();
+            certify_at_identified_rank(&spectrum, 1, &charged).unwrap_err();
         assert!(
             matches!(
                 refusal,
@@ -1247,13 +1307,13 @@ mod tests {
             )
             .unwrap()
         };
-        let still = certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(array![0.0, 0.0]))
+        let still = certify_at_identified_rank(&spectrum, 1, &bounds_for(array![0.0, 0.0]))
             .unwrap();
         assert_eq!(still.rank, 2);
         let displaced = [1.0, -0.4 - 0.1 + 0.5];
         assert_eq!(DenseSpectralOperator::identified_rank(&displaced, 1), 1);
         let refusal =
-            certify_identified_rank_locally_constant(&spectrum, 1, &bounds_for(array![0.0, 0.1]))
+            certify_at_identified_rank(&spectrum, 1, &bounds_for(array![0.0, 0.1]))
                 .unwrap_err();
         assert!(
             matches!(

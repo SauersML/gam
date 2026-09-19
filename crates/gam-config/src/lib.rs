@@ -202,6 +202,7 @@ pub(crate) fn resolve_fit_request_config(
         fit_config.slope_time_degree = value;
     }
     fit_config.z_column = json_config.z_column;
+    fit_config.residual_columns = json_config.residual_columns.unwrap_or_default();
     fit_config.frozen_score = json_config.frozen_score.unwrap_or(false);
     fit_config.latent_measure = json_config.latent_measure;
     fit_config.declared_latent_law = json_config.declared_latent_law.map(|law| {
@@ -422,6 +423,25 @@ mod tests {
             error.to_string().contains("unknown field `outer_max_iter`"),
             "{error}"
         );
+    }
+
+    /// Solver tolerances are derived from the problem (gam SPEC 18-23), so the wire
+    /// document has no key for one: `outer_tol` and `inner_tol` are refused by
+    /// name, like `outer_max_iter` above.
+    #[test]
+    fn solver_tolerances_are_refused_by_the_wire_document() {
+        for key in ["outer_tol", "inner_tol"] {
+            let config = Value::Object(serde_json::Map::from_iter([(
+                key.to_string(),
+                json!(1e-8),
+            )]));
+            let error = serde_json::from_value::<FitRequestConfigDocument>(config)
+                .expect_err("the wire document has no tolerance key");
+            assert!(
+                error.to_string().contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
+        }
     }
 
     /// #2633: the conformal-precompute switch must reach `FitConfig` through the

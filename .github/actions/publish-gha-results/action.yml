@@ -93,6 +93,38 @@ runs:
           exit 0
         fi
 
+        # WHICH steps failed before this one. `job.status` says only that the job
+        # failed, and "publish job: failure" read as though publishing had failed.
+        # Run 35301501610 published fine, and the failures were its steps 8 and
+        # 9. The jobs API lists this job's steps while it runs: the job is the
+        # in-progress one on this runner. A step that finished moments ago may not
+        # be reported yet, and the lookup can be refused (no `actions: read`), so
+        # an empty answer is labelled as unreported, never as "none failed".
+        failed_steps=""
+        if [ "${JOB_STATUS:-}" = failure ]; then
+          failed_steps=$(curl -fsS \
+            -H "Authorization: Bearer ${GH_TOKEN_PUBLISH}" -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY:-}/actions/runs/${GITHUB_RUN_ID:-}/attempts/${GITHUB_RUN_ATTEMPT:-1}/jobs?per_page=100" 2>/dev/null \
+            | jq -r --arg runner "${RUNNER_NAME:-}" \
+                '.jobs[] | select(.runner_name == $runner and .status == "in_progress") | .steps[] | select(.conclusion == "failure") | "\(.number)\t\(.name)"' 2>/dev/null) \
+            || failed_steps=""
+        fi
+        if [ -n "$failed_steps" ]; then
+          failed_numbers=$(printf '%s\n' "$failed_steps" | cut -f1 | paste -sd, - | sed 's/,/, /g')
+          status_label="job status: ${JOB_STATUS} at step(s) ${failed_numbers}"
+          # Joined without rewriting the names, which may hold `;` themselves. Run
+          # 35327329208's body read "streaming;  full" when the `;` join was
+          # respaced.
+          failed_detail=$(printf '%s\n' "$failed_steps" | awk -F'\t' 'NR > 1 { printf " | " } { printf "step %s: %s", $1, $2 }')
+        elif [ "${JOB_STATUS:-}" = failure ]; then
+          status_label="job status: failure, failing step not reported by the jobs API"
+          failed_detail=""
+        else
+          status_label="job status: ${JOB_STATUS:-unknown}"
+          failed_detail=""
+        fi
+        failed_json=$(printf '%s' "$failed_detail" | sed 's/\\/\\\\/g; s/"/\\"/g')
+
         # Provenance travels WITH the numbers, and only when there are numbers:
         # this file alone can never be the reason a commit happens.
         cat > "$STAGE/_run.json" <<PROVENANCE
@@ -100,6 +132,7 @@ runs:
           "workflow": "${GITHUB_WORKFLOW:-}",
           "publish_job_status": "${JOB_STATUS:-}",
           "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
+          "publish_job_failed_steps": "${failed_json}",
           "run_id": "${GITHUB_RUN_ID:-}",
           "run_number": "${GITHUB_RUN_NUMBER:-}",
           "run_attempt": "${GITHUB_RUN_ATTEMPT:-}",
@@ -157,7 +190,17 @@ runs:
           # that run, so the run has not concluded. Rather than fabricate one,
           # the label now names what it actually measures. Same rule as #2743:
           # a status line must track the thing it names.
-          git commit --quiet -m "results(${RESULTS_NAME}): run ${GITHUB_RUN_ID:-} (publish job: ${JOB_STATUS:-unknown}; run verdict NOT measured here) [skip ci]"
+          #
+          # The label used to read "publish job: failure", which reads as a failed
+          # publish, but this commit exists only when the publish succeeded. It
+          # now says "published" and names the job's status with the failed steps
+          # the jobs API reported (run 35301501610: steps 8 and 9).
+          subject="results(${RESULTS_NAME}): run ${GITHUB_RUN_ID:-} published (${status_label}; run verdict NOT measured here) [skip ci]"
+          if [ -n "$failed_detail" ]; then
+            git commit --quiet -m "$subject" -m "Failed before publishing, per the jobs API: ${failed_detail}"
+          else
+            git commit --quiet -m "$subject"
+          fi
           git push --quiet origin HEAD:main 2>/dev/null || return 1
           return 0
         }

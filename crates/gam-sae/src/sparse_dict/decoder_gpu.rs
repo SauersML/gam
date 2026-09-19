@@ -64,8 +64,9 @@ use gam_gpu::gpu_error::{GpuError, GpuResultExt};
 /// it, so it can never change a result bit.
 const COLUMN_BLOCK_THREADS: u32 = 128;
 
-/// CUDA `gridDim.y` hard limit; rows beyond it are covered by the kernels'
-/// row-stride loops.
+/// Structural (#2469): CUDA's `gridDim.y` hard limit, `2¹⁶ − 1`, a device
+/// capacity. Rows beyond it are covered by the kernels' row-stride loops, so
+/// it bounds the launch geometry and never the rows a kernel processes.
 const MAX_GRID_Y: usize = 65_535;
 
 /// The block primitives, in one NVRTC module. All arithmetic is f64 with

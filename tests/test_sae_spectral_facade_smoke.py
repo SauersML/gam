@@ -31,6 +31,7 @@ from gamfit import (
     separation_limit,
     sparse_dict_dual_certificate,
     sparse_dictionary_fit,
+    whole_set_containment,
 )
 
 
@@ -164,6 +165,32 @@ def test_compose_contracts_smoke():
     assert len(composed.per_stage_contribution) == 3
     assert composed.total_defect == pytest.approx(sum(composed.per_stage_contribution))
     assert isinstance(composed.domain_ok, bool)
+
+
+def test_whole_set_containment_smoke():
+    chain = [
+        ("encode", 1.0, 0.01, 1.2),
+        ("transport", 1.0, 0.02, 0.9),
+        ("decode", 1.0, 0.005, 1.0),
+    ]
+    held = whole_set_containment(chain, 0.1, [0.0, 0.0, 0.0])
+    assert held.composed == compose_contracts(chain)
+    assert len(held.stages) == 3
+    # Stage 1 is entered at the initial radius; stage 2 at 0.1 * 1.2 + 0.01.
+    assert held.stages[0].required_radius == pytest.approx(0.1)
+    assert held.stages[1].required_radius == pytest.approx(0.13)
+    assert all(stage.rounding_band >= 0.0 for stage in held.stages)
+    assert held.contained
+    # Positive control: an offset that carries stage 2's entry past its domain radius.
+    far = whole_set_containment(chain, 0.1, [0.0, 0.95, 0.0])
+    assert far.stages[0].contained and not far.stages[1].contained
+    assert not far.contained
+    # An offset count that differs from the chain length is refused in Rust.
+    with pytest.raises(ValueError):
+        whole_set_containment(chain, 0.1, [0.0, 0.0])
+    # A NaN domain radius fails closed: refused in Rust, never reported as contained.
+    with pytest.raises(ValueError):
+        whole_set_containment([("encode", float("nan"), 0.01, 1.2)], 0.1, [0.0])
 
 
 def test_loop_holonomy_smoke():

@@ -21,28 +21,58 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 16;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-// FittedModelPayload has 98 serialized fields in schema version 15. These pin
-// fixtures leave `group_metadata=None` and `deployment_extensions=[]`; those are
-// the only two fields guarded by `skip_serializing_if`, so their JSON payloads
-// contain exactly 96 keys. Version 12 adds the required fitted-estimator tag so
-// an expectile target cannot be decoded as a Gaussian observation law.
-// Any payload-field or skip-rule change requires a fresh enumeration before
-// changing this pin.
+// Any payload-field or skip-rule change requires a fresh enumeration and a
+// stateful-sync audit before the key-count pin below changes: the count is
+// what detects a payload field the stateful sync has not been audited for.
+// Keep it a literal. A count derived from the struct would pass whenever a field
+// is added, and this failure is what forces the audit, so the literal is the
+// control.
 //
-// Re-enumerated at the tip that carries this line: `FittedModelPayload`
-// declares 98 `pub` fields, exactly two of which carry `skip_serializing_if`
-// (`group_metadata`, `deployment_extensions` -- the same two named above), and
-// the struct has no `#[serde(skip)]` and no `#[serde(flatten)]`, so the
-// declared-field count IS the serialized-key count. 98 - 2 = 96.
+// The schema version is not pinned. The assert reads `MODEL_PAYLOAD_VERSION`,
+// so a saved model must record the version this binary writes. A literal copy
+// of the constant stayed at 16 through the bumps to 17, 18 and 19 while no
+// gate ran this binary. A bump that adds no payload key changes what a field
+// means, and `inference/model.rs` documents that beside the constant.
 //
-// The previous pin of 94 was correct when the struct had 96 fields; two were
-// added since (both `#[serde(default)]` only, so both always serialize) and the
-// pin was not re-derived. Noting the arithmetic here because the count is
-// stated in three places in this comment and all three must move together --
-// which is how it drifted the first time.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 96;
+// Enumerated at schema version 22 (i2939's enumeration at 19, re-counted by
+// i2955 at 20 and by gam#2926 at 22): `FittedModelPayload` declares 104 `pub`
+// fields and has no `#[serde(skip)]` and no `#[serde(flatten)]`. Four carry
+// `skip_serializing_if`, and these fixtures leave all four at their skipped value:
+// `declared_latent_law=None`, `declared_latent_law_compression=None`,
+// `group_metadata=None` and `deployment_extensions=[]`. So the JSON payload
+// carries 104 - 4 = 100 keys. The version 12 fitted-estimator tag is one of them:
+// it keeps an expectile target from decoding as a Gaussian observation law.
+//
+// Stateful-sync audit for the fields added since the last correct pin (96 keys,
+// schema 15): `basis_adequacy`, `declared_latent_law`,
+// `declared_latent_law_compression`, `residual_repair`, `score_crossfit_folds`,
+// `score_transform`, `slope_time_basis`,
+// `survival_marginal_slope_joint_latent_law` and `unidentified_scalar_terms`,
+// plus the `logslope` -> `slope` renames (`baseline_slope(s)`,
+// `slope_formula(s)`, `resolved_slopespec(s)`). Four fields were removed:
+// `adaptive_regularization_diagnostics`, `gaussian_jackknife_plus`,
+// `survival_time_smooth_lambda` and `survivalridge_lambda`. None is a fitted
+// link state. `score_transform` nests a CTN stage's transformation-normal
+// payload (`inference/ctn.rs` `fit_chain`), a family shape with no
+// stateful-link slot. `residual_repair` carries the Bernoulli marginal-slope
+// residual block's geometry (gam#2924, `#[serde(default)]` only, so it always
+// serializes). `FittedModel::synchronize_stateful_link_metadata` mirrors every
+// `FittedLinkState` variant through an exhaustive match, so a new stateful link
+// cannot be persisted without a sync arm. Schema 17 re-reads a beta-logistic
+// `sas_state` as the standardized link, and it syncs through the `BetaLogistic`
+// arm into the same `sas_state` slot this file pins for SAS. Schema 18 adds
+// `rho_posterior` inside the fit artifacts, not a payload key. Schema 19 deletes
+// `FitInference`'s four covariance/SE copies inside the fit result (#2955).
+// Schema 20 adds `FitInference::edf_rank_bound` there (#2901). Neither is a
+// payload key or a stateful-link slot.
+// Schema 22 records the #2954 certificate's Newton polish and each railed coordinate's
+// face kind inside the fit artifacts: neither is a payload key or a stateful-link slot.
+// Schema 23 adds `latent_law_consumed`, which records the latent law a marginal-slope
+// fit consumed and its certificate (gam#2926, `#[serde(default)]` only, so it always
+// serializes); it is a fit record, not a fitted link state, so no stateful-link slot
+// changes.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 100;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -70,8 +100,8 @@ fn assert_saved_model_schema_is_pinned(saved: &Value) {
     );
     assert_eq!(
         payload.get("version").and_then(Value::as_u64),
-        Some(EXPECTED_MODEL_PAYLOAD_VERSION),
-        "saved model schema version changed; audit stateful payload fields before updating this test"
+        Some(u64::from(MODEL_PAYLOAD_VERSION)),
+        "a saved model must record the payload version this binary writes"
     );
     if let Some(fit) = payload.get("fit_result").and_then(Value::as_object) {
         for (label, materialization) in [

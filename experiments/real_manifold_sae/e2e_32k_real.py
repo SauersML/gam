@@ -153,7 +153,6 @@ def main() -> None:
             smoothness_weight=0.01,
             isometry_weight=0.0,
             learning_rate=1.0,
-            ard_per_atom=False,
         )
         man_wall = time.perf_counter() - t0
         man_r2 = float(model.reconstruction_r2)

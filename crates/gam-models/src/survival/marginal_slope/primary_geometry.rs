@@ -134,11 +134,17 @@ pub(crate) struct DenestedCellPrimaryFixedPartials {
     pub(crate) coeff_bbbu: Vec<[f64; 4]>,
 }
 
-/// Pre-computed partition cell data for a single timepoint evaluation.
-/// Built once per (a, b, β_h, β_w) and reused across the three passes
-/// (F, D, D_uv) that previously each rebuilt partition cells independently.
-pub(crate) struct CachedPartitionCells {
-    pub(crate) cells: Vec<CachedCellEntry>,
+/// Pre-computed calibration data for a single timepoint evaluation, built once
+/// per (a, b, β_h, β_w) and reused across the three passes (F, D, D_uv) that
+/// previously each rebuilt it independently: the Gaussian law's partition cells,
+/// or the nodes of the declared finite law the fit anchors on (gam#2948).
+pub(crate) enum CachedPartitionCells {
+    Gaussian(Vec<CachedCellEntry>),
+    /// The law's nodes, with the probit-frailty scale `s` the index carries.
+    Law {
+        nodes: Vec<CachedLawNode>,
+        scale: f64,
+    },
 }
 
 /// Direction-independent per-row state for the flex third-order contraction.
@@ -175,6 +181,25 @@ pub(crate) struct CachedCellEntry {
     pub(crate) partition_cell: exact_kernel::DenestedPartitionCell,
     pub(crate) state: exact_kernel::CellMomentState,
     pub(crate) fixed: DenestedCellPrimaryFixedPartials,
+}
+
+/// One node `u_k` of a declared finite law at a timepoint's solved intercept `a`
+/// and slope `b` (gam#2948). The de-nested index there is
+/// `η_k = s·(U + b·h(u_k) + w(U))` with `U = a + b·u_k`: the score warp is read at
+/// the fixed node, the link deviation at `U`, and each basis function enters
+/// linearly in its own coefficient.
+pub(crate) struct CachedLawNode {
+    pub(crate) node: f64,
+    pub(crate) weight: f64,
+    /// `h(u_k)`, zero without a score warp.
+    pub(crate) score_value: f64,
+    /// `(primary axis, H_j(u_k))` for each score-warp basis function not zero at the node.
+    pub(crate) score_basis: Vec<(usize, f64)>,
+    /// `[w, w′, w″, w‴]` at `U`, zero without a link deviation.
+    pub(crate) link_stack: [f64; 4],
+    /// `(primary axis, [W_j, W_j′, W_j″, W_j‴])` at `U` for each link basis function
+    /// not identically zero there.
+    pub(crate) link_basis: Vec<(usize, [f64; 4])>,
 }
 
 pub(crate) struct SurvivalFlexTimepointExact {

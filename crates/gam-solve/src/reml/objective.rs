@@ -989,6 +989,34 @@ impl<'a> RemlState<'a> {
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
     /// here to avoid repeating the 18-field struct literal.
+    /// The inner residual an assembly presents to the unified evaluator (#2954).
+    ///
+    /// `populate` says whether the evaluator applies the inner-KKT envelope
+    /// correction; without it the assembly presents exact KKT and the value is
+    /// the raw criterion at `β̂`. An armed certificate capture is handed the
+    /// residual either way, so the certificate's band can charge the error the
+    /// inner mode leaves in `V` where this assembly declines to correct it: the
+    /// normal-equation residual of a direct Gaussian-identity solve, or the
+    /// iterative inner Newton's own final penalized gradient.
+    fn presented_inner_kkt_residual(
+        &self,
+        residual: Option<crate::model_types::ProjectedKktResidual>,
+        populate: bool,
+    ) -> Option<crate::model_types::ProjectedKktResidual> {
+        if let Some(residual) = residual.as_ref() {
+            let source = if self.gaussian_fixed_cache_eligible() {
+                crate::estimate::outer_eval_capture::InnerResidualSource::NormalEquations
+            } else {
+                crate::estimate::outer_eval_capture::InnerResidualSource::InnerGradient
+            };
+            crate::estimate::outer_eval_capture::stash_certificate_band_residual(
+                residual.clone(),
+                source,
+            );
+        }
+        residual.filter(|_| populate)
+    }
+
     pub(crate) fn finish_assembly(
         &self,
         pirls_result: &PirlsResult,
@@ -1176,6 +1204,7 @@ impl<'a> RemlState<'a> {
             );
         }
         Ok(super::assembly::InnerAssembly {
+            cone_normalizer: None,
             // The single-eta GLM lane prices its logdet on the same operator its
             // inner solve converged against, so the mode response has nothing to
             // separate from (#2612).
@@ -1309,6 +1338,26 @@ impl<'a> RemlState<'a> {
         // c-nontrivial fits and design-moving ψ coordinates
         // (`force_spectral_logdet`, #1376) stay on the spectral path even for
         // value-only probes (#901).
+        // A spectral operator priced on the full transformed frame publishes its
+        // rank decision (#2959 D1). One priced on an active-constraint face's
+        // free basis does not: its matrix is the face's projection, whose rank
+        // the identified-rank certificate does not evaluate.
+        let publish_spectral = |operator: std::sync::Arc<DenseSpectralOperator>| {
+            if free_basis_opt.is_none() {
+                bundle.publish_criterion_rank_decision(|| super::CriterionRankDecision {
+                    predicate: if structural_rank.is_some() {
+                        super::CriterionRankPredicate::StructuralRank
+                    } else {
+                        super::CriterionRankPredicate::IdentifiedSubspace
+                    },
+                    frame: super::CriterionFrame::Transformed,
+                    penalty_rank,
+                    hessian: std::sync::Arc::clone(&bundle.h_total),
+                    operator: std::sync::Arc::clone(&operator),
+                });
+            }
+            operator
+        };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = if mode
             == super::reml_outer_engine::EvalMode::ValueOnly
             && structural_rank.is_none()
@@ -1320,7 +1369,7 @@ impl<'a> RemlState<'a> {
                 h_for_operator.as_ref(),
             ) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
-                Err(_) => std::sync::Arc::new(
+                Err(_) => publish_spectral(std::sync::Arc::new(
                     DenseSpectralOperator::from_symmetric_on_identified_subspace(
                         h_for_operator.as_ref(),
                         penalty_rank,
@@ -1330,10 +1379,10 @@ impl<'a> RemlState<'a> {
                             "DenseSpectralOperator from PIRLS Hessian: {e}"
                         ))
                     })?,
-                ),
+                )),
             }
         } else {
-            std::sync::Arc::new(
+            publish_spectral(std::sync::Arc::new(
                 if let Some(rank) = structural_rank {
                     DenseSpectralOperator::from_symmetric_with_structural_rank(
                         h_for_operator.as_ref(),
@@ -1350,7 +1399,7 @@ impl<'a> RemlState<'a> {
                         "DenseSpectralOperator from PIRLS Hessian: {e}"
                     ))
                 })?,
-            )
+            ))
         };
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
@@ -1421,7 +1470,9 @@ impl<'a> RemlState<'a> {
         // vector additionally carries a constraint-normal (Lagrange multiplier)
         // component this standard path does not strip, so present exact-KKT
         // there (unchanged behaviour) rather than a mis-projected residual.
-        let inner_kkt_residual = if populate_inner_kkt && free_basis_opt.is_none() {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented && free_basis_opt.is_none() {
             self.standard_inner_kkt_residual_transformed(
                 pirls_result,
                 bundle.firth_dense_operator.is_some(),
@@ -1437,6 +1488,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1520,7 +1573,9 @@ impl<'a> RemlState<'a> {
         // Sparse-exact assembles β and H in the original basis (see `beta =
         // sparse_exact_beta_original`), so the envelope residual is mapped to
         // that basis. Sparse-native fits are unconstrained on this path.
-        let inner_kkt_residual = if populate_inner_kkt {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
                 bundle.firth_dense_operator.is_some()
@@ -1529,6 +1584,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1787,7 +1844,28 @@ impl<'a> RemlState<'a> {
                     "using the canonical spectral Hessian operator for moving-design coordinates"
                 );
             }
-            build_spectral()?
+            let operator = build_spectral()?;
+            bundle.publish_criterion_rank_decision(|| {
+                let root_priced = bundle
+                    .root_scale_hessian_operator
+                    .get()
+                    .and_then(Option::as_ref)
+                    .is_some_and(|root| std::sync::Arc::ptr_eq(root, &operator));
+                super::CriterionRankDecision {
+                    predicate: if root_priced {
+                        super::CriterionRankPredicate::RootScale
+                    } else if structural_rank.is_some() {
+                        super::CriterionRankPredicate::StructuralRank
+                    } else {
+                        super::CriterionRankPredicate::IdentifiedSubspace
+                    },
+                    frame: super::CriterionFrame::Original,
+                    penalty_rank,
+                    hessian: std::sync::Arc::new(h_total_original.clone()),
+                    operator: std::sync::Arc::clone(&operator),
+                }
+            });
+            operator
         };
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
@@ -1880,7 +1958,9 @@ impl<'a> RemlState<'a> {
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
         // maps up cleanly via the same orthogonal `Qs`.
-        let inner_kkt_residual = if populate_inner_kkt {
+        let presented = populate_inner_kkt
+            || crate::estimate::outer_eval_capture::certificate_parts_capture_enabled();
+        let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
                 bundle.firth_dense_operator.is_some()
@@ -1889,6 +1969,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let inner_kkt_residual =
+            self.presented_inner_kkt_residual(inner_kkt_residual, populate_inner_kkt);
         self.finish_assembly(
             pirls_result,
             ctx,
@@ -1934,6 +2016,37 @@ impl<'a> RemlState<'a> {
     /// branch, where `free_basis_opt` already rotates everything into a reduced QS
     /// subspace (penalty-coord fast path uses `build_dense_assembly` there because
     /// the projected-`Z` original-basis route is unavailable in that subspace).
+    /// The evaluation bundle at `rho` and the rank decision the dense criterion
+    /// priced there (#2959 D1).
+    ///
+    /// An outer evaluation served from the outer-eval cache builds no assembly,
+    /// and a value-only probe prices a Cholesky that decides no rank, so the
+    /// decision may not be published yet. Then the criterion's own builder is run
+    /// once at a derivative order, which prices the spectral operator and
+    /// publishes the decision: the decision is always the builder's, never a
+    /// second call to its predicate. The sparse route prices a strict
+    /// factorization and publishes none.
+    pub(crate) fn criterion_rank_decision_at(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<(EvalShared, Option<std::sync::Arc<super::CriterionRankDecision>>), EstimationError>
+    {
+        let bundle = self.obtain_eval_bundle(rho)?;
+        if bundle.criterion_rank_decision().is_none()
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
+        {
+            self.build_auto_assembly(
+                rho,
+                &bundle,
+                super::reml_outer_engine::EvalMode::ValueAndGradient,
+                false,
+                false,
+            )?;
+        }
+        let decision = bundle.criterion_rank_decision();
+        Ok((bundle, decision))
+    }
+
     pub(crate) fn build_auto_assembly(
         &self,
         rho: &Array1<f64>,
@@ -2058,7 +2171,22 @@ impl<'a> RemlState<'a> {
             mode,
             prior,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|error| match error {
+            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
+            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} evaluation refused this trial point: {fold}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} evaluation refused this trial point: {refusal}"),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        })?;
         let result = self.apply_theta_correction_atom_to_result(result, &tk_atom)?;
         // Adaptive, block-local Laplace-to-sampling fallback (issue #784): where
         // a curvature direction is too non-Gaussian for the Laplace summary,
@@ -2101,6 +2229,16 @@ impl<'a> RemlState<'a> {
             );
         }
         crate::estimate::outer_eval_capture::record_rho_outer_criterion(result.cost, components);
+        crate::estimate::outer_eval_capture::record_certificate_criterion(
+            crate::estimate::outer_eval_capture::CertificateCriterion {
+                cost: result.cost,
+                fixed_beta: components[0],
+                logdet_h: components[1],
+                logdet_s: components[2],
+                kkt: components[3],
+                inner_residual_energy: result.ift_residual_energy,
+            },
+        );
         // This value/derivative tuple is the genuine REML/LAML criterion. An
         // optimizer-only diagnostic must never mutate it: a former hard-gated
         // ALO augmentation introduced a finite objective jump when leverage
@@ -2150,7 +2288,26 @@ impl<'a> RemlState<'a> {
             eval_mode,
             prior,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|error| match error {
+            // gam#2765: an inner mode at a fold refuses this trial point by its typed verdict.
+            super::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!(
+                        "the {eval_mode:?} EFS evaluation refused this trial point: {fold}"
+                    ),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!(
+                        "the {eval_mode:?} EFS evaluation refused this trial point: {refusal}"
+                    ),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::Failed(reason) => {
+                EstimationError::InvalidInput(reason)
+            }
+        })?;
         let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &tk_atom)?;
         // Fold the #784 adaptive block-local Laplace-to-sampling correction into
         // the EFS objective too, so the EFS fixed-point and the BFGS/Newton path

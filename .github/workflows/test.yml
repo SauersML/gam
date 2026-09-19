@@ -1244,6 +1244,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Compile gamfit with invalid string escapes as errors (#2975)
+        # Same check as python-contracts.yml: an invalid escape is a DeprecationWarning
+        # on 3.11 and a SyntaxWarning from 3.12, and will become a SyntaxError that
+        # breaks `import gamfit`.
+        run: python -W error::DeprecationWarning -W error::SyntaxWarning -m compileall -q -f gamfit
+
       - name: Install maturin
         run: python -m pip install --upgrade pip "maturin>=1.7,<2"
 

@@ -14,6 +14,7 @@ mod cli_bad_input_contract;
 mod criterion_absence_words_on_fit_lines_2627;
 mod fit_data_boundary;
 mod frontend_payload_parity_2470;
+mod joint_events_reload_2961;
 mod regression_bspline_nonzero_anchor_pin_2297;
 mod regression_predict_cli_surfaces_covariance_provenance;
 mod regression_predict_uncertainty_point_mean_linear_link;

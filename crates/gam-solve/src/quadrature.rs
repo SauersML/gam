@@ -175,7 +175,7 @@ use crate::estimate::EstimationError;
 use crate::mixture_link::{
     beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
 };
-use gam_math::probability::{erfcx_nonnegative, normal_logcdf};
+use gam_math::probability::erfcx_nonnegative;
 use gam_math::quadrature::{GaussHermiteRule, gauss_hermite_rule};
 use gam_math::special::stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg;
 use gam_problem::types::{
@@ -201,12 +201,6 @@ fn safe_exp(x: f64) -> f64 {
 #[inline]
 fn safe_expwith_saturation(x: f64) -> (f64, bool) {
     (safe_exp(x), x > QUADRATURE_EXP_LOG_MAX)
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Complex {
-    re: f64,
-    im: f64,
 }
 
 /// Quadrature context that owns Gauss-Hermite caches.
@@ -325,7 +319,6 @@ const LOGIT_ERFCX_SIGMA_MAX: f64 = 6.0;
 /// to drift ~4e-3 from the scalar value at (μ=3, σ=3)).
 const LOGIT_JET_GHQ_SIGMA_MAX: f64 = 1.0;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
-const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
 /// Latent SD above which the cloglog integrated jet stops trusting shifted
 /// lognormal-Laplace moment reconstruction for higher derivatives. The moments
 /// `E[u^m exp(-u)]`, `u=exp(eta)`, evaluate the survival term at
@@ -333,10 +326,6 @@ const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
 /// the small k3 contribution to cancellation. Directly integrating the stable
 /// pointwise derivatives keeps the location-family jet identity intact.
 const CLOGLOG_JET_MOMENT_SIGMA_MAX: f64 = 1.0;
-const CLOGLOG_RARE_EVENT_LOG_MAX: f64 = -18.0;
-const CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN: f64 = 8.0;
-const CLOGLOG_POSITIVE_SATURATION_EDGE: f64 = 5.0;
-const CLOGLOG_POSITIVE_SATURATION_SIGMAS: f64 = 8.0;
 // ── Log-space survival panel (#2714) ────────────────────────────────────────
 //
 // `ln S(μ,σ)`, `S(μ,σ) = E[exp(−e^η)]`, `η ~ N(μ,σ²)`, is evaluated on ONE
@@ -450,7 +439,6 @@ pub(crate) const LOG_SURVIVAL_MAX_MU_DERIVATIVE_ORDER: usize = 8;
 /// region where the tower is equally well conditioned and the rung basis was
 /// being used only because `σ < 8`.
 const LOG_SURVIVAL_TOWER_MAX_LOG_CANCELLATION: f64 = 6.1;
-const SERIES_CONSECUTIVE_SMALL_TERMS: usize = 6;
 const LOGIT_MAX_TERMS: usize = 160;
 /// Documented absolute-accuracy contract of the erfcx logistic-normal
 /// backend. The series truncation bound (see `logistic_normal_series_cutoff`)
@@ -468,42 +456,6 @@ const LOGIT_MAX_TERMS: usize = 160;
 /// N=160, correctly deferring to GHQ which is accurate to ~1e-13 in that
 /// regime after the QR eigenvector fix.
 const LOGIT_ERFCX_ACCURACY_TARGET: f64 = 1.0e-11;
-const CLOGLOG_MILES_ALPHA: f64 = 60.0;
-const CLOGLOG_MILES_MAX_TERMS: usize = 256;
-// Upper bound on the (log of the) peak Miles-series term magnitude under which
-// the alternating cancellation still leaves a usable result in f64.
-//
-// The Miles series for S(mu, sigma) has term magnitudes whose log peaks at
-// `peak_log(mu, sigma) ≈ α − (mu − ln α)² / (2 σ²)` near n = α. The final S is
-// O(1), so a peak of `exp(peak_log)` is summed with alternating signs and must
-// cancel down to ~1. f64 has ~53 bits, so after losing roughly peak_log/ln(2)
-// bits to cancellation, the residual carries `53 − peak_log/ln(2)` bits of
-// precision. Setting the cap at 0 means the peak term magnitude is bounded by
-// 1, so the alternating sum never reaches into regions where bits get spent on
-// cancellation at all. Outside this gate the caller drops down to CC / Gamma /
-// GHQ, which evaluate the same survival object on numerically stable grids and
-// do not depend on telescoping huge cancellations. The exit from "Miles
-// reliable" to "fall back" therefore happens at peak terms of size 1, so the
-// two backends already agree on the boundary at full f64 precision and the
-// integrated cloglog mean remains monotone in `mu` as the routing switches.
-const CLOGLOG_MILES_PEAK_LOG_MAX: f64 = 0.0;
-const CLOGLOG_GAMMA_K_REF: f64 = 0.5;
-const CLOGLOG_GAMMA_T_MAX_REF: f64 = 24.0;
-const CLOGLOG_GAMMA_H_REF: f64 = 0.01;
-// Default accuracy target for the real-line Clenshaw-Curtis cloglog backend.
-// This is intentionally looser than full machine epsilon so the node-count
-// heuristic stays practical in the central moderate/large-sigma regime.
-const CLOGLOG_CC_TOL: f64 = 1e-12;
-// Gamma uses a fixed composite Simpson rule on [0, T] with this many samples.
-// CC only wins if its requested node count stays comfortably below that fixed
-// complex-arithmetic workload.
-const CLOGLOG_GAMMA_SAMPLE_COUNT: usize =
-    (CLOGLOG_GAMMA_T_MAX_REF / CLOGLOG_GAMMA_H_REF) as usize + 1;
-// CC nodes are pure f64 work while Gamma nodes pay for complex log-gamma and
-// complex exponentials, so CC can still be favorable with somewhat more nodes
-// than this threshold. Keep the threshold conservative until benchmarks say
-// otherwise.
-const CLOGLOG_CC_PREFER_THRESHOLD: usize = CLOGLOG_GAMMA_SAMPLE_COUNT / 3;
 
 impl QuadratureContext {
     pub fn new() -> Self {
@@ -640,96 +592,6 @@ fn compute_clenshaw_curtis_n(n: usize) -> ClenshawCurtisRule {
     }
 
     ClenshawCurtisRule { nodes, weights }
-}
-
-/// Truncation half-width `A` and node count of the Clenshaw-Curtis rule whose
-/// tail and quadrature remainders certify the cloglog survival integral to `tol`.
-#[derive(Clone, Copy, Debug)]
-struct CloglogCcSize {
-    half_width: f64,
-    nodes: usize,
-}
-
-fn cloglog_cc_required_nodes(
-    mu: f64,
-    sigma: f64,
-    tol: f64,
-) -> Result<CloglogCcSize, EstimationError> {
-    if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0 && tol.is_finite() && tol > 0.0) {
-        crate::bail_invalid_estim!(
-            "CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
-                .to_string(),
-        );
-    }
-
-    // This is the node-count logic of the actual CC evaluator, exposed as a
-    // cheap routing estimate so we can decide whether the bounded real-line
-    // cosine grid is likely to beat the fixed-work complex Gamma backend before
-    // paying to evaluate either one.
-    //
-    // The tail slice `2Φ(-A) ≤ tol/4` fixes `A = -Φ⁻¹(tol/8)`, and `[-A, A]` is
-    // an interval only while that quantile is negative, i.e. `tol/8 < 1/2`. A
-    // tolerance outside that range is refused, not floored onto a half-width
-    // it did not ask for (#2469).
-    let a = gam_math::probability::standard_normal_quantile(tol / 8.0)
-        .map(|z| -z)
-        .map_err(|err| {
-            EstimationError::InvalidInput(format!("CC cloglog backend tail truncation: {err}"))
-        })?;
-    if !(a > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "CC cloglog backend needs tol/8 below one half for a positive truncation \
-             half-width, got tol={tol}"
-        )));
-    }
-
-    let ay = a * sigma;
-    let y = if ay > 0.0 {
-        1.0_f64.min(std::f64::consts::PI / (4.0 * ay))
-    } else {
-        1.0
-    };
-    // `ρ = y + √(1+y²)`, so `ρ - 1 = y + y²/(1 + √(1+y²))` and `ln ρ = asinh y`,
-    // both positive for every `y > 0` without forming `ρ - 1` by cancellation.
-    // A `y` that underflowed to zero leaves no ellipse and is refused.
-    let rho_minus_one = y + y * y / (1.0 + (1.0 + y * y).sqrt());
-    let log_rho = y.asinh();
-    if !(log_rho > 0.0) {
-        crate::bail_invalid_estim!("CC cloglog backend ellipse bound became degenerate");
-    }
-    let m_s = (0.5 * (a * y) * (a * y)).exp() / (2.0 * std::f64::consts::PI).sqrt();
-    let eps_quad = tol / 4.0;
-    let numer = ((8.0 * a * m_s) / (rho_minus_one * eps_quad)).max(1.0);
-
-    // The remainder bound falls as `n` grows, so the certified count is the
-    // smallest `n` with `ρ^(n-1) ≥ numer`; a bound that is not finite names no
-    // rule. Three points is the smallest odd rule `compute_clenshaw_curtis_n`
-    // builds, and it meets any request below it.
-    let requested = 1.0 + numer.ln() / log_rho;
-    if !requested.is_finite() {
-        crate::bail_invalid_estim!("CC cloglog backend node bound is not finite");
-    }
-    let mut nodes = (requested.ceil() as usize).max(3);
-    if nodes.is_multiple_of(2) {
-        nodes += 1;
-    }
-    Ok(CloglogCcSize {
-        half_width: a,
-        nodes,
-    })
-}
-
-#[inline]
-fn cloglog_should_prefer_cc(mu: f64, sigma: f64, tol: f64) -> bool {
-    // Prefer CC only when its Bernstein-ellipse node estimate stays comfortably
-    // below the fixed Simpson workload of the Gamma reference backend. That
-    // makes CC an automatic fast path for moderate central cases, while very
-    // broad or numerically awkward cases continue to use the exact
-    // Mellin-Barnes/Gamma representation.
-    match cloglog_cc_required_nodes(mu, sigma, tol) {
-        Ok(size) => size.nodes <= CLOGLOG_CC_PREFER_THRESHOLD,
-        Err(_) => false,
-    }
 }
 
 /// Fixed production rule built by the shared `O(n²)`-time, `O(n)`-space
@@ -1162,67 +1024,6 @@ fn logit_posterior_meanwith_deriv_controlled(
     }
 }
 
-#[inline]
-fn cloglog_extreme_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative> {
-    // Extreme-input ladder for the cloglog mean and its location derivative.
-    //
-    // Regimes:
-    // - mu + sigma^2 / 2 << 0: rare-event tail, where 1 - exp(-exp(eta)) ~= exp(eta)
-    // - mu - 8 sigma >> 0: survival term is numerically indistinguishable from 0
-    //
-    // The large-σ regime is intentionally NOT handled here (see the trailing
-    // comment); the thresholds otherwise leave overlap with the Taylor/Miles/
-    // Gamma branches so neighboring formulas still cover the transition band.
-    let rare_log = mu + 0.5 * sigma * sigma;
-    if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
-        let mean = safe_exp(rare_log);
-        return Some(IntegratedMeanDerivative {
-            mean,
-            dmean_dmu: mean,
-            mode: IntegratedExpectationMode::ControlledAsymptotic,
-        });
-    }
-    if mu - CLOGLOG_POSITIVE_SATURATION_SIGMAS * sigma >= CLOGLOG_POSITIVE_SATURATION_EDGE {
-        return Some(IntegratedMeanDerivative {
-            mean: 1.0,
-            dmean_dmu: 0.0,
-            mode: IntegratedExpectationMode::ControlledAsymptotic,
-        });
-    }
-    // The large-σ regime (σ ≥ CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN) is handled
-    // upstream in cloglog_posterior_meanwith_deriv_controlled via the accurate
-    // log-space Gumbel survival quadrature, so this ladder no longer carries the
-    // leading-order "sharp transition" split (it was biased low by 2–7%, #799,
-    // and zeroed the derivative through value-space underflow, #798).
-    None
-}
-
-#[inline]
-fn cloglog_survival_extreme_asymptotic(
-    mu: f64,
-    sigma: f64,
-) -> Option<(f64, IntegratedExpectationMode)> {
-    let rare_log = mu + 0.5 * sigma * sigma;
-    if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
-        let mean = safe_exp(rare_log);
-        return Some((
-            (1.0 - mean).clamp(0.0, 1.0),
-            IntegratedExpectationMode::ControlledAsymptotic,
-        ));
-    }
-    if mu - CLOGLOG_POSITIVE_SATURATION_SIGMAS * sigma >= CLOGLOG_POSITIVE_SATURATION_EDGE {
-        // For σ < CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN this deep in the positive
-        // tail S is below ~1e-300, so the value path's hard zero is exact to
-        // f64. The genuine log-magnitude (needed by the kernel derivative path)
-        // is recovered separately by cloglog_log_survival_term_controlled.
-        return Some((0.0, IntegratedExpectationMode::ControlledAsymptotic));
-    }
-    // σ ≥ CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN is handled by the caller via the
-    // accurate log-space Gumbel quadrature (replaces the biased step-model
-    // split, #799).
-    None
-}
-
 /// One Laplace-localized Clenshaw–Curtis panel for the log-space survival
 /// integrals at a given `(μ, σ)` and μ-derivative order.
 ///
@@ -1322,34 +1123,42 @@ fn log_survival_peak_z(mu: f64, sigma: f64) -> f64 {
     let residual = |z: f64| log_sigma + mu + sigma * z - (-z).ln();
     let mut hi = -f64::MIN_POSITIVE;
     let mut lo = -1.0;
-    let mut widen = 0;
-    while residual(lo) > 0.0 && widen < 4096 {
+    // Doubling a finite `lo` leaves the exponent range within its 1024 binades,
+    // so the finiteness check ends this search (#2469).
+    while residual(lo) > 0.0 {
         lo *= 2.0;
-        widen += 1;
         if !lo.is_finite() {
             return f64::MIN;
         }
     }
-    let mut z = if lo > -1.0e6 { 0.5 * (lo + hi) } else { lo };
-    for _ in 0..200 {
+    // Safeguarded Newton on the bracket. A Newton step is taken only when it lands
+    // strictly inside the bracket and the bracket halved on the previous update;
+    // otherwise the step bisects. So the bracket halves at least every second
+    // step, and the loop ends at the bracket's own resolution: no double lies
+    // strictly inside it, or the step no longer moves `z` (#2469).
+    let mut z = 0.5 * (lo + hi);
+    let mut width = hi - lo;
+    loop {
         let r = residual(z);
         if r > 0.0 {
             hi = z;
         } else {
             lo = z;
         }
-        // d/dz [ln σ + μ + σz − ln(−z)] = σ + 1/(−z) > 0.
-        let slope = sigma + 1.0 / (-z);
-        let mut next = z - r / slope;
-        if !(next > lo && next < hi) {
-            next = 0.5 * (lo + hi);
+        let midpoint = 0.5 * (lo + hi);
+        if !(midpoint > lo && midpoint < hi) {
+            return z;
         }
-        if (next - z).abs() <= f64::EPSILON * (1.0 + z.abs()) {
+        let halved = hi - lo <= 0.5 * width;
+        width = hi - lo;
+        // d/dz [ln σ + μ + σz − ln(−z)] = σ + 1/(−z) > 0.
+        let newton = z - r / (sigma + 1.0 / (-z));
+        let next = if halved && newton > lo && newton < hi { newton } else { midpoint };
+        if next == z {
             return next;
         }
         z = next;
     }
-    z
 }
 
 /// Maximizer of the complement branch's log-integrand: the unique root of
@@ -1365,15 +1174,17 @@ fn log_complement_peak_z(mu: f64, sigma: f64) -> f64 {
     if branch.log_integrand_slope(mu, sigma, hi) > 0.0 {
         return hi;
     }
-    for _ in 0..200 {
+    // Bisect until no double lies strictly inside the bracket, so the peak is
+    // located to the last bit at any scale of `σ` (#2469).
+    loop {
         let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
         if branch.log_integrand_slope(mu, sigma, mid) > 0.0 {
             lo = mid;
         } else {
             hi = mid;
-        }
-        if hi - lo <= f64::EPSILON * (1.0 + hi.abs()) {
-            break;
         }
     }
     0.5 * (lo + hi)
@@ -1398,12 +1209,12 @@ fn log_survival_panel_edge(
     let mut step = 1.0_f64;
     let mut inner = z_peak;
     let mut outer = z_peak + direction * step;
-    let mut widen = 0;
-    while !fallen(outer) && widen < 4096 {
+    // Doubling a finite step leaves the exponent range within its 1024 binades,
+    // so the finiteness check ends this search (#2469).
+    while !fallen(outer) {
         inner = outer;
         step *= 2.0;
         outer = z_peak + direction * step;
-        widen += 1;
         if !outer.is_finite() {
             return inner;
         }
@@ -1413,15 +1224,16 @@ fn log_survival_panel_edge(
     } else {
         (outer, inner)
     };
-    for _ in 0..200 {
+    // Bisect until no double lies strictly inside the bracket (#2469).
+    loop {
         let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
         if fallen(mid) == (direction > 0.0) {
             hi = mid;
         } else {
             lo = mid;
-        }
-        if hi - lo <= f64::EPSILON * (1.0 + mid.abs()) {
-            break;
         }
     }
     if direction > 0.0 { hi } else { lo }
@@ -1939,110 +1751,6 @@ fn cloglog_negative_tail_mean(eta: f64) -> f64 {
 // solely for its unit test) lives inside `mod tests` below.
 
 #[inline]
-fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
-    // Small-variance heat-kernel expansion for the cloglog inverse link.
-    //
-    // For η = μ + σ Z, Z ~ N(0,1), and any analytic f the heat-kernel
-    // (even-moment) identity gives
-    //
-    //   E[f(η)] = Σ_{k≥0} σ^(2k) / (2^k · k!) · f^(2k)(μ).
-    //
-    // Here f(x) = 1 − exp(−exp(x)) is entire, so the series is valid
-    // globally. Truncating at the σ⁶ term yields
-    //
-    //   E[f(η)]       ≈ f + (σ²/2) f'' + (σ⁴/8) f^(4) + (σ⁶/48) f^(6)
-    //   d/dμ E[f(η)]  ≈ f' + (σ²/2) f''' + (σ⁴/8) f^(5) + (σ⁶/48) f^(7).
-    //
-    // Coefficients are heat-kernel weights 1/(2^k k!), not Taylor 1/(2k)!:
-    // 1/(2²·2!) = 1/8 (not 1/4! = 1/24), 1/(2³·3!) = 1/48 (not 1/6! = 1/720).
-    //
-    // A single formula covers the entire real line once the constituent
-    // evaluations are written stably:
-    //   • f0 uses -expm1(-ex) to stay bit-exact for μ ≪ 0 (where ex ≈ 0)
-    //   • surv = exp(-ex) underflows cleanly to 0 for μ ≫ 0, yielding
-    //     the saturation limit f ≡ 1, f' ≡ 0 without any branch.
-    // No separate "negative-tail" MGF approximation is needed; the Taylor
-    // truncation error is uniformly O(σ⁶ · ex) across the whole domain.
-    if sigma <= CLOGLOG_SIGMA_DEGENERATE {
-        return IntegratedMeanDerivative {
-            mean: cloglog_mean_exact(mu),
-            dmean_dmu: cloglog_mean_d1_exact(mu),
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        };
-    }
-
-    let ex = safe_exp(mu);
-    if !ex.is_finite() {
-        // Non-finite μ in the positive direction saturates f to 1 and f' to 0.
-        return IntegratedMeanDerivative {
-            mean: 1.0,
-            dmean_dmu: 0.0,
-            mode: IntegratedExpectationMode::ControlledAsymptotic,
-        };
-    }
-    let surv = (-ex).exp();
-    if surv == 0.0 {
-        // exp(-ex) underflow: positive-μ saturation, same limit.
-        return IntegratedMeanDerivative {
-            mean: 1.0,
-            dmean_dmu: 0.0,
-            mode: IntegratedExpectationMode::ControlledAsymptotic,
-        };
-    }
-
-    let s2 = sigma * sigma;
-    let s4 = s2 * s2;
-    let s6 = s4 * s2;
-    let s8 = s4 * s4;
-    let e2x = ex * ex;
-    let e3x = e2x * ex;
-    let e4x = e3x * ex;
-    let e5x = e4x * ex;
-    let e6x = e5x * ex;
-    let e7x = e6x * ex;
-    let e8x = e7x * ex;
-    let e9x = e8x * ex;
-    // -expm1(-ex) = 1 - exp(-ex) is bit-exact even when ex is subnormal.
-    //
-    // Derivatives of f(x) = 1 - exp(-exp(x)) follow the Stirling-second-kind
-    // pattern: f^(n)(x) = exp(-exp(x)) * sum_{k=1..n} (-1)^(k+1) S(n,k) u^k,
-    // where u = exp(x) and S(n,k) are Stirling numbers of the second kind:
-    //   S(2,.) = {1, 1}
-    //   S(3,.) = {1, 3, 1}
-    //   S(4,.) = {1, 7, 6, 1}
-    //   S(5,.) = {1, 15, 25, 10, 1}
-    //   S(6,.) = {1, 31, 90, 65, 15, 1}
-    //   S(7,.) = {1, 63, 301, 350, 140, 21, 1}
-    //   S(8,.) = {1, 127, 966, 1701, 1050, 266, 28, 1}
-    //   S(9,.) = {1, 255, 3025, 7770, 6951, 2646, 462, 36, 1}
-    let f0 = -(-ex).exp_m1();
-    let f1 = ex * surv;
-    let f2 = surv * (ex - e2x);
-    let f3 = surv * (ex - 3.0 * e2x + e3x);
-    let f4 = surv * (ex - 7.0 * e2x + 6.0 * e3x - e4x);
-    let f5 = surv * (ex - 15.0 * e2x + 25.0 * e3x - 10.0 * e4x + e5x);
-    let f6 = surv * (ex - 31.0 * e2x + 90.0 * e3x - 65.0 * e4x + 15.0 * e5x - e6x);
-    let f7 = surv * (ex - 63.0 * e2x + 301.0 * e3x - 350.0 * e4x + 140.0 * e5x - 21.0 * e6x + e7x);
-    let f8 = surv
-        * (ex - 127.0 * e2x + 966.0 * e3x - 1701.0 * e4x + 1050.0 * e5x - 266.0 * e6x + 28.0 * e7x
-            - e8x);
-    let f9 = surv
-        * (ex - 255.0 * e2x + 3025.0 * e3x - 7770.0 * e4x + 6951.0 * e5x - 2646.0 * e6x
-            + 462.0 * e7x
-            - 36.0 * e8x
-            + e9x);
-    // Heat-kernel coefficients 1/(2^k k!): k=1: 1/2, k=2: 1/8, k=3: 1/48,
-    // k=4: 1/384. Truncation after sigma^8 leaves O(sigma^10) remainder,
-    // comfortably below 1e-12 rel at sigma = 0.1 even in the negative tail.
-    IntegratedMeanDerivative {
-        mean: f0 + 0.5 * s2 * f2 + (s4 / 8.0) * f4 + (s6 / 48.0) * f6 + (s8 / 384.0) * f8,
-        dmean_dmu: (f1 + 0.5 * s2 * f3 + (s4 / 8.0) * f5 + (s6 / 48.0) * f7 + (s8 / 384.0) * f9)
-            .max(0.0),
-        mode: IntegratedExpectationMode::ControlledAsymptotic,
-    }
-}
-
-#[inline]
 /// Panelized adaptive-Simpson refinement with Richardson extrapolation on a
 /// single panel `[a, b]`. `whole` is the one-panel Simpson estimate; the panel
 /// is bisected until the two-panel estimate agrees to `tol` (or `depth` is
@@ -2117,124 +1825,33 @@ fn integrate_normal_adaptive(mu: f64, sigma: f64, f: impl Fn(f64) -> f64) -> f64
     total
 }
 
-fn cloglog_posterior_meanwith_deriv_quadrature(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
-    if sigma <= 0.0 {
-        return IntegratedMeanDerivative {
-            mean: cloglog_mean_exact(mu),
-            dmean_dmu: cloglog_mean_d1_exact(mu),
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        };
-    }
-    let mean = cloglog_mean_from_survival(survival_posterior_mean_quadrature(mu, sigma));
-    let dmean_dmu = integrate_normal_adaptive(mu, sigma, cloglog_mean_d1_exact).max(0.0);
-    IntegratedMeanDerivative {
-        mean,
-        dmean_dmu,
-        mode: IntegratedExpectationMode::QuadratureFallback,
-    }
-}
-
-#[inline]
-fn survival_posterior_mean_quadrature(eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_adaptive(eta, se_eta, gumbel_survival).clamp(0.0, 1.0)
-}
-
 fn cloglog_survival_term_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> (f64, IntegratedExpectationMode) {
-    // Shared scalar evaluator for the lognormal-Laplace object
+    // The lognormal-Laplace object
     //
     //   S(mu, sigma) = E[exp(-exp(eta))],  eta ~ N(mu, sigma^2),
     //
-    // This is the survival transform itself, and it is also the complement-core
-    // of the cloglog inverse link:
+    // is the survival transform itself and the complement-core of the cloglog
+    // inverse link (cloglog mean = 1 - S, survival mean = S). If X = exp(eta),
+    // then X ~ LogNormal(mu, sigma^2) and S = E[exp(-X)] = L(1; mu, sigma), with
+    // L(z; mu, sigma) = E[exp(-z exp(eta))] in general.
     //
-    //   cloglog mean   = 1 - S(mu, sigma)
-    //   survival mean  = S(mu, sigma).
-    //
-    // The exact mathematical object behind this is the Laplace transform of a
-    // lognormal random variable. If X = exp(eta), then X ~ LogNormal(mu,sigma^2)
-    // and
-    //
-    //   S(mu, sigma) = E[exp(-X)] = L(1; mu, sigma),
-    //
-    // where more generally
-    //
-    //   L(z; mu, sigma) = E[exp(-z exp(eta))],  z > 0.
-    //
-    // So every path below is just a different exact or controlled evaluator for
-    // the same scalar target.
-    //
-    // Routing here mirrors the production ladder used by the integrated
-    // cloglog derivative path:
-    // - plug-in when sigma is effectively zero
-    // - Taylor / heat-kernel at small sigma
-    // - explicit extreme-input asymptotics
-    // - Miles erfc-series in tail-dominated regimes
-    // - Clenshaw-Curtis on the truncated real integral in the central regime
-    // - exact Gamma/Mellin-Barnes if CC would need too many nodes or misbehaves
-    // - GHQ only as the final numerical fallback
-    //
-    // Validation target for the extended asymptotic routes: compare against
-    // 256-point GHQ on representative difficult points such as
-    // (-20, 0.1), (-5, 5), (0, 20), (10, 0.5), (10, 10), and (-0.5, 100).
+    // Its value is the exponential of the one log-space survival surface of the
+    // #2714 panel at every sigma > 0; the only other branch is the exact sigma = 0
+    // point mass. S is consumed here as a probability, so exponentiating ln S
+    // loses nothing; a consumer that needs its magnitude below the f64 floor reads
+    // `cloglog_log_survival_term_controlled` instead.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         return (
             gumbel_survival(mu).clamp(0.0, 1.0),
             IntegratedExpectationMode::ExactClosedForm,
         );
     }
-    if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
-        let mean = cloglog_small_sigma_taylor(mu, sigma).mean;
-        return (
-            (1.0 - mean).clamp(0.0, 1.0),
-            IntegratedExpectationMode::ControlledAsymptotic,
-        );
-    }
-    if let Some(out) = cloglog_survival_extreme_asymptotic(mu, sigma) {
-        return out;
-    }
-    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
-        // Accurate large-σ survival from the log-space survival panel,
-        // replacing the leading-order "sharp transition" split that was biased
-        // low by 2–7% across σ ∈ [8, 20] (#799). Exponentiating ln S here loses
-        // nothing on the value path (S is consumed as a probability); the
-        // log-magnitude that the kernel derivative path needs is taken straight
-        // from cloglog_log_survival_term_controlled, which reads the same panel.
-        let log_s = log_survival_jet(ctx, mu, sigma, 0).log_survival;
-        return (
-            safe_exp(log_s).clamp(0.0, 1.0),
-            IntegratedExpectationMode::ControlledAsymptotic,
-        );
-    }
-    if cloglog_survival_miles_is_reliable(mu, sigma)
-        && let Ok(out) = cloglog_survival_miles(mu, sigma)
-    {
-        return (
-            out.clamp(0.0, 1.0),
-            IntegratedExpectationMode::ExactSpecialFunction,
-        );
-    }
-    if cloglog_should_prefer_cc(mu, sigma, CLOGLOG_CC_TOL)
-        && let Ok(out) = cloglog_survival_cc(ctx, mu, sigma, CLOGLOG_CC_TOL)
-    {
-        return (
-            out.clamp(0.0, 1.0),
-            IntegratedExpectationMode::ExactSpecialFunction,
-        );
-    }
-    if let Ok(out) = cloglog_survival_gamma_reference(mu, sigma) {
-        return (
-            out.clamp(0.0, 1.0),
-            IntegratedExpectationMode::ExactSpecialFunction,
-        );
-    }
-    (
-        survival_posterior_mean_quadrature(mu, sigma),
-        IntegratedExpectationMode::QuadratureFallback,
-    )
+    let jet = log_survival_jet(ctx, mu, sigma, 0);
+    (safe_exp(jet.log_survival).clamp(0.0, 1.0), jet.mode)
 }
 
 #[inline]
@@ -2320,87 +1937,6 @@ fn cloglog_survivalsecond_moment_controlled(
 }
 
 #[inline]
-fn cloglog_survival_pair_controlled(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> (
-    (f64, IntegratedExpectationMode),
-    (f64, IntegratedExpectationMode),
-) {
-    let shiftedmu = mu + sigma * sigma;
-
-    // For the exact/control branches it is numerically cleaner if the mean
-    // path S(mu, sigma) and the derivative path S(mu + sigma^2, sigma) are
-    // evaluated on the same backend whenever possible. That keeps
-    //
-    //   mean       = 1 - S(mu, sigma)
-    //   dmean/dmu  = exp(mu + sigma^2/2) * S(mu + sigma^2, sigma)
-    //
-    // on one approximation surface instead of mixing, for example, CC for the
-    // base term with Gamma for the shifted term. If a paired attempt fails, we
-    // fall back to the usual independent routing.
-    if cloglog_survival_miles_is_reliable(mu, sigma)
-        && cloglog_survival_miles_is_reliable(shiftedmu, sigma)
-        && let (Ok(base), Ok(shifted)) = (
-            cloglog_survival_miles(mu, sigma),
-            cloglog_survival_miles(shiftedmu, sigma),
-        )
-    {
-        return (
-            (
-                base.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-            (
-                shifted.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-        );
-    }
-
-    if cloglog_should_prefer_cc(mu, sigma, CLOGLOG_CC_TOL)
-        && cloglog_should_prefer_cc(shiftedmu, sigma, CLOGLOG_CC_TOL)
-        && let (Ok(base), Ok(shifted)) = (
-            cloglog_survival_cc(ctx, mu, sigma, CLOGLOG_CC_TOL),
-            cloglog_survival_cc(ctx, shiftedmu, sigma, CLOGLOG_CC_TOL),
-        )
-    {
-        return (
-            (
-                base.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-            (
-                shifted.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-        );
-    }
-
-    if let (Ok(base), Ok(shifted)) = (
-        cloglog_survival_gamma_reference(mu, sigma),
-        cloglog_survival_gamma_reference(shiftedmu, sigma),
-    ) {
-        return (
-            (
-                base.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-            (
-                shifted.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            ),
-        );
-    }
-
-    (
-        cloglog_survival_term_controlled(ctx, mu, sigma),
-        cloglog_survival_term_controlled(ctx, shiftedmu, sigma),
-    )
-}
-
-#[inline]
 fn cloglog_mean_from_survival(survival: f64) -> f64 {
     let survival = survival.clamp(0.0, 1.0);
     if survival > 0.5 {
@@ -2419,36 +1955,17 @@ fn cloglog_mean_from_survival(survival: f64) -> f64 {
     }
 }
 
-#[inline]
-fn cloglog_shift_identity_derivative(mu: f64, sigma: f64, shifted_survival: f64) -> f64 {
-    // Exact Gaussian tilting identity:
-    //
-    //   d/dmu E[1 - exp(-exp(eta))]
-    //     = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma),
-    //
-    // where S is the shared survival term. The product is evaluated in the log
-    // domain because exp(mu + sigma^2/2) can overflow even though the final
-    // derivative is always bounded:
-    //
-    //   0 <= E[exp(eta - exp(eta))] <= sup_x x e^{-x} = e^{-1}.
-    //
-    // So any positive overflow is numerical, not mathematical, and can be
-    // safely capped at the exact global upper bound.
-    if !(mu.is_finite() && sigma.is_finite()) || shifted_survival <= 0.0 {
-        return 0.0;
-    }
-    cloglog_shift_identity_derivative_log(mu, sigma, shifted_survival.ln())
-}
-
-/// Log-domain form of [`cloglog_shift_identity_derivative`] that takes
-/// `ln S(mu + sigma^2, sigma)` directly.
+/// The integrated cloglog location derivative by the exact Gaussian tilting
+/// identity
 ///
-/// This is the underflow-safe path: when the shifted survival `S(mu+σ²,σ)` is
-/// below the f64 floor (large σ, #798), the value form above sees
-/// `shifted_survival == 0` and returns a spurious zero slope, whereas the
-/// genuine derivative `exp(mu + σ²/2) · S(mu+σ², σ)` is finite and O(1) because
-/// the huge prefix exactly compensates the tiny survival. Carrying the survival
-/// as a log keeps that cancellation exact.
+/// ```text
+///   d/dmu E[1 - exp(-exp(eta))] = exp(mu + sigma^2/2) * S(mu + sigma^2, sigma),
+/// ```
+///
+/// from `ln S(mu + sigma^2, sigma)`. The product is formed in log space: the
+/// shifted survival can sit below the f64 floor (large σ, #798) while the
+/// derivative is finite and O(1), because the huge prefix exactly compensates
+/// the tiny survival, and it is bounded by `sup_x x·e^{−x} = e^{−1}`.
 #[inline]
 fn cloglog_shift_identity_derivative_log(mu: f64, sigma: f64, log_shifted_survival: f64) -> f64 {
     if !(mu.is_finite() && sigma.is_finite()) || log_shifted_survival == f64::NEG_INFINITY {
@@ -2464,509 +1981,27 @@ fn cloglog_shift_identity_derivative_log(mu: f64, sigma: f64, log_shifted_surviv
     safe_exp(log_derivative).clamp(0.0, upper)
 }
 
-#[inline]
-fn log_half_erfc_stable(u: f64) -> f64 {
-    // Stable log(0.5 * erfc(u)).
-    //
-    // In the Miles series, each term contains
-    //   exp(mu n + 0.5 sigma^2 n^2) * 0.5 * erfc(u_n).
-    // For large positive u_n, erfc(u_n) underflows long before the *whole*
-    // term becomes negligible, so we switch to
-    //   erfc(u) = exp(-u^2) erfcx(u),  u > 0,
-    // and carry the -u^2 contribution in log-space. For u <= 0, erfc(u) is
-    // O(1): 0.5*erfc(u) = Phi(-u*sqrt(2)), so log(0.5*erfc(u)) is exactly
-    // normal_logcdf(-u*sqrt(2)) — reusing the full-precision (libm-erfc) primitive
-    // instead of statrs::erfc (which carried ~1e-10 relative error, #932).
-    if u > 0.0 {
-        -u * u + (0.5 * erfcx_nonnegative(u)).ln()
-    } else {
-        normal_logcdf(-u * SQRT_2)
-    }
-}
-
-/// True when the Miles erfc-gated lognormal-Laplace series can be summed in
-/// f64 without the alternating-cancellation transient destroying the result.
-///
-/// Background. The Miles representation of `S(mu, sigma) = E[exp(-exp(eta))]`
-/// is a real series
-///
-/// ```text
-///   S = Σ_{n≥0} (-1)^n / n! · exp(mu n + ½ σ² n²) · ½ erfc(u_n)
-///   u_n = (mu − ln α + σ² n) / (√2 σ).
-/// ```
-///
-/// For large positive `u_n`, `½ erfc(u_n)` decays like `exp(-u_n²) / (√(2π) u_n)`.
-/// Substituting the asymptotic and using Stirling on `ln n!`, the log of the
-/// `n`-th term magnitude reduces to
-///
-/// ```text
-///   log|t_n| ≈ n ln(α / n) + n − ½ (mu − ln α)² / σ²,
-/// ```
-///
-/// which is maximised at `n = α` with peak value
-///
-/// ```text
-///   peak_log(mu, sigma) = α − ½ (mu − ln α)² / σ².
-/// ```
-///
-/// The series telescopes down to `S ∈ [0, 1]`, so once `peak_log` exceeds
-/// `CLOGLOG_MILES_PEAK_LOG_MAX` the partial sums sweep through magnitudes
-/// `exp(peak_log)` and the residual after cancellation no longer carries enough
-/// f64 precision to be a reliable answer. The fixed `|mu|/σ ≥ 3` gate that
-/// used to guard the Miles call was a proxy for "tail-dominated", not for
-/// "series reliable" — it misses precisely the band `mu ∈ (ln α − √(2 α σ²),
-/// ln α + √(2 α σ²))` where the peak term blows up, and several values of mu in
-/// that band were already empirically returning a clamped-but-wrong S
-/// (e.g. the latent cloglog inverse link was producing μ = 0.94 instead of
-/// μ ≈ 0.07 for `mu ≈ −3.2, σ = 1`).
-///
-/// This predicate replaces the proxy with the actual reliability condition.
-/// Callers should drop to the CC / Gamma / GHQ branches when it returns false,
-/// which all evaluate the same survival object on numerically stable grids.
-#[inline]
-fn cloglog_survival_miles_is_reliable(mu: f64, sigma: f64) -> bool {
-    if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0) {
-        return false;
-    }
-    let alpha_ln = CLOGLOG_MILES_ALPHA.ln();
-    let shifted = mu - alpha_ln;
-    let peak_log = CLOGLOG_MILES_ALPHA - 0.5 * shifted * shifted / (sigma * sigma);
-    peak_log.is_finite() && peak_log <= CLOGLOG_MILES_PEAK_LOG_MAX
-}
-
-fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
-    // This routine approximates the survival term
-    //
-    //   S(mu, sigma) = E[exp(-exp(eta))],   eta ~ N(mu, sigma^2),
-    //
-    // using the Miles erfc-gated lognormal-Laplace series. Writing
-    //
-    //   X = exp(eta) ~ LogNormal(mu, sigma^2),
-    //
-    // S is the Laplace transform E[exp(-X)] evaluated at 1. Theorem-3 gives a
-    // real series of the form
-    //
-    //   S(mu, sigma)
-    //     = sum_{n>=0} (-1)^n / n!
-    //         * exp(mu n + 0.5 sigma^2 n^2)
-    //         * 0.5 * erfc(u_n)
-    //
-    //   u_n = (mu - ln(alpha) + sigma^2 n) / (sqrt(2) sigma).
-    //
-    // The erfc factor gates the lognormal moment term so that the product stays
-    // finite in the tail-dominated regime where this backend is used. We only
-    // evaluate S here; the caller forms
-    //
-    //   mean = 1 - S
-    //   dmean/dmu = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
-    //
-    // Pairwise accumulation is used because the series alternates in sign and
-    // consecutive terms partially cancel. Grouping terms before the truncation
-    // check produces a materially more stable stopping rule than looking at
-    // individual terms in isolation.
-    let alpha_ln = CLOGLOG_MILES_ALPHA.ln();
-    let mut s_sum = 0.0_f64;
-    let mut stable_pairs = 0usize;
-
-    for pair_start in (0..CLOGLOG_MILES_MAX_TERMS).step_by(2) {
-        let mut pair_s = 0.0_f64;
-        for n in pair_start..(pair_start + 2).min(CLOGLOG_MILES_MAX_TERMS) {
-            let nf = n as f64;
-            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
-            let base_log = nf * mu + 0.5 * sigma * sigma * nf * nf
-                - statrs::function::gamma::ln_gamma(nf + 1.0);
-            let u = (mu - alpha_ln + sigma * sigma * nf) / (SQRT_2 * sigma);
-            let log_half_erfc = log_half_erfc_stable(u);
-            let term_log = base_log + log_half_erfc;
-            if term_log > QUADRATURE_EXP_LOG_MAX {
-                crate::bail_invalid_estim!("Miles cloglog series term exceeded finite exp range");
-            }
-            let term = sign * safe_exp(term_log);
-            pair_s += term;
-        }
-        s_sum += pair_s;
-
-        let s_scale = s_sum.abs().max(1.0);
-        if pair_s.abs() <= 2e-15 * s_scale {
-            stable_pairs += 1;
-            if stable_pairs >= SERIES_CONSECUTIVE_SMALL_TERMS {
-                if s_sum.is_finite() && (-1e-10..=1.0 + 1e-10).contains(&s_sum) {
-                    return Ok(s_sum.clamp(0.0, 1.0));
-                }
-                break;
-            }
-        } else {
-            stable_pairs = 0;
-        }
-    }
-
-    Err(EstimationError::InvalidInput(
-        "Miles cloglog series did not converge safely".to_string(),
-    ))
-}
-
-fn cloglog_survival_cc(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-    tol: f64,
-) -> Result<f64, EstimationError> {
-    if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0 && tol.is_finite() && tol > 0.0) {
-        crate::bail_invalid_estim!(
-            "CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
-                .to_string(),
-        );
-    }
-
-    // Real-line representation of the shared survival term
-    //
-    //   S(mu, sigma)
-    //     = 1/sqrt(2pi) ∫ exp(-t^2/2 - exp(mu + sigma t)) dt.
-    //
-    // This comes directly from eta = mu + sigma Z with Z ~ N(0,1):
-    //
-    //   S(mu, sigma)
-    //     = E[exp(-exp(eta))]
-    //     = 1/sqrt(2pi) ∫ exp(-t^2/2) exp(-exp(mu + sigma t)) dt.
-    //
-    // We truncate to [-A, A] using the Gaussian tail bound
-    //
-    //   ∫_{|t| > A} phi(t) exp(-exp(mu + sigma t)) dt <= 2 Phi(-A),
-    //
-    // then apply Clenshaw-Curtis on [-A, A] after the affine map t = A x.
-    //
-    // In other words, we first turn the infinite Gaussian expectation into a
-    // finite interval problem, and then use a Chebyshev/cosine-grid quadrature
-    // rule on that bounded interval. The mapped nodes x_j = cos(j pi / (n - 1))
-    // become t_j = A x_j, which concentrates points near ±A where the cosine
-    // grid is densest.
-    //
-    // The node count comes from the same Bernstein-ellipse style bound used in
-    // the math notes: we pick a conservative ellipse height y so the mapped
-    // integrand stays analytic in a strip where the double exponential term
-    // does not blow up, convert that to rho, and request enough cosine nodes to
-    // make the quadrature remainder smaller than the quadrature slice of `tol`.
-    //
-    // This mirrors the standard Clenshaw-Curtis error picture: after mapping to
-    // [-1, 1], analyticity in a Bernstein ellipse controls how fast the
-    // Chebyshev coefficients decay, which in turn controls how many cosine-grid
-    // nodes are needed.
-    //
-    // So this backend is still computing the exact same scalar object as the
-    // Gamma/Mellin-Barnes path below; it just works on the real integral rather
-    // than the Bromwich contour representation.
-    let size = cloglog_cc_required_nodes(mu, sigma, tol)?;
-    // CC is evaluated only where the router prefers it: the preference
-    // threshold is the one size gate, so no second, larger cap exists to
-    // disagree with it (#2469).
-    if size.nodes > CLOGLOG_CC_PREFER_THRESHOLD {
-        crate::bail_invalid_estim!("CC cloglog backend requires too many nodes");
-    }
-    let a = size.half_width;
-
-    let rule = ctx.clenshaw_curtis_n(size.nodes);
-    let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
-    let mut sum = 0.0_f64;
-    let mut c = 0.0_f64;
-    for (&x, &w) in rule.nodes.iter().zip(rule.weights.iter()) {
-        let t = a * x;
-        let u = mu + sigma * t;
-        let e = safe_exp(u);
-        let w0 = (-0.5 * t * t).exp() * inv_sqrt_2pi;
-        let yk = w * w0 * (-e).exp() - c;
-        let tk = sum + yk;
-        c = (tk - sum) - yk;
-        sum = tk;
-    }
-
-    let survival = (a * sum).clamp(0.0, 1.0);
-    if !survival.is_finite() {
-        crate::bail_invalid_estim!("CC cloglog backend produced non-finite values");
-    }
-    Ok(survival)
-}
-
-#[inline]
-fn complex_add(a: Complex, b: Complex) -> Complex {
-    Complex {
-        re: a.re + b.re,
-        im: a.im + b.im,
-    }
-}
-
-#[inline]
-fn complex_sub(a: Complex, b: Complex) -> Complex {
-    Complex {
-        re: a.re - b.re,
-        im: a.im - b.im,
-    }
-}
-
-#[inline]
-fn complexmul(a: Complex, b: Complex) -> Complex {
-    Complex {
-        re: a.re * b.re - a.im * b.im,
-        im: a.re * b.im + a.im * b.re,
-    }
-}
-
-#[inline]
-fn complex_div(a: Complex, b: Complex) -> Complex {
-    // Division by a zero complex is the pole of the function being evaluated
-    // (the Lanczos sum's `z + i` vanishes only at a pole of Γ); the quotient is
-    // returned as the arithmetic gives it, not floored to a finite value.
-    let den = b.re * b.re + b.im * b.im;
-    Complex {
-        re: (a.re * b.re + a.im * b.im) / den,
-        im: (a.im * b.re - a.re * b.im) / den,
-    }
-}
-
-#[inline]
-fn complex_abs(z: Complex) -> f64 {
-    z.re.hypot(z.im)
-}
-
-#[inline]
-fn complex_ln(z: Complex) -> Complex {
-    Complex {
-        re: complex_abs(z).ln(),
-        im: z.im.atan2(z.re),
-    }
-}
-
-#[inline]
-fn complex_exp(z: Complex) -> Complex {
-    let e = z.re.exp();
-    Complex {
-        re: e * z.im.cos(),
-        im: e * z.im.sin(),
-    }
-}
-
-#[inline]
-fn complex_sin(z: Complex) -> Complex {
-    Complex {
-        re: z.re.sin() * z.im.cosh(),
-        im: z.re.cos() * z.im.sinh(),
-    }
-}
-
-fn complex_log_gamma_lanczos(z: Complex) -> Complex {
-    // Reference-quality complex log-gamma for the Mellin-Barnes cloglog
-    // backend. This is the key special-function primitive for evaluating the
-    // exact Bromwich integral of the lognormal Laplace transform.
-    const G: f64 = 7.0;
-    const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-
-    if z.re < 0.5 {
-        let piz = Complex {
-            re: std::f64::consts::PI * z.re,
-            im: std::f64::consts::PI * z.im,
-        };
-        let one_minusz = Complex {
-            re: 1.0 - z.re,
-            im: -z.im,
-        };
-        return complex_sub(
-            complex_sub(
-                Complex {
-                    re: std::f64::consts::PI.ln(),
-                    im: 0.0,
-                },
-                complex_ln(complex_sin(piz)),
-            ),
-            complex_log_gamma_lanczos(one_minusz),
-        );
-    }
-
-    let z1 = Complex {
-        re: z.re - 1.0,
-        im: z.im,
-    };
-    let mut x = Complex {
-        re: COEFFS[0],
-        im: 0.0,
-    };
-    for (i, c) in COEFFS.iter().enumerate().skip(1) {
-        x = complex_add(
-            x,
-            complex_div(
-                Complex { re: *c, im: 0.0 },
-                Complex {
-                    re: z1.re + i as f64,
-                    im: z1.im,
-                },
-            ),
-        );
-    }
-    let t = Complex {
-        re: z1.re + G + 0.5,
-        im: z1.im,
-    };
-    complex_add(
-        complex_add(
-            Complex {
-                re: 0.5 * (2.0 * std::f64::consts::PI).ln(),
-                im: 0.0,
-            },
-            complexmul(
-                Complex {
-                    re: z1.re + 0.5,
-                    im: z1.im,
-                },
-                complex_ln(t),
-            ),
-        ),
-        complex_sub(complex_ln(x), t),
-    )
-}
-
-// `cloglog_posterior_meanwith_deriv_gamma_reference` is a test reference
-// implementation; it lives inside `mod tests` below.
-
-fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
-    if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
-        crate::bail_invalid_estim!(
-            "Gamma cloglog reference backend requires finite mu and positive sigma"
-        );
-    }
-
-    // Exact Mellin-Barnes / Bromwich representation for the lognormal Laplace
-    // transform at lambda = 1:
-    //
-    //   S(mu, sigma)
-    //     = E[exp(-exp(eta))],   eta ~ N(mu, sigma^2)
-    //     = 1/pi ∫_0^∞ Re[
-    //         Γ(k + i t)
-    //         exp(0.5 sigma^2 (k + i t)^2 - mu (k + i t))
-    //       ] dt,
-    //
-    // with k > 0 fixed on the Bromwich line. This comes from the exact
-    // Mellin-Barnes identity
-    //
-    //   L(z; mu, sigma)
-    //     = (1 / 2πi) ∫ Γ(s) z^{-s} exp(-mu s + 0.5 sigma^2 s^2) ds,
-    //
-    // specialized to z = 1 and then rewritten on the vertical line s = k + it.
-    // This is the exact special-function representation of the same
-    // lognormal-Laplace object used by the large-sigma central cloglog path.
-    //
-    // The surrounding cloglog code only asks this routine for S itself. The
-    // final outputs are reconstructed outside via
-    //
-    //   mean       = 1 - S(mu, sigma)
-    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma),
-    //
-    // so the integral below remains a scalar survival evaluator.
-    //
-    // Numerically, the Γ(k + i t) factor decays like exp(-pi t / 2) on the
-    // vertical line, while the Gaussian factor contributes exp(-0.5 sigma^2
-    // t^2) in magnitude. That makes the tail rapidly damped, which is why a
-    // fixed composite Simpson rule on [0, T] is adequate here despite the
-    // complex oscillation.
-    let n = (CLOGLOG_GAMMA_T_MAX_REF / CLOGLOG_GAMMA_H_REF).round() as usize;
-    let n = if n.is_multiple_of(2) { n } else { n + 1 };
-    let h = CLOGLOG_GAMMA_T_MAX_REF / n as f64;
-
-    let eval = |t: f64| -> f64 {
-        let z = Complex {
-            re: CLOGLOG_GAMMA_K_REF,
-            im: t,
-        };
-        let log_gamma = complex_log_gamma_lanczos(z);
-        let z_sq = complexmul(z, z);
-        let exponent = complex_sub(
-            complex_add(
-                log_gamma,
-                Complex {
-                    re: 0.5 * sigma * sigma * z_sq.re,
-                    im: 0.5 * sigma * sigma * z_sq.im,
-                },
-            ),
-            Complex {
-                re: mu * z.re,
-                im: mu * z.im,
-            },
-        );
-        complex_exp(exponent).re
-    };
-
-    let f0 = eval(0.0);
-    let fn_ = eval(CLOGLOG_GAMMA_T_MAX_REF);
-    let mut sum_s = f0 + fn_;
-    for i in 1..n {
-        let t = i as f64 * h;
-        let fi = eval(t);
-        let w = if i % 2 == 0 { 2.0 } else { 4.0 };
-        sum_s += w * fi;
-    }
-    let sval = ((h / 3.0) * sum_s / std::f64::consts::PI).clamp(0.0, 1.0);
-    if !sval.is_finite() {
-        crate::bail_invalid_estim!("Gamma cloglog reference backend produced non-finite values");
-    }
-    Ok(sval)
-}
-
 pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> IntegratedMeanDerivative {
-    // Final production routing for integrated cloglog under Gaussian latent
-    // uncertainty.
+    // Integrated cloglog under Gaussian latent uncertainty:
     //
-    // The target quantity is always
+    //   mean(mu, sigma)  = E[1 - exp(-exp(eta))] = 1 - S(mu, sigma),
+    //   dmean/dmu        = E[exp(eta - exp(eta))]
+    //                    = exp(mu + sigma^2/2) * S(mu + sigma^2, sigma),
+    //   eta ~ N(mu, sigma^2),
     //
-    //   mean(mu, sigma)      = E[1 - exp(-exp(eta))]
-    //   dmean/dmu            = E[exp(eta - exp(eta))],
-    //   eta ~ N(mu, sigma^2).
-    //
-    // Different numerical regimes favor different exact or controlled
-    // representations of the same lognormal-Laplace object:
-    //
-    // 1. sigma ~= 0
-    //    The Gaussian collapses to a point mass, so the ordinary inverse link
-    //    and its pointwise derivative are exact.
-    //
-    // 2. small sigma
-    //    The heat-kernel / Taylor expansion is efficient and tracks the true
-    //    integrated mean and derivative to high accuracy without invoking any
-    //    special-function machinery.
-    //
-    // 3. explicit extreme-input asymptotics
-    //    Large negative mu uses the exact lognormal first moment of exp(eta),
-    //    very large positive mu saturates to 1, and very large sigma uses the
-    //    transition split at eta ~= 0.
-    //
-    // 4. tail-dominated large sigma
-    //    The Miles erfc-gated series is efficient because the erfc gate keeps
-    //    the alternating lognormal-moment series short and numerically tame.
-    //
-    // 5. central large sigma
-    //    The exact Mellin-Barnes / Gamma inversion is preferred, because the
-    //    Miles series is no longer the best-behaved production representation.
-    //
-    // 6. final escape
-    //    GHQ remains only as a numerical fallback if the chosen special-
-    //    function backend returns a non-finite or non-converged result.
-    //
-    // This layered routing is the real conclusion of the math work: not one
-    // magical universal formula, but one shared mathematical target with the
-    // best evaluator chosen for each regime.
-    // ApproxKind: NumericalApproximation — each branch carries its own
-    // backward error bound (special-function or GHQ tail), composed so the
-    // worst-case error is the max across regimes; documented at each branch.
+    // the second line by Gaussian tilting. Both read the one log-space survival
+    // surface `ln S` of the #2714 panel at every sigma > 0: the mean as
+    // `-expm1(ln S)`, the derivative with its `exp(mu + sigma^2/2)` prefix added
+    // in log space. There is no second evaluator to route to or to check against.
+    // The value-space ladder this replaces (heat-kernel Taylor, extreme-input
+    // asymptotics, Miles / Clenshaw-Curtis / Gamma series, adaptive Simpson, and
+    // a drift check between them) was wrong by 336% relative in the mean at
+    // (mu, sigma) = (-35, 5.9) and by 26% in the derivative at (8, 1) against a
+    // 50-digit reference (#2469), and its absolute drift tolerances saw neither.
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
         return IntegratedMeanDerivative {
             // cloglog_mean_exact uses expm1 to avoid 1 − 1 cancellation for
@@ -2978,76 +2013,16 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
-    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
-        // Large-σ regime: form both the mean and the location derivative from the
-        // accurate, underflow-safe log-space survival. This replaces the biased
-        // step-model split (mean too low by 2–7%, #799) and, because the
-        // derivative is exp(μ + σ²/2)·S(μ+σ², σ) carried entirely in log space,
-        // it no longer collapses to zero when S(μ+σ², σ) underflows (#798).
-        let (log_base, base_mode) = cloglog_log_survival_term_controlled(ctx, mu, sigma);
-        let (log_shift, shift_mode) =
-            cloglog_log_survival_term_controlled(ctx, mu + sigma * sigma, sigma);
-        // mean = 1 − S = −expm1(ln S), stable for S near both 0 and 1.
-        let mean = (-log_base.exp_m1()).clamp(0.0, 1.0);
-        let dmean = cloglog_shift_identity_derivative_log(mu, sigma, log_shift);
-        return IntegratedMeanDerivative {
-            mean,
-            dmean_dmu: dmean.max(0.0),
-            mode: worse_integrated_expectation_mode(base_mode, shift_mode),
-        };
-    }
-    let candidate = if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
-        cloglog_small_sigma_taylor(mu, sigma)
-    } else if let Some(out) = cloglog_extreme_asymptotic(mu, sigma) {
-        out
-    } else {
-        let ((survival, mode), (shifted_survival, shifted_mode)) =
-            cloglog_survival_pair_controlled(ctx, mu, sigma);
-        if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
-            || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
-        {
-            return cloglog_posterior_meanwith_deriv_quadrature(mu, sigma);
-        }
-        let mean = cloglog_mean_from_survival(survival);
-        let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
-        let mode = if matches!(mode, IntegratedExpectationMode::ControlledAsymptotic)
-            || matches!(
-                shifted_mode,
-                IntegratedExpectationMode::ControlledAsymptotic
-            ) {
-            IntegratedExpectationMode::ControlledAsymptotic
-        } else {
-            mode
-        };
-        IntegratedMeanDerivative {
-            mean,
-            dmean_dmu: dmean.max(0.0),
-            mode,
-        }
-    };
-    // Safety-net drift check with loose tolerances — see logit comment.
-    // Skip for large-sigma ControlledAsymptotic: the transition approximation
-    // legitimately diverges from 128-node GHQ by more than the drift tolerance
-    // at sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN, and the asymptotic is the
-    // trusted answer in that regime.
-    if matches!(
-        candidate.mode,
-        IntegratedExpectationMode::ControlledAsymptotic
-    ) && sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN
-    {
-        return candidate;
-    }
-    let ghq = cloglog_posterior_meanwith_deriv_quadrature(mu, sigma);
-    // Drift tolerances tightened on the derivative absolute floor: the
-    // Taylor truncation diverges in the positive-saturation band
-    // (e.g. mu ~ 3, sigma ~ 0.24) because f^(n) grow near the saturation
-    // transition, and a 1e-5 absolute floor hid 1e-6-scale errors there.
-    // GHQ is the trusted evaluator in that regime because f' has negligible
-    // probability outside the Gaussian 3-sigma window.
-    if integrated_mean_derivative_drift_exceeds(&candidate, &ghq, 1e-6, 1e-4, 1e-7, 1e-3) {
-        ghq
-    } else {
-        candidate
+    let (log_base, base_mode) = cloglog_log_survival_term_controlled(ctx, mu, sigma);
+    let (log_shift, shift_mode) =
+        cloglog_log_survival_term_controlled(ctx, mu + sigma * sigma, sigma);
+    // mean = 1 − S = −expm1(ln S), stable for S near both 0 and 1.
+    let mean = (-log_base.exp_m1()).clamp(0.0, 1.0);
+    let dmean = cloglog_shift_identity_derivative_log(mu, sigma, log_shift);
+    IntegratedMeanDerivative {
+        mean,
+        dmean_dmu: dmean.max(0.0),
+        mode: worse_integrated_expectation_mode(base_mode, shift_mode),
     }
 }
 
@@ -4346,6 +3321,88 @@ where
     normal_expectation_nd_adaptive_result::<2, _, _, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
 }
 
+/// Where a bivariate normal `N(mu, cov)` puts its mass when `cov` may be
+/// singular in floating point, as [`normal_expectation_2d_projected_result`]
+/// integrates it.
+///
+/// The 2-D rule runs exactly when its Cholesky factor exists without jitter:
+/// the pivots `a` and `b − (c/√a)²` of `cov = [[a, c], [c, b]]`, formed as
+/// `cholesky_static` forms them, are both positive. Any other `cov` is rank one
+/// in floating point or indefinite, and the nearest positive semidefinite
+/// covariance keeps only its major eigenpair: variance `m + r` with
+/// `m = (a + b)/2` and `r = hypot((a − b)/2, c)`, along the major eigenvector.
+/// A covariance with no positive eigenvalue is a point mass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BivariateNormalSupport {
+    /// Both Cholesky pivots are positive: the law spreads over the plane.
+    Plane,
+    /// Only the major eigenpair carries variance: `mu + t·axis` with
+    /// `t ~ N(0, variance)` and `axis` a unit vector.
+    Axis { axis: [f64; 2], variance: f64 },
+    /// No positive eigenvalue: all mass at `mu`.
+    Point,
+}
+
+impl BivariateNormalSupport {
+    /// The support of `N(·, cov)` for a finite symmetric `cov`.
+    pub fn of(cov: [[f64; 2]; 2]) -> Self {
+        let (a, b, c) = (cov[0][0], cov[1][1], cov[1][0]);
+        if a > 0.0 {
+            let below = c / a.sqrt();
+            if b - below * below > 0.0 {
+                return Self::Plane;
+            }
+        }
+        let half_difference = 0.5 * a - 0.5 * b;
+        let radius = half_difference.hypot(c);
+        let major = 0.5 * a + 0.5 * b + radius;
+        if major <= 0.0 {
+            return Self::Point;
+        }
+        // The major eigenvector is `(r + h, c)` or `(c, r − h)` with `h = (a − b)/2`;
+        // take whichever adds rather than cancels. It is nonzero here: `r + h = 0`
+        // with `h ≥ 0` forces `h = c = 0`, so `a = b = m > 0` and both pivots were
+        // positive.
+        let (u0, u1) = if half_difference >= 0.0 {
+            (radius + half_difference, c)
+        } else {
+            (c, radius - half_difference)
+        };
+        let length = u0.hypot(u1);
+        Self::Axis {
+            axis: [u0 / length, u1 / length],
+            variance: major,
+        }
+    }
+}
+
+/// `E[f(x₀, x₁)]` under `N(mu, cov)` for a finite symmetric `cov`, integrated
+/// over every direction in which `cov` carries variance: adaptive 2-D
+/// Gauss–Hermite on [`BivariateNormalSupport::Plane`], the 1-D rule along the
+/// major axis on [`BivariateNormalSupport::Axis`], and `f(mu)` on a point mass.
+pub fn normal_expectation_2d_projected_result<F, R, E>(
+    ctx: &QuadratureContext,
+    mu: [f64; 2],
+    cov: [[f64; 2]; 2],
+    f: F,
+) -> Result<R, E>
+where
+    F: Fn(f64, f64) -> Result<R, E>,
+    R: GhqValue,
+{
+    match BivariateNormalSupport::of(cov) {
+        BivariateNormalSupport::Plane => {
+            normal_expectation_nd_adaptive_result::<2, _, R, E>(ctx, mu, cov, 21, |x| f(x[0], x[1]))
+        }
+        BivariateNormalSupport::Axis { axis, variance } => {
+            normal_expectation_nd_adaptive_result::<1, _, R, E>(ctx, [0.0], [[variance]], 21, |t| {
+                f(mu[0] + axis[0] * t[0], mu[1] + axis[1] * t[0])
+            })
+        }
+        BivariateNormalSupport::Point => f(mu[0], mu[1]),
+    }
+}
+
 /// Closed-form posterior mean under probit link when eta is Gaussian:
 /// E[Phi(Z)] for Z ~ N(eta, se_eta^2) = Phi(eta / sqrt(1 + se_eta^2)).
 ///
@@ -4501,57 +3558,6 @@ mod tests {
     use approx::assert_relative_eq;
     use gam_spec::LikelihoodSpec;
 
-    /// Pins `log_half_erfc_stable` (both the `u > 0` erfcx branch and the
-    /// `u <= 0` `normal_logcdf` branch) against an external high-precision
-    /// reference (mpmath, dps=50) for `log(0.5·erfc(u))`. Guards the #932
-    /// root-cause fix: the `u <= 0` branch previously routed through
-    /// `statrs::erfc` (~1e-10 relative error); the 1e-12 tolerance here fails
-    /// on any regression to a low-accuracy complementary error function.
-    #[test]
-    fn log_half_erfc_stable_matches_high_precision_reference() {
-        let refs: &[(f64, f64)] = &[
-            (-3.0, -1.1045309498499094e-5),
-            (-1.5, -0.017092677825984745),
-            (-0.5, -0.27410803278438573),
-            (0.0, -0.69314718055994531),
-            (0.7, -1.8257336940742865),
-            (2.0, -6.0580884451765829),
-            (5.0, -27.89403672609738),
-            (12.0, -147.75386135854695),
-        ];
-        for &(u, reference) in refs {
-            let got = log_half_erfc_stable(u);
-            let rel = (got - reference).abs() / reference.abs().max(1.0e-6);
-            assert!(
-                rel < 1.0e-12,
-                "log_half_erfc_stable({u}) = {got:.17e}, reference {reference:.17e}, \
-                 rel {rel:.3e} >= 1e-12"
-            );
-        }
-    }
-
-    pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(
-        mu: f64,
-        sigma: f64,
-    ) -> Result<IntegratedMeanDerivative, EstimationError> {
-        // Reference: mean = 1 - S(mu, sigma), dmean/dmu = exp(mu + sigma^2/2) *
-        // S(mu + sigma^2, sigma).
-        let survival = cloglog_survival_gamma_reference(mu, sigma)?;
-        let shifted_survival = cloglog_survival_gamma_reference(mu + sigma * sigma, sigma)?;
-        let mean = cloglog_mean_from_survival(survival);
-        let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
-        if !(mean.is_finite() && dmean.is_finite()) {
-            crate::bail_invalid_estim!(
-                "Gamma cloglog reference backend produced non-finite values"
-            );
-        }
-        Ok(IntegratedMeanDerivative {
-            mean,
-            dmean_dmu: dmean.max(0.0),
-            mode: IntegratedExpectationMode::ExactSpecialFunction,
-        })
-    }
-
     fn even_moment_exp_neg_x2(power: usize) -> f64 {
         assert!(power.is_multiple_of(2));
         let m = power / 2;
@@ -4605,21 +3611,6 @@ mod tests {
         }
         let sum: f64 = rule.weights.iter().sum();
         assert_relative_eq!(sum, 2.0, epsilon = 1e-14, max_relative = 1e-14);
-    }
-
-    #[test]
-    fn test_cc_preference_prefers_moderate_central_case() {
-        assert!(cloglog_should_prefer_cc(-0.2, 0.8, CLOGLOG_CC_TOL));
-    }
-
-    #[test]
-    fn test_cc_preference_prefers_moderately_large_case() {
-        assert!(cloglog_should_prefer_cc(0.0, 2.0, CLOGLOG_CC_TOL));
-    }
-
-    #[test]
-    fn test_cc_preference_rejects_broad_case() {
-        assert!(!cloglog_should_prefer_cc(0.0, 5.0, CLOGLOG_CC_TOL));
     }
 
     #[test]
@@ -5091,10 +4082,11 @@ mod tests {
     }
 
     #[test]
-    fn test_cloglog_taylor_negative_tail_matches_mathematical_target() {
+    fn test_cloglog_negative_tail_matches_mathematical_target() {
+        let ctx = QuadratureContext::new();
         let mu = -40.0;
         let sigma = 0.1;
-        let out = cloglog_small_sigma_taylor(mu, sigma);
+        let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
         let (expected_mean, expected_deriv) = cloglog_reference_mean_and_derivative(mu, sigma);
 
         assert!(
@@ -5283,16 +4275,64 @@ mod tests {
         }
     }
 
+    /// `(mu, sigma, ln E[1 - exp(-exp(eta))], ln E[exp(eta - exp(eta))])` for
+    /// `eta ~ N(mu, sigma^2)`: the log of the integrated cloglog mean and of its
+    /// location derivative, from 50-digit mpmath quadrature. Each integrand is
+    /// log-concave, so the reference places 121 breakpoints at +-60 local widths
+    /// around its mode (spec-lead's truth3.py, #2469).
+    const CLOGLOG_INTEGRATED_REFERENCE: &[(f64, f64, f64, f64)] = &[
+        (8.0, 1.0, -3.989_793_784_967_362_000_2e-12, -24.416_460_656_908_228),
+        (-35.0, 5.9, -18.211_122_410_899_579, -18.339_200_225_246_829),
+        (6.0, 0.025, 0.0, -356.570_584_783_525_03),
+        (2.5, 0.24, -6.057_951_710_870_456_1e-5, -7.646_194_685_271_555_2),
+        (-60.0, 7.9, -29.704_544_253_336_292, -29.831_468_173_064_908),
+        (-45.0, 7.9, -17.835_241_966_258_719, -18.200_130_943_040_836),
+        (12.0, 0.4, 0.0, -251.599_626_124_600_76),
+        (0.0, 1.0, -0.480_872_829_174_680_3, -1.351_482_882_134_652_8),
+        (-3.0, 0.01, -3.024_743_917_485_727_3, -3.049_744_413_007_874_4),
+        (3.0, 0.26, -9.593_995_695_714_014_7e-7, -11.529_830_057_475_451),
+        (-35.0, 0.005, -34.999_987_500_000_000, -34.999_987_500_000_001),
+    ];
+
+    /// The integrated cloglog mean and its location derivative come off the one
+    /// log-survival surface at every `(mu, sigma)`, at that surface's own
+    /// accuracy: `1e-13` of the log's magnitude (floored at 1), the bar
+    /// `log_survival_matches_a_high_precision_reference_2714` holds `ln S` to. The
+    /// log is the consumed axis: the mean and derivative enter a log likelihood
+    /// and the Fisher weight `d1^2 / (mean (1 - mean))`, so each must be right
+    /// against its own magnitude, however far below 1 it sits.
+    ///
+    /// Rows the replaced value-space ladder got wrong (#2469, probe 1336291 at
+    /// 6cceb4e517): `(8, 1)` its derivative by 26%; `(-35, 5.9)` its mean by
+    /// 336%; `(6, 0.025)` its derivative by seven orders; `(12, 0.4)` its
+    /// derivative as exactly zero; `(-60, 7.9)` / `(-45, 7.9)` its tail mean and
+    /// derivative; `(2.5, 0.24)` / `(3, 0.26)` the positive-saturation band; and
+    /// `(0, 1)` at 2e-13 of the mean. `(-3, 0.01)` and `(-35, 0.005)` are rows it
+    /// had right.
     #[test]
-    fn test_cloglog_dispatch_uses_gamma_backend_for_large_sigma_central_regime() {
+    fn integrated_cloglog_reads_the_one_log_survival_surface_2469() {
         let ctx = QuadratureContext::new();
-        let out =
-            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, -0.2, 0.8)
-                .expect("cloglog integrated inverse-link moments should evaluate");
-        assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
-        assert!(out.mean.is_finite());
-        assert!(out.dmean_dmu.is_finite());
-        assert!(out.dmean_dmu >= 0.0);
+        let mut worst = 0.0_f64;
+        for &(mu, sigma, ln_mean, ln_d1) in CLOGLOG_INTEGRATED_REFERENCE {
+            let out = cloglog_posterior_meanwith_deriv_controlled(&ctx, mu, sigma);
+            assert!(
+                out.mean > 0.0 && out.dmean_dmu > 0.0,
+                "cloglog({mu}, {sigma}): mean {:e} and derivative {:e} must be positive",
+                out.mean,
+                out.dmean_dmu
+            );
+            let mean_error = (out.mean.ln() - ln_mean).abs() / ln_mean.abs().max(1.0);
+            let d1_error = (out.dmean_dmu.ln() - ln_d1).abs() / ln_d1.abs().max(1.0);
+            worst = worst.max(mean_error).max(d1_error);
+            assert!(
+                mean_error <= 1.0e-13 && d1_error <= 1.0e-13,
+                "cloglog({mu}, {sigma}): ln mean {:.17e} against {ln_mean:.17e} (error \
+                 {mean_error:.3e}), ln d1 {:.17e} against {ln_d1:.17e} (error {d1_error:.3e})",
+                out.mean.ln(),
+                out.dmean_dmu.ln()
+            );
+        }
+        assert!(worst > 0.0, "every row reproduced bit-exactly: the table tests nothing");
     }
 
     #[test]
@@ -5305,47 +4345,6 @@ mod tests {
         assert!(out.mean.is_finite());
         assert!(out.dmean_dmu.is_finite());
         assert!(out.dmean_dmu >= 0.0);
-    }
-
-    #[test]
-    fn test_cloglog_cc_matches_gamma_reference_on_central_case() {
-        let ctx = QuadratureContext::new();
-        let mu = -0.2;
-        let sigma = 0.8;
-        let cc = cloglog_survival_cc(&ctx, mu, sigma, CLOGLOG_CC_TOL).expect("cc backend");
-        let gamma = cloglog_survival_gamma_reference(mu, sigma).expect("gamma backend");
-        assert_relative_eq!(cc, gamma, epsilon = 5e-6, max_relative = 5e-6);
-    }
-
-    #[test]
-    fn test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case() {
-        let mu = -0.2;
-        let sigma = 0.8;
-        let gamma =
-            cloglog_posterior_meanwith_deriv_gamma_reference(mu, sigma).expect("gamma reference");
-        let mut rng_state = 0x9e3779b97f4a7c15u64;
-        let mut mean_mc = 0.0f64;
-        let mut deriv_mc = 0.0f64;
-        let n_samples = 300_000usize;
-        for _ in 0..n_samples {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let u1 = ((rng_state as f64) / (u64::MAX as f64)).clamp(1e-12, 1.0 - 1e-12);
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let u2 = ((rng_state as f64) / (u64::MAX as f64)).clamp(1e-12, 1.0 - 1e-12);
-            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            let eta = mu + sigma * z;
-            mean_mc += cloglog_mean_exact(eta);
-            deriv_mc += cloglog_mean_d1_exact(eta);
-        }
-        mean_mc /= n_samples as f64;
-        deriv_mc /= n_samples as f64;
-        assert_relative_eq!(gamma.mean, mean_mc, epsilon = 2e-3, max_relative = 2e-3);
-        assert_relative_eq!(
-            gamma.dmean_dmu,
-            deriv_mc,
-            epsilon = 2e-3,
-            max_relative = 2e-3
-        );
     }
 
     #[test]
@@ -6005,6 +5004,96 @@ mod tests {
         // positive semidefinite matrix has.
         assert!(cholesky_static::<2>(&[[0.0, 1.0], [1.0, 0.0]]).is_none());
     }
+
+    /// `normal_expectation_2d_projected_result` reproduces the closed-form
+    /// Gaussian moments on every support it integrates over (gam#2931).
+    ///
+    /// Under the law the rule integrates, `E[1] = 1`, `E[xₖ] = μₖ` and
+    /// `E[xₖxₗ] = μₖμₗ + Σₖₗ`, where `Σ` is the covariance itself on the plane
+    /// and its major eigenpair `variance·axis·axisᵀ` on a rank-one or indefinite
+    /// covariance. An n-point Gauss–Hermite rule integrates every polynomial of
+    /// degree ≤ 2n − 1 exactly and the adaptive rule never takes fewer than 7
+    /// points, so what is left is the rounding of the rule's own weighted sum.
+    /// Each of its `nodes` terms is formed by at most `2·D` node and weight
+    /// products, `D·(D + 1)` Cholesky or axis products and sums, one monomial
+    /// product and the weight times the value; the terms are then summed, scaled
+    /// by the rule's normalisation and compared with a closed form of at most two
+    /// rounded operations. So the bar is
+    /// `accumulation_band(nodes·(2·D + D·(D + 1) + 2) + 3, Σ w·|f|)`, with the
+    /// node count taken from the uncapped schedule (never fewer nodes than the
+    /// rule ran) and `Σ w·|f|` read off the same rule. A point mass is `f(μ)` bit
+    /// for bit.
+    #[test]
+    fn projected_bivariate_expectation_reproduces_closed_form_moments_2931() {
+        type Moments = (f64, f64, f64, f64, f64, f64);
+        let ctx = QuadratureContext::new();
+        let mu = [0.3, -1.2];
+        let monomials =
+            |x0: f64, x1: f64| -> Result<Moments, String> { Ok((1.0, x0, x1, x0 * x0, x0 * x1, x1 * x1)) };
+        let magnitudes = |x0: f64, x1: f64| -> Result<Moments, String> {
+            Ok((1.0, x0.abs(), x1.abs(), x0 * x0, (x0 * x1).abs(), x1 * x1))
+        };
+        let entries = |m: Moments| [m.0, m.1, m.2, m.3, m.4, m.5];
+        let check = |label: &str, cov: [[f64; 2]; 2], law: [[f64; 2]; 2], dims: usize, max_sd: f64| {
+            let got = entries(
+                normal_expectation_2d_projected_result(&ctx, mu, cov, &monomials).expect("moments"),
+            );
+            let absolute = entries(
+                normal_expectation_2d_projected_result(&ctx, mu, cov, &magnitudes)
+                    .expect("magnitudes"),
+            );
+            let exact = [
+                1.0,
+                mu[0],
+                mu[1],
+                mu[0] * mu[0] + law[0][0],
+                mu[0] * mu[1] + law[0][1],
+                mu[1] * mu[1] + law[1][1],
+            ];
+            let nodes = adaptive_point_count_from_sd(max_sd).pow(dims as u32);
+            let terms = nodes * (2 * dims + dims * (dims + 1) + 2) + 3;
+            for k in 0..6 {
+                let gap = (got[k] - exact[k]).abs();
+                let bar = gam_linalg::roundoff::accumulation_band(terms, absolute[k]);
+                assert!(
+                    gap <= bar,
+                    "[{label}] moment {k}: rule {:.17e}, closed form {:.17e}, gap {gap:.3e} above \
+                     the rounding bar {bar:.3e}",
+                    got[k],
+                    exact[k]
+                );
+            }
+        };
+
+        let plane = [[0.04, 0.012], [0.012, 0.09]];
+        assert_eq!(BivariateNormalSupport::of(plane), BivariateNormalSupport::Plane);
+        check("plane", plane, plane, 2, plane[1][1].sqrt());
+
+        // Exactly rank one in floating point: the second pivot 1 − (0.5/0.5)² is 0.
+        let rank_one = [[0.25, 0.5], [0.5, 1.0]];
+        let BivariateNormalSupport::Axis { variance, .. } = BivariateNormalSupport::of(rank_one) else {
+            panic!("a rank-one covariance integrates along its major axis");
+        };
+        assert_eq!(variance, 1.25);
+        check("rank-one axis", rank_one, rank_one, 1, variance.sqrt());
+
+        // Indefinite: eigenvalues ±1. The rule integrates the nearest positive
+        // semidefinite covariance, the eigenpair 1 along (1, 1)/√2.
+        let indefinite = [[0.0, 1.0], [1.0, 0.0]];
+        let BivariateNormalSupport::Axis { variance, .. } = BivariateNormalSupport::of(indefinite) else {
+            panic!("an indefinite covariance integrates along its major axis");
+        };
+        assert_eq!(variance, 1.0);
+        check("indefinite axis", indefinite, [[0.5, 0.5], [0.5, 0.5]], 1, variance.sqrt());
+
+        let point = [[0.0, 0.0], [0.0, 0.0]];
+        assert_eq!(BivariateNormalSupport::of(point), BivariateNormalSupport::Point);
+        let at_point = entries(
+            normal_expectation_2d_projected_result(&ctx, mu, point, &monomials).expect("point mass"),
+        );
+        let at_mean = entries(monomials(mu[0], mu[1]).expect("monomials at the mean"));
+        assert_eq!(at_point.map(f64::to_bits), at_mean.map(f64::to_bits));
+    }
 }
 
 #[cfg(test)]
@@ -6012,8 +5101,48 @@ mod log_survival_panel_2714_tests {
     use super::{
         LOG_SURVIVAL_MAX_MU_DERIVATIVE_ORDER, LOG_SURVIVAL_PANEL_MAX_NODES,
         LOG_SURVIVAL_PANEL_MIN_NODES, LOG_SURVIVAL_TOWER_MAX_LOG_CANCELLATION, LogSurvivalBranch,
-        QuadratureContext, log_survival_jet, log_survival_panel,
+        QuadratureContext, log_complement_peak_z, log_survival_jet, log_survival_panel,
+        log_survival_panel_edge,
     };
+
+    /// #2469: the log-survival root brackets stop at their own floating-point
+    /// resolution, not after 200 steps.
+    /// - With `σ = 1e60` the complement peak sits near `5e-60` inside `(0, 1e60]`.
+    ///   Bisection needs about 450 halvings to reach adjacent doubles. The replaced
+    ///   cap returned a point about `0.3` away, where the slope is long negative. The
+    ///   returned peak brackets the slope's sign change to one ulp.
+    /// - Each panel edge is the first double past the peak at which the drop is
+    ///   reached.
+    #[test]
+    fn log_survival_roots_stop_at_their_brackets_resolution_2469() {
+        let complement = LogSurvivalBranch::Complement;
+        let (mu, sigma) = (0.0_f64, 1.0e60_f64);
+        let peak = log_complement_peak_z(mu, sigma);
+        assert!(peak > 0.0 && peak.is_finite(), "peak {peak:e}");
+        assert!(
+            complement.log_integrand_slope(mu, sigma, peak.next_down()) > 0.0
+                && complement.log_integrand_slope(mu, sigma, peak.next_up()) <= 0.0,
+            "the slope changes sign within one ulp of {peak:e}"
+        );
+
+        for (branch, mu, sigma) in [
+            (LogSurvivalBranch::Survival, 3.2_f64, 0.15_f64),
+            (LogSurvivalBranch::Complement, -30.0, 0.05),
+            (LogSurvivalBranch::Survival, 12.0, 0.002),
+        ] {
+            let peak = match branch {
+                LogSurvivalBranch::Survival => super::log_survival_peak_z(mu, sigma),
+                LogSurvivalBranch::Complement => log_complement_peak_z(mu, sigma),
+            };
+            let peak_log = branch.log_integrand(mu, sigma, peak);
+            let drop = 40.0;
+            let fallen = |z: f64| peak_log - branch.log_integrand(mu, sigma, z) >= drop;
+            let upper = log_survival_panel_edge(branch, mu, sigma, peak, drop, 1.0);
+            let lower = log_survival_panel_edge(branch, mu, sigma, peak, drop, -1.0);
+            assert!(fallen(upper) && !fallen(upper.next_down()), "upper edge {upper:e}");
+            assert!(fallen(lower) && !fallen(lower.next_up()), "lower edge {lower:e}");
+        }
+    }
 
     /// `(mu, sigma, ln S)` — 60-digit mpmath reference for
     /// `S(mu,sigma) = E[exp(-e^eta)]`, `eta ~ N(mu, sigma^2)`.

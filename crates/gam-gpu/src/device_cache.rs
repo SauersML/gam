@@ -15,6 +15,7 @@ pub use linux::{KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch};
 #[cfg(target_os = "linux")]
 mod linux {
     use super::super::gpu_error::GpuError;
+    use crate::driver::{CudarcLibrary, require_cudarc_library};
     use crate::gpu_error::GpuResultExt;
     use cudarc::driver::{CudaContext, CudaModule};
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
@@ -58,6 +59,8 @@ mod linux {
             source: &str,
         ) -> Result<&Arc<CudaModule>, GpuError> {
             self.get_or_load(ctx, label, || {
+                // cudarc's NVRTC loader panics when libnvrtc is missing (#2972).
+                require_cudarc_library(CudarcLibrary::Nvrtc)?;
                 compile_ptx_with_opts(source, nvrtc_compile_options()?)
                     .gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))
             })
@@ -156,6 +159,8 @@ mod linux {
     /// this instead when their kernel uses double atomics, or the device path
     /// silently falls back to the CPU.
     pub fn compile_ptx_arch<S: AsRef<str>>(source: S) -> Result<cudarc::nvrtc::Ptx, GpuError> {
+        // cudarc's NVRTC loader panics when libnvrtc is missing (#2972).
+        require_cudarc_library(CudarcLibrary::Nvrtc)?;
         compile_ptx_with_opts(source.as_ref(), nvrtc_compile_options()?)
             .gpu_ctx_with(|err| std::format!("NVRTC compile failed: {err}"))
     }

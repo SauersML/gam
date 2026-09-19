@@ -2872,12 +2872,22 @@ fn duplicate_atom(
     let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
-    if parent < child_rho.log_ard.len() {
-        let inherited = child_rho.log_ard[parent].clone();
-        child_rho.log_ard.push(inherited);
-    } else {
-        child_rho.log_ard.push(Array1::<f64>::zeros(0));
-    }
+    // #2822 — the child inherits the parent's proper coordinate prior. A parent with
+    // no block, or an empty one, has no prior to inherit, and the fission refuses
+    // instead of manufacturing an atom whose coordinate posterior is improper.
+    let inherited = match child_rho.log_ard.get(parent) {
+        Some(block) if !block.is_empty() => block.clone(),
+        other => {
+            return Err(format!(
+                "duplicate_atom: parent {parent} carries {} ARD axes (rho has {} blocks for K={k} \
+                 atoms), so there is no proper coordinate prior for the child to inherit; every \
+                 coordinate atom carries a full log_ard block",
+                other.map_or(0, |block| block.len()),
+                child_rho.log_ard.len()
+            ));
+        }
+    };
+    child_rho.log_ard.push(inherited);
     // The fissioned child inherits the PARENT atom's per-atom smoothness strength
     // (#1556). As with `log_ard`, failing to grow `log_lambda_smooth` in step with
     // `k_atoms()` makes the next `assemble_arrow_schur` panic on the per-atom
@@ -4616,8 +4626,8 @@ fn race_birth_topology(
         None
     };
     // #2906 — the atlas's holonomy as a second challenger. When the readout names a circle
-    // at chart rank 1, or a cylinder at rank 2, that kind races on the quotient coordinates
-    // the non-tree holonomies dictate. Fail-open like the intrinsic
+    // at chart rank 1, or a cylinder or Möbius band at rank 2, that kind races on the quotient
+    // coordinates the atlas's holonomy dictates. Fail-open like the intrinsic
     // arm: a quotient that does not read, or does not race, leaves the other arms' verdict
     // untouched.
     let all_rows: Vec<usize> = (0..target.nrows()).collect();
@@ -5724,8 +5734,9 @@ pub(crate) fn discover_primary_atom_topologies(
                 None => None,
             };
             // #2906 — the atlas's holonomy as a third challenger. When the readout names a
-            // circle at chart rank 1, the circle races on the quotient coordinate the non-tree
-            // holonomies dictate, instead of on phases of a principal projection. It races
+            // circle at chart rank 1, or a Möbius band at rank 2, that kind races on the quotient
+            // coordinates the atlas's holonomy dictates, instead of on phases of a principal
+            // projection. It races
             // under the same REML evidence, and a named loop whose holonomy does not read is
             // returned as an error. A primary atom cannot be installed as a cylinder
             // (`sae_build_atom_plans` refuses the kind; cylinders are born), so a cylinder
@@ -5952,14 +5963,14 @@ fn developed_sheet_specs(
 }
 
 /// The atlas's holonomy quotient as a loop challenger (#2906), or `None` unless the readout
-/// names a circle at chart rank 1 or a cylinder at chart rank 2. A Möbius verdict offers none,
-/// because the band's developed centerline curls and no flat read of it is a loop coordinate
-/// (`LocalAtlas::holonomy_quotient_coordinates`). The candidate
+/// names a circle at chart rank 1, or a cylinder or Möbius band at chart rank 2. The candidate
 /// is the kind the readout names, on the coordinates `LocalAtlas::holonomy_quotient_coordinates`
-/// reads off the non-tree holonomies, so a loop is seeded from the deck transformation the
-/// atlas measured rather than from phases of a principal projection. A circle or cylinder
-/// races at the order its own quotient chart's periodogram selects
-/// (`realize_birth_harmonic_orders`), and a chart carrying no angular energy offers none.
+/// reads off the atlas's holonomy, so a loop is seeded from the deck transformation the atlas
+/// measured rather than from phases of a principal projection. A Möbius band's coordinates are
+/// its double cover's, read through the charts' handedness, so the band is seeded only where
+/// the cover is twisted. A circle or cylinder races at the order its own quotient chart's
+/// periodogram selects (`realize_birth_harmonic_orders`), and a chart carrying no angular energy
+/// offers none. A Möbius band races at the resolution the primary menu's band uses.
 /// `local_target` is the image the atlas was built on, its row `i` being `rows[i]`; rows it
 /// does not cover carry zero coordinates, and the race gives them zero weight.
 fn quotient_loop_specs(
@@ -5977,6 +5988,9 @@ fn quotient_loop_specs(
         }
         (Some(atlas), Some(GraphCompressionKind::Cylinder)) if atlas.intrinsic_dim() == 2 => {
             (atlas, GraphCompressionKind::Cylinder)
+        }
+        (Some(atlas), Some(GraphCompressionKind::MobiusStrip)) if atlas.intrinsic_dim() == 2 => {
+            (atlas, GraphCompressionKind::MobiusStrip)
         }
         _ => return Ok(None),
     };
@@ -6001,8 +6015,7 @@ fn quotient_loop_specs(
             LatentManifold::Circle { period: 1.0 },
             coords,
         )?,
-        // The match above admits only a circle or a cylinder.
-        _ => TopologyCandidateSpec::new(
+        GraphCompressionKind::Cylinder => TopologyCandidateSpec::new(
             AutoTopologyKind::Cylinder,
             SaeAtomGeometryPlan::new(
                 SaeAtomBasisKind::Cylinder,
@@ -6016,6 +6029,24 @@ fn quotient_loop_specs(
             LatentManifold::Product(vec![
                 LatentManifold::Circle { period: 1.0 },
                 LatentManifold::Euclidean,
+            ]),
+            coords,
+        )?,
+        // The match above admits only a circle, a cylinder or a Möbius band.
+        _ => TopologyCandidateSpec::new(
+            AutoTopologyKind::Mobius,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Mobius,
+                2,
+                SaeBasisResolution::MobiusHarmonics {
+                    circle_order: crate::manifold::SAE_MOBIUS_CIRCLE_HARMONICS,
+                    width_degree: crate::manifold::SAE_MOBIUS_WIDTH_DEGREE,
+                },
+                SaeReferenceMetricPlan::MobiusQuotient,
+            )?,
+            LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 2.0 },
+                LatentManifold::Interval { lo: -1.0, hi: 1.0 },
             ]),
             coords,
         )?,
@@ -8102,7 +8133,8 @@ pub struct ProductionRefitParams {
 /// and the per-round ledgers (#997).
 ///
 /// The shard refit folds a held-out block into a candidate via the SAME inner
-/// joint-fit driver the outer fit used ([`SaeManifoldTerm::run_joint_fit_arrow_schur`]),
+/// joint-fit driver the outer fit used, as a converged solve
+/// (`SaeManifoldTerm::run_joint_fit_arrow_schur_to_convergence`),
 /// PENALTY-FREE: the gate's evidence is a held-out reconstruction
 /// likelihood-ratio, and the isometry/ARD penalties are gauge/regularization
 /// terms that do not belong in the evaluation likelihood. Every candidate and
@@ -8141,7 +8173,7 @@ pub fn run_production_structure_search(
             weights[r] = 1.0;
         }
         cand_term.set_row_loss_weights(weights)?;
-        cand_term.run_joint_fit_arrow_schur(
+        cand_term.run_joint_fit_arrow_schur_to_convergence(
             full_target,
             &mut cand_rho,
             None,

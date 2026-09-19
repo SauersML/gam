@@ -318,7 +318,7 @@ fn zero_amplitude_interior_force_points_away_from_collapse_1026() {
     let rho = SaeManifoldRho::new(
         (1e-4_f64).ln(),
         (1e-4_f64).ln(),
-        vec![Array1::<f64>::zeros(0); 2],
+        vec![Array1::<f64>::zeros(1); 2],
     );
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
@@ -395,7 +395,7 @@ fn repulsion_is_radially_inert_barrier_sets_net_radial_2343() {
     let rho = SaeManifoldRho::new(
         (1e-4_f64).ln(),
         (1e-4_f64).ln(),
-        vec![Array1::<f64>::zeros(0); 2],
+        vec![Array1::<f64>::zeros(1); 2],
     );
 
     // Shared real atom 0 on channel 0.
@@ -548,7 +548,7 @@ fn duplicate_decoder_has_finite_nonzero_separating_curvature_1026() {
     let rho = SaeManifoldRho::new(
         (1e-3_f64).ln(),
         (1e-3_f64).ln(),
-        vec![Array1::<f64>::zeros(0); 2],
+        vec![Array1::<f64>::zeros(1); 2],
     );
 
     let mut term_dup = build(dec_dup0, dec_dup1);

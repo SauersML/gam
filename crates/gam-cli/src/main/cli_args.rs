@@ -22,12 +22,77 @@ pub(crate) struct Cli {
     pub(crate) log_level: Option<log::LevelFilter>,
 }
 
+#[derive(Args, Debug)]
+pub(crate) struct JointEventsArgs {
+    #[command(subcommand)]
+    pub(crate) action: JointEventsAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum JointEventsAction {
+    /// Fit the model from subjects and events tables and write the saved model.
+    Fit(JointEventsFitArgs),
+    /// Condition a saved model on each history and forecast after its exit.
+    Forecast(JointEventsForecastArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JointEventsFitArgs {
+    #[arg(long, value_name = "CSV", help = "Subjects table: columns id, entry, exit")]
+    pub(crate) subjects: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Events table: columns id, time, mark, with rows in any order; an event at or before its subject's entry is prior history"
+    )]
+    pub(crate) events: PathBuf,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "NAME:KIND",
+        help = "The mark vocabulary with each mark's kind (recurrent, once or terminal), e.g. diagnosis:once,death:terminal; without it the observed marks, all recurrent"
+    )]
+    pub(crate) marks: Vec<String>,
+    #[arg(long, value_name = "MODEL.json", help = "Write the saved model here")]
+    pub(crate) out: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct JointEventsForecastArgs {
+    #[arg(long, value_name = "MODEL.json", help = "A model saved by `gam joint-events fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Histories to condition on: columns id, entry, exit; each forecast opens at its history's exit"
+    )]
+    pub(crate) subjects: PathBuf,
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Their events: columns id, time, mark, with rows in any order"
+    )]
+    pub(crate) events: PathBuf,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        required = true,
+        help = "Forecast horizons as offsets after each history's exit, comma separated"
+    )]
+    pub(crate) horizons: Vec<f64>,
+    #[arg(long, value_name = "JSON", help = "Write the forecasts here instead of stdout")]
+    pub(crate) out: Option<PathBuf>,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
     /// Fit a model from a dataset + formula and persist it to disk.
     Fit(FitArgs),
     /// Fit a row-aligned manifold crosscoder and write its GAM-SAE report.
     Crosscoder(CrosscoderArgs),
+    /// Run one manifold parameter decomposition request (`gam.mpd-request`) and
+    /// write its report and the arrays it names.
+    ParameterDecomposition(ParameterDecompositionArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
     /// Predict on a new dataset using a fitted model.
@@ -40,6 +105,9 @@ pub(crate) enum Command {
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
     Generate(GenerateArgs),
+    /// Fit the joint latent-signature event model and save it, or forecast
+    /// histories from a saved model.
+    JointEvents(JointEventsArgs),
     /// Fit an event-history model (marked counting process with a latent
     /// per-subject state) from subjects, events and covariate-segment tables.
     FitEvents(FitEventsArgs),
@@ -171,6 +239,24 @@ pub(crate) struct CrosscoderArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct ParameterDecompositionArgs {
+    /// Versioned `gam.mpd-request` JSON document: the same bytes
+    /// `gamfit.run_parameter_decomposition` sends.
+    #[arg(long, value_name = "REQUEST.json")]
+    pub(crate) request: PathBuf,
+
+    /// Named input array, an NPY with any number of axes. Repeat once per array id
+    /// the request names.
+    #[arg(long, value_name = "ID=FILE")]
+    pub(crate) tensor: Vec<NamedNpyInput>,
+
+    /// Output directory: `report.json`, and `<id>.npy` for every array id the report
+    /// names.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) out: PathBuf,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct FitArgs {
     #[arg(
         value_name = "DATA",
@@ -188,6 +274,7 @@ pub(crate) struct FitArgs {
             "predict_noise",
             "slope_formula",
             "z_column",
+            "residual_columns",
             "weights_column",
             "offset_column",
             "noise_offset_column",
@@ -238,10 +325,17 @@ pub(crate) struct FitArgs {
     #[arg(long = "slope-formula")]
     pub(crate) slope_formula: Option<String>,
     /// Column containing the latent score z for the Bernoulli marginal-slope
-    /// family. The fit auto-detects whether to use the standard-normal or
-    /// empirical latent measure for marginal calibration.
+    /// family. By default the fit anchors the marginal index on the estimated
+    /// law of the score; the Gaussian closed form is used only when declared
+    /// (`latent_measure = "gaussian"`), and is refused when the score contradicts it.
     #[arg(long = "z-column")]
     pub(crate) z_column: Option<String>,
+    /// Residual genetic repair column (gam#2924, Bernoulli marginal-slope):
+    /// a conditionally centred genetic residual feature entering the genetic
+    /// drive beside the score with a ridge-shrunk constant coefficient. Repeat
+    /// the flag for every column of the block.
+    #[arg(long = "residual-column", value_name = "COLUMN")]
+    pub(crate) residual_columns: Vec<String>,
     /// Optional non-negative per-row training weights column.
     #[arg(long = "weights-column")]
     pub(crate) weights_column: Option<String>,

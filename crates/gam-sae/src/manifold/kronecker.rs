@@ -1,5 +1,7 @@
 use gam_runtime::warm_start::Fingerprinter;
-use gam_solve::arrow_schur::{BetaBlockId, BetaPenaltyOp};
+use gam_solve::arrow_schur::{
+    BetaBlockId, BetaPenaltyOp, RowHtbetaDeclaration, guaranteed_norm_upper_bound,
+};
 use ndarray::{Array2, ArrayView1};
 use std::ops::Range;
 use std::sync::Arc;
@@ -216,6 +218,143 @@ impl SaeKroneckerRows {
             }
         }
     }
+
+    /// `u ← |U_n|·(|U_n|ᵀ·u)` for one row (#2627); the identity when no whitening
+    /// metric is installed. Returns the accumulation depth it adds. See
+    /// [`abs_metric_majorant_row`].
+    pub(crate) fn apply_abs_output_metric_row(&self, row: usize, u: &mut [f64]) -> usize {
+        match self.output_metric.as_ref() {
+            Some(metric) => abs_metric_majorant_row(metric, row, u),
+            None => 0,
+        }
+    }
+
+    /// Guaranteed upper bounds on `‖H_tβ^(i)‖₂` of the installed cross-block
+    /// operator `H_tβ^(i) = L_i·M_n·J_i` (#2627).
+    ///
+    /// `‖H_tβ^(i)‖₂ ≤ ‖L_i‖_F · max_o (|U_n||U_n|ᵀ·1)_o · √(‖J_i‖_∞·‖J_i‖₁)`: the
+    /// middle factor bounds `‖M_n‖₂` because `|M_n| ≤ |U_n||U_n|ᵀ` is symmetric and
+    /// nonnegative (it is 1 for the isotropic metric), and the gather factor is
+    /// [`gather_norm_squared_upper_bound`]. Rows are independent, so they fan
+    /// across the pool and are collected in row order.
+    pub(crate) fn row_norm_bounds(&self) -> Arc<[f64]> {
+        use rayon::prelude::*;
+        let bounds: Vec<f64> = (0..self.a_phi.len())
+            .into_par_iter()
+            .map(|row| {
+                let jac = &self.local_jac[row];
+                let mut jac_squares = 0.0_f64;
+                for &value in jac.iter() {
+                    jac_squares += value * value;
+                }
+                let mut metric_mass = vec![1.0_f64; self.p];
+                let metric_depth = self.apply_abs_output_metric_row(row, &mut metric_mass);
+                let metric_bound = metric_mass.iter().copied().fold(0.0_f64, f64::max);
+                let mut support = self.a_phi[row].clone();
+                let gather_squared = gather_norm_squared_upper_bound(&mut support, self.p);
+                let computed = jac_squares.sqrt() * metric_bound * gather_squared.sqrt();
+                let depth = (jac.len() + 1) + metric_depth + (2 * support.len() + 2) + 2;
+                guaranteed_norm_upper_bound(computed, depth)
+            })
+            .collect();
+        Arc::from(bounds.into_boxed_slice())
+    }
+
+    /// The cross block's declaration for `set_row_htbeta_operator` (#2627):
+    /// [`Self::row_norm_bounds`] and the apply depth.
+    ///
+    /// The forward apply gathers `J_β x`, an inner product over the row's `m_i` support
+    /// entries per channel. It then applies the metric (`p` then `rank` terms, charged
+    /// whenever a metric is installed) and `L_i` (`p` terms), so its depth is
+    /// `m_i + metric + p`. The transpose accumulates `L_iᵀ v` (`q_i` terms) and the metric,
+    /// then scatters `φ_s·u_j` into each β entry once per covering support entry (at most
+    /// `m_i` additions after the product), so its depth is `q_i + metric + m_i + 1`. The
+    /// declared depth covers both, over every row.
+    pub(crate) fn htbeta_declaration(&self) -> RowHtbetaDeclaration {
+        let metric_depth = self
+            .output_metric
+            .as_ref()
+            .map_or(0, |metric| self.p + metric.metric_rank());
+        let widest_support = self.a_phi.iter().map(Vec::len).max().unwrap_or(0);
+        let widest_latent = self
+            .local_jac
+            .iter()
+            .map(|jac| jac.len().checked_div(self.p).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        RowHtbetaDeclaration {
+            row_norm_bounds: self.row_norm_bounds(),
+            apply_depth: widest_support + metric_depth + self.p.max(widest_latent) + 1,
+        }
+    }
+}
+
+/// `u ← |U_n|·(|U_n|ᵀ·u)`: the majorant `|U_n||U_n|ᵀ ≥ |M_n|` of one row of
+/// `metric` applied to a nonnegative `p`-vector (#2627), since
+/// `|M_n[i, j]| ≤ Σ_k |U_n[i, k]|·|U_n[j, k]|`. A Euclidean metric is the identity,
+/// exactly as in `RowMetric::apply_metric_row`. Returns the depth it adds: inner
+/// products of lengths `p`, then `rank`.
+pub(crate) fn abs_metric_majorant_row(
+    metric: &gam_problem::RowMetric,
+    row: usize,
+    u: &mut [f64],
+) -> usize {
+    if !metric.drives_gauge() {
+        return 0;
+    }
+    let p = u.len();
+    let rank = metric.metric_rank();
+    let mut projected = vec![0.0_f64; rank];
+    for (k, slot) in projected.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for (i, &value) in u.iter().enumerate() {
+            acc += metric.factor_entry(row, i, k).abs() * value;
+        }
+        *slot = acc;
+    }
+    for (i, target) in u.iter_mut().enumerate() {
+        let mut acc = 0.0_f64;
+        for (k, &value) in projected.iter().enumerate() {
+            acc += metric.factor_entry(row, i, k).abs() * value;
+        }
+        *target = acc;
+    }
+    p + rank
+}
+
+/// The computed product `‖J‖_∞·‖J‖₁` for the gather
+/// `J x = Σ_s φ_s·x[base_s .. base_s + width]`, so `‖J‖₂ ≤ √(‖J‖_∞·‖J‖₁)` is at
+/// most its square root (#2627).
+///
+/// Every output channel sums `|φ_s|` over the whole support, so
+/// `‖J‖_∞ = Σ_s |φ_s|`. A β column collects `|φ_t|` from each run covering it,
+/// and every run covering a column of run `s` has its base within `width` of
+/// `base_s`, so `‖J‖₁ ≤ max_s Σ_{|base_t − base_s| < width} |φ_t|`. That is exact
+/// for the disjoint atom-basis runs the SAE support holds, and it still covers
+/// repeated or overlapping runs. `support` is sorted in place. The accumulation
+/// depth is `2m + 1` for `m` support entries.
+pub(crate) fn gather_norm_squared_upper_bound(support: &mut [(usize, f64)], width: usize) -> f64 {
+    support.sort_unstable_by_key(|entry| entry.0);
+    let mut row_mass = 0.0_f64;
+    for entry in support.iter() {
+        row_mass += entry.1.abs();
+    }
+    let mut column_mass = 0.0_f64;
+    let mut lo = 0usize;
+    for s in 0..support.len() {
+        let base = support[s].0;
+        while support[lo].0 + width <= base {
+            lo += 1;
+        }
+        let mut window = 0.0_f64;
+        let mut t = lo;
+        while t < support.len() && support[t].0 < base + width {
+            window += support[t].1.abs();
+            t += 1;
+        }
+        column_mass = column_mass.max(window);
+    }
+    row_mass * column_mass
 }
 
 impl SaeKroneckerRow for SaeKroneckerRows {
@@ -439,6 +578,35 @@ impl BetaPenaltyOp for WhitenedRowGramPenaltyOp {
                 }
             }
         }
+    }
+
+    /// `M = Σ_n |J_n|ᵀ·|U_n||U_n|ᵀ·|J_n|` (#2627): the gather and scatter read `|φ_n|`
+    /// and `|M_n| ≤ |U_n||U_n|ᵀ` entrywise, so `M ≥ |P|`, and `M` is symmetric.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let p = self.kron.p;
+        let mut u = vec![0.0_f64; p];
+        let mut metric_depth = 0usize;
+        let mut widest_support = 0usize;
+        for row in 0..self.n_rows() {
+            u.fill(0.0);
+            let support = &self.kron.a_phi[row];
+            widest_support = widest_support.max(support.len());
+            for &(base, phi) in support.iter() {
+                let weight = phi.abs();
+                for j in 0..p {
+                    u[j] += weight * x[base + j];
+                }
+            }
+            metric_depth = self.kron.apply_abs_output_metric_row(row, &mut u);
+            for &(base, phi) in support.iter() {
+                let weight = phi.abs();
+                for j in 0..p {
+                    out[base + j] += weight * u[j];
+                }
+            }
+        }
+        let total_support: usize = self.kron.a_phi.iter().map(Vec::len).sum();
+        widest_support + metric_depth + total_support + 2
     }
 }
 
@@ -741,6 +909,65 @@ impl BetaPenaltyOp for WhitenedFactoredFrameOp {
         for tr in self.metric.row_traces().iter() {
             hasher.write_f64(*tr);
         }
+    }
+
+    /// `M = Σ_n |Φ_n|ᵀ·|U_n||U_n|ᵀ·|Φ_n|` (#2627), where `|Φ_n|` expands each active
+    /// atom through `|U_k|` (the identity for an unframed atom) with `|weight|`.
+    /// `M ≥ |P|` entrywise and `M` is symmetric.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let mut u_p = vec![0.0_f64; self.p];
+        let mut metric_depth = 0usize;
+        let mut widest_support = 0usize;
+        for row in 0..self.n_rows() {
+            u_p.fill(0.0);
+            widest_support = widest_support.max(self.support[row].len());
+            for &(atom, basis, w) in self.support[row].iter() {
+                let weight = w.abs();
+                let r = self.ranks[atom];
+                let cb = self.c_offsets[atom] + basis * r;
+                match &self.frames[atom] {
+                    Some(u) => {
+                        for j in 0..self.p {
+                            let mut acc = 0.0_f64;
+                            for a in 0..r {
+                                acc += u[[j, a]].abs() * x[cb + a];
+                            }
+                            u_p[j] += weight * acc;
+                        }
+                    }
+                    None => {
+                        for j in 0..self.p {
+                            u_p[j] += weight * x[cb + j];
+                        }
+                    }
+                }
+            }
+            metric_depth = abs_metric_majorant_row(&self.metric, row, &mut u_p);
+            for &(atom, basis, w) in self.support[row].iter() {
+                let weight = w.abs();
+                let r = self.ranks[atom];
+                let cb = self.c_offsets[atom] + basis * r;
+                match &self.frames[atom] {
+                    Some(u) => {
+                        for a in 0..r {
+                            let mut acc = 0.0_f64;
+                            for j in 0..self.p {
+                                acc += u[[j, a]].abs() * u_p[j];
+                            }
+                            out[cb + a] += weight * acc;
+                        }
+                    }
+                    None => {
+                        for j in 0..self.p {
+                            out[cb + j] += weight * u_p[j];
+                        }
+                    }
+                }
+            }
+        }
+        let widest_frame = self.ranks.iter().copied().max().unwrap_or(0);
+        let total_support: usize = self.support.iter().map(Vec::len).sum();
+        widest_support * (widest_frame + 1) + metric_depth + (self.p + 1) + total_support + 2
     }
 }
 

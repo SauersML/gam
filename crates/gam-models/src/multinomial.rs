@@ -483,7 +483,7 @@ fn multinomial_formula_penalized_separation_evidence(
         return Ok(None);
     }
     let unreached_span = identifiable_span.dot(&unreached);
-    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::diagnose(
         penalized.view(),
         unreached_span.view(),
     )?;
@@ -542,12 +542,12 @@ fn multinomial_formula_penalized_separation_evidence(
     // Both wider readings, so the refusal shows what it did NOT decide on: the
     // whole penalized span (which the model's own prior bounds) and the
     // likelihood alone (which is not the curvature the fit has).
-    let whole_penalized = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+    let whole_penalized = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::diagnose(
         penalized.view(),
         identifiable_span,
     )?;
     let (span_min, span_max) = whole_penalized.information_extrema();
-    let unpenalized = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+    let unpenalized = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::diagnose(
         information.view(),
         identifiable_span,
     )?;

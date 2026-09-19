@@ -1843,21 +1843,24 @@ pub(crate) fn build_cv_log_density_table(
 
 /// Adjudicated outcome of a predictive race. A mixed smooth/discrete race and
 /// any race containing an adaptive class use honest held-out stacking; only a
-/// race of fixed candidates from one side of that boundary uses evidence alone.
+/// race of fixed candidates from one side of that boundary uses the candidates'
+/// BIC/2 scores alone.
 #[derive(Debug, Clone)]
 pub struct PredictiveRaceVerdict {
     /// Candidate display names, column-aligned with the stacking table / weights.
     pub candidate_names: Vec<String>,
     /// Whether the race actually mixed model classes (smooth vs discrete).
     pub is_cross_class: bool,
-    /// Rank-aware Laplace negative-log-evidence per candidate (corroboration;
-    /// lower is better).
-    pub negative_log_evidence: Vec<f64>,
+    /// Each candidate's BIC/2, `−log-likelihood + ½·k·log n` on the shared
+    /// negative-log-likelihood scale (lower is better): a Schwarz approximation,
+    /// not a marginal likelihood. It corroborates a stacking headline and decides
+    /// only a same-class race.
+    pub bic_half: Vec<f64>,
     /// Stacking weights over the candidates (present iff `headline` is
     /// [`Headline::Stacking`]).
     pub stacking: Option<StackingWeights>,
     /// Index of the headline winner. For stacking races this is the max-weight
-    /// candidate; for evidence races it is the min-evidence one.
+    /// candidate; for same-class races it is the one with the smallest BIC/2.
     pub winner_index: usize,
     /// Which statistic drove the headline.
     pub headline: Headline,
@@ -1872,20 +1875,20 @@ pub struct PredictiveRaceVerdict {
 /// Which statistic adjudicated the headline ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Headline {
-    /// Rank-aware Laplace evidence (same-class race, winner-take-all).
+    /// The candidates' BIC/2 scores (same-class race, winner-take-all).
     Evidence,
     /// Held-out predictive log-density / stacking weights (cross-class or
     /// adaptive-class race).
     Stacking,
 }
 
-/// How a candidate's `negative_log_evidence` was certified — the source of the
+/// How a candidate's `bic_half` was certified — the source of the
 /// decision-margin the same-class race must respect before it can transfer a
-/// verdict from approximate evidence to the full-corpus verdict.
+/// verdict from an approximate score to the full-corpus verdict.
 ///
-/// * [`Exact`] — the evidence is a genuine point value (dense logdet, full
-///   corpus); no margin floor.
-/// * [`Coreset`] — the evidence was raced on a certified row coreset; the lead
+/// * [`Exact`] — the score is a genuine point value (full corpus); no margin
+///   floor.
+/// * [`Coreset`] — the score was raced on a certified row coreset; the lead
 ///   must exceed the certificate's [`CoresetCertificate::race_transfer_margin`]
 ///   (#1012 contract).
 ///
@@ -1910,14 +1913,16 @@ impl EvidenceCertification {
 
 }
 
-/// One candidate entering the predictive adjudicator: its kind, its rank-aware
-/// Laplace negative-log-evidence (already computed on the common scale), how
-/// that evidence was certified (for the margin contract), and a selection-time
-/// held-out-density provider that refits per CV fold.
+/// One candidate entering the predictive adjudicator: its kind, its BIC/2 on the
+/// common negative-log-likelihood scale, how that score was certified (for the
+/// margin contract), and a selection-time held-out-density provider that refits
+/// per CV fold.
 pub struct PredictiveRaceCandidate<'a> {
     pub kind: PredictiveCandidateKind,
-    pub negative_log_evidence: f64,
-    /// Certification of `negative_log_evidence`.
+    /// `−log-likelihood + ½·k·log n` (lower wins). A Schwarz approximation, not a
+    /// marginal likelihood.
+    pub bic_half: f64,
+    /// Certification of `bic_half`.
     pub certification: EvidenceCertification,
     pub density_provider: HeldOutDensityProvider<'a>,
 }
@@ -1963,11 +1968,11 @@ pub fn adjudicate_predictive_race(
         return Err("predictive race requires at least one candidate".to_string());
     }
     for (index, candidate) in candidates.iter().enumerate() {
-        if !candidate.negative_log_evidence.is_finite() {
+        if !candidate.bic_half.is_finite() {
             return Err(format!(
-                "predictive race candidate {index} ({}) has non-finite negative-log-evidence {:?}",
+                "predictive race candidate {index} ({}) has non-finite BIC/2 {:?}",
                 candidate.kind.display_name(),
-                candidate.negative_log_evidence
+                candidate.bic_half
             ));
         }
         let required_margin = candidate.certification.required_margin();
@@ -1990,7 +1995,7 @@ pub fn adjudicate_predictive_race(
         }
     }
     let names: Vec<String> = candidates.iter().map(|c| c.kind.display_name()).collect();
-    let evidence: Vec<f64> = candidates.iter().map(|c| c.negative_log_evidence).collect();
+    let bic_half: Vec<f64> = candidates.iter().map(|c| c.bic_half).collect();
 
     // Cross-class iff the race mixes at least one discrete (non-smooth) density
     // class — the mixture rung OR a structured union (#907) — with at least one
@@ -2006,18 +2011,18 @@ pub fn adjudicate_predictive_race(
     let use_stacking = is_cross_class || has_adaptive_class;
 
     if !use_stacking {
-        // Same-class: winner-take-all on rank-aware evidence (lower wins).
+        // Same-class: winner-take-all on BIC/2 (lower wins).
         let certifications: Vec<EvidenceCertification> =
             candidates.iter().map(|c| c.certification).collect();
         // Every value was validated above, so this reduction cannot silently
         // retain index zero merely because no comparable value existed.
-        let winner_index = evidence
+        let winner_index = bic_half
             .iter()
             .enumerate()
             .min_by(|left, right| left.1.total_cmp(right.1))
             .map(|(index, _)| index)
-            .ok_or_else(|| "predictive race has no evidence values".to_string())?;
-        let best = evidence[winner_index];
+            .ok_or_else(|| "predictive race has no BIC/2 values".to_string())?;
+        let best = bic_half[winner_index];
         // Decision-margin contract (#1011 enclosure / #1012 coreset, one seam):
         // the winner's lead over the closest contender must clear the larger of
         // the two candidates' required margins (an exact candidate floors at 0,
@@ -2027,11 +2032,11 @@ pub fn adjudicate_predictive_race(
         // an explicit escalation rather than silently anointing a winner the
         // bounds cannot distinguish.
         let mut insufficient_margin: Option<InsufficientRaceMargin> = None;
-        for (idx, &nle) in evidence.iter().enumerate() {
+        for (idx, &score) in bic_half.iter().enumerate() {
             if idx == winner_index {
                 continue;
             }
-            let lead = nle - best;
+            let lead = score - best;
             let required = certifications[winner_index]
                 .required_margin()
                 .max(certifications[idx].required_margin());
@@ -2050,7 +2055,7 @@ pub fn adjudicate_predictive_race(
         return Ok(PredictiveRaceVerdict {
             candidate_names: names,
             is_cross_class: false,
-            negative_log_evidence: evidence,
+            bic_half,
             stacking: None,
             winner_index,
             headline: Headline::Evidence,
@@ -2076,7 +2081,7 @@ pub fn adjudicate_predictive_race(
     Ok(PredictiveRaceVerdict {
         candidate_names: names,
         is_cross_class,
-        negative_log_evidence: evidence,
+        bic_half,
         stacking: Some(stacking),
         winner_index,
         headline: Headline::Stacking,
@@ -2312,13 +2317,13 @@ mod tests {
         let candidates = vec![
             PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-                negative_log_evidence: 10.0,
+                bic_half:10.0,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),
             },
             PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
-                negative_log_evidence: 10.0 + lead,
+                bic_half:10.0 + lead,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),
             },
@@ -2344,13 +2349,13 @@ mod tests {
                 kind: PredictiveCandidateKind::MixtureClass,
                 // Deliberately make evidence prefer the other class: the test
                 // must fail if this adaptive race takes the evidence shortcut.
-                negative_log_evidence: 100.0,
+                bic_half:100.0,
                 certification: EvidenceCertification::Exact,
                 density_provider: Box::new(|_, eval| Ok(vec![0.0; eval.len()])),
             },
             PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::RingOfClustersClass,
-                negative_log_evidence: 0.0,
+                bic_half:0.0,
                 certification: EvidenceCertification::Exact,
                 density_provider: Box::new(|_, eval| Ok(vec![-20.0; eval.len()])),
             },
@@ -2382,13 +2387,13 @@ mod tests {
         let duplicate = vec![
             PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-                negative_log_evidence: 1.0,
+                bic_half:1.0,
                 certification: EvidenceCertification::Exact,
                 density_provider: trivial_provider(),
             },
             PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-                negative_log_evidence: 2.0,
+                bic_half:2.0,
                 certification: EvidenceCertification::Exact,
                 density_provider: trivial_provider(),
             },
@@ -2410,13 +2415,13 @@ mod tests {
             let candidates = vec![
                 PredictiveRaceCandidate {
                     kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-                    negative_log_evidence: 1.0,
+                    bic_half:1.0,
                     certification: EvidenceCertification::Exact,
                     density_provider: trivial_provider(),
                 },
                 PredictiveRaceCandidate {
                     kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
-                    negative_log_evidence: invalid,
+                    bic_half:invalid,
                     certification: EvidenceCertification::Exact,
                     density_provider: trivial_provider(),
                 },
@@ -2430,10 +2435,7 @@ mod tests {
             )
             .expect_err("a non-finite candidate must not be skipped in favor of index zero");
             assert!(error.contains("candidate 1"), "{error}");
-            assert!(
-                error.contains("non-finite negative-log-evidence"),
-                "{error}"
-            );
+            assert!(error.contains("non-finite BIC/2"), "{error}");
         }
     }
 
@@ -2443,7 +2445,7 @@ mod tests {
             let candidates = vec![
                 PredictiveRaceCandidate {
                     kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
-                    negative_log_evidence: 1.0,
+                    bic_half:1.0,
                     certification: EvidenceCertification::Coreset {
                         certificate: CoresetCertificate {
                             eps_spectral: 0.0,
@@ -2456,7 +2458,7 @@ mod tests {
                 },
                 PredictiveRaceCandidate {
                     kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
-                    negative_log_evidence: 2.0,
+                    bic_half:2.0,
                     certification: EvidenceCertification::Exact,
                     density_provider: trivial_provider(),
                 },

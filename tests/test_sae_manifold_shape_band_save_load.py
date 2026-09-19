@@ -34,7 +34,7 @@ def _fit_circle(n: int = 400, noise: float = 0.18, seed: int = 0, n_iter: int = 
     x = clean + noise * rng.standard_normal((n, 2))
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
-        isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
+        isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=n_iter, learning_rate=1.0, random_state=seed,
     )
     return fit, x
@@ -172,7 +172,7 @@ def test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale(
     x = clean + 0.02 * col_scale * rng.standard_normal((n, 2))
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
-        isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
+        isometry_weight=0.0, sparsity_weight=0.01,
         smoothness_weight=0.01, n_iter=40, learning_rate=1.0, random_state=11,
     )
     recon = np.asarray(fit.reconstruct_training())

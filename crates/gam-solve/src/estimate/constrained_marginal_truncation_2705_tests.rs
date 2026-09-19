@@ -240,6 +240,7 @@ fn declined_moments_leave_the_marginal_covariance_untouched_2705() {
                 reason: "probe: properness was not certified".to_string(),
             },
             active_rows: Vec::new(),
+            boundary_approximation_refusal: None,
         },
     );
 

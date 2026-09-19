@@ -332,8 +332,9 @@ pub enum FitFailure {
     /// A nested fit through the workflow boundary failed, e.g. a CTN stage fit.
     Workflow(Box<WorkflowError>),
     /// A failure raised in orchestration code, categorized where it is raised.
-    /// A `String` converted without a category lands here as
-    /// [`FailureCategory::Unclassified`], which is what it honestly is.
+    /// There is no conversion from text: a helper's text whose failures span
+    /// categories is raised as [`FailureCategory::Unclassified`] through
+    /// [`Self::unclassified`], at a call site that names it (#2937).
     Raised {
         category: FailureCategory,
         reason: String,
@@ -362,6 +363,37 @@ impl FitFailure {
         }
     }
 
+    /// The caller's configuration, data or problem size was refused.
+    #[must_use]
+    pub fn input(reason: impl Into<String>) -> Self {
+        Self::raised(FailureCategory::Input, reason)
+    }
+
+    /// State the engine built from validated input disagreed with itself.
+    #[must_use]
+    pub fn invariant(reason: impl Into<String>) -> Self {
+        Self::raised(FailureCategory::Invariant, reason)
+    }
+
+    /// A numerical step failed on the fit's own iterates.
+    #[must_use]
+    pub fn numerical(reason: impl Into<String>) -> Self {
+        Self::raised(FailureCategory::Numerical, reason)
+    }
+
+    /// A quadrature or compression did not reach its tolerance.
+    #[must_use]
+    pub fn integration(reason: impl Into<String>) -> Self {
+        Self::raised(FailureCategory::Integration, reason)
+    }
+
+    /// Text from a helper whose failures span categories. Each call site is
+    /// named, so what is left untyped stays countable (#2937).
+    #[must_use]
+    pub fn unclassified(reason: impl Into<String>) -> Self {
+        Self::raised(FailureCategory::Unclassified, reason)
+    }
+
     /// Put `context` in front of this failure without changing what it is.
     #[must_use]
     pub fn context(self, context: impl Into<String>) -> Self {
@@ -377,6 +409,107 @@ impl FitFailure {
         Self::Annotated {
             source: Box::new(self),
             note: note.into(),
+        }
+    }
+
+    /// This failure as the fit boundary hands it to the caller (gam#2943).
+    ///
+    /// An inner solve that never certified its mode is a trial-point refusal
+    /// while an outer search can still step away from it. Once the fit has
+    /// ended no search is left, so the boundary names that refusal
+    /// [`CustomFamilyError::FitEndedWithoutCertifiedInnerMode`], whether it
+    /// arrives bare or as the last inner refusal an outer smoothing failure
+    /// carries. This is the only place that variant is minted. The outer
+    /// verdict it was read through stays in front as context, and every other
+    /// failure is returned unchanged.
+    #[must_use]
+    pub fn ending_the_fit(self) -> Self {
+        match self {
+            Self::Context { context, source } => Self::Context {
+                context,
+                source: Box::new(source.ending_the_fit()),
+            },
+            Self::Annotated { source, note } => Self::Annotated {
+                source: Box::new(source.ending_the_fit()),
+                note,
+            },
+            Self::CustomFamily(err) => match Self::terminal_inner_refusal(&err).cloned() {
+                None => Self::CustomFamily(err),
+                Some(refusal) => {
+                    let bare = matches!(err, CustomFamilyError::InnerSolveNotConverged { .. });
+                    Self::ended_by(refusal, (!bare).then(|| err.to_string()))
+                }
+            },
+            Self::Estimation(err) => {
+                let refusal = Self::custom_family_leaf(&err)
+                    .and_then(Self::terminal_inner_refusal)
+                    .cloned();
+                match refusal {
+                    None => Self::Estimation(err),
+                    Some(refusal) => {
+                        let bare = matches!(
+                            err.as_ref(),
+                            EstimationError::CustomFamily(
+                                CustomFamilyError::InnerSolveNotConverged { .. }
+                            )
+                        );
+                        Self::ended_by(refusal, (!bare).then(|| err.to_string()))
+                    }
+                }
+            }
+            Self::Workflow(err) => match *err {
+                WorkflowError::Fit(failure) => {
+                    Self::Workflow(Box::new(WorkflowError::Fit(failure.ending_the_fit())))
+                }
+                other => Self::Workflow(Box::new(other)),
+            },
+            other @ (Self::SurvivalMarginalSlope(_) | Self::Raised { .. }) => other,
+        }
+    }
+
+    /// The inner refusal a custom-family failure ends in: the refusal itself,
+    /// or for an outer smoothing failure the search's most recent uncertified
+    /// inner solve (`search_inner_refusal`), else its last evaluation's refusal,
+    /// read through nested outer failures. `None` when the fit did not end on
+    /// one, including a refusal already minted as the fit-ending variant.
+    fn terminal_inner_refusal(err: &CustomFamilyError) -> Option<&CustomFamilyError> {
+        match err {
+            CustomFamilyError::InnerSolveNotConverged { .. } => Some(err),
+            CustomFamilyError::OuterSmoothingFailed {
+                search_inner_refusal,
+                last_refusal,
+                ..
+            } => search_inner_refusal
+                .as_deref()
+                .and_then(Self::terminal_inner_refusal)
+                .or_else(|| last_refusal.as_deref().and_then(Self::terminal_inner_refusal)),
+            _ => None,
+        }
+    }
+
+    /// The custom-family error an engine error carries, read through fatal
+    /// outer-evaluation wrappers. Unlike
+    /// [`EstimationError::innermost_estimation_error`] it does not descend into an
+    /// outer smoothing failure's own verdict, which would pass over the refusals
+    /// that failure carries.
+    fn custom_family_leaf(err: &EstimationError) -> Option<&CustomFamilyError> {
+        match err {
+            EstimationError::CustomFamily(family) => Some(family),
+            EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
+                source.estimation_error().and_then(Self::custom_family_leaf)
+            }
+            _ => None,
+        }
+    }
+
+    /// The fit-ending variant for `refusal`, under the outer verdict it was
+    /// read through when there is one.
+    fn ended_by(refusal: CustomFamilyError, outer_verdict: Option<String>) -> Self {
+        let ended =
+            Self::CustomFamily(CustomFamilyError::fit_ended_without_certified_inner_mode(refusal));
+        match outer_verdict {
+            Some(verdict) => ended.context(verdict),
+            None => ended,
         }
     }
 
@@ -523,21 +656,6 @@ impl std::error::Error for FitFailure {
     }
 }
 
-/// Legacy `Result<_, String>` helpers inside a fit convert through `?`. A
-/// string names no category, so it is recorded as unclassified rather than
-/// guessed.
-impl From<String> for FitFailure {
-    fn from(reason: String) -> Self {
-        Self::raised(FailureCategory::Unclassified, reason)
-    }
-}
-
-impl From<&str> for FitFailure {
-    fn from(reason: &str) -> Self {
-        Self::raised(FailureCategory::Unclassified, reason)
-    }
-}
-
 impl From<EstimationError> for FitFailure {
     fn from(err: EstimationError) -> Self {
         Self::Estimation(Arc::new(err))
@@ -553,6 +671,31 @@ impl From<CustomFamilyError> for FitFailure {
 impl From<SurvivalMarginalSlopeError> for FitFailure {
     fn from(err: SurvivalMarginalSlopeError) -> Self {
         Self::SurvivalMarginalSlope(err)
+    }
+}
+
+/// A term-design construction refusal, under the category the engine gives it
+/// as [`EstimationError::BasisError`], with the basis error's own text.
+impl From<gam_problem::BasisError> for FitFailure {
+    fn from(err: gam_problem::BasisError) -> Self {
+        let reason = err.to_string();
+        Self::raised(EstimationError::from(err).failure_category(), reason)
+    }
+}
+
+/// A survival location-scale refusal, under its variant's category, with its
+/// own text.
+impl From<crate::survival::location_scale::SurvivalLocationScaleError> for FitFailure {
+    fn from(err: crate::survival::location_scale::SurvivalLocationScaleError) -> Self {
+        Self::raised(err.failure_category(), err.to_string())
+    }
+}
+
+/// A latent survival or binary refusal, under its variant's category, with its
+/// own text.
+impl From<crate::survival::latent::LatentSurvivalError> for FitFailure {
+    fn from(err: crate::survival::latent::LatentSurvivalError) -> Self {
+        Self::raised(err.failure_category(), err.to_string())
     }
 }
 
@@ -633,7 +776,7 @@ mod fit_failure_tests {
                 "SurvivalMarginalSlopeError::IntegrationFailed",
             ),
             (
-                FitFailure::from("a helper's prose".to_string()),
+                FitFailure::unclassified("a helper's prose"),
                 FailureCategory::Unclassified,
                 "FitFailure::Unclassified",
             ),
@@ -658,6 +801,7 @@ mod fit_failure_tests {
                 seeds_refused()
             ),
             last_refusal: None,
+            search_inner_refusal: None,
             outer_error: Arc::new(seeds_refused()),
         });
         assert_eq!(failure.category(), FailureCategory::StartupSeeds);
@@ -665,6 +809,52 @@ mod fit_failure_tests {
         assert!(matches!(
             failure.estimation_error(),
             Some(EstimationError::StartupSeedsRefused(_))
+        ));
+    }
+
+    /// A CTN prefit whose outer search declined a certified optimum and certified nothing
+    /// in its place used to reach its caller as `IntegrationFailed` text (#2953, at
+    /// 598f3da691). The transformation fit wraps the custom-family refusal under its
+    /// context, and the variant must survive that and the fit-model boundary by type.
+    #[test]
+    fn a_ctn_prefit_dominated_plateau_refusal_keeps_its_variant_by_type_2953() {
+        let refusal = EstimationError::DominatedCertifiedPlateau {
+            context: "custom family".to_string(),
+            kind: gam_problem::DominanceRefusalKind::IncumbentUnescapableSaddle,
+            plateau_rho: vec![0.5],
+            plateau_value: 73.02427,
+            incumbent_rho: vec![-1.25],
+            incumbent_value: 72.50521,
+            incumbent_projected_grad_norm: Some(2.632e-1),
+            gap: 9.541e-3,
+            band: 1.088e-6,
+            continuation: "declined another certified optimum at objective 7.302427e1".to_string(),
+            terminal_refusal: Box::new(EstimationError::RemlOptimizationFailed(
+                "not stationary".to_string(),
+            )),
+        };
+        let failure = FitFailure::from(CustomFamilyError::OuterSmoothingFailed {
+            reason: format!(
+                "outer smoothing optimization failed certified-fit validation after exhausting \
+                 strategy fallbacks: {refusal}"
+            ),
+            last_refusal: None,
+            search_inner_refusal: None,
+            outer_error: Arc::new(refusal),
+        })
+        .context("transformation fit failed");
+        let boundary = WorkflowError::from(failure);
+        assert_eq!(boundary.failure_category(), FailureCategory::Convergence);
+        assert_eq!(boundary.variant_name(), "EstimationError::DominatedCertifiedPlateau");
+        let WorkflowError::Fit(failure) = &boundary else {
+            panic!("the CTN prefit refusal must stay a typed fit failure: {boundary}");
+        };
+        assert!(matches!(
+            failure.estimation_error(),
+            Some(EstimationError::DominatedCertifiedPlateau {
+                kind: gam_problem::DominanceRefusalKind::IncumbentUnescapableSaddle,
+                ..
+            })
         ));
     }
 
@@ -732,6 +922,109 @@ mod fit_failure_tests {
             FitFailure::from(WorkflowError::Fit(failure)),
             FitFailure::Estimation(_)
         ));
+    }
+
+    fn uncertified_inner_solve() -> CustomFamilyError {
+        CustomFamilyError::InnerSolveNotConverged {
+            cycles: 1,
+            terminal: None,
+            kkt_residual: Some(2.5e-1),
+            kkt_tol: Some(1.0e-6),
+            theta_dim: 4,
+            rho_dim: 2,
+            psi_dim: 0,
+            cycle_budget: Some(1),
+            carrying_block: Some("eta".to_string()),
+        }
+    }
+
+    fn outer_smoothing_failed(
+        last_refusal: Option<CustomFamilyError>,
+        search_inner_refusal: Option<CustomFamilyError>,
+    ) -> CustomFamilyError {
+        CustomFamilyError::OuterSmoothingFailed {
+            reason: "outer smoothing optimization failed certified-fit validation".to_string(),
+            last_refusal: last_refusal.map(Box::new),
+            search_inner_refusal: search_inner_refusal.map(Box::new),
+            outer_error: Arc::new(EstimationError::RemlOptimizationFailed("stalled".to_string())),
+        }
+    }
+
+    fn assert_ended_on_the_uncertified_solve(failure: &FitFailure) {
+        assert_eq!(
+            failure.variant_name(),
+            "CustomFamilyError::FitEndedWithoutCertifiedInnerMode",
+            "{failure}"
+        );
+        assert_eq!(failure.category(), FailureCategory::Convergence, "{failure}");
+        let evidence = failure
+            .terminal_inner_mode_evidence()
+            .unwrap_or_else(|| panic!("the terminal solve's evidence must be readable: {failure}"));
+        assert_eq!(evidence.cycles, 1, "{failure}");
+        assert_eq!(evidence.cycle_budget, Some(1), "{failure}");
+        assert_eq!(evidence.carrying_block, Some("eta"), "{failure}");
+    }
+
+    #[test]
+    fn the_fit_boundary_names_a_fit_that_ended_on_an_uncertified_inner_solve_2943() {
+        // A bare refusal becomes the variant, with nothing in front of it.
+        let bare = FitFailure::from(uncertified_inner_solve()).ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&bare);
+        assert!(matches!(bare, FitFailure::CustomFamily(_)), "{bare}");
+
+        // Context a layer put in front stays in front.
+        let folded = FitFailure::from(uncertified_inner_solve())
+            .context("CTN fold 1 failed")
+            .ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&folded);
+        assert!(folded.to_string().starts_with("CTN fold 1 failed: "), "{folded}");
+
+        // The search's last inner refusal, read through the outer verdict, which
+        // stays in front as context.
+        let outer = outer_smoothing_failed(
+            Some(uncertified_inner_solve()),
+            Some(uncertified_inner_solve()),
+        );
+        let outer_text = outer.to_string();
+        let through_outer = FitFailure::from(outer.clone()).ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&through_outer);
+        assert!(
+            through_outer.to_string().starts_with(&outer_text),
+            "{through_outer}"
+        );
+
+        // A search whose inner solve refused and whose later trials ran finite:
+        // the last evaluation did not refuse, and the whole-search record still
+        // names the inner solve that decided the fit.
+        let after_finite_trials =
+            FitFailure::from(outer_smoothing_failed(None, Some(uncertified_inner_solve())))
+                .ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&after_finite_trials);
+
+        // The same outer failure arriving as an engine error.
+        let through_estimation =
+            FitFailure::from(EstimationError::CustomFamily(outer)).ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&through_estimation);
+    }
+
+    #[test]
+    fn the_fit_boundary_leaves_every_other_failure_as_it_was_2943() {
+        let no_inner_refusal = FitFailure::from(outer_smoothing_failed(None, None));
+        let before = (no_inner_refusal.variant_name(), no_inner_refusal.to_string());
+        let after = no_inner_refusal.ending_the_fit();
+        assert_eq!((after.variant_name(), after.to_string()), before);
+
+        let seeds = FitFailure::from(seeds_refused()).ending_the_fit();
+        assert_eq!(seeds.variant_name(), "EstimationError::StartupSeedsRefused");
+
+        // A variant already minted is not wrapped a second time.
+        let minted = FitFailure::from(CustomFamilyError::fit_ended_without_certified_inner_mode(
+            uncertified_inner_solve(),
+        ));
+        let text = minted.to_string();
+        let again = minted.ending_the_fit();
+        assert_ended_on_the_uncertified_solve(&again);
+        assert_eq!(again.to_string(), text);
     }
 }
 

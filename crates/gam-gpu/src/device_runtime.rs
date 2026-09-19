@@ -2,13 +2,13 @@
 use std::cell::Cell;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
-use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
+#[cfg(target_os = "linux")]
+use super::driver::{CudarcLibrary, require_cudarc_library};
 use super::gpu_error::GpuError;
 use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
@@ -67,76 +67,8 @@ pub enum GpuAvailabilityRef<'a> {
     Absent(&'a GpuAbsence),
 }
 
-#[cfg(target_os = "linux")]
-thread_local! {
-    static CUDARC_RECOVERY_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
-
-#[cfg(target_os = "linux")]
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
-    payload
-        .downcast_ref::<&'static str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-}
-
-/// Suppress loader diagnostics only while this thread can recover them.
-/// An unguarded loader panic must still reach the application's panic hook.
-#[cfg(target_os = "linux")]
-fn install_cudarc_panic_filter() {
-    static HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
-    HOOK_INSTALLED.get_or_init(|| {
-        let prior = panic::take_hook();
-        panic::set_hook(Box::new(move |info| {
-            if cfg!(panic = "unwind")
-                && CUDARC_RECOVERY_ACTIVE.with(Cell::get)
-                && panic_message(info.payload())
-                    .is_some_and(|message| message.starts_with("Unable to dynamically load"))
-            {
-                return;
-            }
-            prior(info);
-        }));
-    });
-}
-
-/// Own both recovery and diagnostic suppression, including nested calls.
-/// Unrelated panics retain their normal hook and unwind behavior.
-#[cfg(target_os = "linux")]
-fn catch_cudarc<T>(call: impl FnOnce() -> T) -> Result<T, String> {
-    install_cudarc_panic_filter();
-    struct RecoveryScope(bool);
-    impl Drop for RecoveryScope {
-        fn drop(&mut self) {
-            CUDARC_RECOVERY_ACTIVE.with(|active| active.set(self.0));
-        }
-    }
-    let scope = RecoveryScope(CUDARC_RECOVERY_ACTIVE.with(|active| active.replace(true)));
-    let outcome = catch_unwind(AssertUnwindSafe(call));
-    drop(scope);
-    match outcome {
-        Ok(value) => Ok(value),
-        Err(payload) => match panic_message(payload.as_ref()) {
-            Some(message) if message.starts_with("Unable to dynamically load") => {
-                Err(message.to_owned())
-            }
-            _ => panic::resume_unwind(payload),
-        },
-    }
-}
-
 impl GpuRuntime {
     pub fn probe() -> Result<GpuAvailability, GpuError> {
-        #[cfg(target_os = "linux")]
-        {
-            catch_cudarc(Self::probe_devices)
-                .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?
-        }
-        #[cfg(not(target_os = "linux"))]
-        Self::probe_devices()
-    }
-
-    fn probe_devices() -> Result<GpuAvailability, GpuError> {
         #[cfg(not(target_os = "linux"))]
         {
             let reason = "CUDA support not compiled into this build";
@@ -147,159 +79,168 @@ impl GpuRuntime {
 
         #[cfg(target_os = "linux")]
         {
-            // `cudarc 0.19`'s entry points lazily initialize the CUDA driver
-            // through generated `culib()` helpers. On CPU-only Linux hosts the
-            // first such call emits `panic_no_lib_found` before unwinding, which
-            // polluted large-scale logs even when the panic was later caught and the
-            // fit fell back to CPU. Keep the preflight completely outside
-            // cudarc: use gam's own `libloading` probe first, and only touch
-            // cudarc after the platform loader can open `libcuda`.
-            //
-            // The preflight does not always agree with cudarc's own loader
-            // candidate list (e.g. large-scale workbench images expose CUDA *runtime*
-            // stub libraries under `/usr/local/cuda-*/targets/.../lib` but no
-            // driver `libcuda.so` in any loader path), so we additionally
-            // install a panic-hook filter that suppresses cudarc's
-            // `panic_no_lib_found` message and wrap every cudarc entry point
-            // below in `catch_unwind` to convert the panic into a typed
-            // `GpuError::DriverCallFailed` instead.
-            // #1017 probe-first fix: establish cudarc's primary context P and
-            // initialize the CUDA runtime ON IT as the VERY FIRST CUDA action -- before
-            // gam's libloading libcuda preload, the compute-lib dlopens, and device_count.
-            // The clean cuda_context_for-first path works; the probe-first path failed
-            // because a pre-context CUDA touch left the runtime bound to a non-P context,
-            // so later cuBLAS/cuSOLVER handle creation on the P-stream returned
-            // NOT_INITIALIZED. Making cuda_context_for the first action replicates the
-            // working clean path (CudaContext::new loads libcuda + retains the primary +
-            // ensure runs the runtime init); on a CPU-only host it returns None cleanly
-            // via the panic filter + catch_unwind, and the preload check below still runs.
-            let primary_ready = cuda_context_for(0).is_some();
-            log::trace!("[GPU] probe pre-init primary context + runtime: {primary_ready}");
-            match crate::driver::preload_cuda_driver() {
-                Ok(()) => {}
-                Err(GpuError::DriverLibraryUnavailable { reason }) => {
-                    Self::record_cpu_reason(reason.clone());
-                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
-                    diagnostics::log_cuda_disabled(&reason);
-                    return Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable {
-                        reason,
-                    }));
-                }
-                Err(error) => return Err(error),
-            }
-
-            // Driver-only environments (e.g. large-scale workbench images that expose
-            // `libcuda.so.1` but ship no cuBLAS/cuSOLVER/cuSPARSE) used to slip
-            // past the libcuda preflight, enable the runtime, and then panic
-            // out of cudarc's `panic_no_lib_found` on the first `CudaBlas::new`
-            // — the panic crossed the PyO3 FFI boundary as a
-            // `ValueError: fit_table panicked inside Rust boundary: Unable to
-            // dynamically load the "cublas" shared library`. The compute
-            // libraries are dispatch-critical (every cuBLAS / cuSOLVER /
-            // cuSPARSE site under `src/gpu/` calls `CudaBlas::new` /
-            // `DnHandle::new` / cusparse handle creation eagerly during
-            // workspace allocation), so we refuse to advertise GPU unless all
-            // three load cleanly here.
-            for stem in ["cublas", "cusolver", "cusparse"] {
-                if let Err(error) = crate::driver::require_cuda_compute_library(stem) {
-                    let reason = format!("lib{stem} unavailable: {error}");
-                    Self::record_cpu_reason(reason.clone());
-                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
-                    diagnostics::log_cuda_disabled(&reason);
-                    return Err(GpuError::RuntimeDependencyUnavailable { reason });
-                }
-            }
-
-            // cudarc 0.19's `culib()` panics via `panic_no_lib_found` when its
-            // own (separate from gam's) dynamic-loader candidate list cannot
-            // find libcuda — this can happen even after our `preload_cuda_driver`
-            // succeeds, for example if our probe loaded a CUDA stub library but
-            // cudarc's loader searches a disjoint set of names. Convert any such
-            // panic into a typed probe failure so the runtime cleanly disables
-            // CUDA and the CPU fallback proceeds without alarming stderr noise.
-            let device_count = match catch_cudarc(CudaContext::device_count) {
-                Err(_) => {
-                    return Err(GpuError::DriverCallFailed {
-                        reason: "cudarc failed after the CUDA driver preflight succeeded"
-                            .to_string(),
-                    });
-                }
-                Ok(Ok(count)) => count,
-                Ok(Err(error)) => {
-                    // `device_count` performs `cuInit`, so this is the first
-                    // moment the host's kernel driver actually answers. A
-                    // refusal that is an ENVIRONMENT fact (userland CUDA
-                    // libraries with no matching kernel driver — the container
-                    // / CPU-node case #2267 hit as
-                    // `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`) is typed absence:
-                    // Auto falls back to CPU, Required still refuses with the
-                    // same diagnosis. Anything else stays a probe fault.
-                    if let Some(absence) = absence_from_driver_init_error(&error) {
-                        let reason = absence.to_string();
-                        Self::record_cpu_reason(reason.clone());
-                        log::info!("[GPU] CUDA acceleration disabled: {reason}");
-                        diagnostics::log_cuda_disabled(&reason);
-                        return Ok(GpuAvailability::Absent(absence));
-                    }
-                    return Err(GpuError::DriverCallFailed {
-                        reason: error.to_string(),
-                    });
-                }
-            };
-            if device_count <= 0 {
-                let reason = "CUDA driver reported no devices";
-                Self::record_cpu_reason(reason);
-                diagnostics::log_cuda_disabled(reason);
-                return Ok(GpuAvailability::Absent(GpuAbsence::NoDevice {
-                    reason: reason.to_string(),
-                }));
-            }
-
-            let mut devices = Vec::new();
-            for ordinal in
-                0..usize::try_from(device_count).map_err(|_| GpuError::DriverCallFailed {
-                    reason: "negative CUDA device count".into(),
-                })?
-            {
-                let ctx = cuda_context_for(ordinal).ok_or_else(|| {
-                    gpu_err!("failed to create CUDA context for device {ordinal}")
-                })?;
-                catch_cudarc(|| ctx.bind_to_thread())
-                    .map_err(|_| GpuError::DriverCallFailed {
-                        reason: "CUDA context binding panicked after driver discovery".to_string(),
-                    })?
-                    .map_err(|err| GpuError::DriverCallFailed {
-                        reason: err.to_string(),
-                    })?;
-                devices.push(catch_cudarc(|| cuda_device_info(ordinal, &ctx)).map_err(
-                    |_| GpuError::DriverCallFailed {
-                        reason:
-                            "CUDA device inspection panicked after driver discovery".to_string(),
-                    },
-                )??);
-            }
-
-            devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
-            let Some(device) = devices.first().cloned() else {
-                Self::record_cpu_reason("CUDA driver reported no usable devices");
-                diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
-                return Ok(GpuAvailability::Absent(GpuAbsence::NoDevice {
-                    reason: "CUDA driver reported no usable devices".to_string(),
-                }));
-            };
-
-            let policy = crate::calibration::calibrated_policy_for_device(&device);
-            let memory_budget_bytes = device.memory_budget_bytes();
-            diagnostics::log_cuda_enabled(&device, &policy);
-            diagnostics::log_cuda_pool(&devices);
-
-            Ok(GpuAvailability::Available(Self {
-                device,
-                devices,
-                policy,
-                memory_budget_bytes,
-            }))
+            Self::probe_after_driver_preflight(
+                require_cudarc_library(CudarcLibrary::Driver),
+                Self::probe_loaded_driver,
+            )
         }
+    }
+
+    /// Let cudarc run only after its libcuda loader is known to succeed.
+    ///
+    /// cudarc reports a missing library by panicking inside its loader, and a
+    /// `panic = "abort"` consumer cannot recover that panic, so any fit that
+    /// reached the probe on a host without libcuda killed the process (#2972).
+    /// `driver` is the non-panicking walk over cudarc's own libcuda candidates. A
+    /// missing library is typed absence here, and `probe_loaded_driver`, which
+    /// makes the first cudarc call, never runs.
+    #[cfg(target_os = "linux")]
+    fn probe_after_driver_preflight(
+        driver: Result<(), GpuError>,
+        probe_loaded_driver: impl FnOnce() -> Result<GpuAvailability, GpuError>,
+    ) -> Result<GpuAvailability, GpuError> {
+        match driver {
+            Ok(()) => probe_loaded_driver(),
+            Err(GpuError::DriverLibraryUnavailable { reason }) => {
+                Self::record_cpu_reason(reason.clone());
+                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                diagnostics::log_cuda_disabled(&reason);
+                Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable { reason }))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn probe_loaded_driver() -> Result<GpuAvailability, GpuError> {
+        // #1017 probe-first fix: establish cudarc's primary context P and
+        // initialize the CUDA runtime ON IT as the VERY FIRST CUDA action -- before
+        // gam's libloading libcuda preload, the compute-lib dlopens, and device_count.
+        // The clean cuda_context_for-first path works; the probe-first path failed
+        // because a pre-context CUDA touch left the runtime bound to a non-P context,
+        // so later cuBLAS/cuSOLVER handle creation on the P-stream returned
+        // NOT_INITIALIZED. Making cuda_context_for the first action replicates the
+        // working clean path (CudaContext::new loads libcuda + retains the primary +
+        // ensure runs the runtime init). The libcuda walk before this call opened the
+        // library CudaContext::new opens, and cuda_context_for walks cudarc's
+        // libcudart names where its first runtime call would load them.
+        let primary_ready = cuda_context_for(0).is_some();
+        log::trace!("[GPU] probe pre-init primary context + runtime: {primary_ready}");
+        match crate::driver::preload_cuda_driver() {
+            Ok(()) => {}
+            Err(GpuError::DriverLibraryUnavailable { reason }) => {
+                Self::record_cpu_reason(reason.clone());
+                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                diagnostics::log_cuda_disabled(&reason);
+                return Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable { reason }));
+            }
+            Err(error) => return Err(error),
+        }
+
+        // Driver-only environments (e.g. large-scale workbench images that expose
+        // `libcuda.so.1` but ship no cuBLAS/cuSOLVER/cuSPARSE) used to slip
+        // past the libcuda preflight, enable the runtime, and then panic
+        // out of cudarc's `panic_no_lib_found` on the first `CudaBlas::new`
+        // — the panic crossed the PyO3 FFI boundary as a
+        // `ValueError: fit_table panicked inside Rust boundary: Unable to
+        // dynamically load the "cublas" shared library`. The compute
+        // libraries are dispatch-critical (every cuBLAS / cuSOLVER /
+        // cuSPARSE site under `src/gpu/` calls `CudaBlas::new` /
+        // `DnHandle::new` / cusparse handle creation eagerly during
+        // workspace allocation), so we refuse to advertise GPU unless all
+        // three load cleanly here.
+        for stem in ["cublas", "cusolver", "cusparse"] {
+            if let Err(error) = crate::driver::require_cuda_compute_library(stem) {
+                let reason = format!("lib{stem} unavailable: {error}");
+                Self::record_cpu_reason(reason.clone());
+                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                diagnostics::log_cuda_disabled(&reason);
+                return Err(GpuError::RuntimeDependencyUnavailable { reason });
+            }
+        }
+
+        // The stack preload above opens libraries by path. cudarc opens the ones it
+        // drives by its own candidate names when a handle is first created, and
+        // panics when none opens, so advertise the runtime only when those names
+        // open too (#2972).
+        for library in [CudarcLibrary::Runtime, CudarcLibrary::Blas, CudarcLibrary::Solver] {
+            if let Err(error) = require_cudarc_library(library) {
+                let reason = format!("cudarc cannot open lib{}: {error}", library.name());
+                Self::record_cpu_reason(reason.clone());
+                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                diagnostics::log_cuda_disabled(&reason);
+                return Err(GpuError::RuntimeDependencyUnavailable { reason });
+            }
+        }
+
+        let device_count = match CudaContext::device_count() {
+            Ok(count) => count,
+            Err(error) => {
+                // `device_count` performs `cuInit`, so this is the first
+                // moment the host's kernel driver actually answers. A
+                // refusal that is an ENVIRONMENT fact (userland CUDA
+                // libraries with no matching kernel driver — the container
+                // / CPU-node case #2267 hit as
+                // `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`) is typed absence:
+                // Auto falls back to CPU, Required still refuses with the
+                // same diagnosis. Anything else stays a probe fault.
+                if let Some(absence) = absence_from_driver_init_error(&error) {
+                    let reason = absence.to_string();
+                    Self::record_cpu_reason(reason.clone());
+                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                    diagnostics::log_cuda_disabled(&reason);
+                    return Ok(GpuAvailability::Absent(absence));
+                }
+                return Err(GpuError::DriverCallFailed {
+                    reason: error.to_string(),
+                });
+            }
+        };
+        if device_count <= 0 {
+            let reason = "CUDA driver reported no devices";
+            Self::record_cpu_reason(reason);
+            diagnostics::log_cuda_disabled(reason);
+            return Ok(GpuAvailability::Absent(GpuAbsence::NoDevice {
+                reason: reason.to_string(),
+            }));
+        }
+
+        let mut devices = Vec::new();
+        for ordinal in
+            0..usize::try_from(device_count).map_err(|_| GpuError::DriverCallFailed {
+                reason: "negative CUDA device count".into(),
+            })?
+        {
+            let ctx = cuda_context_for(ordinal).ok_or_else(|| {
+                gpu_err!("failed to create CUDA context for device {ordinal}")
+            })?;
+            ctx.bind_to_thread()
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: err.to_string(),
+                })?;
+            devices.push(cuda_device_info(ordinal, &ctx)?);
+        }
+
+        devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
+        let Some(device) = devices.first().cloned() else {
+            Self::record_cpu_reason("CUDA driver reported no usable devices");
+            diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
+            return Ok(GpuAvailability::Absent(GpuAbsence::NoDevice {
+                reason: "CUDA driver reported no usable devices".to_string(),
+            }));
+        };
+
+        let policy = crate::calibration::calibrated_policy_for_device(&device);
+        let memory_budget_bytes = device.memory_budget_bytes();
+        diagnostics::log_cuda_enabled(&device, &policy);
+        diagnostics::log_cuda_pool(&devices);
+
+        Ok(GpuAvailability::Available(Self {
+            device,
+            devices,
+            policy,
+            memory_budget_bytes,
+        }))
     }
 
     /// Return the cached probe outcome without collapsing faults into absence.
@@ -544,23 +485,30 @@ thread_local! {
 /// 256-byte cudaMalloc/cudaFree entirely, removing the per-call driver tax while
 /// preserving the invariant — a switch to any other ordinal re-runs the full
 /// repair.
+///
+/// Returns `false` when cudarc cannot open libcudart: the runtime touch would
+/// reach cudarc's panicking loader, and a context without the repair is not a
+/// usable context.
 #[cfg(target_os = "linux")]
-fn bind_and_touch_runtime(ordinal: usize, ctx: &Arc<CudaContext>) {
+fn bind_and_touch_runtime(ordinal: usize, ctx: &Arc<CudaContext>) -> bool {
     if BOUND_RUNTIME_ORDINAL.with(Cell::get) == Some(ordinal) {
-        return;
+        return true;
     }
-    let bound = catch_cudarc(|| ctx.bind_to_thread());
-    log::trace!(
-        "[GPU] cuda_context_for bind ok={} ordinal={ordinal}",
-        matches!(bound, Ok(Ok(())))
-    );
+    // `cudaSetDevice` in the runtime touch is cudarc's first libcudart call (#2972).
+    if let Err(error) = require_cudarc_library(CudarcLibrary::Runtime) {
+        log::debug!("[GPU] cuda_context_for ordinal={ordinal}: {error}");
+        return false;
+    }
+    let bound = ctx.bind_to_thread().is_ok();
+    log::trace!("[GPU] cuda_context_for bind ok={bound} ordinal={ordinal}");
     ensure_cuda_runtime_device(ordinal);
     // Latch the memo only after a SUCCESSFUL bind: a failed bind left the
     // thread's current context indeterminate, so the next call must retry the
     // full repair rather than assume `ordinal` is current.
-    if matches!(bound, Ok(Ok(()))) {
+    if bound {
         BOUND_RUNTIME_ORDINAL.with(|c| c.set(Some(ordinal)));
     }
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -568,13 +516,12 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<CudaContext>>>> = OnceLock::new();
     let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ctx) = contexts.lock().ok()?.get(&ordinal).cloned() {
-        bind_and_touch_runtime(ordinal, &ctx);
-        return Some(ctx);
+        return bind_and_touch_runtime(ordinal, &ctx).then_some(ctx);
     }
-    // cudarc 0.19 panics from `panic_no_lib_found` if its loader fails to
-    // locate libcuda. Demote that to `None` so the runtime probe surfaces a
-    // typed `DriverUnavailable` rather than tearing down the worker thread.
-    let ctx = catch_cudarc(|| CudaContext::new(ordinal)).ok()?.ok()?;
+    // `CudaContext::new` is cudarc's first libcuda call, and cudarc's loader
+    // panics when libcuda is missing. Settle that without cudarc (#2972).
+    require_cudarc_library(CudarcLibrary::Driver).ok()?;
+    let ctx = CudaContext::new(ordinal).ok()?;
     let out = {
         let mut guard = contexts.lock().ok()?;
         guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone()
@@ -583,8 +530,7 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     // an entry created on another thread; the memoised bind rebinds so the primary
     // context is current on THIS thread before the runtime touch (same probe-first
     // NOT_INITIALIZED guard) on the first touch, and is a no-op thereafter.
-    bind_and_touch_runtime(ordinal, &out);
-    Some(out)
+    bind_and_touch_runtime(ordinal, &out).then_some(out)
 }
 
 #[cfg(target_os = "linux")]
@@ -651,84 +597,58 @@ mod policy_resolution_contract_tests {
     use super::*;
     use crate::GpuPolicy;
 
-    /// Exercise the installed hook in fresh processes so other parallel tests
-    /// cannot replace it or hide a diagnostic in libtest's output capture.
+    /// #2972: a missing libcuda is typed absence decided before cudarc runs.
+    /// cudarc reports a missing library only by panicking, which a
+    /// `panic = "abort"` consumer cannot recover, so the probe must not reach
+    /// cudarc at all. The driver verdicts come from the real candidate walk.
     #[cfg(target_os = "linux")]
     #[test]
-    fn cudarc_loader_panic_diagnostics_follow_recovery_scope() {
-        const CHILD_MODE_PREFIX: &str = "__gam_cudarc_child_";
-        const LOADER_PANIC: &str = "Unable to dynamically load synthetic CUDA library";
-        if let Some(mode) = std::env::args()
-            .find_map(|argument| argument.strip_prefix(CHILD_MODE_PREFIX).map(str::to_owned))
-        {
-            install_cudarc_panic_filter();
-            match mode.as_str() {
-                "caught" => {
-                    assert_eq!(
-                        catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")),
-                        Err(LOADER_PANIC.into()),
-                    );
-                    assert!(!CUDARC_RECOVERY_ACTIVE.with(Cell::get));
-                }
-                "nested" => {
-                    let outer = catch_cudarc::<()>(|| {
-                        assert!(catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")).is_err());
-                        assert!(CUDARC_RECOVERY_ACTIVE.with(Cell::get));
-                        panic!("{LOADER_PANIC}");
-                    });
-                    assert_eq!(outer, Err(LOADER_PANIC.into()));
-                    assert!(!CUDARC_RECOVERY_ACTIVE.with(Cell::get));
-                }
-                "after" => {
-                    assert!(catch_cudarc::<()>(|| panic!("{LOADER_PANIC}")).is_err());
-                    panic!("{LOADER_PANIC}");
-                }
-                "other_thread" => {
-                    catch_cudarc(|| {
-                        assert!(
-                            std::thread::spawn(|| panic!("{LOADER_PANIC}"))
-                                .join()
-                                .is_err()
-                        );
-                    })
-                    .expect("a different thread's panic must not enter this recovery");
-                }
-                "unrelated" => {
-                    catch_cudarc::<()>(|| panic!("unrelated failure"))
-                        .expect("unrelated panics must unwind");
-                }
-                "unguarded" => panic!("{LOADER_PANIC}"),
-                _ => panic!("unknown subprocess mode: {mode}"),
-            }
-            return;
-        }
-        for (mode, succeeds, diagnostic) in [
-            ("caught", true, None),
-            ("nested", true, None),
-            ("after", false, Some(LOADER_PANIC)),
-            ("other_thread", true, Some(LOADER_PANIC)),
-            ("unrelated", false, Some("unrelated failure")),
-            ("unguarded", false, Some(LOADER_PANIC)),
-        ] {
-            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-                .args([
-                    "--exact",
-                    "device_runtime::policy_resolution_contract_tests::cudarc_loader_panic_diagnostics_follow_recovery_scope",
-                    "--nocapture",
-                ])
-                // A skip filter that matches no test carries the child mode
-                // through libtest's argument parser without environment state.
-                .args(["--skip", &format!("{CHILD_MODE_PREFIX}{mode}")])
-                .output()
-                .expect("run hook regression subprocess");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert_eq!(output.status.success(), succeeds, "mode={mode}: {stderr}");
-            assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-            match diagnostic {
-                Some(message) => assert!(stderr.contains(message), "mode={mode}: {stderr}"),
-                None => assert!(stderr.is_empty(), "mode={mode}: {stderr}"),
-            }
-        }
+    fn missing_driver_library_is_absence_before_any_cudarc_call_2972() {
+        let temp = tempfile::tempdir().expect("temporary driver directory");
+        let absent = temp.path().join("libcuda.so.1");
+        let unloadable = temp.path().join("libcuda.so.2972");
+        std::fs::write(&unloadable, b"not an ELF object").expect("write unloadable driver");
+        let walk = |candidate: &std::path::Path| {
+            crate::driver::load_library_names(&[candidate.display().to_string()]).map(|_| ())
+        };
+        let mut cudarc_calls = 0;
+
+        let availability = GpuRuntime::probe_after_driver_preflight(walk(&absent), || {
+            cudarc_calls += 1;
+            Ok(GpuAvailability::Absent(GpuAbsence::UnsupportedPlatform))
+        })
+        .expect("a missing driver library is absence, not a probe fault");
+        assert!(
+            matches!(
+                availability,
+                GpuAvailability::Absent(GpuAbsence::DriverUnavailable { .. })
+            ),
+            "a missing libcuda must be typed DriverUnavailable: {availability:?}"
+        );
+        assert_eq!(cudarc_calls, 0, "the probe reached cudarc without libcuda");
+
+        let error = GpuRuntime::probe_after_driver_preflight(walk(&unloadable), || {
+            cudarc_calls += 1;
+            Ok(GpuAvailability::Absent(GpuAbsence::UnsupportedPlatform))
+        })
+        .expect_err("a present but unloadable driver is a probe fault");
+        assert!(
+            matches!(error, GpuError::DriverLibraryLoadFailed { .. }),
+            "an unloadable libcuda must stay a load fault: {error}"
+        );
+        assert_eq!(cudarc_calls, 0, "the probe reached cudarc with an unloadable libcuda");
+
+        // Positive control: a driver that opens hands the probe to cudarc.
+        let availability = GpuRuntime::probe_after_driver_preflight(Ok(()), || {
+            cudarc_calls += 1;
+            Ok(GpuAvailability::Absent(GpuAbsence::UnsupportedPlatform))
+        })
+        .expect("the loaded-driver probe's outcome is returned as is");
+        assert!(matches!(
+            availability,
+            GpuAvailability::Absent(GpuAbsence::UnsupportedPlatform)
+        ));
+        assert_eq!(cudarc_calls, 1, "a loadable driver must reach the cudarc probe");
     }
 
     #[test]

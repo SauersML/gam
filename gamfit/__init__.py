@@ -100,6 +100,7 @@ from ._shape_census import (
 from ._compare import compare_models
 from ._event_history import EventHistoryModel, fit_event_history
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
+from ._joint_events import JointEventModel, fit_joint_event_model, load_joint_event_model
 from ._sparse_dictionary import (
     BlockSparseDictStream,
     BlockSparseDictionaryConvergence,
@@ -138,7 +139,9 @@ from ._sae_spectral import (
     RoutabilityFloor,
     SpectrometerReport,
     SpikeRecovery,
+    StageContainment,
     VarianceChargeEvidence,
+    WholeSetContainment,
     atlas_nerve_diagram,
     audit_sae,
     block_firing_coordinates,
@@ -156,6 +159,7 @@ from ._sae_spectral import (
     routability_floor,
     separation_limit,
     sparse_dict_dual_certificate,
+    whole_set_containment,
 )
 from ._penalties import (
     ARDPenalty,
@@ -385,6 +389,7 @@ from .manifold_crosscoder import sae_crosscoder_fit
 from .manifold_behavior import sae_behavior_fit
 from .checkpoint_dynamics import sae_checkpoint_dynamics
 from .intervention_calibration import ChartCalibration, fit_chart_calibration
+from .parameter_decomposition import ParameterDecompositionReport, run_parameter_decomposition
 from ._sae_spectral import audit_sae
 from .geometry import (
     CircleManifold,

@@ -193,6 +193,8 @@ pub use warm_start::*;
 #[cfg(test)]
 mod jeffreys_arming_979_tests;
 #[cfg(test)]
+mod certificate_1b_2954_tests;
+#[cfg(test)]
 mod soft_rho_guard_floor_2629_tests;
 #[cfg(test)]
 mod test_support;

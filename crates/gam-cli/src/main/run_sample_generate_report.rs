@@ -575,7 +575,19 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // band and the spec's order. The implied-order diagnostic uses
                 // λ_raw = λ̃ / ||S_raw,ℓ||_F, before the arbitrary Mellin
                 // ε_ℓ^(-2s0)·log_step gauge is folded into the fit-time forms.
+                // λ̃ is read by the rebuilt layout's global index, so a rebuild
+                // with another block count must refuse rather than misread it.
                 {
+                    if design.smooth.terms.iter().any(|term| {
+                        matches!(term.metadata, gam::basis::BasisMetadata::MeasureJet { .. })
+                    }) {
+                        gam::inference::model::saved_lambdas_index_rebuilt_layout(
+                            &spec,
+                            design.penalties.len(),
+                            &fit,
+                            "report measure-jet spectrum",
+                        )?;
+                    }
                     let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
                     for term in &design.smooth.terms {
                         let k = term.active_penalties.len();

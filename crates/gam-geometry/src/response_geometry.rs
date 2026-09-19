@@ -411,6 +411,229 @@ impl ResponseManifold {
             }
         }
     }
+
+    /// The base-point quantities that scale the rounding of every logarithm
+    /// taken at `base`, read once per Karcher evaluation.
+    fn karcher_base(&self, base: ArrayView1<'_, f64>) -> GeometryResult<KarcherBase> {
+        match self {
+            Self::Spd { n } => {
+                let (evals, _) =
+                    crate::manifold::symmetric_eigen(&crate::manifold::from_flat(base, *n, *n)?)?;
+                let largest = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+                let smallest = evals.iter().fold(f64::INFINITY, |acc, &v| acc.min(v));
+                if !(smallest > 0.0) {
+                    return Err(GeometryError::InvalidPoint("SPD eigenvalue is not positive"));
+                }
+                // An ambient error `E` at `P` has metric norm at most `‖E‖_F/λ_min`
+                // while a tangent `V` has at least `‖V‖_F/λ_max`, so ambient
+                // rounding relative to a tangent grows by `κ(P)` in the metric.
+                Ok(KarcherBase {
+                    defect: 0.0,
+                    distortion: largest / smallest,
+                })
+            }
+            Self::Grassmann { k, n } | Self::Stiefel { k, n } => {
+                // The logarithms treat `Y` as orthonormal; a frame off by
+                // `‖YᵀY − I‖_F` moves every logarithm by up to that defect per
+                // unit of target magnitude.
+                let y = crate::manifold::from_flat(base, *n, *k)?;
+                let gram = y.t().dot(&y);
+                let mut defect_sq = 0.0_f64;
+                for i in 0..*k {
+                    for j in 0..*k {
+                        let e = gram[[i, j]] - if i == j { 1.0 } else { 0.0 };
+                        defect_sq += e * e;
+                    }
+                }
+                // The canonical Stiefel norm lies between `1/√2` and `1` of the
+                // Frobenius norm the ambient arithmetic rounds in.
+                let distortion = match self {
+                    Self::Stiefel { k, .. } if *k > 1 => std::f64::consts::SQRT_2,
+                    _ => 1.0,
+                };
+                Ok(KarcherBase {
+                    defect: defect_sq.sqrt(),
+                    distortion,
+                })
+            }
+            // Conformal metrics scale every coordinate alike.
+            Self::Poincare { .. } | Self::ConstantCurvature { .. } => Ok(KarcherBase {
+                defect: 0.0,
+                distortion: 1.0,
+            }),
+        }
+    }
+
+    /// First-order rounding band, in the metric norm at `base`, of one computed
+    /// logarithm `log = log_base(value)` whose metric norm is `distance`: how far
+    /// the tangent the log map returns can sit from the exact logarithm. Each arm
+    /// follows the arithmetic of that manifold's logarithm; `γ_k` is
+    /// [`accumulation_growth`](gam_linalg::roundoff::accumulation_growth).
+    fn log_rounding_band(
+        &self,
+        base: ArrayView1<'_, f64>,
+        value: ArrayView1<'_, f64>,
+        log: ArrayView1<'_, f64>,
+        distance: f64,
+        at: &KarcherBase,
+    ) -> GeometryResult<f64> {
+        use gam_linalg::roundoff::accumulation_growth;
+        let band = match self {
+            Self::Grassmann { k: 1, n } | Self::Stiefel { k: 1, n } => {
+                // `SphereManifold::log_map` (the projective log aligns the sign of
+                // `value` first, which leaves every magnitude here unchanged):
+                // `u = x − (p·x)p` is an `n`-term inner product and two operations
+                // per coordinate, so it rounds by `γ_{n+2}(‖x‖₁ + |p·x|‖p‖₁)`, and
+                // its direction is scaled by `θ/‖u‖ = θ/sin θ`. The chord angle `θ`,
+                // `‖u‖` and that scale take at most `2n + 8` more operations. A base
+                // off the unit sphere by `δ` tilts `u` by at most `δ·‖x‖₁`.
+                let base_l1: f64 = base.iter().map(|v| v.abs()).sum();
+                let value_l1: f64 = value.iter().map(|v| v.abs()).sum();
+                let cosine = crate::manifold::dot(base, value).abs();
+                let stretch = if distance > 0.0 {
+                    distance / distance.sin()
+                } else {
+                    1.0
+                };
+                stretch
+                    * (accumulation_growth(n + 2) * (value_l1 + cosine * base_l1)
+                        + at.defect * value_l1)
+                    + accumulation_growth(2 * n + 8) * distance
+            }
+            Self::Grassmann { k, n } => {
+                // `YᵀZ` (`n`-term sums), its Gauss–Jordan inverse (backward stable
+                // to `kε·max`), the normal `Z − Y(YᵀZ)`, `M = normal·(YᵀZ)⁻¹`, the
+                // Gram `MᵀM` with its eigenvectors, and `U·Σ·Vᵀ`: at most
+                // `n + 3k + 1` operations per entry. The normal cancels to
+                // `‖sin Θ‖ ≤ d` from terms of size `‖Y‖_F + ‖Z‖_F`; the inverse
+                // amplifies that by `sec θ_max` and errs by `sec²θ_max·k` times
+                // `γ` itself, applied to the normal. `σ = atan(t)` has
+                // `dσ/dt = cos²σ ≤ 1`, so the map from `M` to `Δ` amplifies nothing.
+                let delta = crate::manifold::from_flat(log, *n, *k)?;
+                let (angles_sq, _) = crate::manifold::symmetric_eigen(&delta.t().dot(&delta))?;
+                let largest_angle = angles_sq
+                    .iter()
+                    .fold(0.0_f64, |acc, &v| acc.max(v))
+                    .sqrt();
+                let cos_largest = largest_angle.cos();
+                if !(cos_largest > 0.0) {
+                    return Err(GeometryError::Singular(
+                        "Grassmann logarithm at a principal angle of π/2 has no rounding band",
+                    ));
+                }
+                let secant = 1.0 / cos_largest;
+                let magnitude = crate::manifold::norm(base) + crate::manifold::norm(value);
+                accumulation_growth(n + 3 * k + 1)
+                    * (secant * magnitude + secant * secant * (*k as f64) * distance + distance)
+                    + at.defect * secant * magnitude
+            }
+            Self::Stiefel { n, .. } => {
+                // `stiefel_canonical_log` certifies its normal block inside
+                // `γ_{n²+2n}‖log V‖_F`, with `‖log V‖_F ≤ √2‖Δ‖_F ≤ 2d` (the
+                // canonical norm is at least `‖Δ‖_F/√2`). Its frames come from two
+                // Gram–Schmidt passes over at most `n` columns (`γ_{2n²+n}` each)
+                // of unit columns, and `Δ = YA + Y⊥B` is two `n`-term products.
+                let magnitude = crate::manifold::norm(base) + crate::manifold::norm(value);
+                accumulation_growth(n * n + 2 * n) * 2.0 * distance
+                    + (accumulation_growth(2 * n * n + 2 * n) + at.defect) * magnitude
+            }
+            Self::Spd { n } => {
+                // `P^{±1/2}` come from one symmetric eigendecomposition of `P`,
+                // backward stable to `nε‖P‖₂`; in the metric at `P` that moves the
+                // base by `nε·κ(P)`, and a base move of `h` moves the logarithm by at
+                // most `(1 + d)·h` on this Hadamard manifold. `M = P^{-1/2}QP^{-1/2}`
+                // (two `n`-term products) rounds by `γ_{2n}κ(P)‖M‖₂`, and `log M`
+                // (a second eigendecomposition, `nε‖M‖₂` backward) is amplified by
+                // the logarithm's divided differences, at most `1/λ_min(M)`, into
+                // `κ(M) ≤ e^{√2·d}` (the eigenvalue spread of `log M` is at most
+                // `√2‖log M‖_F`). `P^{1/2}·log M·P^{1/2}` rounds by `γ_{2n}κ(P)d`.
+                // `√n` bounds the Frobenius norm by the spectral one.
+                let spread = (std::f64::consts::SQRT_2 * distance).exp();
+                accumulation_growth(4 * n)
+                    * at.distortion
+                    * (*n as f64).sqrt()
+                    * (spread + 2.0 * (1.0 + distance))
+            }
+            Self::Poincare { dim, curvature } => {
+                // `log_p(x) = (2/λ_p)·log_0((−p) ⊕ x)`, and the metric at `p`
+                // multiplies by `λ_p`, so the band is twice that of `log_0(y)`.
+                // Möbius addition forms three `dim`-term inner products, two
+                // coefficients, a denominator and one quotient per coordinate:
+                // `y` rounds by `γ_{2d+6}(c_u‖p‖ + c_v‖x‖ + ‖y‖·c_d)/denominator`
+                // with `c_u, c_v, c_d` the coefficients' absolute-value sums.
+                // `log_0(y) = atanh(s)/(√k‖y‖)·y`, `s = √k‖y‖`, turns a move `δy`
+                // into at most `δy·(1/(1 − s²) + atanh(s)/s)`: its radial slope and
+                // its angular stretch. The scalar factors add `γ_{2d+4}·d`.
+                let k = -curvature;
+                let uv = -crate::manifold::dot(base, value);
+                let uu = base.dot(&base);
+                let vv = value.dot(&value);
+                let coeff_u = 1.0 + 2.0 * k * uv + k * vv;
+                let coeff_v = 1.0 - k * uu;
+                let denom = 1.0 + 2.0 * k * uv + k * k * uu * vv;
+                let mut y_sq = 0.0_f64;
+                for (&p, &x) in base.iter().zip(value.iter()) {
+                    let y = (coeff_u * (-p) + coeff_v * x) / denom;
+                    y_sq += y * y;
+                }
+                let y_norm = y_sq.sqrt();
+                let s = k.sqrt() * y_norm;
+                // `log_0` clamps `s` at `1 − BOUNDARY_EPS`: past it the returned
+                // logarithm is shortened, not rounded, and no band covers it.
+                if s >= 1.0 - crate::manifolds::poincare::BOUNDARY_EPS {
+                    return Err(GeometryError::Singular(
+                        "Poincaré logarithm clamped at the ball boundary: the target lies beyond \
+                         the distance the base can resolve",
+                    ));
+                }
+                let magnitudes = (1.0 + 2.0 * k * uv.abs() + k * vv) * uu.sqrt()
+                    + (1.0 + k * uu) * vv.sqrt()
+                    + y_norm * (1.0 + 2.0 * k * uv.abs() + k * k * uu * vv);
+                let y_band = accumulation_growth(2 * dim + 6) * magnitudes / denom;
+                let angular = if s > 0.0 { s.atanh() / s } else { 1.0 };
+                2.0 * y_band * (1.0 / (1.0 - s * s) + angular)
+                    + accumulation_growth(2 * dim + 4) * distance
+            }
+            Self::ConstantCurvature { dim, kappa } => {
+                // The centred chart takes `ℓ = T(κr²)·(x − p)` with `r = ‖x − p‖`,
+                // measured by the conformal factor `λ_p`: the difference rounds by
+                // `γ₁(‖x‖ + ‖p‖)`, `κr²` by `γ_{d+1}|κ|r²`, which `T` turns into
+                // `|T′|·γ_{d+1}|κ|r²`, and `T` itself and the product add `γ₄T`.
+                let centred = &value.to_owned() - &base;
+                let r_sq = centred.dot(&centred);
+                let w = kappa * r_sq;
+                let [t, t_prime, _] = crate::manifolds::constant_curvature::t_stacks3(w);
+                let lambda = ConstantCurvature::new(*dim, *kappa).conformal_factor(base)?;
+                let magnitude = crate::manifold::norm(base) + crate::manifold::norm(value);
+                lambda
+                    * accumulation_growth(dim + 6)
+                    * (t.abs() * magnitude + r_sq.sqrt() * (t.abs() + (w * t_prime).abs()))
+            }
+        };
+        if !band.is_finite() {
+            return Err(GeometryError::Singular(
+                "response geometry logarithm has no finite rounding band",
+            ));
+        }
+        Ok(band)
+    }
+}
+
+/// Base-point quantities scaling the rounding of the logarithms taken there:
+/// the frame's orthonormality defect (Grassmann/Stiefel) and the factor by
+/// which the metric can magnify ambient rounding relative to a tangent
+/// (`κ(P)` for SPD, `√2` for the canonical Stiefel metric, `1` otherwise).
+struct KarcherBase {
+    defect: f64,
+    distortion: f64,
+}
+
+/// The Karcher direction `ξ = Σ wᵢ log_p(xᵢ)` at one point, its metric norm, and
+/// the rounding band of that norm.
+struct KarcherState {
+    xi: Array1<f64>,
+    residual: f64,
+    band: f64,
 }
 
 /// Batched response-geometry logarithm: map every manifold-valued response row
@@ -534,8 +757,7 @@ pub fn dispatch_log_map(
                 }
                 centroid
             }
-            _ => response_frechet_mean(manifold, values, weights, 1.0e-12, 256)
-                .map_err(|err| err.to_string())?,
+            _ => response_frechet_mean(manifold, values, weights).map_err(|err| err.to_string())?,
         },
     };
     let tangent = response_log_map(manifold, values, base_point.view())?;
@@ -553,26 +775,80 @@ pub fn dispatch_exp_map(
     response_exp_map(manifold, tangent, base)
 }
 
+/// The Karcher direction `ξ = Σ wᵢ log_p(xᵢ) = −½ grad V` at `p` over the
+/// positive-mass rows of `values`, its metric norm, and the rounding band of
+/// that norm: each logarithm's own band, plus the weighted sum's at most `m`
+/// roundings per coordinate magnified by the metric's distortion (the weights
+/// sum to one). The norm's own rounding is relative to the residual, so it is
+/// second order at the certificate `‖ξ‖_p ≤ band`.
+fn karcher_state(
+    manifold: ResponseManifold,
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    p: ArrayView1<'_, f64>,
+) -> GeometryResult<KarcherState> {
+    let at = manifold.karcher_base(p)?;
+    let mut xi = Array1::<f64>::zeros(p.len());
+    let mut log_bands = 0.0_f64;
+    let mut log_mass = 0.0_f64;
+    for (x, &weight) in values.outer_iter().zip(weights.iter()) {
+        if weight == 0.0 {
+            continue;
+        }
+        let lg = manifold.log_point(p, x)?;
+        let distance = manifold.sq_metric_norm(p, lg.view())?.sqrt();
+        log_bands += weight * manifold.log_rounding_band(p, x, lg.view(), distance, &at)?;
+        log_mass += weight * distance;
+        xi.scaled_add(weight, &lg);
+    }
+    let residual = manifold.sq_metric_norm(p, xi.view())?.sqrt();
+    let band = log_bands
+        + gam_linalg::roundoff::accumulation_growth(values.nrows()) * at.distortion * log_mass;
+    Ok(KarcherState {
+        xi,
+        residual,
+        band,
+    })
+}
+
+/// The context every typed Fréchet-mean refusal carries.
+const FRECHET_MEAN_CONTEXT: &str = "response geometry Fréchet mean";
+
 /// Intrinsic (Karcher) Fréchet mean of manifold-valued responses, the default
 /// base point when the user supplies none. `values` is `(n_rows, ambient)`.
 ///
 /// This is the SPD safeguarded Karcher iteration generalised over an arbitrary
-/// [`ResponseManifold`]: a Riemannian gradient-descent on the weighted
-/// dispersion `V(P) = Σ_i w_i ‖log_P(X_i)‖²_P` with the descent direction
-/// `ξ = Σ_i w_i log_P(X_i)` (`= −½ grad V`), a unit Karcher step `exp_P(t·ξ)`
-/// with Armijo backtracking plus a round-off cushion, and the metric-norm
-/// stationarity certificate `‖ξ‖_P ≤ tol`. No approximate point is returned on
-/// a stalled line search or exhausted iteration budget. Positively curved
-/// geometries additionally require the weighted support to lie inside their
-/// analytic strong-convexity radius, certifying the stationary point as the
-/// unique global Fréchet mean; diffuse data return a typed error and require an
-/// explicit base instead of selecting a capped multistart basin.
+/// [`ResponseManifold`]: a Riemannian gradient descent on the weighted
+/// dispersion `V(P) = Σ_i w_i ‖log_P(X_i)‖²_P` along `ξ = Σ_i w_i log_P(X_i)`
+/// (`= −½ grad V`), with Karcher steps `exp_P(t·ξ)` backtracked from the unit
+/// step. It runs in two phases, and each ends on its own progress rather than
+/// on a budget:
+///
+/// 1. While `V` resolves progress, a step must pass the Armijo test and lower
+///    `V` by more than its round-off cushion. `V ≥ 0` falls by at least that
+///    cushion per step, so the phase is finite.
+/// 2. Once no backtracked step resolves a decrease of `V`, the residual
+///    `‖ξ‖_P` carries the progress: a step is accepted when it strictly lowers
+///    the residual, and a strictly decreasing sequence of doubles is finite.
+///
+/// The only success exit is the stationarity certificate `‖ξ‖_P ≤ β(P)`, where
+/// `β` is the rounding band of `ξ`'s own evaluation ([`karcher_state`]): a
+/// residual inside it is not resolved from zero. A phase-2 search that finds no
+/// step lowering a residual above the band is a stall, and is refused as a typed
+/// [`GeometryError::NonConvergence`] carrying the band as its tolerance. No
+/// approximate point is ever returned.
+///
+/// Positively curved geometries additionally require the weighted support to
+/// lie inside their analytic strong-convexity radius, certifying the stationary
+/// point as the unique global Fréchet mean. The seed is a positive-mass sample,
+/// so a support that spreads from it by twice that radius can never pass the
+/// certificate (triangle inequality), and is refused before the descent runs.
+/// Diffuse data return a typed error and require an explicit base instead of
+/// selecting a multistart basin.
 pub(crate) fn response_frechet_mean(
     manifold: ResponseManifold,
     values: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
-    tol: f64,
-    max_iter: usize,
 ) -> GeometryResult<Array1<f64>> {
     let ambient = manifold.ambient_dim();
     let (m, cols) = values.dim();
@@ -581,102 +857,30 @@ pub(crate) fn response_frechet_mean(
             "response geometry Fréchet mean requires a non-empty value matrix with manifold ambient width",
         ));
     }
-    if !(tol.is_finite() && tol > 0.0) {
-        return Err(GeometryError::InvalidPoint(
-            "response geometry Fréchet mean tolerance must be finite and positive",
-        ));
-    }
     let w = crate::normalize_weights(m, weights).map_err(|_| {
         GeometryError::InvalidPoint("response geometry Fréchet mean has invalid weights")
     })?;
     let samples: Vec<Array1<f64>> = (0..m).map(|i| values.row(i).to_owned()).collect();
 
-    let dispersion = |p: ArrayView1<'_, f64>| -> GeometryResult<f64> {
-        let mut acc = 0.0_f64;
-        for (i, x) in samples.iter().enumerate() {
-            if w[i] == 0.0 {
+    let stationarity = |p: ArrayView1<'_, f64>| karcher_state(manifold, values, w.view(), p);
+
+    // Largest geodesic distance from `p` to a positive-mass sample.
+    let support_radius = |p: ArrayView1<'_, f64>| -> GeometryResult<f64> {
+        let mut radius = 0.0_f64;
+        for (index, sample) in samples.iter().enumerate() {
+            if w[index] == 0.0 {
                 continue;
             }
-            let lg = manifold.log_point(p, x.view())?;
-            let sq = manifold.sq_metric_norm(p, lg.view())?;
-            acc += w[i] * sq;
-        }
-        Ok(acc)
-    };
-
-    let stationarity = |p: ArrayView1<'_, f64>| -> GeometryResult<(Array1<f64>, f64)> {
-        let mut xi = Array1::<f64>::zeros(ambient);
-        for (i, x) in samples.iter().enumerate() {
-            if w[i] == 0.0 {
-                continue;
+            let log = manifold.log_point(p, sample.view())?;
+            let distance = manifold.sq_metric_norm(p, log.view())?.sqrt();
+            if !distance.is_finite() {
+                return Err(GeometryError::Singular(
+                    "response geometry Fréchet support radius is non-finite",
+                ));
             }
-            let lg = manifold.log_point(p, x.view())?;
-            xi.scaled_add(w[i], &lg);
+            radius = radius.max(distance);
         }
-        let residual = manifold.sq_metric_norm(p, xi.view())?.sqrt();
-        Ok((xi, residual))
-    };
-
-    // Safeguarded Riemannian gradient descent from one interior start. The only
-    // success exit is the analytic Karcher certificate `‖Σwᵢlogₚ(xᵢ)‖ₚ≤tol`;
-    // line-search or iteration exhaustion above it is typed non-convergence.
-    let descend = |start: Array1<f64>| -> GeometryResult<(Array1<f64>, f64)> {
-        let mut p = start;
-        let mut f_cur = dispersion(p.view())?;
-        for iteration in 0..max_iter {
-            // Riemannian gradient direction ξ = Σ wᵢ log_p(xᵢ) = −½ grad V.
-            let (xi, grad_norm) = stationarity(p.view())?;
-            if grad_norm <= tol {
-                return Ok((p, grad_norm));
-            }
-
-            // Armijo-backtracked unit Karcher step exp_p(t·ξ). A step that
-            // leaves the manifold's domain (e.g. a Poincaré overshoot past the
-            // ball boundary) or lands where the dispersion is undefined is an
-            // INVALID trial (`Ok(None)`): shrink and retry without consulting
-            // the Armijo test. The descent never aborts on a trial-evaluation error.
-            let pred = grad_norm * grad_norm;
-            let f_tol = armijo_roundoff_cushion(f_cur);
-            let accepted = match backtracking_line_search::<_, Infallible>(
-                BacktrackConfig::default(),
-                |t| {
-                    let step = &xi * t;
-                    let Ok(cand) = manifold.exp_point(p.view(), step.view()) else {
-                        return Ok(None);
-                    };
-                    let Ok(f_cand) = dispersion(cand.view()) else {
-                        return Ok(None);
-                    };
-                    Ok(Some((f_cand, cand)))
-                },
-                |t, f_cand| f_cand <= f_cur - 2.0 * constants::ARMIJO_C1 * t * pred + f_tol,
-            ) {
-                Ok(result) => result,
-                Err(never) => match never {},
-            };
-            let Some(accepted_step) = accepted else {
-                return Err(GeometryError::NonConvergence {
-                    context: "response geometry Fréchet mean",
-                    iterations: iteration + 1,
-                    residual: grad_norm,
-                    tolerance: tol,
-                });
-            };
-            p = accepted_step.payload;
-            f_cur = accepted_step.value;
-        }
-        // The final allowed update can cross the requested threshold.
-        let (_, residual) = stationarity(p.view())?;
-        if residual <= tol {
-            Ok((p, residual))
-        } else {
-            Err(GeometryError::NonConvergence {
-                context: "response geometry Fréchet mean",
-                iterations: max_iter,
-                residual,
-                tolerance: tol,
-            })
-        }
+        Ok(radius)
     };
 
     // Choose one row-order-invariant positive-mass seed: highest weight, then
@@ -715,35 +919,154 @@ pub(crate) fn response_frechet_mean(
         samples[seed_index].view(),
         Array1::<f64>::zeros(ambient).view(),
     )?;
-    let (mean, stationarity_residual) = descend(start)?;
 
-    if let Some(uniqueness_radius) = manifold.frechet_uniqueness_radius() {
-        let mut support_radius = 0.0_f64;
-        for (index, sample) in samples.iter().enumerate() {
-            if w[index] == 0.0 {
-                continue;
-            }
-            let log = manifold.log_point(mean.view(), sample.view())?;
-            let distance = manifold.sq_metric_norm(mean.view(), log.view())?.sqrt();
-            if !distance.is_finite() {
-                return Err(GeometryError::Singular(
-                    "response geometry Fréchet support radius is non-finite",
-                ));
-            }
-            support_radius = support_radius.max(distance);
+    let uniqueness_radius = manifold.frechet_uniqueness_radius();
+    if let Some(uniqueness_radius) = uniqueness_radius {
+        // A certified mean lies within the uniqueness radius of every
+        // positive-mass sample, the seed included, so every sample lies within
+        // twice that radius of the seed.
+        let seed_spread = support_radius(start.view())?;
+        if seed_spread >= 2.0 * uniqueness_radius {
+            return Err(GeometryError::FrechetMeanSupportNotLocalized {
+                context: FRECHET_MEAN_CONTEXT,
+                seed_spread,
+                uniqueness_radius,
+            });
         }
+    }
+
+    let (p, state) = karcher_descent(manifold, values, w.view(), start, stationarity)?;
+
+    if let Some(uniqueness_radius) = uniqueness_radius {
+        let support_radius = support_radius(p.view())?;
         if support_radius >= uniqueness_radius {
             return Err(GeometryError::FrechetMeanNotGloballyCertified {
-                context: "response geometry Fréchet mean",
-                stationarity_residual,
-                tolerance: tol,
+                context: FRECHET_MEAN_CONTEXT,
+                stationarity_residual: state.residual,
+                tolerance: state.band,
                 support_radius,
                 uniqueness_radius,
             });
         }
     }
 
-    Ok(mean)
+    Ok(p)
+}
+
+/// Weighted dispersion `V(p) = Σ wᵢ ‖log_p(xᵢ)‖²_p` over the positive-mass rows.
+fn karcher_dispersion(
+    manifold: ResponseManifold,
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    p: ArrayView1<'_, f64>,
+) -> GeometryResult<f64> {
+    let mut acc = 0.0_f64;
+    for (x, &weight) in values.outer_iter().zip(weights.iter()) {
+        if weight == 0.0 {
+            continue;
+        }
+        let lg = manifold.log_point(p, x)?;
+        acc += weight * manifold.sq_metric_norm(p, lg.view())?;
+    }
+    Ok(acc)
+}
+
+/// The two-phase Karcher descent of [`response_frechet_mean`] from `start`,
+/// certified by the band `stationarity` reports with each residual. Returns the
+/// certified point with its state, or the typed stall.
+///
+/// It stops without a budget. Each accepted phase-1 step lowers the computed
+/// `V ≥ 0` by more than its cushion `8ε(1 + V) ≥ 8ε`, so phase 1 takes at most
+/// `V(start)/(8ε)` steps. Each accepted phase-2 step strictly lowers the
+/// computed residual, a non-negative double, and only finitely many doubles lie
+/// below the residual phase 2 starts from. Each backtracking search tries a
+/// bounded number of step lengths.
+fn karcher_descent(
+    manifold: ResponseManifold,
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    start: Array1<f64>,
+    stationarity: impl Fn(ArrayView1<'_, f64>) -> GeometryResult<KarcherState>,
+) -> GeometryResult<(Array1<f64>, KarcherState)> {
+    let dispersion = |p: ArrayView1<'_, f64>| karcher_dispersion(manifold, values, weights, p);
+    let mut p = start;
+    let mut state = stationarity(p.view())?;
+    let mut f_cur = dispersion(p.view())?;
+    let mut iterations = 0usize;
+
+    // Phase 1: Armijo-backtracked unit Karcher steps exp_p(t·ξ) that lower V by
+    // a resolved amount. A step that leaves the manifold's domain (e.g. a
+    // Poincaré overshoot past the ball boundary) or lands where the dispersion
+    // is undefined is an INVALID trial (`Ok(None)`): shrink and retry without
+    // consulting the acceptance test.
+    while !(state.residual <= state.band) {
+        let pred = state.residual * state.residual;
+        let f_tol = armijo_roundoff_cushion(f_cur);
+        let accepted = match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig::default(),
+            |t| {
+                let step = &state.xi * t;
+                let Ok(cand) = manifold.exp_point(p.view(), step.view()) else {
+                    return Ok(None);
+                };
+                let Ok(f_cand) = dispersion(cand.view()) else {
+                    return Ok(None);
+                };
+                Ok(Some((f_cand, cand)))
+            },
+            |t, f_cand| {
+                f_cand < f_cur - f_tol
+                    && f_cand <= f_cur - 2.0 * constants::ARMIJO_C1 * t * pred + f_tol
+            },
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        };
+        let Some(accepted_step) = accepted else {
+            break;
+        };
+        p = accepted_step.payload;
+        f_cur = accepted_step.value;
+        state = stationarity(p.view())?;
+        iterations += 1;
+    }
+
+    // Phase 2: the same steps, accepted when they strictly lower the residual.
+    // A trial that rounds back onto `p` cannot, so it is contracted unevaluated.
+    while !(state.residual <= state.band) {
+        let residual = state.residual;
+        let accepted = match backtracking_line_search::<_, Infallible>(
+            BacktrackConfig::default(),
+            |t| {
+                let step = &state.xi * t;
+                let Ok(cand) = manifold.exp_point(p.view(), step.view()) else {
+                    return Ok(None);
+                };
+                if cand == p {
+                    return Ok(None);
+                }
+                let Ok(cand_state) = stationarity(cand.view()) else {
+                    return Ok(None);
+                };
+                Ok(Some((cand_state.residual, (cand, cand_state))))
+            },
+            |_, cand_residual| cand_residual < residual,
+        ) {
+            Ok(result) => result,
+            Err(never) => match never {},
+        };
+        let Some(accepted_step) = accepted else {
+            return Err(GeometryError::NonConvergence {
+                context: FRECHET_MEAN_CONTEXT,
+                iterations,
+                residual: state.residual,
+                tolerance: state.band,
+            });
+        };
+        (p, state) = accepted_step.payload;
+        iterations += 1;
+    }
+    Ok((p, state))
 }
 
 // ── Curvature as an estimand on the response geometry (#944 stage 4 / #1104) ──
@@ -818,17 +1141,18 @@ pub enum ResponseGeometryError {
     CurvatureUnidentified {
         dispersion: f64,
     },
+    /// The κ̂ score solve collapsed its sign bracket to adjacent doubles without
+    /// its certificate: a score inside its own rounding band at a point of
+    /// positive curvature.
     CurvatureNonConvergence {
         iterations: usize,
-        max_iter: usize,
         bracket_lo: f64,
         bracket_hi: f64,
         kappa: f64,
         criterion: f64,
         score: f64,
         curvature: f64,
-        kkt_residual: f64,
-        tolerance: f64,
+        score_band: f64,
     },
 }
 
@@ -842,23 +1166,20 @@ impl fmt::Display for ResponseGeometryError {
             ),
             Self::CurvatureNonConvergence {
                 iterations,
-                max_iter,
                 bracket_lo,
                 bracket_hi,
                 kappa,
                 criterion,
                 score,
                 curvature,
-                kkt_residual,
-                tolerance,
+                score_band,
             } => write!(
                 f,
-                "response curvature did not satisfy its minimizing box-KKT certificate after \
-                 {iterations}/{max_iter} iterations: bracket=[{bracket_lo:.6e}, \
-                 {bracket_hi:.6e}], kappa={kappa:.6e}, criterion={criterion:.6e}, \
-                 score={score:.6e}, normalized KKT residual={kkt_residual:.6e} \
-                 (required <= {tolerance:.6e}), curvature={curvature:.6e} \
-                 (required > 0)"
+                "response curvature did not satisfy its minimizing KKT certificate: after \
+                 {iterations} steps its score bracket [{bracket_lo:.6e}, {bracket_hi:.6e}] \
+                 holds no double strictly inside, at kappa={kappa:.6e}, \
+                 criterion={criterion:.6e}, score={score:.6e} (required |score| <= its \
+                 rounding band {score_band:.6e}), curvature={curvature:.6e} (required > 0)"
             ),
         }
     }
@@ -1068,6 +1389,9 @@ struct CurvatureCriterionJet {
     value: f64,
     score: f64,
     curvature: f64,
+    /// First-order rounding band of `score`: a score inside it is not resolved
+    /// from zero by the arithmetic that formed it.
+    score_band: f64,
     base: Array1<f64>,
 }
 
@@ -1110,6 +1434,13 @@ fn response_curvature_criterion_jet(
     let mut chart_volume = 0.0_f64;
     let mut chart_volume_d1 = 0.0_f64;
     let mut chart_volume_d2 = 0.0_f64;
+    // Absolute magnitudes of the score's terms, each scaled by how far rounding
+    // in the centred coordinate can move it (see `score_band` below).
+    let base_norm = crate::manifold::norm(base.view());
+    let mut dispersion_mass = 0.0_f64;
+    let mut dispersion_d1_mass = 0.0_f64;
+    let mut ln_jac_d1_mass = 0.0_f64;
+    let mut chart_volume_d1_mass = 0.0_f64;
 
     // #2351: the chart origin is IDENTIFIED with the flat centroid — every
     // per-row quantity evaluates on the mean-centred coordinate z_i = y_i − μ.
@@ -1127,6 +1458,18 @@ fn response_curvature_criterion_jet(
         dispersion += r * r;
         dispersion_d1 += 2.0 * r * r_d1;
         dispersion_d2 += 2.0 * (r_d1 * r_d1 + r * r_d2);
+        // The centred coordinate `z = y − μ` rounds by `γ(‖y‖ + ‖μ‖)` absolute,
+        // and each score term carries at most the fourth power of `‖z‖`
+        // (`r·∂r/∂κ ∝ ‖z‖⁴`), so it moves by at most `4(‖y‖ + ‖μ‖)/‖z‖` of itself
+        // per unit `γ` on top of its own rounding.
+        let centred_norm = crate::manifold::norm(centred.view());
+        let lift = if centred_norm > 0.0 {
+            1.0 + 4.0 * (crate::manifold::norm(row) + base_norm) / centred_norm
+        } else {
+            1.0
+        };
+        dispersion_mass += r * r * lift;
+        dispersion_d1_mass += (2.0 * r * r_d1).abs() * lift;
 
         if dim > 1 {
             // J_κ(r)=S(u)^(d−1), u=κr². Chain-rule jets of u.
@@ -1145,6 +1488,7 @@ fn response_curvature_criterion_jet(
             ln_jac += exponent * s[0].ln();
             ln_jac_d1 += exponent * log_s_d1 * u_d1;
             ln_jac_d2 += exponent * (log_s_d2 * u_d1 * u_d1 + log_s_d1 * u_d2);
+            ln_jac_d1_mass += (exponent * log_s_d1 * u_d1).abs() * lift;
         }
 
         // −d ln λ_z = d[ln(1+κ‖z‖²)−ln 2], evaluated at the CENTRED coordinate
@@ -1160,6 +1504,7 @@ fn response_curvature_criterion_jet(
         chart_volume += d * (gauge.ln() - std::f64::consts::LN_2);
         chart_volume_d1 += d * q / gauge;
         chart_volume_d2 -= d * q * q / (gauge * gauge);
+        chart_volume_d1_mass += (d * q / gauge).abs() * lift;
     }
     let nobs = (n_rows * dim) as f64;
     if !(dispersion.is_finite() && dispersion > 0.0) {
@@ -1182,13 +1527,78 @@ fn response_curvature_criterion_jet(
             "response curvature criterion jet is non-finite".into(),
         ));
     }
+    // First-order rounding band of the score, `γ_N` times the magnitudes above.
+    // The centroid is an `n`-term mean and the centred coordinate one more
+    // subtraction; the distance κ-jet takes a `dim`-term norm and at most ten
+    // more operations per term; the score sums `n` terms. So `N = 2n + dim + 12`.
+    // The quotient `D′/D` rounds by `(Σ|2rr′| + |D′|·Σr²/D)/D` relative to those.
+    let score_band = gam_linalg::roundoff::accumulation_growth(2 * n_rows + dim + 12)
+        * (0.5 * nobs * (dispersion_d1_mass + dispersion_d1.abs() * dispersion_mass / dispersion)
+            / dispersion
+            + ln_jac_d1_mass
+            + chart_volume_d1_mass);
     Ok(CurvatureCriterionJet {
         kappa,
         value,
         score,
         curvature,
+        score_band,
         base,
     })
+}
+
+/// The κ̂ score root inside the sign bracket `(lo, hi)` (score negative at `lo`,
+/// positive at `hi`), from `start` strictly inside it, by safeguarded Newton with
+/// no budget.
+///
+/// Each step first moves one bracket end onto the current κ, which lies strictly
+/// inside the bracket, so the bracket strictly shrinks; the solve ends when no
+/// double lies strictly inside it, so κ̂ is resolved to adjacent doubles.
+/// Newton's score step supplies local quadratic convergence, and an inadmissible
+/// Newton point is replaced by the midpoint, which at least halves the bracket.
+/// The certificate is a score inside its own rounding band at a point of
+/// positive curvature. A collapsed bracket around a score still resolved from
+/// zero is a sign change the score cannot resolve, and is refused typed.
+fn curvature_score_root(
+    mut jet_at: impl FnMut(f64) -> Result<CurvatureCriterionJet, ResponseGeometryError>,
+    start: CurvatureCriterionJet,
+    (lo, hi): (f64, f64),
+) -> Result<CurvatureCriterionJet, ResponseGeometryError> {
+    let mut a = lo;
+    let mut b = hi;
+    let mut iterations = 0_usize;
+    let mut current = start;
+    loop {
+        if current.score < 0.0 {
+            a = current.kappa;
+        } else {
+            b = current.kappa;
+        }
+        let newton = current.kappa - current.score / current.curvature;
+        let next = if current.curvature > 0.0 && newton.is_finite() && newton > a && newton < b {
+            newton
+        } else {
+            0.5 * (a + b)
+        };
+        if !(next > a && next < b) {
+            break;
+        }
+        current = jet_at(next)?;
+        iterations += 1;
+    }
+    if !(current.score.abs() <= current.score_band && current.curvature > 0.0) {
+        return Err(ResponseGeometryError::CurvatureNonConvergence {
+            iterations,
+            bracket_lo: a,
+            bracket_hi: b,
+            kappa: current.kappa,
+            criterion: current.value,
+            score: current.score,
+            curvature: current.curvature,
+            score_band: current.score_band,
+        });
+    }
+    Ok(current)
 }
 
 /// Fit curvature as an estimand on a constant-curvature response geometry.
@@ -1196,7 +1606,9 @@ fn response_curvature_criterion_jet(
 /// κ̂ is the minimiser of the profiled criterion [`response_curvature_criterion`]
 /// (the σ-profiled honest change-of-variables negative log-evidence of the wrapped
 /// normal w.r.t. ambient measure), found by a safeguarded root solve of its
-/// exact analytic score inside the chart-validity bracket. The base point μ is
+/// exact analytic score inside the chart-validity bracket, resolved to adjacent
+/// doubles with no tolerance or budget and certified against the score's own
+/// rounding band (`curvature_score_root`). The base point μ is
 /// the κ-independent flat centroid, so
 /// every `V_p` evaluation scores the SAME geometry without re-entangling κ with the
 /// chart scale (the #1104 fix). The exact outer
@@ -1229,8 +1641,6 @@ pub fn fit_response_curvature(
     values: ArrayView2<'_, f64>,
     dim: usize,
     level: f64,
-    tol: f64,
-    max_iter: usize,
 ) -> Result<ResponseCurvatureFit, ResponseGeometryError> {
     if dim == 0 {
         return Err(ResponseGeometryError::InvalidInput(
@@ -1248,18 +1658,12 @@ pub fn fit_response_curvature(
             "response curvature CI level must lie in (0, 1)".into(),
         ));
     }
-    if !(tol.is_finite() && tol > 0.0) {
-        return Err(ResponseGeometryError::InvalidInput(
-            "response curvature tolerance must be finite and positive".into(),
-        ));
-    }
 
     // Establish identifiability at the flat member before constructing bounds;
     // a zero-dispersion point cloud carries no curvature scale.
     let flat_jet = response_curvature_criterion_jet(values, dim, 0.0)?;
     let (kappa_min, kappa_max, rho_max) = response_kappa_bounds(values);
     let span = kappa_max - kappa_min;
-    let nobs = (n_rows * dim) as f64;
     if !(span.is_finite() && span > 0.0) {
         return Err(ResponseGeometryError::NumericalGeometry(
             "response curvature chart bracket is not finite and ordered".into(),
@@ -1274,80 +1678,30 @@ pub fn fit_response_curvature(
     };
 
     // ── κ̂: analytic score root / constrained box-KKT solve. ─────────────
-    // `(span/nobs)·|V'|` is dimensionless, response-scale invariant, and row-
-    // replication invariant. At a bound only the outward score component is a
-    // KKT violation.
-    let normalized_kkt = |kappa: f64, score: f64| {
-        let violation = if kappa == kappa_min {
-            (-score).max(0.0)
-        } else if kappa == kappa_max {
-            score.max(0.0)
-        } else {
-            score.abs()
-        };
-        span * violation / nobs
-    };
-
+    // At a bound only the outward score component is a KKT violation, so a
+    // bound whose score points outward is the constrained minimum itself.
     let lower = response_curvature_criterion_jet(values, dim, kappa_min)?;
     let upper = response_curvature_criterion_jet(values, dim, kappa_max)?;
-    let mut a = kappa_min;
-    let mut b = kappa_max;
-    let mut iterations = 0_usize;
-    let (jet, railed_at_resolution_limit, railed_at_hyperbolic_resolution_limit) =
-        if lower.score >= 0.0 {
-            // V'(κ_min) ≥ 0: the constrained minimum sits ON the hyperbolic
-            // chart-domain bound — the criterion is still improving as κ decreases
-            // past the limit where the cloud fills the hyperbolic ball of its own
-            // spread. Exactly symmetric to the spherical rail below (#2351): κ̂ is
-            // an UPPER bound on κ, not a resolved point estimate, and must be
-            // reported as railed rather than as a confident hyperbolic verdict.
-            (lower, false, true)
-        } else if upper.score <= 0.0 {
-            // V'(κ_max)≤0 means the criterion is still improving at the
-            // spherical chart-resolution limit.
-            (upper, true, false)
-        } else {
-            let mut current = flat_jet;
-            while iterations < max_iter {
-                iterations += 1;
-                if normalized_kkt(current.kappa, current.score) <= tol && current.curvature > 0.0 {
-                    break;
-                }
-                if current.score < 0.0 {
-                    a = current.kappa;
-                } else {
-                    b = current.kappa;
-                }
-
-                // Newton's score step supplies local quadratic convergence; the
-                // analytic sign bracket safeguards it globally. An inadmissible
-                // Newton point is replaced by the strictly contracting midpoint.
-                let newton = current.kappa - current.score / current.curvature;
-                let next =
-                    if current.curvature > 0.0 && newton.is_finite() && newton > a && newton < b {
-                        newton
-                    } else {
-                        0.5 * (a + b)
-                    };
-                current = response_curvature_criterion_jet(values, dim, next)?;
-            }
-            let residual = normalized_kkt(current.kappa, current.score);
-            if residual > tol || current.curvature <= 0.0 {
-                return Err(ResponseGeometryError::CurvatureNonConvergence {
-                    iterations,
-                    max_iter,
-                    bracket_lo: a,
-                    bracket_hi: b,
-                    kappa: current.kappa,
-                    criterion: current.value,
-                    score: current.score,
-                    curvature: current.curvature,
-                    kkt_residual: residual,
-                    tolerance: tol,
-                });
-            }
-            (current, false, false)
-        };
+    let (jet, railed_at_resolution_limit, railed_at_hyperbolic_bound) = if lower.score >= 0.0 {
+        // V'(κ_min) ≥ 0: the constrained minimum sits ON the hyperbolic
+        // chart-domain bound — the criterion is still improving as κ decreases
+        // past the limit where the cloud fills the hyperbolic ball of its own
+        // spread. Exactly symmetric to the spherical rail below (#2351): κ̂ is
+        // an UPPER bound on κ, not a resolved point estimate, and must be
+        // reported as railed rather than as a confident hyperbolic verdict.
+        (lower, false, true)
+    } else if upper.score <= 0.0 {
+        // V'(κ_max)≤0 means the criterion is still improving at the
+        // spherical chart-resolution limit.
+        (upper, true, false)
+    } else {
+        let root = curvature_score_root(
+            |kappa| response_curvature_criterion_jet(values, dim, kappa),
+            flat_jet,
+            (kappa_min, kappa_max),
+        )?;
+        (root, false, false)
+    };
     let kappa_hat = jet.kappa;
     // #2351: the hyperbolic rail flag must also fire on the BOUNDARY-LAYER
     // interior optimum. Near the chart-domain edge the conformal restoring
@@ -1358,7 +1712,7 @@ pub fn fit_response_curvature(
     // ball of its own spread — the estimate is chart-limited, not resolved,
     // regardless of whether the KKT condition binds exactly AT the bound.
     let railed_at_hyperbolic_resolution_limit =
-        railed_at_hyperbolic_resolution_limit || kappa_hat <= 0.99 * kappa_min;
+        railed_at_hyperbolic_bound || kappa_hat <= 0.99 * kappa_min;
     let v_p_hat = jet.value;
     let base = jet.base.clone();
 
@@ -1371,12 +1725,6 @@ pub fn fit_response_curvature(
     // honest "how curved relative to its spread" number alongside the dimensional κ̂.
     let kappa_r2 = kappa_hat * rho_max * rho_max;
 
-    let kappa_tol = tol * span;
-    if !(kappa_tol.is_finite() && kappa_tol > 0.0) {
-        return Err(ResponseGeometryError::InvalidInput(
-            "response curvature tolerance underflows in the chart scale".into(),
-        ));
-    }
     let profile_ci = crate::curvature_estimand::profile_ci_walk(
         &mut v_p,
         kappa_hat,
@@ -1384,7 +1732,6 @@ pub fn fit_response_curvature(
         kappa_min,
         kappa_max,
         level,
-        kappa_tol,
     )
     .map_err(ResponseGeometryError::NumericalGeometry)?;
     let flatness = crate::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)
@@ -1421,25 +1768,18 @@ mod tests {
     use ndarray::{Array2, array};
 
     fn round_trip(manifold: ResponseManifold, values: Array2<f64>) {
-        let base =
-            response_frechet_mean(manifold, values.view(), None, 1e-12, 500).expect("frechet mean");
+        let base = response_frechet_mean(manifold, values.view(), None).expect("frechet mean");
         // The six `*_round_trip_and_mean` tests used to check nothing about the
         // MEAN: exp∘log is an involution at ANY base point, so a
         // `response_frechet_mean` that returned `values.row(0)` passed all six.
         // `frechet_residual` re-derives the analytic Karcher stationarity
         // residual independently, which is the property the names claim.
-        //
-        // Bound source: the solver's OWN tolerance. `response_frechet_mean`'s
-        // only success exit is the certificate ‖Σwᵢlogₚ(xᵢ)‖ₚ ≤ tol, and it is
-        // called here with tol = 1e-12. 1e-10 is 100× that, covering only the
-        // summation-order difference between this re-derivation and the
-        // solver's own sum. Widening it past ~1e-12 stops testing the
-        // certificate at all.
         let residual = frechet_residual(manifold, values.view(), base.view());
+        let band = certified_band(manifold, values.view(), base.view());
         assert!(
-            residual <= 1e-10,
-            "{manifold:?} Fréchet mean is not stationary: residual {residual:.3e} > 1e-10 \
-             (the solver's success exit certified it at <= 1e-12)"
+            residual <= 3.0 * band,
+            "{manifold:?} Fréchet mean is not stationary: residual {residual:.3e} > 3 x its \
+             rounding band {band:.3e}"
         );
         let tangent = response_log_map(manifold, values.view(), base.view()).expect("log map");
         let back = response_exp_map(manifold, tangent.view(), base.view()).expect("exp map");
@@ -1540,9 +1880,7 @@ mod tests {
 
     /// Deterministic Fibonacci-lattice cover of S² (== `St(3,1)` == `Gr(1,3)`
     /// projectively), spread over the WHOLE sphere. This is the widely spread
-    /// cloud that makes the Fréchet objective nearly flat, so a single-seed
-    /// Karcher descent converges only linearly and exhausts a `max_iter=256`
-    /// budget — the #2140 trigger.
+    /// cloud that makes the Fréchet objective nearly flat — the #2140 trigger.
     fn fibonacci_sphere(n: usize) -> Array2<f64> {
         let mut v = Array2::<f64>::zeros((n, 3));
         let golden = std::f64::consts::PI * (1.0 + 5.0_f64.sqrt());
@@ -1574,6 +1912,22 @@ mod tests {
             .sqrt()
     }
 
+    /// The rounding band `β` the solver certifies a uniform-weight mean `p`
+    /// against. Its success exit is `r̂ ≤ β` with `r̂` within `β` of the exact
+    /// residual, so the exact residual is at most `2β`, and an independent
+    /// re-derivation such as [`frechet_residual`], rounding within `β` of it
+    /// again, is at most `3β`.
+    fn certified_band(
+        manifold: ResponseManifold,
+        values: ArrayView2<'_, f64>,
+        p: ArrayView1<'_, f64>,
+    ) -> f64 {
+        let uniform = Array1::from_elem(values.nrows(), 1.0 / values.nrows() as f64);
+        karcher_state(manifold, values, uniform.view(), p)
+            .expect("Karcher state at the mean")
+            .band
+    }
+
     #[test]
     fn successful_stiefel_k1_frechet_mean_is_analytically_stationary() {
         let inv = 1.0 / 1.01_f64.sqrt();
@@ -1584,8 +1938,7 @@ mod tests {
             [inv, -0.1 * inv, 0.0],
         ];
         let manifold = ResponseManifold::Stiefel { k: 1, n: 3 };
-        let tol = 1.0e-10;
-        let mean = response_frechet_mean(manifold, values.view(), None, tol, 256)
+        let mean = response_frechet_mean(manifold, values.view(), None)
             .expect("tight sphere cloud must reach the Karcher certificate");
 
         assert_eq!(mean.len(), 3);
@@ -1595,32 +1948,54 @@ mod tests {
             "mean must be unit-norm, got {nrm}"
         );
         let residual = frechet_residual(manifold, values.view(), mean.view());
+        let band = certified_band(manifold, values.view(), mean.view());
         assert!(
-            residual <= tol,
-            "successful mean residual {residual:.3e} exceeds tolerance {tol:.3e}"
+            residual <= 3.0 * band,
+            "successful mean residual {residual:.3e} exceeds 3 x its rounding band {band:.3e}"
         );
     }
 
+    /// A cloud spread over the whole sphere can have no certified mean, and
+    /// without an iteration budget it must still be refused, never certified
+    /// (#2140). A certified mean lies inside the uniqueness radius `π/4` of every
+    /// sample, the seed included, so every sample lies within `π/2` of the seed.
+    /// On the sphere the Fibonacci cover has rows almost antipodal to any seed,
+    /// so it is refused before the descent runs. The projective plane is only
+    /// `π/2` across, so there the same cover descends to stationarity and is
+    /// refused by the support-ball certificate.
     #[test]
-    fn budget_exhausted_generic_frechet_is_typed_non_convergence() {
+    fn diffuse_sphere_cloud_is_refused_not_certified() {
         let values = fibonacci_sphere(60);
-        for manifold in [
-            ResponseManifold::Stiefel { k: 1, n: 3 },
-            ResponseManifold::Grassmann { k: 1, n: 3 },
-        ] {
-            match response_frechet_mean(manifold, values.view(), None, 1.0e-30, 0) {
-                Err(GeometryError::NonConvergence {
-                    context,
-                    iterations,
-                    residual,
-                    tolerance,
-                }) => {
-                    assert_eq!(context, "response geometry Fréchet mean");
-                    assert_eq!(iterations, 0);
-                    assert!(residual.is_finite() && residual > tolerance);
-                }
-                other => panic!("{manifold:?} expected typed exhaustion, got {other:?}"),
+        match response_frechet_mean(ResponseManifold::Stiefel { k: 1, n: 3 }, values.view(), None)
+        {
+            Err(GeometryError::FrechetMeanSupportNotLocalized {
+                context,
+                seed_spread,
+                uniqueness_radius,
+            }) => {
+                assert_eq!(context, "response geometry Fréchet mean");
+                assert_eq!(uniqueness_radius, std::f64::consts::FRAC_PI_4);
+                assert!(seed_spread >= 2.0 * uniqueness_radius);
             }
+            other => panic!("expected the diffuse cloud to be refused before descent, got {other:?}"),
+        }
+        match response_frechet_mean(
+            ResponseManifold::Grassmann { k: 1, n: 3 },
+            values.view(),
+            None,
+        ) {
+            Err(GeometryError::FrechetMeanNotGloballyCertified {
+                stationarity_residual,
+                tolerance,
+                support_radius,
+                uniqueness_radius,
+                ..
+            }) => {
+                assert!(stationarity_residual <= tolerance);
+                assert!(support_radius >= uniqueness_radius);
+                assert_eq!(uniqueness_radius, std::f64::consts::FRAC_PI_4);
+            }
+            other => panic!("expected the diffuse projective cloud to be refused, got {other:?}"),
         }
     }
 
@@ -1665,17 +2040,16 @@ mod tests {
             [2.1, 0.05, 0.05, 1.02],
             [1.95, -0.03, -0.03, 0.98],
         ];
-        let mean = response_frechet_mean(
-            ResponseManifold::Spd { n: 2 },
-            values.view(),
-            None,
-            1e-12,
-            500,
-        )
-        .expect("SPD cluster must converge");
+        let mean = response_frechet_mean(ResponseManifold::Spd { n: 2 }, values.view(), None)
+            .expect("SPD cluster must converge");
         assert!(mean.iter().all(|c| c.is_finite()));
     }
 
+    /// Two rows 1.8 rad apart on the circle spread from either seed by more than
+    /// twice the uniqueness radius `π/4`, so they are refused before descent.
+    /// A three-row cloud within `π/2` of its heaviest row passes that precheck,
+    /// but its mean sits 1.0065 rad from the seed, outside `π/4`: it descends to
+    /// stationarity and is then refused by the support-ball certificate.
     #[test]
     fn diffuse_positive_curvature_cloud_has_typed_global_certificate_error() {
         let manifold = ResponseManifold::Stiefel { k: 1, n: 2 };
@@ -1685,7 +2059,32 @@ mod tests {
             values.clone(),
             values.slice(ndarray::s![..;-1, ..]).to_owned(),
         ] {
-            match response_frechet_mean(manifold, cloud.view(), None, 1.0e-12, 256) {
+            match response_frechet_mean(manifold, cloud.view(), None) {
+                Err(GeometryError::FrechetMeanSupportNotLocalized {
+                    seed_spread,
+                    uniqueness_radius,
+                    ..
+                }) => {
+                    assert!(seed_spread >= 2.0 * uniqueness_radius);
+                    assert_eq!(uniqueness_radius, std::f64::consts::FRAC_PI_4);
+                }
+                other => panic!("expected the pair to be refused before descent, got {other:?}"),
+            }
+        }
+
+        let angles = [0.0_f64, 1.5, 1.55];
+        let weights = array![0.34, 0.33, 0.33];
+        let mut cloud = Array2::<f64>::zeros((3, 2));
+        for (row, angle) in angles.into_iter().enumerate() {
+            cloud[[row, 0]] = angle.cos();
+            cloud[[row, 1]] = angle.sin();
+        }
+        let reversed_weights = weights.slice(ndarray::s![..;-1]).to_owned();
+        for (rows, row_weights) in [
+            (cloud.clone(), weights.clone()),
+            (cloud.slice(ndarray::s![..;-1, ..]).to_owned(), reversed_weights),
+        ] {
+            match response_frechet_mean(manifold, rows.view(), Some(row_weights.view())) {
                 Err(GeometryError::FrechetMeanNotGloballyCertified {
                     stationarity_residual,
                     tolerance,
@@ -1714,28 +2113,26 @@ mod tests {
             values[[row, 1]] = angle.sin();
         }
         let reversed = values.slice(ndarray::s![..;-1, ..]).to_owned();
-        let direct = response_frechet_mean(manifold, values.view(), None, 1.0e-12, 256)
+        let direct = response_frechet_mean(manifold, values.view(), None)
             .expect("tight cloud has a certified global mean");
-        let permuted = response_frechet_mean(manifold, reversed.view(), None, 1.0e-12, 256)
+        let permuted = response_frechet_mean(manifold, reversed.view(), None)
             .expect("permuted tight cloud has a certified global mean");
-        // THE ONE BOUND IN THIS FILE BEING LOOSENED, deliberately. 1.0e-12 was
-        // EXACTLY the tolerance both runs above were solved to, and a bound at
-        // the solver's own tolerance is not strict -- it is wrong. Each run may
-        // stop anywhere inside the ‖grad‖ ≤ 1e-12 stationarity ball, so two
-        // independently converged runs can legitimately differ by ~2× tol in
-        // gradient, and by more than that in displacement once the 1/κ
-        // curvature factor is applied. As written this is a live flake, not a
-        // check.
-        //
-        // Bound source: 100× the solver tolerance (1e-12) named on the two
-        // `response_frechet_mean` calls above. Still orders below any real
-        // permutation asymmetry, which would be O(the descent step), ~1e-2.
+        // Each run stops anywhere inside its own certificate, so the two may
+        // differ. On the circle the dispersion is exactly quadratic in the angle
+        // near a tight cloud, so the geodesic distance from a point to the mean
+        // IS its exact residual, at most twice its band (see `certified_band`).
+        // The two means are therefore within `2β_direct + 2β_permuted` of each
+        // other along the circle, and each coordinate moves by at most the arc.
+        let direct_band = certified_band(manifold, values.view(), direct.view());
+        let permuted_band = certified_band(manifold, reversed.view(), permuted.view());
+        let separation = 2.0 * (direct_band + permuted_band);
         assert!(
             (&direct - &permuted)
                 .iter()
-                .all(|value| value.abs() <= 1.0e-10)
+                .all(|value| value.abs() <= separation),
+            "permuted means differ by more than {separation:.3e}: {direct} vs {permuted}"
         );
-        assert!(frechet_residual(manifold, values.view(), direct.view()) <= 1.0e-12);
+        assert!(frechet_residual(manifold, values.view(), direct.view()) <= 3.0 * direct_band);
     }
 
     #[test]
@@ -1743,14 +2140,130 @@ mod tests {
         let manifold = ResponseManifold::Stiefel { k: 1, n: 2 };
         let values = array![[1.0, 0.0], [-1.0, 0.0]];
         let weights = array![1.0, 0.0];
-        let mean =
-            response_frechet_mean(manifold, values.view(), Some(weights.view()), 1.0e-12, 32)
-                .expect("zero-mass cut-locus row must be ignored");
+        let mean = response_frechet_mean(manifold, values.view(), Some(weights.view()))
+            .expect("zero-mass cut-locus row must be ignored");
         assert!(
             (&mean - &values.row(0))
                 .iter()
                 .all(|value| value.abs() <= f64::EPSILON)
         );
+    }
+
+    /// `n` rows `exp_base(v)`, each coordinate of `v` an i.i.d. normal of scale
+    /// `sigma/√ambient`, from a fixed seed.
+    fn exp_cloud(
+        manifold: ResponseManifold,
+        base: ArrayView1<'_, f64>,
+        n: usize,
+        sigma: f64,
+        seed: u64,
+    ) -> Array2<f64> {
+        let ambient = manifold.ambient_dim();
+        let mut rng = DetNormal::new(seed);
+        let mut out = Array2::<f64>::zeros((n, ambient));
+        for row in 0..n {
+            let tangent =
+                Array1::from_shape_fn(ambient, |_| rng.normal() * sigma / (ambient as f64).sqrt());
+            let value = manifold
+                .exp_point(base, tangent.view())
+                .expect("cloud exponential");
+            out.row_mut(row).assign(&value);
+        }
+        out
+    }
+
+    /// A Poincaré cloud about a base at radius 0.9 has dispersion `V ≈ 9.4`,
+    /// whose evaluation rounds by more than the Armijo cushion `8ε(1 + V)`. Once
+    /// `‖ξ‖²` fell into that noise, a dispersion-only descent accepted only steps
+    /// of `t ≤ 1.9e-9` that left `ξ` unchanged, and it stalled at `‖ξ‖ = 2.9e-7`
+    /// until its iteration budget ran out. The residual phase carries the descent
+    /// on to the certificate.
+    #[test]
+    fn noisy_dispersion_poincare_cloud_is_certified_by_the_residual_phase() {
+        let manifold = ResponseManifold::Poincare {
+            dim: 5,
+            curvature: -1.0,
+        };
+        let mut base = Array1::<f64>::zeros(5);
+        base[0] = 0.9;
+        let values = exp_cloud(manifold, base.view(), 100, 0.3, 1006);
+        let mean = response_frechet_mean(manifold, values.view(), None)
+            .expect("the residual phase certifies the mean");
+        let residual = frechet_residual(manifold, values.view(), mean.view());
+        let band = certified_band(manifold, values.view(), mean.view());
+        assert!(
+            residual <= 3.0 * band,
+            "Poincaré mean residual {residual:.3e} exceeds 3 x its rounding band {band:.3e}"
+        );
+    }
+
+    /// Past `√k·|(−p) ⊕ x| = 1 − BOUNDARY_EPS` the Poincaré logarithm is
+    /// clamped: it returns a shortened tangent, not a rounded one, so a Karcher
+    /// field built from it has zeros that are not the mean. A cloud with rows
+    /// beyond that horizon of the seed must be refused, never certified. A
+    /// dispersion-only descent stalled on this cloud at `‖ξ‖ = 3.7e-2` until its
+    /// iteration budget ran out.
+    #[test]
+    fn poincare_cloud_beyond_the_log_clamp_is_refused_not_certified() {
+        let manifold = ResponseManifold::Poincare {
+            dim: 2,
+            curvature: -1.0,
+        };
+        let mut base = Array1::<f64>::zeros(2);
+        base[0] = 0.3;
+        let values = exp_cloud(manifold, base.view(), 2000, 3.0, 1008);
+        match response_frechet_mean(manifold, values.view(), None) {
+            Err(GeometryError::Singular(message)) => {
+                assert!(message.contains("clamped at the ball boundary"), "{message}");
+            }
+            other => panic!("expected the clamped cloud to be refused, got {other:?}"),
+        }
+    }
+
+    /// The phase-2 stall refusal, forced. The same SPD cloud and seed are
+    /// descended twice: with its derived band the descent certifies, and with
+    /// the band set to zero, below the residual's own rounding floor, phase 2
+    /// runs until no step strictly lowers the residual and must then refuse,
+    /// typed, rather than loop or certify.
+    #[test]
+    fn karcher_descent_below_its_rounding_floor_refuses_by_stall() {
+        let manifold = ResponseManifold::Spd { n: 2 };
+        let values = array![
+            [2.0, 0.0, 0.0, 1.0],
+            [1.0, 0.3, 0.3, 2.0],
+            [3.0, -0.5, -0.5, 1.5],
+        ];
+        let weights = Array1::from_elem(3, 1.0 / 3.0);
+        let start = values.row(0).to_owned();
+        let derived =
+            |p: ArrayView1<'_, f64>| karcher_state(manifold, values.view(), weights.view(), p);
+        let (mean, state) =
+            karcher_descent(manifold, values.view(), weights.view(), start.clone(), derived)
+                .expect("the derived band certifies this cloud");
+        assert!(state.residual <= state.band);
+        assert!(mean.iter().all(|value| value.is_finite()));
+
+        let zero_band = |p: ArrayView1<'_, f64>| {
+            karcher_state(manifold, values.view(), weights.view(), p)
+                .map(|state| KarcherState { band: 0.0, ..state })
+        };
+        match karcher_descent(manifold, values.view(), weights.view(), start, zero_band) {
+            Err(GeometryError::NonConvergence {
+                context,
+                residual,
+                tolerance,
+                ..
+            }) => {
+                assert_eq!(context, "response geometry Fréchet mean");
+                assert_eq!(tolerance, 0.0);
+                assert!(residual.is_finite() && residual > 0.0);
+            }
+            Ok((_, state)) => panic!(
+                "the zero-band descent certified at residual {:.3e}",
+                state.residual
+            ),
+            Err(other) => panic!("expected the zero-band descent to stall, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1908,10 +2421,9 @@ mod tests {
         };
 
         let unweighted_ref =
-            response_frechet_mean(manifold, values.view(), None, 1e-12, 256).expect("unweighted");
-        let weighted_ref =
-            response_frechet_mean(manifold, values.view(), Some(weights.view()), 1e-12, 256)
-                .expect("weighted");
+            response_frechet_mean(manifold, values.view(), None).expect("unweighted");
+        let weighted_ref = response_frechet_mean(manifold, values.view(), Some(weights.view()))
+            .expect("weighted");
         // Sanity: the two intrinsic means genuinely differ, so this design can
         // distinguish a weighted from an unweighted base point.
         assert!(
@@ -2055,25 +2567,52 @@ mod tests {
         }
     }
 
+    /// The κ̂ score solve's refusal, forced. The same cloud and bracket are
+    /// solved twice: with each score's derived band the root certifies, and with
+    /// the band set to zero, below the score's own rounding floor, the bracket
+    /// collapses to adjacent doubles and the solve must refuse, typed, rather
+    /// than loop or certify.
     #[test]
-    fn response_curvature_budget_exhaustion_is_typed_non_convergence() {
+    fn curvature_score_root_below_its_rounding_floor_refuses_by_bracket_collapse() {
         let values = synth_cloud(3, 0.8, 80, 0.15, 0xC0A7_2247);
-        match fit_response_curvature(values.view(), 3, 0.95, 1.0e-14, 0) {
+        let (kappa_min, kappa_max, _) = response_kappa_bounds(values.view());
+        let start = response_curvature_criterion_jet(values.view(), 3, 0.0).expect("flat jet");
+        let root = curvature_score_root(
+            |kappa| response_curvature_criterion_jet(values.view(), 3, kappa),
+            start.clone(),
+            (kappa_min, kappa_max),
+        )
+        .expect("the derived band certifies this cloud's κ̂");
+        assert!(root.score.abs() <= root.score_band && root.curvature > 0.0);
+
+        let zero_band = |kappa: f64| {
+            response_curvature_criterion_jet(values.view(), 3, kappa).map(|jet| {
+                CurvatureCriterionJet {
+                    score_band: 0.0,
+                    ..jet
+                }
+            })
+        };
+        let start = CurvatureCriterionJet {
+            score_band: 0.0,
+            ..start
+        };
+        match curvature_score_root(zero_band, start, (kappa_min, kappa_max)) {
             Err(ResponseGeometryError::CurvatureNonConvergence {
-                iterations,
-                max_iter,
-                kkt_residual,
-                tolerance,
+                bracket_lo,
+                bracket_hi,
                 score,
-                curvature,
+                score_band,
                 ..
             }) => {
-                assert_eq!(iterations, 0);
-                assert_eq!(max_iter, 0);
-                assert!(kkt_residual.is_finite() && kkt_residual > tolerance);
-                assert!(score.is_finite() && curvature.is_finite());
+                assert_eq!(score_band, 0.0);
+                assert!(score.is_finite() && score != 0.0);
+                // The bracket has no double strictly inside it.
+                let midpoint = 0.5 * (bracket_lo + bracket_hi);
+                assert!(midpoint == bracket_lo || midpoint == bracket_hi);
             }
-            other => panic!("expected typed curvature exhaustion, got {other:?}"),
+            Ok(jet) => panic!("the zero-band solve certified κ = {}", jet.kappa),
+            Err(other) => panic!("expected the zero-band solve to refuse, got {other:?}"),
         }
     }
 
@@ -2096,7 +2635,7 @@ mod tests {
         for (idx, &k_star) in k_stars.iter().enumerate() {
             let values = synth_cloud(dim, k_star, n, sigma, 0xC0FFEE ^ (idx as u64 + 1));
             let (kmin, kmax, _rho) = response_kappa_bounds(values.view());
-            let fit = fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256)
+            let fit = fit_response_curvature(values.view(), dim, 0.95)
                 .expect("response curvature fit");
             k_hats.push(fit.kappa_hat);
 
@@ -2146,7 +2685,7 @@ mod tests {
             // identical points so the only change is the global scale.
             let alpha = 1.5_f64;
             let scaled = values.mapv(|v| alpha * v);
-            let fit_scaled = fit_response_curvature(scaled.view(), dim, 0.95, 1e-12, 256)
+            let fit_scaled = fit_response_curvature(scaled.view(), dim, 0.95)
                 .expect("scaled response curvature fit");
             let expected = fit.kappa_hat / (alpha * alpha);
             // Tolerance scales with magnitude; the transform is exact in the
@@ -2172,10 +2711,10 @@ mod tests {
         // ambient-origin κ_min/conformal-term bug.
         let values = synth_cloud(dim, 0.6, n, sigma, 0xC0FFEE ^ 4);
         let fit =
-            fit_response_curvature(values.view(), dim, 0.95, 1e-12, 256).expect("untranslated fit");
+            fit_response_curvature(values.view(), dim, 0.95).expect("untranslated fit");
         let shifted = &values + 10.0;
         let fit_shifted =
-            fit_response_curvature(shifted.view(), dim, 0.95, 1e-12, 256).expect("translated fit");
+            fit_response_curvature(shifted.view(), dim, 0.95).expect("translated fit");
         assert!(
             (fit.kappa_hat - fit_shifted.kappa_hat).abs() <= 1.0e-9 * (1.0 + fit.kappa_hat.abs()),
             "κ̂ moved under pure translation: {} vs {}",
@@ -2207,7 +2746,7 @@ mod tests {
         for &k_star in &[-1.0_f64, 0.0, 0.8] {
             let values = synth_cloud(1, k_star, n, sigma, 0xD1 ^ (k_star.to_bits()));
             let (kmin, kmax, _rho) = response_kappa_bounds(values.view());
-            let fit = fit_response_curvature(values.view(), 1, 0.95, 1e-12, 256)
+            let fit = fit_response_curvature(values.view(), 1, 0.95)
                 .expect("d=1 curvature fit");
             let span = kmax - kmin;
             assert!(

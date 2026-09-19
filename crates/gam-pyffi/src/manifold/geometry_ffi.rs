@@ -1221,14 +1221,8 @@ fn response_geometry_fit_curvature<'py>(
                 ));
             }
         };
-        gam::geometry::response_geometry::fit_response_curvature(
-            arr.view(),
-            dim,
-            level,
-            1.0e-12,
-            256,
-        )
-        .map_err(|error| error.to_string())
+        gam::geometry::response_geometry::fit_response_curvature(arr.view(), dim, level)
+            .map_err(|error| error.to_string())
     })?;
     let verdict = match fit.profile_ci.verdict {
         gam::geometry::CurvatureVerdict::Spherical => "spherical",
@@ -5092,7 +5086,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyInterventionCalibrationPlan>()?;
     module.add_function(wrap_pyfunction!(intervention_calibration_plan, module)?)?;
     inference_instruments::register(module)?;
+    crate::joint_event_ffi::register(module)?;
     crate::event_history_ffi::register(module)?;
+    crate::parameter_decomposition_ffi::register(module)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_backward, module)?)?;
@@ -5118,7 +5114,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
-    module.add_function(wrap_pyfunction!(model_evidence, module)?)?;
+    module.add_function(wrap_pyfunction!(model_conditional_aic, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
@@ -5246,7 +5242,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(rank_charge_dof, module)?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_class::<BlockSparseDictStream>()?;
-    module.add_function(wrap_pyfunction!(identifiable_factor_log_evidence, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        identifiable_factor_profile_log_likelihood,
+        module
+    )?)?;
     module.add_class::<IsometryPenalty>()?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
@@ -5275,6 +5274,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(separation_limit, module)?)?;
     module.add_function(wrap_pyfunction!(recover_spikes, module)?)?;
     module.add_function(wrap_pyfunction!(compose_contracts, module)?)?;
+    module.add_function(wrap_pyfunction!(whole_set_containment, module)?)?;
     module.add_function(wrap_pyfunction!(loop_holonomy, module)?)?;
     module.add_function(wrap_pyfunction!(
         conditional_coactivation_influence,
@@ -5484,23 +5484,25 @@ fn diagnostics_concat_decoder_blocks<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-/// Score one converged identifiable-factor fit at fixed hyperparameters.
+/// Penalized profile log-likelihood of one converged identifiable-factor fit at
+/// fixed hyperparameters (not a marginal likelihood; see
+/// `gam_sae::identifiability::identifiable_factor_profile_log_likelihood`).
 ///
 /// This is deliberately scalar. A sampled RSS/penalty table cannot supply the
-/// analytic hyperparameter derivatives needed for continuous evidence
+/// analytic hyperparameter derivatives needed for continuous hyperparameter
 /// optimization and is therefore not accepted at the FFI boundary.
 #[pyfunction]
-fn identifiable_factor_log_evidence(
+fn identifiable_factor_profile_log_likelihood(
     residual_sum_squares: f64,
     penalty: f64,
     n_obs: i64,
 ) -> PyResult<f64> {
     if n_obs <= 0 {
         return Err(py_value_error(format!(
-            "identifiable_factor_log_evidence: n_obs must be > 0, got {n_obs}"
+            "identifiable_factor_profile_log_likelihood: n_obs must be > 0, got {n_obs}"
         )));
     }
-    gam::terms::sae::identifiability::identifiable_factor_log_evidence(
+    gam::terms::sae::identifiability::identifiable_factor_profile_log_likelihood(
         residual_sum_squares,
         penalty,
         n_obs as usize,
@@ -6913,11 +6915,24 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
+    warm_start: Option<(&[u8], &str)>,
 ) -> Result<Vec<u8>, WorkflowError> {
     // The stderr `[OUTER step]` log stream (installed by `progress_log::
     // init_logging` at module import) carries solver progress for the Python
     // bindings; the former always-on TUI session lane has been removed.
     let mut fit_config = parse_fit_config(config_json)?;
+    // `warm_start_from`: the saved model's certified outer point, staged under the
+    // caller's scratch directory for this one fit.
+    if let Some((model_bytes, scratch_dir)) = warm_start {
+        let prior = load_model_impl(model_bytes)?;
+        fit_config.outer_warm_start = Some(
+            gam::families::fit_orchestration::OuterWarmStart::from_model(
+                prior.payload(),
+                &formula,
+                std::path::PathBuf::from(scratch_dir),
+            )?,
+        );
+    }
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
@@ -7212,6 +7227,7 @@ fn predict_dataset_with_options_impl(
             .uncertainty
             .map(|source| source.as_str().to_string()),
         point_covariance_source: provenance.point.map(|source| source.as_str().to_string()),
+        point_covariance_note: provenance.point_note,
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
@@ -7220,10 +7236,13 @@ fn predict_dataset_with_options_impl(
 /// what the evaluator actually consumed for the point estimate and for the
 /// attached SE/band. Presenters serialize these values; the request string is
 /// never evidence.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PredictColumnsCovarianceProvenance {
     pub(crate) point: Option<gam_predict::InferenceCovarianceMode>,
     pub(crate) uncertainty: Option<gam_predict::InferenceCovarianceMode>,
+    /// What the posterior-mean point is conditional on when the fit withheld its
+    /// covariance (gam#2985).
+    pub(crate) point_note: Option<String>,
 }
 
 fn predict_columns(
@@ -7314,6 +7333,7 @@ fn predict_columns(
                 uncertainty: options
                     .interval
                     .map(|_| gam_predict::InferenceCovarianceMode::Conditional),
+                point_note: None,
             },
         ));
     }
@@ -7430,6 +7450,10 @@ fn predict_columns(
     let provenance = PredictColumnsCovarianceProvenance {
         point: resolved.point_covariance_source,
         uncertainty: resolved.uncertainty_covariance_source,
+        point_note: resolved
+            .point_covariance_provenance
+            .as_ref()
+            .map(gam_predict::PointCovarianceProvenance::explain),
     };
     let posterior_mean = resolved.posterior_mean.ok_or_else(|| {
         "default prediction did not produce the required posterior mean".to_string()
@@ -7562,6 +7586,7 @@ fn predict_encoded_table_conformal_impl(
         ),
         covariance_source: None,
         point_covariance_source: None,
+        point_covariance_note: None,
     })
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
@@ -7599,6 +7624,7 @@ fn predict_encoded_table_full_conformal_impl(
         )),
         covariance_source: None,
         point_covariance_source: None,
+        point_covariance_note: None,
     })
     .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }

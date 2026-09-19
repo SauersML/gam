@@ -48,7 +48,6 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `assignment` | `"softmax"` | gate kind: `softmax` / `ordered_beta_bernoulli` / `threshold_gate` / `topk` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
 | `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
-| `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
 | `sparsity_weight` | `None` | optional coordinate-shrinkage strength override; omitted delegates to the native neutral log-strength origin (`1.0`). Refused with a fixed-concentration `ordered_beta_bernoulli` prior, which has no strength coordinate |
@@ -225,12 +224,13 @@ fixed prior has no strength to tune, so `sparsity_weight` is refused there. Each
   fixed. Routed to the decoder (`"beta"`) block, complementary to the
   intrinsic-dim and topology selection below.
 
-- **ARD intrinsic-dim pruning** (`ard_per_atom=True`, **on by default**). An
-  automatic-relevance-determination penalty on each atom's latent coordinate
-  block prunes unused coordinate axes, so the *intrinsic* dimension actually
-  used is driven below `d_atom` when the data does not fill it. The surviving
-  count per atom is `fit.atoms[k].active_dim` (also `fit.summary()
-  ["active_dims"]`).
+- **ARD intrinsic-dim pruning** (always on). An automatic-relevance-determination
+  prior on each atom's latent coordinate block prunes unused coordinate axes, so
+  the *intrinsic* dimension actually used is driven below `d_atom` when the data
+  does not fill it. It is also each row's proper coordinate prior. Without it the
+  coordinate posterior is improper and the criterion has no lower bound. So there
+  is no option to switch it off (#2822). The surviving count per atom is
+  `fit.atoms[k].active_dim` (also `fit.summary()["active_dims"]`).
 
 - **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
@@ -357,7 +357,7 @@ model, so the reported band still reflects the joint covariance of the returned
 (possibly grown) dictionary, seed and born atoms alike.
 
 !!! note "Full fitted-state persistence"
-    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v7
+    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v9
     artifact schema. They retain each atom's decoder coefficients, fitted
     per-token coordinates, resolved topology, shape-band grid/mean/sd/robust sd, and a
     compact per-output-channel covariance factor. Loading reconstructs the

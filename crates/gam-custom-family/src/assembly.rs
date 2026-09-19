@@ -187,6 +187,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         contracted_psi_second_order: contracted_psi_fn,
         kkt_residual: inner.kkt_residual.clone(),
         active_constraints: inner.active_constraints.clone(),
+        cone_normalizer: inner.cone_normalizer.clone(),
     };
 
     Ok((evaluator, ext_dim, joint_log_lambdas))
@@ -241,6 +242,12 @@ impl HessianFactorization for FirstOrderTraceSkipOperator {
         } else {
             self.inner.as_exact_dense_spectral()
         }
+    }
+
+    /// Always the inner backend's: the skip list serves traces, and the span is what the
+    /// forwarded `solve` divides by (gam#2765).
+    fn inverted_span(&self) -> Option<gam_solve::estimate::reml::reml_outer_engine::InvertedSpan> {
+        self.inner.inverted_span()
     }
 
     /// Always the inner backend's, skip list or not (gam#979).
@@ -484,7 +491,9 @@ pub(crate) fn unified_joint_cost_gradient(
         }
         (0.0, gradient_correction, None)
     });
-    let mut result = evaluator.evaluate(rho_slice, eval_mode, first_order_trace_correction)?;
+    let mut result = evaluator
+        .evaluate(rho_slice, eval_mode, first_order_trace_correction)
+        .map_err(|error| unified_evaluation_error(error, eval_mode, "evaluation"))?;
 
     let cost = result.cost;
     let criterion_components = [
@@ -515,6 +524,31 @@ pub(crate) fn unified_joint_cost_gradient(
         criterion_components,
         ext_mode_response_cols,
     ))
+}
+
+/// A unified-evaluator failure as the custom family reports it (gam#2765): an inner mode at a fold,
+/// or a constrained Laplace normalizer that cannot be formed, refuses the trial point by its typed
+/// verdict, and any other failure keeps its diagnostic.
+fn unified_evaluation_error(
+    error: gam_solve::estimate::reml::reml_outer_engine::RemlLamlError,
+    eval_mode: EvalMode,
+    route: &str,
+) -> CustomFamilyError {
+    match error {
+        gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::InnerModeFold(fold) => {
+            CustomFamilyError::TrialPointRefused {
+                reason: format!("the {eval_mode:?} {route} refused this trial point: {fold}"),
+            }
+        }
+        gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+            CustomFamilyError::TrialPointRefused {
+                reason: format!("the {eval_mode:?} {route} refused this trial point: {refusal}"),
+            }
+        }
+        gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::Failed(reason) => {
+            CustomFamilyError::from(reason)
+        }
+    }
 }
 
 pub(crate) fn unified_joint_efs_eval(
@@ -592,7 +626,8 @@ pub(crate) fn unified_joint_efs_eval(
         rho_slice,
         eval_mode,
         None,
-    )?;
+    )
+    .map_err(|error| unified_evaluation_error(error, eval_mode, "EFS evaluation"))?;
 
     let gradient = result
         .gradient
@@ -817,6 +852,42 @@ fn assembled_operator_fingerprint(
 /// This function encapsulates all shared logic: penalty assembly, mode inverse
 /// computation, precomputation of joint corrections + second-order traces, and
 /// routing through `unified_joint_cost_gradient`.
+/// gam#2945 positive controls, for tests only: nothing outside a test sets it. An outer
+/// finite-difference gate must show that it catches a missing second-order completion term, so a test
+/// can omit one term from every value+gradient+Hessian evaluation in this process until it clears the
+/// setting. Unset, the check is one atomic read per such evaluation and changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionCurvatureAblation {
+    /// Omit `∂²C/∂ψ_i∂ψ_j|_β` from each ψ pair's drift.
+    PsiPair,
+    /// Omit `∂_ψ D_β C[v]` from the fixed-drift derivative.
+    BetaPsi,
+}
+
+static COMPLETION_CURVATURE_ABLATION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+impl CompletionCurvatureAblation {
+    fn code(self) -> u8 {
+        match self {
+            Self::PsiPair => 1,
+            Self::BetaPsi => 2,
+        }
+    }
+}
+
+/// Set or clear the [`CompletionCurvatureAblation`] every later Hessian evaluation in this process reads.
+/// For tests only.
+pub fn set_completion_curvature_ablation(term: Option<CompletionCurvatureAblation>) {
+    COMPLETION_CURVATURE_ABLATION.store(
+        term.map_or(0, CompletionCurvatureAblation::code),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+fn completion_curvature_ablated(term: CompletionCurvatureAblation) -> bool {
+    COMPLETION_CURVATURE_ABLATION.load(std::sync::atomic::Ordering::SeqCst) == term.code()
+}
+
 pub(crate) fn joint_outer_evaluate(
     inner: &BlockwiseInnerResult,
     specs: &[ParameterBlockSpec],
@@ -831,6 +902,10 @@ pub(crate) fn joint_outer_evaluate(
     include_logdet_h: bool,
     include_logdet_s: bool,
     project_hessian_logdet: bool,
+    // Whether an explicit ψ coordinate of this evaluation moves the Jeffreys
+    // completion (gam#2930). A property of the family and its hyper layout, the
+    // same for every `eval_mode`: see `completion_priced` below.
+    completion_moves_with_psi: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
     rho_prior: gam_problem::RhoPrior,
@@ -859,6 +934,9 @@ pub(crate) fn joint_outer_evaluate(
                 + Sync,
         >,
     >,
+    // The outer Hessian's second-order correction traces from the workspace's
+    // row kernels (gam#2922), paired with the owned closures above.
+    owned_second_correction_traces: Option<Arc<DriftSecondCorrectionTracesFn>>,
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
     batched_outer_hessian_operator: Option<Arc<dyn gam_problem::HessianOperator>>,
@@ -962,21 +1040,122 @@ pub(crate) fn joint_outer_evaluate(
     // it prices `½·log|Zᵀ M Z|₊` on the inner mode's active face (`Z = I` when no row is
     // active). `M` carries the complete Jeffreys curvature `H_Φ + completion` when the family
     // supplies the completion's β-drifts, so the value, its traces and the mode response all
-    // read `M_true`. An explicit ψ-motion of the completion has no trace derivative here, so a
-    // ψ coordinate that moves the completion keeps `M_DD` in the criterion, and the
-    // completion then stays in the IFT operator alone (#2612).
+    // read `M_true`.
+    //
+    // gam#2930: that holds in every eval mode, whether or not a ψ coordinate moves the
+    // completion. The rule it replaces kept `M_DD` where ψ moved the completion and read that
+    // from whether this call had built the ψ completion action, which only a Hessian request
+    // does: value screening and gradients priced `M_true`, the outer Hessian `M_DD`, and seed
+    // validation refused every covariate-bearing constant-slope survival fit. `M_DD` is also
+    // the curvature whose smallest eigenvalue crosses zero near survival optima (#2894). A
+    // gradient of the `M_true` criterion adds the completion's explicit derivative
+    // `∂C/∂ψ|_β` to each ψ coordinate's drift below. Its ψψ and ρψ curvature adds
+    // `∂²C/∂ψ∂ψ|_β` to each ψ pair's drift and `∂_ψ D_β C[v]` to the fixed-drift derivative where
+    // the workspace contracts every ψ-moved trace Hessian; elsewhere a Hessian request on such a
+    // criterion is refused, and the fit declares no outer Hessian.
     let projected_criterion = project_hessian_logdet
         && include_logdet_h
         && include_logdet_s
         && pseudo_logdet_mode == PseudoLogdetMode::Smooth;
     let completion_priced = projected_criterion
         && robust_jeffreys_completion.is_some()
-        && ext_bundle
-            .as_ref()
-            .map_or(true, |bundle| bundle.completion_psi.is_none())
         && jeffreys_hphi_drift.as_ref().is_some_and(|drift| {
             drift.completion_first.is_some() && drift.completion_second.is_some()
         });
+    let mut ext_bundle = ext_bundle;
+    let mut completion_psi_partials: Vec<Array2<f64>> = Vec::new();
+    if completion_priced && completion_moves_with_psi {
+        let curvature_served = ext_bundle.as_ref().is_some_and(|bundle| {
+            bundle.completion_psi_pair.is_some() && bundle.completion_beta_psi.is_some()
+        });
+        if eval_mode == EvalMode::ValueGradientHessian && !curvature_served {
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: "the outer Hessian of a criterion that prices a psi-moving Jeffreys \
+                         completion needs the completion's second psi partial and its mixed \
+                         psi-beta drift, which this frame's workspace does not contract (gam#2930)"
+                    .to_string(),
+            });
+        }
+        if let Some(bundle) = ext_bundle.as_mut() {
+            let completion_psi_partial = bundle.completion_psi_partial.clone().ok_or_else(|| {
+                CustomFamilyError::trial_point(
+                    "a criterion that prices a psi-moving Jeffreys completion requires the \
+                     completion's explicit psi derivative (gam#2930)",
+                )
+            })?;
+            for (psi, coord) in bundle.coords.iter_mut().enumerate() {
+                let partial = completion_psi_partial(psi)?;
+                if partial.dim() != (total, total) {
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "the Jeffreys completion's psi partial for axis {psi} has shape {:?}, \
+                         expected ({total}, {total}) (gam#2930)",
+                        partial.dim()
+                    )));
+                }
+                let partial = (&partial + &partial.t()).mapv(|value| 0.5 * value);
+                match coord.drift.dense.as_mut() {
+                    Some(dense) => *dense += &partial,
+                    None => coord.drift.dense = Some(partial.clone()),
+                }
+                completion_psi_partials.push(partial);
+            }
+            if eval_mode == EvalMode::ValueGradientHessian
+                && let (Some(pair), Some(beta_psi)) = (
+                    bundle.completion_psi_pair.clone(),
+                    bundle.completion_beta_psi.clone(),
+                )
+            {
+                if !completion_curvature_ablated(CompletionCurvatureAblation::PsiPair)
+                    && let Some(inner_pair) = bundle.ext_ext_fn.take()
+                {
+                    bundle.ext_ext_fn = Some(Box::new(move |psi_i: usize, psi_j: usize| {
+                        let mut pair_terms = inner_pair(psi_i, psi_j)?;
+                        let completion = pair(psi_i, psi_j)?;
+                        let completion = (&completion + &completion.t()).mapv(|value| 0.5 * value);
+                        if pair_terms.b_mat.dim() == completion.dim() {
+                            pair_terms.b_mat += &completion;
+                        } else {
+                            pair_terms.b_operator = Some(Arc::new(CompositeHyperOperator {
+                                dim_hint: completion.nrows(),
+                                dense: Some(completion),
+                                operators: pair_terms.b_operator.into_iter().collect(),
+                            }));
+                        }
+                        Ok(pair_terms)
+                    })
+                        as Box<
+                            dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError>
+                                + Send
+                                + Sync,
+                        >);
+                }
+                if !completion_curvature_ablated(CompletionCurvatureAblation::BetaPsi) {
+                    let inner_drift = bundle.drift_fn.take();
+                    bundle.drift_fn = Some(Box::new(move |psi: usize, direction: &Array1<f64>| {
+                        let completion = beta_psi(psi, direction).map_err(|error| error.to_string())?;
+                        let inner = match inner_drift.as_ref() {
+                            Some(drift) => drift(psi, direction)?,
+                            None => None,
+                        };
+                        Ok(Some(match inner {
+                            Some(DriftDerivResult::Dense(matrix)) => DriftDerivResult::Dense(matrix + completion),
+                            Some(DriftDerivResult::Operator(operator)) => {
+                                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                                    dim_hint: completion.nrows(),
+                                    dense: Some(completion),
+                                    operators: vec![operator],
+                                }))
+                            }
+                            None => DriftDerivResult::Dense(completion),
+                        }))
+                    }) as FixedDriftDerivFn);
+                }
+                // The direction-contracted ψψ hook carries no completion terms, so the per-pair
+                // assembly above owns this criterion's ψψ curvature.
+                bundle.contracted_psi_fn = None;
+            }
+        }
+    }
     let scaled_criterion_jeffreys: Option<Array2<f64>> =
         match (robust_jeffreys_hphi.as_ref(), robust_jeffreys_completion.as_ref()) {
             (Some(hphi), Some(completion)) if completion_priced => {
@@ -984,7 +1163,14 @@ pub(crate) fn joint_outer_evaluate(
             }
             _ => scaled_robust_jeffreys_hphi,
         };
-    let face_tangent = criterion_face_tangent(inner)?;
+    // gam#2765: a mode whose constraints the cone normalizer integrates prices `½ log|M|` over the
+    // full space, and the normalizer carries the truncation; a face determinant would drop the
+    // pinned directions a second time.
+    let face_tangent = if inner.cone_normalizer.is_some() {
+        None
+    } else {
+        criterion_face_tangent(inner)?
+    };
 
     // Build derivative provider from the caller-supplied closures.
     let base_provider_box: Box<dyn HessianDerivativeProvider + '_> =
@@ -994,6 +1180,7 @@ pub(crate) fn joint_outer_evaluate(
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 compute_d2h_many: owned_compute_d2h_many,
+                second_correction_traces: owned_second_correction_traces,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
@@ -1020,6 +1207,9 @@ pub(crate) fn joint_outer_evaluate(
             }
             drift.completion_psi = ext_bundle.as_ref().and_then(|bundle| bundle.completion_psi.clone());
             drift.response_scale = rho_curvature_scale;
+            // gam#2765: without a completion the stationarity operator is the log-determinant
+            // operator, so no right-hand-side correction exists.
+            drift.completion_present = robust_jeffreys_completion.is_some();
             Box::new(JeffreysHphiAwareJointDerivatives::new(
             base_provider_box,
             drift,
@@ -1325,6 +1515,14 @@ pub(crate) fn joint_outer_evaluate(
     } else {
         None
     };
+    if let Some(kernel) = penalty_subspace_trace.as_ref() {
+        for (psi, partial) in completion_psi_partials.iter().enumerate() {
+            log::info!(
+                "[2930-COMPLETION-PSI] psi={psi} half_trace={:.6e}",
+                0.5 * rho_curvature_scale * kernel.trace_projected_logdet(partial)
+            );
+        }
+    }
 
     // gam#1587/#561: `unified_joint_cost_gradient` appends one coordinate per
     // full-width joint penalty (the centered `M⊗S_t` multinomial penalty) AFTER
@@ -1541,6 +1739,7 @@ pub(crate) fn joint_outer_evaluate_efs(
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
                 compute_d2h_many: owned_compute_d2h_many,
+                second_correction_traces: None,
                 family_outer_hessian_operator: None,
             })
         } else {
@@ -1620,7 +1819,12 @@ pub(crate) fn joint_outer_evaluate_efs(
             0.0,
             None,
             scaled_joint_penalty.as_ref(),
-            criterion_face_tangent(inner)?.as_ref(),
+            if inner.cone_normalizer.is_some() {
+                None
+            } else {
+                criterion_face_tangent(inner)?
+            }
+            .as_ref(),
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
@@ -1743,6 +1947,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     }
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    refuse_efs_where_the_cone_normalizer_is_priced(family, specs, &inner.block_states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
 
@@ -1770,6 +1975,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                 owned_compute_dh_many,
                 owned_compute_d2h,
                 owned_compute_d2h_many,
+                owned_second_correction_traces: _,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;
@@ -2268,6 +2474,118 @@ pub(crate) fn assemble_block_local_s_psi_psi(
     }
 }
 
+/// Refuse an EFS update at a mode whose family declares linear constraints (gam#2765).
+///
+/// The EFS fixed point models the penalty-trace structure of the criterion's gradient, not the
+/// constrained Laplace normalizer's share of it, so such a mode has no EFS update. The custom-family
+/// planner disables the fixed point for these families; this refusal keeps any other route from
+/// iterating a fixed point of a different criterion.
+pub(crate) fn refuse_efs_where_the_cone_normalizer_is_priced<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+) -> Result<(), CustomFamilyError> {
+    if collect_block_linear_constraints(family, states, specs)?.iter().any(Option::is_some) {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "custom-family EFS cannot price the constrained Laplace normalizer (gam#2765); \
+                     a gradient-based outer solver prices it"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The constrained Laplace normalizer's inputs at an inner mode (gam#2765): every linear
+/// inequality row the family declares over the joint coefficients, and the unprojected gradient
+/// `∇F(β̂) = S_λβ̂ + Jβ̂ − ∇ℓ(β̂) − ∇Φ(β̂)` of the objective the inner solve drove to its KKT
+/// point. `None` when the family declares no constraint.
+///
+/// `F` is the objective the inner certificate measures: with the Jeffreys term armed it is
+/// `−ℓ + ½βᵀSβ − Φ`, so its stationarity is `∇ℓ + ∇Φ − Sβ = 0` off the active rows. The gradient
+/// is formed by the same functions that form the certificate's residual
+/// ([`exact_newton_joint_stationarity_vector_from_gradient`] and
+/// [`joint_penalty_stationarity_score`]) from the likelihood score plus `∇Φ`. Without `∇Φ` the
+/// normalizer reads `−∇Φ` as a KKT gradient at an unconstrained mode, where the evaluator takes
+/// the gradient to be stationary, so the criterion's gradient does not differentiate its value.
+pub(crate) fn custom_family_cone_normalizer_input<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    inner: &BlockwiseInnerResult,
+) -> Result<Option<Arc<gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput>>, CustomFamilyError>
+{
+    let states = &inner.block_states;
+    let sets = collect_block_linear_constraints(family, states, specs)?;
+    if sets.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let mut rows: Vec<Array1<f64>> = Vec::new();
+    let mut bounds: Vec<f64> = Vec::new();
+    for (block, set) in sets.iter().enumerate() {
+        let Some(set) = set else { continue };
+        let dense = set.to_dense().map_err(|reason| CustomFamilyError::Optimization {
+            context: "constrained Laplace normalizer rows",
+            reason,
+        })?;
+        let (start, end) = ranges[block];
+        for row in 0..dense.a.nrows() {
+            let mut joint = Array1::<f64>::zeros(total);
+            joint.slice_mut(s![start..end]).assign(&dense.a.row(row));
+            rows.push(joint);
+            bounds.push(dense.b[row]);
+        }
+    }
+    let score = match inner
+        .terminal_likelihood_score
+        .as_ref()
+        .filter(|terminal| terminal.evaluated_at(states))
+    {
+        Some(terminal) => terminal.score.clone(),
+        // The inner solve's own gradient loader, at the returned states.
+        None => load_joint_gradient_evaluation(
+            family,
+            specs,
+            options,
+            states,
+            family.inner_joint_workspace_gradient_available(specs),
+            None,
+        )?
+        .1
+        .ok_or_else(|| CustomFamilyError::Optimization {
+            context: "constrained Laplace normalizer gradient",
+            reason: "the family publishes no joint likelihood gradient at the mode".to_string(),
+        })?,
+    };
+    let mut certified_score = score;
+    if family.joint_jeffreys_term_required()
+        && let Some(z_joint) = build_joint_jeffreys_subspace(family, specs, &ranges)?
+        && let Some((_phi, grad_phi, _hphi)) =
+            custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+    {
+        certified_score += &grad_phi;
+    }
+    let mut gradient =
+        exact_newton_joint_stationarity_vector_from_gradient(&certified_score, states, specs, &inner.s_lambdas)?;
+    if let Some(joint_score) = joint_penalty_stationarity_score(options, specs, states) {
+        gradient += &joint_score;
+    }
+    let q = rows.len();
+    let mut row_matrix = Array2::<f64>::zeros((q, total));
+    for (index, row) in rows.into_iter().enumerate() {
+        row_matrix.row_mut(index).assign(&row);
+    }
+    Ok(Some(Arc::new(
+        gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput {
+            rows: row_matrix,
+            bounds: Array1::from(bounds),
+            gradient,
+            gradient_motion: gam_solve::estimate::reml::reml_outer_engine::ConeGradientMotion::Stationary,
+        },
+    )))
+}
+
 /// A joint likelihood score together with the operating point it was
 /// evaluated at.
 ///
@@ -2531,6 +2849,9 @@ pub struct BlockwiseInnerResult {
     /// The smoothing state this mode was solved at — the cache key a reuse
     /// decision must be taken against (#2615).
     pub(crate) objective_state: InnerObjectiveState,
+    /// The constrained Laplace normalizer's inputs at this mode (gam#2765); `None` when the family
+    /// declares no linear constraint.
+    pub(crate) cone_normalizer: Option<Arc<gam_solve::estimate::reml::reml_outer_engine::ConeNormalizerInput>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {

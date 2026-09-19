@@ -152,6 +152,7 @@ mod fit;
 mod fit_config;
 mod materialize;
 mod request;
+mod warm_start_from;
 
 #[cfg(test)]
 mod gaussian_high_edf_observation_interval_tests;
@@ -186,3 +187,4 @@ pub(crate) use fit::*;
 pub use fit_config::*;
 pub use materialize::*;
 pub use request::*;
+pub use warm_start_from::*;

@@ -545,6 +545,7 @@ fn certificate_with(
         curvature,
         lambdas_railed: Vec::new(),
         railed_facts: Vec::new(),
+        newton_polish: None,
         curvature_floor,
     }
 }

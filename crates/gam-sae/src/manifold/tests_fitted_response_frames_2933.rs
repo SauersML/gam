@@ -9,6 +9,10 @@
 //! re-solves each perturbed fit to the joint fixed point of both blocks and
 //! differences every fitted scalar, so it measures the frame-integrated response
 //! without reading the operator.
+use super::construction::{
+    FittedResponseFrame, ShapeInformationRoute, exact_a_pencil_decompositions_on_this_thread,
+    hutchinson_residual_dof_resolved,
+};
 use super::tests_fitted_response_edf_2933::{
     ROOT_GRADIENT_CEILING, polish_to_root, root_norm, trace_and_residual_dof,
 };
@@ -34,14 +38,25 @@ const FRAME_FIXED_POINT_TOLERANCE: f64 = 1.0e-12;
 /// decoder lies in the span of the first `rank` output axes, so the fit activates
 /// a rank-`rank` frame on that span (the #2933 F35 fixture). `off_span_constant`
 /// adds a constant along output axis 2 at rank 2, a component outside the frame
-/// span meant to bind the rank constraint. Whether it does at the re-solved root,
-/// so that `∇_B L·U⊥ ≠ 0` and the bilinear cross curvature `E` is material, is
-/// measured there and printed, not assumed.
+/// span. It does not bind the rank constraint: the joint root absorbs it (job 1280343
+/// measured `‖∇_B L·U⊥‖_F = 1.58e-4` against `‖∇_B L‖_F = 1.34`), so the bilinear
+/// cross curvature `E` is not material in any arm of this fixture.
 fn framed_circle(
     rank: usize,
     off_span_constant: f64,
 ) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
-    let (n, p, m) = (24usize, 12usize, 3usize);
+    framed_circle_in(12, rank, off_span_constant)
+}
+
+/// [`framed_circle`] in `p` outputs: the decoder, the target's signal and its
+/// perturbations live on the same first three output axes, and the remaining axes
+/// carry no data, so only the frame's complement grows with `p`.
+fn framed_circle_in(
+    p: usize,
+    rank: usize,
+    off_span_constant: f64,
+) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let (n, m) = (24usize, 3usize);
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).expect("periodic basis"));
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("periodic jets");
@@ -178,7 +193,7 @@ fn assert_agrees(label: &str, value: f64, resolved: f64) {
 
 /// #2933 F39 — at rank 2 on a 3-column basis the frame orientation carries a
 /// response the fixed-frame divergence omits: with the target in the frame span,
-/// and with an off-span constant intended to bind the rank constraint. At rank 3
+/// and with an off-span constant, which the joint root absorbs. At rank 3
 /// the frame is a pure factorization gauge. In each, the divergence, its residual
 /// dof and the residual dof the dispersion prices must be the re-solved response's,
 /// priced integrated over the frame, with no count charged for it. Each arm prints
@@ -191,7 +206,7 @@ fn assert_agrees(label: &str, value: f64, resolved: f64) {
 fn learned_frames_price_their_integrated_response_2933_f39() {
     for (label, rank, off_span_constant) in [
         ("rank 2 in span", 2usize, 0.0_f64),
-        ("rank 2 binding off-span constant", 2, 0.3),
+        ("rank 2 with an absorbed off-span constant", 2, 0.3),
         ("rank 3 gauge", 3, 0.0),
     ] {
         let (mut term, target, rho) = framed_circle(rank, off_span_constant);
@@ -289,4 +304,374 @@ fn learned_frames_price_their_integrated_response_2933_f39() {
             "{label}: a small framed fit must integrate its frames"
         );
     }
+}
+
+/// `Var(zᵀMz)` for a Rademacher `z`: `2(‖S‖²_F − Σᵢ Sᵢᵢ²)` with `S = (M + Mᵀ)/2`, the
+/// variance of one probe of `tr M`.
+pub(super) fn rademacher_quadratic_form_variance(matrix: &Array2<f64>) -> f64 {
+    let symmetric = (matrix + &matrix.t()) * 0.5;
+    let frobenius = symmetric.iter().map(|value| value * value).sum::<f64>();
+    let diagonal = (0..symmetric.nrows())
+        .map(|index| symmetric[[index, index]] * symmetric[[index, index]])
+        .sum::<f64>();
+    2.0 * (frobenius - diagonal)
+}
+
+/// #2933 F39 — the probe count bounds the Monte Carlo variance from above instead
+/// of reading it off the sample. The stream is a Hutchinson-shaped term with a
+/// known law, `X = (ν/6)·χ²₆`: mean `ν = 100` and variance `ν²/3`, a residual dof
+/// whose `2ν` target needs about `ν/6 ≈ 17` probes. Its first two draws, 30 and 40,
+/// sit close together and low. The rule that compares their sample variance with
+/// the target stops there, more than four target deviations `√(2ν)` from `ν`. The
+/// upper confidence bound keeps probing, and where it stops the mean is within four
+/// target deviations of `ν`.
+#[test]
+fn the_probe_count_keeps_probing_past_an_under_read_variance_2933_f39() {
+    const MEAN: f64 = 100.0;
+    const CHI_SQUARED_DEGREES: usize = 6;
+    let target_deviation = (2.0 * MEAN).sqrt();
+    let mut values = vec![30.0_f64, 40.0];
+    let early_mean = 0.5 * (values[0] + values[1]);
+    let early_variance = (values[0] - values[1]).powi(2) / 2.0;
+    assert!(
+        early_variance / 2.0 <= 2.0 * early_mean
+            && (early_mean - MEAN).abs() > 4.0 * target_deviation,
+        "the fixture's first two draws must stop the sample-variance rule far from ν: mean \
+         {early_mean}, sample variance {early_variance}"
+    );
+    assert!(
+        !hutchinson_residual_dof_resolved(&values).expect("the rule evaluates"),
+        "two close draws must not bound the probe variance within the target"
+    );
+    let mut state = 0x2933_F39D_u64;
+    let mut uniform = || {
+        let bits = gam_linalg::utils::splitmix64(&mut state);
+        ((bits >> 11) as f64 + 0.5) / (1_u64 << 53) as f64
+    };
+    let stopped_at = loop {
+        // `−2 ln U` of a uniform `U` is a χ²₂ draw, so three of them sum to χ²₆.
+        let chi_squared: f64 = (0..CHI_SQUARED_DEGREES / 2)
+            .map(|_| -2.0 * uniform().ln())
+            .sum();
+        values.push(MEAN / CHI_SQUARED_DEGREES as f64 * chi_squared);
+        if hutchinson_residual_dof_resolved(&values).expect("the rule evaluates") {
+            break values.len();
+        }
+        assert!(
+            values.len() < 100_000,
+            "the rule never bounded the variance of a finite-variance stream"
+        );
+    };
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    eprintln!(
+        "[#2933 F39 probe count] the sample-variance rule stops at 2 with mean {early_mean}; the \
+         bound stops at {stopped_at} with mean {mean:.3} against ν = {MEAN} (target deviation \
+         {target_deviation:.3})"
+    );
+    assert!(
+        (mean - MEAN).abs() <= 4.0 * target_deviation,
+        "where the bound stops, the mean {mean} is more than four target deviations \
+         ({target_deviation:.3}) from ν = {MEAN}"
+    );
+}
+
+/// The rank-2 framed fixture of [`learned_frames_price_their_integrated_response_2933_f39`] in
+/// `p` outputs at its joint root, with the frame active and its evidence factor.
+fn framed_state(
+    p: usize,
+    off_span_constant: f64,
+) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho, ArrowFactorCache) {
+    let (mut term, target, rho) = framed_circle_in(p, 2, off_span_constant);
+    term.recompute_joint_shape_uncertainty(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+        .expect("the framed fixture fits");
+    assert_eq!(
+        term.atoms[0].decoder_frame.as_ref().map(|frame| frame.rank()),
+        Some(2),
+        "the fit must activate a rank-2 frame"
+    );
+    let gates = term.collapse_prevention_gates();
+    term.declare_collapse_prevention_gates(&gates);
+    let (cache, norm, change) = framed_root(&mut term, &target, &rho);
+    assert!(
+        norm <= ROOT_GRADIENT_CEILING && change <= FRAME_FIXED_POINT_TOLERANCE,
+        "the framed fixture stopped at ‖g‖={norm:.3e}, frame change {change:.3e}"
+    );
+    (term, target, rho, cache)
+}
+
+/// The largest carried host reading at which [`sae_exact_stationarity_admitted`]
+/// refuses `dim`. The predicate only grows with the reading, so bisection over it finds
+/// the edge.
+fn largest_refusing_host(dim: usize) -> usize {
+    let (mut refused, mut admitted) = (0usize, usize::MAX / 2);
+    assert!(
+        !sae_exact_stationarity_admitted(dim, refused) && sae_exact_stationarity_admitted(dim, admitted),
+        "the exact-stationarity admission at dimension {dim} must refuse an empty host and admit \
+         an unbounded one"
+    );
+    while admitted - refused > 1 {
+        let reading = refused + (admitted - refused) / 2;
+        if sae_exact_stationarity_admitted(dim, reading) {
+            admitted = reading;
+        } else {
+            refused = reading;
+        }
+    }
+    refused
+}
+
+/// #2933 F39 — a host too small for the dense frame-integrated eigensystem changes
+/// how the response is computed, never what is estimated. The carried host reading is
+/// one byte below the least one that admits the dense route's resident blocks at their
+/// exact dimension `t + Σ M_k·p`, and the fixture is wide enough (`p = 128`) that those
+/// blocks exceed the tiny-plan relaxation. The refusal therefore comes from the budget
+/// itself, and every smaller allocation the probe route makes is still admitted. The
+/// divergence must still integrate the frames, now by output-space probes. The probes
+/// must meet their own stopping rule, and land within four of the `√(2ν)` sampling
+/// deviations that rule holds them to of the dense route's residual dof at the
+/// admitting host. Restoring the dense route whatever the host, or the flip to the
+/// fixed-frame response on a refusal, turns this red.
+#[test]
+fn a_refused_dense_integrated_route_still_integrates_the_frames_2933_f39() {
+    let (mut term, target, rho, cache) = framed_state(128, 0.0);
+    let dense = term
+        .fitted_response_divergence(target.view(), &rho, &cache)
+        .expect("the admitting host prices the integrated response");
+    assert_eq!(
+        (dense.estimator, dense.frame_conditioning),
+        (
+            FittedResponseDivergenceEstimator::ExactSpectral,
+            SaeFrameConditioning::MarginalOverLearnedFrames
+        ),
+        "the default host must admit the dense frame-integrated route"
+    );
+    let dense_dim = sae_exact_stationarity_dim(cache.delta_t_len(), term.beta_dim());
+    assert!(
+        sae_exact_stationarity_resident_bytes(dense_dim) > SAE_DIRECT_ALWAYS_ADMIT_BYTES,
+        "the dense route's {} resident bytes at dimension {dense_dim} must exceed the tiny-plan \
+         relaxation, so its refusal is the budget's",
+        sae_exact_stationarity_resident_bytes(dense_dim)
+    );
+    term.host_available_bytes = largest_refusing_host(dense_dim);
+    let probed = term
+        .fitted_response_divergence(target.view(), &rho, &cache)
+        .expect("the refusing host prices the integrated response by probes");
+    eprintln!(
+        "[#2933 F39 route] dense dim {dense_dim}, host {} bytes: dense ν={:.9e} tr R={:.9e}; \
+         probed ν={:.9e} tr R={:.9e} ({:?}, {:?})",
+        term.host_available_bytes,
+        dense.likelihood_residual_dof,
+        dense.divergence,
+        probed.likelihood_residual_dof,
+        probed.divergence,
+        probed.estimator,
+        probed.frame_conditioning
+    );
+    assert_eq!(
+        probed.frame_conditioning,
+        SaeFrameConditioning::MarginalOverLearnedFrames,
+        "a refused dense route must not change the estimand to the fixed-frame response"
+    );
+    let FittedResponseDivergenceEstimator::Hutchinson { likelihood, raw } = probed.estimator else {
+        panic!(
+            "a host below the dense route's resident blocks must price the frames by probes, got \
+             {:?}",
+            probed.estimator
+        );
+    };
+    assert!(raw.is_none(), "the fixture carries no whitening metric");
+    assert!(
+        likelihood.probes >= 2
+            && likelihood.residual_dof_standard_error.powi(2) <= 2.0 * likelihood.residual_dof,
+        "the probes stopped at {} with a residual-dof Monte Carlo variance {:.3e} above 2ν̂ = \
+         {:.3e}",
+        likelihood.probes,
+        likelihood.residual_dof_standard_error.powi(2),
+        2.0 * likelihood.residual_dof
+    );
+    let sampling_deviation = (2.0 * dense.likelihood_residual_dof).sqrt();
+    assert!(
+        (probed.likelihood_residual_dof - dense.likelihood_residual_dof).abs()
+            <= 4.0 * sampling_deviation,
+        "the probed residual dof {:.9e} is more than four sampling deviations \
+         ({sampling_deviation:.3e}) from the dense {:.9e}",
+        probed.likelihood_residual_dof,
+        dense.likelihood_residual_dof
+    );
+}
+
+/// #2933 F39 — the probe route and the dense route price one operator. Probing the
+/// lifted evidence factor with every canonical output direction reproduces the dense
+/// frame-integrated `ν = Σ‖e − Re‖²` and `tr R = Σ eᵀRe` exactly, with no statistical
+/// multiple: each probe's solve resolves its Ritz pairs to `√ε` relative (the Krylov
+/// solve's resolution tolerance), so the sums agree to `√ε` of the sum of the probe
+/// values' magnitudes. Both of the F39 rank-2 arms are probed, the target in the frame
+/// span and with an off-span constant, and each prints `‖∇_B L·U⊥‖_F`, the normal
+/// gradient the cross curvature `E` is built from. Neither arm makes `E` material (job
+/// 1280343), so this pin does not cover `E`.
+#[test]
+fn canonical_probes_of_the_lifted_factor_reproduce_the_dense_integrated_response_2933_f39() {
+    for (label, off_span_constant) in [("in span", 0.0_f64), ("absorbed off-span constant", 0.3)] {
+        let (term, target, rho, cache) = framed_state(12, off_span_constant);
+        let dense = term
+            .fitted_response_divergence(target.view(), &rho, &cache)
+            .expect("the admitting host prices the integrated response");
+        assert_eq!(
+            dense.estimator,
+            FittedResponseDivergenceEstimator::ExactSpectral,
+            "{label}: the default host must admit the dense frame-integrated route"
+        );
+        let operator = term
+            .frame_integrated_response_operator(&rho, target.view(), None)
+            .expect("the lifted evidence factor builds at the framed state");
+        let (n, p) = target.dim();
+        let (mut residual_dof, mut residual_magnitude) = (0.0_f64, 0.0_f64);
+        let (mut divergence, mut divergence_magnitude) = (0.0_f64, 0.0_f64);
+        for row in 0..n {
+            for col in 0..p {
+                let mut z = vec![vec![0.0_f64; p]; n];
+                z[row][col] = 1.0;
+                let (residual, trace) = operator
+                    .probe(FittedResponseFrame::Likelihood, &z)
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: the canonical probe ({row}, {col}) solves: {error}")
+                    });
+                residual_dof += residual;
+                residual_magnitude += residual.abs();
+                divergence += trace;
+                divergence_magnitude += trace.abs();
+            }
+        }
+        let frame = term.atoms[0]
+            .decoder_frame
+            .as_ref()
+            .expect("the framed state carries its frame")
+            .frame()
+            .to_owned();
+        let residual_at_root = term
+            .reconstruction_residual(target.view(), &rho)
+            .expect("the framed state has a residual");
+        let data_gradient = term.atoms[0].basis_values.t().dot(&residual_at_root);
+        let normal_gradient = &data_gradient - &data_gradient.dot(&frame).dot(&frame.t());
+        let resolution = f64::EPSILON.sqrt();
+        eprintln!(
+            "[#2933 F39 canonical {label}] ‖∇_B L·U⊥‖_F={:.3e}; ν {residual_dof:.12e} against \
+             dense {:.12e} (gap {:.3e}, bar {:.3e}); tr R {divergence:.12e} against dense \
+             {:.12e} (gap {:.3e}, bar {:.3e})",
+            normal_gradient.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            dense.likelihood_residual_dof,
+            (residual_dof - dense.likelihood_residual_dof).abs(),
+            resolution * residual_magnitude,
+            dense.divergence,
+            (divergence - dense.divergence).abs(),
+            resolution * divergence_magnitude
+        );
+        assert!(
+            (residual_dof - dense.likelihood_residual_dof).abs() <= resolution * residual_magnitude,
+            "{label}: canonical probes give ν = {residual_dof:.12e}, the dense route {:.12e}",
+            dense.likelihood_residual_dof
+        );
+        assert!(
+            (divergence - dense.divergence).abs() <= resolution * divergence_magnitude,
+            "{label}: canonical probes give tr R = {divergence:.12e}, the dense route {:.12e}",
+            dense.divergence
+        );
+    }
+}
+
+/// #2933 F33/F35 — a shape report on the frame-marginal route decomposes the
+/// frame-integrated pencil once, for the dispersion's divergence and the covariance
+/// together. Forming it again for either consumer counts two.
+#[test]
+fn a_frame_marginal_shape_report_decomposes_its_pencil_once_2933_f39() {
+    let (term, target, rho, cache) = framed_state(12, 0.0);
+    let loss = term.loss(target.view(), &rho).expect("the framed state has a loss");
+    let residual = term
+        .reconstruction_residual(target.view(), &rho)
+        .expect("the framed state has a residual");
+    let entered = exact_a_pencil_decompositions_on_this_thread();
+    let route = term
+        .shape_information_route(&rho, target.view(), None, &cache)
+        .expect("the framed state has a shape information route");
+    assert!(
+        matches!(route, ShapeInformationRoute::FrameMarginal(_)),
+        "the default host must admit the frame-marginal covariance"
+    );
+    let dispersion = term
+        .reconstruction_dispersion_with_geometry(
+            &loss,
+            &cache,
+            &rho,
+            residual.view(),
+            Some(route.held_response_geometry()),
+        )
+        .expect("the frame-marginal report prices a dispersion");
+    let information = term
+        .shape_information(&route, &rho, target.view(), &cache)
+        .expect("the frame-marginal report inverts its information");
+    let decompositions = exact_a_pencil_decompositions_on_this_thread() - entered;
+    eprintln!(
+        "[#2933 F39 report] {decompositions} pencil decompositions; raw noise variance {:.9e}, \
+         observed-information covariance {}",
+        dispersion.raw_output_noise_variance,
+        matches!(information, SaeShapeInformation::ObservedInformation(_))
+    );
+    assert_eq!(
+        decompositions, 1,
+        "one frame-marginal report must decompose its pencil once, for the dispersion and the \
+         covariance together"
+    );
+}
+
+/// #2933 F39 — a dense evaluation of a framed state forms its fitted-response divergence
+/// once, for the value's rank charge and the gradient's rank-charge derivative together.
+/// The value leaves its dispersion on the spectral block it hands the gradient. Reading
+/// it there must decompose nothing. Forming it again, the derivative with no block, must
+/// decompose the frame-integrated pencil, which is the counter's positive control. Both
+/// derivatives must agree bit for bit, because they price one dispersion at one state.
+#[test]
+fn a_dense_evaluation_forms_its_fitted_response_once_for_value_and_gradient_2933_f39() {
+    let (mut term, target, rho, _root_cache) = framed_state(12, 0.0);
+    let (_value, loss, priced) = term
+        .penalized_quasi_laplace_criterion_priced_with_lane(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+            true,
+            None,
+        )
+        .expect("the framed state prices a dense criterion at its own rho");
+    let (cache, geometry) = priced.expect("the dense route hands its spectral block on");
+    let entered = exact_a_pencil_decompositions_on_this_thread();
+    let shared = term
+        .production_rank_charge_derivative(target.view(), &rho, &loss, &cache, Some(&geometry))
+        .expect("the rank-charge derivative reads the value's block");
+    let read = exact_a_pencil_decompositions_on_this_thread() - entered;
+    let formed = term
+        .production_rank_charge_derivative(target.view(), &rho, &loss, &cache, None)
+        .expect("the rank-charge derivative forms its own dispersion");
+    let forming = exact_a_pencil_decompositions_on_this_thread() - entered - read;
+    let bits = |values: &Array1<f64>| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    eprintln!(
+        "[#2933 F39 once per state] decompositions: reading the value's dispersion {read}, \
+         forming it again {forming}"
+    );
+    assert!(
+        forming > 0,
+        "control: forming the framed dispersion must decompose the frame-integrated pencil"
+    );
+    assert_eq!(
+        read, 0,
+        "the gradient's rank charge must read the value's dispersion, not form it again"
+    );
+    assert!(
+        bits(&shared.direct_rho) == bits(&formed.direct_rho)
+            && bits(&shared.theta.t) == bits(&formed.theta.t)
+            && bits(&shared.theta.beta) == bits(&formed.theta.beta),
+        "the derivative off the value's dispersion must equal the one that forms it, bit for bit"
+    );
 }

@@ -277,13 +277,26 @@ pub enum SaeCriterionError {
     IndefiniteObservedInformation {
         block: &'static str,
     },
+    /// #2234 — atom `atom` carries a closure-certified circle orbit, whose evidence both routes
+    /// integrate exactly: `log|A_s| − log det N − 2·log I + log 2π`. The arrow route prices it on
+    /// its exact reduced-Schur orbit lane where the stiffened pencil is certified free of band and
+    /// negative directions (step 1a). `refusal` names the arrow lane that could not price this
+    /// state and why. It refuses by this name rather than through the indefinite-`A` verdict,
+    /// which would claim the state has no Laplace normalizer while the dense route prices the
+    /// same state finitely.
+    OrbitCriterionUnavailableOnArrowRoute {
+        atom: usize,
+        refusal: ArrowOrbitRefusal,
+    },
 }
 
 impl SaeCriterionError {
     pub fn vanished_atoms(&self) -> Option<&VanishedAtoms> {
         match self {
             Self::VanishedAtoms(atoms) => Some(atoms),
-            Self::Numerical(_) | Self::IndefiniteObservedInformation { .. } => None,
+            Self::Numerical(_)
+            | Self::IndefiniteObservedInformation { .. }
+            | Self::OrbitCriterionUnavailableOnArrowRoute { .. } => None,
         }
     }
 
@@ -337,6 +350,12 @@ impl std::fmt::Display for SaeCriterionError {
                 f,
                 "exact observed-information Hessian is indefinite at the converged mode \
                  ({block} block): ½log|A| is undefined (the inner point is not a maximum)"
+            ),
+            Self::OrbitCriterionUnavailableOnArrowRoute { atom, refusal } => write!(
+                f,
+                "atom {atom} carries a closure-certified circle orbit, and the arrow route's {} \
+                 cannot price its orbit-eliminated criterion (#2234): {refusal}",
+                refusal.lane()
             ),
         }
     }
@@ -779,6 +798,14 @@ include!("construction_fitted_response.rs");
 
 // [#2253] Exact hard-rank-charge direct and implicit-response derivatives.
 include!("construction_rank_charge_derivative.rs");
+
+// [#2234] The declared compact chart orbit, integrated exactly: the stiffened operator the dense
+// exact-A block prices and the orbit-eliminated exact-A pseudo-inverse beside it.
+include!("construction_orbit_elimination.rs");
+
+// [#2234] The same orbit-eliminated evidence on the arrow route, off one elimination of the
+// bordered operator, and the arrow-held seams the exact-A channels read their operands through.
+include!("construction_orbit_arrow.rs");
 
 // [#780] The outer-gradient error taxonomy (`OuterGradientError`), the
 // `ForcedRowLayout` override alias, the `COTRAIN_*` co-training weight
@@ -2889,20 +2916,15 @@ impl SaeManifoldTerm {
     /// `Self::validate_analytic_penalty_registry` otherwise produces during
     /// `assemble_arrow_schur`).
     ///
-    /// Native ARD rides the separate `native_ard_enabled` FFI flag rather than a
-    /// registry descriptor, but because it composes it is admitted on a mixed
-    /// dictionary; only a NON-composing REGISTRY penalty triggers the refusal.
+    /// The coordinate ARD prior is on every atom (#2822) and composes over a mixed
+    /// dictionary, so it never triggers the refusal; only a NON-composing REGISTRY
+    /// penalty does.
     ///
     /// Homogeneous coord dims (including `K == 1`) always pass, as does a
     /// heterogeneous dictionary that carries only composing penalties.
     pub fn validate_heterogeneous_atom_compatibility(
         &self,
         registry: Option<&AnalyticPenaltyRegistry>,
-        // Retained for FFI signature stability and self-documentation. Post-F6 it
-        // no longer gates: native ARD composes over heterogeneous coord dims
-        // (`ard_value` is a per-atom sum over `d_k`), so it is admitted whether or
-        // not it is enabled — only a NON-composing registry penalty refuses.
-        native_ard_enabled: bool,
     ) -> Result<(), String> {
         // Per-atom coord latent dims via the same accessor the registry
         // validator uses, so the two cannot disagree on "heterogeneous".
@@ -2914,7 +2936,7 @@ impl SaeManifoldTerm {
             // Homogeneous coord dims: every row-block penalty dispatches cleanly.
             return Ok(());
         };
-        // Native ARD (the `native_ard_enabled` flag) composes over heterogeneous
+        // The coordinate ARD prior composes over heterogeneous
         // coord dims: `ard_value` sums per atom over `d_k` axes with a per-atom
         // `log_ard[k]` of length `d_k`, so a mixed dictionary is its native shape
         // and it never forces a uniform `atom_dim`. Only the fixed-`d` structural
@@ -2938,9 +2960,8 @@ impl SaeManifoldTerm {
              coordinate dims cannot be dispatched (they would silently truncate or pad axes). \
              Either configure a uniform atom_dim for all atoms, or drop this penalty. The \
              dim-adaptive row-block penalties — SCAD-MCP, sparsity, native ARD, isometry — \
-             compose on a mixed dictionary and are admitted (native ARD enabled here: {}).",
-            offender.name(),
-            native_ard_enabled
+             compose on a mixed dictionary and are admitted.",
+            offender.name()
         ))
     }
 
@@ -5637,11 +5658,10 @@ include!("construction_quasi_laplace.rs");
 // and private-field access. Keeps this tracked file under the 10k limit.
 include!("construction_row_jet_logdet_channels.rs");
 
-// [#780 line-count gate] Massive-K decoder-smoothness effective-dof Hutchinson
-// estimator (associated constants + the matrix-free per-atom trace) lives in a
-// sibling file as another `impl SaeManifoldTerm` block, inlined here so it keeps
-// the SAME module scope and private-field access. The two gated exact/estimator
-// entry points above dispatch into it at `K >= MIN_ATOMS`.
+// [#780 line-count gate] The decoder-smoothness effective dof and κ-penalty traces
+// taken off a reduced-Schur probe bundle live in a sibling file as another
+// `impl SaeManifoldTerm` block, inlined here so it keeps the SAME module scope and
+// private-field access.
 include!("construction_smoothness_dof.rs");
 
 // [#780 line-count gate] `term_from_geometry_plans_with_mode` (the geometry-plan
@@ -5665,19 +5685,4 @@ mod construction_tests {
     use super::*;
 
     include!("construction_tests.rs");
-}
-
-/// Solve-invariant operands of `selected_inverse_row_blocks_or_solve` (#932
-/// FRONT C): everything fixed across the per-row sweep of one
-/// trace/adjoint pass — the deflated solver, the factor cache, the dense
-/// `(H⁻¹)_ββ`, the Takahashi-vs-solve route flag, the shared zero β-RHS, and
-/// the error-context prefix — bundled so each per-row call carries only the
-/// row coordinates and the reusable scratch buffer.
-pub(crate) struct SelectedInverseRowSolve<'a> {
-    pub(crate) solver: &'a DeflatedArrowSolver<'a>,
-    pub(crate) cache: &'a ArrowFactorCache,
-    pub(crate) beta_inv: &'a Array2<f64>,
-    pub(crate) fast_selected: bool,
-    pub(crate) rhs_beta_zero: ArrayView1<'a, f64>,
-    pub(crate) context: &'a str,
 }

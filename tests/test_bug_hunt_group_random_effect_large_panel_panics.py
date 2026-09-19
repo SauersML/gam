@@ -71,8 +71,8 @@ def test_group_random_intercept_fits_large_panel() -> None:
 
     model = gamfit.fit(df, "y ~ group(site)", family="gaussian")
 
-    # The fit must produce a usable model with a finite marginal-likelihood score.
-    assert np.isfinite(model.evidence)
+    # The fit must produce a usable model with a finite conditional-AIC score.
+    assert np.isfinite(model.conditional_aic)
 
     # And it must actually recover the group structure it was generated from:
     # one prediction per group should track the true per-group mean closely.

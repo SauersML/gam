@@ -3,11 +3,14 @@
 Target spec (no scale_dimensions, no linkwiggle, no score-warp, no survival):
 
     train  : columns = [case, sex, prs_z, PC1..PC10]
-    formula: case ~ duchon(PC1..PC10, centers=40, order=1, power=2, length_scale=1)
-                  + sex
+    formula: case ~ duchon(PC1..PC10, centers=40) + sex
     link   : probit
-    slope: duchon(PC1..PC10, centers=40, order=1, power=2, length_scale=1)
+    slope: duchon(PC1..PC10, centers=40)
     z-column: prs_z
+
+The PC smooth is gam's scale-free default Duchon kernel: no order, power or
+length scale. The center count is fixed so every probe size fits the same
+basis.
 
 Outputs:
   - <outdir>/dch_<N>.csv          (synthetic data)
@@ -38,9 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 GEN_PY = Path(__file__).resolve().parent / "gen.py"
 
 PC_COLS = ", ".join(f"PC{j}" for j in range(1, 11))
-DUCHON_TERM = (
-    f"duchon({PC_COLS}, centers=40, order=1, power=2, length_scale=1)"
-)
+DUCHON_TERM = f"duchon({PC_COLS}, centers=40)"
 MEAN_FORMULA = f"case ~ link(type=probit) + sex + {DUCHON_TERM}"
 SLOPE_FORMULA = DUCHON_TERM
 

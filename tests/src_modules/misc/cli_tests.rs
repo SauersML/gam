@@ -400,6 +400,7 @@ mod tests {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
@@ -509,6 +510,7 @@ mod tests {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         };
         let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
@@ -706,6 +708,7 @@ fn saved_fit_summary_fixture() -> SavedFitSummary {
             curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
             lambdas_railed: Vec::new(),
             railed_facts: Vec::new(),
+            newton_polish: None,
             curvature_floor: None,
         }),
     }
@@ -1096,6 +1099,7 @@ fn location_scale_fit_args(
         predict_noise: Some(noise_formula.to_string()),
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1503,6 +1507,7 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1637,6 +1642,7 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1724,6 +1730,7 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -1835,6 +1842,76 @@ fn cli_request_document_survival_time_anchor_reaches_the_fit_2631() {
          requested {EXPLICIT_ANCHOR}, saved {anchor}"
     );
     remove_temp_file(&model_path);
+}
+
+/// gam#2926: a `--request` document's `latent_measure` must reach the Bernoulli
+/// marginal-slope fit, and the saved model must record the law the fit consumed
+/// under that spelling's own label. `latent_measure` has no CLI flag, so the
+/// document is the only way to request one.
+#[test]
+fn cli_request_document_latent_measure_reaches_the_marginal_slope_fit_2926() {
+    fn unit(state: &mut u64) -> f64 {
+        (gam::utils::splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("request_latent_measure.csv");
+    let rows = 240;
+    let mut csv = String::from("y,z,x\n");
+    let mut state = 0x2926_C11E_0000_0001_u64;
+    for row in 0..rows {
+        let x = -1.5 + 3.0 * (row as f64 + 0.5) / rows as f64;
+        let u1 = unit(&mut state).max(f64::MIN_POSITIVE);
+        let u2 = unit(&mut state);
+        let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        let probability = gam::probability::normal_cdf(-0.2 + 0.5 * x + 0.6 * z);
+        let y = u8::from(unit(&mut state) < probability);
+        csv.push_str(&format!("{y},{z},{x}\n"));
+    }
+    fs::write(&train_path, csv)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write marginal-slope csv", e));
+
+    for (latent_measure, label) in [
+        ("global-empirical", "requested-global-empirical"),
+        ("conditional-location-scale", "conditional-location-scale"),
+    ] {
+        let request_path = td.path().join(format!("request_{latent_measure}.request.json"));
+        let model_path = td.path().join(format!("request_{latent_measure}.model.json"));
+        fs::write(
+            &request_path,
+            format!(
+                r#"{{"schema":"gam.fit-request","schema_version":1,
+                     "formula":"y ~ x",
+                     "config":{{"family":"bernoulli-marginal-slope","z_column":"z",
+                                "slope_formula":"1","latent_measure":"{latent_measure}"}}}}"#
+            ),
+        )
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write fit-request document", e));
+        let mut args = binomial_link_fit_args(
+            train_path.clone(),
+            model_path.clone(),
+            "unused ~ when --request is supplied",
+        );
+        args.request = Some(request_path);
+        args.formula_positional = None;
+        run_fit(args).unwrap_or_else(|e| {
+            panic!(
+                "fit from a --request document with latent_measure={latent_measure} should \
+                 succeed: {e:?}"
+            )
+        });
+        let saved = SavedModel::load_from_path(&model_path)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+        let consumed = saved
+            .latent_law_consumed
+            .as_ref()
+            .expect("a saved marginal-slope model must record the latent law it consumed");
+        assert_eq!(
+            consumed.label(),
+            label,
+            "a --request document's latent_measure={latent_measure} must reach the fit"
+        );
+        remove_temp_file(&model_path);
+    }
 }
 
 /// A `--request` document's frailty must reach the survival routes. `SurvivalArgs`
@@ -2164,6 +2241,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         predict_noise: Some("1".to_string()),
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2400,6 +2478,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         predict_noise: None,
         slope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2513,6 +2592,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
         predict_noise: None,
         slope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -2558,6 +2638,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         predict_noise: None,
         slope_formula: Some("1 + s(z, type=duchon, centers=6)".to_string()),
         z_column: Some("z".to_string()),
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3023,6 +3104,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3159,6 +3241,7 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3311,6 +3394,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         predict_noise: None,
         slope_formula: None,
         z_column: None,
+        residual_columns: Vec::new(),
         weights_column: None,
         offset_column: None,
         noise_offset_column: None,
@@ -3732,6 +3816,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         inference: Some(FitInference {
             edf_by_block: vec![1.5],
             penalty_block_trace: vec![],
+            edf_rank_bound: Vec::new(),
             edf_total: 1.5,
             smoothing_correction: None,
             smoothing_correction_method: None,
@@ -3742,10 +3827,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             reparam_qs: Some(Array2::eye(2)),
             dispersion: gam::estimate::Dispersion::known(1.0)
                 .expect("unit known dispersion is valid"),
-            beta_covariance: None,
-            beta_standard_errors: None,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
+            factorized_standard_errors: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -3792,6 +3874,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
                 curvature: gam::solver::rho_optimizer::CurvatureEvidence::Measured { psd: true },
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             }),
             ..Default::default()
@@ -3870,6 +3953,7 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
                 curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
                 lambdas_railed: Vec::new(),
                 railed_facts: Vec::new(),
+                newton_polish: None,
                 curvature_floor: None,
             }),
         },
@@ -4621,7 +4705,7 @@ fn bernoulli_marginal_slope_saved_model_fixture(
     baseline_slope: f64,
     latent_z_normalization: SavedLatentZNormalization,
     latent_measure: LatentMeasureKind,
-    latent_z_rank_int_calibration: Option<gam::families::bms::LatentZRankIntCalibration>,
+    latent_law_consumed: gam::families::bms::LatentLawConsumed,
     latent_z_conditional_calibration: Option<gam::families::bms::LatentZConditionalCalibration>,
     score_warp_runtime: Option<&gam::families::bms::DeviationRuntime>,
     link_dev_runtime: Option<&gam::families::bms::DeviationRuntime>,
@@ -4642,12 +4726,13 @@ fn bernoulli_marginal_slope_saved_model_fixture(
             baseline_slope,
             latent_z_normalization,
             latent_measure,
-            latent_z_rank_int_calibration,
+            latent_law_consumed,
             latent_z_conditional_calibration,
             score_warp_runtime,
             link_dev_runtime,
             base_link,
             frailty,
+            residual_repair: None,
         },
         SavedModelSourceMetadata {
             training_headers,
@@ -4685,7 +4770,17 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         0.0,
         SavedLatentZNormalization { mean: 0.2, sd: 1.3 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -4758,12 +4853,23 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
         baseline_slope: 0.7,
         latent_z_normalization: SavedLatentZNormalization { mean: 1.1, sd: 2.2 },
         latent_measure: LatentMeasureKind::StandardNormal,
-        latent_z_rank_int_calibration: None,
+        latent_law_consumed: gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         latent_z_conditional_calibration: None,
         score_warp_runtime: None,
         link_dev_runtime: None,
         base_link: InverseLink::Standard(StandardLink::Probit),
         frailty: gam::families::survival::lognormal_kernel::FrailtySpec::None,
+        residual_repair: None,
     };
 
     // CLI source metadata: headers + per-feature ranges, no offset columns.
@@ -4909,7 +5015,17 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         1.0,
         SavedLatentZNormalization { mean: 1.0, sd: 2.0 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -4995,7 +5111,17 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         0.0,
         SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
         LatentMeasureKind::StandardNormal,
-        None,
+        gam::families::bms::LatentLawConsumed::DeclaredGaussian {
+            evidence: gam::families::bms::ConditionalLawEvidence {
+                mean_p_value: None,
+                variance_p_value: None,
+                skewness_p_value: None,
+                alpha: 1.0e-3,
+            },
+            adequacy: None,
+            residual: None,
+            uncertified: None,
+        },
         None,
         None,
         None,
@@ -6156,6 +6282,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         &derivative_offset_exit,
         &primary_offset,
         &noise_offset,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(
@@ -6374,6 +6501,7 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         &derivative_offset_exit,
         &primary_offset,
         &noise_offset,
+        None,
     )
     .unwrap_or_else(|e| {
         panic!(

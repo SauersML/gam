@@ -104,7 +104,6 @@ def run_one(
         assignment="softmax",
         top_k=1,
         isometry_weight=0.0,
-        ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         n_iter=int(max_iter),

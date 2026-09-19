@@ -2,12 +2,13 @@
   "workflow": "Reference Quality Suite",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "run_id": "34670695655",
-  "run_number": "584",
+  "publish_job_failed_steps": "step 8: Run quality suite (resilient + streaming; full per-test capture)",
+  "run_id": "35390892691",
+  "run_number": "593",
   "run_attempt": "1",
-  "event": "push",
+  "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "1b5d8b9a2305fc44a597114b75649c0ff6222ac3",
-  "completed_utc": "2026-09-12T05:51:24Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/34670695655"
+  "sha": "5a2cbcaebba1a1c8dd0bb7ce849db04cbc604c3b",
+  "completed_utc": "2026-09-18T23:43:39Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/35390892691"
 }

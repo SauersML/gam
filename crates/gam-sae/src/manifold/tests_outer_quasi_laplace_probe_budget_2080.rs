@@ -24,7 +24,7 @@ use super::tests::{deterministic_circle_noise, global_ev};
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atb};
-use gam_solve::rho_optimizer::{OuterEval, OuterEvalOrder, OuterObjective, OuterProblem};
+use gam_solve::rho_optimizer::{OuterEval, OuterEvalOrder, OuterObjective, OuterProblem, OuterResult};
 use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
@@ -692,7 +692,6 @@ struct CeilingPathologyConfig {
     harmonics: usize,
     sigma: f64,
     inner_max_iter: usize,
-    outer_max_iter: usize,
     initial_step_norm: f64,
     materialization_ratio_floor: f64,
     step_collapse_radius: f64,
@@ -708,7 +707,6 @@ impl Default for CeilingPathologyConfig {
             harmonics: 2,
             sigma: 0.05,
             inner_max_iter: 8,
-            outer_max_iter: 8,
             initial_step_norm: 0.25,
             materialization_ratio_floor: 0.05,
             step_collapse_radius: 1.0e-3,
@@ -732,15 +730,52 @@ struct CeilingPathologyReport {
     rho_displacement: f64,
     ev: f64,
     telemetry: OuterProbeTelemetry,
+    /// The typed error the outer run returned, rendered. An errored run measures neither
+    /// outer-run symptom below, so it carries no live-lock verdict; this is its report.
     outer_error: Option<String>,
     predicted_decrease_not_materializing: bool,
-    step_collapsed: bool,
-    huge_final_gradient: bool,
+    /// `None` where the outer run returned an error and the symptom was never measured.
+    step_collapsed: Option<bool>,
+    /// `None` where the outer run returned an error and the symptom was never measured.
+    huge_final_gradient: Option<bool>,
     live_lock_present: bool,
 }
 
 fn l2_norm(v: &Array1<f64>) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// #2156 — the live-lock signature is three MEASURED symptoms together: the predicted first-step
+/// decrease did not materialize, the accepted ρ step collapsed, and the final gradient stayed huge.
+/// A symptom that was never measured is not present.
+fn live_lock_signature(
+    predicted_decrease_not_materializing: bool,
+    step_collapsed: Option<bool>,
+    huge_final_gradient: Option<bool>,
+) -> bool {
+    predicted_decrease_not_materializing
+        && step_collapsed == Some(true)
+        && huge_final_gradient == Some(true)
+}
+
+/// The outer-run symptoms of [`live_lock_signature`], `(step_collapsed, huge_final_gradient)`,
+/// measured on a returned result. An outer run that returned a typed error measures neither.
+fn outer_run_live_lock_symptoms(
+    run: &Result<OuterResult, EstimationError>,
+    seed: &Array1<f64>,
+    cfg: CeilingPathologyConfig,
+) -> (Option<bool>, Option<bool>) {
+    match run {
+        Ok(result) => {
+            let final_grad_norm = result.final_grad_norm.unwrap_or(f64::NAN);
+            let rho_displacement = l2_norm(&(&result.rho - seed));
+            (
+                Some(rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius),
+                Some(final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor),
+            )
+        }
+        Err(..) => (None, None),
+    }
 }
 
 fn seeded_k1_circle_objective(
@@ -817,28 +852,31 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
     let seed = fit_seeded.2;
     let mut objective = fit_seeded.3;
     let n_params = seed.len();
-    let mut problem = OuterProblem::new(n_params)
-        .with_max_iter(cfg.outer_max_iter);
+    // #2080: no hand-set outer budget. The search runs to its own certificate or to the
+    // engine's typed non-convergence, as the acceptances in this file do since 9d46bfa66.
+    // Under an 8-iteration budget the run stopped at that budget before its certificate
+    // (job 1230144: termination=iteration_budget); without it the run certifies (job 1264867).
+    let mut problem = OuterProblem::new(n_params);
     if cfg.pin_initial_rho {
         problem = problem.with_initial_rho(seed.clone());
     }
     let run = problem.run(&mut objective, "SAE manifold ceiling-vs-pathology #2156");
     let telemetry = objective.probe_telemetry();
+    let (step_collapsed, huge_final_gradient) = outer_run_live_lock_symptoms(&run, &seed, cfg);
+    let live_lock_present = live_lock_signature(
+        predicted_decrease_not_materializing,
+        step_collapsed,
+        huge_final_gradient,
+    );
     match run {
         Ok(result) => {
             let final_grad_norm = result.final_grad_norm.unwrap_or(f64::NAN);
             let rho_displacement = l2_norm(&(&result.rho - &seed));
-            let step_collapsed =
-                rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius;
-            let huge_final_gradient =
-                final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor;
             objective
                 .certify_outer_result(&result)
                 .expect("ceiling-pathology outer result must certify the installed state");
             let fitted = objective.into_fitted().expect("outer fit was evaluated");
             let ev = global_ev(z.view(), fitted.term.fitted().view());
-            let live_lock_present =
-                predicted_decrease_not_materializing && step_collapsed && huge_final_gradient;
             CeilingPathologyReport {
                 initial_cost: initial.cost,
                 initial_grad_norm,
@@ -874,9 +912,9 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
             telemetry,
             outer_error: Some(err.to_string()),
             predicted_decrease_not_materializing,
-            step_collapsed: false,
-            huge_final_gradient: false,
-            live_lock_present: true,
+            step_collapsed,
+            huge_final_gradient,
+            live_lock_present,
         },
     }
 }
@@ -971,7 +1009,7 @@ fn ceiling_vs_pathology_outer_reml_instrument_2156() {
          outer_converged={}, outer_iterations={}, final_value={:.6e}, final_grad_norm={:.6e}, \
          rho_displacement={:.6e}, ev={:.4}, criterion_calls={}, \
          infeasible_criterion_evals={}, infeasible_total={}, outer_error={:?}, \
-         predicted_not_materializing={}, step_collapsed={}, huge_final_gradient={}, \
+         predicted_not_materializing={}, step_collapsed={:?}, huge_final_gradient={:?}, \
          live_lock_present={}",
         report.initial_cost,
         report.initial_grad_norm,
@@ -993,11 +1031,51 @@ fn ceiling_vs_pathology_outer_reml_instrument_2156() {
         report.huge_final_gradient,
         report.live_lock_present,
     );
+    // An outer run that returned an error decides nothing about live-lock: report the typed
+    // error it returned, which is the failure this fixture has.
+    if let Some(outer_error) = &report.outer_error {
+        panic!(
+            "#2156 CEILING-vs-PATHOLOGY instrument: the outer search returned an error instead \
+             of a result, so no live-lock verdict exists: {outer_error}; report={report:?}"
+        );
+    }
     assert!(
         !report.live_lock_present,
         "#2156 CEILING-vs-PATHOLOGY instrument detected the live-lock signature: \
          predicted decrease did not materialize, accepted ρ step collapsed, and \
          final gradient stayed huge; report={report:?}"
+    );
+}
+
+/// #2156 control — an outer run that returns a typed error measures neither outer-run symptom,
+/// so it yields no live-lock verdict even where the first-step prediction did not materialize.
+/// Only all three measured symptoms make the signature.
+#[test]
+fn outer_error_yields_no_live_lock_verdict_2156() {
+    let cfg = CeilingPathologyConfig::default();
+    let seed = Array1::<f64>::zeros(2);
+    let run: Result<OuterResult, EstimationError> = Err(
+        EstimationError::ParameterConstraintViolation(
+            "#2156 control: a typed outer error".to_string(),
+        ),
+    );
+    let (step_collapsed, huge_final_gradient) = outer_run_live_lock_symptoms(&run, &seed, cfg);
+    assert_eq!(
+        (step_collapsed, huge_final_gradient),
+        (None, None),
+        "an errored outer run measures no outer-run symptom"
+    );
+    assert!(
+        !live_lock_signature(true, step_collapsed, huge_final_gradient),
+        "an errored outer run must carry no live-lock verdict"
+    );
+    assert!(
+        live_lock_signature(true, Some(true), Some(true)),
+        "all three measured symptoms make the live-lock signature"
+    );
+    assert!(
+        !live_lock_signature(false, Some(true), Some(true)),
+        "a materialized first-step prediction is no live-lock"
     );
 }
 

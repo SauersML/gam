@@ -99,10 +99,10 @@ def test_scan_model_predicts_and_summarizes(degree, penalty_order, order):
     edf = float(summary.edf_total)
     assert order < edf < n, f"edf {edf} must lie in ({order}, {n})"
 
-    # evidence(): always the conditional AIC. The scan's concentrated diffuse
+    # conditional_aic: always the conditional AIC. The scan's concentrated diffuse
     # REML value is a different estimand and must never be substituted here.
-    expected_evidence = -2.0 * log_likelihood + 2.0 * edf
-    assert float(model.evidence) == pytest.approx(expected_evidence)
+    expected_conditional_aic = -2.0 * log_likelihood + 2.0 * edf
+    assert float(model.conditional_aic) == pytest.approx(expected_conditional_aic)
 
     # term_blocks: exactly one contiguous coefficient block for the smooth.
     blocks = model.term_blocks
@@ -289,4 +289,4 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
     l0 = model.smoothing_parameters()
     l1 = reloaded.smoothing_parameters()
     assert l1 == l0
-    assert reloaded.evidence == model.evidence
+    assert reloaded.conditional_aic == model.conditional_aic

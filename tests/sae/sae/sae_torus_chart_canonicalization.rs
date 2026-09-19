@@ -16,10 +16,19 @@
 //!   `Isom(T², flat) = U(1)² ⋊ D₄`;
 //! * (d) two different planted gauges canonicalize to the same chart, up to
 //!   the residual group `U(1)² ⋊ D₄`.
+//!
+//! #2822 — every coordinate atom carries a proper ARD prior, `V(t) = (α/κ²)(1 − cos κt)`
+//! on each periodic axis. It is evaluated at the coordinates a chart move changes, so it
+//! prices charts, and the flow orbit is equal-cost only where it cannot resolve the move.
+//! These contracts are stated there: the fixture's `α` is derived so the largest change
+//! the prior can make over the orbit equals the keep gate's band floor.
+//! `torus_canonicalization_declines_a_chart_the_coordinate_prior_prices_2822` pins the other
+//! side, a resolvable `α`.
 
 use faer::Side as FaerSide;
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::terms::latent::LatentManifold;
+use gam::terms::sae::chart_canonicalization::CHART_RECOMPOSITION_REL_TOL;
 use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
     sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
@@ -284,8 +293,23 @@ fn planted_warped_torus(
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); 1]);
+    let rho = SaeManifoldRho::new(
+        0.0,
+        0.0,
+        vec![Array1::<f64>::from_elem(D, orbit_unresolving_torus_log_ard()); 1],
+    );
     (term, z, rho)
+}
+
+/// #2822 — the torus axes' log ARD precision at which the prior cannot price a chart move.
+/// `V(t) = (α/κ²)(1 − cos κt)` lies in `[0, 2α/κ²]` on each axis, so moving the `N` rows to
+/// any other chart changes `Σ_i Σ_axis V` by at most `2NDα/κ²`. At this `α` that bound equals
+/// the keep gate's band floor `CHART_RECOMPOSITION_REL_TOL`: the planted state's orbit is
+/// equal-cost to within the gate's resolution, which is the premise the contracts above are
+/// stated under.
+fn orbit_unresolving_torus_log_ard() -> f64 {
+    let kappa = std::f64::consts::TAU;
+    (CHART_RECOMPOSITION_REL_TOL * kappa * kappa / (2.0 * (N * D) as f64)).ln()
 }
 
 fn metric_summaries(term: &SaeManifoldTerm) -> Vec<(f64, f64)> {
@@ -529,5 +553,67 @@ fn two_random_gauges_canonicalize_to_the_same_chart() {
     assert!(
         truth_distance_b < 2.0e-3,
         "gauge B canonical chart must recover the honest chart; alignment distance {truth_distance_b}"
+    );
+}
+
+/// #2822 — under a resolvable coordinate prior the flow orbit is not a gauge of the
+/// penalized objective. The canonical chart moves the rows along the prior's energy on
+/// both axes, so the keep gate must restore the planted chart exactly: coordinates and
+/// decoder bit-identical, `chart_canonicalized` false. The planted state and its canonical
+/// chart are both priced under `log α = 0`. The positive control is the same planted state
+/// canonicalized where the prior cannot price the move.
+#[test]
+fn torus_canonicalization_declines_a_chart_the_coordinate_prior_prices_2822() {
+    let honest = honest_sample();
+    let (term, z, unresolving) = planted_warped_torus(Gauge::A, &honest);
+    let resolvable = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(D); 1]);
+    let pre = term
+        .penalized_objective_total(z.view(), &resolvable, None, 1.0)
+        .expect("the planted state prices under log α 0");
+    let mut canonical = term.clone();
+    canonical
+        .canonicalize_charts_post_fit(z.view(), &unresolving, None)
+        .expect("canonicalization pass where the prior cannot price the chart");
+    assert!(
+        canonical.atoms[0].chart_canonicalized,
+        "positive control: the planted torus canonicalizes where the orbit is equal-cost"
+    );
+    let post = canonical
+        .penalized_objective_total(z.view(), &resolvable, None, 1.0)
+        .expect("the canonical state prices under log α 0");
+    let band = CHART_RECOMPOSITION_REL_TOL * (1.0 + pre.abs());
+    eprintln!(
+        "[#2822 canon torus] log α 0: planted total {pre:.12e}, canonical total {post:.12e}, \
+         Δ {:.6e} against the keep band {band:.3e}",
+        post - pre
+    );
+    assert!(
+        post - pre > band,
+        "premise: the coordinate prior must price the canonical chart above the keep band; \
+         Δ {:.6e}, band {band:.3e}",
+        post - pre
+    );
+
+    let coords_before = term.assignment.coords[0].as_matrix().to_owned();
+    let decoder_before = term.atoms[0].decoder_coefficients().clone();
+    let mut declined = term.clone();
+    declined
+        .canonicalize_charts_post_fit(z.view(), &resolvable, None)
+        .expect("canonicalization pass under log α 0");
+    assert!(
+        !declined.atoms[0].chart_canonicalized,
+        "a chart move the coordinate prior prices by Δ {:.6e} > band {band:.3e} is not a gauge move \
+         and must be declined",
+        post - pre
+    );
+    assert_eq!(
+        declined.assignment.coords[0].as_matrix().to_owned(),
+        coords_before,
+        "a declined canonicalization restores the planted coordinates exactly"
+    );
+    assert_eq!(
+        declined.atoms[0].decoder_coefficients(),
+        &decoder_before,
+        "a declined canonicalization restores the planted decoder exactly"
     );
 }

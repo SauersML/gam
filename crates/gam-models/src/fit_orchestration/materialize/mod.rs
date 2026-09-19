@@ -42,5 +42,41 @@ use latent::*;
 use secondary::*;
 use validation::*;
 
+/// The custom-family solver options a materialized request takes from the
+/// caller's configuration, resolved once.
+///
+/// A request builder that spread `..BlockwiseFitOptions::default()` had to
+/// restate every caller field it meant to keep, and one that forgot a field
+/// dropped it silently. The latent survival and latent binary requests never
+/// read `FitConfig::compute_covariance`, so the default `false` withheld the
+/// conditional covariance of every latent fit, including fits whose truncated
+/// cone moments were available (#2677 B0). `None` computes the covariance,
+/// which the default posterior-mean prediction reads (SPEC rule 3).
+///
+/// Location-scale and the binomial link-wiggle refit do not take their options
+/// from here: their model is incomplete without the joint posterior, so their
+/// fit drivers force covariance at the final fit and keep the pilots cheap.
+fn blockwise_fit_options(config: &FitConfig) -> BlockwiseFitOptions {
+    with_caller_warm_start(
+        BlockwiseFitOptions {
+            compute_covariance: config.compute_covariance.unwrap_or(true),
+            persistent_warm_start_store: config.persistent_warm_start_store.clone(),
+            ..BlockwiseFitOptions::default()
+        },
+        config,
+    )
+}
+
+/// A `warm_start_from` point on a custom-family request, as the request's
+/// required cache session. Every custom-family request built from a `FitConfig`
+/// passes through here, so the point reaches the solver on every such route.
+fn with_caller_warm_start(mut options: BlockwiseFitOptions, config: &FitConfig) -> BlockwiseFitOptions {
+    if let Some(warm_start) = config.outer_warm_start.as_ref() {
+        options.cache_session = Some(std::sync::Arc::clone(warm_start.session()));
+        options.required_warm_start = Some(warm_start.required().clone());
+    }
+    options
+}
+
 #[cfg(test)]
 mod tests;

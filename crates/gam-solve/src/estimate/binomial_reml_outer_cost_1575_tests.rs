@@ -1024,6 +1024,47 @@ fn binomial_logit_inner_refusal_names_its_carried_datum_1575() {
 /// a constant coefficient vector lies in the second-difference null, so
 /// `v_j = (1, −1 on block j)` has `Xv_j = 0` and `Sv_j = 0`: H has exactly three
 /// structural nulls, while the data resolve every linear trend.
+/// #2901, the ruling's pin (1): a canonical logit fit has Fisher weights
+/// `μ(1 − μ) ≥ 0` and no Firth term, so `XᵀWX ⪰ 0` certifies every block's trace
+/// against its rank without an eigendecomposition.
+#[test]
+fn a_fisher_weight_fit_certifies_every_block_structurally_2901() {
+    let (x, y, s_list) = build_fixture();
+    let weights = Array1::<f64>::ones(N);
+    let offset = Array1::<f64>::zeros(N);
+    let fit = fit_gamwith_heuristic_log_lambdas(
+        x,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &s_list,
+        None,
+        LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        ),
+        &logit_options(),
+    )
+    .expect("binomial/logit P-spline REML fit should succeed");
+    let inference = fit.inference.as_ref().expect("the fit computed inference");
+    assert_eq!(
+        inference.edf_rank_bound.len(),
+        inference.penalty_block_trace.len(),
+        "one rank-bound status per penalty block"
+    );
+    assert!(
+        !inference.edf_rank_bound.is_empty()
+            && inference.edf_rank_bound.iter().all(|bound| matches!(
+                bound,
+                crate::estimate::EdfRankBound::Certified(
+                    crate::estimate::EdfRankCertificate::Structural
+                )
+            )),
+        "{:?}",
+        inference.edf_rank_bound
+    );
+}
+
 #[test]
 fn binomial_logit_fit_publishes_a_certified_identified_subspace_2901() {
     let (x, y, s_list) = build_fixture();

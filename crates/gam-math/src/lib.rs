@@ -23,6 +23,7 @@ pub mod nested_dual;
 pub mod paired_timing;
 pub mod probability;
 pub mod quadrature;
+pub mod roundoff;
 pub mod score_opt;
 pub mod serial_dependence;
 pub mod special;
@@ -34,3 +35,5 @@ mod jet_poisson_oracle_tests;
 pub mod quantile;
 // SwiGLU/SiLU gate kernels for the finite-response calculation (#2946 R9).
 pub mod gaussian_gated;
+mod double_double;
+pub mod sparse_grid;

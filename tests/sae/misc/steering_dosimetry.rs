@@ -827,6 +827,79 @@ fn target_dose_expansion_continues_through_a_local_decrease() {
     );
 }
 
+/// gh#2263: the bisection safeguard, not the Illinois weighting, bounds the observations
+/// on a dose that is a step at every scale the bracket reaches. A patched forward whose
+/// applied move is quantized coarsely (one quantum is `2⁻⁶` of a turn) reads plateaus, and
+/// the target sits `2⁻²³` of one jump below the upper plateau. A reading on that plateau
+/// is `2⁻²³` of a jump over the target and a reading below the jump is about a whole jump
+/// under it, so the weighted secant lands a sliver below the upper end and doubles that
+/// step only once per same-side observation. It spends about twenty observations reaching
+/// the jump, far more than the three in which the safeguard must halve the bracket, so the
+/// secant alone creeps. The solve must stay within [`safeguard_observation_bound`] and end on
+/// the jump itself, the first displacement on the closer upper plateau.
+#[test]
+fn target_dose_step_probe_meets_the_safeguard_bound_where_the_secant_alone_creeps() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let quantum = 2.0_f64.powi(-6);
+    let quantized_kl = |s: f64| analytic_kl(quantum * (s / quantum).floor());
+    let lower = quantized_kl(quantum);
+    let upper = quantized_kl(2.0 * quantum);
+    let target = upper - (upper - lower) * 2.0_f64.powi(-23);
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
+            measured_nats: quantized_kl(plan.t_to[0] - t0),
+            certified_attainable_upper_nats: None,
+        })
+    };
+    let plan = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            direction: &[1.0],
+            target_nats: target,
+        },
+        Some(&mut probe),
+    )
+    .expect("a step dose must still be resolved");
+
+    let measured = plan
+        .applied_probe
+        .as_ref()
+        .expect("applied probe")
+        .measured_nats;
+    let jump = 2.0 * quantum;
+    let bound = safeguard_observation_bound(plan.seed_displacement, jump);
+    println!(
+        "step probe: {} probes (guaranteed at most {bound}), measured {measured:.15e}, \
+         plateaus {lower:.15e}..{upper:.15e}, target {target:.15e}, displacement {:.17e}, \
+         seed {:.17e}, jump at {jump:.17e}",
+        plan.iterations, plan.displacement, plan.seed_displacement
+    );
+    assert!(
+        plan.iterations <= bound,
+        "the safeguarded bracket guarantees at most {bound} probes; took {}",
+        plan.iterations
+    );
+    assert_eq!(
+        measured, upper,
+        "the solve must end on the plateau closer to the target"
+    );
+    assert_eq!(
+        plan.displacement, jump,
+        "the landing must be the jump itself, the first displacement on the upper plateau"
+    );
+    assert!(
+        lower < target && target < upper,
+        "precondition: the target {target} must sit inside the jump {lower}..{upper}"
+    );
+}
+
 /// gh#2263: a patched forward whose applied move is quantized sees a step function
 /// of the displacement. When the target sits just above one plateau, the Illinois
 /// weighted secant creeps towards the far endpoint: each same-side observation

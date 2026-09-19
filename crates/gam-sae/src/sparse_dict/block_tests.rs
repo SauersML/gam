@@ -12,6 +12,20 @@ use crate::sparse_dict::{
 };
 use ndarray::{Array1, Array2};
 
+/// [`code_row`] at `decoder`'s own inverse Grams, as [`route_and_code_all`] calls it.
+fn code_row_at(
+    row: ArrayView1<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    k: usize,
+    shortlist: &[(u32, f32)],
+) -> RowBlockCode {
+    let inverse_grams =
+        stored_spans(decoder, b).expect("every fixture block spans b dimensions").inverse_grams;
+    code_row(row, decoder, &inverse_grams, gamma, b, k, shortlist)
+}
+
 /// Exact tied loss of a stored row code, independent of the fitter's own
 /// accumulation, so the assertions below price the objective and not a proxy.
 fn row_loss(
@@ -52,7 +66,7 @@ fn a_block_is_admitted_only_when_it_lowers_the_row_loss_2825() {
     );
     let shortlist = [(0u32, 1.0_f32), (1u32, gate_one as f32)];
 
-    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    let selected = code_row_at(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
     assert_eq!(selected.blocks[0], 0);
     assert_eq!(
         selected.gates[1], 0.0,
@@ -84,7 +98,7 @@ fn orthogonal_blocks_that_lower_the_loss_are_all_admitted_2825() {
     let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
     let x = ndarray::array![3.0_f32, 4.0];
     let shortlist = [(1u32, 4.0_f32), (0u32, 3.0_f32)];
-    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    let selected = code_row_at(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
     let mut taken: Vec<u32> = selected
         .blocks
         .iter()
@@ -123,7 +137,7 @@ fn a_non_descent_scale_keeps_the_support_definable_2825() {
     };
     // NON-VACUITY: at a descent scale this row takes both blocks.
     assert_eq!(
-        live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(),
+        live(&code_row_at(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(),
         2
     );
     for gamma in [2.0_f32, 3.5] {
@@ -131,7 +145,7 @@ fn a_non_descent_scale_keeps_the_support_definable_2825() {
             2.0 * gamma - gamma * gamma <= 0.0,
             "gamma {gamma} must be non-descent"
         );
-        let selected = code_row(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
+        let selected = code_row_at(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
         assert_eq!(
             live(&selected),
             vec![1],
@@ -143,7 +157,7 @@ fn a_non_descent_scale_keeps_the_support_definable_2825() {
         assert!(projected > 0.0, "the refreshed scale must stay defined");
     }
     // The null is reached through the scale, and it decodes to exactly zero.
-    let null = code_row(x.view(), decoder.view(), 0.0, 1, 2, &shortlist);
+    let null = code_row_at(x.view(), decoder.view(), 0.0, 1, 2, &shortlist);
     assert_eq!(live(&null), vec![1]);
     assert!(null.codes.iter().all(|code| *code == 0.0));
     assert_eq!(row_loss(x.view(), &null, decoder.view(), 1), 25.0);
@@ -1193,7 +1207,7 @@ fn coordinate_partition_seed_fits_end_to_end() {
 fn packed_block_gates_use_stored_codes_and_preserve_padding_2825() {
     let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
     let row = ndarray::array![3.0_f32, 4.0];
-    let code = code_row(row.view(), decoder.view(), 0.7, 1, 2, &[(0, 3.0)]);
+    let code = code_row_at(row.view(), decoder.view(), 0.7, 1, 2, &[(0, 3.0)]);
     let (blocks, gates, codes) = pack_block_codes(&[code], 2, 1);
     assert_eq!(blocks[[0, 0]], 0);
     assert_eq!(blocks[[0, 1]], 0);
@@ -1294,7 +1308,9 @@ fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_28
 /// The tied loss `L(S) = ‖x − γ Σ_{g∈S} P_g x‖²` a support actually prices,
 /// computed in f64 straight from the projectors — independent of anything
 /// `code_row` accumulates, so it can adjudicate the selection rather than
-/// restate it.
+/// restate it. `P_g` is the orthogonal projector of block `g`'s stored span, built
+/// here from an f64 Gram–Schmidt basis of the stored rows rather than the coder's
+/// inverse Gram.
 fn tied_loss_of_support(
     row: &[f64],
     decoder: ArrayView2<'_, f32>,
@@ -1305,14 +1321,29 @@ fn tied_loss_of_support(
     let p = row.len();
     let mut reconstruction = vec![0.0_f64; p];
     for &block in blocks {
+        let mut basis: Vec<Vec<f64>> = Vec::with_capacity(b);
         for axis in 0..b {
-            let atom = decoder.row(block * b + axis);
-            let mut projection = 0.0_f64;
-            for (value, &direction) in row.iter().zip(atom.iter()) {
-                projection += value * direction as f64;
+            let mut direction: Vec<f64> = decoder
+                .row(block * b + axis)
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            for previous in &basis {
+                let overlap: f64 = direction.iter().zip(previous).map(|(a, c)| a * c).sum();
+                for (entry, &component) in direction.iter_mut().zip(previous) {
+                    *entry -= overlap * component;
+                }
             }
-            for (out, &direction) in reconstruction.iter_mut().zip(atom.iter()) {
-                *out += projection * direction as f64;
+            let norm = direction.iter().map(|value| value * value).sum::<f64>().sqrt();
+            for entry in direction.iter_mut() {
+                *entry /= norm;
+            }
+            basis.push(direction);
+        }
+        for direction in &basis {
+            let projection: f64 = row.iter().zip(direction).map(|(value, d)| value * d).sum();
+            for (out, &component) in reconstruction.iter_mut().zip(direction) {
+                *out += projection * component;
             }
         }
     }
@@ -1400,7 +1431,7 @@ fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
         let gates = block_gates(projections.view());
         let shortlist = route_row_blocks(&gates, k);
         for &gamma in &[0.4_f32, 0.8, 1.0, 1.3] {
-            let code = code_row(row.view(), decoder.view(), gamma, b, k, &shortlist);
+            let code = code_row_at(row.view(), decoder.view(), gamma, b, k, &shortlist);
             let admitted = admitted_blocks_of(&code);
             let quota: Vec<usize> = shortlist
                 .iter()
@@ -1796,4 +1827,179 @@ fn a_block_fit_is_returned_only_from_a_certified_fixed_point_2902() {
         ),
         Err(other) => panic!("expected typed non-convergence, got {other:?}"),
     }
+}
+
+/// #2502 — A BLOCK'S CODE PRICES ITS STORED SPAN, NOT ITS STORED ROWS.
+///
+/// `f32` storage leaves frame rows orthonormal only to rounding. A coder that prices
+/// a block through `UᵀU` therefore moves whenever a frame is rewritten, even when the
+/// span does not, and on the Spark layer-18 fit that made the losing one-block swaps
+/// of every paired frame trial sum to up to 5.0e-4 against a 2.46e-6 bar (lane job
+/// 1229606). Doubling one stored row is exact in binary floating point and leaves the
+/// span bit for bit, so the coder must admit the same blocks and decode every row to
+/// the same loss, to the bit. The positive control prices the same supports through
+/// `UᵀU`, which the doubling moves.
+#[test]
+fn a_blocks_code_is_a_function_of_its_stored_span_2502() {
+    let p = 6usize;
+    let b = 2usize;
+    let n_blocks = 5usize; // K = 10 > P: the projectors overlap
+    let k = 3usize;
+    let doubled_block = 2usize;
+    let mut state = 0x2502_u64;
+    let mut next = || {
+        state = splitmix64_block(state);
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+    for block in 0..n_blocks {
+        let mut frame = Array2::from_shape_fn((b, p), |_| next() as f32);
+        gram_schmidt_rows(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * b..(block + 1) * b, ..])
+            .assign(&frame);
+    }
+    let mut doubled = decoder.clone();
+    for column in 0..p {
+        doubled[[doubled_block * b, column]] *= 2.0;
+    }
+    // The loss of a support priced through `UᵀU`, the pricing this test refutes.
+    let gram_free_loss = |row: &Array1<f32>, frames: &Array2<f32>, blocks: &[usize], gamma: f64| {
+        let mut reconstruction = vec![0.0_f64; p];
+        for &block in blocks {
+            for axis in 0..b {
+                let atom = frames.row(block * b + axis);
+                let projection: f64 =
+                    row.iter().zip(atom.iter()).map(|(&x, &a)| x as f64 * a as f64).sum();
+                for (out, &a) in reconstruction.iter_mut().zip(atom.iter()) {
+                    *out += projection * a as f64;
+                }
+            }
+        }
+        row.iter()
+            .zip(&reconstruction)
+            .map(|(&x, &fitted)| (x as f64 - gamma * fitted).powi(2))
+            .sum::<f64>()
+    };
+    let mut touched = 0usize;
+    let mut gram_free_moved = 0usize;
+    for _ in 0..32 {
+        let row = Array1::from_shape_fn(p, |_| next() as f32);
+        let gates = block_gates(block_projections_row(row.view(), decoder.view(), n_blocks, b).view());
+        let shortlist = route_row_blocks(&gates, k);
+        for &gamma in &[0.6_f32, 1.0] {
+            let stored = code_row_at(row.view(), decoder.view(), gamma, b, k, &shortlist);
+            let rescaled = code_row_at(row.view(), doubled.view(), gamma, b, k, &shortlist);
+            let admitted = admitted_blocks_of(&stored);
+            assert_eq!(
+                admitted,
+                admitted_blocks_of(&rescaled),
+                "doubling a stored row changed the admitted support at gamma {gamma}"
+            );
+            let loss = row_loss(row.view(), &stored, decoder.view(), b);
+            let rescaled_loss = row_loss(row.view(), &rescaled, doubled.view(), b);
+            assert_eq!(
+                loss.to_bits(),
+                rescaled_loss.to_bits(),
+                "doubling a stored row moved the decoded loss at gamma {gamma}: {loss:e} vs \
+                 {rescaled_loss:e}"
+            );
+            if admitted.contains(&doubled_block) {
+                touched += 1;
+                let gamma = gamma as f64;
+                if gram_free_loss(&row, &decoder, &admitted, gamma).to_bits()
+                    != gram_free_loss(&row, &doubled, &admitted, gamma).to_bits()
+                {
+                    gram_free_moved += 1;
+                }
+            }
+        }
+    }
+    assert!(touched > 0, "no row admitted the doubled block, so the test is vacuous");
+    assert_eq!(
+        gram_free_moved, touched,
+        "UᵀU pricing must see the doubling on every row that admits the doubled block"
+    );
+}
+
+/// #2502 — A STORED FRAME'S CONDITIONING ENTERS ITS ROUNDING BAND, AND A FRAME ITS OWN
+/// STORAGE CANNOT RESOLVE IS REFUSED.
+///
+/// A block's span coordinates `w = (UUᵀ)⁻¹Ux` carry the rounding of `Ux` and of the Gram,
+/// amplified by `‖(UUᵀ)⁻¹‖`. Rows `e0` and `e0 + δ·e1` span the same plane as `e0, e1`,
+/// but their Gram's condition number is about `4/δ²`. At δ = 1e-2 the frame is admitted,
+/// and its coordinates' band must exceed an orthonormal frame's on the same row by the
+/// conditioning, which a band without `‖(UUᵀ)⁻¹‖` misses (it grows with ‖w‖ alone, about
+/// 27 times here, against about 3000). At δ = 1e-4 the Gram's second pivot, δ², falls
+/// below the f32 storage floor `u₃₂·√2·max G_ii`, the stored bits do not determine the
+/// plane, and the frame is refused by name. An all-zero frame is a dead block with the zero
+/// projector.
+#[test]
+fn a_stored_frames_conditioning_enters_its_rounding_band_2502() {
+    let p = 4usize;
+    let b = 2usize;
+    let frame = |delta: f32| ndarray::array![[1.0_f32, 0.0, 0.0, 0.0], [1.0, delta, 0.0, 0.0]];
+    let orthonormal = ndarray::array![[1.0_f32, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]];
+    let row = ndarray::array![0.8_f32, 0.3, -0.4, 0.2];
+    let row_norm = row.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+    let band = |decoder: &Array2<f32>| {
+        let spans = stored_spans(decoder.view(), b).expect("an admitted frame");
+        let code = code_row_at(row.view(), decoder.view(), 1.0, b, 1, &[(0, 1.0)]);
+        spans.coordinate_rounding(&code, b, p, row_norm)
+    };
+    let orthonormal_band = band(&orthonormal);
+    let conditioned = frame(1.0e-2);
+    let conditioned_band = band(&conditioned);
+    assert!(orthonormal_band > 0.0);
+    assert!(
+        conditioned_band >= 50.0 * orthonormal_band,
+        "the band must carry the frame's conditioning: {conditioned_band:e} vs {orthonormal_band:e}"
+    );
+    let error = stored_spans(frame(1.0e-4).view(), b)
+        .err()
+        .expect("a frame below the storage floor must be refused");
+    assert!(error.contains("block 0") && error.contains("do not resolve"), "{error}");
+    let dead = stored_spans(Array2::<f32>::zeros((b, p)).view(), b).expect("a dead block");
+    assert!(dead.inverse_grams.iter().all(|&value| value == 0.0));
+}
+
+/// #2469: a row collapses when its Gram–Schmidt residual is inside the pass's
+/// rounding band, not below an absolute `1e-9`. An independent row whose norm
+/// is far below `1e-9` keeps its own direction; under the literal it was
+/// replaced by the first free canonical axis, `e₁`. A row exactly in the span
+/// of the kept rows still collapses to the canonical fallback (positive
+/// control), and a power-of-two rescaling of the block leaves every output bit
+/// unchanged.
+#[test]
+fn gram_schmidt_rows_collapse_on_the_rounding_band_not_an_absolute_floor_2469() {
+    let tiny = 2.0_f32.powi(-40);
+    let mut block = Array2::<f32>::zeros((3, 3));
+    block[[0, 0]] = 1.0;
+    block[[1, 1]] = tiny;
+    block[[1, 2]] = tiny;
+    block[[2, 0]] = 3.0;
+    let mut orthonormal = block.clone();
+    gram_schmidt_rows(&mut orthonormal);
+    let half = std::f32::consts::FRAC_1_SQRT_2;
+    let near = |value: f32, expected: f32| (value - expected).abs() <= f32::EPSILON;
+
+    assert_eq!(orthonormal.row(0).to_vec(), vec![1.0, 0.0, 0.0], "the first row is e₀");
+    assert!(
+        orthonormal[[1, 0]] == 0.0 && near(orthonormal[[1, 1]], half) && near(orthonormal[[1, 2]], half),
+        "an independent row of norm 2⁻⁴⁰·√2 must keep its direction (e₁ + e₂)/√2, got {:?}",
+        orthonormal.row(1)
+    );
+    assert!(
+        orthonormal[[2, 0]] == 0.0 && near(orthonormal[[2, 1]], half) && near(orthonormal[[2, 2]], -half),
+        "a row in the span of e₀ must collapse to the canonical fallback (e₁ − e₂)/√2, got {:?}",
+        orthonormal.row(2)
+    );
+
+    let scale = 2.0_f32.powi(-20);
+    let mut rescaled = block.mapv(|value| value * scale);
+    gram_schmidt_rows(&mut rescaled);
+    assert!(
+        rescaled.iter().zip(orthonormal.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+        "a power-of-two rescaling must leave the orthonormalisation bit-identical"
+    );
 }

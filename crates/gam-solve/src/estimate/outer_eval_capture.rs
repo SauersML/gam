@@ -19,6 +19,7 @@
 //! Tests consume typed arrays rather than scraping formatted production logs.
 
 use crate::estimate::EstimationError;
+use crate::model_types::ProjectedKktResidual;
 use ndarray::{Array1, Array2};
 use std::cell::RefCell;
 
@@ -511,6 +512,150 @@ pub(crate) fn record_rho_gradient_parts(parts: Vec<RhoGradientParts>) {
     RHO_AUDIT.with(|audit| {
         if let Some(state) = audit.borrow_mut().as_mut() {
             state.parts = parts;
+        }
+    });
+}
+
+/// The criterion's additive channels at one evaluation, beside its value
+/// (#2954): the scalars `RemlCriterionComponents` splits the cost into, and the
+/// inner mode's KKT-residual energy when the evaluation formed one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CertificateCriterion {
+    pub cost: f64,
+    pub fixed_beta: f64,
+    pub logdet_h: f64,
+    pub logdet_s: f64,
+    pub kkt: f64,
+    /// `½·rᵀH_β⁻¹r` of the inner mode's KKT residual `r` (with the moving-Hessian
+    /// log-det response where the family's Hessian moves with `β`), as the
+    /// evaluation formed it. `None` when it formed none.
+    pub inner_residual_energy: Option<f64>,
+}
+
+/// What one evaluation publishes to an armed certificate capture (#2954).
+#[derive(Clone, Debug, Default)]
+pub struct CertificateEvidence {
+    /// Each ρ coordinate's gradient parts. Empty when the route publishes none.
+    pub parts: Vec<RhoGradientParts>,
+    /// The criterion's channels. `None` when the route publishes none.
+    pub criterion: Option<CertificateCriterion>,
+    /// The inner factor `log|H_β|` was read from. `None` when the route publishes
+    /// none, or its factorization forms no condition bound.
+    pub inner_factor: Option<InnerFactorCondition>,
+    /// The error `V` carries because its inner mode stops at a residual rather
+    /// than at the exact mode. `None` when the evaluation could form no residual.
+    pub inner_residual: Option<InnerResidualCharge>,
+}
+
+/// The inner-mode error an evaluation's value carries (#2954): `E_r = ½·rᵀH_β⁻¹r`
+/// in `V`'s own units, for the residual `r` the inner solve stopped at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InnerResidualCharge {
+    pub energy: f64,
+    pub source: InnerResidualSource,
+}
+
+/// Where an evaluation's inner-mode residual came from (#2954).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InnerResidualSource {
+    /// The iterative inner Newton's own final penalized gradient `∇_β L_pen(β̂)`.
+    InnerGradient,
+    /// The normal-equation residual `(XᵀWX + S_λ)β̂ − XᵀWz` at the `β̂` a direct
+    /// solve returned.
+    NormalEquations,
+}
+
+/// The inner Hessian factor behind an evaluation's `log|H_β|` (#2954): the
+/// first-order forward error its own backward error carries into `log|H_β|`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InnerFactorCondition {
+    pub logdet_forward_error: f64,
+}
+
+thread_local! {
+    static CERTIFICATE_EVIDENCE: RefCell<Option<CertificateEvidence>> =
+        const { RefCell::new(None) };
+    static CERTIFICATE_BAND_RESIDUAL: RefCell<Option<(ProjectedKktResidual, InnerResidualSource)>> =
+        const { RefCell::new(None) };
+}
+
+/// Arm the capture an outer stationarity verdict reads (#2954), discarding any
+/// previous window.
+///
+/// The Newton-decrement verdict charges each gradient component on the
+/// magnitudes of the channels it was summed from, and the criterion's own band
+/// on the error its value carries, and only the evaluation itself has either.
+/// This capture records those and nothing else: none of the ρ-block audit's
+/// drift split, penalty frame or penalty energy, so arming it costs the
+/// evaluation almost nothing, and a caller's armed audit is never touched.
+pub(crate) fn begin_certificate_parts_capture() {
+    CERTIFICATE_EVIDENCE.with(|slot| *slot.borrow_mut() = Some(CertificateEvidence::default()));
+    CERTIFICATE_BAND_RESIDUAL.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Disarm the capture and take what the last evaluation published.
+pub(crate) fn take_certificate_evidence() -> CertificateEvidence {
+    CERTIFICATE_BAND_RESIDUAL.with(|slot| *slot.borrow_mut() = None);
+    CERTIFICATE_EVIDENCE.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+pub(crate) fn certificate_parts_capture_enabled() -> bool {
+    CERTIFICATE_EVIDENCE.with(|slot| slot.borrow().is_some())
+}
+
+/// Publish one evaluation's parts to an armed capture (no-op when disarmed).
+pub(crate) fn record_certificate_parts(parts: &[RhoGradientParts]) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.parts = parts.to_vec();
+        }
+    });
+}
+
+/// Publish the inner factor an evaluation read `log|H_β|` from to an armed
+/// capture (no-op when disarmed).
+pub(crate) fn record_certificate_inner_factor(factor: InnerFactorCondition) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.inner_factor = Some(factor);
+        }
+    });
+}
+
+/// Publish the inner-mode error an evaluation's value carries to an armed
+/// capture (no-op when disarmed).
+pub(crate) fn record_certificate_inner_residual(charge: InnerResidualCharge) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.inner_residual = Some(charge);
+        }
+    });
+}
+
+/// Hand the inner residual of an assembly that presents exact KKT to the
+/// evaluation that prices it, for the certificate's band alone (#2954): the
+/// value never reads it. No-op when disarmed.
+pub(crate) fn stash_certificate_band_residual(
+    residual: ProjectedKktResidual,
+    source: InnerResidualSource,
+) {
+    if certificate_parts_capture_enabled() {
+        CERTIFICATE_BAND_RESIDUAL.with(|slot| *slot.borrow_mut() = Some((residual, source)));
+    }
+}
+
+/// Take the residual [`stash_certificate_band_residual`] handed over, if any.
+pub(crate) fn take_certificate_band_residual() -> Option<(ProjectedKktResidual, InnerResidualSource)>
+{
+    CERTIFICATE_BAND_RESIDUAL.with(|slot| slot.borrow_mut().take())
+}
+
+/// Publish one evaluation's criterion channels to an armed capture (no-op when
+/// disarmed).
+pub(crate) fn record_certificate_criterion(criterion: CertificateCriterion) {
+    CERTIFICATE_EVIDENCE.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.criterion = Some(criterion);
         }
     });
 }

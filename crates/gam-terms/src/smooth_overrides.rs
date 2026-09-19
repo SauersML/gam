@@ -635,14 +635,6 @@ fn apply_measure_jet(
         }
         spec.alpha = alpha;
     }
-    if let Some(tau) = descriptor.get("tau").and_then(JsonValue::as_f64) {
-        if !(tau.is_finite() && tau >= 0.0) {
-            return Err(format!(
-                "smooths[{symbol:?}].tau must be a finite nonnegative number"
-            ));
-        }
-        spec.tau0 = tau;
-    }
     if let Some(n) = descriptor.get("scales").and_then(JsonValue::as_u64) {
         spec.num_scales = n as usize;
     }

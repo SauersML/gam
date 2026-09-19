@@ -31,6 +31,16 @@ pub trait HessianFactorization: Send + Sync {
         None
     }
 
+    /// The orthonormal basis and the eigenvalues this backend's `solve` divides by on it
+    /// (gam#2765), read from an exact dense spectral view. A backend whose `solve` lifts through a
+    /// projection, or that holds its dense matrix, names its own. The default never densifies: a
+    /// sparse factorization has no dense form to decompose within its memory budget, so it names
+    /// no span, and a mode solved against it is not graded for a fold.
+    fn inverted_span(&self) -> Option<InvertedSpan> {
+        self.as_exact_dense_spectral()
+            .and_then(InvertedSpan::from_dense_spectral)
+    }
+
     /// Assemble the raw dense Hessian represented by this backend for
     /// active-constraint tangent projection.
     ///
@@ -297,6 +307,13 @@ pub trait HessianFactorization: Send + Sync {
 
     /// Full dimension of H.
     fn dim(&self) -> usize;
+
+    /// A first-order bound on the forward error of [`Self::logdet`] carried from
+    /// this factorization's own backward error (#2954), with the `O(‖δH‖²)`
+    /// remainder dropped. `None` when the backend forms none.
+    fn logdet_forward_error(&self) -> Option<f64> {
+        None
+    }
 
     /// Whether this operator is backed by a dense factorization.
     ///

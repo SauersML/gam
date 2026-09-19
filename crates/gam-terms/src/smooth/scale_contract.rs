@@ -1567,7 +1567,6 @@ mod tests {
                     center_strategy: centers,
                     order_s: 1.5,
                     alpha: 1.0,
-                    tau0: 1e-3,
                     num_scales: 3,
                     length_scale: 0.55 * factor,
                     double_penalty: false,

@@ -16,17 +16,16 @@ use crate::fit_orchestration::drivers::{
 use gam_terms::smooth::{SpatialLogKappaCoords, TermCollectionSpec};
 use ndarray::{Array1, ArrayView2};
 
-/// The exact-joint hyperparameter setup of a location-scale fit: the ρ seed,
-/// and the κ coordinates and their bounds from the data. The ρ domain is not
-/// this builder's to supply: the driver derives it per coordinate from the
-/// seed design of each block once it has built them (#2812). A location-scale
-/// fit with NO spatial terms never reaches this — it routes through
-/// `fit_custom_family`, whose ρ domain is the same per-term resolvability
-/// interval.
+/// The exact-joint hyperparameter setup of a location-scale fit: the ρ seed and
+/// the ρ domain the caller derived over every block that owns a ρ coordinate
+/// (#2812, `realized_blocks_rho_domain`), and the κ coordinates and their
+/// bounds from the data.
 pub(crate) fn build_location_scale_exact_joint_setup(
     data: ArrayView2<'_, f64>,
     blocks: &[&TermCollectionSpec],
     rho0: Array1<f64>,
+    rho_lower: Array1<f64>,
+    rho_upper: Array1<f64>,
 ) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
     let mut all_values = Vec::new();
     let mut all_dims = Vec::new();
@@ -64,6 +63,8 @@ pub(crate) fn build_location_scale_exact_joint_setup(
 
     Ok(ExactJointHyperSetup::new(
         rho0,
+        rho_lower,
+        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -146,7 +147,7 @@ mod tests {
     /// [`build_location_scale_exact_joint_setup`] in block order — GAMLSS as
     /// `[mean, noise]`, survival as `[threshold, log_sigma]`. This test pins the
     /// invariant they rely on: the engine concatenates per-block κ seeds and
-    /// bounds in block order, with the rho head boxed to `±RHO_BOUND`, exactly
+    /// bounds in block order, with the rho head on the domain the caller derived, exactly
     /// matching an independent per-block assembly. If the layout ever drifts,
     /// every family's exact Newton ψ direction would index the wrong
     /// coordinates; this catches it before the matvec runs.
@@ -168,12 +169,19 @@ mod tests {
         let block_b = one_term_block("scale", 1, 2.0);
 
         // A non-trivial rho seed in penalty order so the head slice is checked,
-        // not just the κ tail.
+        // not just the κ tail, on a domain whose first upper edge the seed passes.
         let rho0 = array![0.3, -0.7];
+        let rho_lower = array![-1.0, -1.0];
+        let rho_upper = array![0.1, 2.0];
 
-        let setup =
-            build_location_scale_exact_joint_setup(data.view(), &[&block_a, &block_b], rho0.clone())
-                .expect("two-block isotropic-scale geometry");
+        let setup = build_location_scale_exact_joint_setup(
+            data.view(),
+            &[&block_a, &block_b],
+            rho0.clone(),
+            rho_lower.clone(),
+            rho_upper.clone(),
+        )
+        .expect("two-block isotropic-scale geometry");
 
         let rho_dim = rho0.len();
         assert_eq!(
@@ -209,25 +217,17 @@ mod tests {
         let lower = setup.lower();
         let upper = setup.upper();
 
-        // Rho head: seed (sanitized clamp leaves these untouched) and the shared
-        // joint-search box: every seed here is strictly inside the prior, so the
-        // box is the prior itself.
+        // Rho head: the seed projected into the domain the caller derived, and
+        // that domain as the ρ half of the joint-search box (#2902 item 15).
         for k in 0..rho_dim {
+            let projected = rho0[k].clamp(rho_lower[k], rho_upper[k]);
             assert!(
-                (theta0[k] - rho0[k]).abs() <= 1e-12,
-                "rho seed mismatch at {k}: {} vs {}",
-                theta0[k],
-                rho0[k]
+                (theta0[k] - projected).abs() <= 1e-12,
+                "rho seed mismatch at {k}: {} vs {projected}",
+                theta0[k]
             );
-            // #2812: the domain is derived from each block's own spectrum, and
-            // the seed is interior to it.
-            assert!(
-                lower[k] < rho0[k] && rho0[k] < upper[k],
-                "seed {k} = {} must be interior to its derived domain [{}, {}]",
-                rho0[k],
-                lower[k],
-                upper[k]
-            );
+            assert_eq!(lower[k], rho_lower[k], "rho lower edge {k}");
+            assert_eq!(upper[k], rho_upper[k], "rho upper edge {k}");
         }
 
         // κ tail: must be block A then block B, coordinate-for-coordinate equal

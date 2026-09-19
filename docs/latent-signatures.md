@@ -1,25 +1,90 @@
 # Joint latent signatures: mathematical target
 
-This document is a mathematical target, not a description of code in the tree.
-An implementation of it -- `gam_event_history::joint`: the complete-path
-density, structured Laplace posterior, importance integration, differentiated
-reference evolution with disease histories, independent replication, adaptive
-time/particle refinement, and a cohort observation objective sharing these
-reference strata -- was removed in 8e9e48c499 (#2899) because no product or
-production code used it. It is recoverable from
-`8e9e48c499^:crates/gam-event-history/src/joint/` and `.../joint.rs`; its
-parameter-fitting workflow, structure search and serving interface were never
-finished. The engine that is built today is the older log-linear Gaussian event
-model, documented in `event-history.md`. Where this document says "the
-implemented state", read "the state that implementation reached".
+This document is the mathematical target of `gam_event_history::joint`. Only
+the rank-zero model is built today; "Implementation status" below lists what
+is on main. A component is added only together with a production caller on
+one Rust path: fit a cohort, condition on a new history, forecast, save and
+reload. `gam joint-events`, gamfit's `fit_joint_event_model` and
+`load_joint_event_model`, and gam-pyffi call that path (#2961).
 
-The implemented state has independent OU innovations with stationary variance
-one, a genetic mean linear in supplied predictable basis rows, and constant
-learned jumps for nonterminal marks. Entry means depend on supplied context,
-genetics, and recorded once-only prevalence. This conditional entry regression
-does not yet provide the reference-law conditioning required below. Decoder
-weights are constant per mark; observation intercepts and slopes are constant
-per channel. These restrictions are explicit parts of the present density.
+An earlier implementation -- the complete-path density, structured Laplace
+posterior, importance integration, differentiated reference evolution with
+disease histories, independent replication, adaptive time/particle refinement,
+and a cohort observation objective sharing these reference strata -- was
+removed in 8e9e48c499 (#2899) because no product or production code used it.
+It is recoverable from `8e9e48c499^:crates/gam-event-history/src/joint/` and
+`.../joint.rs`; its parameter-fitting workflow, structure search and serving
+interface were never finished. Elsewhere in this document, "implemented"
+describes what that removed implementation reached, not what is on main. The
+log-linear Gaussian event model documented in `event-history.md` is a separate
+engine.
+
+The removed implementation's state has independent OU innovations with
+stationary variance one, a genetic mean linear in supplied predictable basis
+rows, and constant learned jumps for nonterminal marks. Entry means depend on
+supplied context, genetics, and recorded once-only prevalence. This conditional
+entry regression does not yet provide the reference-law conditioning required
+below. Decoder weights are constant per mark; observation intercepts and slopes
+are constant per channel. These restrictions are explicit parts of that
+density.
+
+## Implementation status
+
+On main, the rank-zero model runs end to end.
+
+- The production path is `fit_joint_event_model`,
+  `JointEventModel::{condition, save, load}` and
+  `ConditionedJointModel::forecast` (`joint/model.rs`). `gam joint-events
+  fit|forecast`, gam-pyffi's `joint_event_ffi` and gamfit's `_joint_events`
+  call it. Saving writes what forecasting needs, never the training records.
+  In the crate, a test checks that save, reload and forecast reproduce the
+  in-memory forecast bit for bit, and that a saved model of another kind,
+  another version or an inconsistent state is refused. Across processes, a
+  model saved by `gam joint-events fit` reloads and forecasts bit for bit what
+  `gam joint-events forecast` writes and what the in-memory fit forecasts
+  (`crates/gam-cli/tests/suite/joint_events_reload_2961.rs`), and one saved
+  through gamfit does the same in a fresh interpreter
+  (`tests/test_joint_events_reload.py`).
+- The law's types are the full target's (`joint/law.rs`). A specification
+  declares signatures, marks, the baseline, population, drive and entry bases
+  with their frozen penalties, the measurement channels, and the Gaussian law
+  of the genetic scores. A history is latent nodes with compensator quadrature
+  points. `JointLikelihood` checks a specification, and every history against
+  it, including each channel's support (`joint/emission.rs`). The fit builds
+  only the rank-zero specification of its marks, which has no signatures,
+  channels or genetic scores, and a reload refuses any other.
+- A follow-up record holds a subject's entry, exit and dated events of
+  recurrent, once-only and terminal marks, and takes no covariates. Its nodes
+  are entry, the distinct event times and exit, and events at one time form
+  one node. A once-only mark fired at or before entry starts outside its risk
+  set, and exposure starts at entry. The fit reads each mark's event count
+  `y_d` and at-risk exposure `E_d`, the sufficient statistics of the rank-zero
+  complete-path density `sum_d y_d log r_d - E_d r_d`.
+- The rates (`joint/constant_rate_inference.rs`) have independent Gamma
+  posteriors `Gamma(shape = y_d+1, rate = E_d+c)` at one empirical-Bayes
+  strength `c`, a rate in the data's time unit. The rank-zero law has no
+  genetic likelihood, measurement channel or function-prior span. `opt` finds the
+  unique root of the analytic score in `log c` inside a bracket derived from
+  the counts and exposures, and the strength is accepted only where the score
+  is within the counted rounding estimate `Evidence::resolution` and the
+  curvature is positive. An event-free exposed cohort takes the exact
+  zero-rate law; a cohort with no exposure is refused. Conditioning adds a
+  history's events and exposure at the fitted strength. Forecasts give the
+  survival `P(T_dagger > s+u | H_s)` and each mark's incidence
+  `P(s < T_d <= s+u, T_d < T_dagger | H_s)` from the posterior-predictive
+  Lomax laws, never from inserted rates. Where the competing causes' Gamma
+  rate parameters differ, the incidence is a Gauss-Legendre bracket whose
+  half-width plus a counted rounding band is returned as `incidence_error`;
+  otherwise it is closed form with zero error.
+
+Not on main: the positive decoder; the channels' observation densities, beyond
+the support check, and their category prior; the genetic drive, a density for
+the genetic score law, and the missing-score law; learned jumps; entry
+conditioning beyond prevalent once-only marks; the structured state-space
+posterior; reference evolution, `M_d`, its sensitivities and resolution;
+function, decoder and structural priors and the structure models;
+complete-path scores, cohort integrals, coefficient integration and strengths
+beyond the rank-zero `c`; forecasts with signatures; and the table encoder.
 
 ## State, events, and a positive decoder
 

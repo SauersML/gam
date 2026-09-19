@@ -1286,6 +1286,12 @@ pub(crate) fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
 /// (FD permitted only inside the test as an independent check of the closed
 /// form). Also pins the exact threshold value `−λ/(8τ³)` and asserts the
 /// production entry is strictly negative there (the old formula returned 0).
+///
+/// #2080 then added the gate-logit Jacobian curvature `J''(ℓ) = 2a(1−a)/τ²` to the
+/// logit diagonal of both `B` and `A` (`GateLogitJacobian`), so each adjoint also
+/// carries `J'''(ℓ) = 2a(1−a)(1−2a)/τ³`. The oracle differentiates `P'' + J''`, the
+/// saturated-clamp arm expects `J'''` alone in the majorizer adjoint, and the seam
+/// values are unchanged because `J'''` vanishes at `a = 1/2`.
 #[test]
 fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     use ndarray::{Array1, Array2, Array3};
@@ -1333,11 +1339,14 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     let sparsity = rho
         .lambda_sparse()
         .expect("the fixture rho was built with a sparsity lambda");
-    // Exact, separately-certified Hessian diagonal P''(ℓ) as a function of ℓ.
+    // The logit diagonal both operators carry, as a function of ℓ: the prior's
+    // separately-certified P''(ℓ) plus #2080's gate-logit Jacobian curvature
+    // J''(ℓ) = 2a(1 − a)/τ² (`GateLogitJacobian`), which is exact and enters `B` and `A`
+    // alike, so both theta-adjoints carry its logit derivative too.
     let p2 = |logit: f64| -> f64 {
         let a = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
         let s = a * (1.0 - a);
-        sparsity * s * (1.0 - 2.0 * a) * inv_tau * inv_tau
+        sparsity * s * (1.0 - 2.0 * a) * inv_tau * inv_tau + 2.0 * s * inv_tau * inv_tau
     };
 
     let mut saw_threshold = false;
@@ -1378,18 +1387,27 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
                     "row {row} atom {atom}: below the threshold the clamp is inactive, so                      the majorizer adjoint {clamped:e} must equal the exact {entry:e}"
                 );
             } else if signed < -1.0e-4 {
-                // Clamp saturated: `B` carries a hard zero, so its adjoint is zero
-                // while the exact one is emphatically not.
-                assert_eq!(
-                    clamped, 0.0,
-                    "row {row} atom {atom}: above the threshold `B` installs a hard zero,                      so its theta-adjoint must be exactly zero; got {clamped:e}"
+                // Clamp saturated: `B` carries a hard zero for the prior's curvature,
+                // so the prior's part of its adjoint is zero while the exact one is
+                // emphatically not. #2080's gate-logit Jacobian is exact and sits in
+                // both operators, so the majorizer adjoint carries its J''' alone.
+                let gate_third =
+                    crate::assignment::GateLogitJacobian::eval(1.0, logit, threshold, temperature)
+                        .third();
+                assert!(
+                    (clamped - gate_third).abs() <= 1.0e-12 * gate_third.abs().max(1.0),
+                    "row {row} atom {atom}: above the threshold `B` installs a hard zero for the \
+                     prior, so its theta-adjoint must be the gate-logit Jacobian's J''' \
+                     {gate_third:e} alone; got {clamped:e}"
                 );
                 assert!(
-                    entry.abs() > 1.0e-6,
-                    "row {row} atom {atom}: the two operators must SEPARATE above the                      threshold, or this arm proves nothing; exact={entry:e}"
+                    (entry - clamped).abs() > 1.0e-6,
+                    "row {row} atom {atom}: the two operators must SEPARATE above the \
+                     threshold, or this arm proves nothing; exact={entry:e} majorizer={clamped:e}"
                 );
             }
-            // Independent oracle: 4th-order central difference of exact P''(ℓ).
+            // Independent oracle: 4th-order central difference of the exact logit
+            // diagonal P''(ℓ) + J''(ℓ).
             let h = 1.0e-3_f64;
             let fd = (-p2(logit + 2.0 * h) + 8.0 * p2(logit + h) - 8.0 * p2(logit - h)
                 + p2(logit - 2.0 * h))

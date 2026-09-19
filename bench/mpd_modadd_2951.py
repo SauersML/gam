@@ -8,6 +8,9 @@ Stage S0 is torch only.
   file; the step-0 checkpoint is control C1, the random init of the same run.
 * ``s0`` runs the executor controls and the benchmark oracle on stored checkpoints and writes
   one JSON receipt.
+* ``execute`` is the torch driver of the Schur cross-check receipt
+  (``crates/gam-sae/examples/mpd_modadd_schur_2951.rs``): it writes each declared checkpoint's
+  W_E and its least-squares shift operator T1 as ``<f8`` arrays, plus ``export.json``.
 
 W_E is one tensor with three use sites (pos0 ``a``, pos1 ``b``, pos2 ``=``). ``forward`` runs
 each occurrence as its own lookup, so a use-specific edit and a global edit are different
@@ -25,6 +28,7 @@ import json
 import math
 import os
 
+import numpy as np
 import torch
 
 SITES = {"pos0": (0,), "pos1": (1,), "operands": (0, 1), "global": (0, 1, 2)}
@@ -381,6 +385,48 @@ def s0(args):
     print(f"RECEIPT {args.out}", flush=True)
 
 
+def export_shift_operators(settings, args):
+    """Stage ``schur_cross_check``: each declared checkpoint's W_E and least-squares shift operator T1."""
+    os.makedirs(args.out_dir, exist_ok=True)
+    exports = []
+    for entry in settings["runs"]:
+        run = torch.load(os.path.join(args.harvest, entry["file"]), map_location="cpu", weights_only=True)
+        p = run["config"]["p"]
+        for step in entry["checkpoints"] or [max(run["checkpoints"])]:
+            table = run["checkpoints"][step]["W_E"].double()
+            cycled = table[:p]
+            shifted = cycled[(torch.arange(p) + 1) % p]
+            # T1 with E T1^T = E_shift over the cycled rows; the minimum-norm solve maps the d - p
+            # directions off the rows' span to zero.
+            t1 = torch.linalg.lstsq(cycled, shifted).solution.T.contiguous()
+            residual = torch.linalg.norm(cycled @ t1.T - shifted) / torch.linalg.norm(shifted)
+            sigma = torch.linalg.svdvals(cycled)
+            name = f"{entry['label']}.{step}"
+            # W_E in its trained dtype: the receipt widens it to binary64, exact for float32.
+            np.save(os.path.join(args.out_dir, f"W_E.{name}.npy"), run["checkpoints"][step]["W_E"].numpy())
+            np.save(os.path.join(args.out_dir, f"T1.{name}.npy"), t1.numpy())
+            exports.append({
+                "name": name, "file": entry["file"], "step": step, "labels": run["config"]["labels"],
+                "p": p, "d_model": table.shape[1], "sigma_max": sigma[0].item(),
+                "sigma_min": sigma[-1].item(), "relative_residual": residual.item(),
+            })
+            print(f"[execute] {exports[-1]}", flush=True)
+    with open(os.path.join(args.out_dir, "export.json.partial"), "w") as handle:
+        json.dump({"stage": "execute", "exports": exports}, handle)
+    os.replace(os.path.join(args.out_dir, "export.json.partial"), os.path.join(args.out_dir, "export.json"))
+    print(f"[execute] wrote {len(exports)} checkpoints to {args.out_dir}", flush=True)
+
+
+def execute(args):
+    """The receipt driver: ``receipt.sh`` always runs ``execute``, and the settings' stage picks the export."""
+    with open(args.settings) as handle:
+        settings = json.load(handle)
+    stages = {"schur_cross_check": export_shift_operators}
+    if settings["stage"] not in stages:
+        raise SystemExit(f"[execute] no stage {settings['stage']!r}; declared stages: {sorted(stages)}")
+    stages[settings["stage"]](settings, args)
+
+
 def int_list(text):
     return [int(v) for v in text.split(",") if v]
 
@@ -411,11 +457,17 @@ def main():
     receipt.add_argument("--kmax", type=int, required=True)
     receipt.add_argument("--device", required=True)
     receipt.add_argument("--out", required=True)
+    export = commands.add_parser("execute")
+    export.add_argument("--harvest", required=True)
+    export.add_argument("--settings", required=True)
+    export.add_argument("--out-dir", required=True)
     args = parser.parse_args()
     if args.command == "train":
         train(args)
-    else:
+    elif args.command == "s0":
         s0(args)
+    else:
+        execute(args)
 
 
 if __name__ == "__main__":

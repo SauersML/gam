@@ -138,3 +138,102 @@ echo "$outcome,$cause"
     assert_eq!(out, "REF_ERROR");
     assert_eq!(cause, "reference_tool");
 }
+
+/// The run step's `metric` column holds the figures the test printed, not gam's
+/// logger trace. Run 35301501610 captured 176,202 chars of optimizer trace for one
+/// PASS row (`ess` inside `hessian_qp_elapsed=`, `loglik=` every cycle), and the
+/// aggregator's csv reader refused the row.
+#[test]
+fn test_reference_quality_metric_column_keeps_only_the_tests_own_figures() {
+    let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
+    let metric_line = yaml
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("metric=$("))
+        .expect("the run step builds the metric column with `metric=$(...)`");
+    let dir = std::env::temp_dir().join(format!(
+        "quality_metric_column_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("metric.sh");
+    std::fs::write(
+        &script,
+        format!("log=$1\n{metric_line}\nprintf '%s' \"$metric\"\n"),
+    )
+    .unwrap();
+    let log = dir.join("case.log");
+    let extract = |log_content: &str| -> String {
+        std::fs::write(&log, log_content).unwrap();
+        let output = Command::new("bash").arg(&script).arg(&log).output().unwrap();
+        assert!(
+            output.status.success(),
+            "metric extraction failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    // gam's logger lines, including one appended to libtest's `test <name> ... `,
+    // contribute nothing; the test's own println! figures are all kept.
+    let traced = extract(
+        "test families::module::case ... [INFO] [STAGE] identifiability canonicalise: start rho_dim=9\n\
+         [INFO] [PIRLS/JN] cyc=  0/1200 obj=1.914364e2 -loglik=1.643632e2 pen=2.707e1\n\
+         [INFO] [joint-newton-tr] phase=line_search cycle=0 r=1.000e0 hessian_qp_elapsed=0.001s\n\
+         held-out rmse=0.06613 deviance=3.5443 coverage: 0.95\n",
+    );
+    assert_eq!(traced, "rmse=0.06613 deviance=3.5443 coverage: 0.95 ");
+
+    // Positive control for the tag filter: the same trace figures printed by the
+    // test itself, untagged, are captured.
+    assert_eq!(
+        extract("obj=1.914364e2 -loglik=1.643632e2\n"),
+        "loglik=1.643632e2 "
+    );
+
+    // Token boundaries: `ess` inside `hessian_qp_elapsed=` and `acc` inside
+    // `accepted_step_inf=` are not metrics. Positive controls: `ess` and `rmse` as
+    // whole name parts (`ess_bulk=`, `gam_rmse=`) are.
+    assert_eq!(
+        extract("hessian_qp_elapsed=0.001s accepted_step_inf=7.085e0 ess_bulk=412 gam_rmse=0.1\n"),
+        "ess_bulk=412 rmse=0.1 "
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The results commit names the steps that failed before publishing, each name
+/// verbatim. Run 35327329208's body read "streaming;  full": the list was joined on
+/// `;` and respaced, which also rewrote the `;` inside step 8's own name.
+#[test]
+fn test_publish_action_names_failed_steps_verbatim() {
+    let action = std::fs::read_to_string(".github/actions/publish-gha-results/action.yml").unwrap();
+    let assignment = |name: &str| -> String {
+        action
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(&format!("{name}=$(printf '%s\\n' \"$failed_steps\"")))
+            .unwrap_or_else(|| panic!("the action builds `{name}` from `$failed_steps`"))
+            .to_string()
+    };
+    let script = format!(
+        "failed_steps=$(printf '8\\tRun quality suite (resilient + streaming; full per-test capture)\\n9\\tAggregate quality pairs (#1561 gate + #2395 paired power)')\n{}\n{}\nprintf '%s\\n%s' \"$failed_numbers\" \"$failed_detail\"\n",
+        assignment("failed_numbers"),
+        assignment("failed_detail"),
+    );
+    let output = Command::new("bash").arg("-c").arg(&script).output().unwrap();
+    assert!(
+        output.status.success(),
+        "the failed-step labels did not build: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let (numbers, detail) = stdout
+        .split_once('\n')
+        .expect("the numbers line, then the detail line");
+    assert_eq!(numbers, "8, 9");
+    assert_eq!(
+        detail,
+        "step 8: Run quality suite (resilient + streaming; full per-test capture) | \
+         step 9: Aggregate quality pairs (#1561 gate + #2395 paired power)"
+    );
+}

@@ -1,6 +1,7 @@
 mod autodiff_crosscheck_extended;
 mod autodiff_sas_hypergradient_localization;
 mod block_orthogonality_hvp_correctness;
+mod block_quadrature_degenerate_twin_784;
 mod contract_gradient_gates;
 mod derivative_consistency_fd;
 mod exact_oracle_tests;

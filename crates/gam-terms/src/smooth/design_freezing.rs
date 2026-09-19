@@ -289,7 +289,6 @@ fn freeze_smooth_basis_from_metadata(
                 eps_band,
                 order_s,
                 alpha,
-                tau0,
                 masses,
                 support_means,
                 penalty_normalization_scales,
@@ -309,7 +308,6 @@ fn freeze_smooth_basis_from_metadata(
             s.length_scale = length_scale.standardized_value();
             s.order_s = *order_s;
             s.alpha = *alpha;
-            s.tau0 = *tau0;
             s.num_scales = eps_band.len();
             s.frozen_quadrature = Some(MeasureJetFrozenQuadrature {
                 masses: masses.clone(),

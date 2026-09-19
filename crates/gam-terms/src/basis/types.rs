@@ -1407,7 +1407,6 @@ pub enum BasisMetadata {
         eps_band: Vec<f64>,
         order_s: f64,
         alpha: f64,
-        tau0: f64,
         masses: Array1<f64>,
         support_means: Vec<f64>,
         penalty_normalization_scales: Vec<f64>,
@@ -1624,9 +1623,9 @@ pub enum PenaltySource {
     OperatorMass,
     OperatorTension,
     OperatorStiffness,
-    /// Collocated third-derivative energy `Σ_abc (∂³f/∂x_a∂x_b∂x_c)²` of an
-    /// isotropic Matérn smooth whose kernel admits it
-    /// ([`MaternNu::admits_third_order_operator`]): the order-3 term of the
+    /// Collocated third-derivative energy `Σ_abc (∂³f/∂x_a∂x_b∂x_c)²` of a
+    /// Matérn smooth whose kernel admits it, under the isotropic or an
+    /// anisotropic metric ([`MaternNu::admits_third_order_operator`]): the order-3 term of the
     /// kernel's Sobolev norm, which mass, tension and stiffness do not control.
     OperatorThirdOrder,
     /// One per input axis `a` of a multivariate Duchon smooth: the gradient
@@ -1739,6 +1738,43 @@ impl std::fmt::Debug for ActivePenalty {
 pub struct FilteredPenalties {
     pub active: Vec<ActivePenalty>,
     pub dropped: Vec<DroppedPenaltyInfo>,
+}
+
+impl FilteredPenalties {
+    /// Give a re-filter's records the numbering of the build it re-filtered.
+    ///
+    /// `filter_penalty_candidates` numbers its input from zero. A re-filter's
+    /// input is an earlier build's ACTIVE penalties after a chart change, one
+    /// candidate each and in order, so a candidate's position equals its
+    /// `original_index` only while that build dropped nothing. Once it did, the
+    /// positions compact. A Matérn trial whose odd-order collocation Grams
+    /// underflowed kept [Mass 0, Stiffness 2] and dropped Tension 1 and
+    /// ThirdOrder 3, and the re-filter handed the survivors back as [Mass 0,
+    /// Stiffness 1] beside those drops. A consumer selecting by
+    /// `original_index` then reads the wrong block: the incremental realizer
+    /// paired the cached Tension slot with Stiffness and aborted the fit instead
+    /// of refusing the trial (#2817, #2953).
+    ///
+    /// `original_indices[j]` is the `original_index` of the j-th candidate the
+    /// re-filter was given. Each survivor, and each block the re-filter itself
+    /// drops, takes back its candidate's index.
+    pub fn with_build_numbering(mut self, original_indices: &[usize]) -> Result<Self, BasisError> {
+        let build_index = |position: usize| {
+            original_indices.get(position).copied().ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "penalty re-filter record {position} names no candidate among the {} it was given",
+                    original_indices.len()
+                ))
+            })
+        };
+        for active in &mut self.active {
+            active.info.original_index = build_index(active.info.original_index)?;
+        }
+        for dropped in &mut self.dropped {
+            dropped.original_index = build_index(dropped.original_index)?;
+        }
+        Ok(self)
+    }
 }
 
 /// A positive-semidefinite quadratic with a construction witness.

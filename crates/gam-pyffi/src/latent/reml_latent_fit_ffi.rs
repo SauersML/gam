@@ -61,7 +61,7 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
                     Some(value) => bound.setattr("final_grad_norm", value)?,
                     None => bound.setattr("final_grad_norm", py.None())?,
                 }
-                match result.final_gradient.as_ref() {
+                match result.final_gradient() {
                     Some(value) => {
                         bound.setattr("final_gradient", value.clone().into_pyarray(py))?
                     }
@@ -985,41 +985,6 @@ fn latent_analytic_penalty_registry(
     build_analytic_penalty_registry_from_json(Some(&latent_payload), descriptors.as_ref())
 }
 
-/// The registry energy a latent REML score adds, at descriptor-pinned weights
-/// (ρ = 0 on every owned axis).
-///
-/// #2933 F02 — these fits declare only the latent block `t` and install no
-/// decoder jets. A β-tier penalty would be priced on the fitted coefficients,
-/// whose layout none of the β-tier kinds describes here (each self-disables to
-/// 0 on the mismatch), so it is refused instead of scored as zero; an isometry
-/// penalty has no `J` and refuses through the registry precondition.
-fn latent_analytic_penalty_value(
-    registry: &AnalyticPenaltyRegistry,
-    t: ArrayView1<'_, f64>,
-) -> Result<f64, String> {
-    if let Some((_, _, name)) = registry
-        .rho_layout()
-        .into_iter()
-        .find(|(_, tier, _)| matches!(tier, PenaltyTier::Beta))
-    {
-        return Err(format!(
-            "analytic penalty `{name}` is β-tier, but a latent REML fit declares only the latent \
-             block t, so it has no coefficient block to price; refused instead of scored as zero"
-        ));
-    }
-    registry.isometry_evaluation_precondition(IsometryEvaluationOrder::Value, t.len())?;
-    let rho = Array1::<f64>::zeros(registry.total_rho_count());
-    registry.validate_rho(rho.view())?;
-    let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
-    {
-        if matches!(tier, PenaltyTier::Psi) {
-            value += penalty.value(t, rho.slice(s![rho_slice]));
-        }
-    }
-    Ok(value)
-}
-
 /// `∂/∂t` of [`latent_analytic_penalty_value`], which both latent backward
 /// companions add into `grad_t` so it stays the gradient of the reported
 /// `reml_score` (#2933 F02).
@@ -1162,7 +1127,7 @@ fn glm_reml_fit_latent_backward_impl(
     if let Some(precisions) = dim_selection_precision {
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                let prec = precisions.physical[a];
+                let prec = precisions.physical()[a];
                 grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
             }
         }
@@ -3054,54 +3019,6 @@ fn periodic_position_domain(
     Ok((left, right, knots_or_centers.len() - 1))
 }
 
-fn validate_position_period(
-    label: &str,
-    knots_or_centers: ArrayView1<'_, f64>,
-    periodic: bool,
-    period: Option<f64>,
-) -> Result<(), String> {
-    if periodic {
-        let left = knots_or_centers
-            .iter()
-            .fold(f64::INFINITY, |a, &b| a.min(b));
-        let right = knots_or_centers
-            .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        if !left.is_finite() || !right.is_finite() || left >= right {
-            return Err(format!(
-                "{label} periodic support must have increasing finite endpoints"
-            ));
-        }
-        let implied = right - left;
-        if let Some(period) = period {
-            if !period.is_finite() || period <= 0.0 {
-                return Err(format!(
-                    "{label} period must be finite and positive; got {period}"
-                ));
-            }
-            // The period is the domain WRAP, not the sample/center span. Centers
-            // on a half-open grid [start, start+period) (e.g. linspace(0,1,K,
-            // endpoint=False) with period 1.0) span only `period − one_spacing`,
-            // so requiring span == period rejected every legitimate explicit
-            // period (gam#580). The only real constraint is that every center
-            // fits inside a single period, i.e. `period >= span`.
-            if period < implied - 1.0e-10 * implied.max(1.0) {
-                return Err(format!(
-                    "{label} explicit period ({period}) is smaller than the center span \
-                     ({implied}); every center must lie within a single period"
-                ));
-            }
-        } else if label != "duchon" {
-            return Err(format!(
-                "{label} periodic position basis requires an explicit period"
-            ));
-        }
-    } else if period.is_some() {
-        return Err(format!("{label} period is only valid when periodic=true"));
-    }
-    Ok(())
-}
-
 fn normalized_position_basis_kind(basis_kind: &str) -> Result<String, String> {
     let normalized = basis_kind
         .trim()
@@ -4177,12 +4094,13 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
 }
 
 #[pyfunction]
-fn model_evidence(model_bytes: Vec<u8>) -> PyResult<f64> {
+fn model_conditional_aic(model_bytes: Vec<u8>) -> PyResult<f64> {
     let payload = summary_payload_from_model_bytes(&model_bytes)?;
     // Report the SAME Occam-penalised conditional-AIC ranking score that
     // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
-    // REML/LAML evidence headline, so `Model.evidence` ordering agrees with the
-    // winner `compare_models` declares. Lower is still better (issue #2079).
+    // REML/LAML criterion, so `Model.conditional_aic` ordering agrees with the
+    // winner `compare_models` declares. Lower is still better (issue #2079). It
+    // is a cost on the −2·log scale and no marginal likelihood (#2946 T12).
     ranking_score_from_summary_payload(&payload)
 }
 

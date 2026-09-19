@@ -215,8 +215,8 @@ records. A row narrowed under that rule reads `narrowed-to-crate`; its declarati
 stays, so its commit carries no census or source-removal record.
 
 Where a file's owner judged a producer superseded, the surviving carrier was
-deleted instead of getting its producer back, with an entry in
-`docs/source-removal-changes.json`: `ArrowBlocks` and `ArrowDirection`
+deleted instead of getting its producer back, with the acknowledgement in the
+deleting commit (`git log -p -- docs/source-removal-changes.json`): `ArrowBlocks` and `ArrowDirection`
 (`gpu_kernels/resident_arrow.rs`), `DeviceResidentPcgInput` and
 `DeviceResidentPcgOutput` (`bms/gpu/device_pcg.rs`),
 `BernoulliMarginalSlopeAloRowInput` and `BernoulliMarginalSlopeAloRowGeometry`

@@ -776,6 +776,12 @@ impl HessianFactorization for DenseCholeskyOperator {
         self.cached_logdet
     }
 
+    /// The dense matrix this factorization inverts, decomposed (gam#2765): it is already held, so
+    /// naming its span costs a decomposition and no densification.
+    fn inverted_span(&self) -> Option<InvertedSpan> {
+        InvertedSpan::from_symmetric(&self.matrix)
+    }
+
     fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
         Ok(self.matrix.clone())
     }
@@ -880,6 +886,32 @@ impl HessianFactorization for DenseCholeskyOperator {
         self.n_dim
     }
 
+    /// Componentwise (#2954): the computed factor is exact for `H + δH` with
+    /// `|δH| ≤ γ_(p+1)·|L||Lᵀ|` (Higham, *Accuracy and Stability of Numerical
+    /// Algorithms*, Thm 10.3), and `δ log|H| = tr(H⁻¹δH)` to first order. With
+    /// `D = diag(H)^(1/2)` and `H̃ = D⁻¹HD⁻¹`, whose factor `L̃ = D⁻¹L` has
+    /// `‖L̃‖_F² = tr H̃ = p`, the trace is at most
+    /// `γ_(p+1)·‖H̃⁻¹‖_F·‖|L̃||L̃ᵀ|‖_F ≤ p·γ_(p+1)·‖H̃⁻¹‖_F`, the equilibrated
+    /// condition van der Sluis makes the right one for Cholesky, and
+    /// `‖H̃⁻¹‖_F = ‖(D·L⁻ᵀ)(D·L⁻ᵀ)ᵀ‖_F ≤ ‖D·L⁻ᵀ‖_F²` from the inverse root in hand.
+    fn logdet_forward_error(&self) -> Option<f64> {
+        let p = self.n_dim;
+        if self.matrix.nrows() != p || self.inverse_root.nrows() != p {
+            return None;
+        }
+        let mut scaled_inverse_root = 0.0_f64;
+        for i in 0..p {
+            let scale = self.matrix[[i, i]].abs();
+            for j in 0..self.inverse_root.ncols() {
+                let entry = self.inverse_root[[i, j]];
+                scaled_inverse_root += scale * entry * entry;
+            }
+        }
+        let bound =
+            p as f64 * gam_linalg::roundoff::accumulation_growth(p + 1) * scaled_inverse_root;
+        (bound.is_finite() && bound > 0.0).then_some(bound)
+    }
+
     fn is_dense(&self) -> bool {
         true
     }
@@ -961,6 +993,11 @@ impl HessianFactorization for BlockCoupledOperator {
             BlockCoupledFactorization::Spectral(operator) => Some(operator),
             BlockCoupledFactorization::PositiveDefinite(_) => None,
         }
+    }
+
+    /// The inner factorization's span (gam#2765).
+    fn inverted_span(&self) -> Option<InvertedSpan> {
+        self.inner.as_factorization().inverted_span()
     }
 
     fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {

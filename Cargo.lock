@@ -3565,6 +3565,7 @@ dependencies = [
  "log",
  "ndarray 0.17.2",
  "num-dual",
+ "opt",
  "rand 0.10.2",
  "rand_distr 0.6.0",
  "rayon",
@@ -3584,6 +3585,7 @@ dependencies = [
  "csv",
  "gam",
  "gam-data",
+ "gam-math",
  "gam-predict",
  "gam-runtime",
  "gam-sae",
@@ -3756,6 +3758,7 @@ version = "0.3.157"
 dependencies = [
  "dyn-stack",
  "faer",
+ "gam-math",
  "gam-runtime",
  "log",
  "ndarray 0.17.2",
@@ -3795,6 +3798,9 @@ dependencies = [
  "gam-runtime",
  "ndarray 0.17.2",
  "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -6413,7 +6419,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opt"
 version = "0.9.0"
-source = "git+https://github.com/SauersML/opt.git?rev=67267030c302a4d403256912117835d37e0f1618#67267030c302a4d403256912117835d37e0f1618"
+source = "git+https://github.com/SauersML/opt.git?rev=53ce029cce55fd79dd0be03906a57a916085ebb9#53ce029cce55fd79dd0be03906a57a916085ebb9"
 dependencies = [
  "faer",
  "log",

@@ -256,8 +256,11 @@ def summarize_head_numpy(
     bins = (np.arange(q.shape[0]) % period).astype(np.int64)
     score_sum = np.zeros((period, period), dtype=np.float64)
     score_count = np.zeros((period, period), dtype=np.int64)
+    # Causal attention normalizes query row i over keys j <= i only; the later keys never enter the executed
+    # softmax, so the chart averages the same pairs the torch path does.
     for query_index, qb in enumerate(bins):
-        for key_index, kb in enumerate(bins):
+        for key_index in range(query_index + 1):
+            kb = bins[key_index]
             score_sum[int(qb), int(kb)] += float(scores_np[query_index, key_index])
             score_count[int(qb), int(kb)] += 1
     if np.any(score_count == 0):

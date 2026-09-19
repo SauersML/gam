@@ -629,6 +629,7 @@ pub fn assemble_sparse_factor_h_dense(
 // ---------------------------------------------------------------------------
 
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
+use faer::linalg::cholesky::ldlt::factor::LdltRegularization;
 use faer::linalg::cholesky::llt::factor::LltRegularization;
 use faer::sparse::linalg::amd;
 use faer::sparse::linalg::cholesky::simplicial;
@@ -846,6 +847,81 @@ fn factorize_simplicial_canonical_upper(
         n,
         logdet,
     })
+}
+
+/// The inertia of a sparse symmetric matrix from its simplicial `LDLᵀ` factor, on the
+/// AMD ordering and symbolic analysis the sparse Cholesky here uses (#2901).
+///
+/// `P A Pᵀ = L D Lᵀ` with `L` unit lower triangular is a congruence, so by Sylvester's
+/// law of inertia `A` has as many negative, zero and positive eigenvalues as `D` has
+/// pivots of each sign. The factorization does not pivot, so an exactly zero pivot
+/// stops it before the inertia is known, and `None` is returned. `factor_magnitude` is
+/// `‖L̂‖_F²·max|D̂|`.
+pub fn sparse_symmetric_inertia(
+    h: &SparseColMat<usize, f64>,
+) -> Result<Option<crate::faer_ndarray::SymmetricInertia>, LinalgError> {
+    let h_upper = canonicalize_sparse_symmetric_upper(h)?;
+    let n = h_upper.ncols();
+    let mut inertia = crate::faer_ndarray::SymmetricInertia {
+        negative: 0,
+        zero: 0,
+        positive: 0,
+        smallest_pivot: f64::INFINITY,
+        factor_magnitude: 0.0,
+    };
+    if n == 0 {
+        return Ok(Some(inertia));
+    }
+    let SparseCholeskyAnalysis {
+        a_perm_upper,
+        symbolic,
+        ..
+    } = analyze_canonical_upper(&h_upper)?;
+    let mut l_values = vec![0.0f64; symbolic.len_val()];
+    let mut mem = MemBuffer::new(simplicial::factorize_simplicial_numeric_ldlt_scratch::<
+        usize,
+        f64,
+    >(n));
+    if simplicial::factorize_simplicial_numeric_ldlt::<usize, f64>(
+        &mut l_values,
+        a_perm_upper.as_ref(),
+        LdltRegularization::default(),
+        &symbolic,
+        MemStack::new(&mut mem),
+    )
+    .is_err()
+    {
+        return Ok(None);
+    }
+    // Each column of `L` stores its pivot `D_jj` first, in place of the unit diagonal.
+    let col_ptr = symbolic.col_ptr();
+    let mut lower_frobenius_sq = 0.0_f64;
+    let mut pivot_norm = 0.0_f64;
+    let mut finite = true;
+    for j in 0..n {
+        let start = col_ptr[j];
+        let pivot = l_values[start];
+        if !pivot.is_finite() {
+            finite = false;
+        } else if pivot < 0.0 {
+            inertia.negative += 1;
+        } else if pivot > 0.0 {
+            inertia.positive += 1;
+        } else {
+            inertia.zero += 1;
+        }
+        inertia.smallest_pivot = inertia.smallest_pivot.min(pivot);
+        pivot_norm = pivot_norm.max(pivot.abs());
+        lower_frobenius_sq += 1.0;
+        for value in &l_values[start + 1..col_ptr[j + 1]] {
+            lower_frobenius_sq += value * value;
+        }
+    }
+    if !finite {
+        return Ok(None);
+    }
+    inertia.factor_magnitude = lower_frobenius_sq * pivot_norm;
+    Ok(Some(inertia))
 }
 
 impl SimplicialFactor {

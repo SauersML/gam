@@ -21,12 +21,16 @@
 //! scratch on the process [`MemoryGovernor`] before allocating, so a request that
 //! cannot fit is a typed refusal rather than an out-of-memory abort.
 
-use gam_linalg::faer_ndarray::{fast_ab_into, fast_atb};
+use faer::Accum;
+use faer::linalg::matmul::matmul;
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, array2_to_matmut, fast_ab_into, matmul_parallelism,
+};
 use gam_runtime::resource::{
     Governed, MemoryGovernor, MemoryReservation, MemoryReservationError, byte_balanced_row_chunk,
     dense_f64_bytes,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, ShapeBuilder, s};
 
 /// Refusal from a matrix-free edit kernel.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +220,7 @@ impl EditFootprint {
     }
 
     /// [`edit_factor_cotangents`] over `n_rows` rows: the two `tile × R`
-    /// projections and one `max(d_out, d_in) × R` tile product at a time.
+    /// projections. Each tile's product adds straight into the result.
     pub fn factor_cotangents(
         n_rows: usize,
         input_dim: usize,
@@ -229,11 +233,10 @@ impl EditFootprint {
         let result_rows = checked_sum(&[output_dim, input_dim], CONTEXT)?;
         let result_bytes = f64_bytes(result_rows, terms, CONTEXT)?;
         let tile_bytes = f64_bytes(tile_rows, tile_cols, CONTEXT)?;
-        let product_bytes = f64_bytes(output_dim.max(input_dim), terms, CONTEXT)?;
         Ok(Self {
             tile_rows,
             result_bytes,
-            scratch_bytes: checked_sum(&[tile_bytes, product_bytes], CONTEXT)?,
+            scratch_bytes: tile_bytes,
         })
     }
 
@@ -463,15 +466,39 @@ fn cotangents_tiled(
         let end = n_rows.min(start + tile_rows);
         let output_rows = cotangent.slice(s![start..end, ..]);
         let input_rows = input.slice(s![start..end, ..]);
-        let mut input_projections = Array2::<f64>::zeros((end - start, terms));
+        // Column-major projections make `gᵀ (h V)` a product of column-major operands
+        // (the transpose of row-major rows is column-major). faer multiplies those at full
+        // speed and adds the product into the result with no temporary: at 4096 terms and
+        // LLM width, 2.6-3.1 s against 8.2 s for a row-major temporary (#2951, job 1181471).
+        let mut input_projections = Array2::<f64>::zeros((end - start, terms).f());
         fast_ab_into(&input_rows, &edit.right, &mut input_projections);
-        left += &fast_atb(&output_rows, &input_projections);
-        let mut output_projections = Array2::<f64>::zeros((end - start, terms));
+        accumulate_transposed_product(&mut left, output_rows, input_projections.view());
+        let mut output_projections = Array2::<f64>::zeros((end - start, terms).f());
         fast_ab_into(&output_rows, &edit.left, &mut output_projections);
-        right += &fast_atb(&input_rows, &output_projections);
+        accumulate_transposed_product(&mut right, input_rows, output_projections.view());
         start = end;
     }
     FactorCotangents { left, right }
+}
+
+/// `target += rowsᵀ projections`.
+fn accumulate_transposed_product(
+    target: &mut Array2<f64>,
+    rows: ArrayView2<'_, f64>,
+    projections: ArrayView2<'_, f64>,
+) {
+    let par = matmul_parallelism(target.nrows(), target.ncols(), rows.nrows());
+    let lhs = FaerArrayView::new(&rows);
+    let rhs = FaerArrayView::new(&projections);
+    let mut dst = array2_to_matmut(target);
+    matmul(
+        dst.as_mut(),
+        Accum::Add,
+        lhs.as_ref().transpose(),
+        rhs.as_ref(),
+        1.0,
+        par,
+    );
 }
 
 fn expect_pullback_rows(

@@ -311,14 +311,8 @@ where
         .map(|inf| inf.edf_total)
         .unwrap_or(0.0);
     let geometry = result.geometry;
-    let covariance_conditional = result
-        .inference
-        .as_ref()
-        .and_then(|inf| inf.beta_covariance.as_ref().map(|c| c.as_array().clone()));
-    let covariance_corrected = result
-        .inference
-        .as_ref()
-        .and_then(|inf| inf.beta_covariance_corrected.clone());
+    let covariance_conditional = result.covariance_conditional;
+    let covariance_corrected = result.covariance_corrected;
     let penalized_objective = result.reml_score;
     let outer_cost_evals = result.outer_cost_evals;
     let inner_pirls_solves = result.inner_pirls_solves;

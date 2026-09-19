@@ -197,7 +197,7 @@ fn run_production_fit(z: &Array2<f64>, coord_seed: &[f64], label: &str) -> SaeMa
     let init_rho = SaeManifoldRho::new(
         SPARSITY.ln(),
         SMOOTHNESS.ln(),
-        vec![Array1::<f64>::zeros(0); 1],
+        vec![Array1::<f64>::zeros(1); 1],
     );
     let init_rho = init_rho.for_assignment(&term.assignment);
     let init_rho_flat = init_rho

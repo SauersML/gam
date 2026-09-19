@@ -1,337 +1,3 @@
-fn latent_basis_kind(value: &str) -> Result<&'static str, String> {
-    match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
-        "duchon" | "duchonspline" => Ok("duchon"),
-        // Dispatch hooks for the in-flight non-Duchon derivative helpers.
-        // The call sites below are intentionally shaped around
-        // `InputLocationDerivative::{Radial, Jet}` so Matérn can plug into
-        // the radial path and sphere / tensor / periodic bases can plug into
-        // the pre-computed-jet path without changing the contraction code.
-        "matern" | "maternradial" => Ok("matern"),
-        "sphere" | "spherical" => Ok("sphere"),
-        "bsplinetensor" | "tensorbspline" => Ok("bspline_tensor"),
-        "periodicbspline" | "periodicspline" => Ok("periodic_bspline"),
-        other => Err(format!("unsupported latent basis_kind {other:?}")),
-    }
-}
-
-fn radial_input_location_jet(
-    t_mat: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    phi_r: ArrayView2<'_, f64>,
-) -> Result<Array3<f64>, String> {
-    if phi_r.dim() != (t_mat.nrows(), centers.nrows()) {
-        return Err(format!(
-            "radial derivative shape {:?} does not match t/centers ({}, {})",
-            phi_r.dim(),
-            t_mat.nrows(),
-            centers.nrows()
-        ));
-    }
-    if t_mat.ncols() != centers.ncols() {
-        return Err(format!(
-            "radial derivative dimension mismatch: t has {} cols, centers has {}",
-            t_mat.ncols(),
-            centers.ncols()
-        ));
-    }
-    let mut out = Array3::<f64>::zeros((t_mat.nrows(), centers.nrows(), t_mat.ncols()));
-    for n in 0..t_mat.nrows() {
-        for k in 0..centers.nrows() {
-            let mut r2 = 0.0;
-            for a in 0..t_mat.ncols() {
-                let delta = t_mat[[n, a]] - centers[[k, a]];
-                r2 += delta * delta;
-            }
-            let r = r2.sqrt();
-            if r <= 1.0e-12 {
-                continue;
-            }
-            let scale = phi_r[[n, k]] / r;
-            for a in 0..t_mat.ncols() {
-                out[[n, k, a]] = scale * (t_mat[[n, a]] - centers[[k, a]]);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn latent_input_location_jet(
-    basis_kind: &str,
-    t_mat: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
-    tensor_knot_offsets: Option<&[usize]>,
-    tensor_degrees: Option<&[usize]>,
-) -> Result<Array3<f64>, String> {
-    match latent_basis_kind(basis_kind)? {
-        "duchon" => {
-            // Mirror the column layout used by `build_latent_duchon_design` /
-            // `build_duchon_basis`: the forward design is the radial block
-            // projected through the kernel-constraint nullspace Z
-            // (p_constrained = n_centers − n_poly cols) concatenated with the
-            // polynomial nullspace block (n_poly cols). The derivative jet
-            // must use the same effective nullspace order and the same Z
-            // projection so its column count matches the design exactly.
-            // Resolve the SAME admissible (nullspace_order, power) pair the
-            // forward `build_latent_duchon_design` resolves for this ambient
-            // dimension (issue #875): the pure polyharmonic kernel exists only
-            // when 2(p + s) > d, so `resolve_duchon_orders` may lift the
-            // spectral power s (and null-space order) above the m-derived
-            // request. The jet must differentiate the *resolved* forward kernel
-            // — same power, same null-space — or its column count and scaling
-            // would diverge from the design.
-            let dim_ambient = centers.ncols();
-            let (resolved_nullspace, resolved_power) =
-                resolve_duchon_orders(dim_ambient, duchon_nullspace_order_from_m(m), 0, None);
-            let effective_nullspace = duchon_effective_nullspace_order(centers, resolved_nullspace);
-            // The canonical construction (shared with the forward design via
-            // `build_duchon_basis`) mean-centers the centers before the RRQR
-            // (#1375), so the jet's `Z` is bit-identical to the design's `Z`
-            // instead of a pivot-drifted basis of the same null space.
-            let radial_transform = duchon_kernel_constraint_nullspace(centers, effective_nullspace)
-                .map_err(|err| err.to_string())?;
-            // The radial derivative differentiates the exact forward Green's
-            // function: same scale-free pure Duchon spectrum (`length_scale =
-            // None`, the resolved spectral power `s`), not a hard-coded
-            // surrogate (issue #440).
-            let phi_r = duchon_radial_first_derivative_nd(
-                t_mat,
-                centers,
-                None,
-                effective_nullspace,
-                resolved_power,
-            )
-            .map_err(|err| err.to_string())?;
-            let radial_jet = radial_input_location_jet(t_mat, centers, phi_r.view())?;
-            let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, effective_nullspace);
-
-            let n_rows = radial_jet.shape()[0];
-            let dim = radial_jet.shape()[2];
-            let n_kernel = radial_transform.ncols();
-            let n_poly = poly_jet.shape()[1];
-            if poly_jet.shape()[0] != n_rows || poly_jet.shape()[2] != dim {
-                return Err(format!(
-                    "Duchon polynomial derivative shape mismatch: radial jet is \
-                     {}x{}x{}, polynomial jet is {}x{}x{}",
-                    n_rows,
-                    radial_jet.shape()[1],
-                    dim,
-                    poly_jet.shape()[0],
-                    n_poly,
-                    poly_jet.shape()[2],
-                ));
-            }
-            // Scalar kernel amplification `α` the forward
-            // `build_latent_duchon_design` (→ `build_duchon_basis` with the
-            // resolved `power`, `length_scale = None`) applies to the kernel
-            // block `α·K(t,C)·Z`. The input-location derivative is
-            // `α·K'(t,C)·Z`, so the raw radial jet must carry the same `α`
-            // computed against the same resolved spectral power; the appended
-            // polynomial columns are un-amplified, matching the forward.
-            let kernel_amp = duchon_pure_kernel_amplification(
-                centers,
-                resolved_nullspace,
-                resolved_power as f64,
-            );
-            let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
-            for axis in 0..dim {
-                let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-                let mut block = jet.slice_mut(s![.., ..n_kernel, axis]);
-                block.assign(&projected);
-                block *= kernel_amp;
-            }
-            jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
-            Ok(jet)
-        }
-        "matern" => {
-            // Fixes audit-revised claim that non-Duchon latent input-location
-            // derivatives must use the closed-form helper instead of stubbing.
-            let phi_r =
-                matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
-                    .map_err(|err| err.to_string())?;
-            radial_input_location_jet(t_mat, centers, phi_r.view())
-        }
-        "sphere" => {
-            // Fixes audit-revised claim that sphere latent derivatives are
-            // analytic jets, not unsupported hooks.
-            let jet = sphere_first_derivative_nd(t_mat, centers, m, true)
-                .map_err(|err| err.to_string())?;
-            Ok(jet)
-        }
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat.ok_or_else(|| {
-                "tensor B-spline latent derivative requires knots_concat".to_string()
-            })?;
-            let offsets = tensor_knot_offsets.ok_or_else(|| {
-                "tensor B-spline latent derivative requires knot_offsets".to_string()
-            })?;
-            let degrees = tensor_degrees
-                .ok_or_else(|| "tensor B-spline latent derivative requires degrees".to_string())?;
-            let per_axis = split_tensor_knots_owned(knots, offsets, t_mat.ncols())?;
-            let per_axis_views = per_axis
-                .iter()
-                .map(|axis_knots| axis_knots.view())
-                .collect::<Vec<_>>();
-            let jet = bspline_tensor_first_derivative(t_mat, &per_axis_views, degrees)
-                .map_err(|err| err.to_string())?;
-            Ok(jet)
-        }
-        "periodic_bspline" => {
-            // Fixes audit-revised claim that periodic latent derivatives are
-            // analytic jets. The latent pyffi path carries only centers today,
-            // so infer the period from the first center column.
-            if centers.ncols() != 1 || centers.nrows() == 0 {
-                return Err(
-                    "periodic B-spline latent derivative requires one-column centers".to_string(),
-                );
-            }
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for &value in centers.column(0).iter() {
-                lo = lo.min(value);
-                hi = hi.max(value);
-            }
-            if !(lo.is_finite() && hi.is_finite() && hi > lo) {
-                return Err("periodic B-spline centers must define a finite range".to_string());
-            }
-            let jet = periodic_bspline_first_derivative_nd(t_mat, (lo, hi), m, centers.nrows())
-                .map_err(|err| err.to_string())?;
-            Ok(jet)
-        }
-        other => Err(format!(
-            "latent_basis_kind returned an unknown normalized kind: {other}"
-        )),
-    }
-}
-
-fn gaussian_reml_weight_vector_local(
-    n_obs: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        Some(w) => {
-            if w.len() != n_obs {
-                return Err(format!(
-                    "Gaussian REML weights length mismatch: expected {n_obs}, got {}",
-                    w.len()
-                ));
-            }
-            if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
-                return Err("Gaussian REML weights must be finite and non-negative".to_string());
-            }
-            Ok(w.to_owned())
-        }
-        None => Ok(Array1::ones(n_obs)),
-    }
-}
-
-fn latent_scalar_weights_with_fisher(
-    n_obs: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-    fisher_w: Option<ArrayView3<'_, f64>>,
-) -> Result<Option<Array1<f64>>, String> {
-    let Some(fw) = fisher_w else {
-        return Ok(weights.map(|w| w.to_owned()));
-    };
-    if fw.shape() != [n_obs, 1, 1] {
-        return Err(format!(
-            "fisher_w currently accepts scalar blocks of shape ({n_obs}, 1, 1) on this latent entry point; got {:?}",
-            fw.shape()
-        ));
-    }
-    let mut out = match weights {
-        Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w))?,
-        None => Array1::ones(n_obs),
-    };
-    for n in 0..n_obs {
-        let v = fw[[n, 0, 0]];
-        if !(v.is_finite() && v >= 0.0) {
-            return Err(format!(
-                "fisher_w[{n},0,0] must be finite and non-negative; got {v}"
-            ));
-        }
-        out[n] *= v;
-    }
-    Ok(Some(out))
-}
-
-fn latent_row_weights(
-    n_obs: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w)),
-        None => Ok(Array1::ones(n_obs)),
-    }
-}
-
-fn validate_dense_fisher_w(
-    n_obs: usize,
-    n_outputs: usize,
-    fisher_w: ArrayView3<'_, f64>,
-) -> Result<(), String> {
-    if fisher_w.shape() != [n_obs, n_outputs, n_outputs] {
-        return Err(format!(
-            "fisher_w dense blocks must have shape ({n_obs}, {n_outputs}, {n_outputs}); got {:?}",
-            fisher_w.shape()
-        ));
-    }
-    for n in 0..n_obs {
-        for a in 0..n_outputs {
-            for b in 0..n_outputs {
-                let v = fisher_w[[n, a, b]];
-                if !v.is_finite() {
-                    return Err(format!("fisher_w[{n},{a},{b}] must be finite; got {v}"));
-                }
-            }
-            if fisher_w[[n, a, a]] < 0.0 {
-                return Err(format!(
-                    "fisher_w[{n},{a},{a}] must be non-negative; got {}",
-                    fisher_w[[n, a, a]]
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LatentAuxStrengthState {
-    log_mu: f64,
-    mu: f64,
-    auto: bool,
-}
-
-struct LatentAuxPriorStats {
-    targets: Array2<f64>,
-    residual_sq: f64,
-    strength: LatentAuxStrengthState,
-    score: f64,
-}
-
-fn latent_aux_prior_stats(
-    t_mat: ArrayView2<'_, f64>,
-    u_view: ArrayView2<'_, f64>,
-    aux_family: AuxPriorFamily,
-    aux_strength: Option<f64>,
-) -> Result<LatentAuxPriorStats, String> {
-    let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
-    // The closed-form auxiliary-prior REML statistics (residual norm + the
-    // log_mu optimum at fixed t + the prior score) live in core; this packs
-    // them into the FFI latent-fit plumbing struct.
-    let stats = gam::terms::latent::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
-    Ok(LatentAuxPriorStats {
-        targets,
-        residual_sq: stats.residual_sq,
-        strength: LatentAuxStrengthState {
-            log_mu: stats.log_mu,
-            mu: stats.mu,
-            auto: stats.auto,
-        },
-        score: stats.score,
-    })
-}
 
 /// Honestly surface the SAE manifold loss score under `primary_key` (#1231).
 ///
@@ -401,127 +67,6 @@ fn set_aux_strength_items<'py>(
     Ok(())
 }
 
-/// Atomically validated diagonal latent precision state.
-///
-/// Python supplies logarithmic precisions.  This carrier validates the whole
-/// vector against the engine's one exact log-strength domain and materializes
-/// `exp(log_alpha)` once, before any fit or gradient work.  Keeping both views
-/// prevents value/gradient desynchronization and removes exponentials from the
-/// observation loops and latent-optimizer iterations.
-#[derive(Clone, Debug)]
-struct ValidatedDimSelectionPrecisions {
-    log: Array1<f64>,
-    physical: Array1<f64>,
-}
-
-impl ValidatedDimSelectionPrecisions {
-    fn new(log: ArrayView1<'_, f64>, latent_dim: usize) -> Result<Self, String> {
-        if log.len() != latent_dim {
-            return Err(format!(
-                "dim_selection_log_precision length {} must equal latent_dim {latent_dim}",
-                log.len()
-            ));
-        }
-        let mut physical = Array1::<f64>::zeros(latent_dim);
-        for (axis, (&log_alpha, alpha)) in log.iter().zip(physical.iter_mut()).enumerate() {
-            *alpha = gam::checked_exp_log_strength(log_alpha)
-                .map_err(|error| format!("dim_selection_log_precision[{axis}]: {error}"))?;
-        }
-        Ok(Self {
-            log: log.to_owned(),
-            physical,
-        })
-    }
-
-    /// `0.5*alpha_axis*||t_axis||^2`, evaluated by a scaled sum-of-squares so
-    /// `t^2` cannot overflow before multiplication by a small precision.
-    fn axis_energy(&self, t: ArrayView2<'_, f64>, axis: usize) -> Result<f64, String> {
-        if t.ncols() != self.log.len() || axis >= self.log.len() {
-            return Err(format!(
-                "dim-selection precision has {} axes but latent coordinates have {}",
-                self.log.len(),
-                t.ncols()
-            ));
-        }
-        let multiplier = (0.5 * self.physical[axis]).sqrt();
-        let mut scale = 0.0_f64;
-        let mut sumsq = 1.0_f64;
-        for &coordinate in t.column(axis) {
-            if !coordinate.is_finite() {
-                return Err(format!(
-                    "latent coordinate on dim-selection axis {axis} must be finite; got \
-                         {coordinate}"
-                ));
-            }
-            let magnitude = (multiplier * coordinate).abs();
-            if !magnitude.is_finite() {
-                return Err(format!(
-                    "dim-selection prior energy is unrepresentable on axis {axis}"
-                ));
-            }
-            if magnitude == 0.0 {
-                continue;
-            }
-            if scale < magnitude {
-                let ratio = scale / magnitude;
-                sumsq = 1.0 + sumsq * ratio * ratio;
-                scale = magnitude;
-            } else {
-                let ratio = magnitude / scale;
-                sumsq += ratio * ratio;
-            }
-        }
-        let energy = if scale == 0.0 {
-            0.0
-        } else {
-            scale * scale * sumsq
-        };
-        if energy.is_finite() {
-            Ok(energy)
-        } else {
-            Err(format!(
-                "dim-selection prior energy is unrepresentable on axis {axis}"
-            ))
-        }
-    }
-
-    /// Normalized Gaussian ARD negative-log prior
-    /// `sum_a [0.5*alpha_a*||t_a||^2 - 0.5*n*log(alpha_a)]`.
-    fn prior_score(&self, t: ArrayView2<'_, f64>) -> Result<f64, String> {
-        if t.ncols() != self.log.len() {
-            return Err(format!(
-                "dim-selection precision has {} axes but latent coordinates have {}",
-                self.log.len(),
-                t.ncols()
-            ));
-        }
-        let mut total = 0.0_f64;
-        let mut compensation = 0.0_f64;
-        for axis in 0..self.log.len() {
-            let energy = self.axis_energy(t, axis)?;
-            let axis_score = energy - 0.5 * t.nrows() as f64 * self.log[axis];
-            if !axis_score.is_finite() {
-                return Err(format!(
-                    "dim-selection prior score is unrepresentable on axis {axis}"
-                ));
-            }
-            let updated = total + axis_score;
-            compensation += if total.abs() >= axis_score.abs() {
-                (total - updated) + axis_score
-            } else {
-                (axis_score - updated) + total
-            };
-            total = updated;
-        }
-        let score = total + compensation;
-        if score.is_finite() {
-            Ok(score)
-        } else {
-            Err("dim-selection prior score is unrepresentable".to_string())
-        }
-    }
-}
-
 #[cfg(test)]
 mod dim_selection_precision_domain_tests {
     use super::ValidatedDimSelectionPrecisions;
@@ -541,7 +86,7 @@ mod dim_selection_precision_domain_tests {
         let precisions = ValidatedDimSelectionPrecisions::new(logs.view(), 2).unwrap();
         for axis in 0..2 {
             assert_eq!(
-                precisions.physical[axis].to_bits(),
+                precisions.physical()[axis].to_bits(),
                 gam::checked_exp_log_strength(logs[axis]).unwrap().to_bits()
             );
         }
@@ -551,35 +96,13 @@ mod dim_selection_precision_domain_tests {
         let tiny = ValidatedDimSelectionPrecisions::new(array![-700.0].view(), 1).unwrap();
         let coordinates = array![[1.0e200], [-1.0e200]];
         let energy = tiny.axis_energy(coordinates.view(), 0).unwrap();
-        let scaled_coordinate = (0.5 * tiny.physical[0]).sqrt() * 1.0e200;
+        let scaled_coordinate = (0.5 * tiny.physical()[0]).sqrt() * 1.0e200;
         let expected = 2.0 * scaled_coordinate * scaled_coordinate;
         assert!(
             (energy - expected).abs() <= 1e-12 * expected,
             "scaled large-coordinate energy: expected {expected}, got {energy}"
         );
     }
-}
-
-fn latent_prior_score_and_aux_state_for_t(
-    t_mat: ArrayView2<'_, f64>,
-    aux_u: Option<ArrayView2<'_, f64>>,
-    aux_family: AuxPriorFamily,
-    aux_strength: Option<f64>,
-    dim_selection_precision: Option<&ValidatedDimSelectionPrecisions>,
-) -> Result<(f64, Option<LatentAuxStrengthState>), String> {
-    let latent_dim = t_mat.ncols();
-    let mut latent_prior_score = 0.0_f64;
-    let mut aux_strength_state = None;
-    if let Some(u_view) = aux_u {
-        let stats = latent_aux_prior_stats(t_mat, u_view, aux_family, aux_strength)?;
-        latent_prior_score += stats.score;
-        aux_strength_state = Some(stats.strength);
-    }
-    if let Some(precisions) = dim_selection_precision {
-        assert_eq!(latent_dim, precisions.log.len());
-        latent_prior_score += precisions.prior_score(t_mat)?;
-    }
-    Ok((latent_prior_score, aux_strength_state))
 }
 
 fn dense_fisher_gaussian_fit_to_pydict<'py>(
@@ -1338,81 +861,6 @@ fn multinomial_model_metadata_pyfunc<'py>(
     Ok(out.unbind())
 }
 
-fn gaussian_reml_fit_latent_impl(
-    t_flat: ArrayView1<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    n_obs: usize,
-    latent_dim: usize,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    basis_kind: &str,
-    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
-    tensor_knot_offsets: Option<&[usize]>,
-    tensor_degrees: Option<&[usize]>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    init_lambda: Option<f64>,
-    aux_u: Option<ArrayView2<'_, f64>>,
-    aux_family: AuxPriorFamily,
-    aux_strength: Option<f64>,
-    dim_selection_precision: Option<&ValidatedDimSelectionPrecisions>,
-    analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-    periodic: Option<&[Option<f64>]>,
-) -> Result<
-    (
-        gam::solver::gaussian_reml::GaussianRemlMultiResult,
-        Array2<f64>,
-        Option<LatentAuxStrengthState>,
-    ),
-    String,
-> {
-    let (design, t_mat, _jet) = build_latent_forward_design(
-        basis_kind,
-        t_flat,
-        n_obs,
-        latent_dim,
-        centers,
-        m,
-        tensor_knots_concat,
-        tensor_knot_offsets,
-        tensor_degrees,
-        periodic,
-    )?;
-    // Build the (optionally) augmented Y/X stack carrying the identifiability
-    // penalty. The penalty `½ μ ‖t − t_ref‖²` is *not* on the design Φ; it
-    // acts on t directly. Because t enters Φ nonlinearly, we cannot fold it
-    // into the inner Gaussian-closed-form solve without changing the solver.
-    // We therefore evaluate the *penalty contribution* here and return it
-    // for the caller to expose; the inner ridge stays unchanged.
-    //
-    // The forward path's responsibility is to produce a self-consistent fit
-    // at the current t; the outer loop owns the gauge enforcement (it adds
-    // ∂R_id/∂t to grad_t and walks t under that combined gradient).
-    let mut fit = gaussian_reml_multi_closed_form_with_cache(
-        design.view(),
-        y,
-        penalty,
-        weights,
-        init_lambda,
-        None,
-    )
-    .map_err(|err| err.to_string())?;
-    // Fixes audit-revised claim that ARD / aux-prior REML selection requires
-    // normalized priors, not raw quadratic corrections alone.
-    let (mut latent_prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
-        t_mat.view(),
-        aux_u,
-        aux_family,
-        aux_strength,
-        dim_selection_precision,
-    )?;
-    if let Some(registry) = analytic_penalties {
-        latent_prior_score += latent_analytic_penalty_value(registry, t_flat)?;
-    }
-    fit.reml_score += latent_prior_score;
-    Ok((fit, design, aux_strength_state))
-}
-
 /// Forward fit: build the latent design at the current latent `t`,
 /// solve the Gaussian REML inner problem, and return the standard
 /// REML fit dictionary plus the materialized design (for warm-starts).
@@ -1682,7 +1130,10 @@ fn structured_residual_pass_diagnostics_dict<'py>(
         item.set_item("pass", d.pass)?;
         item.set_item("gamma", d.gamma)?;
         item.set_item("factor_rank", d.factor_rank)?;
-        item.set_item("log_evidence", d.log_evidence)?;
+        item.set_item(
+            "bic_penalized_log_likelihood",
+            d.bic_penalized_log_likelihood,
+        )?;
         item.set_item("factor_energy", d.factor_energy)?;
         item.set_item("diagonal_mean", d.diagonal_mean)?;
         item.set_item("dispersion_before", d.dispersion_before)?;
@@ -1721,7 +1172,6 @@ fn sae_manifold_fit_inner<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
     threshold_gate_threshold: f64,
-    native_ard_enabled: bool,
     seed_refine_routing: bool,
     seed_refine_random_state: u64,
     // WP-D output-Fisher shard (#980). Magic-by-default: the *presence* of
@@ -1829,7 +1279,6 @@ fn sae_manifold_fit_inner<'py>(
         ridge_beta,
         top_k,
         threshold: threshold_gate_threshold,
-        native_ard_enabled,
         seed_refine_routing,
         seed_refine_random_state,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
@@ -2045,9 +1494,9 @@ fn sae_fit_report_into_dict<'py>(
         // Schur factor. Streaming-unavailable bands remain absent; no alternate
         // per-atom covariance is substituted.
         if let Some(unc) = shape_uncertainty.atoms.get(atom_idx) {
-            // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
-            // budget — the python reader treats the key as optional and the band
-            // quantities below remain exact.
+            // Omitted (not set) when the framed atoms' dense covariances do not fit
+            // the memory governor's single-materialization cap — the python reader
+            // treats the key as optional and the band quantities below remain exact.
             if let Some(cov) = &unc.decoder_covariance {
                 // #2135 — the emitted decoder is the FULL-width `M × p` block, so
                 // its covariance must live in the same `M`-frame. For a #1117
@@ -2278,6 +1727,13 @@ fn sae_fit_report_into_dict<'py>(
     out.set_item(
         "shape_covariance_operator",
         shape_uncertainty.operator.as_str(),
+    )?;
+    // #2900 — why the learned frames are held fixed (`None` unless they are). The
+    // integrated covariance is admitted on host memory, so a result names its
+    // conditioning and the reason instead of silently reporting the smaller one.
+    out.set_item(
+        "shape_covariance_frame_conditioning_reason",
+        shape_uncertainty.operator.frame_conditioning_reason(),
     )?;
     // Provenance of the per-row inner product the fit installed (#980). Object 4
     // reads this to certify which metric the gauge pulled back through:

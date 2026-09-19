@@ -229,6 +229,30 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let z = data.values.column(z_idx).to_owned();
     validate_bernoulli_marginal_slope_z_column_variance(z_column, z.view(), weights.view())?;
     let score_influence_jacobian = None;
+    // gam#2924: the residual repair block, read by column name. The columns
+    // must be absent from both formulas — a residual feature that also enters
+    // a surface would be read twice, once as a covariate and once as drive.
+    let residual = if config.residual_columns.is_empty() {
+        None
+    } else {
+        let n = data.values.nrows();
+        let mut features = Array2::<f64>::zeros((n, config.residual_columns.len()));
+        for (local, name) in config.residual_columns.iter().enumerate() {
+            let idx = resolve_role_col(col_map, name, "residual")?;
+            features.column_mut(local).assign(&data.values.column(idx));
+            validate_marginal_slope_z_column_exclusion(
+                parsed,
+                &parsed_slope,
+                name,
+                "Bernoulli marginal-slope residual column",
+                "slope_formula",
+            )?;
+        }
+        Some(gam_models_bms_residual_spec(
+            config.residual_columns.clone(),
+            features,
+        ))
+    };
 
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
@@ -244,6 +268,8 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         link_dev: routing.link_dev,
         latent_z_policy: config.marginal_slope_latent_policy(),
         score_influence_jacobian,
+        residual,
+        declared_latent_law: config.declared_latent_law_grid()?,
     };
 
     Ok(MaterializedModel {
@@ -251,20 +277,18 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         request: FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
             data: data.values.view(),
             spec,
-            options: BlockwiseFitOptions {
-                // gam#2718: honor the caller instead of forcing `true`. `None`
-                // keeps the historical behaviour (compute it), so this is a
-                // widening -- no existing caller changes behaviour.
-                compute_covariance: config.compute_covariance.unwrap_or(true),
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                // Robustness (Firth/Jeffreys stabilizer) is the unconditional
-                // default for bernoulli marginal-slope — no flag to thread.
-                ..Default::default()
-            },
+            options: blockwise_fit_options(config),
             kappa_options: config.spatial_optimization.clone(),
             policy,
         }),
         inference_notes,
         unidentified_scalar_terms,
     })
+}
+
+fn gam_models_bms_residual_spec(
+    columns: Vec<String>,
+    features: Array2<f64>,
+) -> crate::bms::ResidualRepairSpec {
+    crate::bms::ResidualRepairSpec { columns, features }
 }

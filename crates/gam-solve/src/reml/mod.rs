@@ -4636,6 +4636,60 @@ pub(crate) struct FirthTauBetaPartialKernel {
     pub(super) d_beta_dot_h: Array1<f64>,
 }
 
+/// The predicate a dense criterion builder decided `½log|H|₊`'s rank with
+/// (#2959 D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CriterionRankPredicate {
+    /// `H`'s identified subspace: the eigenvalues above `p·ε·‖H‖₂`, never fewer
+    /// than `rank(S_λ)` ([`reml_outer_engine::DenseSpectralOperator::identified_rank`]).
+    IdentifiedSubspace,
+    /// A structural rank taken from the unscaled design and penalty roots (Firth).
+    StructuralRank,
+    /// The root `B = [√W·X; √λ_k R_k]`'s singular values, every mode priced
+    /// (#2644, gam#2735).
+    RootScale,
+}
+
+/// The coefficient frame a criterion rank decision was taken in (#2959 D1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CriterionFrame {
+    /// PIRLS's transformed frame: the matrix is the bundle's `h_total`.
+    Transformed,
+    /// The original frame: the matrix is `Qs·h_total·Qsᵀ` with the transformed
+    /// barrier swapped for the original-basis one.
+    Original,
+}
+
+/// The rank decision the dense criterion priced `½log|H|₊` with at one
+/// evaluation point, published by the builder that priced it (#2959 D1).
+///
+/// The identified-rank certificate (#2901 V22) certifies this decision. It used
+/// to re-rank PIRLS's stabilized Hessian with its own call to the predicate, so
+/// wherever a builder priced a different rank (the root upgrade pricing a mode the
+/// assembled band masks) the certificate vouched for a rank the criterion never
+/// used.
+pub(crate) struct CriterionRankDecision {
+    pub(crate) predicate: CriterionRankPredicate,
+    pub(crate) frame: CriterionFrame,
+    /// `rank(S_λ)`, the floor the predicate was taken at.
+    pub(crate) penalty_rank: usize,
+    /// The matrix the decision was taken on, in `frame`.
+    pub(crate) hessian: Arc<Array2<f64>>,
+    /// The operator the criterion priced: its raw eigenpairs and active set.
+    pub(crate) operator: Arc<reml_outer_engine::DenseSpectralOperator>,
+}
+
+impl CriterionRankDecision {
+    /// The number of eigenpairs the criterion priced.
+    pub(crate) fn priced_rank(&self) -> usize {
+        self.operator
+            .active_mask
+            .iter()
+            .filter(|&&active| active)
+            .count()
+    }
+}
+
 /// Holds the state for the outer REML optimization and supplies cost and
 /// gradient evaluations to the `opt` optimizer.
 ///
@@ -4692,6 +4746,12 @@ pub(crate) struct EvalShared {
     /// once per ρ rather than once per value/gradient/Hessian call at that ρ.
     pub(crate) root_scale_hessian_operator:
         std::sync::OnceLock<Option<Arc<reml_outer_engine::DenseSpectralOperator>>>,
+    /// The rank decision the dense criterion priced at this evaluation point,
+    /// published by its builder (#2959 D1). Shared across the bundle's clones, so
+    /// the copy the cache keeps carries what the evaluation's own copy decided.
+    /// Empty until a builder prices a spectral operator here: the value-only
+    /// Cholesky and the sparse route publish none.
+    pub(crate) criterion_rank_decision: Arc<std::sync::OnceLock<Arc<CriterionRankDecision>>>,
     /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, in the
     /// ORIGINAL coefficient frame (#2454).
     ///
@@ -4810,6 +4870,23 @@ impl EvalShared {
             (Some(a), Some(b)) => a == b,
             _ => false,
         }
+    }
+
+    /// Publish the rank decision the builder priced at this point. The first
+    /// builder to price a spectral operator here decides; every later build at
+    /// the same point prices the same matrix with the same predicate.
+    pub(crate) fn publish_criterion_rank_decision(
+        &self,
+        decision: impl FnOnce() -> CriterionRankDecision,
+    ) {
+        self.criterion_rank_decision
+            .get_or_init(|| Arc::new(decision()));
+    }
+
+    /// The rank decision a builder published at this point, if one priced a
+    /// spectral operator here.
+    pub(crate) fn criterion_rank_decision(&self) -> Option<Arc<CriterionRankDecision>> {
+        self.criterion_rank_decision.get().map(Arc::clone)
     }
 
     /// Lazily build — once per evaluation point — the original-frame
@@ -5348,6 +5425,36 @@ impl RemlArena {
     }
 }
 
+/// The ρ at which a fit decides the #784 block-local correction's admission,
+/// which [`RemlState::block_correction_admission`] then freezes for the fit
+/// (#2748, #1082).
+///
+/// A fixed-ρ evaluation publishes the ρ it is handed, so it decides there, at
+/// its first evaluation whose skewness verdict engages. A search publishes its
+/// certified optimum, and deciding at whichever ρ it evaluates first made the
+/// fitted criterion a function of the start. On
+/// `gam_tensor_te_2d_poisson_matches_mgcv` the verdict engaged at the first
+/// evaluation (`max|γ| = 0.238` against `τ = 0.126`) and not at the Laplace
+/// optimum (`0.066`), so that latch integrated an `m = 8` block at every one of
+/// 132 later inner solutions for a correction the published ρ declines (job
+/// 1246493). A search therefore prices the Laplace criterion, decides once at
+/// its certified optimum, and either declines there or latches and continues
+/// the corrected search from that optimum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockCorrectionDecision {
+    /// Decided at the first evaluation whose verdict engages (a fixed-ρ caller).
+    AtFirstEngagedEvaluation,
+    /// A search is running on the Laplace criterion: the correction is zero and
+    /// nothing latches.
+    DeferredToOptimum,
+    /// The next evaluation, at the search's certified optimum, decides.
+    DecidingAtOptimum,
+    /// The verdict declined at the certified optimum: zero for the fit.
+    DeclinedAtOptimum,
+    /// Admitted at the certified optimum and latched.
+    AdmittedAtOptimum,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5413,7 +5520,13 @@ pub(crate) struct RemlState<'a> {
     /// whose correction never engages is bit-identical to the pre-#2748 fit and
     /// a fit that engaged consistently keeps the same block it always had; only
     /// the fits that were toggling change.
+    ///
+    /// WHERE that admission is decided is [`Self::block_correction_decision`]
+    /// (#1082).
     pub(crate) block_correction_admission: AtomicUsize,
+    /// The ρ at which [`Self::block_correction_admission`] is decided (#1082); see
+    /// [`BlockCorrectionDecision`].
+    pub(crate) block_correction_decision: std::sync::Mutex<BlockCorrectionDecision>,
     /// The per-axis Gauss–Hermite orders latched beside
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve

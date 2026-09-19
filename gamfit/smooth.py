@@ -533,8 +533,6 @@ class MeasureJet(Smooth):
         affine-jet energy.
     alpha : optional finite float — density-normalization exponent (outer
         weight ``q^(1−2α)``).
-    tau : optional float ``≥ 0`` — dimensionless jet-ridge floor on the
-        local slope Gram; ``0`` selects the exact pseudo-inverse.
     scales : optional int — number of scale nodes in the multiscale band.
     length_scale : optional positive float — representer (Gaussian RBF)
         range. Supplying it PINS the range: an explicit value is read as a
@@ -557,7 +555,6 @@ class MeasureJet(Smooth):
     n_centers: int | None = None
     s: float | None = None
     alpha: float | None = None
-    tau: float | None = None
     scales: int | None = None
     length_scale: float | None = None
     learn_length_scale: bool | None = None
@@ -573,8 +570,6 @@ class MeasureJet(Smooth):
             out["s"] = float(self.s)
         if self.alpha is not None:
             out["alpha"] = float(self.alpha)
-        if self.tau is not None:
-            out["tau"] = float(self.tau)
         if self.scales is not None:
             out["scales"] = int(self.scales)
         if self.length_scale is not None:

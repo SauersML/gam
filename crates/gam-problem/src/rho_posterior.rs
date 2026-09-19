@@ -1,9 +1,9 @@
-//! `ρ`-posterior certificate / escalation DATA types (contract-down #1521).
+//! `ρ`-posterior adequacy / escalation DATA types (contract-down #1521).
 //!
 //! These are the plain-data carriers that a fit result STORES
 //! (`FitArtifacts::{rho_posterior, rho_posterior_escalation}`) and that the
 //! gam-solve REML evaluator returns. The COMPUTATION that produces them — the
-//! PSIS certificate, the Tier-1 Gauss-Hermite quadrature, and the Tier-2 NUTS
+//! PSIS adequacy diagnostic, the Tier-1 Gauss-Hermite quadrature, and the Tier-2 NUTS
 //! escalation (which pulls the gam-inference `hmc_io` sampler) — stays UP in the
 //! monolith `inference::rho_posterior`, which re-exports these types so its
 //! construction sites name them unchanged. Contract-downed here (the neutral
@@ -15,14 +15,25 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::OnceLock;
 
-/// Reliability tier read off the Pareto tail-shape `k̂` of the `ρ`-importance
-/// weights.
+/// Adequacy grade of the Laplace proposal, read off the Pareto tail-shape `k̂`
+/// of the `ρ`-importance weights (#2946 T2).
+///
+/// It is a diagnostic with a sampling error, not a certificate: `k̂` comes from
+/// `⌈√M⌉` tail excesses and carries the standard error
+/// `gam_solve::psis::shape_standard_error`, so a grade whose `k̂` sits within a
+/// few standard errors of a cutoff says nothing about which side the true shape
+/// is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RhoCertificate {
-    /// `k̂ < 0.5`: the Laplace proposal is excellent — the plug-in (REML
-    /// conditional) intervals plus the first-order `V_ρ` correction are
-    /// certified adequate; `ρ`-uncertainty does not need a heavier treatment.
-    PlugInCertified,
+pub enum RhoProposalAdequacy {
+    /// `k̂ < 0.5`: the importance weights have a finite second moment, so the
+    /// plug-in (REML conditional) intervals plus the first-order `V_ρ`
+    /// correction are adequate by this diagnostic; `ρ`-uncertainty does not need
+    /// a heavier treatment.
+    ///
+    /// `PlugInCertified` is its legacy token: accepted when reading a payload
+    /// written before #2946 T2, never written.
+    #[serde(alias = "PlugInCertified")]
+    PlugInAdequate,
     /// `0.5 ≤ k̂ ≤ 0.7`: the proposal is usable but the self-normalized
     /// importance weights should be used to correct moments.
     ImportanceCorrect,
@@ -45,32 +56,35 @@ pub const ESCALATE_K_HAT: f64 = 0.7;
 /// `k̂` below which the proposal's importance weights have finite variance
 /// (`k < 1/2` ⇒ the generalized-Pareto tail has a second moment), so the
 /// plug-in answer plus the first-order correction needs no reweighting.
-pub const PLUG_IN_CERTIFIED_K_HAT: f64 = 0.5;
+pub const PLUG_IN_ADEQUATE_K_HAT: f64 = 0.5;
 
-impl RhoCertificate {
+impl RhoProposalAdequacy {
     pub fn from_k_hat(k_hat: f64) -> Self {
         if !k_hat.is_finite() || k_hat > ESCALATE_K_HAT {
-            RhoCertificate::Escalate
-        } else if k_hat < PLUG_IN_CERTIFIED_K_HAT {
-            RhoCertificate::PlugInCertified
+            RhoProposalAdequacy::Escalate
+        } else if k_hat < PLUG_IN_ADEQUATE_K_HAT {
+            RhoProposalAdequacy::PlugInAdequate
         } else {
-            RhoCertificate::ImportanceCorrect
+            RhoProposalAdequacy::ImportanceCorrect
         }
     }
 }
 
-/// The Tier-0 `ρ`-uncertainty certificate for a fit.
+/// The Tier-0 `ρ`-uncertainty adequacy diagnostic for a fit: the PSIS tail
+/// shape of the Laplace proposal's importance weights and the grade read off it.
 ///
 /// Every field persists with the fit, so `k_hat` and `effective_sample_size`
 /// are finite by construction: the producer refuses a non-finite tail shape
 /// ([`RhoPosteriorRefusal::TailShapeNotFinite`]) and weights that do not
 /// normalize ([`RhoPosteriorRefusal::SmoothedWeightsNotNormalizable`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RhoPosteriorCertificate {
+pub struct RhoPosteriorAdequacy {
     /// Pareto tail-shape of the importance weights — the reliability diagnostic.
     pub k_hat: f64,
-    /// The reliability tier derived from `k_hat`.
-    pub certificate: RhoCertificate,
+    /// The adequacy grade read off `k_hat`. `certificate` is its legacy key:
+    /// accepted when reading a payload written before #2946 T2, never written.
+    #[serde(alias = "certificate")]
+    pub adequacy: RhoProposalAdequacy,
     /// Number of proposal draws `M`.
     pub n_samples: usize,
     /// Kish effective sample size `(Σw)² / Σw²` — how many of the `M` draws are
@@ -78,10 +92,10 @@ pub struct RhoPosteriorCertificate {
     pub effective_sample_size: f64,
 }
 
-/// Why the Tier-0 `ρ`-certificate could not be formed at `ρ̂` (#2627).
+/// Why the Tier-0 `ρ`-adequacy diagnostic could not be formed at `ρ̂` (#2627).
 ///
-/// One arm per refusal site of the certificate computation. The certificate is a
-/// post-fit diagnostic, so a refusal still publishes the fit, and the arm travels
+/// One arm per refusal site of the adequacy computation. It is a post-fit
+/// diagnostic, so a refusal still publishes the fit, and the arm travels
 /// with it: a caller asserts on the reason rather than reading a log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RhoPosteriorRefusal {
@@ -127,16 +141,16 @@ impl fmt::Display for RhoPosteriorRefusal {
     }
 }
 
-/// Why a fit carries no attempt at the Tier-0 `ρ`-certificate (#2627).
+/// Why a fit carries no attempt at the Tier-0 `ρ`-adequacy diagnostic (#2627).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RhoPosteriorNotComputed {
-    /// Only the REML evaluator's post-fit seam forms the certificate, and this
+    /// Only the REML evaluator's post-fit seam forms the diagnostic, and this
     /// fit was assembled on a route that does not pass through it.
     NotFormedOnThisRoute,
     /// The fit was run without inference (`FitOptions::compute_inference` is
     /// false), and the seam runs only inside the inference pass.
     InferenceNotRequested,
-    /// No certificate producer is registered (a build that never links the
+    /// No adequacy producer is registered (a build that never links the
     /// sampler tier).
     EscalatorUnregistered,
     /// The outer Hessian at `ρ̂` could not be formed.
@@ -147,10 +161,10 @@ impl fmt::Display for RhoPosteriorNotComputed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFormedOnThisRoute => {
-                f.write_str("this fit's route does not pass through the certificate seam")
+                f.write_str("this fit's route does not pass through the adequacy seam")
             }
             Self::InferenceNotRequested => {
-                f.write_str("the fit was run without inference, where the certificate seam runs")
+                f.write_str("the fit was run without inference, where the adequacy seam runs")
             }
             Self::EscalatorUnregistered => f.write_str("no rho-posterior producer is registered"),
             Self::OuterHessianUnavailable { reason } => {
@@ -160,27 +174,29 @@ impl fmt::Display for RhoPosteriorNotComputed {
     }
 }
 
-/// What the Tier-0 `ρ`-certificate seam concluded for a fit (#2627).
+/// What the Tier-0 `ρ`-adequacy diagnostic seam concluded for a fit (#2627).
 ///
 /// It replaces an `Option` whose `None` merged four different facts: nothing to
-/// certify, no producer, no outer Hessian, and a refusal whose reason reached only
+/// grade, no producer, no outer Hessian, and a refusal whose reason reached only
 /// a log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RhoPosteriorOutcome {
-    /// No smoothing coordinate: there is nothing to certify.
+    /// No smoothing coordinate: there is nothing to grade.
     NotApplicable,
-    /// The certificate was never attempted, and why.
+    /// The diagnostic was never attempted, and why.
     NotComputed(RhoPosteriorNotComputed),
-    /// The certificate was attempted and refused, and why.
+    /// The diagnostic was attempted and refused, and why.
     Refused(RhoPosteriorRefusal),
-    /// The certificate was formed. Its tier may still say the plug-in is
-    /// inadequate.
-    Certified(RhoPosteriorCertificate),
+    /// The diagnostic was formed. Its grade may still say the plug-in is
+    /// inadequate. `Certified` is its legacy tag: accepted when reading a payload
+    /// written before #2946 T2, never written.
+    #[serde(alias = "Certified")]
+    Assessed(RhoPosteriorAdequacy),
 }
 
 impl Default for RhoPosteriorOutcome {
     /// A fit assembled away from the REML evaluator's post-fit seam never formed
-    /// the certificate.
+    /// the diagnostic.
     fn default() -> Self {
         Self::NotComputed(RhoPosteriorNotComputed::NotFormedOnThisRoute)
     }
@@ -238,8 +254,8 @@ pub struct RhoPosteriorSamples {
     pub converged: bool,
 }
 
-/// The auto-selected escalation outcome when the Tier-0 certificate reads
-/// [`RhoCertificate::Escalate`] (#938): Tier 1 (deterministic quadrature) for
+/// The auto-selected escalation outcome when the Tier-0 grade reads
+/// [`RhoProposalAdequacy::Escalate`] (#938): Tier 1 (deterministic quadrature) for
 /// `K ≤ 4`, Tier 2 (NUTS over `ρ`) for `K ≤ 16`, and an HONEST report that
 /// escalation is unavailable beyond that — never a silently-degraded answer.
 #[derive(Debug, Clone)]
@@ -256,13 +272,13 @@ pub enum RhoPosteriorEscalation {
 
 // ───────────────────────── injected escalator trait (#1521) ──────────────────
 
-/// The gam-inference-tier producer of the Tier-0 `ρ`-certificate and the
+/// The gam-inference-tier producer of the Tier-0 `ρ`-adequacy diagnostic and the
 /// auto-selected Tier-1/Tier-2 escalation (trait-inversion #1521).
 ///
-/// The COMPUTATION — the PSIS certificate, the Gauss-Hermite quadrature, and
+/// The COMPUTATION — the PSIS adequacy diagnostic, the Gauss-Hermite quadrature, and
 /// the Tier-2 NUTS over `ρ` — pulls the gam-inference `hmc_io` sampler, so it
 /// STAYS UP in the monolith `inference::rho_posterior`. That module implements
-/// this trait over its real `rho_posterior_certificate` / `escalate_rho_posterior`
+/// this trait over its real `rho_posterior_adequacy` / `escalate_rho_posterior`
 /// functions and injects the impl DOWN via [`set_rho_posterior_escalator`];
 /// gam-solve's REML evaluator calls THROUGH [`rho_posterior_escalator`]. Only
 /// neutral types (ndarray + the contract-downed `ρ`-posterior carriers) and
@@ -274,17 +290,17 @@ pub enum RhoPosteriorEscalation {
 /// [`RhoPosteriorNotComputed::EscalatorUnregistered`] and runs no escalation,
 /// leaving the plug-in + first-order intervals.
 pub trait RhoPosteriorEscalator: Send + Sync {
-    /// Tier-0 PSIS `ρ`-certificate. `criterion` evaluates the outer criterion
+    /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
     /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns
-    /// `Ok(None)` when there is nothing to certify (`K = 0`) and the typed
-    /// [`RhoPosteriorRefusal`] when the certificate cannot be formed.
-    fn rho_posterior_certificate(
+    /// `Ok(None)` when there is nothing to grade (`K = 0`) and the typed
+    /// [`RhoPosteriorRefusal`] when the diagnostic cannot be formed.
+    fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
         n_samples: Option<usize>,
-    ) -> Result<Option<RhoPosteriorCertificate>, RhoPosteriorRefusal>;
+    ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
     /// `Unavailable`). `criterion` returns the exact profiled criterion value,
@@ -301,7 +317,7 @@ pub trait RhoPosteriorEscalator: Send + Sync {
 
 static RHO_POSTERIOR_ESCALATOR: OnceLock<Box<dyn RhoPosteriorEscalator>> = OnceLock::new();
 
-/// Register the monolith's `hmc_io`-backed `ρ`-posterior certificate/escalation
+/// Register the monolith's `hmc_io`-backed `ρ`-posterior adequacy/escalation
 /// producer. Called once at process init by the gam-inference tier. First writer
 /// wins; a later call is ignored (returns `Err` with the boxed value) so a
 /// re-init can never swap a live producer mid-run.
@@ -311,7 +327,7 @@ pub fn set_rho_posterior_escalator(
     RHO_POSTERIOR_ESCALATOR.set(escalator)
 }
 
-/// The registered `ρ`-posterior certificate/escalation producer, or `None` when
+/// The registered `ρ`-posterior adequacy/escalation producer, or `None` when
 /// the sampler tier is not linked / not yet initialized (gam-solve then records
 /// `EscalatorUnregistered` and runs no escalation, leaving plug-in intervals).
 pub fn rho_posterior_escalator() -> Option<&'static dyn RhoPosteriorEscalator> {
@@ -323,52 +339,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_k_hat_below_half_is_plug_in_certified() {
+    fn from_k_hat_below_half_is_plug_in_adequate() {
         assert_eq!(
-            RhoCertificate::from_k_hat(0.0),
-            RhoCertificate::PlugInCertified
+            RhoProposalAdequacy::from_k_hat(0.0),
+            RhoProposalAdequacy::PlugInAdequate
         );
         assert_eq!(
-            RhoCertificate::from_k_hat(0.499),
-            RhoCertificate::PlugInCertified
+            RhoProposalAdequacy::from_k_hat(0.499),
+            RhoProposalAdequacy::PlugInAdequate
         );
     }
 
     #[test]
     fn from_k_hat_between_half_and_point_seven_is_importance_correct() {
         assert_eq!(
-            RhoCertificate::from_k_hat(0.5),
-            RhoCertificate::ImportanceCorrect
+            RhoProposalAdequacy::from_k_hat(0.5),
+            RhoProposalAdequacy::ImportanceCorrect
         );
         assert_eq!(
-            RhoCertificate::from_k_hat(0.7),
-            RhoCertificate::ImportanceCorrect
+            RhoProposalAdequacy::from_k_hat(0.7),
+            RhoProposalAdequacy::ImportanceCorrect
         );
         assert_eq!(
-            RhoCertificate::from_k_hat(0.65),
-            RhoCertificate::ImportanceCorrect
+            RhoProposalAdequacy::from_k_hat(0.65),
+            RhoProposalAdequacy::ImportanceCorrect
         );
     }
 
     #[test]
     fn from_k_hat_above_point_seven_is_escalate() {
-        assert_eq!(RhoCertificate::from_k_hat(0.701), RhoCertificate::Escalate);
-        assert_eq!(RhoCertificate::from_k_hat(10.0), RhoCertificate::Escalate);
+        assert_eq!(RhoProposalAdequacy::from_k_hat(0.701), RhoProposalAdequacy::Escalate);
+        assert_eq!(RhoProposalAdequacy::from_k_hat(10.0), RhoProposalAdequacy::Escalate);
     }
 
     #[test]
     fn from_k_hat_nan_is_escalate() {
         assert_eq!(
-            RhoCertificate::from_k_hat(f64::NAN),
-            RhoCertificate::Escalate
+            RhoProposalAdequacy::from_k_hat(f64::NAN),
+            RhoProposalAdequacy::Escalate
         );
     }
 
     #[test]
     fn from_k_hat_infinity_is_escalate() {
         assert_eq!(
-            RhoCertificate::from_k_hat(f64::INFINITY),
-            RhoCertificate::Escalate
+            RhoProposalAdequacy::from_k_hat(f64::INFINITY),
+            RhoProposalAdequacy::Escalate
         );
     }
 
@@ -394,9 +410,9 @@ mod tests {
             RhoPosteriorOutcome::Refused(RhoPosteriorRefusal::HessianNotPositiveDefinite {
                 detail: "Cholesky(NonPositivePivot { index: 0 })".to_string(),
             }),
-            RhoPosteriorOutcome::Certified(RhoPosteriorCertificate {
+            RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
                 k_hat: 0.25,
-                certificate: RhoCertificate::PlugInCertified,
+                adequacy: RhoProposalAdequacy::PlugInAdequate,
                 n_samples: 64,
                 effective_sample_size: 61.5,
             }),
@@ -409,6 +425,86 @@ mod tests {
         assert_eq!(
             RhoPosteriorOutcome::default(),
             RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::NotFormedOnThisRoute)
+        );
+    }
+
+    /// #2946 T2: the saved-model encoding names the diagnostic for what it is.
+    /// The written tokens are `Assessed`, `adequacy` and the grade names, and none
+    /// of the words that called a sampled tail-shape grade a certificate.
+    #[test]
+    fn assessed_outcome_writes_adequacy_tokens_not_certificate_words_2946() {
+        let json = serde_json::to_string(&RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
+            k_hat: 0.25,
+            adequacy: RhoProposalAdequacy::PlugInAdequate,
+            n_samples: 64,
+            effective_sample_size: 61.5,
+        }))
+        .expect("outcome serializes");
+        assert_eq!(
+            json,
+            r#"{"Assessed":{"k_hat":0.25,"adequacy":"PlugInAdequate","n_samples":64,"effective_sample_size":61.5}}"#
+        );
+        for grade in [
+            RhoProposalAdequacy::PlugInAdequate,
+            RhoProposalAdequacy::ImportanceCorrect,
+            RhoProposalAdequacy::Escalate,
+        ] {
+            let token = serde_json::to_string(&grade).expect("grade serializes");
+            assert!(!token.to_ascii_lowercase().contains("certif"), "{token}");
+        }
+    }
+
+    /// #2946 T2: a payload written before the rename (the v18 tokens `Certified`,
+    /// `certificate` and `PlugInCertified`) still reads, as the same outcome, and
+    /// writes back only the new tokens. The reader accepts the older payload
+    /// version by design, so the legacy tokens are read-only aliases.
+    #[test]
+    fn legacy_certificate_tokens_read_and_rewrite_as_adequacy_2946() {
+        let legacy = r#"{"Certified":{"k_hat":0.25,"certificate":"PlugInCertified","n_samples":64,"effective_sample_size":61.5}}"#;
+        let read: RhoPosteriorOutcome = serde_json::from_str(legacy).expect("a legacy payload reads");
+        assert_eq!(
+            read,
+            RhoPosteriorOutcome::Assessed(RhoPosteriorAdequacy {
+                k_hat: 0.25,
+                adequacy: RhoProposalAdequacy::PlugInAdequate,
+                n_samples: 64,
+                effective_sample_size: 61.5,
+            })
+        );
+        assert_eq!(
+            serde_json::to_string(&read).expect("outcome serializes"),
+            r#"{"Assessed":{"k_hat":0.25,"adequacy":"PlugInAdequate","n_samples":64,"effective_sample_size":61.5}}"#
+        );
+
+        // Control: the same shapes without the aliases refuse the legacy payload,
+        // so the read above rests on the aliases and not on a lenient parser.
+        #[derive(Debug, Deserialize)]
+        enum GradeWithoutAlias {
+            PlugInAdequate,
+            ImportanceCorrect,
+            Escalate,
+        }
+        #[derive(Debug, Deserialize)]
+        struct AdequacyWithoutAlias {
+            k_hat: f64,
+            adequacy: GradeWithoutAlias,
+            n_samples: usize,
+            effective_sample_size: f64,
+        }
+        #[derive(Debug, Deserialize)]
+        enum OutcomeWithoutAlias {
+            Assessed(AdequacyWithoutAlias),
+        }
+        let refused = serde_json::from_str::<OutcomeWithoutAlias>(legacy)
+            .expect_err("without the aliases the legacy payload must not read");
+        assert!(refused.to_string().contains("unknown variant `Certified`"), "{refused}");
+        let current = serde_json::to_string(&read).expect("outcome serializes");
+        let OutcomeWithoutAlias::Assessed(mirror) =
+            serde_json::from_str::<OutcomeWithoutAlias>(&current).expect("the mirror reads new tokens");
+        assert!(matches!(mirror.adequacy, GradeWithoutAlias::PlugInAdequate));
+        assert_eq!(
+            (mirror.k_hat, mirror.n_samples, mirror.effective_sample_size),
+            (0.25, 64, 61.5)
         );
     }
 }

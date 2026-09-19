@@ -1257,10 +1257,15 @@ mod adaptive_bounded_duchon_tests {
         }
     }
 
+    /// The setup projects its ρ seed into the domain its builder derived
+    /// (#2902 item 15): a non-finite seed takes the domain's midpoint, an
+    /// interior seed is kept, and a seed past an edge lands on that edge.
     #[test]
-    fn two_block_exact_joint_setup_sanitizes_non_finite_rho_seed() {
+    fn exact_joint_setup_projects_its_rho_seed_into_the_derived_domain_2902() {
         let setup = ExactJointHyperSetup::new(
-            array![f64::NEG_INFINITY, 0.25, f64::INFINITY],
+            array![f64::NEG_INFINITY, 0.25, 40.0],
+            array![-30.0, -30.0, -30.0],
+            array![10.0, 10.0, 10.0],
             SpatialLogKappaCoords::new_with_dims(array![0.5], vec![1]),
             SpatialLogKappaCoords::new_with_dims(array![-2.0], vec![1]),
             SpatialLogKappaCoords::new_with_dims(array![2.0], vec![1]),
@@ -1268,9 +1273,9 @@ mod adaptive_bounded_duchon_tests {
 
         let theta0 = setup.theta0();
         assert!(theta0.iter().all(|v| v.is_finite()));
-        assert_eq!(theta0[0], 0.0);
+        assert_eq!(theta0[0], -10.0);
         assert_eq!(theta0[1], 0.25);
-        assert_eq!(theta0[2], 0.0);
+        assert_eq!(theta0[2], 10.0);
         assert_eq!(theta0[3], 0.5);
     }
 

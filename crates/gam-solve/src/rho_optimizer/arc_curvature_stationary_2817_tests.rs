@@ -1138,6 +1138,11 @@ fn an_exhausted_arc_budget_refuses_instead_of_retrying_2817() {
             PlanRunOutcome::FixedPointContinuationRequested(request) => {
                 panic!("an ARC pass requested a fixed-point continuation: {}", request.refusal)
             }
+            PlanRunOutcome::DominatedPlateau(dominated) => panic!(
+                "fixture precondition: one pass over the quartic returns its exhausted \
+                 checkpoint, but it declined a dominated certified winner at cost {:.6e}",
+                dominated.plateau.final_value
+            ),
         };
 
     let mut runner_obj = problem.build_objective(
@@ -1188,6 +1193,8 @@ fn step_2817(iter: usize, step_norm: f64, radius: f64, actual: f64) -> StepInfo 
         predicted_decrease: actual,
         actual_decrease: actual,
         trust_radius: Some(radius),
+        regularization: None,
+        line_search_step: None,
     }
 }
 

@@ -342,6 +342,129 @@ impl BetaCouplingGraph {
 // BetaPenaltyOp — matrix-free penalty-side H_ββ abstraction (#296)
 // ---------------------------------------------------------------------------
 
+/// A guaranteed upper bound on a nonnegative quantity from its rounded value
+/// (#2627).
+///
+/// `computed` is the floating-point result of accumulating nonnegative terms
+/// along paths of at most `operations` rounded operations, so it is the exact
+/// value `s` times `1 + θ` with `|θ| ≤ γ_n` (Higham, *Accuracy and Stability of
+/// Numerical Algorithms*, 2nd ed., Lemma 3.1). Then
+/// `s ≤ computed/(1 − γ_n) ≤ computed·(1 + γ_{2n})`. Forming `γ`, the factor
+/// `1 + γ` and the product rounds three more times, each by at most `u`
+/// relative, so the result is at least `computed·(1 + γ_m(1 − 2u))(1 − 2u)`
+/// with `m = 2n + 3`. That is `≥ computed·(1 + γ_{2n})` exactly when
+/// `n(1 − 4u) + 1 − 12u ≥ 0`, which holds for every `n`.
+///
+/// Once `m·u ≥ 1` the accumulation carries no usable bound and the answer is
+/// `+∞`. The model assumes no overflow or underflow in the accumulation.
+pub fn guaranteed_norm_upper_bound(computed: f64, operations: usize) -> f64 {
+    let growth = gam_linalg::roundoff::accumulation_growth(
+        operations.saturating_mul(2).saturating_add(3),
+    );
+    if !growth.is_finite() {
+        return f64::INFINITY;
+    }
+    computed * (1.0 + growth)
+}
+
+/// A guaranteed upper bound on the Frobenius norm of `values`, and so on the
+/// spectral norm of any matrix whose entries they are (#2627).
+///
+/// The sum of squares of `n` entries is an inner product of length `n`, and the
+/// square root rounds once more.
+pub fn frobenius_norm_upper_bound<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+    let mut sum_squares = 0.0_f64;
+    let mut count = 0usize;
+    for value in values {
+        sum_squares += value * value;
+        count += 1;
+    }
+    guaranteed_norm_upper_bound(sum_squares.sqrt(), count + 1)
+}
+
+/// What a matrix-free per-row cross-block operator `H_tβ^(i)` declares about itself
+/// (#2627), installed with it through `ArrowSchurSystem::set_row_htbeta_operator`.
+///
+/// * `row_norm_bounds[i]` is a guaranteed upper bound on `‖H_tβ^(i)‖₂` of the forward
+///   operator alone, from the operator's own entries (see
+///   [`guaranteed_norm_upper_bound`]). A ridge ladder can stop structurally only at a
+///   shift it can prove positive definite, and these bounds are what it reads.
+/// * `apply_depth` bounds the rounded operations (products and additions, the addition
+///   into an existing output entry included) on any path from an input entry into one
+///   output entry, of the forward apply and of its transpose as executed. Every term the
+///   applies form is a product of entries and inputs, so each computed output entry is
+///   the exact sum of those terms up to a relative error `γ_depth` of their absolute sum
+///   (Higham, *Accuracy and Stability of Numerical Algorithms*, 2nd ed., Lemma 3.1), and a
+///   staged apply adds its stages' depths.
+///
+/// The depth is read off the operator's loop structure: an inner product of `n` terms
+/// has depth `n`, and one more for an addition into an existing entry. It is the longest
+/// accumulation of one apply, not a flop total, so it does not grow with the row count.
+#[derive(Debug, Clone)]
+pub struct RowHtbetaDeclaration {
+    pub row_norm_bounds: Arc<[f64]>,
+    pub apply_depth: usize,
+}
+
+/// `out += M·x` for the majorant `M_ab = max(|A_ab|, |A_ba|)` of a square dense
+/// `A` and of its transpose. Returns the accumulation depth `n + 1`: an inner
+/// product of length `n`, then the addition into `out`.
+pub(crate) fn dense_abs_majorant_matvec(matrix: &Array2<f64>, x: &[f64], out: &mut [f64]) -> usize {
+    let n = matrix.nrows();
+    for a in 0..n {
+        let mut acc = 0.0_f64;
+        for b in 0..n {
+            acc += matrix[[a, b]].abs().max(matrix[[b, a]].abs()) * x[b];
+        }
+        out[a] += acc;
+    }
+    n + 1
+}
+
+/// Block indices grouped by placement `(row, column)`, so a majorant can sum the
+/// blocks placed at one key and pair the key with its transpose `(column, row)`.
+fn blocks_by_placement(
+    placements: impl Iterator<Item = (usize, usize)>,
+) -> std::collections::BTreeMap<(usize, usize), Vec<usize>> {
+    let mut groups = std::collections::BTreeMap::<(usize, usize), Vec<usize>>::new();
+    for (index, placement) in placements.enumerate() {
+        groups.entry(placement).or_default().push(index);
+    }
+    groups
+}
+
+/// The majorant block `max(Σ_group |A|, (Σ_partner |B|)ᵀ)` of one placement:
+/// `group` holds the blocks placed at `(r, c)` and `partner` those placed at
+/// `(c, r)`. An entry outside a block's own shape contributes zero.
+fn placement_majorant(group: &[&Array2<f64>], partner: &[&Array2<f64>]) -> Array2<f64> {
+    let rows = group
+        .iter()
+        .map(|block| block.nrows())
+        .chain(partner.iter().map(|block| block.ncols()))
+        .max()
+        .unwrap_or(0);
+    let cols = group
+        .iter()
+        .map(|block| block.ncols())
+        .chain(partner.iter().map(|block| block.nrows()))
+        .max()
+        .unwrap_or(0);
+    let mut direct = Array2::<f64>::zeros((rows, cols));
+    for block in group {
+        for ((i, j), value) in block.indexed_iter() {
+            direct[[i, j]] += value.abs();
+        }
+    }
+    let mut transposed = Array2::<f64>::zeros((rows, cols));
+    for block in partner {
+        for ((i, j), value) in block.indexed_iter() {
+            transposed[[j, i]] += value.abs();
+        }
+    }
+    direct.zip_mut_with(&transposed, |entry, mirrored| *entry = entry.max(*mirrored));
+    direct
+}
+
 /// Identifies one contiguous column block in the shared β vector for
 /// block-Jacobi Schur pre-conditioning (#287).
 ///
@@ -380,6 +503,34 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// rather than the full `K×K` dense form, which would defeat the structured
     /// operator's storage savings.
     fn fingerprint(&self, hasher: &mut Fingerprinter);
+
+    /// `out += M·x` for a nonnegative `x`, where `M` is a nonnegative matrix
+    /// that majorizes this operator's entries and those of its transpose:
+    /// `M ≥ |P|` and `M ≥ |P|ᵀ` entrywise. Returns the accumulation depth `k`.
+    ///
+    /// This is the operator's structural norm declaration (#2627). It has no
+    /// default, so an operator that cannot state a bound does not compile. A
+    /// consumer reads everything it needs from `M`:
+    ///
+    /// * `‖P‖₂ ≤ √(‖P‖₁·‖P‖_∞) ≤ max_i (M·1)_i`, since the row sums of `M`
+    ///   dominate both the row and the column sums of `|P|`. This is an upper
+    ///   bound from the entries, never a Rayleigh estimate.
+    /// * In a diagonal metric `D`:
+    ///   `‖D P D⁻¹‖₂ ≤ √(max_i d_i·(M d⁻¹)_i · max_j (M d)_j/d_j)`.
+    /// * Collatz–Wielandt: `ρ(P) ≤ ρ(M) ≤ max_i (M y)_i / y_i` for any positive `y`.
+    ///
+    /// Operators compose by adding their `M`, so a sum of operators on disjoint
+    /// blocks is bounded by its largest block, not by the sum of the block norms.
+    ///
+    /// # Depth
+    ///
+    /// `k` bounds the rounded operations (products and additions, the addition
+    /// into `out` included) on any path into one entry of `out`. Every term is
+    /// nonnegative, so each computed increment is the exact `(M x)_i` up to a
+    /// relative error `γ_k` (Higham, *ASNA* 2nd ed., Lemma 3.1), and
+    /// [`guaranteed_norm_upper_bound`] makes a computed bound a guaranteed one.
+    /// Accumulating several calls into one buffer adds their depths.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize;
 
     /// If this operator writes its `matvec` contribution into EXACTLY one
     /// contiguous output range `[start, end)` and touches no other index,
@@ -472,6 +623,10 @@ impl BetaPenaltyOp for DensePenaltyOp {
     fn fingerprint(&self, hasher: &mut Fingerprinter) {
         hasher.write_str("dense-penalty-op-v1");
         hasher.write_f64_array2(&self.0);
+    }
+
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        dense_abs_majorant_matvec(&self.0, x, out)
     }
 }
 
@@ -672,6 +827,55 @@ impl BetaPenaltyOp for CoupledCarrierPenaltyOp {
 
     fn gradient(&self, beta: &[f64], out: &mut [f64]) {
         self.apply_add(beta, out);
+    }
+
+    /// `M = |V|·C̃·|V|ᵀ` with `C̃ = max(|C|, |C|ᵀ)`: `|P_ij| ≤ Σ_{a,b} |v_a[i]|·|C_ab|·|v_b[j]|`,
+    /// and `C̃` is symmetric, so `M` also majorizes `|P|ᵀ`. The depth is the widest
+    /// carrier's dot product, the `ne`-term coupling row, and the scatter of every run
+    /// into `out`.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let ne = self.carriers.len();
+        let dots: Vec<f64> = self
+            .carriers
+            .iter()
+            .map(|runs| {
+                let mut acc = 0.0_f64;
+                for (start, values) in runs {
+                    let xs = &x[*start..*start + values.len()];
+                    for (value, xi) in values.iter().zip(xs) {
+                        acc += value.abs() * xi;
+                    }
+                }
+                acc
+            })
+            .collect();
+        let mut coefficients = vec![0.0_f64; ne];
+        for a in 0..ne {
+            let mut acc = 0.0_f64;
+            for b in 0..ne {
+                acc += self.coupling[[a, b]].abs().max(self.coupling[[b, a]].abs()) * dots[b];
+            }
+            coefficients[a] = acc;
+        }
+        for (runs, &coefficient) in self.carriers.iter().zip(&coefficients) {
+            if coefficient == 0.0 {
+                continue;
+            }
+            for (start, values) in runs {
+                let ys = &mut out[*start..*start + values.len()];
+                for (value, yi) in values.iter().zip(ys) {
+                    *yi += coefficient * value.abs();
+                }
+            }
+        }
+        let widest_carrier = self
+            .carriers
+            .iter()
+            .map(|runs| runs.iter().map(|(_, values)| values.len()).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        let total_runs: usize = self.carriers.iter().map(Vec::len).sum();
+        widest_carrier + ne + total_runs + 1
     }
 
     fn diagonal(&self, diag: &mut [f64]) {
@@ -890,6 +1094,26 @@ impl BetaPenaltyOp for IdentityRightKroneckerPenaltyOp {
         hasher.write_usize(self.k);
         hasher.write_usize(self.p);
         hasher.write_f64_array2(&self.factor_a);
+    }
+
+    /// `M = max(|A|, |A|ᵀ) ⊗ I_p`, since `|A ⊗ I_p| = |A| ⊗ I_p`.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let p_a = self.factor_a.nrows();
+        let p = self.p;
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p {
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let majorant = self.factor_a[[i_a, j_a]]
+                        .abs()
+                        .max(self.factor_a[[j_a, i_a]].abs());
+                    acc += majorant * x[off + j_a * p + i_b];
+                }
+                out[off + i_a * p + i_b] += acc;
+            }
+        }
+        p_a + 1
     }
 }
 
@@ -1304,6 +1528,49 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
             hasher.write_f64_array2(&blk.data);
         }
     }
+
+    /// `M = Ã ⊗ I_p`, where `Ã` places at `(r, c)` the majorant block
+    /// `max(Σ|A_rc|, Σ|A_cr|ᵀ)` and its transpose at `(c, r)`. Blocks placed at one
+    /// key are summed, so repeated placements stay covered, and pairing each key
+    /// with its transpose keeps `Ã` symmetric without doubling a symmetric pair.
+    /// One placement majorant is held at a time, so the transient storage is the
+    /// largest block.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let p = self.p;
+        let groups = blocks_by_placement(self.blocks.iter().map(|blk| (blk.row_off, blk.col_off)));
+        for (&(row_off, col_off), group) in &groups {
+            let partner = groups.get(&(col_off, row_off));
+            if row_off > col_off && partner.is_some() {
+                continue;
+            }
+            let direct: Vec<&Array2<f64>> = group.iter().map(|&index| &self.blocks[index].data).collect();
+            let mirrored: Vec<&Array2<f64>> = partner
+                .map(|indices| indices.iter().map(|&index| &self.blocks[index].data).collect())
+                .unwrap_or_default();
+            let majorant = placement_majorant(&direct, &mirrored);
+            for ((li, lj), &weight) in majorant.indexed_iter() {
+                if weight == 0.0 {
+                    continue;
+                }
+                let row_base = (row_off + li) * p;
+                let col_base = (col_off + lj) * p;
+                for oc in 0..p {
+                    out[row_base + oc] += weight * x[col_base + oc];
+                }
+                if row_off != col_off {
+                    for oc in 0..p {
+                        out[col_base + oc] += weight * x[row_base + oc];
+                    }
+                }
+            }
+        }
+        let placed_width: usize = self
+            .blocks
+            .iter()
+            .map(|blk| blk.data.nrows() + blk.data.ncols())
+            .sum();
+        placed_width + self.blocks.len() + 2
+    }
 }
 
 /// One co-occurring `(atom_i, atom_j)` block of the **frame-factored** data-fit
@@ -1563,6 +1830,64 @@ impl BetaPenaltyOp for FactoredFrameKroneckerOp {
             hasher.write_f64_array2(&blk.w);
         }
     }
+
+    /// `M` places `G̃ ⊗ W̃` at `(atom_i, atom_j)` and its transpose at
+    /// `(atom_j, atom_i)`, with `G̃ = max(Σ|g|, Σ|g_partner|ᵀ)` and `W̃` likewise from
+    /// `w`. Every covered entry `|Σ g·w|` is at most `(Σ|g|)(Σ|w|)`, and
+    /// `max(ab, cd) ≤ max(a, c)·max(b, d)` for nonnegative factors, so `M ≥ |P|` and
+    /// `M ≥ |P|ᵀ`. `W̃` is read over `r_i × r_j`, the extent `matvec` applies.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let groups = blocks_by_placement(self.blocks.iter().map(|blk| (blk.atom_i, blk.atom_j)));
+        for (&(atom_i, atom_j), group) in &groups {
+            let partner = groups.get(&(atom_j, atom_i));
+            if atom_i > atom_j && partner.is_some() {
+                continue;
+            }
+            let partner_indices: &[usize] = partner.map(Vec::as_slice).unwrap_or(&[]);
+            let direct_g: Vec<&Array2<f64>> = group.iter().map(|&index| &self.blocks[index].g).collect();
+            let mirrored_g: Vec<&Array2<f64>> =
+                partner_indices.iter().map(|&index| &self.blocks[index].g).collect();
+            let direct_w: Vec<&Array2<f64>> = group.iter().map(|&index| &self.blocks[index].w).collect();
+            let mirrored_w: Vec<&Array2<f64>> =
+                partner_indices.iter().map(|&index| &self.blocks[index].w).collect();
+            let basis_majorant = placement_majorant(&direct_g, &mirrored_g);
+            let frame_majorant = placement_majorant(&direct_w, &mirrored_w);
+            let (r_i, r_j) = (self.ranks[atom_i], self.ranks[atom_j]);
+            let (off_i, off_j) = (self.offsets[atom_i], self.offsets[atom_j]);
+            let frame_rows = frame_majorant.nrows().min(r_i);
+            let frame_cols = frame_majorant.ncols().min(r_j);
+            for ((li, lj), &basis_weight) in basis_majorant.indexed_iter() {
+                if basis_weight == 0.0 {
+                    continue;
+                }
+                let row_base = off_i + li * r_i;
+                let col_base = off_j + lj * r_j;
+                for a in 0..frame_rows {
+                    let mut acc = 0.0_f64;
+                    for b in 0..frame_cols {
+                        acc += frame_majorant[[a, b]] * x[col_base + b];
+                    }
+                    out[row_base + a] += basis_weight * acc;
+                }
+                if atom_i != atom_j {
+                    for b in 0..frame_cols {
+                        let mut acc = 0.0_f64;
+                        for a in 0..frame_rows {
+                            acc += frame_majorant[[a, b]] * x[row_base + a];
+                        }
+                        out[col_base + b] += basis_weight * acc;
+                    }
+                }
+            }
+        }
+        let placed_basis_width: usize = self
+            .blocks
+            .iter()
+            .map(|blk| blk.g.nrows() + blk.g.ncols())
+            .sum();
+        let widest_frame = self.ranks.iter().copied().max().unwrap_or(0);
+        placed_basis_width + widest_frame + 2 * self.blocks.len() + 3
+    }
 }
 
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
@@ -1681,6 +2006,16 @@ impl BetaPenaltyOp for CompositePenaltyOp {
             op.fingerprint(hasher);
         }
     }
+
+    /// `M = Σ_ops M_op`, which majorizes `|Σ_ops P_op|` and its transpose; the
+    /// operators accumulate into one buffer, so their depths add.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        let mut depth = 0usize;
+        for op in &self.ops {
+            depth += op.accumulate_abs_majorant_matvec(x, out);
+        }
+        depth
+    }
 }
 
 /// Adapts a closure-based matrix-free `H_ββ` operator (from
@@ -1775,5 +2110,13 @@ impl BetaPenaltyOp for MatvecDiagPenaltyOp {
         for &value in self.diagonal_vec.iter() {
             hasher.write_f64(value);
         }
+    }
+
+    /// A closure has no entries to read, so the majorant is taken from the
+    /// operator's own probed dense form, at the `K` applies `to_dense` already
+    /// pays. `set_shared_beta_operator` is the one production installer of this
+    /// adapter, and its caller installs the structured operator in its place.
+    fn accumulate_abs_majorant_matvec(&self, x: &[f64], out: &mut [f64]) -> usize {
+        dense_abs_majorant_matvec(&self.to_dense(), x, out)
     }
 }

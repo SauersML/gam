@@ -38,7 +38,6 @@ def _fit(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
                 atom_topology="euclidean",
                 assignment="softmax",
                 isometry_weight=0.0,
-                ard_per_atom=False,
                 sparsity_weight=0.01,
                 smoothness_weight=0.01,
                 decoder_incoherence_weight=decoder_incoherence_weight,

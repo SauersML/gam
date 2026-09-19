@@ -13,11 +13,63 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         slot: Option<(usize, SurvivalInterceptSlotKind)>,
     ) -> Result<(f64, f64), String> {
+        // gam#2948: a family anchored on a declared finite law solves the
+        // identity on that law's nodes; on the Gaussian law the de-nested cells
+        // integrate it.
+        let law = self.flex_law_grid(slot.map(|(row, _)| row))?;
+        // The identity `T(a) = Φ(∓q)` is solved on its SMALLER tail and in log
+        // units (gam#2971): the residual is `log T(a) − log Φ(∓q)`, with `T` the
+        // marginal survival `Σ Φ(−η)` when `q ≥ 0` and the marginal failure
+        // `Σ Φ(η)` otherwise. The probability residual this replaces was held to
+        // an absolute `1e-12`. Where the smaller tail is itself below that, every
+        // `a` in a wide band met it, so the solve returned whatever seed it was
+        // given, and the row likelihood followed the warm-start slot's history
+        // rather than β. A relative residual pins the root however it is seeded.
+        let survival_side = q >= 0.0;
+        let log_target = if survival_side {
+            crate::probability::normal_logcdf(-q)
+        } else {
+            crate::probability::normal_logcdf(q)
+        };
+        // The terms one evaluation of `T` sums: the law's nodes, or at most one
+        // de-nested cell per breakpoint of either deviation plus the two tails.
+        let terms = match law {
+            Some(grid) => grid.len(),
+            None => {
+                self.score_warp
+                    .as_ref()
+                    .map_or(0, |runtime| runtime.breakpoints().len())
+                    + self
+                        .link_dev
+                        .as_ref()
+                        .map_or(0, |runtime| runtime.breakpoints().len())
+                    + 1
+            }
+        };
+        let rounding = crate::latent_anchor::anchor_residual_rounding(log_target, terms);
+        let tolerance = crate::latent_anchor::ANCHOR_LOG_RESIDUAL_TOL.max(rounding);
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
+            let (tail, tail_a, tail_aa) =
+                self.calibration_smaller_tail(law, a, q, slope, beta_h, beta_w, survival_side)?;
+            if !(tail.is_finite() && tail > 0.0) {
+                return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "survival marginal-slope intercept calibration tail T={tail:.3e} at \
+                         a={a:.6} (q={q:.6}) has no finite logarithm"
+                    ),
+                }
+                .into());
+            }
+            let ratio = tail_a / tail;
+            Ok((tail.ln() - log_target, ratio, tail_aa / tail - ratio * ratio))
         };
         let probit_scale = self.probit_frailty_scale();
-        let a_closed_form = q * rigid_observed_scale(slope, probit_scale) / probit_scale;
+        // The rigid root, with no warp and no deviation, on the row's own law:
+        // the closed form on the Gaussian law, the solved anchor on a finite one.
+        let a_closed_form = match law {
+            Some(grid) => solve_anchor(q, probit_scale * slope, grid)? / probit_scale,
+            None => q * rigid_observed_scale(slope, probit_scale) / probit_scale,
+        };
 
         // Prefer the previous PIRLS iter's converged intercept as the initial
         // guess; β changes only a little between consecutive PIRLS iterations,
@@ -42,7 +94,7 @@ impl SurvivalMarginalSlopeFamily {
             eval,
             a_init,
             "survival intercept",
-            1e-12,
+            tolerance,
             64,
             64,
         );
@@ -55,7 +107,7 @@ impl SurvivalMarginalSlopeFamily {
                 eval,
                 a_closed_form,
                 "survival intercept",
-                1e-12,
+                tolerance,
                 64,
                 64,
             );
@@ -82,54 +134,29 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let target_survival = crate::probability::normal_cdf(-q);
-        let achieved_survival = target_survival + residual;
-        let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
-        let probability_tol = SURVIVAL_INTERCEPT_ABS_RESIDUAL_TOL
-            .max(SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL * tail_mass);
-        let mut log_tail_residual = None;
-        // Always accept if probability-space residual is within tolerance:
-        // a perfectly-converged probability solve (residual=0) is the best
-        // achievable answer, and rejecting it because the deep-tail log
-        // computation has its own floating-point noise (~6e-8 at |q|>=7)
-        // would discard a correct intercept. When tail_mass is small we
-        // *additionally* accept tight log-space agreement, so well-resolved
-        // tails that drift slightly outside the absolute probability_tol
-        // (which can be ulp-bounded) still validate.
-        let residual_ok = if tail_mass < SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD {
-            let probability_pass = residual.abs() <= probability_tol;
-            let (achieved_tail, target_log_tail) = if target_survival <= 0.5 {
-                let (target_log_survival, _) = signed_probit_logcdf_and_mills_ratio(-q);
-                (achieved_survival, target_log_survival)
-            } else {
-                let (target_log_failure, _) = signed_probit_logcdf_and_mills_ratio(q);
-                (1.0 - achieved_survival, target_log_failure)
-            };
-            let log_pass = if target_log_tail.is_finite()
-                && achieved_tail.is_finite()
-                && achieved_tail > 0.0
-            {
-                let log_residual = achieved_tail.ln() - target_log_tail;
-                log_tail_residual = Some(log_residual);
-                log_residual.abs() <= SURVIVAL_INTERCEPT_REL_TAIL_RESIDUAL_TOL
-            } else {
-                false
-            };
-            probability_pass || log_pass
-        } else {
-            residual.abs() <= probability_tol
-        };
-
-        if !residual_ok {
-            let log_tail_detail = log_tail_residual
-                .map(|value| format!(", log_tail_residual={value:.3e}"))
-                .unwrap_or_default();
+        // `residual` and `abs_deriv` are the log-tail residual and `|d log T/da|`
+        // at the accepted root. A root is certified only where its residual sits
+        // inside what the arithmetic resolves, the rule the rigid anchor solve
+        // applies (gam#2928); anything else is refused by name.
+        let resolution = crate::latent_anchor::anchor_residual_resolution(a, abs_deriv, rounding);
+        if !(residual.abs() <= resolution) {
             return Err(SurvivalMarginalSlopeError::RootSolveFailed {
                 reason: format!(
-                    "survival marginal-slope intercept solve failed: \
-                     residual={residual:.3e} at a={a:.6}, target survival={target_survival:.6e}, \
-                     achieved survival={achieved_survival:.6e}, probability_tol={probability_tol:.3e}\
-                     {log_tail_detail}"
+                    "survival marginal-slope intercept solve did not resolve its log-tail \
+                     residual: residual={residual:.3e} against resolution={resolution:.3e} at \
+                     a={a:.6} (q={q:.6}, log target={log_target:.6e}, |d log T/da|={abs_deriv:.3e})"
+                ),
+            }
+            .into());
+        }
+        // Callers read the density normalisation `|T′(a)| = |d log T/da|·T(a)`,
+        // with `T(a) = exp(residual + log target)` at the accepted root.
+        let density = abs_deriv * (residual + log_target).exp();
+        if !(density.is_finite() && density > 0.0) {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope intercept density normalisation |T′(a)|={density:.3e} \
+                     at a={a:.6} (q={q:.6}) is not finite and positive"
                 ),
             }
             .into());
@@ -147,6 +174,77 @@ impl SurvivalMarginalSlopeFamily {
             cache.store(row, kind, a, beta_tag);
         }
 
-        Ok((a, abs_deriv))
+        Ok((a, density))
+    }
+
+    /// `(T, T′, T″)` of the calibration's smaller tail at `a` (gam#2971): the
+    /// marginal survival `Σ Φ(−η)` on the survival side, the marginal failure
+    /// `Σ Φ(η)` otherwise. On the Gaussian law every de-nested cell contributes
+    /// its own positive probability, so nothing subtracts probabilities near
+    /// one. A finite law's residual is already summed on this tail
+    /// (`F = T − Φ(−q)` on the survival side, `F = Φ(q) − T` otherwise), so `T`
+    /// is read back from it.
+    fn calibration_smaller_tail(
+        &self,
+        law: Option<AnchorGrid<'_>>,
+        a: f64,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        survival_side: bool,
+    ) -> Result<(f64, f64, f64), String> {
+        if let Some(grid) = law {
+            let (f, f_a, f_aa) =
+                self.evaluate_law_survival_calibration(grid, a, q, slope, beta_h, beta_w)?;
+            return Ok(if survival_side {
+                (f + crate::probability::normal_cdf(-q), f_a, f_aa)
+            } else {
+                (crate::probability::normal_cdf(q) - f, -f_a, -f_aa)
+            });
+        }
+        let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
+        let scale = self.probit_frailty_scale();
+        // The survival tail integrates `Φ(−η)`, the failure tail `Φ(η)`.
+        let sign = if survival_side { -1.0 } else { 1.0 };
+        let mut tail = 0.0;
+        let mut tail_a = 0.0;
+        let mut tail_aa = 0.0;
+        for partition_cell in cells {
+            let index = partition_cell.cell;
+            let cell = exact_kernel::DenestedCubicCell {
+                left: index.left,
+                right: index.right,
+                c0: sign * index.c0,
+                c1: sign * index.c1,
+                c2: sign * index.c2,
+                c3: sign * index.c3,
+            };
+            let state = exact_kernel::evaluate_cell_moments(cell, 9)?;
+            tail += state.value;
+            let (dc_da_index, _) = exact_kernel::denested_cell_coefficient_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let (dc_daa_index, _, _) = exact_kernel::denested_cell_second_partials(
+                partition_cell.score_span,
+                partition_cell.link_span,
+                a,
+                slope,
+            );
+            let dc_da = scale_coeff4(dc_da_index, sign * scale);
+            let dc_daa = scale_coeff4(dc_daa_index, sign * scale);
+            tail_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            tail_aa += exact_kernel::cell_second_derivative_from_moments(
+                cell,
+                &dc_da,
+                &dc_da,
+                &dc_daa,
+                &state.moments,
+            )?;
+        }
+        Ok((tail, tail_a, tail_aa))
     }
 }

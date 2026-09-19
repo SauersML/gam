@@ -152,6 +152,7 @@ pub(crate) fn fit_transformation_normal(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<TransformationNormalFitResult, crate::fit_orchestration::FitFailure> {
     use crate::fit_orchestration::FitFailure;
+    use gam_problem::FailureCategory;
     let options = options.clone();
     // CTN advertises profiled outer-Hessian HVP support and supplies the
     // callback derivative kernel consumed by the unified REML/LAML evaluator.
@@ -195,9 +196,11 @@ pub(crate) fn fit_transformation_normal(
     // 1. Build a bootstrap covariate design first so the response basis can
     // adapt to the tensor width instead of always using the global default.
     let boot_design = build_term_collection_design(covariate_data, &covariate_spec)
-        .map_err(|e| format!("failed to build bootstrap covariate design: {e}"))?;
-    let boot_spec = freeze_term_collection_from_design(&covariate_spec, &boot_design)
-        .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
+        .map_err(|e| FitFailure::from(e).context("failed to build bootstrap covariate design"))?;
+    let boot_spec =
+        freeze_term_collection_from_design(&covariate_spec, &boot_design).map_err(|e| {
+            FitFailure::from(e).context("failed to freeze bootstrap covariate spatial basis centers")
+        })?;
     let mut effective_config = config.clone();
     // When the caller has already resolved the knot count (cross-fit pins it
     // once at the smallest fold complement so every fold shares one p_resp),
@@ -215,8 +218,11 @@ pub(crate) fn fit_transformation_normal(
 
     // 2. Build response basis ONCE — it is independent of κ once the effective
     // response complexity has been chosen.
+    // The response basis validates the response and the configuration it is
+    // built from, so its refusals are input refusals.
     let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
-        build_response_basis(response, &effective_config)?;
+        build_response_basis(response, &effective_config)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
 
     // 3. Check whether spatial κ optimization is needed.
     let spatial_terms = spatial_length_scale_term_indices(&covariate_spec);
@@ -229,8 +235,15 @@ pub(crate) fn fit_transformation_normal(
         let cov_spec_resolved = boot_spec;
         let effective_offset = cov_design
             .compose_offset(offset.view(), "transformation-normal fit")
-            .map_err(|error| error.to_string())?;
+            .map_err(FitFailure::from)?;
 
+        // The family helpers below still return text, so each refusal takes the
+        // category of the helper's contract (#2937): the constructor validates
+        // the response, weights, offset and design it is handed (input); the
+        // smoothing seed is read off the data's likelihood scale and the
+        // penalties' scales (input); a block built at the family's own seed and
+        // the score calibration of the family's own fit are engine contracts
+        // (invariant).
         let family = TransformationNormalFamily::from_prebuilt_response_basis(
             response,
             resp_val,
@@ -248,12 +261,20 @@ pub(crate) fn fit_transformation_normal(
                 .map(|bp| bp.to_penalty_matrix(cov_design.design.ncols()))
                 .collect(),
             &effective_config,
-        )?;
-        let rho0 = family.penalty_scale_log_lambdas()?;
-        let blocks = vec![family.block_spec(&rho0)?];
+        )
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        let rho0 = family
+            .penalty_scale_log_lambdas()
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+        let blocks = vec![
+            family
+                .block_spec(&rho0)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?,
+        ];
         let fit = fit_custom_family(&family, &blocks, &options)
             .map_err(|e| FitFailure::from(e).context("transformation fit failed"))?;
-        let (fit, score_calibration) = calibrate_transformation_scores(&family, fit)?;
+        let (fit, score_calibration) = calibrate_transformation_scores(&family, fit)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
 
         return Ok(TransformationNormalFitResult {
             family,
@@ -270,7 +291,7 @@ pub(crate) fn fit_transformation_normal(
 
     let kappa0 = SpatialLogKappaCoords::from_length_scales_aniso(&covariate_spec, &spatial_terms)
         .reseed_from_data(covariate_data, &covariate_spec, &spatial_terms)
-        .map_err(|error| error.to_string())?;
+        .map_err(FitFailure::from)?;
     let kappa_dims = kappa0.dims_per_term().to_vec();
     let kappa_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
         covariate_data,
@@ -278,20 +299,24 @@ pub(crate) fn fit_transformation_normal(
         &spatial_terms,
         &kappa_dims,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(FitFailure::from)?;
     let kappa_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
         covariate_data,
         &covariate_spec,
         &spatial_terms,
         &kappa_dims,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(FitFailure::from)?;
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let kappa0 = kappa0.clamp_to_bounds(&kappa_lower, &kappa_upper);
 
-    // Check analytic derivative capability.
+    // Check analytic derivative capability. The ψ-derivative builder reads the
+    // term bases of the design, so its refusals are the basis refusals the
+    // engine files as input.
     let analytic_psi_available =
-        build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
+        build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)
+            .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?
+            .is_some();
 
     // Rebuild from the frozen `boot_spec` so the probe's penalty topology
     // matches the topology produced by every other build path in this
@@ -306,11 +331,12 @@ pub(crate) fn fit_transformation_normal(
     // but every subsequent
     // evaluator measures the frozen build, and `evaluate_custom_family_joint_hyper`
     // refuses with a `joint hyper rho dimension mismatch`.
-    let probe_design = build_term_collection_design(covariate_data, &boot_spec)
-        .map_err(|e| format!("failed to rebuild frozen probe covariate design: {e}"))?;
+    let probe_design = build_term_collection_design(covariate_data, &boot_spec).map_err(|e| {
+        FitFailure::from(e).context("failed to rebuild frozen probe covariate design")
+    })?;
     let probe_offset = probe_design
         .compose_offset(offset.view(), "transformation-normal spatial probe")
-        .map_err(|error| error.to_string())?;
+        .map_err(FitFailure::from)?;
 
     // Build an initial family + blocks for capability probing.
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
@@ -330,9 +356,14 @@ pub(crate) fn fit_transformation_normal(
             .map(|bp| bp.to_penalty_matrix(probe_design.design.ncols()))
             .collect(),
         &effective_config,
-    )?;
-    let rho0 = probe_family.penalty_scale_log_lambdas()?;
-    let probe_block = probe_family.block_spec(&rho0)?;
+    )
+    .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+    let rho0 = probe_family
+        .penalty_scale_log_lambdas()
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
+    let probe_block = probe_family
+        .block_spec(&rho0)
+        .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     let n_penalties = probe_block.initial_log_lambdas.len();
     log::info!(
         "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
@@ -384,8 +415,9 @@ pub(crate) fn fit_transformation_normal(
     // the first derivative-bearing evaluation freezes the selected mode's
     // INPUT as the branch anchor. Every later trial restarts from that fixed
     // anchor, making the profile independent of rejected-trial cache history.
+    let walk_signals = crate::exact_mode_branch::OuterWalkSignals::default();
     let exact_mode_branch: RefCell<ExactCoefficientModeBranch> =
-        RefCell::new(ExactCoefficientModeBranch::default());
+        RefCell::new(ExactCoefficientModeBranch::new(walk_signals.clone()));
 
     // The ρ domain of the CTN tensor penalties by the #2812 resolvability law the
     // non-spatial `fit_custom_family` route applies to the same block. The driver
@@ -393,21 +425,14 @@ pub(crate) fn fit_transformation_normal(
     // penalty for the four tensor coordinates, so without it this search kept the
     // precision box ±ln(1/√ε) and railed ρ at −18.022 in large_scale run
     // 34666040783 (#2896).
-    let (rho_lower, rho_upper) =
-        crate::custom_family::per_block_resolvability_rho_domain(&probe_blocks, &options)
-            .map_err(|error| format!("transformation-normal rho resolvability domain: {error}"))?;
-    if rho_lower.len() != rho0.len() || rho_upper.len() != rho0.len() {
-        return Err(FitFailure::raised(
-            gam_problem::FailureCategory::Invariant,
-            format!(
-                "transformation-normal rho resolvability domain has {} coordinates for {} smoothing penalties",
-                rho_lower.len(),
-                rho0.len(),
-            ),
-        ));
-    }
-    let joint_setup = ExactJointHyperSetup::new(rho0, kappa0, kappa_lower, kappa_upper)
-        .with_rho_domain(rho_lower, rho_upper);
+    let (rho_lower, rho_upper) = crate::fit_orchestration::drivers::realized_blocks_rho_domain(
+        &probe_blocks,
+        &options,
+        rho0.len(),
+    )
+    .map_err(|failure| failure.context("transformation-normal"))?;
+    let joint_setup =
+        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
 
     // Clone response basis parts for use inside closures.
     let rv = resp_val.clone();
@@ -540,6 +565,7 @@ pub(crate) fn fit_transformation_normal(
         // repeat a full CTN inner solve and caused every large-scale lane to
         // exhaust the 2400-second command budget before marginal-slope began.
         true,
+        Some(walk_signals),
         outer_derivative_policy,
         // fit_fn
         |theta,
@@ -548,11 +574,19 @@ pub(crate) fn fit_transformation_normal(
          provenance: SpatialFitProvenance<'_, CustomFamilyJointHyperModeSelection>| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let hyper_values = theta.slice(s![joint_setup.rho_dim()..]).to_owned();
-            ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)?;
+            // Unclassified by name (#2937): the geometry rebuild returns text
+            // that mixes basis-construction refusals, the family constructor's
+            // input validation and the cache's own invariants, so no one
+            // category is true of it.
+            ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
-            let geometry = cache_ref
-                .as_mut()
-                .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
+            let geometry = cache_ref.as_mut().ok_or_else(|| {
+                FitFailure::raised(
+                    FailureCategory::Invariant,
+                    "missing transformation exact geometry cache",
+                )
+            })?;
             let final_options = crate::outer_subsample::exact_outer_options(&options);
             let fit = match provenance {
                 SpatialFitProvenance::NoOuterOptimization => {
@@ -603,7 +637,12 @@ pub(crate) fn fit_transformation_normal(
                     .row_quantity_cache
                     .lock()
                     .expect("CTN row quantity cache mutex poisoned") = None;
-                let final_rows = geometry.family.row_quantities(&block.beta)?;
+                // The fitted mode's row quantities: a non-finite value or a
+                // non-positive h' there is a numerical failure of the mode.
+                let final_rows = geometry
+                    .family
+                    .row_quantities(&block.beta)
+                    .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
                 let max_abs_h = final_rows
                     .h
                     .iter()
@@ -615,7 +654,10 @@ pub(crate) fn fit_transformation_normal(
                     .covariate_design
                     .try_row_chunk(0..response.len())
                     .map_err(|err| {
-                        format!("final CTN covariate design validation failed: {err}")
+                        FitFailure::raised(
+                            materialization_failure_category(&err),
+                            format!("final CTN covariate design validation failed: {err}"),
+                        )
                     })?;
                 let max_abs_cov = cov_chunk.iter().copied().map(f64::abs).fold(0.0, f64::max);
                 log::info!(
@@ -749,8 +791,28 @@ pub(crate) fn fit_transformation_normal(
 
     let mut fit = solved.fit;
     let (calibrated_fit, score_calibration) =
-        calibrate_transformation_scores(&fit.family, fit.fit.clone())?;
+        calibrate_transformation_scores(&fit.family, fit.fit.clone())
+            .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     fit.fit = calibrated_fit;
     fit.score_calibration = score_calibration;
     Ok(fit)
+}
+
+/// The category of a design materialization refusal (#2937). A dense footprint
+/// over the policy's or the memory governor's limit, or a mode the policy
+/// forbids, is the problem's size or configuration, which the engine files as
+/// input (`EstimationError::DenseMaterializationRefused`). An operator that
+/// cannot hand out its own rows breaks an engine contract.
+fn materialization_failure_category(
+    err: &MatrixMaterializationError,
+) -> gam_problem::FailureCategory {
+    match err {
+        MatrixMaterializationError::TooLarge { .. }
+        | MatrixMaterializationError::Forbidden { .. }
+        | MatrixMaterializationError::Reservation(_) => gam_problem::FailureCategory::Input,
+        MatrixMaterializationError::MissingRowChunk { .. }
+        | MatrixMaterializationError::RowMaterializationFailed { .. } => {
+            gam_problem::FailureCategory::Invariant
+        }
+    }
 }

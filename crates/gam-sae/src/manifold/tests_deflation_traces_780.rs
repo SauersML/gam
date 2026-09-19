@@ -10,13 +10,18 @@ use super::tests_recovery_split_780::{
 };
 use super::*;
 
-/// Deflation-derivative regression for a NON-α ρ-component. The deflation that
-/// the ordered Beta--Bernoulli-prior negative curvature triggers stiffens the WHOLE per-row `H_tt`
-/// block (logit AND coordinate slots), so it corrupts EVERY outer ρ-component's
-/// `½ tr(H⁻¹ ∂H/∂ρ)` trace — not only the ordered Beta--Bernoulli α one. This pins the ARD
-/// log-precision trace (`ard_log_precision_hessian_trace`, through its per-slot
-/// Daleckii–Krein correction) against the fixed-state central
-/// difference of `log|H|` w.r.t. `log_ard[atom][axis]`, with deflation active.
+/// Deflation-derivative regression for a NON-α ρ-component. A row deflation
+/// stiffens the WHOLE per-row `H_tt` block (logit AND coordinate slots), so it
+/// corrupts EVERY outer ρ-component's `½ tr(H⁻¹ ∂H/∂ρ)` trace — not only the
+/// ordered Beta--Bernoulli α one. This pins the ARD log-precision trace
+/// (`ard_log_precision_hessian_trace`, through its per-slot Daleckii–Krein
+/// correction) against the fixed-state central difference of `log|H|` w.r.t.
+/// `log_ard[atom][axis]`, with deflation active. The anchor is the shared ordered
+/// Beta--Bernoulli deflated anchor,
+/// [`super::tests_deflated_from_probes_2712::obb_deflated_anchor`], where every
+/// row's logit slots deflate by construction: at the historical temperature 0.7
+/// the gate-logit Jacobian gives the gates an interior mode and no row deflates
+/// (#2080).
 #[test]
 pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     // The `gauge_deflated_directions > 0` assertion below is all-or-nothing: the
@@ -32,24 +37,14 @@ pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     // is present and silent. Install it at `Debug` so the number reaches the
     // failure output.
     gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
-    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
-    rho.log_lambda_sparse = 0.5;
     // The ARD log-precision stays at the fixture default; lifting it off the floor
-    // pushes the inner solve into a non-PD basin at this ρ. The ARD curvature block is
-    // small but live, and its log-α derivative is exactly what the trace and the
-    // FD oracle both probe — with deflation active (5 directions).
-    let (_value, _loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            5,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("converged cache");
+    // pushes the inner solve into a non-PD basin. The ARD curvature block is small
+    // but live, and its log-α derivative is exactly what the trace and the FD
+    // oracle both probe, with deflation active.
+    let (term, rho, target, cache) =
+        super::tests_deflated_from_probes_2712::obb_deflated_anchor(
+            "ARD log-precision trace on the deflated ordered Beta--Bernoulli anchor",
+        );
     assert!(
         cache.gauge_deflated_directions > 0,
         "ARD deflation regression requires a deflated direction; got {}",

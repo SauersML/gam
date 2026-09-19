@@ -39,10 +39,12 @@
 //!   `cI` mask, invariant under every change of component basis. The next block
 //!   reads the summed stream ([`decoder_layer`]).
 //!
-//! The analytic pullbacks of the gate and the norms ([`swiglu_hidden_pullback`],
+//! The analytic pullbacks of the gate, the component layer and the norms
+//! ([`swiglu_hidden_pullback`], [`ComponentSwiglu::pullback`],
 //! [`MaskedNorm::pullback`]) carry cotangents through the same summed inputs, so
 //! a parameter gradient through a masked block (P16) never differentiates a
-//! per-component copy.
+//! per-component copy. The component layer also returns the cotangent of every
+//! masked factor's mask.
 //!
 //! Every downstream readout passes a final norm (`z = W_U N(h_L)`), so a mask on
 //! any residual write reaches the logits through `(mean(h_L^2) + eps)^(-1/2)`,
@@ -300,12 +302,51 @@ impl NativeSwiglu {
         self.gate.ncols()
     }
 
+    /// The source's `gate_proj` weight, `H x d`.
+    pub fn gate(&self) -> ArrayView2<'_, f64> {
+        self.gate.view()
+    }
+
+    /// The source's `up_proj` weight, `H x d`.
+    pub fn up(&self) -> ArrayView2<'_, f64> {
+        self.up.view()
+    }
+
+    /// The source's `down_proj` weight, `d x H`.
+    pub fn down(&self) -> ArrayView2<'_, f64> {
+        self.down.view()
+    }
+
+    /// Every stage of the layer on the original tensors.
+    pub fn execute_stages(&self, inputs: ArrayView2<'_, f64>) -> Result<SwigluStages, GatedRewriteError> {
+        require_shape("SwiGLU input rows", (inputs.nrows(), self.width()), inputs.dim())?;
+        let gate = inputs.dot(&self.gate.t());
+        let up = inputs.dot(&self.up.t());
+        let hidden = swiglu_hidden(gate.view(), up.view())?;
+        let write = hidden.dot(&self.down.t());
+        Ok(SwigluStages {
+            gate,
+            up,
+            hidden,
+            write,
+        })
+    }
+
     /// The layer's write for every normalized input row, on the original tensors.
     pub fn execute(&self, inputs: ArrayView2<'_, f64>) -> Result<Array2<f64>, GatedRewriteError> {
-        require_shape("SwiGLU input rows", (inputs.nrows(), self.width()), inputs.dim())?;
-        let hidden = swiglu_hidden(inputs.dot(&self.gate.t()).view(), inputs.dot(&self.up.t()).view())?;
-        Ok(hidden.dot(&self.down.t()))
+        Ok(self.execute_stages(inputs)?.write)
     }
+}
+
+/// Every stage of a SwiGLU layer that torch exports as a module output: `gate_proj`,
+/// `up_proj`, the `down_proj` input `s(gate) ⊙ up`, and `down_proj`, the write with no
+/// residual added.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwigluStages {
+    pub gate: Array2<f64>,
+    pub up: Array2<f64>,
+    pub hidden: Array2<f64>,
+    pub write: Array2<f64>,
 }
 
 /// How the three factors of a [`ComponentSwiglu`] execute.
@@ -364,13 +405,70 @@ impl ComponentSwiglu {
         }
     }
 
-    /// The layer's write for every normalized input row under `mask`.
-    pub fn execute(&self, inputs: ArrayView2<'_, f64>, mask: SwigluMask<'_>) -> Result<Array2<f64>, SwigluError> {
+    /// Every stage of the layer under `mask`.
+    pub fn execute_stages(
+        &self,
+        inputs: ArrayView2<'_, f64>,
+        mask: SwigluMask<'_>,
+    ) -> Result<SwigluStages, SwigluError> {
         let gate = read_through(self.native.gate.view(), &self.gate, inputs, mask.gate)?;
         let up = read_through(self.native.up.view(), &self.up, inputs, mask.up)?;
         let hidden = swiglu_hidden(gate.view(), up.view())?;
-        Ok(read_through(self.native.down.view(), &self.down, hidden.view(), mask.down)?)
+        let write = read_through(self.native.down.view(), &self.down, hidden.view(), mask.down)?;
+        Ok(SwigluStages {
+            gate,
+            up,
+            hidden,
+            write,
+        })
     }
+
+    /// The layer's write for every normalized input row under `mask`.
+    pub fn execute(&self, inputs: ArrayView2<'_, f64>, mask: SwigluMask<'_>) -> Result<Array2<f64>, SwigluError> {
+        Ok(self.execute_stages(inputs, mask)?.write)
+    }
+
+    /// The analytic pullback of [`ComponentSwiglu::execute`] at `inputs` and `mask` for the write cotangent
+    /// rows `y_bar`: the down factor, then the SiLU gate and the Hadamard product
+    /// ([`swiglu_hidden_pullback`]), then both reads, with the input cotangents of the two reads summed.
+    ///
+    /// A masked factor pulls back through mpd-rewrite's [`ExactFactor::apply_masked_pullback`], which returns
+    /// its input cotangent and its mask cotangent without forming `U diag(m) R`. A factor left all on pulls back
+    /// as `y_bar W` on its original tensor and has no mask to differentiate.
+    pub fn pullback(
+        &self,
+        inputs: ArrayView2<'_, f64>,
+        mask: SwigluMask<'_>,
+        write_cotangent: ArrayView2<'_, f64>,
+    ) -> Result<SwigluPullback, SwigluError> {
+        require_finite("SwiGLU write cotangent", write_cotangent)?;
+        let stages = self.execute_stages(inputs, mask)?;
+        let (hidden_cotangent, down_mask) =
+            pull_through(self.native.down.view(), &self.down, stages.hidden.view(), mask.down, write_cotangent)?;
+        let hidden = swiglu_hidden_pullback(stages.gate.view(), stages.up.view(), hidden_cotangent.view())?;
+        let (gate_inputs, gate_mask) =
+            pull_through(self.native.gate.view(), &self.gate, inputs, mask.gate, hidden.gate.view())?;
+        let (up_inputs, up_mask) = pull_through(self.native.up.view(), &self.up, inputs, mask.up, hidden.up.view())?;
+        Ok(SwigluPullback {
+            inputs: gate_inputs + &up_inputs,
+            gate_mask,
+            up_mask,
+            down_mask,
+        })
+    }
+}
+
+/// Cotangents of a [`ComponentSwiglu`] layer's input rows and of every masked factor's mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SwigluPullback {
+    /// `dl/dx` for every input row, through both reads.
+    pub inputs: Array2<f64>,
+    /// `dl/dm_g`, or `None` when the gate factor executed all on.
+    pub gate_mask: Option<Array1<f64>>,
+    /// `dl/dm_u`, or `None` when the up factor executed all on.
+    pub up_mask: Option<Array1<f64>>,
+    /// `dl/dm_d`, or `None` when the down factor executed all on.
+    pub down_mask: Option<Array1<f64>>,
 }
 
 fn solve_factor(
@@ -405,6 +503,40 @@ fn read_through(
             }
         }
         ComponentMask::Components(mask) => factor.apply_masked(inputs, mask),
+    }
+}
+
+/// The pullback of [`read_through`] at `inputs` for the output cotangent rows `y_bar`: `y_bar W` on the original
+/// tensor with the factor all on, else the factor's masked-apply pullback with its mask cotangent.
+fn pull_through(
+    native: ArrayView2<'_, f64>,
+    factor: &ExactFactor,
+    inputs: ArrayView2<'_, f64>,
+    mask: ComponentMask<'_>,
+    output_cotangent: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Option<Array1<f64>>), ShapeMismatch> {
+    match mask {
+        ComponentMask::AllOn => {
+            if output_cotangent.ncols() != native.nrows() {
+                Err(ShapeMismatch {
+                    what: "SwiGLU read cotangent width",
+                    expected: native.nrows(),
+                    found: output_cotangent.ncols(),
+                })
+            } else if output_cotangent.nrows() != inputs.nrows() {
+                Err(ShapeMismatch {
+                    what: "SwiGLU read cotangent rows",
+                    expected: inputs.nrows(),
+                    found: output_cotangent.nrows(),
+                })
+            } else {
+                Ok((output_cotangent.dot(&native), None))
+            }
+        }
+        ComponentMask::Components(mask) => {
+            let cotangents = factor.apply_masked_pullback(inputs, mask, output_cotangent)?;
+            Ok((cotangents.inputs, Some(cotangents.mask)))
+        }
     }
 }
 
@@ -702,10 +834,8 @@ mod tests {
     use ndarray::{Array, Array1, Array2, ArrayView2, Axis, Dimension, Zip, arr0, array, s};
     use qd::Quad;
     use rand::rngs::StdRng;
+    use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
     use rand::{RngExt, SeedableRng};
-
-    /// Higham's unit roundoff for round-to-nearest binary64, `u = 2^-53`.
-    const UNIT_ROUNDOFF: f64 = f64::EPSILON / 2.0;
 
     /// A Lipschitz constant of the SiLU gate: `s' = sigma + t sigma (1 - sigma)`
     /// and `sigma (1 - sigma) = e^-|t| / (1 + e^-|t|)^2 <= e^-|t|`, so
@@ -731,20 +861,12 @@ mod tests {
         silu_derivatives(t)[0]
     }
 
-    /// `gamma_n = n u / (1 - n u)`: a product of `n` factors `(1 + delta)^(+-1)`
-    /// with `|delta| <= u` lies within `gamma_n` of one (Higham, Accuracy and
-    /// Stability of Numerical Algorithms, Lemma 3.1).
-    fn gamma(operations: usize) -> f64 {
-        let scaled = operations as f64 * UNIT_ROUNDOFF;
-        scaled / (1.0 - scaled)
-    }
-
     /// Divides a computed tolerance by `1 - gamma_(k + 1)`, where `k` bounds the
     /// rounded operations along any chain of the tolerance arithmetic and the
     /// extra operation is this division, so the computed tolerance dominates its
     /// real-arithmetic value.
     fn inflate<D: Dimension>(tolerance: Array<f64, D>, operations: usize) -> Array<f64, D> {
-        let factor = 1.0 - gamma(operations + 1);
+        let factor = 1.0 - accumulation_growth(operations + 1);
         tolerance.mapv(|value| value / factor)
     }
 
@@ -842,9 +964,74 @@ mod tests {
         /// are computed with the same structure, so dividing by `1 - gamma_n`
         /// makes them dominate their real values.
         fn roundoff_radius(&self, mask: &Array1<f64>, inputs: ArrayView2<'_, f64>) -> Array2<f64> {
-            let bound = gamma(self.operations_per_term());
+            let bound = accumulation_growth(self.operations_per_term());
             self.term_magnitudes(mask, inputs)
                 .mapv(|magnitude| bound * magnitude / (1.0 - bound))
+        }
+
+        /// Every term `y_ri u_ic m_c r_cj` of an adjoint entry `((y U) ⊙ m) R` passes the products with `u`, `m`
+        /// and `r`, at most `p - 1` additions over outputs and at most `C - 1` additions over components.
+        fn adjoint_operations_per_term(&self) -> usize {
+            self.writes.nrows() + self.writes.ncols() + 1
+        }
+
+        /// `((|y| |U|) ⊙ |m|) |R|`, the sum of `|y_ri u_ic m_c r_cj|` over the terms of each adjoint entry.
+        fn adjoint_term_magnitudes(&self, mask: &Array1<f64>, cotangent: ArrayView2<'_, f64>) -> Array2<f64> {
+            (cotangent.mapv(f64::abs).dot(&self.writes.mapv(f64::abs)) * &mask.mapv(f64::abs))
+                .dot(&self.reads.mapv(f64::abs))
+        }
+
+        /// A radius on `fl(((y U) ⊙ m) R)` against the real adjoint at the real cotangent, given the computed
+        /// cotangent and its radius: the adjoint's own rounding plus the cotangent's radius carried through
+        /// `|U| |m| |R|`.
+        fn adjoint_radius(
+            &self,
+            mask: &Array1<f64>,
+            cotangent: ArrayView2<'_, f64>,
+            cotangent_radius: ArrayView2<'_, f64>,
+        ) -> Array2<f64> {
+            let bound = accumulation_growth(self.adjoint_operations_per_term());
+            self.adjoint_term_magnitudes(mask, cotangent)
+                .mapv(|magnitude| bound * magnitude / (1.0 - bound))
+                + &self.adjoint_term_magnitudes(mask, cotangent_radius)
+        }
+
+        /// A radius on the mask cotangent `m_bar_c = sum_r (y U)_rc (x R^T)_rc` from a computed cotangent and
+        /// input with their radii. `P = y U` lies within `gamma_p |y| |U| + |e_y| |U|` and `G = x R^T` within
+        /// `gamma_d |x| |R|^T + e_x |R|^T`; then `|P G - P* G*| <= e_P |G| + (|P| + e_P) e_G` per row, and the
+        /// product and the row sum add `gamma_rows` of `sum_r |P G|`.
+        fn mask_cotangent_radius(
+            &self,
+            inputs: ArrayView2<'_, f64>,
+            input_radius: ArrayView2<'_, f64>,
+            cotangent: ArrayView2<'_, f64>,
+            cotangent_radius: ArrayView2<'_, f64>,
+        ) -> Array1<f64> {
+            let absolute_writes = self.writes.mapv(f64::abs);
+            let absolute_reads = self.reads.mapv(f64::abs);
+            let output_growth = accumulation_growth(self.writes.nrows());
+            let input_growth = accumulation_growth(self.reads.ncols());
+            let row_growth = accumulation_growth(inputs.nrows());
+            let projected = cotangent.dot(&self.writes);
+            let coordinates = inputs.dot(&self.reads.t());
+            let projected_radius = cotangent
+                .mapv(f64::abs)
+                .dot(&absolute_writes)
+                .mapv(|value| output_growth * value / (1.0 - output_growth))
+                + &cotangent_radius.dot(&absolute_writes);
+            let coordinates_radius = inputs
+                .mapv(f64::abs)
+                .dot(&absolute_reads.t())
+                .mapv(|value| input_growth * value / (1.0 - input_growth))
+                + &input_radius.dot(&absolute_reads.t());
+            Zip::from(&projected)
+                .and(&coordinates)
+                .and(&projected_radius)
+                .and(&coordinates_radius)
+                .map_collect(|&p, &g, &e_p, &e_g| {
+                    e_p * g.abs() + (p.abs() + e_p) * e_g + row_growth * (p * g).abs() / (1.0 - row_growth)
+                })
+                .sum_axis(Axis(0))
         }
     }
 
@@ -923,14 +1110,40 @@ mod tests {
         Array1::from_shape_fn(components, |component| if component == index { 1.0 } else { 0.0 })
     }
 
-    /// `fl(F_m(x))` for every input row on one route, with a radius bounding
-    /// `|fl(F_m(x)) - F_m(x)|` entrywise.
+    /// A radius on the computed hidden rows `g = fl(fl(s(a_g)) a_u)` against the real ones, from the computed
+    /// pre-activations and their radii `e_g`, `e_u`.
     ///
-    /// With `e_g`, `e_u` the read radii and `rho` the measured SiLU error,
-    /// `|fl(s(a_g)) - s(a_g)| <= rho + L e_g`. The Hadamard stage
-    /// `g = fl(fl(s(a_g)) a_u)` then has radius
-    /// `u |g| / (1 - u) + (rho + L e_g) |a_u| + (|s(a_g)| + rho + L e_g) e_u`, and
-    /// the write radius is the down read's magnitudes over `e_hidden` plus its own.
+    /// With `rho` the measured SiLU error, `|fl(s(a_g)) - s(a_g)| <= rho + L e_g`, so the Hadamard stage has
+    /// radius `u |g| / (1 - u) + (rho + L e_g) |a_u| + (|s(a_g)| + rho + L e_g) e_u`.
+    fn hidden_radius(
+        gate: &Array2<f64>,
+        up: &Array2<f64>,
+        hidden: &Array2<f64>,
+        gate_radius: &Array2<f64>,
+        up_radius: &Array2<f64>,
+    ) -> Array2<f64> {
+        Zip::from(gate)
+            .and(up)
+            .and(hidden)
+            .and(gate_radius)
+            .and(up_radius)
+            .map_collect(|&gate_value, &up_value, &hidden_value, &gate_error, &up_error| {
+                let silu_error = silu_evaluation_error(gate_value) + SILU_LIPSCHITZ * gate_error;
+                UNIT_ROUNDOFF * hidden_value.abs() / (1.0 - UNIT_ROUNDOFF)
+                    + silu_error * up_value.abs()
+                    + (silu(gate_value).abs() + silu_error) * up_error
+            })
+    }
+
+    /// `|x y z - x* y* z*| <= e_x |y| |z| + (|x| + e_x) e_y |z| + (|x| + e_x)(|y| + e_y) e_z` from computed
+    /// factors and their radii.
+    fn triple_product_radius(x: f64, e_x: f64, y: f64, e_y: f64, z: f64, e_z: f64) -> f64 {
+        e_x * y.abs() * z.abs() + (x.abs() + e_x) * e_y * z.abs() + (x.abs() + e_x) * (y.abs() + e_y) * e_z
+    }
+
+    /// `fl(F_m(x))` for every input row on one route, with a radius bounding
+    /// `|fl(F_m(x)) - F_m(x)|` entrywise: the read radii, the Hadamard stage's
+    /// [`hidden_radius`], and the down read's magnitudes over that radius plus its own.
     fn swiglu_block(
         fixture: &SwigluFixture,
         masks: &SwigluMasks,
@@ -942,19 +1155,9 @@ mod tests {
         let hidden = swiglu_hidden(gate.view(), up.view()).expect("the fixture pre-activations are finite");
         let gate_radius = fixture.gate.roundoff_radius(&masks.gate, inputs);
         let up_radius = fixture.up.roundoff_radius(&masks.up, inputs);
-        let hidden_radius = Zip::from(&gate)
-            .and(&up)
-            .and(&hidden)
-            .and(&gate_radius)
-            .and(&up_radius)
-            .map_collect(|&gate_value, &up_value, &hidden_value, &gate_error, &up_error| {
-                let silu_error = silu_evaluation_error(gate_value) + SILU_LIPSCHITZ * gate_error;
-                UNIT_ROUNDOFF * hidden_value.abs() / (1.0 - UNIT_ROUNDOFF)
-                    + silu_error * up_value.abs()
-                    + (silu(gate_value).abs() + silu_error) * up_error
-            });
+        let hidden_error = hidden_radius(&gate, &up, &hidden, &gate_radius, &up_radius);
         let write = fixture.down.apply(route, &masks.down, hidden.view());
-        let radius = fixture.down.term_magnitudes(&masks.down, hidden_radius.view())
+        let radius = fixture.down.term_magnitudes(&masks.down, hidden_error.view())
             + &fixture.down.roundoff_radius(&masks.down, hidden.view());
         (write, radius)
     }
@@ -977,7 +1180,7 @@ mod tests {
             radius += &write_radius;
             magnitude += &write.mapv(f64::abs);
         }
-        let summation = gamma(components - 1);
+        let summation = accumulation_growth(components - 1);
         let summation_radius = magnitude.mapv(|value| summation * value / (1.0 - summation));
         (sum, radius + &summation_radius)
     }
@@ -1098,7 +1301,14 @@ mod tests {
             up: ComponentMask::AllOn,
             down: ComponentMask::AllOn,
         };
+        let native_stages = component.native().execute_stages(inputs.view()).expect("finite rows");
+        let component_stages = component.execute_stages(inputs.view(), all_on).expect("finite rows");
+        assert_eq!(
+            component_stages, native_stages,
+            "every factor all on must execute the original tensors on their original path, stage by stage"
+        );
         let native = component.native().execute(inputs.view()).expect("finite rows");
+        assert_eq!(native, native_stages.write, "execute must return the stages' write bit for bit");
         assert_eq!(
             component.execute(inputs.view(), all_on).expect("finite rows"),
             native,
@@ -1263,7 +1473,7 @@ mod tests {
             let gate_entry = cotangents.gate[index];
             let up_entry = cotangents.up[index];
             let hidden = cotangent[index];
-            let gate_radius = gamma(2) * gate_entry.abs() / (1.0 - gamma(2))
+            let gate_radius = accumulation_growth(2) * gate_entry.abs() / (1.0 - accumulation_growth(2))
                 + (hidden * up[index]).abs() * silu_slope_evaluation_error(t);
             let up_radius =
                 UNIT_ROUNDOFF * up_entry.abs() / (1.0 - UNIT_ROUNDOFF) + hidden.abs() * silu_evaluation_error(t);
@@ -1302,6 +1512,280 @@ mod tests {
             wrong_difference > tolerance,
             "positive control: a gate cotangent missing the up factor must differ beyond the bound \
              {tolerance:e}, got {wrong_difference:e}"
+        );
+    }
+
+    #[test]
+    fn component_swiglu_pullback_matches_a_double_double_central_difference() {
+        let (component, inputs) = random_component_swiglu(2963);
+        let mut rng = StdRng::seed_from_u64(2964);
+        let as_fixture = |which: SwigluFactor| Factor {
+            writes: component.factor(which).write().to_owned(),
+            reads: component.factor(which).read().to_owned(),
+        };
+        let gate_factor = as_fixture(SwigluFactor::Gate);
+        let up_factor = as_fixture(SwigluFactor::Up);
+        let down_factor = as_fixture(SwigluFactor::Down);
+        let masks = SwigluMasks {
+            gate: MaskKind::Signed.draw(&mut rng, GATE_COMPONENTS),
+            up: MaskKind::Signed.draw(&mut rng, UP_COMPONENTS),
+            down: MaskKind::Signed.draw(&mut rng, DOWN_COMPONENTS),
+        };
+        let input_direction = uniform_rows(&mut rng, ROWS, INPUT_DIM, -1.0, 1.0);
+        let gate_direction = Array1::from_shape_simple_fn(GATE_COMPONENTS, || rng.random_range(-1.0..1.0));
+        let up_direction = Array1::from_shape_simple_fn(UP_COMPONENTS, || rng.random_range(-1.0..1.0));
+        let down_direction = Array1::from_shape_simple_fn(DOWN_COMPONENTS, || rng.random_range(-1.0..1.0));
+        let write_cotangent = uniform_rows(&mut rng, ROWS, INPUT_DIM, -1.0, 1.0);
+        let mask = SwigluMask {
+            gate: ComponentMask::Components(masks.gate.view()),
+            up: ComponentMask::Components(masks.up.view()),
+            down: ComponentMask::Components(masks.down.view()),
+        };
+        let pullback = component
+            .pullback(inputs.view(), mask, write_cotangent.view())
+            .expect("finite fixture");
+        let gate_mask_cotangent = pullback.gate_mask.as_ref().expect("the gate factor ran masked");
+        let up_mask_cotangent = pullback.up_mask.as_ref().expect("the up factor ran masked");
+        let down_mask_cotangent = pullback.down_mask.as_ref().expect("the down factor ran masked");
+
+        // `<x_bar, dx> + sum_f <m_bar_f, dm_f>`, summed in double-double so only the f64 entries round.
+        let directional = |down_mask: &Array1<f64>| {
+            let dot = |cotangent: &Array1<f64>, direction: &Array1<f64>| {
+                Zip::from(cotangent)
+                    .and(direction)
+                    .fold(quad(0.0), |sum, &value, &step_direction| sum + quad(value) * quad(step_direction))
+            };
+            Zip::from(&pullback.inputs)
+                .and(&input_direction)
+                .fold(quad(0.0), |sum, &value, &direction| sum + quad(value) * quad(direction))
+                + dot(gate_mask_cotangent, &gate_direction)
+                + dot(up_mask_cotangent, &up_direction)
+                + dot(down_mask, &down_direction)
+        };
+
+        // `U diag(m + t dm) R` applied to every row in double-double.
+        let quad_read = |factor: &Factor, factor_mask: &Array1<f64>, direction: &Array1<f64>, rows: &[Vec<Quad>], step: f64| {
+            rows.iter()
+                .map(|row| {
+                    let coordinates: Vec<Quad> = (0..factor.reads.nrows())
+                        .map(|component| {
+                            let read = (0..factor.reads.ncols())
+                                .fold(quad(0.0), |sum, column| sum + quad(factor.reads[[component, column]]) * row[column]);
+                            (quad(factor_mask[component]) + quad(step) * quad(direction[component])) * read
+                        })
+                        .collect();
+                    (0..factor.writes.nrows())
+                        .map(|output| {
+                            coordinates
+                                .iter()
+                                .enumerate()
+                                .fold(quad(0.0), |sum, (component, &coordinate)| {
+                                    sum + quad(factor.writes[[output, component]]) * coordinate
+                                })
+                        })
+                        .collect::<Vec<Quad>>()
+                })
+                .collect::<Vec<Vec<Quad>>>()
+        };
+        // `f(t) = <y_bar, F(x + t dx; m + t dm)>` in double-double.
+        let evaluate = |step: f64| {
+            let rows: Vec<Vec<Quad>> = (0..ROWS)
+                .map(|row| {
+                    (0..INPUT_DIM)
+                        .map(|column| quad(inputs[[row, column]]) + quad(step) * quad(input_direction[[row, column]]))
+                        .collect()
+                })
+                .collect();
+            let gate = quad_read(&gate_factor, &masks.gate, &gate_direction, &rows, step);
+            let up = quad_read(&up_factor, &masks.up, &up_direction, &rows, step);
+            let hidden: Vec<Vec<Quad>> = gate
+                .iter()
+                .zip(&up)
+                .map(|(gate_row, up_row)| gate_row.iter().zip(up_row).map(|(&g, &u)| quad_silu(g) * u).collect())
+                .collect();
+            let write = quad_read(&down_factor, &masks.down, &down_direction, &hidden, step);
+            write.iter().enumerate().fold(quad(0.0), |total, (row, write_row)| {
+                write_row
+                    .iter()
+                    .enumerate()
+                    .fold(total, |sum, (column, &value)| sum + quad(write_cotangent[[row, column]]) * value)
+            })
+        };
+
+        // Forward radii at the computed stages, which the pullback recomputes with the same operations.
+        let gate = gate_factor.apply(Route::Factored, &masks.gate, inputs.view());
+        let up = up_factor.apply(Route::Factored, &masks.up, inputs.view());
+        let hidden = swiglu_hidden(gate.view(), up.view()).expect("finite rows");
+        let zero_inputs = Array2::<f64>::zeros(inputs.raw_dim());
+        let gate_radius = gate_factor.roundoff_radius(&masks.gate, inputs.view());
+        let up_radius = up_factor.roundoff_radius(&masks.up, inputs.view());
+        let hidden_error = hidden_radius(&gate, &up, &hidden, &gate_radius, &up_radius);
+
+        // Backward radii: the down adjoint of the exact write cotangent, the gate and Hadamard pullback, both reads.
+        let zero_write_cotangent = Array2::<f64>::zeros(write_cotangent.raw_dim());
+        let hidden_cotangent = ((write_cotangent.dot(&down_factor.writes)) * &masks.down).dot(&down_factor.reads);
+        let hidden_cotangent_error =
+            down_factor.adjoint_radius(&masks.down, write_cotangent.view(), zero_write_cotangent.view());
+        let down_mask_radius = down_factor.mask_cotangent_radius(
+            hidden.view(),
+            hidden_error.view(),
+            write_cotangent.view(),
+            zero_write_cotangent.view(),
+        );
+        let mut gate_cotangent = Array2::<f64>::zeros(gate.raw_dim());
+        let mut gate_cotangent_error = Array2::<f64>::zeros(gate.raw_dim());
+        let mut up_cotangent = Array2::<f64>::zeros(gate.raw_dim());
+        let mut up_cotangent_error = Array2::<f64>::zeros(gate.raw_dim());
+        let two_products = accumulation_growth(2);
+        for (index, &gate_value) in gate.indexed_iter() {
+            let jet = silu_derivatives(gate_value);
+            let slope_error = silu_slope_evaluation_error(gate_value) + SILU_SECOND_BOUND * gate_radius[index];
+            let value_error = silu_evaluation_error(gate_value) + SILU_LIPSCHITZ * gate_radius[index];
+            let cotangent = hidden_cotangent[index];
+            let cotangent_error = hidden_cotangent_error[index];
+            gate_cotangent[index] = cotangent * jet[1] * up[index];
+            up_cotangent[index] = cotangent * jet[0];
+            gate_cotangent_error[index] = two_products * gate_cotangent[index].abs() / (1.0 - two_products)
+                + triple_product_radius(cotangent, cotangent_error, jet[1], slope_error, up[index], up_radius[index]);
+            up_cotangent_error[index] = UNIT_ROUNDOFF * up_cotangent[index].abs() / (1.0 - UNIT_ROUNDOFF)
+                + triple_product_radius(cotangent, cotangent_error, jet[0], value_error, 1.0, 0.0);
+        }
+        // The two read cotangents are summed once: `u / (1 - u)` of each summed entry.
+        let sum_growth = UNIT_ROUNDOFF / (1.0 - UNIT_ROUNDOFF);
+        let input_radius = gate_factor.adjoint_radius(&masks.gate, gate_cotangent.view(), gate_cotangent_error.view())
+            + &up_factor.adjoint_radius(&masks.up, up_cotangent.view(), up_cotangent_error.view())
+            + &pullback.inputs.mapv(|value| 2.0 * sum_growth * value.abs());
+        let gate_mask_radius = gate_factor.mask_cotangent_radius(
+            inputs.view(),
+            zero_inputs.view(),
+            gate_cotangent.view(),
+            gate_cotangent_error.view(),
+        );
+        let up_mask_radius =
+            up_factor.mask_cotangent_radius(inputs.view(), zero_inputs.view(), up_cotangent.view(), up_cotangent_error.view());
+        let weighted = |radius: &Array1<f64>, direction: &Array1<f64>| {
+            Zip::from(radius).and(direction).fold(0.0, |sum, &e, &d| sum + e * d.abs())
+        };
+        let entry_radius = Zip::from(&input_radius).and(&input_direction).fold(0.0, |sum, &e, &d| sum + e * d.abs())
+            + weighted(&gate_mask_radius, &gate_direction)
+            + weighted(&up_mask_radius, &up_direction)
+            + weighted(&down_mask_radius, &down_direction);
+
+        // Truncation. Along the path each read `a(t) = ((x + t dx) R^T ⊙ (m + t dm)) U^T` is quadratic in `t`:
+        // `|a| <= A0 + tau A1 + tau^2 A2`, `|a'| <= A1 + 2 tau A2`, `|a''| <= 2 A2` and `a''' = 0`. With `|s(z)| <= |z|`,
+        // `|s'| < 11/8`, `|s''| < 7/8` and `|s'''| < 9/8`, `(s∘a)'' = s'' a'^2 + s' a''` and
+        // `(s∘a)''' = s''' a'^3 + 3 s'' a' a''`. Leibniz gives the hidden rows' bounds, and the down stage
+        // `y = U_d ((m_d + t dm_d) ⊙ R_d h)` gives `|y'''| <= ((|h'''| |R_d|^T) ⊙ (|m_d| + tau |dm_d|)
+        // + 3 (|h''| |R_d|^T) ⊙ |dm_d|) |U_d|^T`.
+        let step = 0.5_f64.powi(20);
+        let path_bounds = |factor: &Factor, factor_mask: &Array1<f64>, direction: &Array1<f64>, value: &Array2<f64>, radius: &Array2<f64>| {
+            let absolute_writes = factor.writes.mapv(f64::abs);
+            let absolute_reads = factor.reads.mapv(f64::abs);
+            let input_reads = inputs.mapv(f64::abs).dot(&absolute_reads.t());
+            let direction_reads = input_direction.mapv(f64::abs).dot(&absolute_reads.t());
+            let first = (&input_reads * &direction.mapv(f64::abs) + &(&direction_reads * &factor_mask.mapv(f64::abs)))
+                .dot(&absolute_writes.t());
+            let second = (&direction_reads * &direction.mapv(f64::abs)).dot(&absolute_writes.t());
+            let maximum = value.mapv(f64::abs) + radius + &first.mapv(|entry| step * entry)
+                + &second.mapv(|entry| step * step * entry);
+            let slope = &first + &second.mapv(|entry| 2.0 * step * entry);
+            (maximum, slope, second.mapv(|entry| 2.0 * entry))
+        };
+        let (gate_maximum, gate_slope, gate_curvature) =
+            path_bounds(&gate_factor, &masks.gate, &gate_direction, &gate, &gate_radius);
+        let (up_maximum, up_slope, up_curvature) = path_bounds(&up_factor, &masks.up, &up_direction, &up, &up_radius);
+        let s1 = gate_slope.mapv(|entry| SILU_LIPSCHITZ * entry);
+        let s2 = Zip::from(&gate_slope)
+            .and(&gate_curvature)
+            .map_collect(|&slope, &curvature| SILU_SECOND_BOUND * slope * slope + SILU_LIPSCHITZ * curvature);
+        let s3 = Zip::from(&gate_slope).and(&gate_curvature).map_collect(|&slope, &curvature| {
+            SILU_THIRD_BOUND * slope.powi(3) + 3.0 * SILU_SECOND_BOUND * slope * curvature
+        });
+        let hidden_second = &s2 * &up_maximum + &(2.0 * &s1 * &up_slope) + &(&gate_maximum * &up_curvature);
+        let hidden_third = &s3 * &up_maximum + &(3.0 * &s2 * &up_slope) + &(3.0 * &s1 * &up_curvature);
+        let absolute_down_reads = down_factor.reads.mapv(f64::abs);
+        let absolute_down_writes = down_factor.writes.mapv(f64::abs);
+        let down_mask_reach = masks.down.mapv(f64::abs) + &down_direction.mapv(|entry| step * entry.abs());
+        let write_third = (hidden_third.dot(&absolute_down_reads.t()) * &down_mask_reach
+            + &(hidden_second.dot(&absolute_down_reads.t()) * &down_direction.mapv(|entry| 3.0 * entry.abs())))
+            .dot(&absolute_down_writes.t());
+        let third_derivative =
+            Zip::from(&write_cotangent).and(&write_third).fold(0.0, |sum, &y, &bound| sum + y.abs() * bound);
+        let write_maximum = ((&gate_maximum * &up_maximum).dot(&absolute_down_reads.t()) * &down_mask_reach)
+            .dot(&absolute_down_writes.t());
+        let oracle_magnitude =
+            Zip::from(&write_cotangent).and(&write_maximum).fold(0.0, |sum, &y, &bound| sum + y.abs() * bound);
+        // The oracle's own error: every term of one evaluation passes at most this many double-double
+        // operations, each within `2^-100` relative, and the difference quotient divides by the step.
+        let oracle_operations =
+            4 * (GATE_COMPONENTS * INPUT_DIM + UP_COMPONENTS * INPUT_DIM + HIDDEN_DIM + DOWN_COMPONENTS * HIDDEN_DIM) + 16;
+        let predicted_magnitude = Zip::from(&pullback.inputs)
+            .and(&input_direction)
+            .fold(0.0, |sum, &v, &d| sum + (v * d).abs())
+            + Zip::from(gate_mask_cotangent).and(&gate_direction).fold(0.0, |sum, &v, &d| sum + (v * d).abs())
+            + Zip::from(up_mask_cotangent).and(&up_direction).fold(0.0, |sum, &v, &d| sum + (v * d).abs())
+            + Zip::from(down_mask_cotangent).and(&down_direction).fold(0.0, |sum, &v, &d| sum + (v * d).abs());
+        let entries = ROWS * INPUT_DIM + GATE_COMPONENTS + UP_COMPONENTS + DOWN_COMPONENTS;
+        let tolerance = entry_radius
+            + step * step / 6.0 * third_derivative
+            + quad_relative() * oracle_operations as f64 * oracle_magnitude / step
+            + quad_relative() * (2 * entries) as f64 * predicted_magnitude;
+        let tolerance = inflate(arr0(tolerance), 8 * entries + 64).into_scalar();
+        let central = (evaluate(step) - evaluate(-step)) / quad(2.0 * step);
+        let difference = quad_to_f64(directional(down_mask_cotangent) - central).abs();
+        assert!(
+            difference / (1.0 - UNIT_ROUNDOFF) <= tolerance,
+            "the component SwiGLU pullback's directional derivative differs from the double-double central \
+             difference by {difference:e}, beyond the derived bound {tolerance:e}"
+        );
+        let without_down_mask = Array1::<f64>::zeros(DOWN_COMPONENTS);
+        let wrong_difference = quad_to_f64(directional(&without_down_mask) - central).abs();
+        assert!(
+            wrong_difference > tolerance,
+            "positive control: a pullback dropping the down mask cotangent must differ beyond the bound \
+             {tolerance:e}, got {wrong_difference:e}"
+        );
+
+        // All on: no mask cotangents, and every read pulls back on its original tensor.
+        let all_on = SwigluMask {
+            gate: ComponentMask::AllOn,
+            up: ComponentMask::AllOn,
+            down: ComponentMask::AllOn,
+        };
+        let native_pullback = component
+            .pullback(inputs.view(), all_on, write_cotangent.view())
+            .expect("finite fixture");
+        assert!(
+            native_pullback.gate_mask.is_none() && native_pullback.up_mask.is_none() && native_pullback.down_mask.is_none(),
+            "an all-on factor has no mask to differentiate"
+        );
+        let native = component.native();
+        let native_stages = native.execute_stages(inputs.view()).expect("finite rows");
+        let native_hidden = swiglu_hidden_pullback(
+            native_stages.gate.view(),
+            native_stages.up.view(),
+            write_cotangent.dot(&native.down).view(),
+        )
+        .expect("finite fixture");
+        let native_inputs = native_hidden.gate.dot(&native.gate) + &native_hidden.up.dot(&native.up);
+        assert_eq!(
+            native_pullback.inputs, native_inputs,
+            "every factor all on must pull back on the original tensors bit for bit"
+        );
+        let ones = Array1::ones(GATE_COMPONENTS);
+        let factored_gate = component
+            .pullback(
+                inputs.view(),
+                SwigluMask {
+                    gate: ComponentMask::Components(ones.view()),
+                    ..all_on
+                },
+                write_cotangent.view(),
+            )
+            .expect("finite fixture");
+        assert!(
+            factored_gate.inputs.iter().zip(native_inputs.iter()).any(|(&factored, &original)| factored != original),
+            "positive control: the factored gate pullback at an all-ones mask must differ from the native one in some bit"
         );
     }
 
@@ -1424,10 +1908,10 @@ mod tests {
             // centring of the cotangent adds its mean's radius and `gamma_(d + 1)`. The gain
             // cotangent's terms pass `d + 6` operations and the row sum `rows`; the bias
             // cotangent's row sum `rows - 1`.
-            let term_gamma = gamma(4 * dim + 20);
-            let centring_gamma = gamma(dim + 1);
-            let gain_gamma = gamma(dim + 6 + ROWS);
-            let summation = gamma(ROWS - 1);
+            let term_gamma = accumulation_growth(4 * dim + 20);
+            let centring_gamma = accumulation_growth(dim + 1);
+            let gain_gamma = accumulation_growth(dim + 6 + ROWS);
+            let summation = accumulation_growth(ROWS - 1);
             let mut entry_radius = 0.0;
             let mut predicted_magnitude = 0.0;
             let mut gain_magnitude = Array1::<f64>::zeros(dim);
@@ -1581,7 +2065,7 @@ mod tests {
             .fold(Array2::<f64>::zeros((ROWS, dim)), |accumulated, part| accumulated + part);
         // fl(N(h)) passes the squares, d - 1 additions, the mean, + eps, sqrt, the
         // reciprocal, the product with h and the gain: gamma_(d + 6) relative.
-        let norm_gamma = gamma(dim + 6);
+        let norm_gamma = accumulation_growth(dim + 6);
         let whole = norm.apply(summed.view()).expect("finite residual");
         let mut separate = Array2::<f64>::zeros((ROWS, dim));
         let mut radius = whole.mapv(|value| norm_gamma * value.abs() / (1.0 - norm_gamma));
@@ -1592,7 +2076,7 @@ mod tests {
             magnitude += &normalized.mapv(f64::abs);
             separate += &normalized;
         }
-        let summation = gamma(parts - 1);
+        let summation = accumulation_growth(parts - 1);
         radius += &magnitude.mapv(|value| summation * value / (1.0 - summation));
         let tolerance = inflate(radius, dim + parts + 9);
         let refuted = separate
@@ -1732,10 +2216,10 @@ mod tests {
                 .map_collect(|&mlp_value, &attention_value, &input_value, &total| {
                     let attention_value = attention_value.abs();
                     let input_value = input_value.abs();
-                    gamma(2) * (mlp_value + attention_value + input_value)
+                    accumulation_growth(2) * (mlp_value + attention_value + input_value)
                         + UNIT_ROUNDOFF * (attention_value + input_value)
                         + UNIT_ROUNDOFF * (mlp_value + input_value)
-                        + gamma(3) * total
+                        + accumulation_growth(3) * total
                 });
             inflate(entries, 6)
         };

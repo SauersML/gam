@@ -90,7 +90,7 @@ use ndarray::{Array1, Array2};
 
 use crate::families::compiler::RANK_DECISION_GAP;
 use gam_linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation, with_nested_parallel,
 };
 use gam_problem::{
     EstimationError, FamilyLinearizationState, JointRankCertificate, ParameterBlockSpec,
@@ -1743,11 +1743,42 @@ struct ChannelAwareStreamedGeometry {
     raw_ranges: Vec<std::ops::Range<usize>>,
 }
 
+/// One row chunk's contribution to [`ChannelAwareStreamedGeometry`]: its two
+/// metric Grams (upper block triangle) and its per-column fourth moments.
+struct ChunkGrams {
+    gram_h: Array2<f64>,
+    gram_struct: Array2<f64>,
+    fourth: Vec<f64>,
+}
+
 fn channel_aware_streamed_geometry(
     operators: &[std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator>],
     row_hess: &dyn crate::families::compiler::RowHessian,
     row_structural: &dyn crate::families::compiler::RowHessian,
     col_offsets: &[usize],
+) -> Result<ChannelAwareStreamedGeometry, EstimationError> {
+    let governor = gam_runtime::resource::MemoryGovernor::global();
+    channel_aware_streamed_geometry_within(
+        operators,
+        row_hess,
+        row_structural,
+        col_offsets,
+        &|bytes| {
+            governor
+                .try_reserve(bytes, "identifiability audit row-chunk Grams")
+                .ok()
+        },
+    )
+}
+
+/// [`channel_aware_streamed_geometry`] with the wave's buffer reservation taken
+/// through `reserve`, which returns `None` to refuse a request.
+fn channel_aware_streamed_geometry_within(
+    operators: &[std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator>],
+    row_hess: &dyn crate::families::compiler::RowHessian,
+    row_structural: &dyn crate::families::compiler::RowHessian,
+    col_offsets: &[usize],
+    reserve: &dyn Fn(usize) -> Option<gam_runtime::resource::MemoryReservation>,
 ) -> Result<ChannelAwareStreamedGeometry, EstimationError> {
     if operators.is_empty() {
         return Ok(ChannelAwareStreamedGeometry {
@@ -1768,35 +1799,99 @@ fn channel_aware_streamed_geometry(
     let mut gram_struct = Array2::<f64>::zeros((p_total, p_total));
     let mut fourth = vec![0.0_f64; p_total];
 
-    for start in (0..n).step_by(CHANNEL_AWARE_ROW_CHUNK) {
-        let end = (start + CHANNEL_AWARE_ROW_CHUNK).min(n);
-        let chunk = end - start;
-        let mut chunks: Vec<Array2<f64>> = Vec::with_capacity(operators.len());
-        for (block_idx, op) in operators.iter().enumerate() {
-            let p_b = op.ncols();
-            let mut rows = Array2::<f64>::zeros((chunk * k, p_b));
-            op.channel_flattened_rows(start..end, &mut rows);
-            let base = col_offsets[block_idx];
-            for col in 0..p_b {
-                let mut sum4 = 0.0_f64;
-                for value in rows.column(col).iter() {
-                    let sq = value * value;
-                    sum4 += sq * sq;
-                }
-                fourth[base + col] += sum4;
-            }
-            chunks.push(rows);
+    // Row chunks are independent, so each chunk's two metric Grams and fourth
+    // moments are formed in parallel with sequential GEMMs, then added into the
+    // totals in chunk order: every entry receives the same additions in the same
+    // order as a serial pass over the chunks, whatever the thread count
+    // (gnomon#2337: the serial pass was 9.5 s of single-threaded time in the AoU
+    // death-cause fit). A wave of chunks runs at once, as many as the thread
+    // count and the memory governor admit. A refused wave is halved; one chunk
+    // at a time, the serial pass's own footprint, runs even when the governor
+    // refuses it too, as the serial pass always did.
+    let n_chunks = n.div_ceil(CHANNEL_AWARE_ROW_CHUNK);
+    // A chunk's rows and their metric-weighted copy, plus its two Grams.
+    let rows_bytes =
+        gam_runtime::resource::dense_f64_bytes(CHANNEL_AWARE_ROW_CHUNK * k, 2 * p_total);
+    let grams_bytes = gam_runtime::resource::dense_f64_bytes(2 * p_total, p_total);
+    let chunk_bytes = rows_bytes
+        .zip(grams_bytes)
+        .and_then(|(rows, grams)| rows.checked_add(grams))
+        .unwrap_or(usize::MAX);
+    let mut wave = rayon::current_num_threads().clamp(1, n_chunks.max(1));
+    let wave_buffers = loop {
+        match reserve(chunk_bytes.saturating_mul(wave)) {
+            Some(reservation) => break Some(reservation),
+            None if wave > 1 => wave = wave.div_ceil(2),
+            None => break None,
         }
-        accumulate_channel_metric_gram(&chunks, row_hess, start, end, col_offsets, &mut gram_h)?;
-        accumulate_channel_metric_gram(
-            &chunks,
-            row_structural,
-            start,
-            end,
-            col_offsets,
-            &mut gram_struct,
-        )?;
+    };
+    // Sequential GEMMs (`with_nested_parallel`): the chunks already run in
+    // parallel, and a chunk's Grams must not depend on how many threads are left
+    // over for it.
+    let chunk_grams = |chunk_index: usize| -> Result<ChunkGrams, EstimationError> {
+        with_nested_parallel(|| {
+            let start = chunk_index * CHANNEL_AWARE_ROW_CHUNK;
+            let end = (start + CHANNEL_AWARE_ROW_CHUNK).min(n);
+            let chunk = end - start;
+            let mut fourth = vec![0.0_f64; p_total];
+            let mut chunks: Vec<Array2<f64>> = Vec::with_capacity(operators.len());
+            for (block_idx, op) in operators.iter().enumerate() {
+                let p_b = op.ncols();
+                let mut rows = Array2::<f64>::zeros((chunk * k, p_b));
+                op.channel_flattened_rows(start..end, &mut rows);
+                let base = col_offsets[block_idx];
+                for col in 0..p_b {
+                    let mut sum4 = 0.0_f64;
+                    for value in rows.column(col).iter() {
+                        let sq = value * value;
+                        sum4 += sq * sq;
+                    }
+                    fourth[base + col] = sum4;
+                }
+                chunks.push(rows);
+            }
+            let mut gram_h = Array2::<f64>::zeros((p_total, p_total));
+            let mut gram_struct = Array2::<f64>::zeros((p_total, p_total));
+            accumulate_channel_metric_gram(
+                &chunks,
+                row_hess,
+                start,
+                end,
+                col_offsets,
+                &mut gram_h,
+            )?;
+            accumulate_channel_metric_gram(
+                &chunks,
+                row_structural,
+                start,
+                end,
+                col_offsets,
+                &mut gram_struct,
+            )?;
+            Ok(ChunkGrams {
+                gram_h,
+                gram_struct,
+                fourth,
+            })
+        })
+    };
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    for wave_start in (0..n_chunks).step_by(wave) {
+        let partials: Vec<Result<ChunkGrams, EstimationError>> = (wave_start
+            ..(wave_start + wave).min(n_chunks))
+            .into_par_iter()
+            .map(&chunk_grams)
+            .collect();
+        for partial in partials {
+            let partial = partial?;
+            gram_h += &partial.gram_h;
+            gram_struct += &partial.gram_struct;
+            for (total, value) in fourth.iter_mut().zip(&partial.fourth) {
+                *total += value;
+            }
+        }
     }
+    drop(wave_buffers);
     for i in 0..p_total {
         for j in 0..i {
             gram_h[[i, j]] = gram_h[[j, i]];
@@ -2870,21 +2965,7 @@ pub fn maybe_log_audit_drift(
         every_n_iters
     };
 
-    let beta_pilot_norm: f64 = beta_pilot.iter().map(|b| b * b).sum::<f64>().sqrt();
-    let beta_current_len = beta_current.len();
-    let beta_pilot_len = beta_pilot.len();
-    let diff_norm: f64 = if beta_current_len == beta_pilot_len {
-        beta_current
-            .iter()
-            .zip(beta_pilot.iter())
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt()
-    } else {
-        // Length mismatch — treat as maximum drift.
-        f64::INFINITY
-    };
-    let beta_relative_change = diff_norm / (beta_pilot_norm + f64::EPSILON);
+    let beta_relative_change = audit_beta_relative_change(beta_pilot, beta_current);
 
     let large_beta_movement = beta_relative_change > BETA_RELATIVE_THRESHOLD;
     let periodic_check = (outer_iter % period) == 0;
@@ -2928,7 +3009,59 @@ pub fn maybe_log_audit_drift(
 
     // Re-run the flat audit at beta_current.
     let current_audit = audit_identifiability_with_state(specs, &state)?;
+    Ok(Some(audit_verdict_drift(
+        pilot_audit,
+        &current_audit,
+        beta_relative_change,
+        outer_iter,
+    )))
+}
 
+/// `‖β_current − β_pilot‖₂ / (‖β_pilot‖₂ + ε)`, and infinity when the two vectors have
+/// different lengths (treated as maximum drift).
+pub fn audit_beta_relative_change(beta_pilot: &[f64], beta_current: &[f64]) -> f64 {
+    if beta_current.len() != beta_pilot.len() {
+        return f64::INFINITY;
+    }
+    let beta_pilot_norm: f64 = beta_pilot.iter().map(|b| b * b).sum::<f64>().sqrt();
+    let diff_norm: f64 = beta_current
+        .iter()
+        .zip(beta_pilot.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    diff_norm / (beta_pilot_norm + f64::EPSILON)
+}
+
+impl AuditDriftSummary {
+    /// Whether the current verdict differs from the pilot's in any way that can
+    /// invalidate a fit: a different joint rank, a fatal flip, a newly dropped
+    /// column, or a pilot drop no longer dropped. A flat-routed converged-state
+    /// refusal reads this predicate. A channel-aware one reads
+    /// `ConvergedChannelAwareVerdict::refuses`, which judges drop labels through the
+    /// pilot's gauge.
+    pub fn verdict_changed(&self) -> bool {
+        self.pilot_rank != self.current_rank
+            || self.pilot_fatal != self.current_fatal
+            || !self.newly_dropped.is_empty()
+            || !self.recovered.is_empty()
+    }
+}
+
+/// Compare two identifiability audits of the same specs, and price the realized
+/// path against the pilot's rank certificate.
+///
+/// The two audits must come from the SAME audit function at two operating points:
+/// the flat audit for flat-routed families, and
+/// `channel_aware_audit_at_operating_scalars` for channel-aware ones. Compare a
+/// design-structural drop set with a penalty-augmented one and every penalty-covered
+/// design alias reads as recovered.
+pub fn audit_verdict_drift(
+    pilot_audit: &IdentifiabilityAudit,
+    current_audit: &IdentifiabilityAudit,
+    beta_relative_change: f64,
+    outer_iter: usize,
+) -> AuditDriftSummary {
     let pilot_rank: usize = pilot_audit.blocks.iter().map(|b| b.effective_dim).sum();
     let current_rank: usize = current_audit.blocks.iter().map(|b| b.effective_dim).sum();
 
@@ -3037,7 +3170,7 @@ pub fn maybe_log_audit_drift(
         _ => (None, None),
     };
 
-    Ok(Some(AuditDriftSummary {
+    AuditDriftSummary {
         pilot_rank,
         current_rank,
         pilot_fatal: pilot_audit.fatal,
@@ -3047,7 +3180,7 @@ pub fn maybe_log_audit_drift(
         recovered,
         pilot_certificate_transported,
         excursion_vs_radius,
-    }))
+    }
 }
 
 /// Run [`audit_identifiability`] with an explicit [`FamilyLinearizationState`]
@@ -4058,6 +4191,315 @@ mod tests {
             "full-rank design must keep all 20 directions; got {total_kept} ({})",
             audit.summary,
         );
+    }
+
+    // ── Row-chunk-parallel channel-aware Grams (gnomon#2337) ─────────────────
+
+    /// Two-channel test operator: `J_row = [x_row; y_row]`.
+    struct TwoChannelOperator {
+        x: Array2<f64>,
+        y: Array2<f64>,
+    }
+
+    impl crate::families::compiler::RowJacobianOperator for TwoChannelOperator {
+        fn k(&self) -> usize {
+            2
+        }
+        fn ncols(&self) -> usize {
+            self.x.ncols()
+        }
+        fn nrows(&self) -> usize {
+            self.x.nrows()
+        }
+        fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
+            out[0] = self
+                .x
+                .row(row)
+                .iter()
+                .zip(delta_beta)
+                .map(|(a, b)| a * b)
+                .sum();
+            out[1] = self
+                .y
+                .row(row)
+                .iter()
+                .zip(delta_beta)
+                .map(|(a, b)| a * b)
+                .sum();
+        }
+        fn evaluate_full(&self) -> ndarray::Array3<f64> {
+            ndarray::Array3::from_shape_fn((self.x.nrows(), self.x.ncols(), 2), |(i, j, c)| {
+                if c == 0 {
+                    self.x[[i, j]]
+                } else {
+                    self.y[[i, j]]
+                }
+            })
+        }
+    }
+
+    /// Row-varying symmetric positive definite `2 × 2` row metric.
+    struct TwoChannelRowHessian {
+        n: usize,
+    }
+
+    impl crate::families::compiler::RowHessian for TwoChannelRowHessian {
+        fn k(&self) -> usize {
+            2
+        }
+        fn nrows(&self) -> usize {
+            self.n
+        }
+        fn fill_row(&self, row: usize, out: &mut [f64]) {
+            let t = row as f64 * 0.013;
+            let (a, b, c) = (1.5 + t.sin(), 0.3 * t.cos(), 1.2 + 0.5 * (2.0 * t).sin());
+            out.copy_from_slice(&[a, b, b, c]);
+        }
+        fn evaluate_full(&self) -> ndarray::Array3<f64> {
+            let mut out = ndarray::Array3::<f64>::zeros((self.n, 2, 2));
+            let mut block = [0.0; 4];
+            for row in 0..self.n {
+                self.fill_row(row, &mut block);
+                for (index, value) in block.iter().enumerate() {
+                    out[[row, index / 2, index % 2]] = *value;
+                }
+            }
+            out
+        }
+    }
+
+    /// Two blocks of 16 and 17 columns over four row chunks, the last one
+    /// partial. Every block pair's chunk product is at least 16 · 16 · 8,192
+    /// multiply-adds, above `matmul_parallelism`'s 2,000,000 threshold, so the
+    /// former serial pass ran each one on faer's pool.
+    struct StreamedGeometryFixture {
+        operators: Vec<std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator>>,
+        col_offsets: [usize; 3],
+        row_hess: TwoChannelRowHessian,
+        row_structural: crate::families::compiler::IdentityRowHessian,
+    }
+
+    const STREAMED_FIXTURE_ROWS: usize = 3 * CHANNEL_AWARE_ROW_CHUNK + 123;
+    const STREAMED_FIXTURE_COLS: usize = 33;
+
+    fn streamed_geometry_fixture() -> StreamedGeometryFixture {
+        fn noise(i: usize, j: usize, salt: f64) -> f64 {
+            ((i as f64 * 12.9898 + j as f64 * 78.233 + salt).sin() * 43758.5453).fract() - 0.5
+        }
+        let n = STREAMED_FIXTURE_ROWS;
+        let operator = |cols: usize, salt: f64| {
+            let operator: std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator> =
+                std::sync::Arc::new(TwoChannelOperator {
+                    x: Array2::from_shape_fn((n, cols), |(i, j)| noise(i, j, salt)),
+                    y: Array2::from_shape_fn((n, cols), |(i, j)| noise(i, j, salt + 0.5)),
+                });
+            operator
+        };
+        StreamedGeometryFixture {
+            operators: vec![operator(16, 1.0), operator(17, 2.0)],
+            col_offsets: [0, 16, STREAMED_FIXTURE_COLS],
+            row_hess: TwoChannelRowHessian { n },
+            row_structural: crate::families::compiler::IdentityRowHessian::new(n, 2),
+        }
+    }
+
+    /// The former serial pass, rebuilt as it ran: one chunk at a time, each
+    /// block pair's Gram through `fast_atb` added straight into the total, and
+    /// the fourth moments summed chunk by chunk. Returns the Gram's upper block
+    /// triangle and the per-column fourth moments.
+    fn serial_streamed_gram(
+        fixture: &StreamedGeometryFixture,
+        metric: &dyn crate::families::compiler::RowHessian,
+    ) -> (Array2<f64>, Vec<f64>) {
+        let n = STREAMED_FIXTURE_ROWS;
+        let p_total = STREAMED_FIXTURE_COLS;
+        let col_offsets = fixture.col_offsets;
+        let mut total = Array2::<f64>::zeros((p_total, p_total));
+        let mut fourth = vec![0.0_f64; p_total];
+        for start in (0..n).step_by(CHANNEL_AWARE_ROW_CHUNK) {
+            let end = (start + CHANNEL_AWARE_ROW_CHUNK).min(n);
+            let chunks: Vec<Array2<f64>> = fixture
+                .operators
+                .iter()
+                .enumerate()
+                .map(|(block, op)| {
+                    let mut rows = Array2::<f64>::zeros(((end - start) * 2, op.ncols()));
+                    op.channel_flattened_rows(start..end, &mut rows);
+                    for col in 0..op.ncols() {
+                        let mut sum4 = 0.0_f64;
+                        for value in rows.column(col).iter() {
+                            let sq = value * value;
+                            sum4 += sq * sq;
+                        }
+                        fourth[col_offsets[block] + col] += sum4;
+                    }
+                    rows
+                })
+                .collect();
+            let mut weighted: Vec<Array2<f64>> = chunks
+                .iter()
+                .map(|rows| Array2::<f64>::zeros(rows.dim()))
+                .collect();
+            let mut h_row = vec![0.0_f64; 4];
+            for local_i in 0..end - start {
+                metric.fill_row(start + local_i, &mut h_row);
+                for (block, rows) in chunks.iter().enumerate() {
+                    for out_ch in 0..2 {
+                        for col in 0..rows.ncols() {
+                            let mut acc = 0.0_f64;
+                            for in_ch in 0..2 {
+                                acc += h_row[out_ch * 2 + in_ch] * rows[[local_i * 2 + in_ch, col]];
+                            }
+                            weighted[block][[local_i * 2 + out_ch, col]] = acc;
+                        }
+                    }
+                }
+            }
+            for a in 0..chunks.len() {
+                for b in a..chunks.len() {
+                    let block = fast_atb(&chunks[a], &weighted[b]);
+                    for i in 0..block.nrows() {
+                        for j in 0..block.ncols() {
+                            total[[col_offsets[a] + i, col_offsets[b] + j]] += block[[i, j]];
+                        }
+                    }
+                }
+            }
+        }
+        (total, fourth)
+    }
+
+    /// `geometry`'s two Grams (upper triangle) and fourth-moment ratios equal
+    /// the serial pass's bit for bit.
+    fn assert_serial_pass_bits(
+        fixture: &StreamedGeometryFixture,
+        geometry: &ChannelAwareStreamedGeometry,
+        context: &str,
+    ) {
+        let p_total = STREAMED_FIXTURE_COLS;
+        let (serial_h, serial_fourth) = serial_streamed_gram(fixture, &fixture.row_hess);
+        let (serial_struct, _) = serial_streamed_gram(fixture, &fixture.row_structural);
+        for (label, streamed, serial) in [
+            ("metric", &geometry.gram_h, &serial_h),
+            ("structural", &geometry.gram_struct, &serial_struct),
+        ] {
+            for i in 0..p_total {
+                for j in i..p_total {
+                    assert_eq!(
+                        streamed[[i, j]].to_bits(),
+                        serial[[i, j]].to_bits(),
+                        "{label} Gram [{i}, {j}] {context}: {:e} vs serial {:e}",
+                        streamed[[i, j]],
+                        serial[[i, j]]
+                    );
+                }
+            }
+        }
+        for col in 0..p_total {
+            let sq_norm = serial_struct[[col, col]].max(0.0);
+            let serial_s2 = if sq_norm <= 0.0 {
+                1.0
+            } else {
+                serial_fourth[col] / (sq_norm * sq_norm)
+            };
+            assert_eq!(
+                geometry.col_s2[col].to_bits(),
+                serial_s2.to_bits(),
+                "column {col} fourth-moment ratio {context}"
+            );
+        }
+    }
+
+    /// The row chunks' Grams are formed in parallel and added in chunk order, so
+    /// the streamed geometry is the serial pass's bit for bit at 1, 4 and 12
+    /// workers.
+    #[test]
+    fn channel_aware_streamed_geometry_is_the_serial_pass_bitwise_at_every_width_2337() {
+        let fixture = streamed_geometry_fixture();
+        for workers in [1, 4, 12] {
+            let geometry = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test worker pool")
+                .install(|| {
+                    channel_aware_streamed_geometry(
+                        &fixture.operators,
+                        &fixture.row_hess,
+                        &fixture.row_structural,
+                        &fixture.col_offsets,
+                    )
+                })
+                .expect("streamed geometry");
+            assert_serial_pass_bits(&fixture, &geometry, &format!("at {workers} workers"));
+        }
+    }
+
+    /// A refused wave is halved down to one chunk, and one chunk runs even
+    /// unreserved; at every rung and width the geometry is the serial pass's
+    /// bit for bit. One chunk's buffers are its rows and their weighted copy,
+    /// 4,096 · 2 channels · 2 · 33 columns · 8 bytes = 4,325,376, plus its two
+    /// 33 × 33 Grams, 17,424: 4,342,800 bytes. With 4 and 12 workers the first
+    /// wave is all 4 chunks; with 1 worker it is one chunk.
+    #[test]
+    fn refused_audit_gram_waves_halve_to_one_chunk_and_keep_the_serial_bits_2337() {
+        const CHUNK: usize = 4_342_800;
+        let fixture = streamed_geometry_fixture();
+        let governor = gam_runtime::resource::MemoryGovernor::global();
+        // (byte limit, the requests at ≥ 4 workers, the one admitted there)
+        let rungs = [
+            (usize::MAX, vec![4 * CHUNK], Some(4 * CHUNK)),
+            (10_000_000, vec![4 * CHUNK, 2 * CHUNK], Some(2 * CHUNK)),
+            (5_000_000, vec![4 * CHUNK, 2 * CHUNK, CHUNK], Some(CHUNK)),
+            (0, vec![4 * CHUNK, 2 * CHUNK, CHUNK], None),
+        ];
+        for (limit, wide_requests, wide_admitted) in rungs {
+            for workers in [1, 4, 12] {
+                let requests = std::sync::Mutex::new(Vec::new());
+                let admitted = std::sync::Mutex::new(Vec::new());
+                let geometry = rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .expect("test worker pool")
+                    .install(|| {
+                        channel_aware_streamed_geometry_within(
+                            &fixture.operators,
+                            &fixture.row_hess,
+                            &fixture.row_structural,
+                            &fixture.col_offsets,
+                            &|bytes| {
+                                requests.lock().expect("requested bytes").push(bytes);
+                                let reservation = if bytes <= limit {
+                                    governor.try_reserve(bytes, "audit Gram refusal test").ok()
+                                } else {
+                                    None
+                                };
+                                if reservation.is_some() {
+                                    admitted.lock().expect("admitted bytes").push(bytes);
+                                }
+                                reservation
+                            },
+                        )
+                    })
+                    .expect("streamed geometry");
+                let (expected_requests, expected_admitted) = if workers == 1 {
+                    (vec![CHUNK], (limit >= CHUNK).then_some(CHUNK))
+                } else {
+                    (wide_requests.clone(), wide_admitted)
+                };
+                let context = format!("under a {limit}-byte limit at {workers} workers");
+                assert_eq!(
+                    requests.into_inner().expect("requested bytes"),
+                    expected_requests,
+                    "requests {context}"
+                );
+                assert_eq!(
+                    admitted.into_inner().expect("admitted bytes"),
+                    expected_admitted.into_iter().collect::<Vec<_>>(),
+                    "admitted {context}"
+                );
+                assert_serial_pass_bits(&fixture, &geometry, &context);
+            }
+        }
     }
 
     // ── Competing-risks cross-channel redundancy regression (gam#1590) ──────

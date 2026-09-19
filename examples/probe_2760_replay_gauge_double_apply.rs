@@ -146,6 +146,9 @@ fn main() {
                     dropped_penalties: local.dropped_penalties.clone(),
                     linear_constraints_local: local.linear_constraints.as_ref(),
                     joint_null_rotation: local.joint_null_rotation.as_ref(),
+                    duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
+                        &trial,
+                    ),
                     termname: "duchon_1d",
                 },
             )

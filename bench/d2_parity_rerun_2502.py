@@ -89,7 +89,6 @@ def fit(gamfit, x, k, arm, args):
         sparsity_weight=args.sparsity_weight,
         smoothness_weight=args.smoothness_weight,
         isometry_weight=0.0, learning_rate=args.learning_rate,
-        ard_per_atom=False,
     )
     if arm == "linear":
         return gamfit.sae_manifold_fit(x, d_atom=1, atom_topology="linear", **kw)

@@ -406,7 +406,6 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         assignment=args.assignment,
         top_k=args.top_k,
         isometry_weight=args.isometry_weight,
-        ard_per_atom=args.ard_per_atom,
         sparsity_weight=args.sparsity_weight,
         smoothness_weight=args.smoothness_weight,
         n_iter=args.max_iter,
@@ -601,7 +600,6 @@ def main() -> int:
     parser.add_argument("--sparsity-weight", type=float, default=0.01)
     parser.add_argument("--smoothness-weight", type=float, default=0.01)
     parser.add_argument("--isometry-weight", type=float, default=0.0)
-    parser.add_argument("--ard-per-atom", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--corr-rank", type=int, default=8)
     parser.add_argument("--corr-scale", type=float, default=0.1)
     parser.add_argument("--p-min", type=float, default=5e-4)

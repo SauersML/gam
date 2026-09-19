@@ -100,7 +100,6 @@ fn seeded_term(target: ArrayView2<'_, f64>) -> SaeManifoldTerm {
         ridge_beta: 1.0e-6,
         top_k: None,
         threshold: 0.0,
-        native_ard_enabled: true,
         seed_refine_routing: minimal.refine_routing,
         seed_refine_random_state: 45,
         fit_config: SaeFitConfig::default(),

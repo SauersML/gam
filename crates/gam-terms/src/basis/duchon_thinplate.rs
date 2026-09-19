@@ -1005,6 +1005,47 @@ pub fn duchon_penalties_at_length_scale(
     length_scale: Option<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    let filtered = duchon_penalty_set_at_length_scale(
+        centers,
+        identifiability_transform,
+        operator_collocation_points,
+        operator_penalties,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        radial_reparam,
+        length_scale,
+        workspace,
+    )?;
+    Ok((
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.matrix.clone())
+            .collect(),
+        filtered
+            .active
+            .iter()
+            .map(|penalty| penalty.nullity)
+            .collect(),
+    ))
+}
+
+/// The filtered Duchon penalty set [`duchon_penalties_at_length_scale`] reads its
+/// blocks from: the cold build's candidates and filter, from frozen geometry, in
+/// the chart `identifiability_transform` names.
+pub(crate) fn duchon_penalty_set_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    operator_collocation_points: Option<ArrayView2<'_, f64>>,
+    operator_penalties: &DuchonOperatorPenaltySpec,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    radial_reparam: Option<&Array2<f64>>,
+    length_scale: Option<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<FilteredPenalties, BasisError> {
     // Recompute the effective order + auto-seeded anisotropy exactly as the cold
     // build does (duchon_thinplate.rs:151/159). Both are pure functions of the
     // frozen centers + spec, so the κ trial replays the SAME structural choices.
@@ -1048,19 +1089,7 @@ pub fn duchon_penalties_at_length_scale(
             workspace,
         )?);
     }
-    let filtered = filter_penalty_candidates(candidates)?;
-    Ok((
-        filtered
-            .active
-            .iter()
-            .map(|penalty| penalty.matrix.clone())
-            .collect(),
-        filtered
-            .active
-            .iter()
-            .map(|penalty| penalty.nullity)
-            .collect(),
-    ))
+    filter_penalty_candidates(candidates)
 }
 
 /// Materialise the polynomial null-space block for a Duchon basis.

@@ -320,6 +320,14 @@ fn summary_smooth_terms(
     let data = representative_data_from_ranges(ranges, &factor_levels);
     let design = gam_terms::smooth::build_term_collection_design(data.view(), spec)
         .map_err(|err| format!("frozen-basis design replay failed: {err}"))?;
+    // The walk below reads the fit's per-penalty record by the rebuilt layout's
+    // global index, so a rebuild with another block count would misread it.
+    crate::inference::model::saved_lambdas_index_rebuilt_layout(
+        spec,
+        design.penalties.len(),
+        fit,
+        "per-smooth summary",
+    )?;
 
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142).
     // Prefer the fit's exact weighted Gram `X'WX` when the inference block
@@ -515,6 +523,7 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         null_dim: None,
         iterations: 0,
         edf_total: Some(scan.edf),
+        edf_rank_bound: Vec::new(),
         lambdas: vec![scan.lambda],
         coefficients: Vec::new(),
         smooth_terms,
@@ -618,7 +627,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let display_uncertainty = fit.display_coefficient_uncertainty();
     let standard_errors = display_uncertainty
         .as_ref()
-        .map(|view| view.standard_errors);
+        .map(|view| &view.standard_errors);
     let covariance = display_uncertainty.as_ref().and_then(|view| {
         view.covariance
             .map(|cov| (view.definition.as_str().to_string(), cov))
@@ -664,6 +673,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         null_dim: fit.artifacts.null_space_dim.map(|dim| dim as f64),
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
+        edf_rank_bound: fit.edf_rank_bound().to_vec(),
         lambdas: fit.lambdas.to_vec(),
         coefficients,
         smooth_terms,
@@ -835,6 +845,12 @@ pub struct SummaryPayload {
     pub null_dim: Option<f64>,
     pub iterations: usize,
     pub edf_total: Option<f64>,
+    /// Each penalty block's rank-bound status beside the EDF fields (#2901). An
+    /// `Uncertified` or `NotAssessed` block's trace and EDF are published unclamped,
+    /// and so is `edf_total` when any block is not certified. Empty when the fit
+    /// recorded none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edf_rank_bound: Vec<gam_solve::estimate::EdfRankBound>,
     pub lambdas: Vec<f64>,
     pub coefficients: Vec<SummaryCoefficientRow>,
     /// Per-smooth significance table (mgcv-style). Empty when the model has no
@@ -971,9 +987,10 @@ pub fn saved_model_report_input(
         .unwrap_or_else(|| fit.edf_total().unwrap_or(0.0));
     // Definition-consistent SE column (#2296): corrected-preferred, but never
     // an unlabeled mix of covariance definitions.
-    let standard_errors = fit
-        .display_coefficient_uncertainty()
-        .map(|view| view.standard_errors);
+    let display_uncertainty = fit.display_coefficient_uncertainty();
+    let standard_errors = display_uncertainty
+        .as_ref()
+        .map(|view| &view.standard_errors);
     let coefficients = fit
         .beta
         .iter()

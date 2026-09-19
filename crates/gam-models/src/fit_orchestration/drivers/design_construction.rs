@@ -3029,7 +3029,9 @@ fn fit_bounded_term_collection_with_design(
             "bounded coefficient covariance scaling produced a non-finite value".to_string(),
         ));
     }
-    let beta_standard_errors = beta_covariance
+    // The published standard errors derive from this matrix (#2955); judging its
+    // diagonal here names this lane in the refusal.
+    beta_covariance
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -3064,7 +3066,7 @@ fn fit_bounded_term_collection_with_design(
     } else {
         None
     };
-    let beta_standard_errors_corrected = covariance_corrected
+    covariance_corrected
         .as_ref()
         .map(gam_problem::se_from_covariance)
         .transpose()
@@ -3095,6 +3097,7 @@ fn fit_bounded_term_collection_with_design(
             let inf = FitInference {
                 edf_by_block,
                 penalty_block_trace,
+                edf_rank_bound: Vec::new(),
                 edf_total,
                 // This lane publishes only the first-order correction, so its
                 // retained first-order pair is its primary pair.
@@ -3114,12 +3117,7 @@ fn fit_bounded_term_collection_with_design(
                 penalized_hessian: penalized_hessian.clone().into(),
                 reparam_qs: None,
                 dispersion,
-                beta_covariance: beta_covariance
-                    .clone()
-                    .map(gam_problem::dispersion_cov::PhiScaledCovariance::from),
-                beta_standard_errors,
-                beta_covariance_corrected: covariance_corrected.clone(),
-                beta_standard_errors_corrected,
+                factorized_standard_errors: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -3169,6 +3167,7 @@ fn fit_bounded_term_collection_with_design(
                     // search's stationarity certificate, which the custom-family
                     // fit already carries; it is threaded through, not dropped.
                     criterion_certificate: fit.artifacts.criterion_certificate.clone(),
+                    coefficient_mode_selection: fit.artifacts.coefficient_mode_selection.clone(),
                     ..Default::default()
                 },
                 inner_cycles: 0,
@@ -3394,11 +3393,14 @@ mod spatial_trial_recovery_tests {
 
     #[test]
     fn spatial_value_probe_classifier_matches_derivative_lane() {
-        // The contract is an AGREEMENT: the value-probe lane must retreat to
-        // `+∞` on exactly the errors the derivative lane calls recoverable, and
-        // propagate every other error unchanged. Asserting the agreement over a
-        // table — rather than pinning one hand-picked error per outcome — is
-        // what keeps this gate honest when the producer's verdict moves.
+        // The contract is an AGREEMENT: the value-probe lane must answer with a
+        // typed refusal — a variant `is_trial_point_infeasible` recognizes, still
+        // carrying its reason — on exactly the errors the derivative lane calls
+        // recoverable, and propagate every other error unchanged. No +∞ cost: a
+        // sentinel names no reason, so three walls read "non-finite cost" and
+        // nothing else (#2735). Asserting the agreement over a table — rather
+        // than pinning one hand-picked error per outcome — is what keeps this
+        // gate honest when the producer's verdict moves.
         //
         // #2593 moved that verdict from the message text to the error VARIANT
         // (`TrialPointRefused`), which is what the sibling
@@ -3427,31 +3429,27 @@ mod spatial_trial_recovery_tests {
         for error in cases {
             let message = error.to_string();
             let derivative_lane_recovers = is_recoverable_trial_point_error(&error);
-            match classify_spatial_value_probe_failure(error) {
-                Ok(value) => {
-                    assert!(
-                        derivative_lane_recovers,
-                        "the value probe retreated on {message:?} while the derivative lane \
-                         calls it fatal — the two lanes must classify one error the same way"
-                    );
-                    assert!(
-                        value.is_infinite() && value.is_sign_positive(),
-                        "a domain refusal must retreat to +INFINITY so the line search steps \
-                         away from it; got {value} for {message:?}"
-                    );
-                }
-                Err(propagated) => {
-                    assert!(
-                        !derivative_lane_recovers,
-                        "the value probe propagated {message:?} while the derivative lane \
-                         calls it a recoverable trial point"
-                    );
-                    assert_eq!(
-                        propagated.to_string(),
-                        message,
-                        "a fatal failure must be propagated unchanged, not reworded"
-                    );
-                }
+            let typed = classify_spatial_value_probe_failure(error);
+            if derivative_lane_recovers {
+                assert!(
+                    typed.is_trial_point_infeasible(),
+                    "the value probe must carry {message:?} as a typed refusal the outer \
+                     consumers retreat from; got {typed}"
+                );
+                assert!(
+                    typed.to_string().contains(&message),
+                    "the refusal must keep its reason: {message:?} became {typed}"
+                );
+            } else {
+                assert!(
+                    !typed.is_trial_point_infeasible(),
+                    "the value probe turned the fatal {message:?} into a refusal"
+                );
+                assert_eq!(
+                    typed.to_string(),
+                    message,
+                    "a fatal failure must be propagated unchanged, not reworded"
+                );
             }
         }
     }
@@ -3553,6 +3551,36 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         order,
         design_revision,
     )
+}
+
+/// The error an incremental κ rebuild reports when the realizer cannot put a
+/// term back into its collection's identifiability gauge (#2747).
+///
+/// A trial ψ at which the term's block lies numerically inside the constraint
+/// span cannot be placed, so the model does not exist at that trial: the search
+/// retreats, as for a penalty that is not PSD there, instead of aborting the fit
+/// (gam#2959). Any other placement failure is a defect and stays fatal.
+fn collection_gauge_placement_error(
+    name: &str,
+    trial_report: &str,
+    error: gam_terms::basis::BasisError,
+) -> EstimationError {
+    if matches!(
+        error,
+        gam_terms::basis::BasisError::CollectionGaugeNotOrthogonal { .. }
+    ) {
+        EstimationError::TrialPointRefused {
+            reason: format!(
+                "term '{name}' cannot be placed in its collection's identifiability gauge at \
+                 this psi ({trial_report}): {error}"
+            ),
+        }
+    } else {
+        EstimationError::InvalidInput(format!(
+            "term '{name}' could not be returned to its collection's identifiability gauge \
+             after an incremental rebuild: {error}"
+        ))
+    }
 }
 
 fn evaluate_joint_reml_efs_at_theta(

@@ -375,6 +375,14 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
     );
 }
 
+/// An absent `warm_start_from` leaves every custom-family request without a cache
+/// session, so the default fit is unchanged.
+#[test]
+fn an_absent_warm_start_attaches_no_cache_session() {
+    let absent = blockwise_fit_options(&FitConfig::default());
+    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+}
+
 /// The carrier is survival-only: a standard fit has no survival time basis to
 /// record, and must not fabricate one.
 #[test]
@@ -2398,10 +2406,14 @@ fn survival_location_scale_wiggle_rejects_unsupported_inverse_link() {
         .expect("valid SAS state"),
     );
 
-    let err = match fit_survival_location_scale_model(request) {
+    // Through the fit boundary: the refusal keeps its category (#2937).
+    let err = match fit_model(FitRequest::SurvivalLocationScale(request)) {
         Ok(_) => panic!("survival link wiggle should reject unsupported inverse links"),
         Err(e) => e,
     };
+    assert_eq!(err.failure_category(), gam_problem::FailureCategory::Input, "{err}");
+    assert_eq!(err.variant_name(), "FitFailure::Input", "{err}");
+    let err = err.to_string();
 
     assert!(err.contains("survival link wiggle"));
     assert!(err.contains("does not support"));
@@ -2873,10 +2885,6 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
             .inference
             .as_mut()
             .expect("terms fit must carry an inference block");
-        inference.beta_covariance = Some(conditional.clone().into());
-        inference.beta_covariance_corrected = Some(corrected.clone());
-        inference.beta_standard_errors_corrected =
-            Some(corrected.diag().mapv(|v| v.max(0.0).sqrt()));
         inference.smoothing_correction = Some(&corrected - &conditional);
         inference.smoothing_correction_method = Some(
             gam_solve::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
@@ -2904,25 +2912,6 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
         (top_corrected[[0, 0]] - corrected[[0, 0]]).abs() > 1e-12,
         "remap with s={s} must rescale the corrected covariance"
     );
-    // ...and every inference copy must land bitwise on its top-level twin,
-    // which is exactly what the predict-time revalidation requires.
-    assert_eq!(
-        inference
-            .beta_covariance
-            .as_ref()
-            .expect("inference conditional copy survives")
-            .as_array(),
-        top_conditional,
-        "inference conditional covariance must ride the raw remap bitwise (#2386)"
-    );
-    assert_eq!(
-        inference
-            .beta_covariance_corrected
-            .as_ref()
-            .expect("inference corrected copy survives"),
-        top_corrected,
-        "inference corrected covariance must ride the raw remap bitwise (#2386)"
-    );
     // The corrected decomposition Vp = Vb + C must keep holding in raw units:
     // both sides ride the same congruence, so their difference is the remapped
     // correction matrix.
@@ -2941,12 +2930,11 @@ fn gaussian_location_scale_raw_remap_keeps_inference_covariance_copies_bitwise_e
             );
         }
     }
-    // Corrected SEs are the remapped per-coordinate scale of the corrected
-    // diagonal: se_raw_i = f_i * se_i with f_i > 0, so se_raw_i^2 must equal
-    // the corrected diagonal exactly up to float regrouping.
-    let se = inference
-        .beta_standard_errors_corrected
-        .as_ref()
+    // Corrected SEs are derived from the one remapped corrected covariance, so
+    // se_raw_i^2 must equal the corrected diagonal exactly up to float
+    // regrouping.
+    let se = fit
+        .beta_standard_errors_corrected()
         .expect("corrected SEs survive");
     assert_eq!(se.len(), p);
     for i in 0..p {
@@ -3057,16 +3045,14 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
         .expect("the terms fit publishes a conditional covariance");
     assert_eq!(Some(covariance_a), b.covariance_conditional.as_ref());
     assert_eq!(a.covariance_corrected, b.covariance_corrected);
-    let inf_a = a.inference.as_ref().expect("rescaled inference block");
-    let inf_b = b.inference.as_ref().expect("composed inference block");
     assert!(
-        inf_a.beta_standard_errors.is_some(),
+        a.beta_standard_errors().is_some(),
         "the terms fit publishes conditional standard errors"
     );
-    assert_eq!(inf_a.beta_standard_errors, inf_b.beta_standard_errors);
+    assert_eq!(a.beta_standard_errors(), b.beta_standard_errors());
     assert_eq!(
-        inf_a.beta_standard_errors_corrected,
-        inf_b.beta_standard_errors_corrected
+        a.beta_standard_errors_corrected(),
+        b.beta_standard_errors_corrected()
     );
 
     // Predictions on the fitted rows: each channel's linear predictor
@@ -3119,6 +3105,8 @@ fn gaussian_location_scale_raw_remap_representations_agree_1561() {
     // the as-solved precision on the composed section β_raw = D·β_internal + a.
     let geom_a = a.geometry.as_ref().expect("rescaled geometry");
     let geom_b = b.geometry.as_ref().expect("composed geometry");
+    let inf_a = a.inference.as_ref().expect("rescaled inference block");
+    let inf_b = b.inference.as_ref().expect("composed inference block");
     assert!(geom_a.coefficient_gauge.is_identity());
     assert!(!geom_b.coefficient_gauge.is_identity());
     assert!(
@@ -4032,4 +4020,201 @@ fn marginal_slope_base_link_rejects_flexible_and_unbounded_links() {
         ),
         "a log link must be the typed probit-only refusal, got {err:?}"
     );
+}
+
+/// #2677 B0: every materialized request whose custom-family solver options come
+/// from `blockwise_fit_options` computes the conditional covariance unless the
+/// caller declines it.
+///
+/// The latent survival and latent binary requests used to spread
+/// `BlockwiseFitOptions::default()`, whose `compute_covariance` is `false`, and
+/// never read `FitConfig::compute_covariance`. `compute_joint_posterior`
+/// publishes the conditional covariance only under that flag, so a latent fit
+/// whose cone moments were available (probe 1201712: moment status
+/// `Available`) published none. Every builder the resolver serves is covered,
+/// so a builder that bypasses it shows here. Materializing these requests runs
+/// no fit (#2714 moved the latent baseline chart into the fit), so this reads
+/// the request itself.
+#[test]
+fn materialized_requests_carry_the_callers_covariance_request_2677() {
+    use crate::fit_orchestration::request::FitRequest;
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+
+    let carried = |label: &str, request: &FitRequest<'_>| match request {
+        FitRequest::SurvivalMarginalSlope(request) => request.options.compute_covariance,
+        FitRequest::LatentSurvival(request) => request.options.compute_covariance,
+        FitRequest::LatentBinary(request) => request.options.compute_covariance,
+        FitRequest::BernoulliMarginalSlope(request) => request.options.compute_covariance,
+        FitRequest::TransformationNormal(request) => request.options.compute_covariance,
+        _ => panic!("{label} must materialize its own custom-family request"),
+    };
+    let requests = [(None, true), (Some(false), false), (Some(true), true)];
+
+    let workflow = workflow_test_dataset();
+    for (label, formula, family, slope_formula, z_column) in [
+        ("bernoulli marginal-slope", "event ~ bmi", None, Some("1"), Some("z")),
+        ("transformation-normal", "bmi ~ s(age_entry, k=4)", Some("transformation-normal"), None, None),
+    ] {
+        for (requested, expected) in requests {
+            let config = FitConfig {
+                family: family.map(str::to_string),
+                slope_formula: slope_formula.map(str::to_string),
+                z_column: z_column.map(str::to_string),
+                compute_covariance: requested,
+                ..FitConfig::default()
+            };
+            let materialized = materialize(formula, &workflow, &config)
+                .unwrap_or_else(|error| panic!("{label} should materialize: {error}"));
+            assert_eq!(
+                carried(label, &materialized.request),
+                expected,
+                "#2677 B0: {label} with compute_covariance={requested:?} must carry \
+                 compute_covariance={expected} to the fit"
+            );
+        }
+    }
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("survival_covariance_request_2677.csv");
+    fs::write(
+        &data_path,
+        "entry,exit,event,x,z\n\
+         0.0,0.4,1,-0.9,0.3\n\
+         0.0,0.7,0,-0.6,-1.1\n\
+         0.0,0.9,1,-0.3,0.8\n\
+         0.0,1.2,1,-0.1,-0.4\n\
+         0.0,1.5,0,0.2,1.3\n\
+         0.0,1.8,1,0.4,-0.7\n\
+         0.0,2.2,0,0.6,0.1\n\
+         0.0,2.6,1,0.8,-1.5\n\
+         0.0,3.1,1,0.9,0.6\n\
+         0.0,3.7,0,-0.4,-0.2\n\
+         0.0,4.2,1,0.1,1.0\n\
+         0.0,4.8,0,-0.7,-0.9\n",
+    )
+    .expect("write survival covariance request csv");
+    let data = load_dataset_projected(
+        &data_path,
+        &[
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .expect("load survival covariance request dataset");
+
+    for mode in ["marginal-slope", "latent", "latent-binary"] {
+        for (requested, expected) in requests {
+            let config = if mode == "marginal-slope" {
+                FitConfig {
+                    survival_likelihood: Some(mode.to_string()),
+                    z_column: Some("z".to_string()),
+                    compute_covariance: requested,
+                    ..FitConfig::default()
+                }
+            } else {
+                FitConfig {
+                    survival_likelihood: Some(mode.to_string()),
+                    baseline_target: "weibull".to_string(),
+                    frailty: FrailtySpec::HazardMultiplier {
+                        scale: FrailtyScale::Fixed { sigma: 0.5 },
+                        loading: HazardLoading::Full,
+                    },
+                    compute_covariance: requested,
+                    ..FitConfig::default()
+                }
+            };
+            let materialized = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+                .unwrap_or_else(|error| panic!("{mode} should materialize: {error}"));
+            assert_eq!(
+                carried(mode, &materialized.request),
+                expected,
+                "#2677 B0: survival {mode} with compute_covariance={requested:?} must carry \
+                 compute_covariance={expected} to the fit"
+            );
+        }
+    }
+}
+
+/// #2937: a survival marginal-slope, latent or latent-binary fit refused by its
+/// own input validation raises that category through `fit_model`. All three
+/// routes handed back text, which `fit_model` recorded as
+/// `FitFailure::Unclassified`, so Python raised the bare `FitError`.
+#[test]
+fn survival_marginal_slope_and_latent_refusals_raise_their_category_2937() {
+    use crate::fit_orchestration::request::FitRequest;
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+
+    let td = tempdir().expect("tempdir");
+    let data_path = td.path().join("survival_refusal_category_2937.csv");
+    fs::write(
+        &data_path,
+        "entry,exit,event,x,z\n\
+         0.0,0.4,1,-0.9,0.3\n\
+         0.0,0.7,0,-0.6,-1.1\n\
+         0.0,0.9,1,-0.3,0.8\n\
+         0.0,1.2,1,-0.1,-0.4\n\
+         0.0,1.5,0,0.2,1.3\n\
+         0.0,1.8,1,0.4,-0.7\n\
+         0.0,2.2,0,0.6,0.1\n\
+         0.0,2.6,1,0.8,-1.5\n\
+         0.0,3.1,1,0.9,0.6\n\
+         0.0,3.7,0,-0.4,-0.2\n\
+         0.0,4.2,1,0.1,1.0\n\
+         0.0,4.8,0,-0.7,-0.9\n",
+    )
+    .expect("write survival refusal category csv");
+    let data = load_dataset_projected(
+        &data_path,
+        &[
+            "entry".to_string(),
+            "exit".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .expect("load survival refusal category dataset");
+
+    for mode in ["marginal-slope", "latent", "latent-binary"] {
+        let config = if mode == "marginal-slope" {
+            FitConfig {
+                survival_likelihood: Some(mode.to_string()),
+                z_column: Some("z".to_string()),
+                ..FitConfig::default()
+            }
+        } else {
+            FitConfig {
+                survival_likelihood: Some(mode.to_string()),
+                baseline_target: "weibull".to_string(),
+                frailty: FrailtySpec::HazardMultiplier {
+                    scale: FrailtyScale::Fixed { sigma: 0.5 },
+                    loading: HazardLoading::Full,
+                },
+                ..FitConfig::default()
+            }
+        };
+        let mut request = materialize("Surv(entry, exit, event) ~ x", &data, &config)
+            .unwrap_or_else(|error| panic!("{mode} should materialize: {error}"))
+            .request;
+        // A negative prior weight, which each route's own validator refuses.
+        match &mut request {
+            FitRequest::SurvivalMarginalSlope(request) => request.spec.weights[0] = -1.0,
+            FitRequest::LatentSurvival(request) => request.spec.weights[0] = -1.0,
+            FitRequest::LatentBinary(request) => request.spec.weights[0] = -1.0,
+            _ => panic!("{mode} must materialize its own request"),
+        }
+        let err = match fit_model(request) {
+            Ok(_) => panic!("#2937: {mode} must refuse a negative prior weight"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.failure_category(),
+            gam_problem::FailureCategory::Input,
+            "{mode}: {err}"
+        );
+        assert_eq!(err.variant_name(), "FitFailure::Input", "{mode}: {err}");
+    }
 }

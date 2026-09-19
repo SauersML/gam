@@ -38,6 +38,7 @@ use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
+use gam_math::probability::{normal_cdf, normal_pdf};
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 use gam_terms::smooth::TermCollectionSpec;
@@ -1072,7 +1073,431 @@ fn posterior_standard_error_vectors(
         .collect()
 }
 
+/// How the coefficient posterior enters the posterior-mean surfaces of a
+/// single-event survival prediction: `E_θ[S(t; θ)]`, and beside it the event
+/// density and the linear predictor's moments, under `θ ~ N(θ̂, V)`.
+///
+/// The variants exist so the rule that is not the default stays reachable by
+/// name for comparison, not as alternatives a caller should prefer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurvivalPosteriorIntegration {
+    /// The `2·rank` symmetric sigma-point rule over the whole coefficient
+    /// posterior, every node replayed through the plug-in prediction (anchor,
+    /// timewiggle and flexible runtimes included). It is exact for cubic
+    /// functionals of `θ` only; on the #2765 survival marginal-slope fixture it
+    /// sat 4.1e-4 off a Monte Carlo reference at the fitted covariance and
+    /// 2.0e-3 at 9× it. Every model the exact rule does not cover uses it.
+    SigmaPoint,
+    /// Exact for a survival marginal-slope model on a single latent score
+    /// without a timewiggle, score warp or link deviation; a model anchored on
+    /// the joint law of several scores reads a slope per score, so it is not a
+    /// function of two primaries. `S(t) = Φ(−η(q(t), b(t)))` depends on `θ` only
+    /// through the two primaries, both affine in `θ` (the slope's follow-up
+    /// margin included), so their joint law is exactly bivariate Gaussian and
+    /// the posterior mean is adaptive Gauss–Hermite over it with the anchor
+    /// re-solved at every node. The event density `φ(η)·max(η′, 0)` also reads
+    /// the tangents `(q′(t), b′(t))`: given the primaries they are Gaussian and
+    /// `η′ = η_q·q′ + η_b·b′` is linear in them, so they enter through the
+    /// closed-form mean of the positive part of that conditional normal.
+    ///
+    /// Survival and density are integrated separately under this one rule and
+    /// the published hazard is their ratio `E_θ[f]/E_θ[S]`, the hazard of the
+    /// posterior-predictive law, not the posterior mean `E_θ[f/S]` of the
+    /// per-coefficient hazard; the cumulative hazard is `−log E_θ[S]` and the
+    /// cumulative incidence `1 − E_θ[S]`.
+    ExactAnchor,
+}
+
+impl SurvivalPosteriorIntegration {
+    /// The integration [`predict_survival`] runs for `model`: exact wherever the
+    /// saved model is a function of `(q(t), b(t))`, sigma-point otherwise.
+    pub fn default_for(model: &SavedModel) -> Result<Self, SurvivalPredictError> {
+        if require_saved_survival_likelihood_mode(model)? != SurvivalLikelihoodMode::MarginalSlope {
+            return Ok(Self::SigmaPoint);
+        }
+        let runtime = model.saved_prediction_runtime()?;
+        let affine_primaries = runtime.baseline_time_wiggle.is_none()
+            && runtime.score_warp.is_none()
+            && runtime.link_deviation.is_none()
+            && model.survival_marginal_slope_joint_latent_law.is_none();
+        Ok(if affine_primaries {
+            Self::ExactAnchor
+        } else {
+            Self::SigmaPoint
+        })
+    }
+}
+
+/// [`predict_survival`] under [`SurvivalPredictEstimand::PosteriorMean`] with a
+/// named `integration` (`req.estimand` is not consulted).
+/// [`SurvivalPosteriorIntegration::ExactAnchor`] is refused for a model it does
+/// not cover.
+pub fn predict_survival_posterior_mean_with(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    integration: SurvivalPosteriorIntegration,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    match integration {
+        SurvivalPosteriorIntegration::SigmaPoint => {
+            predict_survival_sigma_point_posterior_mean(req, covariance_mode)
+        }
+        SurvivalPosteriorIntegration::ExactAnchor => {
+            predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
+        }
+    }
+}
+
 fn predict_survival_posterior_mean(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let integration = SurvivalPosteriorIntegration::default_for(req.model)?;
+    predict_survival_posterior_mean_with(req, covariance_mode, integration)
+}
+
+/// First and second posterior moments of a single-event survival prediction,
+/// row × time (row for the linear predictor at each row's own exit time), as
+/// either [`SurvivalPosteriorIntegration`] accumulates them.
+struct SurvivalPosteriorMoments {
+    survival_mean: Array2<f64>,
+    survival_second: Array2<f64>,
+    density_mean: Array2<f64>,
+    hazard_mean: Array2<f64>,
+    eta_mean: Array1<f64>,
+    eta_second: Array1<f64>,
+}
+
+impl SurvivalPosteriorMoments {
+    fn zeros(n_rows: usize, n_times: usize) -> Self {
+        Self {
+            survival_mean: Array2::zeros((n_rows, n_times)),
+            survival_second: Array2::zeros((n_rows, n_times)),
+            density_mean: Array2::zeros((n_rows, n_times)),
+            hazard_mean: Array2::zeros((n_rows, n_times)),
+            eta_mean: Array1::zeros(n_rows),
+            eta_second: Array1::zeros(n_rows),
+        }
+    }
+}
+
+/// Replace the plug-in surfaces of `result` with those of the posterior-predictive
+/// law in `moments`: survival `S̄ = E_θ[S]`, cumulative hazard `−log S̄`, and the
+/// hazard `E_θ[f]/E_θ[S]`, both expectations from the same rule. That is the
+/// predictive law's own hazard; the posterior mean of the hazard, `E_θ[f/S]`,
+/// is a different quantity wherever `S` varies across the posterior and is
+/// never published (`hazard_mean` only tells a zero hazard from an infinite
+/// one where `S̄ = 0`). Posterior standard deviations are added when uncertainty
+/// was requested, and the plug-in survival is kept by name in `survival_plugin`.
+fn publish_survival_posterior_moments(
+    result: &mut SurvivalPredictResult,
+    moments: &SurvivalPosteriorMoments,
+    with_uncertainty: bool,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<(), SurvivalPredictError> {
+    let (n_rows, n_times) = result.survival.dim();
+    if moments.survival_mean.dim() != (n_rows, n_times) || moments.eta_mean.len() != n_rows {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
+                moments.survival_mean.dim()
+            ),
+        });
+    }
+    let SurvivalPosteriorMoments {
+        survival_mean,
+        survival_second,
+        density_mean,
+        hazard_mean,
+        eta_mean,
+        eta_second,
+    } = moments;
+    // `result` is the plug-in prediction and the loop below overwrites its
+    // surfaces with the posterior means, so the plug-in survival is taken
+    // here: one clone per call.
+    let survival_plugin = result.survival.clone();
+    for row in 0..n_rows {
+        for time in 0..n_times {
+            let survival = survival_mean[[row, time]].clamp(0.0, 1.0);
+            let density = density_mean[[row, time]];
+            if !(density.is_finite() && density >= 0.0) {
+                return Err(SurvivalPredictError::NumericalFailure {
+                    reason: format!(
+                        "posterior survival density is invalid at row {row}, time column {time}: {density}"
+                    ),
+                });
+            }
+            result.survival[[row, time]] = survival;
+            result.cumulative_hazard[[row, time]] = -survival.ln();
+            result.hazard[[row, time]] = if survival > 0.0 {
+                density / survival
+            } else if hazard_mean[[row, time]] == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+        }
+    }
+    result.survival_se = with_uncertainty.then(|| {
+        Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
+            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
+                .max(0.0)
+                .sqrt()
+        })
+    });
+    result.eta_se = with_uncertainty.then(|| {
+        Array1::from_shape_fn(n_rows, |row| {
+            (eta_second[row] - eta_mean[row] * eta_mean[row])
+                .max(0.0)
+                .sqrt()
+        })
+    });
+    result.covariance_source = with_uncertainty.then_some(covariance_mode);
+    result.survival_plugin = Some(survival_plugin);
+    Ok(())
+}
+
+/// `(E S, E S², E f, E h, E η, E η²)` of one marginal-slope `(row, t)` cell over
+/// the coefficient posterior: survival `S = Φ(−η)`, event density
+/// `f = φ(η)·max(η′, 0)`, hazard `h = f/S`, and the linear predictor. The
+/// published hazard is `E f / E S` ([`publish_survival_posterior_moments`]);
+/// `E h` only decides between a zero and an infinite hazard where `E S = 0`.
+type ExactAnchorCellMoments = (f64, f64, f64, f64, f64, f64);
+
+/// The coefficient posterior [`SurvivalPosteriorIntegration::ExactAnchor`]
+/// pushes onto every cell's primaries: the active covariance over the
+/// `[time | marginal | slope]` coefficients.
+struct ExactAnchorPosterior {
+    covariance: Array2<f64>,
+}
+
+impl ExactAnchorPosterior {
+    /// The exact integration reads `q(t)`, `q′(t)`, `b(t)` and `b′(t)` as affine
+    /// functions of the `[time | marginal | slope]` coefficients, which the saved
+    /// model is exactly when it carries no timewiggle (whose basis is evaluated
+    /// at `q` itself) and no score-warp or link-deviation runtime (which anchor
+    /// the intercept on their own coefficients).
+    fn require_rigid_coordinates(
+        &self,
+        ctx: &MarginalSlopePredictContext,
+    ) -> Result<(), SurvivalPredictError> {
+        if ctx.saved_timewiggle.is_some() || ctx.predictor.has_flexible_runtime() {
+            return Err(SurvivalPredictError::UnsupportedConfiguration {
+                reason: "the exact anchored survival posterior integration needs q(t) and b(t) \
+                         affine in the coefficients and an anchor that depends on them alone; a \
+                         baseline timewiggle, score warp or link deviation breaks that, and such a \
+                         model integrates with the sigma-point rule"
+                    .to_string(),
+            });
+        }
+        let width = ctx.beta_time.len() + ctx.beta_marginal.len() + ctx.beta_slope.len();
+        if self.covariance.dim() != (width, width) {
+            return Err(SurvivalPredictError::PosteriorCovariance {
+                reason: format!(
+                    "survival marginal-slope active covariance is {:?}, expected {width}x{width} over [time | marginal | slope]",
+                    self.covariance.dim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The exact posterior moments of one assembled cell.
+    ///
+    /// `(q, b, q′, b′)` are affine in the active coefficients through the rows
+    /// `x_q = [time(t) | covariates | 0]`, `x_b = [0 | 0 | slope(t)]`,
+    /// `x_q′ = [time′(t) | 0 | 0]` and `x_b′ = [0 | 0 | slope′(t)]`, so they are
+    /// jointly Gaussian with covariance `X V Xᵀ`. The primaries are integrated
+    /// by the projected bivariate Gauss–Hermite rule; given the primaries `y`
+    /// the tangents are `N(t̂ + B(y − ŷ), C)` with `B = Σ_ty Σ_yy⁻¹` and
+    /// `C = Σ_tt − B Σ_yt`, both taken over the support the rule integrates
+    /// (only the major axis when `Σ_yy` is singular in floating point).
+    fn cell_moments(
+        &self,
+        quadctx: &gam_solve::quadrature::QuadratureContext,
+        ctx: &MarginalSlopePredictContext,
+        cell: &MarginalSlopeCell,
+    ) -> Result<ExactAnchorCellMoments, SurvivalPredictError> {
+        let kernel = ctx
+            .predictor
+            .anchored_row_kernels(&cell.input)
+            .map_err(|e| format!("survival marginal-slope anchored row kernel: {e}"))?
+            .pop()
+            .ok_or_else(|| "survival marginal-slope cell produced no row kernel".to_string())?;
+        let (q_hat, b_hat) = ctx
+            .predictor
+            .anchored_primaries(&cell.input, &ctx.predictor.theta())
+            .map_err(|e| format!("survival marginal-slope primaries: {e}"))?;
+        let (q_hat, b_hat) = (q_hat[0], b_hat[0]);
+
+        let p_q = ctx.beta_time.len() + ctx.beta_marginal.len();
+        let width = p_q + ctx.beta_slope.len();
+        let q_row = cell.input.design.to_dense();
+        let slope_row = cell
+            .input
+            .design_noise
+            .as_ref()
+            .ok_or_else(|| "survival marginal-slope cell has no slope design".to_string())?
+            .to_dense();
+        let slope_tangent_width = cell.slope_tangent_row.as_ref().map_or(0, Array1::len);
+        if q_row.dim() != (1, p_q)
+            || slope_row.dim() != (1, width - p_q)
+            || cell.time_derivative_row.len() != ctx.beta_time.len()
+            || (cell.slope_tangent_row.is_some() && slope_tangent_width != width - p_q)
+        {
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "survival marginal-slope cell rows q={:?}, b={:?}, q'={}, b'={slope_tangent_width} \
+                     do not match the [time | marginal | slope] widths {}, {}, {}",
+                    q_row.dim(),
+                    slope_row.dim(),
+                    cell.time_derivative_row.len(),
+                    ctx.beta_time.len(),
+                    ctx.beta_marginal.len(),
+                    ctx.beta_slope.len(),
+                ),
+            });
+        }
+        let mut rows = Array2::<f64>::zeros((4, width));
+        rows.slice_mut(s![0, ..p_q]).assign(&q_row.row(0));
+        rows.slice_mut(s![1, p_q..]).assign(&slope_row.row(0));
+        rows.slice_mut(s![2, ..ctx.beta_time.len()])
+            .assign(&cell.time_derivative_row);
+        if let Some(tangent_row) = cell.slope_tangent_row.as_ref() {
+            rows.slice_mut(s![3, p_q..]).assign(tangent_row);
+        }
+        let sigma = rows.dot(&self.covariance).dot(&rows.t());
+        if !sigma.iter().all(|entry| entry.is_finite()) {
+            return Err(SurvivalPredictError::PosteriorCovariance {
+                reason: format!(
+                    "survival marginal-slope cell covariance of (q, b, q', b') is not finite: {sigma:?}"
+                ),
+            });
+        }
+        let cov_primaries = [
+            [sigma[[0, 0]], sigma[[0, 1]]],
+            [sigma[[1, 0]], sigma[[1, 1]]],
+        ];
+        let cov_tangent_primary = [
+            [sigma[[2, 0]], sigma[[2, 1]]],
+            [sigma[[3, 0]], sigma[[3, 1]]],
+        ];
+        let regression = match gam_solve::quadrature::BivariateNormalSupport::of(cov_primaries) {
+            gam_solve::quadrature::BivariateNormalSupport::Plane => {
+                // Σ_yy⁻¹ from the pivots `a` and `b − (c/√a)²` the support test
+                // found positive.
+                let (a, c) = (cov_primaries[0][0], cov_primaries[1][0]);
+                let below = c / a.sqrt();
+                let pivot = cov_primaries[1][1] - below * below;
+                let inverse = [
+                    [1.0 / a + c * c / (a * a * pivot), -c / (a * pivot)],
+                    [-c / (a * pivot), 1.0 / pivot],
+                ];
+                cov_tangent_primary.map(|row| {
+                    [
+                        row[0] * inverse[0][0] + row[1] * inverse[1][0],
+                        row[0] * inverse[0][1] + row[1] * inverse[1][1],
+                    ]
+                })
+            }
+            gam_solve::quadrature::BivariateNormalSupport::Axis { axis, variance } => {
+                cov_tangent_primary.map(|row| {
+                    let along = (row[0] * axis[0] + row[1] * axis[1]) / variance;
+                    [along * axis[0], along * axis[1]]
+                })
+            }
+            gam_solve::quadrature::BivariateNormalSupport::Point => [[0.0; 2]; 2],
+        };
+        let mut conditional = [[0.0_f64; 2]; 2];
+        for k in 0..2 {
+            for l in 0..2 {
+                conditional[k][l] = sigma[[2 + k, 2 + l]]
+                    - regression[k][0] * sigma[[0, 2 + l]]
+                    - regression[k][1] * sigma[[1, 2 + l]];
+            }
+        }
+        let conditional_cross = 0.5 * (conditional[0][1] + conditional[1][0]);
+        let tangent_hat = [cell.q_t, cell.b_t];
+
+        gam_solve::quadrature::normal_expectation_2d_projected_result(
+            quadctx,
+            [q_hat, b_hat],
+            cov_primaries,
+            |q, b| -> Result<ExactAnchorCellMoments, SurvivalPredictError> {
+                let (eta, eta_q, eta_b) = kernel
+                    .eta_and_partials(q, b)
+                    .map_err(|e| format!("survival marginal-slope anchored kernel: {e}"))?;
+                if !(eta.is_finite() && eta_q.is_finite() && eta_b.is_finite()) {
+                    return Err(SurvivalPredictError::NumericalFailure {
+                        reason: format!(
+                            "survival marginal-slope posterior node (q={q}, b={b}) produced eta={eta}, eta_q={eta_q}, eta_b={eta_b}"
+                        ),
+                    });
+                }
+                let (dq, db) = (q - q_hat, b - b_hat);
+                let q_t = tangent_hat[0] + regression[0][0] * dq + regression[0][1] * db;
+                let b_t = tangent_hat[1] + regression[1][0] * dq + regression[1][1] * db;
+                let tangent_mean = eta_q * q_t + eta_b * b_t;
+                let tangent_variance = eta_q * eta_q * conditional[0][0]
+                    + 2.0 * eta_q * eta_b * conditional_cross
+                    + eta_b * eta_b * conditional[1][1];
+                // The plug-in kernel clamps `η′` at its physical floor 0
+                // (`clamp_marginal_slope_index_derivative_at_horizon`); this is
+                // that clamp's expectation over the conditional law of `η′`.
+                let positive_tangent = gaussian_positive_part_mean(tangent_mean, tangent_variance);
+                let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
+                let survival = log_survival.exp();
+                Ok((
+                    survival,
+                    survival * survival,
+                    normal_pdf(eta) * positive_tangent,
+                    mills_ratio * positive_tangent,
+                    eta,
+                    eta * eta,
+                ))
+            },
+        )
+    }
+}
+
+/// `E[max(L, 0)]` for `L ~ N(mean, variance)`: `m·Φ(m/s) + s·φ(m/s)` with
+/// `s = √variance`, and `max(m, 0)` when the law is a point mass.
+fn gaussian_positive_part_mean(mean: f64, variance: f64) -> f64 {
+    if variance > 0.0 {
+        let sd = variance.sqrt();
+        let ratio = mean / sd;
+        (mean * normal_cdf(ratio) + sd * normal_pdf(ratio)).max(0.0)
+    } else {
+        mean.max(0.0)
+    }
+}
+
+fn predict_survival_exact_anchor_posterior_mean(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let with_uncertainty = req.with_uncertainty;
+    let (_, active_covariance, _) =
+        survival_prediction_posterior_factor(req.model, covariance_mode)?;
+    let posterior = ExactAnchorPosterior {
+        covariance: active_covariance,
+    };
+    let (mut result, moments) = predict_survival_surfaces(
+        SurvivalPredictRequest {
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+            ..req
+        },
+        covariance_mode,
+        Some(&posterior),
+    )?;
+    let moments = moments.ok_or_else(|| {
+        "internal error: the exact anchored survival pass returned no posterior moments".to_string()
+    })?;
+    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
+    Ok(result)
+}
+
+fn predict_survival_sigma_point_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
@@ -1093,16 +1518,15 @@ fn predict_survival_posterior_mean(
         covariance_mode,
     )?;
     let (n_rows, n_times) = result.survival.dim();
-    // `result` is the plug-in prediction and the loop below overwrites its
-    // surfaces with the posterior means, so the plug-in survival is taken
-    // here: one clone per call, not one per quadrature node.
-    let survival_plugin = result.survival.clone();
-    let mut survival_mean = Array2::<f64>::zeros((n_rows, n_times));
-    let mut survival_second = Array2::<f64>::zeros((n_rows, n_times));
-    let mut density_mean = Array2::<f64>::zeros((n_rows, n_times));
-    let mut hazard_mean = Array2::<f64>::zeros((n_rows, n_times));
-    let mut eta_mean = Array1::<f64>::zeros(n_rows);
-    let mut eta_second = Array1::<f64>::zeros(n_rows);
+    let mut moments = SurvivalPosteriorMoments::zeros(n_rows, n_times);
+    let SurvivalPosteriorMoments {
+        survival_mean,
+        survival_second,
+        density_mean,
+        hazard_mean,
+        eta_mean,
+        eta_second,
+    } = &mut moments;
 
     for_each_survival_posterior_node(&posterior_mean, &active_covariance, &cone_coords, |node, weight| {
         let draw_model = saved_model_with_survival_coefficients(req.model, node)?;
@@ -1153,44 +1577,7 @@ fn predict_survival_posterior_mean(
         Ok(())
     })?;
 
-    for row in 0..n_rows {
-        for time in 0..n_times {
-            let survival = survival_mean[[row, time]].clamp(0.0, 1.0);
-            let density = density_mean[[row, time]];
-            if !(density.is_finite() && density >= 0.0) {
-                return Err(SurvivalPredictError::NumericalFailure {
-                    reason: format!(
-                        "posterior survival density is invalid at row {row}, time column {time}: {density}"
-                    ),
-                });
-            }
-            result.survival[[row, time]] = survival;
-            result.cumulative_hazard[[row, time]] = -survival.ln();
-            result.hazard[[row, time]] = if survival > 0.0 {
-                density / survival
-            } else if hazard_mean[[row, time]] == 0.0 {
-                0.0
-            } else {
-                f64::INFINITY
-            };
-        }
-    }
-    result.survival_se = req.with_uncertainty.then(|| {
-        Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
-                .max(0.0)
-                .sqrt()
-        })
-    });
-    result.eta_se = req.with_uncertainty.then(|| {
-        Array1::from_shape_fn(n_rows, |row| {
-            (eta_second[row] - eta_mean[row] * eta_mean[row])
-                .max(0.0)
-                .sqrt()
-        })
-    });
-    result.covariance_source = req.with_uncertainty.then_some(covariance_mode);
-    result.survival_plugin = Some(survival_plugin);
+    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
     Ok(result)
 }
 
@@ -2141,6 +2528,18 @@ pub fn predict_survival(
     if req.estimand == SurvivalPredictEstimand::PosteriorMean {
         return predict_survival_posterior_mean(req, covariance_mode);
     }
+    predict_survival_surfaces(req, covariance_mode, None).map(|(result, _)| result)
+}
+
+/// The plug-in pass of [`predict_survival`]. With `exact_posterior` it also
+/// integrates every marginal-slope cell over the coefficient posterior, anchor
+/// re-solved at each node, from the same assembled cell the plug-in kernel
+/// evaluates, and returns those moments beside the plug-in surfaces.
+fn predict_survival_surfaces(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    exact_posterior: Option<&ExactAnchorPosterior>,
+) -> Result<(SurvivalPredictResult, Option<SurvivalPosteriorMoments>), SurvivalPredictError> {
     let SurvivalPredictRequest {
         model,
         data,
@@ -2244,6 +2643,7 @@ pub fn predict_survival(
             with_uncertainty,
             covariance_mode,
         )
+        .map(|result| (result, None))
         .map_err(SurvivalPredictError::from);
     }
     if with_uncertainty {
@@ -2395,7 +2795,7 @@ pub fn predict_survival(
     {
         // Baseline offsets at the predict-data's age_entry / age_exit. Used to
         // build the predictor's `pred_input` (which we discard) — the actual
-        // per-(row, t) offset is rebuilt inside `evaluate_marginal_slope_row`.
+        // per-(row, t) offset is rebuilt inside `marginal_slope_cell`.
         let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
             build_survival_time_offsets_for_likelihood(
                 &age_entry,
@@ -2441,6 +2841,26 @@ pub fn predict_survival(
         survival: Vec<f64>,
         cumulative_hazard: Vec<f64>,
         linear_predictor: f64,
+        /// The exact posterior moments of every time column and of the row's
+        /// exit-time cell; empty and `None` unless `exact_posterior` was given.
+        posterior_cells: Vec<ExactAnchorCellMoments>,
+        posterior_exit: Option<ExactAnchorCellMoments>,
+    }
+
+    if let (Some(posterior), Some(ctx)) = (exact_posterior, marginal_slope_ctx.as_ref()) {
+        posterior.require_rigid_coordinates(ctx)?;
+    } else if exact_posterior.is_some() {
+        let got = if joint_marginal_slope_ctx.is_some() {
+            "a marginal-slope model anchored on the joint law of several scores".to_string()
+        } else {
+            survival_likelihood_modename(saved_likelihood_mode).to_string()
+        };
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "the exact anchored survival posterior integration is defined for the \
+                 single-score marginal-slope likelihood only; got {got}"
+            ),
+        });
     }
 
     let row_results: Result<Vec<SurvivalPredictionRow>, SurvivalPredictError> = (0..n)
@@ -2458,7 +2878,9 @@ pub fn predict_survival(
             } else {
                 None
             };
-            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), SurvivalPredictError> {
+            let quadctx = gam_solve::quadrature::QuadratureContext::new();
+            type CellOutput = ((f64, f64, f64), Option<ExactAnchorCellMoments>);
+            let evaluate_at = |t_query: f64| -> Result<CellOutput, SurvivalPredictError> {
                 let t_entry = age_entry[i].min(t_query);
                 let single_entry = Array1::from_elem(1, t_entry);
                 let single_exit = Array1::from_elem(1, t_query);
@@ -2504,13 +2926,14 @@ pub fn predict_survival(
                                 &r_eta_exit,
                                 &r_deriv_exit,
                                 effective_primary_offset[i],
-                            );
+                            )
+                            .map(|plugin| (plugin, None));
                         }
                         let ctx = marginal_slope_ctx.as_ref().ok_or_else(|| {
                             "internal error: marginal-slope context missing for marginal-slope mode"
                                 .to_string()
                         })?;
-                        evaluate_marginal_slope_row(
+                        let cell = marginal_slope_cell(
                             i,
                             ctx,
                             &row_time,
@@ -2518,7 +2941,12 @@ pub fn predict_survival(
                             &r_deriv_exit,
                             effective_primary_offset[i],
                             t_query,
-                        )
+                        )?;
+                        let plugin = evaluate_marginal_slope_cell(ctx, &cell)?;
+                        let posterior = exact_posterior
+                            .map(|posterior| posterior.cell_moments(&quadctx, ctx, &cell))
+                            .transpose()?;
+                        Ok((plugin, posterior))
                     }
                     SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
                         let cov_row = cov_row.as_ref().ok_or_else(|| {
@@ -2533,6 +2961,7 @@ pub fn predict_survival(
                             r_deriv_exit[0],
                             effective_primary_offset[i],
                         )
+                        .map(|plugin| (plugin, None))
                     }
                     SurvivalLikelihoodMode::Latent
                     | SurvivalLikelihoodMode::LatentBinary
@@ -2550,34 +2979,46 @@ pub fn predict_survival(
                 survival: vec![0.0; t_cols],
                 cumulative_hazard: vec![0.0; t_cols],
                 linear_predictor: 0.0,
+                posterior_cells: Vec::new(),
+                posterior_exit: None,
             };
             if per_row_eval {
-                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                let ((eta_t, cum_t, haz_t), posterior) = evaluate_at(age_exit[i])?;
                 row.linear_predictor = eta_t;
                 row.hazard[0] = haz_t;
                 row.cumulative_hazard[0] = cum_t;
                 row.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
+                row.posterior_cells.extend(posterior);
+                row.posterior_exit = posterior;
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
                     if t_query <= 0.0 {
                         row.hazard[j] = 0.0;
                         row.cumulative_hazard[j] = 0.0;
                         row.survival[j] = 1.0;
+                        // At the time origin every coefficient draw has S = 1 and
+                        // no hazard, so the moments carry no posterior spread.
+                        if exact_posterior.is_some() {
+                            row.posterior_cells.push((1.0, 1.0, 0.0, 0.0, 0.0, 0.0));
+                        }
                     } else {
-                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        let ((_eta_t, cum_t, haz_t), posterior) = evaluate_at(t_query)?;
                         row.hazard[j] = haz_t;
                         row.cumulative_hazard[j] = cum_t;
                         row.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                        row.posterior_cells.extend(posterior);
                     }
                 }
-                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                let ((eta_t, _, _), posterior) = evaluate_at(age_exit[i])?;
                 row.linear_predictor = eta_t;
+                row.posterior_exit = posterior;
             }
             Ok(row)
         })
         .collect();
+    let row_results = row_results?;
 
-    for (i, row) in row_results?.into_iter().enumerate() {
+    for (i, row) in row_results.iter().enumerate() {
         linear_predictor[i] = row.linear_predictor;
         for j in 0..t_cols {
             hazard[[i, j]] = row.hazard[j];
@@ -2585,6 +3026,32 @@ pub fn predict_survival(
             survival[[i, j]] = row.survival[j];
         }
     }
+    let posterior_moments = exact_posterior
+        .map(|_| {
+            let mut moments = SurvivalPosteriorMoments::zeros(n, t_cols);
+            for (i, row) in row_results.iter().enumerate() {
+                let exit = row.posterior_exit.ok_or_else(|| {
+                    "internal error: exact posterior moments missing at a row's exit time"
+                        .to_string()
+                })?;
+                if row.posterior_cells.len() != t_cols {
+                    return Err(SurvivalPredictError::from(format!(
+                        "internal error: exact posterior moments cover {} of {t_cols} time columns at row {i}",
+                        row.posterior_cells.len()
+                    )));
+                }
+                moments.eta_mean[i] = exit.4;
+                moments.eta_second[i] = exit.5;
+                for (j, cell) in row.posterior_cells.iter().enumerate() {
+                    moments.survival_mean[[i, j]] = cell.0;
+                    moments.survival_second[[i, j]] = cell.1;
+                    moments.density_mean[[i, j]] = cell.2;
+                    moments.hazard_mean[[i, j]] = cell.3;
+                }
+            }
+            Ok(moments)
+        })
+        .transpose()?;
 
     let times_out: Vec<f64> = if per_row_eval {
         age_exit.to_vec()
@@ -2592,19 +3059,22 @@ pub fn predict_survival(
         eval_times
     };
 
-    Ok(SurvivalPredictResult {
-        times: times_out,
-        hazard,
-        survival,
-        cumulative_hazard,
-        linear_predictor,
-        likelihood_mode: saved_likelihood_mode,
-        survival_se: None,
-        eta_se: None,
-        covariance_source: None,
-        // This IS the plug-in prediction; `survival` carries it.
-        survival_plugin: None,
-    })
+    Ok((
+        SurvivalPredictResult {
+            times: times_out,
+            hazard,
+            survival,
+            cumulative_hazard,
+            linear_predictor,
+            likelihood_mode: saved_likelihood_mode,
+            survival_se: None,
+            eta_se: None,
+            covariance_source: None,
+            // This IS the plug-in prediction; `survival` carries it.
+            survival_plugin: None,
+        },
+        posterior_moments,
+    ))
 }
 
 pub fn predict_competing_risks_survival(
@@ -3225,6 +3695,9 @@ struct MarginalSlopePredictContext {
     /// Per-row noise offset, mirroring the `pred_input.offset_noise` slice
     /// used by the CLI.
     noise_offset: Array1<f64>,
+    /// Per-row scaled context covariates a local latent law is replayed from
+    /// (gam#2926); `None` for every other law.
+    local_law_conditioning: Option<Array2<f64>>,
 }
 
 fn design_row_owned(
@@ -3292,6 +3765,13 @@ fn build_marginal_slope_predict_context(
     };
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
+    let local_law_conditioning =
+        crate::inference::predict_input::build_marginal_slope_local_auxiliary_matrix(
+            model, data, col_map,
+        )
+        .map_err(|error| SurvivalPredictError::InvalidInput {
+            reason: error.to_string(),
+        })?;
     let (predictor, _pred_input, _predictor_fit) = build_saved_survival_marginal_slope_predictor(
         model,
         &fit_saved,
@@ -3305,6 +3785,7 @@ fn build_marginal_slope_predict_context(
         derivative_offset_exit,
         primary_offset,
         &effective_noise_offset,
+        local_law_conditioning.clone(),
     )?;
 
     let blocks = &fit_saved.blocks;
@@ -3339,6 +3820,7 @@ fn build_marginal_slope_predict_context(
         cov_eta,
         z_raw,
         noise_offset: effective_noise_offset,
+        local_law_conditioning,
     })
 }
 
@@ -3563,16 +4045,27 @@ fn evaluate_joint_marginal_slope_row(
     Ok((eta, cum, haz))
 }
 
-/// Evaluate one (row, t) cell for the saved survival marginal-slope kernel.
-///
-/// Calls the saved [`BernoulliMarginalSlopePredictor`]
-/// (`predict_eta_and_time_tangent`) to obtain both the linear predictor `eta`
-/// and its complete time tangent
-/// `eta_t = (∂eta/∂q) q_t + (∂eta/∂b) b_t`. In rigid mode both partials have
-/// closed forms; empirical and flexible latent laws carry their exact implicit
-/// calibration pull-backs. This mirrors `compute_survival_timepoint_exact` in
-/// `survival_marginal_slope.rs`.
-fn evaluate_marginal_slope_row(
+/// One `(row, t)` cell of a saved survival marginal-slope prediction, assembled
+/// but not yet evaluated: the 1-row predictor input at `t`, both primaries' time
+/// tangents at the saved coefficients, and the design rows those tangents are
+/// linear in.
+struct MarginalSlopeCell {
+    /// The q-design row `[time(t) | timewiggle | covariates]`, the slope row
+    /// `b(t)`, both offsets and the row's latent score.
+    input: PredictInput,
+    /// `q′(t)`, the timewiggle chain included.
+    q_t: f64,
+    /// `b′(t)`; `0` for a slope that is constant within a person.
+    b_t: f64,
+    /// `∂q′(t)/∂β_time` over the base time columns: all of `q′(t)`'s dependence
+    /// on the coefficients when the model carries no timewiggle.
+    time_derivative_row: Array1<f64>,
+    /// `∂b′(t)/∂β_slope`; `None` for a slope that is constant within a person.
+    slope_tangent_row: Option<Array1<f64>>,
+}
+
+/// Assemble one (row, t) cell for the saved survival marginal-slope kernel.
+fn marginal_slope_cell(
     row_index: usize,
     ctx: &MarginalSlopePredictContext,
     row_time: &SurvivalTimeBuildOutput,
@@ -3580,7 +4073,7 @@ fn evaluate_marginal_slope_row(
     r_deriv_exit: &Array1<f64>,
     primary_offset_row: f64,
     evaluation_time: f64,
-) -> Result<(f64, f64, f64), SurvivalPredictError> {
+) -> Result<MarginalSlopeCell, SurvivalPredictError> {
     let beta_time = &ctx.beta_time;
     let p_time_base = row_time.x_exit_time.ncols();
     let p_timewiggle = ctx
@@ -3687,7 +4180,7 @@ fn evaluate_marginal_slope_row(
     // evaluated at rather than frozen at the row's own exit time. Reading the
     // exit-time row here would return `S(t)` computed with `b(t_exit)` — a
     // different model at every point of the curve except one.
-    let (slope_row, slope_tangent) = match ctx.slope_time_basis.as_ref() {
+    let (slope_row, slope_tangent, slope_tangent_row) = match ctx.slope_time_basis.as_ref() {
         None => (
             design_row_owned(
                 &ctx.slope_design,
@@ -3695,6 +4188,7 @@ fn evaluate_marginal_slope_row(
                 "survival marginal slope row",
             )?,
             0.0,
+            None,
         ),
         Some(time_basis) => {
             let cov_row = design_row_owned(
@@ -3720,7 +4214,7 @@ fn evaluate_marginal_slope_row(
                 "survival marginal slope tangent row at t",
             )?;
             let tangent = derivative.dot(&ctx.beta_slope);
-            (value, tangent)
+            (value, tangent, Some(derivative))
         }
     };
     let mut slope_design_2d = Array2::<f64>::zeros((1, slope_row.len()));
@@ -3734,18 +4228,48 @@ fn evaluate_marginal_slope_row(
         )),
         offset_noise: Some(Array1::from_elem(1, ctx.noise_offset[row_index])),
         auxiliary_scalar: Some(Array1::from_elem(1, ctx.z_raw[row_index])),
-        auxiliary_matrix: None,
+        // gam#2926: the row's context covariates, so a local latent law is
+        // replayed for this cell exactly as for the whole table.
+        auxiliary_matrix: ctx
+            .local_law_conditioning
+            .as_ref()
+            .map(|conditioning| conditioning.slice(s![row_index..row_index + 1, ..]).to_owned()),
     };
+    Ok(MarginalSlopeCell {
+        input: pred_input,
+        q_t: qd_with_wiggle,
+        b_t: slope_tangent,
+        time_derivative_row: design_row_owned(
+            &row_time.x_derivative_time,
+            0,
+            "survival marginal time derivative row",
+        )?,
+        slope_tangent_row,
+    })
+}
 
+/// Evaluate one (row, t) cell for the saved survival marginal-slope kernel.
+///
+/// Calls the saved [`BernoulliMarginalSlopePredictor`]
+/// (`predict_eta_and_time_tangent`) to obtain both the linear predictor `eta`
+/// and its complete time tangent
+/// `eta_t = (∂eta/∂q) q_t + (∂eta/∂b) b_t`. In rigid mode both partials have
+/// closed forms; empirical and flexible latent laws carry their exact implicit
+/// calibration pull-backs. This mirrors `compute_survival_timepoint_exact` in
+/// `survival_marginal_slope.rs`.
+fn evaluate_marginal_slope_cell(
+    ctx: &MarginalSlopePredictContext,
+    cell: &MarginalSlopeCell,
+) -> Result<(f64, f64, f64), SurvivalPredictError> {
     // Exact IFT pull-back: the predictor consumes both moving primary
     // coordinates. The slope margin contributes even when q is locally flat:
     // `eta_t = eta_q q_t + eta_b b_t`.
     let (eta_arr, eta_t_arr) = ctx
         .predictor
         .predict_eta_and_time_tangent(
-            &pred_input,
-            &Array1::from_elem(1, qd_with_wiggle),
-            &Array1::from_elem(1, slope_tangent),
+            &cell.input,
+            &Array1::from_elem(1, cell.q_t),
+            &Array1::from_elem(1, cell.b_t),
         )
         .map_err(|e| format!("saved survival marginal-slope predictor replay failed: {e}"))?;
     let eta = eta_arr[0];
@@ -4503,7 +5027,19 @@ fn predict_survival_location_scale_batch(
         }
         qdot *= &(derivative_basis.dot(&beta_wiggle) + 1.0);
     }
-    let eta_derivative_full = hdot + qdot;
+    // The scale divides the time transform too (#2695):
+    // `g = e^{−η_σ}·(ḣ − h·η_σ') + qdot`, with `h` the same exit-time channel
+    // the predicted residual reads.
+    let h_exit = location_scale_time_warp_components(
+        &pred_input.x_time_exit,
+        &pred_input.eta_time_offset_exit,
+        time_wiggle_knots.as_ref(),
+        time_wiggle_degree,
+        time_wiggle_ncols,
+        &saved_fit,
+    )?
+    .h;
+    let eta_derivative_full = &inv_sigma * &(&hdot - &(&h_exit * &eta_log_sigma_derivative)) + qdot;
     if eta_derivative_full
         .iter()
         .any(|value| !(value.is_finite() && *value > 0.0))
@@ -5150,6 +5686,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
     derivative_offset_exit: &Array1<f64>,
     primary_offset: &Array1<f64>,
     noise_offset: &Array1<f64>,
+    local_law_conditioning: Option<Array2<f64>>,
 ) -> Result<
     (
         BernoulliMarginalSlopePredictor,
@@ -5399,6 +5936,9 @@ pub fn build_saved_survival_marginal_slope_predictor(
         LatentConditioningSpan::PrimaryDesignTail {
             ncols: cov_design.ncols(),
         },
+        // The residual repair block (gam#2924) is a Bernoulli-only block until
+        // the survival kernel takes it (gam#2923).
+        None,
     )?;
 
     let pred_input = PredictInput {
@@ -5407,7 +5947,9 @@ pub fn build_saved_survival_marginal_slope_predictor(
         design_noise: Some(slope_design.clone()),
         offset_noise: Some(noise_offset.clone()),
         auxiliary_scalar: Some(z.clone()),
-        auxiliary_matrix: None,
+        // gam#2926: a local latent law is replayed from the context covariates
+        // of the prediction rows, exactly as the Bernoulli predictor replays it.
+        auxiliary_matrix: local_law_conditioning,
     };
 
     Ok((predictor, pred_input, predictor_fit))
@@ -5775,6 +6317,8 @@ mod tests {
             latent_z_calibration: None,
             latent_z_conditional_calibration: None,
             latent_conditioning_span: LatentConditioningSpan::PrimaryDesign,
+            residual_repair: None,
+            beta_residual: None,
         };
         let z = 1.1;
         let q = 0.8;

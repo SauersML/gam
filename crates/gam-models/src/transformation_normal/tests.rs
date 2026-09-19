@@ -34,9 +34,15 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     let theta = array![0.5];
     let value_only = gam_problem::EvalMode::ValueOnly;
     let with_gradient = gam_problem::EvalMode::ValueAndGradient;
+    let signals = crate::exact_mode_branch::OuterWalkSignals::default();
+    let accept_step = || {
+        signals
+            .accepted_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
 
     // No mode exists yet: the only candidate is a cold solve.
-    let mut state = ExactCoefficientModeBranch::default();
+    let mut state = ExactCoefficientModeBranch::new(signals.clone());
     let (first_iterate, candidates) = state.candidates(value_only, &theta, &rho);
     assert!(!first_iterate);
     assert_eq!(candidates.len(), 1);
@@ -76,12 +82,14 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
         "an outer-cache seed must not displace the mode this walk certified"
     );
 
-    // The next accepted iterate moves the anchor with the walk; a
-    // derivative-bearing evaluation that did not converge does not.
+    // The next accepted iterate moves the anchor with the walk once the
+    // optimizer reports its step accepted; a derivative-bearing evaluation that
+    // did not converge never does.
     state.record_value(with_gradient, &theta, warm(7.0), false);
     let (_, candidates) = state.candidates(value_only, &theta, &rho);
     assert_eq!(anchor_beta(&candidates), 3.0);
     state.record_value(with_gradient, &theta, warm(8.0), true);
+    accept_step();
     let (_, candidates) = state.candidates(value_only, &theta, &rho);
     assert_eq!(anchor_beta(&candidates), 8.0);
 
@@ -90,6 +98,7 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     // anchor: a multi-start's terminal certification re-evaluates its winner.
     let later_theta = array![-1.5];
     state.record_value(with_gradient, &later_theta, warm(10.0), true);
+    accept_step();
     let (_, candidates) = state.candidates(with_gradient, &theta, &rho);
     assert_eq!(
         anchor_beta(&candidates),
@@ -100,11 +109,108 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     assert_eq!(anchor_beta(&candidates), 10.0, "a θ no iterate owns starts from the anchor");
 
     // A branch that has never seen a mode solves cold at its first iterate.
-    let mut cold = ExactCoefficientModeBranch::default();
+    let mut cold =
+        ExactCoefficientModeBranch::new(crate::exact_mode_branch::OuterWalkSignals::default());
     let (first_iterate, candidates) = cold.candidates(with_gradient, &theta, &rho);
     assert!(first_iterate);
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_none());
+}
+
+/// #2973: the Strong-Wolfe line search evaluates the gradient at every trial that
+/// clears Armijo (#2613), so a derivative-bearing evaluation is not an accepted
+/// iterate. A trial the optimizer has not accepted must leave the anchor where the
+/// walk's accepted iterate put it; otherwise it chooses the basin of every later
+/// probe, and one outer point publishes two certified modes by probe order.
+#[test]
+pub(crate) fn a_gradient_bearing_trial_the_optimizer_did_not_accept_leaves_the_anchor_2973() {
+    let warm = |value: f64| {
+        CustomFamilyWarmStart::from_cached_beta(&[1], &array![value])
+            .expect("one-coefficient mode seed")
+    };
+    let anchor_beta = |candidates: &[Option<CustomFamilyWarmStart>]| {
+        candidates
+            .first()
+            .and_then(Option::as_ref)
+            .expect("a compatible anchor mode")
+            .block_beta_view(0)
+            .expect("one coefficient")[0]
+    };
+    let rho = Array1::zeros(0);
+    let with_gradient = gam_problem::EvalMode::ValueAndGradient;
+    let value_only = gam_problem::EvalMode::ValueOnly;
+    let signals = crate::exact_mode_branch::OuterWalkSignals::default();
+    let accept_step = || {
+        signals
+            .accepted_steps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let reset_walk = || {
+        signals
+            .walk_resets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let mut state = ExactCoefficientModeBranch::new(signals.clone());
+
+    // The walk's starting iterate anchors at once.
+    state.record_value(with_gradient, &array![0.0], warm(1.0), true);
+    let (_, candidates) = state.candidates(value_only, &array![0.1], &rho);
+    assert_eq!(anchor_beta(&candidates), 1.0);
+
+    // Two gradient-bearing trials land in another basin and the optimizer accepts
+    // neither: every later probe still starts from the accepted iterate's mode.
+    state.record_value(with_gradient, &array![0.2], warm(-1.0), true);
+    let (_, candidates) = state.candidates(value_only, &array![0.3], &rho);
+    assert_eq!(
+        anchor_beta(&candidates),
+        1.0,
+        "an unaccepted gradient-bearing trial must not choose the next probe's basin"
+    );
+    state.record_value(with_gradient, &array![0.4], warm(-2.0), true);
+    let (_, candidates) = state.candidates(with_gradient, &array![0.5], &rho);
+    assert_eq!(anchor_beta(&candidates), 1.0);
+
+    // A trial that did not converge leaves the pending trial in place, and the
+    // accepted step promotes the latest converged trial, which is the accepted
+    // iterate's own evaluation.
+    state.record_value(with_gradient, &array![0.6], warm(-9.0), false);
+    accept_step();
+    let (_, candidates) = state.candidates(value_only, &array![0.7], &rho);
+    assert_eq!(anchor_beta(&candidates), -2.0);
+    let (_, candidates) = state.candidates(with_gradient, &array![0.4], &rho);
+    assert_eq!(
+        anchor_beta(&candidates),
+        -2.0,
+        "the accepted iterate is keyed at its own θ"
+    );
+
+    // A walk that ends on an accepted step keeps that iterate's mode across the
+    // reset the driver fires before terminal certification, so the winning θ is
+    // solved from its own mode, not from the iterate before it.
+    state.record_value(with_gradient, &array![0.8], warm(5.0), true);
+    accept_step();
+    reset_walk();
+    let (_, candidates) = state.candidates(with_gradient, &array![0.8], &rho);
+    assert_eq!(
+        anchor_beta(&candidates),
+        5.0,
+        "the terminal certification must start from the final accepted iterate's mode"
+    );
+    state.record_value(with_gradient, &array![0.8], warm(5.0), true);
+
+    // A reset drops a trial its walk never accepted, and the next walk's starting
+    // iterate anchors at once.
+    state.record_value(with_gradient, &array![0.85], warm(6.0), true);
+    reset_walk();
+    let (_, candidates) = state.candidates(value_only, &array![0.9], &rho);
+    assert_eq!(
+        anchor_beta(&candidates),
+        5.0,
+        "a trial pending across a walk reset must not anchor"
+    );
+    state.record_value(with_gradient, &array![3.0], warm(7.0), true);
+    let (_, candidates) = state.candidates(value_only, &array![3.1], &rho);
+    assert_eq!(anchor_beta(&candidates), 7.0, "the new walk's starting iterate anchors at once");
 }
 
 pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {

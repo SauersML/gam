@@ -21,7 +21,7 @@ The runner is:
 (N, 3)
 >>> result.T_free.shape
 (N, 3)
->>> result.evidence  # higher = better (Laplace-style log marginal-likelihood proxy)
+>>> result.profile_log_likelihood  # higher = better at fixed weights; not evidence
 
 If any precondition of the theorem fails, the corresponding warning is emitted
 via :mod:`warnings.warn` as ``UserWarning`` and recorded in
@@ -312,10 +312,11 @@ class IdentifiableFactorFitResult:
         Lachapelle 2401.04890 theorem up to permutation + signed scaling
         when the decoder Jacobian on these columns is full rank and the
         sparsity penalty is active.
-    evidence : float
-        Laplace-style log marginal-likelihood proxy
-        ``-0.5 * N * log(RSS/N) - 0.5 * total_penalty``. Higher is better.
-        Sign convention matches "log evidence", not "negative log evidence".
+    profile_log_likelihood : float
+        Penalized Gaussian profile log-likelihood at the fitted penalty weights,
+        ``-0.5 * N * log(RSS/N) - 0.5 * total_penalty``. Higher is better. No
+        log-determinant or Occam term enters, so it is not a marginal likelihood
+        and does not price model complexity.
     decoder : np.ndarray, shape ``(P, n_supervised + n_free)``
         Linear decoder ``X_hat = T @ decoder.T``.
     aux_prior_weight : float
@@ -337,7 +338,7 @@ class IdentifiableFactorFitResult:
 
     T_supervised: np.ndarray
     T_free: np.ndarray
-    evidence: float
+    profile_log_likelihood: float
     decoder: np.ndarray
     aux_prior_weight: float
     mech_sparsity_weight: float
@@ -596,7 +597,7 @@ def _one_fit(
 
         # Total surrogate loss: recon has direct autograd; the two penalty
         # surrogates have value-matched gradients (Rust-analytic) but their
-        # numeric value is replaced below for evidence reporting.
+        # numeric value is replaced below for the profile log-likelihood.
         loss = recon + aux_surrogate + mech_surrogate
         loss.backward()
         optim.step()
@@ -604,9 +605,10 @@ def _one_fit(
         rss = float(recon.detach().cpu().item())
         total_pen = float(aux_val) + float(mech_val)
 
-    # Final-pass true (RSS, penalty) used by the scalar Rust evidence
-    # primitive. Hyperparameter selection is not inferred from these two
-    # numbers; they describe this fixed-weight converged fit only.
+    # Final-pass true (RSS, penalty) used by the scalar Rust profile
+    # log-likelihood primitive. Hyperparameter selection is not inferred
+    # from these two numbers; they describe this fixed-weight converged fit
+    # only.
     with torch.no_grad():
         t = encoder(x_t)
         t_sup = t[:, :n_supervised]
@@ -653,8 +655,8 @@ def identifiable_factor_fit(
     auxiliary-conditional prior; ``T_free`` is unsupervised and constrained
     by a mechanism-sparsity penalty on its decoder rows. Both penalty
     weights default to the calibrated recipe weights owned by Rust. The
-    resulting single fit is scored with a Laplace-style log
-    marginal-likelihood proxy.
+    resulting single fit is scored by its Gaussian profile log-likelihood at
+    the fitted weights, which is not a marginal likelihood.
 
     Parameters
     ----------
@@ -680,17 +682,20 @@ def identifiable_factor_fit(
     Returns
     -------
     :class:`IdentifiableFactorFitResult`
-        Fitted latents, evidence, decoder, final weights, and a list of
-        precondition warnings (empty if the identifiability theorems'
-        preconditions all hold).
+        Fitted latents, profile log-likelihood, decoder, final weights, and a
+        list of precondition warnings (empty if the identifiability
+        theorems' preconditions all hold).
 
     Notes
     -----
-    The ``evidence`` sign convention is "log evidence" — *higher is better*.
-    The proxy is approximate: REML wiring for arbitrary custom torch
-    encoders is not yet plumbed through the Rust engine, so the default
-    weights are calibrated recipe weights; the Laplace proxy is not an exact
-    REML selector like the one :func:`gamfit.fit` uses for formula-based
+    ``profile_log_likelihood`` is, up to an additive constant, the Gaussian
+    log-likelihood of this fixed-weight fit with the noise scale profiled
+    out, minus half the penalty; *higher is better*. It has no
+    log-determinant or Occam term, so it is not a marginal likelihood or
+    evidence and does not price model complexity. REML wiring for arbitrary
+    custom torch encoders is not yet plumbed through the Rust engine, so the
+    default weights are calibrated recipe weights rather than the output of
+    a REML selector like the one :func:`gamfit.fit` uses for formula-based
     smooths.
     """
 
@@ -719,8 +724,8 @@ def identifiable_factor_fit(
     # Score this one converged fixed-weight fit. The Rust boundary is scalar on
     # purpose: a 1x1 "grid" is not hyperparameter selection, and sampled
     # surfaces cannot certify a continuous two-log-weight optimum.
-    evidence = float(
-        rust_module().identifiable_factor_log_evidence(
+    profile_log_likelihood = float(
+        rust_module().identifiable_factor_profile_log_likelihood(
             float(rss_val),
             float(pen_val),
             int(x_t.shape[0]),
@@ -754,7 +759,7 @@ def identifiable_factor_fit(
     result = IdentifiableFactorFitResult(
         T_supervised=t_sup_np,
         T_free=t_free_np,
-        evidence=float(evidence),
+        profile_log_likelihood=float(profile_log_likelihood),
         decoder=decoder_w,
         aux_prior_weight=float(aux_w),
         mech_sparsity_weight=float(mech_w),

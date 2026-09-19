@@ -1828,6 +1828,9 @@ impl SaeManifoldTerm {
             // so this cannot silently stop covering the operator if a field is
             // added to it.
             let htbeta_fingerprint = kron.content_fingerprint();
+            // #2627 — the operator's declaration: per-row norm bounds from its own entries
+            // and the apply depth from its loop structure.
+            let htbeta_declaration = kron.htbeta_declaration();
             sys.set_row_htbeta_operator_with_fingerprint(
                 move |row_idx, x, out| {
                     // out = L_i · M_n · (J_β · x). Allocate a length-p scratch
@@ -1868,6 +1871,7 @@ impl SaeManifoldTerm {
                     kron_t.apply_output_metric_row(row_idx, &mut u_p);
                     kron_t.scatter_jbeta_t(row_idx, &u_p, out_slice);
                 },
+                htbeta_declaration,
                 htbeta_fingerprint,
             );
         }

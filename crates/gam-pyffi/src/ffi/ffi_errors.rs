@@ -641,6 +641,7 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // (resume from the carried checkpoint / loosen the outer tolerance) is
         // the same across these lanes.
         EstimationError::RemlDidNotConverge { .. } => RemlConvergenceError::new_err(message),
+        EstimationError::DominatedCertifiedPlateau { .. } => RemlConvergenceError::new_err(message),
         EstimationError::BlockOrthogonalRemlDidNotConverge { .. } => {
             RemlConvergenceError::new_err(message)
         }
@@ -688,6 +689,16 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // holding is an outer non-convergence, and the remedy (reseed, widen
         // the window, loosen the outer tolerance) is the REML one.
         EstimationError::TrialPointRefused { .. } => RemlConvergenceError::new_err(message),
+        // A rho-local stage of the #784 block quadrature correction reaches Python only when the
+        // outer search found no rho it could evaluate, which is an outer non-convergence like
+        // `TrialPointRefused`. A corrector that breaks its moment contract is an engine invariant.
+        EstimationError::BlockQuadratureCorrectionRefused { stage } => {
+            if stage.is_trial_point_local() {
+                RemlConvergenceError::new_err(message)
+            } else {
+                FitInvariantError::new_err(message)
+            }
+        }
         EstimationError::OuterObjectiveEvaluationFailed { source, .. } => {
             if let Some(source) = source.estimation_error() {
                 estimation_error_to_pyerr_with_message(source, message)
@@ -1255,7 +1266,7 @@ mod fit_failure_dispatch_tests {
             ));
             assert!(integration.is_instance_of::<IntegrationError>(py));
 
-            let prose = raise(FitFailure::from("a helper's prose".to_string()));
+            let prose = raise(FitFailure::unclassified("a helper's prose"));
             assert!(prose.is_instance_of::<FitError>(py));
             for subclass_check in [
                 prose.is_instance_of::<FitConvergenceError>(py),

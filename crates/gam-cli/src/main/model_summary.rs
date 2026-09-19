@@ -29,7 +29,7 @@ pub(crate) fn build_model_summary(
     let display_uncertainty = fit.display_coefficient_uncertainty();
     let se = display_uncertainty
         .as_ref()
-        .map(|view| view.standard_errors);
+        .map(|view| &view.standard_errors);
     // Wood (2013) design-whitening metric for the Wald smooth test (#2142):
     // the exact weighted Gram `X'WX` when the inference block is present, else
     // the unweighted `X'X` from the summary design (here the real training
@@ -398,6 +398,15 @@ pub(crate) fn covariance_provenance_note(
     }
 }
 
+/// The line a prediction prints when its posterior-mean point integrates a
+/// covariance the fit withheld (gam#2985), so the note reaches the reader beside
+/// the output it qualifies.
+pub(crate) fn point_covariance_provenance_line(
+    provenance: Option<&gam_predict::PointCovarianceProvenance>,
+) -> Option<String> {
+    provenance.map(|provenance| format!("note: {}", provenance.explain()))
+}
+
 pub(crate) fn response_interval_from_mean_sd(
     mean: ArrayView1<'_, f64>,
     response_sd: ArrayView1<'_, f64>,
@@ -551,5 +560,31 @@ mod per_term_edf_tests {
             "Σ per-term EDF (smooth {per_term_sum} + parametric {parametric_dof} = {reconstructed}) \
              must match model total EDF ({edf_total}) within tolerance"
         );
+    }
+}
+
+#[cfg(test)]
+mod point_covariance_provenance_tests {
+    use super::*;
+
+    /// gam#2985: `gam predict` prints this line after the predictions it
+    /// qualifies whenever the resolved columns carry a provenance (the columns'
+    /// half is pinned in gam-predict), and prints nothing extra otherwise.
+    #[test]
+    fn a_withheld_fit_prints_its_point_provenance_2985() {
+        let declined = gam::estimate::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        let provenance =
+            gam_predict::PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined };
+        let line = point_covariance_provenance_line(Some(&provenance))
+            .expect("a withheld fit's prediction prints a note");
+        assert!(
+            line.starts_with("note: posterior mean conditional on the fitted latent law")
+                && line.contains("the pin's missing channel"),
+            "the note names what the point is conditional on and why: {line}"
+        );
+        assert_eq!(point_covariance_provenance_line(None), None);
     }
 }

@@ -281,13 +281,17 @@ fn root_scale_hessian_operator_inner(
 
     // ── The penalty half. `CanonicalPenalty::root` is `rank × block_dim` with
     //    `S_k = rootᵀroot`, so `√λ_k · root` is exactly the block of `B` that
-    //    contributes `λ_k S_k`.
+    //    contributes `λ_k S_k`. Its rows are recorded so each penalty's leverage
+    //    can be read off the root's left singular vectors below.
+    let mut penalty_rows: Vec<Option<(std::ops::Range<usize>, f64)>> =
+        Vec::with_capacity(inputs.penalties.len());
     for (k, penalty) in inputs.penalties.iter().enumerate() {
         let lambda = inputs.lambdas[k];
         if !(lambda.is_finite() && lambda >= 0.0) {
             return Err(format!("penalty {k} carries lambda={lambda}"));
         }
         if lambda == 0.0 {
+            penalty_rows.push(None);
             continue;
         }
         let start = penalty.col_range.start;
@@ -300,6 +304,7 @@ fn root_scale_hessian_operator_inner(
             ));
         }
         let scale = lambda.sqrt();
+        let first_row = rows.len();
         for r in 0..penalty.root.nrows() {
             let mut row = Array1::<f64>::zeros(p);
             for (local, global) in (start..end).enumerate() {
@@ -307,6 +312,7 @@ fn root_scale_hessian_operator_inner(
             }
             rows.push(row);
         }
+        penalty_rows.push(Some((first_row..rows.len(), lambda)));
     }
 
     if rows.len() < p {
@@ -349,8 +355,8 @@ fn root_scale_hessian_operator_inner(
         ));
     }
 
-    let (_, singular, vectors_t) = stacked
-        .svd(false, true)
+    let (left, singular, vectors_t) = stacked
+        .svd(true, true)
         .map_err(|_| "the stacked-root SVD did not converge".to_string())?;
     if singular.len() < p {
         return Err(format!(
@@ -404,7 +410,23 @@ fn root_scale_hessian_operator_inner(
              {root_band:.3e})"
         );
     }
-    DenseSpectralOperator::from_eigenpairs(
+    // ── Each penalty's leverage on every mode (#2959 D2). With `B = UΣVᵀ` and
+    //    `B_k = √λ_k·R_k` the penalty's rows, `B_k v_j = σ_j·U_k[:, j]`, so
+    //    `v_jᵀ λ_k S_k v_j / σ_j² = ‖U_k[:, j]‖²`: the per-mode term of
+    //    `tr(H⁻¹ λ_k S_k)`. Read from `U`, it is accurate to the SVD's own
+    //    `ε·‖B‖/gap`. Formed from `v_j` it is not: `v_j`'s error enters through
+    //    `√λ_k·R_k` and is divided by `σ_j`, so a railed `λ_k` beside a small
+    //    `σ_j` amplifies it by `√λ_k·‖R_k‖/σ_j`.
+    let left = left.ok_or_else(|| "root SVD omitted requested left vectors".to_string())?;
+    let leverage = penalty_rows
+        .into_iter()
+        .map(|rows| {
+            rows.map(|(range, lambda)| {
+                (left.slice(ndarray::s![range, ..p]).to_owned(), lambda)
+            })
+        })
+        .collect();
+    Ok(DenseSpectralOperator::from_eigenpairs(
         singular.mapv(|sigma| sigma * sigma),
         vectors_t
             .ok_or_else(|| "root SVD omitted requested right vectors".to_string())?
@@ -412,7 +434,8 @@ fn root_scale_hessian_operator_inner(
             .to_owned(),
         mode,
         None,
-    )
+    )?
+    .with_root_penalty_leverage(leverage))
 }
 
 #[cfg(test)]
@@ -447,6 +470,103 @@ mod tests {
         }
         q
     }
+
+    /// #2959 D2: a root-priced operator reads its penalty trace `tr(H⁻¹·λS)` off the
+    /// root's left singular vectors, and only at the `λ` the root was taken at. With a
+    /// penalty railed at `λ = 3e7` beside two small data modes (3e-6, 3e-7) in its
+    /// null space, the terms agree with the closed form `Σ_i λ·d_i / (g_i + λ·d_i)`
+    /// (`H` and the penalty share one eigenbasis) to the SVD's own subspace error.
+    /// The fixture where the eigenvector route fails is the real one, pinned by
+    /// gam-models' `a_root_priced_rho_gradient_matches_its_value_2959`.
+    #[test]
+    fn a_root_priced_penalty_trace_is_read_off_the_left_singular_vectors_2959() {
+        use super::super::reml_outer_engine::HessianFactorization;
+        let p = 4usize;
+        let q = dense_orthogonal(p);
+        let rotate = |d: &[f64]| -> Array2<f64> {
+            let mut m = Array2::<f64>::zeros((p, p));
+            for (i, &di) in d.iter().enumerate() {
+                for r in 0..p {
+                    for c in 0..p {
+                        m[[r, c]] += di * q[[r, i]] * q[[c, i]];
+                    }
+                }
+            }
+            let mt = m.t().to_owned();
+            m += &mt;
+            m *= 0.5;
+            m
+        };
+        let d_pen: [f64; 4] = [1.0, 0.6, 0.0, 0.0];
+        let d_data: [f64; 4] = [100.0, 30.0, 3.0e-6, 3.0e-7];
+        let lambda = 3.0e7_f64;
+        let mut x = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            let scale = d_data[i].sqrt();
+            for c in 0..p {
+                x[[i, c]] = scale * q[[c, i]];
+            }
+        }
+        let weights = Array1::<f64>::ones(p);
+        let mut penalty_root = Array2::<f64>::zeros((2, p));
+        for i in 0..2 {
+            let scale = d_pen[i].sqrt();
+            for c in 0..p {
+                penalty_root[[i, c]] = scale * q[[c, i]];
+            }
+        }
+        let penalty = CanonicalPenalty::from_dense_root(penalty_root.clone(), p);
+        let h = rotate(&d_data) + rotate(&d_pen).mapv(|v| v * lambda);
+        let exact: f64 = (0..p)
+            .map(|i| lambda * d_pen[i] / (d_data[i] + lambda * d_pen[i]))
+            .sum();
+        let design = gam_linalg::matrix::DesignMatrix::from(x);
+        let inputs = HessianRootInputs {
+            design: &design,
+            weights: weights.view(),
+            penalties: std::slice::from_ref(&penalty),
+            lambdas: &[lambda],
+        };
+        let operator = root_scale_hessian_operator_for_refused_assembly(
+            &inputs,
+            &h,
+            PseudoLogdetMode::PositiveDefinite,
+        )
+        .expect("the root reproduces H and resolves every mode");
+        let from_left = operator
+            .root_penalty_mode_terms(0, lambda)
+            .expect("a root-priced operator carries the penalty's left-singular rows")
+            .sum();
+        let scaled_root = penalty_root.mapv(|v| v * lambda.sqrt());
+        let from_eigenvectors = operator.trace_logdet_block_root(scaled_root.view(), 0, p);
+        // Wedin: the SVD perturbs each singular subspace by at most
+        // `max(m, p)·ε·σ_max / gap`, and the trace is a sum of `rank` squared
+        // row norms of an orthonormal block.
+        let sigma: Vec<f64> = (0..p)
+            .map(|i| (d_data[i] + lambda * d_pen[i]).sqrt())
+            .collect();
+        let sigma_max = sigma.iter().fold(0.0_f64, |acc, &s| acc.max(s));
+        let gap_min = (0..p)
+            .flat_map(|i| (0..p).filter(move |&j| j != i).map(move |j| (i, j)))
+            .map(|(i, j)| (sigma[i] - sigma[j]).abs())
+            .fold(f64::INFINITY, f64::min);
+        let rows = p + 2;
+        let subspace = (rows.max(p) as f64) * f64::EPSILON * sigma_max / gap_min;
+        let bound = 2.0 * 2.0_f64.sqrt() * (p as f64).sqrt() * subspace;
+        assert!(
+            (from_left - exact).abs() <= bound,
+            "left-singular trace {from_left:.15e} against exact {exact:.15e}: gap {:.3e}, bound {bound:.3e}",
+            (from_left - exact).abs()
+        );
+        assert!(
+            (from_eigenvectors - exact).abs() <= bound,
+            "the eigenvector route on this well-separated fixture: gap {:.3e}, bound {bound:.3e}",
+            (from_eigenvectors - exact).abs()
+        );
+        // A different λ than the root was taken at reads no left-singular terms.
+        assert!(operator.root_penalty_mode_terms(0, 2.0 * lambda).is_none());
+    }
+
 
     /// #2644. `log|H|` must be priced from a ROOT of `XᵀWX + λS + δI`, not from
     /// the assembled matrix's spectrum, once `κ(H)` passes what `ε·κ` can

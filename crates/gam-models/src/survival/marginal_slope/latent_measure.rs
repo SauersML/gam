@@ -37,13 +37,15 @@
 use super::*;
 
 use crate::bms::{
-    EmpiricalLatentMeasureSupport, LatentMeasureCalibration, LatentMeasureKind, LatentZCheckMode,
-    LatentZConditionalCalibration, build_latent_measure_decision,
+    EmpiricalLatentMeasureSupport, LatentLawConsumed, LatentMeasureCalibration, LatentMeasureKind,
+    LatentMeasureSpec, LatentZConditionalCalibration, build_latent_measure_decision,
+    estimated_latent_law,
 };
 
-/// Everything the fit and its persistence need from the automatic gate: the
-/// per-coordinate decisions, the score the gate saw *before* calibrating it, and
-/// the conditioning block it conditioned on.
+/// Everything the fit and its persistence need from the latent-law gate: the
+/// per-coordinate decisions, the law the primary score consumed, the score the
+/// gate saw *before* calibrating it, and the conditioning block it conditioned
+/// on.
 ///
 /// The raw score and the conditioning block are not diagnostics. The
 /// Murphy-Topel generated-regressor correction needs both — it differentiates
@@ -56,8 +58,19 @@ pub(crate) struct SurvivalLatentScoreCalibration {
     pub(crate) per_score: Vec<LatentMeasureCalibration>,
     /// The measure the kernel integrates against, one per latent-score column
     /// (gam#2923). `StandardNormal` is the Gaussian closed form; an empirical
-    /// kind is the declared law the anchored frame solves the identity on.
+    /// kind is the finite law the anchored frame solves the identity on.
     pub(crate) per_score_measure: Vec<LatentMeasureKind>,
+    /// Which law the PRIMARY score consumed (gam#2926), persisted with the model.
+    pub(crate) consumed: LatentLawConsumed,
+    /// Each score's estimated law on its own axis where its provisional closed
+    /// form is certified at the converged fit (gam#2926), one per column; `None`
+    /// for every other law. With one score the certificate is taken on this law;
+    /// with several it is taken on their joint law, and these are what a re-solve
+    /// persists per score.
+    pub(crate) certificate_laws: Vec<Option<crate::bms::EmpiricalZGrid>>,
+    /// With one score whose law moves on the span, the moving-law certificate's
+    /// candidates (gam#2926), taken at the converged fit; `None` otherwise.
+    pub(crate) moving_law: Option<Box<crate::bms::moving_law_rule::MovingLawCandidates>>,
     /// The (normalised, pre-calibration) latent scores the gate was handed.
     pub(crate) raw_scores: Array2<f64>,
     /// The conditioning span `a(C)` the conditional branch used, when it was
@@ -155,8 +168,9 @@ pub(crate) fn anchored_kernel_unavailable_reason(
     None
 }
 
-/// Run the automatic latent-measure gate over every latent-score coordinate and
-/// replace `spec.z` by the calibrated score in place.
+/// Run the latent-law gate over every latent-score coordinate and replace
+/// `spec.z` by the calibrated score in place (only the declared conditional
+/// location-scale law calibrates; every other law leaves the score as given).
 ///
 /// Returns one [`LatentMeasureCalibration`] per z column, in column order, for
 /// persistence: prediction MUST apply the identical map, so the fit's decision
@@ -167,41 +181,41 @@ pub(crate) fn anchored_kernel_unavailable_reason(
 ///
 /// With `K > 1` latent scores the row index is `η = q·c + Σ_k s(g_k)·z_k`, so
 /// the leakage is `Σ_k s(g_k(C))·m_k(C)` — a sum of per-coordinate conditional
-/// shifts. Under the current single global score covariance `Σ`, the
-/// K-generalisation of the correction is therefore the per-coordinate
-/// conditional standardisation on the same basis `a(C)`, after which `Σ` is
-/// recomputed from the calibrated scores by the caller. (A conditional `Σ(C)` is
-/// a different and larger question; it is gam#2766.)
+/// shifts, and each coordinate's law is judged on the same span `a(C)`. (A
+/// conditional `Σ(C)` is a different and larger question; it is gam#2766.)
 pub(crate) fn resolve_survival_latent_score_calibration(
     spec: &mut SurvivalMarginalSlopeTermSpec,
     marginal_design: &TermCollectionDesign,
+    data: ArrayView2<'_, f64>,
 ) -> Result<SurvivalLatentScoreCalibration, String> {
     // #461 seam, mirrored from BMS: when a CTN Stage-1 influence absorber is
     // active the conditional leakage is already absorbed by the absorber's own
     // orthogonalisation, and replacing z here would perturb the widened-marginal
-    // predict seam. The conditional gate is then not engaged; the pooled gates
-    // below it still are, because they are about the marginal law of z and the
-    // absorber says nothing about that.
+    // predict seam. Neither the span test nor a local law is then engaged; the
+    // pooled checks still are, because they are about the marginal law of z and
+    // the absorber says nothing about that.
     let absorber_active = spec
         .score_influence_jacobian
         .as_ref()
         .is_some_and(|jacobian| jacobian.ncols() > 0);
-    // gam#2923: the anchored frame carries an empirical latent measure; where
-    // it serves the spec the gate may fall back to one, exactly as BMS's does.
-    // An EXPLICIT request for one on a configuration the frame does not serve
-    // is refused here by its own reason rather than by the gate's generic one.
-    let explicit_empirical = spec.declared_latent_law.is_some()
-        || matches!(
+    // gam#2923/gam#2926: a declared finite law, the pooled empirical law and the
+    // location-scale law are finite laws the anchored frame carries, and the
+    // default is one only where the score's law departs from the Gaussian law.
+    // Where the frame does not serve the spec a finite law is refused by the
+    // frame's own reason, never replaced by the closed form.
+    let finite_law_requested = spec.declared_latent_law.is_some()
+        || !matches!(
             spec.latent_z_policy.latent_measure,
-            crate::bms::LatentMeasureSpec::GlobalEmpirical { .. }
+            LatentMeasureSpec::StandardNormal | LatentMeasureSpec::Auto { .. }
         );
-    let support = match anchored_kernel_unavailable_reason(spec) {
+    let frame_unavailable = anchored_kernel_unavailable_reason(spec);
+    let support = match frame_unavailable {
         None => EmpiricalLatentMeasureSupport::Available,
         Some(reason) => {
-            if explicit_empirical {
+            if finite_law_requested {
                 return Err(format!(
-                    "survival marginal-slope was asked to anchor on a declared latent law, \
-                     but {reason}"
+                    "survival marginal-slope was asked to anchor on a finite latent law, but \
+                     {reason} (gam#2926)"
                 ));
             }
             EmpiricalLatentMeasureSupport::StandardNormalOnly
@@ -222,36 +236,67 @@ pub(crate) fn resolve_survival_latent_score_calibration(
         return Ok(SurvivalLatentScoreCalibration {
             per_score: vec![LatentMeasureCalibration::None; k],
             per_score_measure: vec![kind; k],
+            consumed: LatentLawConsumed::DeclaredFiniteLaw {
+                nodes: grid.nodes.len(),
+            },
+            certificate_laws: vec![None; k],
+            moving_law: None,
             raw_scores: spec.z.clone(),
             conditioning: None,
         });
     }
+    let context_cols =
+        estimated_latent_law::marginal_formula_context_columns(&spec.marginalspec, data.ncols())?;
+    let context_features = data.select(ndarray::Axis(1), &context_cols);
+    let local_context = (!absorber_active && !context_cols.is_empty()).then(|| {
+        estimated_latent_law::LocalLawContext {
+            features: context_features.view(),
+            feature_cols: context_cols.clone(),
+        }
+    });
     let resolved = resolve_latent_score_calibration_from_parts(
         &spec.z,
         &spec.weights,
         &spec.latent_z_policy,
         absorber_active,
         &marginal_design.design,
+        local_context.as_ref(),
         support,
-    )?;
+    )
+    .map_err(|error| match frame_unavailable {
+        Some(reason) => format!("{error}; the anchored frame is unavailable here because {reason}"),
+        None => error,
+    })?;
     spec.z = resolved.calibrated_scores;
+    let consumed = resolved
+        .per_score_consumed
+        .into_iter()
+        .next()
+        .ok_or_else(|| "survival marginal-slope latent-law gate saw no score column".to_string())?;
     Ok(SurvivalLatentScoreCalibration {
         per_score: resolved.per_score,
         per_score_measure: resolved.per_score_measure,
+        consumed,
+        certificate_laws: resolved.per_score_certificate_law,
+        moving_law: resolved.moving_law,
         raw_scores: resolved.raw_scores,
         conditioning: resolved.conditioning,
     })
 }
 
-/// The gate itself, over exactly the five things it reads.
+/// The gate itself, over exactly the things it reads.
 ///
 /// Split out from the spec-shaped entry point above so it is directly
 /// exercisable: the decision is about `z`, the weights, the policy, the
-/// absorber flag and the marginal design, and nothing else about a survival term
-/// spec bears on it.
+/// absorber flag, the marginal design and the context covariates, and nothing
+/// else about a survival term spec bears on it.
 pub(crate) struct ResolvedLatentScoreCalibration {
     pub(crate) per_score: Vec<LatentMeasureCalibration>,
     pub(crate) per_score_measure: Vec<LatentMeasureKind>,
+    pub(crate) per_score_consumed: Vec<LatentLawConsumed>,
+    pub(crate) per_score_certificate_law: Vec<Option<crate::bms::EmpiricalZGrid>>,
+    /// The moving-law certificate's candidates of a single moving score.
+    pub(crate) moving_law: Option<Box<crate::bms::moving_law_rule::MovingLawCandidates>>,
     pub(crate) raw_scores: Array2<f64>,
     pub(crate) calibrated_scores: Array2<f64>,
     pub(crate) conditioning: Option<std::sync::Arc<Array2<f64>>>,
@@ -263,6 +308,7 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
     policy: &LatentZPolicy,
     absorber_active: bool,
     marginal_design: &DesignMatrix,
+    local_context: Option<&estimated_latent_law::LocalLawContext<'_>>,
     support: EmpiricalLatentMeasureSupport,
 ) -> Result<ResolvedLatentScoreCalibration, String> {
     let k = scores.ncols();
@@ -275,17 +321,30 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
 
     let mut calibrations = Vec::with_capacity(k);
     let mut measures = Vec::with_capacity(k);
+    let mut consumed = Vec::with_capacity(k);
+    let mut certificate_laws = Vec::with_capacity(k);
+    let mut moving_law = None;
     let mut calibrated_scores = scores.clone();
     for col in 0..k {
         let raw = scores.column(col).to_owned();
-        let decision = build_latent_measure_decision(
+        let mut decision = build_latent_measure_decision(
             &raw,
             weights,
             policy,
             conditioning.as_ref().map(|design| design.view()),
+            local_context,
             support,
             "survival-marginal-slope",
         )?;
+        // The moving-law certificate covers one score. With several, a moving
+        // column is routed below on the score as given (gam#2949).
+        if k >= 2 && decision.moving_law.take().is_some() {
+            decision.kind = LatentMeasureKind::StandardNormal;
+            decision.calibration = LatentMeasureCalibration::None;
+            decision.empirical_build = None;
+        } else if decision.moving_law.is_some() {
+            moving_law = decision.moving_law.take();
+        }
         if support == EmpiricalLatentMeasureSupport::StandardNormalOnly
             && !matches!(decision.kind, LatentMeasureKind::StandardNormal)
         {
@@ -298,34 +357,13 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
                     .to_string(),
             );
         }
-        if let LatentMeasureKind::GlobalEmpirical { grid } = &decision.kind {
-            log::info!(
-                "[survival-marginal-slope latent-z] score column {col}: the row index is \
-                 anchored on a declared global-empirical latent law of {} nodes (gam#2923)",
-                grid.nodes.len(),
-            );
-        }
-        if let Some(adequacy) = decision.unmodelled_residual.as_ref() {
-            let message = format!(
-                "survival-marginal-slope latent score column {col} still fails the \
-                 standard-normal adequacy gate after the automatic {} calibration, and this \
-                 family's row kernel has no empirical latent measure to carry the residual law: \
-                 the closed-form standard-normal probit kernel is being applied to a sample the \
-                 gate rejects. Point estimation still uses the calibrated axis (it is the closest \
-                 available to the kernel's own assumption); what is unmodelled is the residual \
-                 SHAPE. Adequacy ledger (x = statistic / bound, x<=1 passed): {}",
-                calibration_label(&decision.calibration),
-                adequacy.ledger(),
-            );
-            match policy.check_mode {
-                LatentZCheckMode::Strict => return Err(message),
-                LatentZCheckMode::WarnOnly => log::warn!("{message}"),
-                LatentZCheckMode::Off => {}
-            }
-        }
+        log::info!(
+            "[survival-marginal-slope latent-z] score column {col}: the row index consumed the \
+             {} latent law (gam#2926)",
+            decision.consumed.label(),
+        );
         let calibrated = match &decision.calibration {
             LatentMeasureCalibration::None => raw,
-            LatentMeasureCalibration::RankInverseNormal(cal) => cal.apply_to_training(&raw)?,
             LatentMeasureCalibration::ConditionalLocationScale(cal) => {
                 // The conditional branch is only reachable when the gate had a
                 // conditioning block to fire on, so it is present here.
@@ -347,14 +385,134 @@ pub(crate) fn resolve_latent_score_calibration_from_parts(
         calibrated_scores.column_mut(col).assign(&calibrated);
         calibrations.push(decision.calibration);
         measures.push(decision.kind);
+        consumed.push(decision.consumed);
+        certificate_laws.push(decision.certificate_law);
+    }
+    if k >= 2 {
+        route_multi_score_latent_laws(&mut measures, &mut consumed, &mut certificate_laws);
     }
     Ok(ResolvedLatentScoreCalibration {
         per_score: calibrations,
         per_score_measure: measures,
+        per_score_consumed: consumed,
+        per_score_certificate_law: certificate_laws,
+        moving_law,
         raw_scores,
         calibrated_scores,
         conditioning,
     })
+}
+
+/// Settle what a fit on `K ≥ 2` scores anchors on, from each column's decision.
+///
+/// With several scores the anchor reads the law of the drive `rᵀz`, and any
+/// column that is not the standard normal sends the fit to the joint latent law
+/// (gam#2929), which transports one pooled residual law by `μ + L(a)·ε`. That
+/// follows a moving covariance but not a moving mean or shape, so a column whose
+/// law moves has nothing to anchor on yet: every column keeps the closed form,
+/// labelled `gaussian-uncertified` and naming the moving score (gam#2949). No
+/// default fit reaches the joint law's refusal of a local law.
+///
+/// Otherwise, when some column departs, the fit anchors on the joint law for all
+/// columns. A column the adequacy screen passed is then not anchored on its
+/// closed form, so it is relabelled `estimated-global`, and no column carries a
+/// closed-form certificate law. When every column passes, the closed form is
+/// provisional, and the converged fit certifies it on the joint law.
+fn route_multi_score_latent_laws(
+    measures: &mut [LatentMeasureKind],
+    consumed: &mut [LatentLawConsumed],
+    certificate_laws: &mut [Option<crate::bms::EmpiricalZGrid>],
+) {
+    // A Gaussian declaration over several scores is one declaration about the
+    // score vector, and the fit records it on the primary score. When a later
+    // score fails the shape screen the record carries that score's ledger, so
+    // the declaration's excess anchoring loss is measured on the joint law.
+    if let LatentLawConsumed::DeclaredGaussian { adequacy: None, .. } = &consumed[0]
+        && let Some((failing, ledger)) =
+            consumed
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(col, decision)| match decision {
+                    LatentLawConsumed::DeclaredGaussian {
+                        adequacy: Some(adequacy),
+                        ..
+                    } => Some((col, adequacy.clone())),
+                    _ => None,
+                })
+    {
+        if let LatentLawConsumed::DeclaredGaussian { adequacy, .. } = &mut consumed[0] {
+            *adequacy = Some(ledger);
+        }
+        certificate_laws[0] = certificate_laws[failing].clone();
+    }
+    let evidence_of = |decision: &LatentLawConsumed| match decision {
+        LatentLawConsumed::EstimatedGaussianAdequate { evidence, .. }
+        | LatentLawConsumed::EstimatedGlobalByResidual { evidence, .. }
+        | LatentLawConsumed::GaussianUncertified { evidence, .. }
+        | LatentLawConsumed::EstimatedGlobal { evidence }
+        | LatentLawConsumed::EstimatedMovingLaw { evidence, .. }
+        | LatentLawConsumed::ConditionalLocationScale { evidence, .. }
+        | LatentLawConsumed::DeclaredGaussian { evidence, .. } => Some(evidence.clone()),
+        LatentLawConsumed::RequestedGlobalEmpirical | LatentLawConsumed::DeclaredFiniteLaw { .. } => {
+            None
+        }
+    };
+    let k = measures.len();
+    if let Some(moving) = consumed
+        .iter()
+        .position(|decision| matches!(decision, LatentLawConsumed::EstimatedMovingLaw { .. }))
+    {
+        let moving_summary = evidence_of(&consumed[moving])
+            .map(|evidence| evidence.summary())
+            .unwrap_or_default();
+        let missing = format!(
+            "the conditional law of score column {moving} moves on the marginal-index span \
+             ({moving_summary}), and with K={k} scores the joint latent law transports one pooled \
+             residual law, which follows a moving covariance but not a moving mean or shape \
+             (gam#2949)"
+        );
+        log::warn!(
+            "[survival-marginal-slope latent-z] every score column keeps the closed form, \
+             uncertified: {missing} (gam#2926)"
+        );
+        for col in 0..k {
+            measures[col] = LatentMeasureKind::StandardNormal;
+            certificate_laws[col] = None;
+            // One policy governs every column, so a local law sits only beside
+            // other automatic decisions, and each of those carries its evidence.
+            let Some(evidence) = evidence_of(&consumed[col]) else {
+                continue;
+            };
+            let adequacy = match &consumed[col] {
+                LatentLawConsumed::EstimatedGaussianAdequate { adequacy, .. } => {
+                    Some(adequacy.clone())
+                }
+                LatentLawConsumed::GaussianUncertified { adequacy, .. } => adequacy.clone(),
+                _ => None,
+            };
+            consumed[col] = LatentLawConsumed::GaussianUncertified {
+                evidence,
+                adequacy,
+                certificate: None,
+                missing: missing.clone(),
+            };
+        }
+        return;
+    }
+    if measures
+        .iter()
+        .any(|measure| !matches!(measure, LatentMeasureKind::StandardNormal))
+    {
+        for col in 0..k {
+            if let LatentLawConsumed::EstimatedGaussianAdequate { evidence, .. } = &consumed[col] {
+                consumed[col] = LatentLawConsumed::EstimatedGlobal {
+                    evidence: evidence.clone(),
+                };
+            }
+            certificate_laws[col] = None;
+        }
+    }
 }
 
 /// Decide the score-covariance field the fit will consume (gam#2766).
@@ -400,7 +558,6 @@ pub(crate) fn resolve_score_covariance_field(
 fn calibration_label(calibration: &LatentMeasureCalibration) -> &'static str {
     match calibration {
         LatentMeasureCalibration::None => "identity",
-        LatentMeasureCalibration::RankInverseNormal(_) => "rank inverse-normal",
         LatentMeasureCalibration::ConditionalLocationScale(_) => "conditional location-scale",
     }
 }
@@ -467,16 +624,24 @@ mod tests {
         )
     }
 
-    fn auto_policy(check_mode: LatentZCheckMode) -> LatentZPolicy {
+    fn policy(latent_measure: LatentMeasureSpec) -> LatentZPolicy {
         LatentZPolicy {
-            check_mode,
+            check_mode: LatentZCheckMode::WarnOnly,
             normalization: LatentZNormalizationMode::Frozen { mean: 0.0, sd: 1.0 },
+            latent_measure,
             ..LatentZPolicy::frozen_transformation_normal()
         }
     }
 
-    /// The gate must fire on a conditionally shifted score, and the score it
-    /// hands the kernel must be the CLEAN one — not merely centred (gam#2768).
+    fn location_scale() -> LatentMeasureSpec {
+        LatentMeasureSpec::ConditionalLocationScale {
+            grid_size: crate::bms::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+        }
+    }
+
+    /// Under the declared conditional location-scale law the gate fires on a
+    /// conditionally shifted score, and the score it hands the kernel is the
+    /// CLEAN one — not merely centred (gam#2768, gam#2926).
     ///
     /// Recovering `ζ` up to sign and a common scale is the whole claim: the fit's
     /// coefficients are then the ones the outcome was generated with, and the
@@ -489,9 +654,10 @@ mod tests {
         let resolved = resolve_latent_score_calibration_from_parts(
             &z,
             &weights,
-            &auto_policy(LatentZCheckMode::WarnOnly),
+            &policy(location_scale()),
             false,
             &design,
+            None,
             EmpiricalLatentMeasureSupport::Available,
         )
         .expect("gate");
@@ -556,9 +722,10 @@ mod tests {
         let resolved = resolve_latent_score_calibration_from_parts(
             &clean,
             &weights,
-            &auto_policy(LatentZCheckMode::WarnOnly),
+            &policy(location_scale()),
             false,
             &design,
+            None,
             EmpiricalLatentMeasureSupport::Available,
         )
         .expect("gate");
@@ -571,6 +738,105 @@ mod tests {
             resolved.calibrated_scores, clean,
             "an unfired gate must leave the score untouched, byte for byte"
         );
+
+        // The default on the same clean score: no structure on the span and a
+        // score the adequacy check cannot tell from N(0, 1), so the closed form,
+        // chosen by that evidence and recorded (gam#2926).
+        let estimated = resolve_latent_score_calibration_from_parts(
+            &clean,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            None,
+            EmpiricalLatentMeasureSupport::Available,
+        )
+        .expect("gate");
+        let LatentLawConsumed::EstimatedGaussianAdequate { adequacy, .. } =
+            &estimated.per_score_consumed[0]
+        else {
+            panic!(
+                "a conditionally standard normal score must reach the closed form by evidence; got {:?}",
+                estimated.per_score_consumed[0]
+            )
+        };
+        assert!(adequacy.passes(), "the recorded evidence must be the passing ledger");
+        assert!(matches!(
+            estimated.per_score_measure[0],
+            LatentMeasureKind::StandardNormal
+        ));
+        assert_eq!(estimated.calibrated_scores, clean);
+    }
+
+    /// The default on a conditionally shifted score with no context covariates
+    /// is refused by name; a closed-form-only kernel keeps the closed form where
+    /// the default law departs, recorded as uncertified with what is missing, and
+    /// fits a provisional closed form where the screen cannot tell the law from
+    /// N(0, 1) (gam#2926).
+    #[test]
+    fn survival_default_law_refuses_or_stays_uncertified_by_name() {
+        let n = 4000;
+        let (z, weights, design, zeta) = shifted_fixture(n, 0.6);
+        let error = match resolve_latent_score_calibration_from_parts(
+            &z,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            None,
+            EmpiricalLatentMeasureSupport::Available,
+        ) {
+            Ok(_) => panic!("a moving conditional law without context covariates must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("conditional law moves on the marginal-index span"),
+            "got {error}"
+        );
+        let uncertified = resolve_latent_score_calibration_from_parts(
+            &z,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            None,
+            EmpiricalLatentMeasureSupport::StandardNormalOnly,
+        )
+        .expect("a closed-form-only kernel keeps the closed form where the default law moves");
+        let LatentLawConsumed::GaussianUncertified { missing, .. } = &uncertified.per_score_consumed[0]
+        else {
+            panic!(
+                "a moving law on a closed-form-only kernel must be recorded as uncertified; got {:?}",
+                uncertified.per_score_consumed[0]
+            )
+        };
+        assert!(
+            missing.contains("moves on the marginal-index span")
+                && missing.contains("evaluates only the closed form"),
+            "the record must say how the law departs and why the kernel cannot carry it; got {missing}"
+        );
+        assert!(matches!(
+            uncertified.per_score_measure[0],
+            LatentMeasureKind::StandardNormal
+        ));
+        let mut clean = Array2::<f64>::zeros((n, 1));
+        for row in 0..n {
+            clean[[row, 0]] = zeta[row];
+        }
+        let adequate = resolve_latent_score_calibration_from_parts(
+            &clean,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            None,
+            EmpiricalLatentMeasureSupport::StandardNormalOnly,
+        )
+        .expect("a Gaussian-adequate score reaches the closed form on a closed-form-only kernel");
+        assert!(matches!(
+            adequate.per_score_consumed[0],
+            LatentLawConsumed::EstimatedGaussianAdequate { .. }
+        ));
     }
 
     /// `K = 2` scores whose conditional CORRELATION is `amplitude·x/√(1+x²)` and
@@ -676,8 +942,8 @@ mod tests {
 
     /// The #461 absorber seam: with a CTN Stage-1 influence absorber active the
     /// conditional leakage is already absorbed, and replacing z would perturb the
-    /// widened-marginal predict seam. The conditional branch must then be
-    /// unreachable even on a score that would otherwise fire it.
+    /// widened-marginal predict seam. Neither the span test nor a calibration may
+    /// then engage, even on a score that would otherwise move on the span.
     #[test]
     fn survival_gate_does_not_condition_behind_an_active_influence_absorber() {
         let n = 4000;
@@ -685,23 +951,48 @@ mod tests {
         let resolved = resolve_latent_score_calibration_from_parts(
             &z,
             &weights,
-            &auto_policy(LatentZCheckMode::WarnOnly),
+            &policy(LatentMeasureSpec::auto_default()),
             true,
             &design,
+            None,
             EmpiricalLatentMeasureSupport::Available,
         )
         .expect("gate");
         assert!(
-            !matches!(
-                resolved.per_score[0],
-                LatentMeasureCalibration::ConditionalLocationScale(_)
-            ),
-            "the conditional branch must be suppressed behind an active absorber"
+            matches!(resolved.per_score[0], LatentMeasureCalibration::None),
+            "no calibration may be fitted behind an active absorber"
+        );
+        let LatentLawConsumed::EstimatedGaussianAdequate { evidence, .. } =
+            &resolved.per_score_consumed[0]
+        else {
+            panic!(
+                "behind an absorber the default has no span to test, and this score is marginally \
+                 N(0, 1), so the closed form by evidence; got {:?}",
+                resolved.per_score_consumed[0]
+            )
+        };
+        assert!(
+            evidence.mean_p_value.is_none(),
+            "the span test must not run behind an absorber"
         );
         assert!(
             resolved.conditioning.is_none(),
             "no conditioning block may be built when the branch is suppressed"
         );
+        // The declared location-scale law needs the span, and says so.
+        let error = match resolve_latent_score_calibration_from_parts(
+            &z,
+            &weights,
+            &policy(location_scale()),
+            true,
+            &design,
+            None,
+            EmpiricalLatentMeasureSupport::Available,
+        ) {
+            Ok(_) => panic!("the declared location-scale law must refuse behind an absorber"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no span is available"), "got {error}");
     }
 
     /// Every latent-score column is gated, not just the primary one: with `K > 1`
@@ -727,9 +1018,10 @@ mod tests {
         let resolved = resolve_latent_score_calibration_from_parts(
             &two,
             &weights,
-            &auto_policy(LatentZCheckMode::WarnOnly),
+            &policy(location_scale()),
             false,
             &design,
+            None,
             EmpiricalLatentMeasureSupport::Available,
         )
         .expect("gate");
@@ -759,14 +1051,114 @@ mod tests {
             );
         }
     }
+
+    /// With `K = 2` scores the default never reaches the joint law's refusal of a
+    /// local law. A column whose law moves keeps every column on the closed form,
+    /// uncertified and naming that column; a column that departs without moving
+    /// sends the fit to the joint law, and the column the screen passed is then
+    /// labelled by the law the fit anchors on, not by a closed form it never
+    /// consumes (gam#2926, gam#2929, gam#2949).
+    #[test]
+    fn multi_score_default_routes_around_the_joint_law_refusal() {
+        let n = 4000;
+        let (first, weights, design, zeta) = shifted_fixture(n, 0.6);
+        let x: Vec<f64> = design_column(&design, 1);
+        let features = Array2::from_shape_vec((n, 1), x.clone()).expect("features");
+        let context = estimated_latent_law::LocalLawContext {
+            features: features.view(),
+            feature_cols: vec![0],
+        };
+
+        let mut moving = Array2::<f64>::zeros((n, 2));
+        moving.column_mut(0).assign(&first.column(0));
+        moving.column_mut(1).assign(&Array1::from(zeta.clone()));
+        let routed = resolve_latent_score_calibration_from_parts(
+            &moving,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            Some(&context),
+            EmpiricalLatentMeasureSupport::Available,
+        )
+        .expect("a moving column at K = 2 keeps the closed form rather than refusing");
+        for col in 0..2 {
+            assert!(
+                matches!(routed.per_score_measure[col], LatentMeasureKind::StandardNormal),
+                "column {col} must keep the closed form; got {:?}",
+                routed.per_score_measure[col]
+            );
+            assert!(routed.per_score_certificate_law[col].is_none());
+            let LatentLawConsumed::GaussianUncertified { missing, .. } =
+                &routed.per_score_consumed[col]
+            else {
+                panic!(
+                    "column {col} must be recorded as uncertified; got {:?}",
+                    routed.per_score_consumed[col]
+                )
+            };
+            assert!(
+                missing.contains("score column 0 moves") && missing.contains("gam#2949"),
+                "the record must name the moving score and the transport issue; got {missing}"
+            );
+        }
+        assert!(
+            joint_latent_law_measure_refusal(2, &routed.per_score_measure).is_none(),
+            "the routed decision must not reach the joint law's refusal"
+        );
+
+        let skewed = standardized(
+            gaussians(n, 0x2926_5C)
+                .into_iter()
+                .map(|g| (0.8 * g).exp())
+                .collect(),
+        );
+        let mut departing = Array2::<f64>::zeros((n, 2));
+        departing.column_mut(0).assign(&Array1::from(zeta));
+        departing.column_mut(1).assign(&Array1::from(skewed));
+        let joint = resolve_latent_score_calibration_from_parts(
+            &departing,
+            &weights,
+            &policy(LatentMeasureSpec::auto_default()),
+            false,
+            &design,
+            Some(&context),
+            EmpiricalLatentMeasureSupport::Available,
+        )
+        .expect("a departing column at K = 2 anchors on the joint law");
+        assert!(
+            matches!(
+                joint.per_score_measure[1],
+                LatentMeasureKind::GlobalEmpirical { .. }
+            ),
+            "the skewed column must depart; got {:?}",
+            joint.per_score_consumed[1]
+        );
+        assert!(
+            matches!(
+                joint.per_score_consumed[0],
+                LatentLawConsumed::EstimatedGlobal { .. }
+            ),
+            "the column the screen passed anchors on the joint law; got {:?}",
+            joint.per_score_consumed[0]
+        );
+        assert!(joint.per_score_certificate_law.iter().all(Option::is_none));
+        assert!(joint_latent_law_measure_refusal(2, &joint.per_score_measure).is_none());
+    }
+
+    fn design_column(design: &DesignMatrix, col: usize) -> Vec<f64> {
+        design
+            .try_to_dense_arc("test design column")
+            .expect("dense design")
+            .column(col)
+            .to_vec()
+    }
 }
 
 #[cfg(test)]
 mod persistence_tests {
     use super::super::spec::split_persisted_latent_calibrations;
-    use crate::bms::{
-        LatentMeasureCalibration, LatentZConditionalCalibration, LatentZRankIntCalibration,
-    };
+    use crate::bms::{LatentMeasureCalibration, LatentZConditionalCalibration};
     use ndarray::Array2;
 
     fn conditional() -> LatentMeasureCalibration {
@@ -782,31 +1174,18 @@ mod persistence_tests {
         })
     }
 
-    fn rank_int() -> LatentMeasureCalibration {
-        LatentMeasureCalibration::RankInverseNormal(LatentZRankIntCalibration {
-            sorted_z: vec![-1.0, 0.0, 1.0],
-            weighted_cdf: vec![0.25, 0.5, 0.75],
-            post_mean: 0.0,
-            post_sd: 1.0,
-        })
-    }
-
     #[test]
     fn an_unfired_gate_persists_nothing() {
-        let (rank, cond) =
-            split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], true)
-                .expect("no calibration is always persistable");
-        assert!(rank.is_none() && cond.is_none());
+        let cond = split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], true)
+            .expect("no calibration is always persistable");
+        assert!(cond.is_none());
     }
 
     #[test]
-    fn the_two_branches_persist_into_their_own_field() {
-        let (rank, cond) =
-            split_persisted_latent_calibrations(&[rank_int()], true).expect("rank-INT persists");
-        assert!(rank.is_some() && cond.is_none());
-        let (rank, cond) = split_persisted_latent_calibrations(&[conditional()], true)
+    fn a_conditional_calibration_persists_into_its_field() {
+        let cond = split_persisted_latent_calibrations(&[conditional()], true)
             .expect("conditional persists");
-        assert!(rank.is_none() && cond.is_some());
+        assert!(cond.is_some());
     }
 
     /// A conditioning span the resolved marginal spec would NOT rebuild is a
@@ -820,10 +1199,10 @@ mod persistence_tests {
             error.contains("RESOLVED marginal spec"),
             "the refusal must name what prediction would rebuild instead; got {error}"
         );
-        // A rank-INT calibration does not condition on anything, so the same
-        // state must NOT refuse it.
-        split_persisted_latent_calibrations(&[rank_int()], false)
-            .expect("rank-INT conditions on nothing and is unaffected by the span");
+        // A fit that calibrated nothing conditions on nothing, so the same state
+        // must NOT refuse it.
+        split_persisted_latent_calibrations(&[LatentMeasureCalibration::None], false)
+            .expect("an uncalibrated score is unaffected by the span");
     }
 
     /// The saved contract holds one score surface. A K>1 fit whose SECOND score

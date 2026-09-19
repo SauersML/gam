@@ -5290,7 +5290,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     // it therefore retains mass only (#707). The matching topology gate lives
     // at `DuchonOperatorPenaltySpec::matern_for_smoothness`. The third-order
     // energy is appended below whenever the collocation builder emitted its
-    // Gram (`MaternNu::admits_third_order_operator`, isotropic metric).
+    // Gram (`MaternNu::admits_third_order_operator`, under either metric).
     // `m` and every `min_order` are small half-integers, which f64 represents
     // exactly, so the order gate is an exact comparison.
     let d = penalty_centers.ncols();
@@ -8735,6 +8735,12 @@ pub fn build_single_local_smooth_term(
             penalty.info.structural_null_frame = None;
         }
     }
+    // The re-filter below numbers its input from zero, and its input is this
+    // build's active penalties, so it hands back their numbering (#2953).
+    let build_numbering: Vec<usize> = penalties_t
+        .iter()
+        .map(|penalty| penalty.info.original_index)
+        .collect();
     let penalty_candidates = penalties_t
         .into_iter()
         .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
@@ -8799,7 +8805,8 @@ pub fn build_single_local_smooth_term(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?;
+    let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?
+        .with_build_numbering(&build_numbering)?;
     dropped_penalties_t.extend(filtered.dropped);
     // Joint-null absorption rotation. Fresh fit specs compute Q from the final
     // per-smooth penalty set (after all in-smooth reparameterizations have

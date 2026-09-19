@@ -10,6 +10,8 @@ pub(crate) struct DeflatedArrowSolver<'a> {
     pub(crate) cache: &'a ArrowFactorCache,
     pub(crate) gauge_basis: Vec<Array1<f64>>,
     pub(crate) gauge_response_physical: Vec<Array1<f64>>,
+    /// `M = GᵀH⁻¹G`, the gauge metric the Woodbury factor was built from.
+    pub(crate) gauge_metric: Array2<f64>,
     pub(crate) woodbury_factor: Option<FaerCholeskyFactor>,
     pub(crate) gauge_stiffness: f64,
 }
@@ -20,6 +22,7 @@ impl<'a> DeflatedArrowSolver<'a> {
             cache,
             gauge_basis: Vec::new(),
             gauge_response_physical: Vec::new(),
+            gauge_metric: Array2::<f64>::zeros((0, 0)),
             woodbury_factor: None,
             gauge_stiffness: 0.0,
         }
@@ -84,6 +87,7 @@ impl<'a> DeflatedArrowSolver<'a> {
             cache,
             gauge_basis,
             gauge_response_physical,
+            gauge_metric,
             woodbury_factor: Some(woodbury_factor),
             gauge_stiffness: stiffness,
         })
@@ -243,24 +247,49 @@ impl<'a> DeflatedArrowSolver<'a> {
         Ok((inv_vv, inv_vbeta))
     }
 
+    /// Diagonal of the latent block of the operator [`Self::solve`] inverts.
+    ///
+    /// Plain arrow: the selected-inverse diagonal of `H⁻¹`. With gauges `G`
+    /// (orthonormal columns `g_a`) at stiffness `s`, `solve` is `(H + s·GGᵀ)⁻¹`, and
+    /// its `idx` diagonal entry reads off `solve(e_idx)` in closed form. With
+    /// `c_a = (H⁻¹g_a)[idx] = R_a[idx] + Σ_b M[b,a]·g_b[idx]` (`R_a` the stored
+    /// physical responses, `M = GᵀH⁻¹G`) and `w = W⁻¹c`, `W = I/s + M`:
+    ///
+    /// ```text
+    ///   out[idx] = (H⁻¹)[idx,idx] − Σ_a (g_a[idx]·c_a + R_a[idx]·w_a − g_a[idx]·w_a/s)
+    /// ```
+    ///
+    /// That is `solve`'s own elimination applied to `e_idx`, so the result equals
+    /// the per-coordinate `solve` loop up to rounding, at `O(r²)` per coordinate
+    /// on top of the plain diagonal instead of one full bordered solve per
+    /// coordinate (#2900).
     pub(crate) fn latent_inverse_diagonal(&self) -> Result<Array1<f64>, String> {
-        if self.woodbury_factor.is_none() {
-            return self
-                .cache
-                .latent_block_inverse_diagonal()
-                .map_err(|err| format!("DeflatedArrowSolver: latent inverse diagonal: {err}"));
-        }
-        let total_t = self.cache.delta_t_len();
-        let mut out = Array1::<f64>::zeros(total_t);
-        let rhs_beta = Array1::<f64>::zeros(self.cache.k);
-        // Reuse one unit-vector buffer: set/clear a single entry per index rather
-        // than allocating and zeroing a total_t-sized RHS on every iteration.
-        let mut rhs_t = Array1::<f64>::zeros(total_t);
-        for idx in 0..total_t {
-            rhs_t[idx] = 1.0;
-            let solved = self.solve(rhs_t.view(), rhs_beta.view())?;
-            rhs_t[idx] = 0.0;
-            out[idx] = solved.t[idx];
+        let mut out = self
+            .cache
+            .latent_block_inverse_diagonal()
+            .map_err(|err| format!("DeflatedArrowSolver: latent inverse diagonal: {err}"))?;
+        let Some(factor) = self.woodbury_factor.as_ref() else {
+            return Ok(out);
+        };
+        let rank = self.gauge_basis.len();
+        let stiffness_recip = self.gauge_stiffness.recip();
+        let mut coeffs = Array1::<f64>::zeros(rank);
+        for idx in 0..out.len() {
+            for a in 0..rank {
+                let mut value = self.gauge_response_physical[a][idx];
+                for b in 0..rank {
+                    value += self.gauge_metric[[b, a]] * self.gauge_basis[b][idx];
+                }
+                coeffs[a] = value;
+            }
+            let weights = factor.solvevec(&coeffs);
+            let mut correction = 0.0_f64;
+            for a in 0..rank {
+                let gauge = self.gauge_basis[a][idx];
+                correction += gauge * coeffs[a] + self.gauge_response_physical[a][idx] * weights[a]
+                    - stiffness_recip * gauge * weights[a];
+            }
+            out[idx] -= correction;
         }
         Ok(out)
     }
@@ -451,6 +480,51 @@ mod selected_inverse_row_blocks_oracle_tests {
         }
     }
 
+    /// #2900 — with gauges installed, `latent_inverse_diagonal` reads the latent
+    /// diagonal of `(H + s·GGᵀ)⁻¹` in closed form. It must equal the per-coordinate
+    /// `solve(e_idx)` route it replaced. The control requires the gauge correction to
+    /// move the diagonal off the plain `H⁻¹` diagonal, so the closed form's correction
+    /// term is exercised.
+    #[test]
+    fn woodbury_latent_diagonal_matches_per_coordinate_solves_2900() {
+        let cache = coupled_arrow_cache();
+        let total_t = cache.delta_t_len();
+        let norm = 3.0_f64.sqrt().recip();
+        let gauges = vec![
+            array![1.0_f64, 1.0, 0.0, 1.0, 0.0].mapv(|v| v * norm),
+            array![1.0_f64, -1.0, 1.0, 0.0, 0.0].mapv(|v| v * norm),
+        ];
+        let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, gauges, 0.7)
+            .expect("gauge Woodbury solver");
+        assert!(!solver.plain_selected_inverse_available());
+        let closed_form = solver.latent_inverse_diagonal().expect("closed-form diagonal");
+        let plain = cache
+            .latent_block_inverse_diagonal()
+            .expect("plain selected-inverse diagonal");
+        assert_eq!(closed_form.len(), total_t);
+        let rhs_beta = Array1::<f64>::zeros(cache.k);
+        let mut largest_correction = 0.0_f64;
+        for idx in 0..total_t {
+            let mut rhs_t = Array1::<f64>::zeros(total_t);
+            rhs_t[idx] = 1.0;
+            let solved = solver
+                .solve(rhs_t.view(), rhs_beta.view())
+                .expect("per-coordinate Woodbury solve");
+            let expected = solved.t[idx];
+            assert!(
+                (closed_form[idx] - expected).abs() <= 1.0e-12 * expected.abs(),
+                "coordinate {idx}: closed form {:.15e} vs per-coordinate solve {expected:.15e}",
+                closed_form[idx]
+            );
+            largest_correction = largest_correction.max((expected - plain[idx]).abs() / expected.abs());
+        }
+        assert!(
+            largest_correction > 1.0e-2,
+            "the gauge stiffening must move the latent diagonal off the plain inverse; \
+             largest relative correction {largest_correction:.3e}"
+        );
+    }
+
     #[test]
     fn row_local_blocks_match_per_row_solve() {
         let cache = coupled_arrow_cache();
@@ -613,6 +687,120 @@ pub(crate) fn apply_cached_arrow_hessian(
         t: out_t,
         beta: out_beta,
     })
+}
+
+/// `‖Φ‖_F` of the operator [`apply_cached_arrow_hessian`] applies, read off its entries
+/// (#2267), with the border optionally pulled back by `lift`: `diag(I, liftᵀ)·Φ·diag(I, lift)`.
+///
+/// ```text
+///   Φ = [ T    C    ]     T = ⊕ᵢ LᵢLᵢᵀ,   Φ_ββ = L_S L_Sᵀ + Σᵢ GᵢᵀGᵢ,   Gᵢ = Lᵢ⁻¹Cᵢ
+///       [ Cᵀ   Φ_ββ ]
+///   ‖Φ‖_F² = Σᵢ ‖LᵢLᵢᵀ‖_F² + 2 Σᵢ ‖Cᵢ‖_F² + ‖Φ_ββ‖_F²
+/// ```
+///
+/// `T` is block diagonal, the cross block `Cᵢ = H_tβ^(i)` sits on both sides of the diagonal,
+/// and `Φ_ββ` is the reduced Schur complement plus the restoration `Σᵢ H_βt^(i) Tᵢ⁻¹ H_tβ^(i)`
+/// the apply adds back. A lift replaces `Cᵢ` by `Cᵢ·lift` and `Φ_ββ` by `liftᵀ·Φ_ββ·lift`. The
+/// cross block is read through the transpose accessor the apply uses, so both name one
+/// operator. This costs `O(n·q·k² + k³)`; the `dim` unit applies it replaces cost
+/// `O(dim·(n·q·k + k²))`.
+pub(crate) fn cached_arrow_hessian_frobenius(
+    cache: &ArrowFactorCache,
+    lift: Option<&Array2<f64>>,
+) -> Result<f64, String> {
+    let k = cache.k;
+    if let Some(lift) = lift {
+        if lift.nrows() != k {
+            return Err(format!(
+                "cached_arrow_hessian_frobenius: lift has {} rows for a border of {k}",
+                lift.nrows()
+            ));
+        }
+    }
+    let mut norm_sq = 0.0_f64;
+    let mut restoration = Array2::<f64>::zeros((k, k));
+    for row in 0..cache.n_rows() {
+        let q = cache.row_dims[row];
+        let factor = cache.undamped_factor(row);
+        // `LLᵀ` from the lower triangle; each strict off-diagonal entry occurs twice.
+        for i in 0..q {
+            for j in 0..=i {
+                let mut entry = 0.0_f64;
+                for m in 0..=j {
+                    entry += factor[[i, m]] * factor[[j, m]];
+                }
+                norm_sq += if i == j { entry * entry } else { 2.0 * entry * entry };
+            }
+        }
+        if k == 0 {
+            continue;
+        }
+        // `Cᵢ` row by row: row `c` of `H_tβ^(i)` is `H_βt^(i)·e_c`.
+        let mut cross = Array2::<f64>::zeros((q, k));
+        let mut unit = Array1::<f64>::zeros(q);
+        for c in 0..q {
+            unit[c] = 1.0;
+            let mut read = Array1::<f64>::zeros(k);
+            if !cache.apply_htbeta_row_transpose(row, unit.view(), &mut read, None) {
+                return Err(format!(
+                    "cached_arrow_hessian_frobenius: H_βt^({row}) apply failed"
+                ));
+            }
+            cross.row_mut(c).assign(&read);
+            unit[c] = 0.0;
+        }
+        norm_sq += 2.0
+            * match lift {
+                None => cross.iter().map(|value| value * value).sum::<f64>(),
+                Some(lift) => cross.dot(lift).iter().map(|value| value * value).sum::<f64>(),
+            };
+        let mut whitened = Array2::<f64>::zeros((q, k));
+        for a in 0..k {
+            whitened.column_mut(a).assign(
+                &gam_linalg::triangular::forward_substitution_lower_vector(factor, cross.column(a)),
+            );
+        }
+        ndarray::linalg::general_mat_mul(1.0, &whitened.t(), &whitened, 1.0, &mut restoration);
+    }
+    if k == 0 {
+        return Ok(norm_sq.sqrt());
+    }
+    let Some(schur_factor) = cache.schur_factor.as_ref() else {
+        return Err(
+            "cached_arrow_hessian_frobenius: dense Schur factor is required".to_string(),
+        );
+    };
+    if !cache.schur_factor_is_undamped {
+        return Err(
+            "cached_arrow_hessian_frobenius: Schur factor was not built from the undamped evidence \
+             row factors"
+                .to_string(),
+        );
+    }
+    let mut border = restoration;
+    for a in 0..k {
+        for b in 0..=a {
+            let mut entry = 0.0_f64;
+            for m in 0..=b {
+                entry += schur_factor[[a, m]] * schur_factor[[b, m]];
+            }
+            border[[a, b]] += entry;
+            if a != b {
+                border[[b, a]] += entry;
+            }
+        }
+    }
+    norm_sq += match lift {
+        None => border.iter().map(|value| value * value).sum::<f64>(),
+        Some(lift) => lift
+            .t()
+            .dot(&border)
+            .dot(lift)
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>(),
+    };
+    Ok(norm_sq.sqrt())
 }
 
 /// Apply the RAW majorizer represented by an evidence cache.

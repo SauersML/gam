@@ -1,17 +1,20 @@
-//! Exact marginal smoothing inference over the smoothing parameters `ρ`
-//! (issue #938): the Tier-0 **PSIS certificate**, plus the auto-selected
+//! Marginal smoothing inference over the smoothing parameters `ρ`
+//! (issue #938): the Tier-0 **PSIS adequacy diagnostic**, plus the auto-selected
 //! escalation tiers — Tier-1 **Gauss-Hermite quadrature** over `ρ` (`K ≤ 4`,
 //! `rho_posterior_quadrature`) and Tier-2 **NUTS over `ρ`** with the exact
 //! profiled gradient (`K ≤ 16`, `rho_posterior_nuts`), routed by
-//! [`escalate_rho_posterior`] when the certificate refuses to certify the
-//! plug-in.
+//! [`escalate_rho_posterior`] when the diagnostic grades the plug-in
+//! [`RhoProposalAdequacy::Escalate`].
 //!
 //! Every GAM ecosystem conditions inference on the estimated smoothing
 //! parameters `ρ̂`; intervals from `V(β̂|ρ̂)` undercover because they ignore
 //! `ρ`-uncertainty. The honest marginal posterior factorizes as
 //! `π(β, ρ | y) = π(β | ρ, y) · π(ρ | y)`, where `π(ρ|y) ∝ exp(−criterion(ρ))`
-//! is exactly the LAML/REML objective the outer optimizer already minimizes
-//! with exact gradients.
+//! is the LAML/REML objective the outer optimizer already minimizes with exact
+//! gradients. For Gaussian REML that criterion is the restricted likelihood
+//! itself; for other families it is the Laplace (LAML) or PQL approximation to
+//! it, so the tiers below integrate that approximate `π(ρ|y)`, not the exact one
+//! (#2946 T2).
 //!
 //! Tier 0 turns "should I worry about `ρ`-uncertainty?" — currently folklore —
 //! into a *computed* diagnostic on every fit, with no MCMC:
@@ -26,11 +29,11 @@
 //!    shift makes the weights self-normalized and finite).
 //! 4. Pareto-smooth the weights ([`gam_solve::psis`]) and read the
 //!    Zhang–Stephens tail shape `k̂`. `k̂ < 0.5` ⇒ the plug-in + first-order
-//!    correction answer is **certified** adequate; `0.5 ≤ k̂ ≤ 0.7` ⇒ usable as
+//!    correction answer is adequate by this diagnostic; `0.5 ≤ k̂ ≤ 0.7` ⇒ usable as
 //!    a self-normalized importance correction; `k̂ > 0.7` ⇒ the Laplace proposal
 //!    is a poor fit and the honest path is a full quadrature/NUTS escalation.
 //!
-//! The certificate is deterministic: the whitened draws come from a fixed-seed
+//! The diagnostic is deterministic: the whitened draws come from a fixed-seed
 //! splitmix64 + Box–Muller stream, so the same fit yields the same `k̂` every
 //! run.
 //!
@@ -38,7 +41,8 @@
 //! [`gam_solve::psis::tail_count`]`(M) = ⌈√M⌉` excesses only, and the reported
 //! shape is that fit shrunk toward `0.5` by ten pseudo-observations. So the
 //! reported value has standard error
-//! `√n(1+k)/(n+10)` (with `n = ⌈√M⌉`) around the shrunk shape
+//! `√n(1+k)/(n+10)` (with `n = ⌈√M⌉`; [`gam_solve::psis::shape_standard_error`],
+//! and per fit [`k_hat_standard_error`]) around the shrunk shape
 //! `(n·k + 10·0.5)/(n + 10)`, NOT around `k`:
 //! at the default `M = 64` the tail sample is `8` and the standard error at the
 //! `0.7` boundary is `≈ 0.27`; at `M = 512` it is `23` and `≈ 0.25`. Reaching a
@@ -47,7 +51,7 @@
 //! the truth lies on: separating a true shape from the `0.7` boundary needs
 //! `⌈√M⌉` large enough that several standard errors fit in the gap. Anything
 //! asserting a verdict (rather than reading a diagnostic) must size `M` from
-//! those two formulas.
+//! `tail_count` and `shape_standard_error`.
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
@@ -55,21 +59,21 @@ use gam_solve::estimate::EstimationError;
 use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, Array2};
 
-// The `ρ`-posterior certificate/escalation DATA types were contract-downed to
+// The `ρ`-posterior adequacy/escalation DATA types were contract-downed to
 // the neutral `gam-problem` crate (#1521) so gam-solve can store/return them
 // without a back-edge into gam-inference. The COMPUTATION below (PSIS
-// certificate, Tier-1 quadrature, Tier-2 NUTS via `hmc_io`) stays here and
-// constructs these types under their original names via this re-export.
+// adequacy diagnostic, Tier-1 quadrature, Tier-2 NUTS via `hmc_io`) stays here and
+// constructs these types under the names re-exported here.
 pub use gam_problem::rho_posterior::{
-    ESCALATE_K_HAT, PLUG_IN_CERTIFIED_K_HAT, RhoCertificate, RhoMixtureNode,
-    RhoPosteriorCertificate, RhoPosteriorEscalation, RhoPosteriorMixture, RhoPosteriorNotComputed,
-    RhoPosteriorOutcome, RhoPosteriorRefusal, RhoPosteriorSamples,
+    ESCALATE_K_HAT, PLUG_IN_ADEQUATE_K_HAT, RhoMixtureNode, RhoPosteriorAdequacy,
+    RhoPosteriorEscalation, RhoPosteriorMixture, RhoPosteriorNotComputed, RhoPosteriorOutcome,
+    RhoPosteriorRefusal, RhoPosteriorSamples, RhoProposalAdequacy,
 };
 
 /// Monolith (gam-inference-tier) implementor of the contract-downed
 /// [`RhoPosteriorEscalator`](gam_problem::rho_posterior::RhoPosteriorEscalator)
-/// (#1521): wraps the real `hmc_io`-backed Tier-0 PSIS certificate
-/// ([`rho_posterior_certificate`]) and the auto-selected Tier-1/Tier-2
+/// (#1521): wraps the real `hmc_io`-backed Tier-0 PSIS adequacy diagnostic
+/// ([`rho_posterior_adequacy`]) and the auto-selected Tier-1/Tier-2
 /// escalation ([`escalate_rho_posterior`], whose Tier-2 NUTS pulls the
 /// gam-inference sampler). Injected at process init via
 /// `gam_problem::rho_posterior::set_rho_posterior_escalator`; gam-solve's REML
@@ -77,14 +81,14 @@ pub use gam_problem::rho_posterior::{
 pub struct HmcIoRhoPosteriorEscalator;
 
 impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEscalator {
-    fn rho_posterior_certificate(
+    fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
         n_samples: Option<usize>,
-    ) -> Result<Option<RhoPosteriorCertificate>, RhoPosteriorRefusal> {
-        rho_posterior_certificate(rho_hat, outer_hessian, criterion, n_samples)
+    ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal> {
+        rho_posterior_adequacy(rho_hat, outer_hessian, criterion, n_samples)
     }
 
     fn escalate_rho_posterior(
@@ -113,7 +117,7 @@ const ESCALATION_NUTS_SAMPLES: usize = 256;
 const ESCALATION_NUTS_SEED: u64 = 0x938_5EED_0938_5EED;
 
 const DEFAULT_M: usize = 64;
-const CERTIFICATE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+const ADEQUACY_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Deterministic standard-normal stream (splitmix64 + Box–Muller). No RNG / env
 /// dependency: the same seed yields the same draws every run.
@@ -190,24 +194,6 @@ fn whitening_factor_from_outer_hessian(
     Ok(l_inv)
 }
 
-/// Gauss–Hermite rule of any order for the STANDARD NORMAL weight, by
-/// Golub–Welsch (`gam_math::quadrature::gauss_hermite_rule`). Probabilists'
-/// convention: the nodes are `√2·x_i` and the weights `w_i/√π` of the
-/// physicists' rule, so the weights sum to one and the rule integrates
-/// polynomials of degree `2n−1` exactly against `N(0,1)`.
-pub(crate) fn standard_normal_gh_rule(nodes_per_axis: usize) -> Result<Vec<(f64, f64)>, String> {
-    let rule = gam_math::quadrature::gauss_hermite_rule(nodes_per_axis).map_err(|error| {
-        format!("standard-normal Gauss–Hermite rule of order {nodes_per_axis}: {error}")
-    })?;
-    let sqrt_pi = std::f64::consts::PI.sqrt();
-    Ok(rule
-        .nodes
-        .iter()
-        .zip(rule.weights.iter())
-        .map(|(&node, &weight)| (std::f64::consts::SQRT_2 * node, weight / sqrt_pi))
-        .collect())
-}
-
 /// Enumerate the product rule over `rules`, one rule per axis, appending every
 /// node with the log of its product weight.
 pub(crate) fn enumerate_gh_product(
@@ -261,9 +247,14 @@ where
             "rho_posterior_quadrature: product quadrature is capped at K<={TIER1_MAX_DIM}, got {k}"
         )));
     }
-    let rule = standard_normal_gh_rule(nodes_per_axis).map_err(|reason| {
-        EstimationError::RemlOptimizationFailed(format!("rho_posterior_quadrature: {reason}"))
-    })?;
+    let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(nodes_per_axis).map_err(
+        |error| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "rho_posterior_quadrature: standard-normal Gauss–Hermite rule of order \
+                 {nodes_per_axis}: {error}"
+            ))
+        },
+    )?;
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian).map_err(|reason| {
         EstimationError::RemlOptimizationFailed(format!("rho_posterior_quadrature: {reason}"))
     })?;
@@ -363,7 +354,7 @@ fn mixture_moments(nodes: &[RhoMixtureNode], k: usize) -> (Array1<f64>, Array2<f
     (mean, covariance)
 }
 
-/// Tier-1 of the exact marginal-smoothing inference stack (#938): adaptive
+/// Tier-1 of the marginal-smoothing inference stack (#938): adaptive
 /// Gauss-Hermite quadrature over `ρ` (`K ≤ 4`), criterion-closure form.
 ///
 /// The exact outer Hessian at `ρ̂` whitens/scales the grid; each node of the
@@ -415,7 +406,7 @@ where
     })
 }
 
-/// Tier-2 of the exact marginal-smoothing inference stack (#938): NUTS over `ρ`
+/// Tier-2 of the marginal-smoothing inference stack (#938): NUTS over `ρ`
 /// with the exact profiled gradient, whitened by the exact outer Hessian at
 /// `ρ̂` (the `hmc` module's whitening design reused one level up).
 ///
@@ -479,8 +470,8 @@ where
     })
 }
 
-/// The auto-selection seam (#938): given an [`RhoCertificate::Escalate`]
-/// verdict from the Tier-0 certificate, pick and run the escalation tier by
+/// The auto-selection seam (#938): given an [`RhoProposalAdequacy::Escalate`]
+/// grade from the Tier-0 adequacy diagnostic, pick and run the escalation tier by
 /// dimension — Tier 1 (deterministic quadrature) for `K ≤ 4`, Tier 2 (NUTS
 /// over `ρ` with the exact profiled gradient) for `K ≤ 16`, and an honest
 /// [`RhoPosteriorEscalation::Unavailable`] beyond that. Magic by default: no
@@ -539,7 +530,7 @@ where
     }
 }
 
-/// Compute the Tier-0 PSIS `ρ`-certificate.
+/// Compute the Tier-0 PSIS `ρ`-adequacy diagnostic.
 ///
 /// * `rho_hat` — the converged smoothing parameters `ρ̂` (length `K`).
 /// * `outer_hessian` — the exact outer Hessian `H_ρ` of the criterion at `ρ̂`
@@ -550,18 +541,18 @@ where
 ///   (or rebuilds) the objective.
 /// * `n_samples` — proposal draw count `M` (defaults to 64 when `None`).
 ///
-/// Returns `Ok(None)` when `K = 0`: there is nothing to certify. Returns the typed
-/// [`RhoPosteriorRefusal`] naming the site when the certificate cannot be formed —
+/// Returns `Ok(None)` when `K = 0`: there is nothing to grade. Returns the typed
+/// [`RhoPosteriorRefusal`] naming the site when the diagnostic cannot be formed —
 /// an outer Hessian whose shape does not match `ρ̂` or that is not positive
 /// definite, an infeasible or non-finite criterion at `ρ̂`, no proposal draw with a
 /// finite criterion, too few finite weights for the Pareto tail fit, a non-finite
 /// tail shape, or smoothed weights that do not normalize.
-pub fn rho_posterior_certificate<F>(
+pub fn rho_posterior_adequacy<F>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
     criterion: F,
     n_samples: Option<usize>,
-) -> Result<Option<RhoPosteriorCertificate>, RhoPosteriorRefusal>
+) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>
 where
     F: Fn(&Array1<f64>) -> Option<f64>,
 {
@@ -585,7 +576,7 @@ where
         .unwrap_or(DEFAULT_M)
         .max(2 * gam_solve::psis::MIN_TAIL_COUNT);
 
-    let mut rng = DetNormal::new(CERTIFICATE_SEED);
+    let mut rng = DetNormal::new(ADEQUACY_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
     for _ in 0..m {
         let z: Array1<f64> = Array1::from_iter((0..k).map(|_| rng.normal()));
@@ -650,12 +641,26 @@ where
         })
         .sum();
 
-    Ok(Some(RhoPosteriorCertificate {
+    Ok(Some(RhoPosteriorAdequacy {
         k_hat,
-        certificate: RhoCertificate::from_k_hat(k_hat),
+        adequacy: RhoProposalAdequacy::from_k_hat(k_hat),
         n_samples: m,
         effective_sample_size: 1.0 / sum_sq,
     }))
+}
+
+/// Standard error of `adequacy.k_hat`, the resolution of its grade (#2946 T2).
+///
+/// It is [`gam_solve::psis::shape_standard_error`] at the tail sample
+/// [`gam_solve::psis::tail_count`]`(n_samples)` that the Pareto fit used,
+/// evaluated at the reported shape as a plug-in for the true one. A grade whose
+/// `k_hat` lies within a few of these of [`PLUG_IN_ADEQUATE_K_HAT`] or
+/// [`ESCALATE_K_HAT`] does not say which side of that cutoff the truth is on.
+pub fn k_hat_standard_error(adequacy: &RhoPosteriorAdequacy) -> f64 {
+    gam_solve::psis::shape_standard_error(
+        gam_solve::psis::tail_count(adequacy.n_samples),
+        adequacy.k_hat,
+    )
 }
 
 #[cfg(test)]
@@ -666,9 +671,9 @@ mod tests {
     /// CLOSED-FORM FIXTURE: when the criterion IS exactly the Gaussian
     /// `−log π(ρ|y) = ½(ρ−ρ̂)ᵀ H_ρ (ρ−ρ̂)` that the Laplace proposal assumes,
     /// the importance weights are all identically 1 — the proposal is the
-    /// target. PSIS must then report a tiny `k̂` and certify the plug-in.
+    /// target. PSIS must then report a tiny `k̂` and grade the plug-in adequate.
     #[test]
-    fn exact_gaussian_target_certifies_plug_in() {
+    fn exact_gaussian_target_grades_plug_in_adequate() {
         let rho_hat = array![0.3, -0.7];
         let h = array![[2.0, 0.5], [0.5, 1.5]];
         // criterion(ρ) = ½ (ρ−ρ̂)ᵀ H (ρ−ρ̂): exactly the proposal's negative log
@@ -683,30 +688,30 @@ mod tests {
             }
             Some(0.5 * q)
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(256))
-            .expect("certificate formed")
-            .expect("certificate present");
-        // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in certified.
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(256))
+            .expect("diagnostic formed")
+            .expect("diagnostic present");
+        // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in adequate.
         assert!(
-            (cert.effective_sample_size - cert.n_samples as f64).abs() < 1e-6,
+            (graded.effective_sample_size - graded.n_samples as f64).abs() < 1e-6,
             "uniform weights must give ESS == M: ess={} M={}",
-            cert.effective_sample_size,
-            cert.n_samples
+            graded.effective_sample_size,
+            graded.n_samples
         );
         assert!(
-            cert.k_hat < 0.5,
+            graded.k_hat < 0.5,
             "exact-Gaussian target must yield small k̂, got {}",
-            cert.k_hat
+            graded.k_hat
         );
-        assert_eq!(cert.certificate, RhoCertificate::PlugInCertified);
+        assert_eq!(graded.adequacy, RhoProposalAdequacy::PlugInAdequate);
     }
 
     /// When the true `π(ρ|y)` is much HEAVIER-tailed than the Gaussian Laplace
     /// proposal (a criterion far flatter than the proposal quadratic in the
-    /// tails), the importance weights blow up and PSIS must refuse to certify
-    /// the plug-in — `k̂` rises and the tier escalates.
+    /// tails), the importance weights blow up and PSIS must not grade the
+    /// plug-in adequate — `k̂` rises and the tier escalates.
     #[test]
-    fn heavy_tailed_target_refuses_to_certify() {
+    fn heavy_tailed_target_is_not_graded_plug_in_adequate() {
         let rho_hat = array![0.0];
         let h = array![[4.0]]; // tight proposal (variance 0.25).
         // Target ∝ a heavy Student-like tail: criterion grows only
@@ -715,16 +720,16 @@ mod tests {
             let r = rho[0];
             Some((1.0 + r * r).ln())
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(512))
-            .expect("certificate formed")
-            .expect("certificate present");
+        let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(512))
+            .expect("diagnostic formed")
+            .expect("diagnostic present");
         assert!(
-            cert.k_hat > 0.5,
+            graded.k_hat > 0.5,
             "heavy-tailed target must raise k̂ above 0.5, got {}",
-            cert.k_hat
+            graded.k_hat
         );
-        // This used to be `assert_ne!(.., PlugInCertified)`, which is ENTAILED
-        // by the `k̂ > 0.5` assertion five lines up: `PlugInCertified` is
+        // This used to be `assert_ne!(.., PlugInAdequate)`, which is ENTAILED
+        // by the `k̂ > 0.5` assertion five lines up: `PlugInAdequate` is
         // DEFINED as `k̂ < 0.5`. It could not distinguish `ImportanceCorrect`
         // from `Escalate`, and it would pass for any future fourth variant.
         //
@@ -733,21 +738,21 @@ mod tests {
         // tiers, and unlike a hard-coded expected tier it cannot go stale if
         // the fixture's k̂ drifts within a band -- while still failing loudly if
         // the thresholds are ever rewired.
-        let expected = RhoCertificate::from_k_hat(cert.k_hat);
+        let expected = RhoProposalAdequacy::from_k_hat(graded.k_hat);
         assert_eq!(
-            cert.certificate, expected,
-            "the certificate tier must follow from k̂ = {} by the documented \
-             thresholds (k̂ < 0.5 PlugInCertified, ≤ 0.7 ImportanceCorrect, \
+            graded.adequacy, expected,
+            "the adequacy grade must follow from k̂ = {} by the documented \
+             thresholds (k̂ < 0.5 PlugInAdequate, ≤ 0.7 ImportanceCorrect, \
              else Escalate)",
-            cert.k_hat
+            graded.k_hat
         );
         assert!(
             matches!(
-                cert.certificate,
-                RhoCertificate::ImportanceCorrect | RhoCertificate::Escalate
+                graded.adequacy,
+                RhoProposalAdequacy::ImportanceCorrect | RhoProposalAdequacy::Escalate
             ),
-            "a heavy-tailed target must refuse to certify the plug-in, got {:?}",
-            cert.certificate
+            "a heavy-tailed target must not grade the plug-in adequate, got {:?}",
+            graded.adequacy
         );
     }
 
@@ -759,10 +764,10 @@ mod tests {
             let d = rho[0] - 1.0;
             Some(0.5 * d * d)
         };
-        let a = rho_posterior_certificate(&rho_hat, &h, crit, Some(64))
+        let a = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
             .expect("a formed")
             .expect("a present");
-        let b = rho_posterior_certificate(&rho_hat, &h, crit, Some(64))
+        let b = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
             .expect("b formed")
             .expect("b present");
         // Kish's (Σw)²/Σw² of self-normalized weights lies in [1, M]: Σw = 1 and
@@ -779,12 +784,34 @@ mod tests {
         assert_eq!(a.k_hat.to_bits(), b.k_hat.to_bits());
     }
 
+    /// #2946 T2: a fit's `k̂` resolution is the Pareto shape error at the tail
+    /// the fit used, `tail_count(M)`, at its own `k̂`. At the default `M = 64` a
+    /// `k̂` at the `0.7` cutoff is resolved only to `≈ 0.27`, the value the
+    /// module docs state.
+    #[test]
+    fn k_hat_standard_error_reads_the_fits_own_tail_2946() {
+        let at_cutoff = RhoPosteriorAdequacy {
+            k_hat: ESCALATE_K_HAT,
+            adequacy: RhoProposalAdequacy::from_k_hat(ESCALATE_K_HAT),
+            n_samples: DEFAULT_M,
+            effective_sample_size: 10.0,
+        };
+        let se = k_hat_standard_error(&at_cutoff);
+        assert_eq!(
+            se.to_bits(),
+            gam_solve::psis::shape_standard_error(8, ESCALATE_K_HAT).to_bits()
+        );
+        assert!((se - 0.27).abs() < 0.005, "{se}");
+        let larger = RhoPosteriorAdequacy { n_samples: 512, ..at_cutoff.clone() };
+        assert!(k_hat_standard_error(&larger) < se);
+    }
+
     #[test]
     fn empty_rho_returns_none() {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
         assert!(matches!(
-            rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), None),
+            rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), None),
             Ok(None)
         ));
     }
@@ -806,13 +833,13 @@ mod tests {
 
     /// A singular outer Hessian has no Gaussian proposal. The ridge used to turn
     /// `[[1, 1], [1, 1]]` into a proposal with variance `≈ 1e10` along its null
-    /// direction; the certificate refuses it instead.
+    /// direction; the diagnostic refuses it instead.
     #[test]
     fn singular_outer_hessian_is_refused() {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(whitening_factor_from_outer_hessian(&h).is_err());
-        let refusal = rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), Some(64))
+        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), Some(64))
             .expect_err("a singular outer Hessian must be refused");
         assert!(
             matches!(refusal, RhoPosteriorRefusal::HessianNotPositiveDefinite { .. }),

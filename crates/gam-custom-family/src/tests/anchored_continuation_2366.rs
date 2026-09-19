@@ -415,6 +415,7 @@ fn double_well_options() -> BlockwiseFitOptions {
         outer_score_subsample: None,
         auto_outer_subsample: false,
         cache_session: None,
+        required_warm_start: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
@@ -629,6 +630,43 @@ fn anchored_continuation_mode_is_independent_of_the_seed_2366() {
     );
 }
 
+/// #2901, the ruling's pin (3): at the certified mode the double well's data
+/// curvature `12β² − 4` is negative and only the penalty makes `H = 12β² − 4 + λ`
+/// positive definite. `H ⪰ λS` fails, so the block has no certified rank bound, and the
+/// exact trace `λ/H` publishes unclamped above its rank of 1 instead of refusing the
+/// fit or being clamped to the rank.
+#[test]
+fn a_double_well_fit_publishes_its_uncertified_trace_2901() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let result = fit_custom_family(&family, &[double_well_spec(2.0)], &double_well_options())
+        .expect("a certified double-well mode publishes EDF without refusing");
+    let bound = result.edf_rank_bound();
+    assert_eq!(bound.len(), 1, "one penalty block: {bound:?}");
+    assert!(
+        matches!(
+            bound[0],
+            gam_solve::estimate::EdfRankBound::Uncertified { smallest_pivot, band }
+                if smallest_pivot < -band
+        ),
+        "the double well's data curvature is resolved negative at its mode: {bound:?}"
+    );
+    let inference = result.inference.as_ref().expect("the fit computed inference");
+    let hessian = inference.penalized_hessian.as_array()[[0, 0]];
+    let lambda = result.lambdas[0];
+    let exact = lambda / hessian;
+    let trace = result.penalty_block_trace()[0];
+    assert!(trace > 1.0, "the trace {trace} lies above the block's rank of 1");
+    assert!(
+        (trace - exact).abs() <= 2.0 * f64::EPSILON * exact,
+        "the published trace {trace} is λ/H = {exact} to one solve and one product"
+    );
+    assert_eq!(
+        result.edf_by_block()[0],
+        1.0 - trace,
+        "an uncertified block's EDF is published unclamped"
+    );
+}
+
 /// The end-to-end property: a whole production fit is a function of the model
 /// and the data, not of the coefficients the caller happened to pass in.
 ///
@@ -723,5 +761,108 @@ fn anchored_continuation_selects_the_anchor_branch_2366() {
         "selected mode {selected} (obj {}) should beat the seed-dependent mode {shallow} (obj {})",
         objective(selected),
         objective(shallow)
+    );
+}
+
+/// gam#2928: the ladder keeps the anchor's corrected mode for its later sweeps,
+/// and the kept mode answers only the anchor it was solved at. A different
+/// anchor, one rounding step away, a different width, or a zero of the other
+/// sign, is solved rather than read.
+#[test]
+fn the_kept_anchor_mode_answers_only_its_own_anchor_2928() {
+    let anchor = array![8.0, 3.5];
+    let kept = crate::fit::AnchorWaypointMode::new(
+        &anchor,
+        crate::assembly::ConstrainedWarmStart {
+            rho: anchor.clone(),
+            block_beta: vec![array![-0.25]],
+            active_sets: vec![None],
+            cached_inner: None,
+        },
+    );
+    let read = kept.at(&anchor).expect("the anchor it was solved at");
+    assert_eq!(read.block_beta[0][0].to_bits(), (-0.25_f64).to_bits());
+    for other in [
+        array![8.0, f64::from_bits(3.5_f64.to_bits() + 1)],
+        array![8.0],
+        array![8.0, 3.5, 0.0],
+        array![8.0, -3.5],
+    ] {
+        assert!(
+            kept.at(&other).is_none(),
+            "anchor {other} read the mode kept for {anchor}"
+        );
+    }
+    assert!(
+        crate::fit::AnchorWaypointMode::new(&array![0.0], kept.at(&anchor).expect("kept").clone())
+            .at(&array![-0.0])
+            .is_none(),
+        "a zero of the other sign is a different anchor"
+    );
+}
+
+/// gam#2661: the rule that selected a fit's coefficient mode is recorded on the
+/// fit, so a caller reads it rather than a log line. A certified anchored
+/// continuation records itself. A nonconvex fit with no smoothing parameter has
+/// no anchor, so it records that the caller's seed selected its mode. A declined
+/// continuation records its refusal, which `require_rule_selected` names.
+#[test]
+fn the_fit_records_which_rule_selected_its_mode_2661() {
+    use gam_solve::model_types::CoefficientModeSelection;
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let options = double_well_options();
+
+    let certified =
+        fit_custom_family(&family, &[double_well_spec(2.0)], &options).expect("double-well fit");
+    let selection = &certified.artifacts.coefficient_mode_selection;
+    assert!(
+        matches!(
+            selection,
+            CoefficientModeSelection::AnchoredContinuation { steps, endpoint_discrepancy }
+                if *steps >= 1 && endpoint_discrepancy.is_finite()
+        ),
+        "a certified continuation recorded {selection:?}"
+    );
+    selection
+        .require_rule_selected("double well")
+        .expect("the anchored continuation selected the mode");
+
+    let mut unpenalized = double_well_spec(2.0);
+    unpenalized.penalties.clear();
+    unpenalized.nullspace_dims.clear();
+    unpenalized.initial_log_lambdas = Array1::zeros(0);
+    let seed_fit =
+        fit_custom_family(&family, &[unpenalized], &options).expect("unpenalized double-well fit");
+    let seed_selection = &seed_fit.artifacts.coefficient_mode_selection;
+    let CoefficientModeSelection::SeedSelected { reason } = seed_selection else {
+        panic!("an unpenalized nonconvex fit recorded {seed_selection:?}");
+    };
+    assert!(reason.contains("no smoothing parameter"), "{reason}");
+    assert!(
+        seed_selection
+            .require_rule_selected("unpenalized double well")
+            .is_err()
+    );
+
+    let refusal = AnchoredContinuationRefusal::EmptySweep { steps: 1 };
+    let declined = crate::fit::declined_continuation_selection(&refusal);
+    assert_eq!(
+        declined,
+        CoefficientModeSelection::SeedSelected {
+            reason: refusal.to_string()
+        }
+    );
+    let refused = declined
+        .require_rule_selected("declined")
+        .expect_err("a seed-selected mode is refused");
+    assert!(
+        refused.contains(&refusal.to_string()),
+        "the refusal is named: {refused}"
+    );
+    assert!(
+        CoefficientModeSelection::NotRecorded
+            .require_rule_selected("old payload")
+            .is_err(),
+        "an unrecorded rule is refused"
     );
 }

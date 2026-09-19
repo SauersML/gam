@@ -1,7 +1,7 @@
 use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
     FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
-    ModelKind,
+    ModelKind, READABLE_PAYLOAD_VERSIONS,
 };
 use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, MixtureLinkState,
@@ -64,10 +64,9 @@ fn fitted_family_all_variants_round_trip_to_identical_json_bytes() {
     }
 }
 
-#[test]
-fn payload_with_older_version_is_rejected_with_version_mismatch() {
-    let payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION - 1,
+fn gaussian_payload_at(version: u32) -> FittedModelPayload {
+    FittedModelPayload::new(
+        version,
         "y ~ 1".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -78,11 +77,32 @@ fn payload_with_older_version_is_rejected_with_version_mismatch() {
             sas_state: None,
         },
         "gaussian".to_string(),
-    );
+    )
+}
 
-    let err = FittedModel::from_payload(payload)
+/// The refused version is read off the binary's readable set, not offset from
+/// `MODEL_PAYLOAD_VERSION`: a bump that keeps its predecessor readable (v19 and
+/// v20 both did) turns `MODEL_PAYLOAD_VERSION - 1` into an accepted version.
+#[test]
+fn payload_with_older_version_is_rejected_with_version_mismatch() {
+    for version in READABLE_PAYLOAD_VERSIONS {
+        if let Err(err) = FittedModel::from_payload(gaussian_payload_at(version))
+            .validate_for_persistence()
+        {
+            assert!(
+                !err.to_string().contains("payload schema mismatch"),
+                "readable payload version {version} must pass the version gate: {err}"
+            );
+        }
+    }
+    let oldest_readable = READABLE_PAYLOAD_VERSIONS
+        .iter()
+        .copied()
+        .min()
+        .expect("this binary reads at least its own payload version");
+    let err = FittedModel::from_payload(gaussian_payload_at(oldest_readable - 1))
         .validate_for_persistence()
-        .expect_err("older payload versions should fail with a schema version mismatch");
+        .expect_err("a payload older than every readable version must fail the version gate");
     assert!(
         err.to_string().contains("MODEL_PAYLOAD_VERSION"),
         "version mismatch errors should explicitly mention MODEL_PAYLOAD_VERSION"

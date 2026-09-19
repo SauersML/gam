@@ -157,10 +157,12 @@ pub struct SaeManifoldRho {
     /// per-atom vector. The EFS / Fellner–Schall multiplicative update is already
     /// per-coordinate and writes each atom's entry independently.
     pub log_lambda_smooth: Vec<f64>,
-    /// Per-atom, per-axis `log(alpha_kj)` ARD strengths. An empty per-atom
-    /// block disables native coordinate ARD for that atom. The inner solve and
-    /// every penalty assembler read THIS full table; `ard_sharing` only governs
-    /// how the OUTER optimizer's flat coordinate vector maps onto it.
+    /// Per-atom, per-axis `log(alpha_kj)` ARD strengths. Every coordinate atom
+    /// carries a full `log_ard` block, one entry per latent axis: the coordinate
+    /// prior is what makes each row's coordinate posterior proper, so an empty
+    /// block is refused at criterion entry (`validated_ard_precisions`). The inner
+    /// solve and every penalty assembler read THIS full table; `ard_sharing` only
+    /// governs how the OUTER optimizer's flat coordinate vector maps onto it.
     pub log_ard: Vec<Array1<f64>>,
     /// #1026 — outer-optimizer ARD parameterization (per-atom vs shared). Does
     /// not change `log_ard`'s shape or the inner-solve math; only `to_flat` /

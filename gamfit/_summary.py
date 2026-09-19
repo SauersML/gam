@@ -39,6 +39,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "null_dim",
     "iterations",
     "edf_total",
+    "edf_rank_bound",
     "lambdas",
     "coefficients",
     "smooth_terms",
@@ -180,7 +181,7 @@ class Summary:
 
         - the fit has **no** criterion at all (:attr:`raw_reml_score` is
           ``None`` too), which is not the same as one that was not recorded: an
-          exactly-interpolating Gaussian fit has :math:`\hat\varphi = 0`, so
+          exactly-interpolating Gaussian fit has :math:`\\hat\\varphi = 0`, so
           its restricted likelihood is unbounded and every score derived from
           it is undefined;
         - the fit has a raw criterion but no penalty null-space metadata, so
@@ -202,6 +203,16 @@ class Summary:
         Outer-loop iteration count.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
+    edf_rank_bound : list of mapping
+        Each penalty block's rank-bound status (#2901): ``{"Certified": ...}`` when
+        the block's trace is certified to lie in ``[0, rank]``;
+        ``{"Uncertified": {"smallest_pivot": ..., "band": ...}}`` (rank bound not
+        certified) when the factorization of the data curvature against the
+        penalty has a negative pivot; or ``{"NotAssessed": {"reason": ...}}``
+        (rank bound not assessed) when the memory governor refused the
+        certificate's workspace. A block that is not certified publishes its
+        trace, its EDF and ``edf_total`` unclamped. Empty when the fit recorded
+        none.
     lambdas : list of float
         Fitted smoothing / precision parameters in penalty-block order.
     coefficients : sequence of mappings
@@ -303,6 +314,8 @@ class Summary:
     null_dim: float | None = None
     iterations: int | None = None
     edf_total: float | None = None
+    #: Per-block rank-bound status beside the EDF fields (#2901).
+    edf_rank_bound: list[Any] = field(default_factory=list)
     lambdas: list[float] = field(default_factory=list)
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)

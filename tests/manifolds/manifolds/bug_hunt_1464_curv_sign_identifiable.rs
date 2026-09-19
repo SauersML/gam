@@ -6,18 +6,20 @@
 //! with the SAME κ̂ returned for the mirror spherical/hyperbolic datasets).
 //!
 //! The evidence is a sign-symmetry argument that needs no absolute scale: two
-//! datasets that are exact mirror images under the curvature sign — one spherical
-//! (κ⋆ = +2), one hyperbolic (κ⋆ = −2) — are generated using the ENGINE'S OWN
-//! geodesic-distance convention (`ConstantCurvature::distance`), so the planted
-//! signal's geometry is gam's own truth, never another tool's output. A correct
-//! estimator MUST distinguish them.
+//! mirror datasets, one spherical (κ⋆ = +2) and one hyperbolic (κ⋆ = −2), each
+//! a member of the fitted term's OWN span at its κ⋆ (see `curved_dataset`), so
+//! the planted signal's geometry is gam's own truth, never another tool's
+//! output. A correct estimator MUST distinguish them.
 //!
 //! κ̂ is read back from the FITTED resolved term spec (the same κ̂ that
 //! `model.curvature()` surfaces), so this drives exactly the user-visible
 //! full-fit path the issue reports on.
 
-use gam::geometry::constant_curvature::ConstantCurvature;
-use gam::smooth::get_constant_curvature_kappa;
+use gam::inference::formula_dsl::parse_formula;
+use gam::smooth::{SmoothBasisSpec, get_constant_curvature_kappa};
+use gam::terms::basis::build_constant_curvature_basis;
+use gam::terms::term_builder::build_termspec;
+use ndarray::{Array1, Array2};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -62,20 +64,32 @@ fn next_gauss(state: &mut u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
+/// The one formula the plant and the fit share, so the planted span is the
+/// span the fit estimates.
+const FIT_FORMULA: &str = "y ~ curv(x1, x2, centers=10)";
+
 /// `n` chart points uniformly in a disk of radius `radius`, with a Gaussian
-/// response built so the curvature is genuinely identifiable: the mean is a
-/// smooth function of the `M_{κ⋆}` geodesic distance to the origin,
-/// `μ = 2·exp(−d_{κ⋆}) − 1` (gam's OWN `ConstantCurvature::distance`), so the
-/// distance-matrix SHAPE — hence the planted signal — depends sharply on κ⋆.
+/// response that is a member of the κ⋆ span of the fitted `curv(...)` term: the
+/// term's own columns at the TRUE κ (its realized centers and auto range),
+/// weighted `w_j = 1/(1+j)` and standardized to unit SD, plus noise.
+///
+/// This fixture used to plant `μ = 2·exp(−d_{κ⋆}(x, 0)) − 1`, a function of
+/// the geodesic distance to the chart ORIGIN. That plant is curvature-BLIND as
+/// a function class: `d_κ(x, 0)` is a strictly monotone reparametrization of
+/// the chart radius at every κ (the argument
+/// `constant_curvature_kappa_inference_e2e` gives for its own generator), so
+/// the geometry carried no signal and both mirror fits railed at the positive
+/// chart bound: κ̂ = +2.1589 (ℓ̂ = 0.954) and +2.1607 (ℓ̂ = 2.6e7) in sw4l job
+/// 1244874 at 95115c8a1f. On an in-span plant the full formula pipeline
+/// recovers κ⋆ = −2, −0.75, +0.75 and +2 as −1.999, −0.729, +0.801 and +2.001
+/// (lane probe 1252018).
 fn curved_dataset(kappa_star: f64, seed: u64) -> gam::data::EncodedDataset {
     let radius = 0.68_f64;
     let noise = 0.02_f64;
     let n = 600usize;
-    let manifold = ConstantCurvature::new(2, kappa_star);
-    let origin = ndarray::array![0.0_f64, 0.0_f64];
-    let mut st = seed;
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
-    let mut records = Vec::with_capacity(n);
+    let mut st = seed;
+    let mut points = Array2::<f64>::zeros((n, 2));
     let mut filled = 0usize;
     while filled < n {
         let a = 2.0 * next_unit(&mut st) - 1.0;
@@ -83,21 +97,59 @@ fn curved_dataset(kappa_star: f64, seed: u64) -> gam::data::EncodedDataset {
         if a * a + b * b > 1.0 {
             continue;
         }
-        let x1 = a * radius;
-        let x2 = b * radius;
-        let pt = ndarray::array![x1, x2];
-        let d = manifold
-            .distance(pt.view(), origin.view())
-            .expect("in-chart geodesic distance");
-        let y = 2.0 * (-d).exp() - 1.0 + noise * next_gauss(&mut st);
-        records.push(StringRecord::from(vec![
-            y.to_string(),
-            x1.to_string(),
-            x2.to_string(),
-        ]));
+        points[(filled, 0)] = a * radius;
+        points[(filled, 1)] = b * radius;
         filled += 1;
     }
-    encode_recordswith_inferred_schema(headers, records).expect("encode curved dataset")
+    let encode = |y: &Array1<f64>| {
+        let records = (0..n)
+            .map(|i| {
+                StringRecord::from(vec![
+                    y[i].to_string(),
+                    points[(i, 0)].to_string(),
+                    points[(i, 1)].to_string(),
+                ])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers.clone(), records)
+            .expect("encode curved dataset")
+    };
+
+    // Resolve the fitted term on the design columns alone (the response does not
+    // enter the spec), then build its columns at κ⋆.
+    let design_only = encode(&Array1::<f64>::zeros(n));
+    let parsed = parse_formula(FIT_FORMULA).expect("the fixture formula parses");
+    let col_map = design_only.column_map();
+    let mut notes = Vec::new();
+    let fitspec = build_termspec(&parsed.terms, &design_only, &col_map, &mut notes)
+        .expect("the fixture formula resolves to a term spec");
+    let SmoothBasisSpec::ConstantCurvature { spec, .. } = &fitspec.smooth_terms[0].basis else {
+        panic!("the fixture formula must resolve to a constant-curvature term");
+    };
+    let mut truth = spec.clone();
+    truth.kappa = kappa_star;
+    truth.kappa_fixed = true;
+    truth.double_penalty = false;
+    let basis = build_constant_curvature_basis(points.view(), &truth)
+        .expect("the planted κ⋆ geometry must be inside its own chart");
+    let design = basis.design.to_dense();
+    let mut y = Array1::<f64>::zeros(n);
+    for j in 0..design.ncols() {
+        let w = 1.0 / (1.0 + j as f64);
+        for i in 0..n {
+            y[i] += w * design[(i, j)];
+        }
+    }
+    let mean = y.iter().sum::<f64>() / n as f64;
+    let sd = (y.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64).sqrt();
+    assert!(
+        sd > 0.0,
+        "the planted κ⋆ = {kappa_star} signal collapsed to a constant"
+    );
+    for i in 0..n {
+        y[i] = (y[i] - mean) / sd + noise * next_gauss(&mut st);
+    }
+    encode(&y)
 }
 
 /// Fit `curv(x1, x2, centers=10)` through the full formula pipeline and return
@@ -108,7 +160,7 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ curv(x1, x2, centers=10)", &data, &config)
+    let result = fit_from_formula(FIT_FORMULA, &data, &config)
         .expect("curv formula fit should succeed");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard Gaussian fit");

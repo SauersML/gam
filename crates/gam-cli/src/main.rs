@@ -163,10 +163,14 @@ mod multinomial_cli;
 mod prediction_csv;
 #[path = "main/run_crosscoder.rs"]
 mod run_crosscoder;
+#[path = "main/run_parameter_decomposition.rs"]
+mod run_parameter_decomposition;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
 #[path = "main/run_fit.rs"]
 mod run_fit;
+#[path = "main/run_joint_events.rs"]
+mod run_joint_events;
 #[path = "main/run_predict.rs"]
 mod run_predict;
 #[path = "main/run_sample_generate_report.rs"]
@@ -185,8 +189,10 @@ pub(crate) use model_summary::*;
 pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
 pub(crate) use run_crosscoder::*;
+pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_diagnose::*;
 pub(crate) use run_fit::*;
+pub(crate) use run_joint_events::*;
 pub(crate) use run_predict::*;
 pub(crate) use run_sample_generate_report::*;
 pub(crate) use run_fit_events::*;
@@ -291,6 +297,7 @@ fn run() -> CliResult<()> {
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
         Command::Crosscoder(args) => run_crosscoder(args),
+        Command::ParameterDecomposition(args) => run_parameter_decomposition_cli(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
         Command::Predict(args) => run_predict(args).map_err(CliError::from),
         Command::TransformationScore(args) => {
@@ -299,6 +306,7 @@ fn run() -> CliResult<()> {
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
+        Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),
         Command::FitEvents(args) => run_fit_events(args).map_err(CliError::from),
     }
 }

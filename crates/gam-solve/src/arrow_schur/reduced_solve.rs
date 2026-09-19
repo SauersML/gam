@@ -79,43 +79,162 @@ pub(crate) fn tile_schur_partial<B: BatchedBlockSolver>(
     Ok(partial)
 }
 
-/// A reduced-Schur chunk partial holding only the `(a, b)` pairs its rows touch,
-/// keyed `a·k + b`, each accumulating `-Σ_rows Σ_c left[c, a]·right[c, b]`.
+/// A reduced-Schur chunk partial over the `(a, b)` pairs its rows touch, each
+/// accumulating `-Σ_rows Σ_c left[c, a]·right[c, b]` in a dense `k×k` value array.
 ///
-/// Every stored value is accumulated in the same row, `c`, `a`, `b` order and from
+/// Every touched value is accumulated in the same row, `c`, `a`, `b` order and from
 /// the same `+0.0` start as a dense zero-seeded `k×k` partial under the CPU
-/// `block_gemm_subtract`, so it is the same f64. A pair no row of the chunk touches
-/// is `+0.0` in the dense partial and absent here, which changes at most the sign
-/// of a zero entry after the fold.
-#[derive(Default)]
+/// `block_gemm_subtract`, so it is the same f64. The fold adds each touched pair
+/// once, and distinct pairs are distinct Schur entries, so the order the pairs are
+/// visited in cannot move a word. A pair no row of the chunk touches is `+0.0` in
+/// the dense zero-seeded partial and never folded here, which changes at most the
+/// sign of a zero entry after the fold.
+///
+/// Which pairs are touched is a `k`-bit set per left index `a`. A factor row `c`
+/// touches `left_active(c) × right_active(c)`, so it ORs the words of
+/// `right_active(c)`'s column set into the set of every `a` in `left_active(c)`:
+/// `|left_active|·|right words|` word ORs outside the product loop. Marking each
+/// product instead (a touched flag and a key push per `a·k + b`) cost the
+/// `inner_fit_core_scaling` system (`N = 40000`, `d = 2`, `k = 256`) 1.19 s per
+/// parallel solve against 0.78 s for the unmarked dense partials it replaced
+/// (sw4i 1255679).
 struct TouchedPairPartial {
-    values: std::collections::HashMap<usize, f64>,
+    k: usize,
+    /// `⌈k/64⌉`, the words of one left index's touched set.
+    words: usize,
+    values: Vec<f64>,
+    /// `touched[a·words + w]` holds columns `64·w ..` of `a`'s touched set.
+    touched: Vec<u64>,
+    /// The left indices with a touched pair, in first-touch order.
+    touched_rows: Vec<usize>,
+    row_listed: Vec<bool>,
     left_active: Vec<(usize, f64)>,
     right_active: Vec<(usize, f64)>,
+    /// The nonzero words of `right_active`'s column set, `(word, bits)` in word order.
+    right_words: Vec<(usize, u64)>,
 }
 
 impl TouchedPairPartial {
-    fn clear(&mut self) {
-        self.values.clear();
+    fn new(k: usize) -> Self {
+        let words = k.div_ceil(u64::BITS as usize);
+        Self {
+            k,
+            words,
+            values: vec![0.0; k * k],
+            touched: vec![0; k * words],
+            touched_rows: Vec::new(),
+            row_listed: vec![false; k],
+            left_active: Vec::new(),
+            right_active: Vec::new(),
+            right_words: Vec::new(),
+        }
     }
 
-    /// `schur[a, b] += partial[a, b]` for every stored pair.
+    /// Back to every pair at `+0.0` and untouched, resetting only the touched pairs.
+    fn clear(&mut self) {
+        let Self {
+            k,
+            words,
+            values,
+            touched,
+            touched_rows,
+            row_listed,
+            ..
+        } = self;
+        for &a in touched_rows.iter() {
+            for (w, word) in touched[a * *words..(a + 1) * *words].iter_mut().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let b = w * u64::BITS as usize + bits.trailing_zeros() as usize;
+                    values[a * *k + b] = 0.0;
+                    bits &= bits - 1;
+                }
+                *word = 0;
+            }
+            row_listed[a] = false;
+        }
+        touched_rows.clear();
+    }
+
+    /// `schur[a, b] += partial[a, b]` for every touched pair.
     fn fold_into(&self, schur: &mut Array2<f64>) {
         let schur_flat = schur
             .as_slice_mut()
             .expect("TouchedPairPartial::fold_into: reduced Schur must be standard-layout");
-        for (&key, &value) in &self.values {
-            schur_flat[key] += value;
+        for &a in &self.touched_rows {
+            let row = self.touched[a * self.words..(a + 1) * self.words].iter();
+            for (w, &word) in row.enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let b = w * u64::BITS as usize + bits.trailing_zeros() as usize;
+                    schur_flat[a * self.k + b] += self.values[a * self.k + b];
+                    bits &= bits - 1;
+                }
+            }
         }
     }
 }
 
+/// The governor charge of one [`TouchedPairPartial`] at border `k`: its value array
+/// (`k²·8` bytes), its touched sets (`k·⌈k/64⌉·8`) and its per-left-index list and
+/// flag (`k·(8 + 1)`). `None` when the byte count overflows.
+///
+/// The per-factor-row scratch (`left_active`, `right_active`, `right_words`, at most
+/// `k` entries each) is not charged.
+fn touched_pair_partial_bytes(k: usize) -> Option<usize> {
+    let words = k.div_ceil(u64::BITS as usize);
+    let values = k.checked_mul(k)?.checked_mul(std::mem::size_of::<f64>())?;
+    let touched = k.checked_mul(words)?.checked_mul(std::mem::size_of::<u64>())?;
+    let rows = k.checked_mul(std::mem::size_of::<usize>() + std::mem::size_of::<bool>())?;
+    values.checked_add(touched)?.checked_add(rows)
+}
+
+/// How the reduced-Schur fold runs once the memory governor has priced its partials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TouchedPairFold {
+    /// Fixed row chunks reduced into this many live partials, folded in chunk order.
+    /// The chunk sums and their fold order do not depend on the count, so every count
+    /// folds the same words; the count only sets how many chunks reduce at once.
+    Chunked { partials: usize },
+    /// No partial is admitted: the rows reduce in place, serially, in row order.
+    InPlace,
+}
+
+/// The most partials, up to `wanted`, whose [`touched_pair_partial_bytes`] charge the
+/// ledger takes, with the reservation, or [`TouchedPairFold::InPlace`] when it takes
+/// none (or the byte count overflows).
+///
+/// A declined footprint degrades the fold's parallelism, never its per-product cost:
+/// every admitted partial is the same dense store. `remaining` is the ledger's
+/// admissible bytes and `reserve` charges it. A charge refused because a peer
+/// reserved first is retried at the count that remains, so the count strictly
+/// decreases until one is taken or none fits.
+pub(crate) fn plan_touched_pair_fold<R>(
+    k: usize,
+    wanted: usize,
+    remaining: impl Fn() -> usize,
+    mut reserve: impl FnMut(usize) -> Option<R>,
+) -> (TouchedPairFold, Option<R>) {
+    let Some(per_partial) = touched_pair_partial_bytes(k) else {
+        return (TouchedPairFold::InPlace, None);
+    };
+    let admissible = |bytes: usize| bytes / per_partial.max(1);
+    let mut partials = wanted.min(admissible(remaining()));
+    while partials > 0 {
+        if let Some(reservation) = reserve(partials * per_partial) {
+            return (TouchedPairFold::Chunked { partials }, Some(reservation));
+        }
+        partials = (partials - 1).min(admissible(remaining()));
+    }
+    (TouchedPairFold::InPlace, None)
+}
+
 /// Subtract one row's Schur contribution into a [`TouchedPairPartial`].
 ///
-/// The loop is `block_gemm_subtract`'s on the CPU backend, with the dense `k×k`
-/// write replaced by a keyed one: for each factor row `c`, the nonzero entries of
-/// `left[c, ·]` and `right[c, ·]` in column order, then `partial[a, b] -= l·r` over
-/// their product in `a`, `b` order.
+/// The loop is `block_gemm_subtract`'s on the CPU backend: for each factor row `c`,
+/// the nonzero entries of `left[c, ·]` and `right[c, ·]` in column order, then
+/// `partial[a, b] -= l·r` over their product in `a`, `b` order. After each `a`'s
+/// products, `right[c, ·]`'s column words are ORed into `a`'s touched set.
 fn subtract_row_schur_contribution_touched_pairs<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     row_idx: usize,
@@ -127,15 +246,22 @@ fn subtract_row_schur_contribution_touched_pairs<B: BatchedBlockSolver>(
 ) -> Result<(), ArrowSchurError> {
     let (left, right) =
         row_schur_contribution_factors(sys, row_idx, row, htt_factor, backend, kind)?;
-    let k = sys.k;
     let TouchedPairPartial {
+        k,
+        words,
         values,
+        touched,
+        touched_rows,
+        row_listed,
         left_active,
         right_active,
+        right_words,
     } = partial;
+    let (k, words) = (*k, *words);
     for c in 0..left.nrows() {
         left_active.clear();
         right_active.clear();
+        right_words.clear();
         let left_row = left.row(c);
         let right_row = right.row(c);
         let left_row = left_row
@@ -152,15 +278,66 @@ fn subtract_row_schur_contribution_touched_pairs<B: BatchedBlockSolver>(
             }
             if r != 0.0 {
                 right_active.push((col, r));
+                let word = col / u64::BITS as usize;
+                let bit = 1_u64 << (col % u64::BITS as usize);
+                match right_words.last_mut() {
+                    Some((last, bits)) if *last == word => *bits |= bit,
+                    _ => right_words.push((word, bit)),
+                }
             }
         }
+        if right_active.is_empty() {
+            continue;
+        }
         for &(a, lca) in left_active.iter() {
+            let partial_row = &mut values[a * k..(a + 1) * k];
             for &(b, rcb) in right_active.iter() {
-                *values.entry(a * k + b).or_insert(0.0) -= lca * rcb;
+                partial_row[b] -= lca * rcb;
+            }
+            let row_touched = &mut touched[a * words..(a + 1) * words];
+            for &(word, bits) in right_words.iter() {
+                row_touched[word] |= bits;
+            }
+            if !row_listed[a] {
+                row_listed[a] = true;
+                touched_rows.push(a);
             }
         }
     }
     Ok(())
+}
+
+/// The parallel reduced-Schur fold: rows in fixed [`SCHUR_FOLD_ROW_CHUNK`]-row
+/// chunks, each reduced in row order into a touched-pair partial, `partials` of them
+/// at once, the partials folded into `schur` in chunk order. Bit-identical run to run
+/// and at every `partials`.
+pub(crate) fn fold_touched_pair_chunk_partials<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    backend: &B,
+    kind: SchurReductionKind,
+    schur: &mut Array2<f64>,
+    partials: usize,
+) -> Result<(), ArrowSchurError> {
+    let k = sys.k;
+    fold_row_chunk_partials_at_width(
+        sys.rows.len(),
+        partials,
+        || TouchedPairPartial::new(k),
+        TouchedPairPartial::clear,
+        |i, partial| {
+            subtract_row_schur_contribution_touched_pairs(
+                sys,
+                i,
+                &sys.rows[i],
+                htt_factors.factor(i),
+                backend,
+                kind,
+                partial,
+            )
+        },
+        |partial| partial.fold_into(schur),
+    )
 }
 
 /// Reduce the per-row Schur contributions `Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
@@ -264,29 +441,40 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         if parallel {
             // Deterministic ordered fold: chunk partials hold `-Σ contribution`
             // over their rows, so `schur += partial` reproduces the serial
-            // `schur -= Σ contribution` in fixed chunk order. Each partial stores
+            // `schur -= Σ contribution` in fixed chunk order. Each partial folds
             // only the `(a, b)` pairs its rows touch, so the fold costs the touched
             // pairs rather than `k²` per chunk: with dense `k×k` partials the
             // main-thread fold was 66% of the build at `k = 4096`, 30,000 rows and
-            // 28 active atoms (#2900, job 1148662), and the per-thread partials
-            // held `8·k²` bytes each.
-            return fold_row_chunk_partials(
-                n_rows,
-                TouchedPairPartial::default,
-                TouchedPairPartial::clear,
-                |i, partial| {
-                    subtract_row_schur_contribution_touched_pairs(
-                        sys,
-                        i,
-                        &sys.rows[i],
-                        htt_factors.factor(i),
-                        backend,
-                        kind,
-                        partial,
-                    )
+            // 28 active atoms (#2900, job 1148662). The governor admits as many
+            // partials as its ledger takes, up to one per pool thread; below one,
+            // the rows reduce in place. A declined footprint costs parallelism,
+            // never per-product work: a keyed store that hashed every product ran
+            // this solve at 24.5 s against 1.2 s dense (sw4i 1255679).
+            let governor = gam_runtime::resource::MemoryGovernor::global();
+            let (fold, charge) = plan_touched_pair_fold(
+                k,
+                fold_row_chunk_partial_count(n_rows),
+                || governor.remaining_bytes(),
+                |bytes| match governor.try_reserve(bytes, "reduced-Schur touched-pair partials") {
+                    Ok(reservation) => Some(reservation),
+                    Err(refusal) => {
+                        log::debug!("[reduced Schur] {refusal}");
+                        None
+                    }
                 },
-                |partial| partial.fold_into(schur),
             );
+            if let TouchedPairFold::Chunked { partials } = fold {
+                let folded = fold_touched_pair_chunk_partials(
+                    sys,
+                    htt_factors,
+                    backend,
+                    kind,
+                    schur,
+                    partials,
+                );
+                drop(charge);
+                return folded;
+            }
         }
         // Serial in-place reduction (original order) — bit-for-bit reference.
         for (i, row) in sys.rows.iter().enumerate() {
@@ -424,6 +612,26 @@ pub(crate) fn dense_reduced_schur_route_under_cap(
         apply: apply_flops,
     }
     .pcg_attempt_under_cap(k, cap_bytes / DENSE_ROUTE_BLOCKS)
+}
+
+/// #2900 row 6.16 — whether a surrogate lane takes the dense `k × k` reduced Schur rather
+/// than its frozen rational surrogate, when one reduced-Schur product costs
+/// `reduced_schur_apply_flops`. The rational surrogate spends at most `num_probes · k`
+/// products per evaluation, the budget the device operator is sized against. The dense
+/// lane is priced as [`DenseReducedSchurRoute::Lane`]: it is taken only where that build,
+/// in products, is within the surrogate's budget and its blocks fit the memory governor's
+/// single-materialization cap. Before this, the dense lane was taken wherever its blocks
+/// fit in core, whatever it cost.
+pub fn surrogate_lane_prices_dense_reduced_schur(
+    lane: &SurrogateLaneState,
+    k: usize,
+    reduced_schur_apply_flops: u64,
+) -> bool {
+    let rational_products = lane.cfg.num_probes.saturating_mul(k);
+    matches!(
+        dense_reduced_schur_route(DenseReducedSchurRoute::Lane, k, reduced_schur_apply_flops),
+        gam_linalg::pcg::PcgAttempt::Budgeted { products } if products <= rational_products
+    )
 }
 
 pub(crate) fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
@@ -1631,16 +1839,8 @@ pub(crate) fn solve_dense_reduced_system(
             return Ok((direct, Some(factor), ArrowPcgDiagnostics::default()));
         }
         let identity = IdentityPreconditioner;
-        let (delta, diag) = steihaug_dense_system(
-            &floored,
-            rhs_beta,
-            &identity,
-            &ArrowPcgOptions {
-                max_iterations: options.trust_region.max_iterations,
-                relative_tolerance: options.trust_region.steihaug_relative_tolerance,
-            },
-            &options.trust_region,
-        )?;
+        let (delta, diag) =
+            steihaug_dense_system(&floored, rhs_beta, &identity, &options.trust_region)?;
         return Ok((delta, Some(factor), diag));
     }
     // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
@@ -1686,16 +1886,8 @@ pub(crate) fn solve_dense_reduced_system(
                 return Ok((direct, Some(floored_factor), ArrowPcgDiagnostics::default()));
             }
             let identity = IdentityPreconditioner;
-            let (delta, diag) = steihaug_dense_system(
-                &floored,
-                rhs_beta,
-                &identity,
-                &ArrowPcgOptions {
-                    max_iterations: options.trust_region.max_iterations,
-                    relative_tolerance: options.trust_region.steihaug_relative_tolerance,
-                },
-                &options.trust_region,
-            )?;
+            let (delta, diag) =
+                steihaug_dense_system(&floored, rhs_beta, &identity, &options.trust_region)?;
             return Ok((delta, Some(floored_factor), diag));
         }
         return Err(ArrowSchurError::SchurFactorFailed {
@@ -1722,16 +1914,7 @@ pub(crate) fn solve_dense_reduced_system(
     // step outside the trust ball, Steihaug-CG returns the boundary point
     // without requiring a second dense factorization.
     let identity = IdentityPreconditioner;
-    let (delta, diag) = steihaug_dense_system(
-        schur,
-        rhs_beta,
-        &identity,
-        &ArrowPcgOptions {
-            max_iterations: options.trust_region.max_iterations,
-            relative_tolerance: options.trust_region.steihaug_relative_tolerance,
-        },
-        &options.trust_region,
-    )?;
+    let (delta, diag) = steihaug_dense_system(schur, rhs_beta, &identity, &options.trust_region)?;
     Ok((delta, Some(factor), diag))
 }
 
@@ -1755,6 +1938,13 @@ pub(crate) const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
 /// order do not depend on the pool.
 pub(crate) const SCHUR_FOLD_ROW_CHUNK: usize = 64;
 
+/// How many partials [`fold_row_chunk_partials`] keeps alive over `n_rows` rows: one
+/// per pool thread, never more than there are chunks. A caller charging the
+/// partials' memory before the fold charges this many.
+fn fold_row_chunk_partial_count(n_rows: usize) -> usize {
+    rayon::current_num_threads().clamp(1, n_rows.div_ceil(SCHUR_FOLD_ROW_CHUNK).max(1))
+}
+
 /// Reduce rows `0..n_rows` into zero-seeded partials over fixed
 /// [`SCHUR_FOLD_ROW_CHUNK`]-row chunks and hand every partial to `fold` in chunk
 /// order.
@@ -1767,8 +1957,35 @@ pub(crate) const SCHUR_FOLD_ROW_CHUNK: usize = 64;
 /// all of it zeroed and freed on every solve. Each buffer is re-zeroed before
 /// its chunk and every chunk reduces its rows in row order, so the fold is
 /// bit-identical to reducing each chunk into a fresh partial.
+///
+/// [`fold_row_chunk_partial_count`] is how many partials it builds.
 pub(crate) fn fold_row_chunk_partials<P, E>(
     n_rows: usize,
+    new_partial: impl Fn() -> P,
+    zero_partial: impl Fn(&mut P) + Sync,
+    reduce_row: impl Fn(usize, &mut P) -> Result<(), E> + Sync,
+    fold: impl FnMut(&P),
+) -> Result<(), E>
+where
+    P: Send,
+    E: Send,
+{
+    fold_row_chunk_partials_at_width(
+        n_rows,
+        fold_row_chunk_partial_count(n_rows),
+        new_partial,
+        zero_partial,
+        reduce_row,
+        fold,
+    )
+}
+
+/// [`fold_row_chunk_partials`] with `width` live partials, at least one and at most
+/// one per chunk. The chunks, their row order and their fold order do not depend on
+/// `width`, so every width folds the same words.
+pub(crate) fn fold_row_chunk_partials_at_width<P, E>(
+    n_rows: usize,
+    width: usize,
     new_partial: impl Fn() -> P,
     zero_partial: impl Fn(&mut P) + Sync,
     reduce_row: impl Fn(usize, &mut P) -> Result<(), E> + Sync,
@@ -1780,7 +1997,7 @@ where
 {
     use rayon::prelude::*;
     let n_chunks = n_rows.div_ceil(SCHUR_FOLD_ROW_CHUNK);
-    let width = rayon::current_num_threads().clamp(1, n_chunks.max(1));
+    let width = width.clamp(1, n_chunks.max(1));
     let mut partials: Vec<P> = (0..width).map(|_| new_partial()).collect();
     for first in (0..n_chunks).step_by(width) {
         let count = width.min(n_chunks - first);
@@ -6815,14 +7032,16 @@ pub(crate) fn build_schur_scalar_inv<B: BatchedBlockSolver>(
 /// Inexact PCG with automatic preconditioner-ladder escalation.
 ///
 /// Starts with `JacobiPreconditioner` (Diagonal or BetaBlockJacobi).
-/// If PCG hits `MaxIter` and `k > PRECOND_ESCALATE_K_THRESHOLD`,
-/// escalates to `ClusterJacobi`; if still `MaxIter`, escalates to
-/// `AdditiveSchwarz { overlap: 1 }`.
+/// If PCG spends its resolved `budget` without converging
+/// (`BudgetExhausted`) and `k > PRECOND_ESCALATE_K_THRESHOLD`, escalates to
+/// `ClusterJacobi`; if that also spends its budget, escalates to
+/// `AdditiveSchwarz { overlap: 1 }`. Each tier may spend the same budget.
 pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     ridge_beta: f64,
     rhs: &Array1<f64>,
+    budget: ArrowPcgBudget,
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     backend: &B,
@@ -6860,27 +7079,26 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
             ridge_beta,
             rhs,
             |r| identity.apply(r),
+            budget,
             pcg,
             trust,
             backend,
             gpu_matvec,
             resident.as_ref(),
         )?;
-        // Mirror the non-gauge contract: below the escalation threshold a MaxIter
-        // stop is accepted (the ladder returns it as `Ok`); above it the ladder
-        // would escalate the preconditioner, but the cluster/Schwarz/IC(0) tiers
-        // assume the un-pinned Schur and cannot precondition the gauge pin, so
-        // surface a recoverable failure and let the outer LM loop escalate the
+        // Mirror the non-gauge contract: below the escalation threshold a
+        // `BudgetExhausted` stop is accepted (the ladder returns it as `Ok`); above it
+        // the ladder would escalate the preconditioner, but the cluster/Schwarz/IC(0)
+        // tiers assume the un-pinned Schur and cannot precondition the gauge pin, so
+        // surface the typed budget refusal and let the outer LM loop escalate the
         // ridge instead (a bespoke pinned-diagonal preconditioner is the follow-up).
-        if diag.stopping_reason == PcgStopReason::MaxIter
+        if diag.stopping_reason == PcgStopReason::BudgetExhausted
             && sys.k > PRECOND_ESCALATE_K_THRESHOLD
         {
-            return Err(ArrowSchurError::PcgFailed {
-                reason: format!(
-                    "gauge-pinned Schur PCG (identity preconditioner) exhausted its \
-                     iteration budget without converging; final relative residual = {:e}",
-                    diag.final_relative_residual
-                ),
+            return Err(ArrowSchurError::PcgBudgetExhausted {
+                budget,
+                products_spent: diag.matvec_calls,
+                final_relative_residual: diag.final_relative_residual,
             });
         }
         return Ok((step, diag));
@@ -6959,6 +7177,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
             effective_ridge,
             rhs,
             |r| jacobi.apply(r),
+            budget,
             pcg,
             trust,
             backend,
@@ -7017,7 +7236,9 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
             }));
         }
     };
-    if sys.k <= PRECOND_ESCALATE_K_THRESHOLD || diag0.stopping_reason != PcgStopReason::MaxIter {
+    if sys.k <= PRECOND_ESCALATE_K_THRESHOLD
+        || diag0.stopping_reason != PcgStopReason::BudgetExhausted
+    {
         return Ok((x0, diag0));
     }
     // Escalation tiers reuse the curvature-floored `effective_ridge` so the
@@ -7048,13 +7269,14 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         effective_ridge,
         rhs,
         |r| cluster.apply(r),
+        budget,
         pcg,
         trust,
         backend,
         gpu_matvec,
         resident.as_ref(),
     )?;
-    if diag1.stopping_reason != PcgStopReason::MaxIter {
+    if diag1.stopping_reason != PcgStopReason::BudgetExhausted {
         return Ok((x1, diag1));
     }
     let schwarz = AdditiveSchwarzPreconditioner::from_arrow_schur(
@@ -7070,13 +7292,14 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         effective_ridge,
         rhs,
         |r| schwarz.apply(r),
+        budget,
         pcg,
         trust,
         backend,
         gpu_matvec,
         resident.as_ref(),
     )?;
-    if diag2.stopping_reason != PcgStopReason::MaxIter {
+    if diag2.stopping_reason != PcgStopReason::BudgetExhausted {
         return Ok((x2, diag2));
     }
     // Final tier — diagonal-assembled additive Schwarz (#299), the cheap-apply
@@ -7099,13 +7322,14 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         effective_ridge,
         rhs,
         |r| diag_schwarz.apply(r),
+        budget,
         pcg,
         trust,
         backend,
         gpu_matvec,
         resident.as_ref(),
     )?;
-    if diag3.stopping_reason != PcgStopReason::MaxIter {
+    if diag3.stopping_reason != PcgStopReason::BudgetExhausted {
         return Ok((x3, diag3));
     }
     // Richest tier — level-0 incomplete Cholesky (#299). ClusterJacobi keeps the
@@ -7129,6 +7353,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         effective_ridge,
         rhs,
         |r| ic0.apply(r),
+        budget,
         pcg,
         trust,
         backend,
@@ -7136,21 +7361,21 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         resident.as_ref(),
     )?;
     // All five preconditioner tiers (Jacobi -> ClusterJacobi -> AdditiveSchwarz
-    // -> DiagAssembledSchwarz -> BlockIncompleteCholesky) exhausted their
-    // iteration budget without driving the residual below tolerance. Returning a
+    // -> DiagAssembledSchwarz -> BlockIncompleteCholesky) spent their product
+    // budget without driving the residual below tolerance. Returning a
     // truncated iterate as `Ok` would feed an arbitrarily-large-residual step
-    // into the Newton driver, where the PCG diagnostics are discarded. Surface a
-    // recoverable failure instead so `solve_with_lm_escalation_inner` escalates
+    // into the Newton driver, where the PCG diagnostics are discarded. Surface the
+    // typed budget refusal instead so `solve_with_lm_escalation_inner` escalates
     // the proximal ridge: better conditioning is precisely what a stalled PCG on
     // an ill-conditioned reduced system needs.
-    if diag4.stopping_reason == PcgStopReason::MaxIter {
-        return Err(ArrowSchurError::PcgFailed {
-            reason: format!(
-                "Schur PCG exhausted all preconditioner tiers (Jacobi, ClusterJacobi, \
-                 AdditiveSchwarz, DiagAssembledSchwarz, BlockIncompleteCholesky) at MaxIter; \
-                 final relative residual = {:e}",
-                diag4.final_relative_residual
-            ),
+    if diag4.stopping_reason == PcgStopReason::BudgetExhausted {
+        return Err(ArrowSchurError::PcgBudgetExhausted {
+            budget,
+            products_spent: [&diag0, &diag1, &diag2, &diag3, &diag4]
+                .iter()
+                .map(|diag| diag.matvec_calls)
+                .sum(),
+            final_relative_residual: diag4.final_relative_residual,
         });
     }
     Ok((x4, diag4))
@@ -7164,6 +7389,7 @@ pub(crate) fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver + Syn
     ridge_beta: f64,
     rhs: &Array1<f64>,
     apply_prec: ApplyPrec,
+    budget: ArrowPcgBudget,
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     backend: &B,
@@ -7173,7 +7399,6 @@ pub(crate) fn run_pcg_with_preconditioner<ApplyPrec, B: BatchedBlockSolver + Syn
 where
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
 {
-    let max_iters = pcg.max_iterations.min(trust.max_iterations);
     let tol = pcg
         .relative_tolerance
         .max(trust.steihaug_relative_tolerance);
@@ -7189,7 +7414,7 @@ where
         rhs,
         |p, out| op.apply_into(p, out),
         apply_prec,
-        max_iters,
+        budget,
         tol,
         trust.radius,
     )
@@ -7204,28 +7429,36 @@ impl IdentityPreconditioner {
     }
 }
 
+/// Steihaug-CG on an assembled dense Schur, the trust-region correction of a dense
+/// step that left the trust ball. The Schur is already factored, so CG may take the
+/// Krylov dimension of the system (#2900 row 6.15).
 pub(crate) fn steihaug_dense_system(
     schur: &Array2<f64>,
     rhs: &Array1<f64>,
     preconditioner: &IdentityPreconditioner,
-    pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
 ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError> {
     steihaug_cg(
         rhs,
         |p, out| dense_matvec(schur, p, out),
         |r| preconditioner.apply(r),
-        pcg.max_iterations,
-        pcg.relative_tolerance,
+        ArrowPcgBudget::krylov_dimension(schur.nrows()),
+        trust.steihaug_relative_tolerance,
         trust.radius,
     )
 }
 
+/// Steihaug-CG on `matvec` within the resolved product `budget` (#2900 row 6.15).
+///
+/// The only budget stop is [`ArrowPcgBudget::stop_at`], read before each product and
+/// after the accuracy test, so a solve that meets its tolerance on the last product
+/// it may spend succeeds. A spent budget returns the truncated iterate with
+/// [`PcgStopReason::BudgetExhausted`].
 pub(crate) fn steihaug_cg<MatVec, ApplyPrec>(
     rhs: &Array1<f64>,
     mut matvec: MatVec,
     mut apply_preconditioner: ApplyPrec,
-    max_iterations: usize,
+    budget: ArrowPcgBudget,
     relative_tolerance: f64,
     trust_radius: f64,
 ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurError>
@@ -7278,7 +7511,12 @@ where
     let mut ap = Array1::<f64>::zeros(n);
     // Reused candidate scratch — avoid per-iteration clone of x.
     let mut candidate = Array1::<f64>::zeros(n);
-    for _ in 0..max_iterations {
+    loop {
+        if let Some(reason) = budget.stop_at(diag.matvec_calls) {
+            diag.final_relative_residual = euclidean_norm(r.view()) / rhs_norm;
+            diag.stopping_reason = reason;
+            return Ok((x, diag));
+        }
         matvec(&p, &mut ap);
         diag.matvec_calls += 1;
         diag.iterations += 1;
@@ -7331,9 +7569,6 @@ where
         }
         rz = rz_next;
     }
-    diag.final_relative_residual = euclidean_norm(r.view()) / rhs_norm;
-    diag.stopping_reason = PcgStopReason::MaxIter;
-    Ok((x, diag))
 }
 
 pub(crate) fn step_to_trust_boundary(
@@ -7418,6 +7653,19 @@ pub enum ArrowSchurError {
     /// The BA inexact-step PCG solve failed before producing a usable
     /// Steihaug trust-region step.
     PcgFailed { reason: String },
+    /// The inexact PCG spent its resolved product budget without meeting its
+    /// forcing tolerance, and nothing answers the miss (#2900 row 6.15): the
+    /// request asked for InexactPCG, or no dense route fits the materialization
+    /// cap. `products_spent` counts the products of every launch the refusal
+    /// covers, and `final_relative_residual` is the recursive `‖r̂‖/‖rhs‖` at the
+    /// last one. Floating-point CG can legitimately need more products than the
+    /// Krylov dimension, so the residual tells a solve cut off while still
+    /// converging from one that stalled.
+    PcgBudgetExhausted {
+        budget: ArrowPcgBudget,
+        products_spent: usize,
+        final_relative_residual: f64,
+    },
     /// The UNBOUNDED (trust-radius = ∞) Schur PCG encountered negative
     /// curvature `pᵀSp ≤ 0` (or a non-positive preconditioned residual): the
     /// reduced Schur is indefinite, the #1026 K≥4 co-collapse signature where
@@ -7435,6 +7683,13 @@ pub enum ArrowSchurError {
     /// Adaptive proximal damping could not produce an Armijo-accepted
     /// nonlinear step.
     AdaptiveCorrectionFailed { reason: String },
+    /// The proximal ridge ladder refused at a rung the system's declared bounds
+    /// certify factorable (#2627): every factorization guard provably passes
+    /// there, so no larger shift can cure the refusal in `cause`.
+    RefusedAtCertifiedShift {
+        proximal_ridge: f64,
+        cause: Box<ArrowSchurError>,
+    },
 }
 
 impl ArrowSchurError {
@@ -7511,6 +7766,18 @@ impl std::fmt::Display for ArrowSchurError {
             ArrowSchurError::PcgFailed { reason } => {
                 write!(f, "arrow-Schur: Schur PCG failed: {reason}")
             }
+            ArrowSchurError::PcgBudgetExhausted {
+                budget,
+                products_spent,
+                final_relative_residual,
+            } => write!(
+                f,
+                "arrow-Schur: Schur PCG spent its product budget ({} products, {:?}) \
+                 without meeting its tolerance: {products_spent} products spent, final \
+                 relative residual {final_relative_residual:e}",
+                budget.products(),
+                budget.basis()
+            ),
             ArrowSchurError::UnboundedNegativeCurvature {
                 curvature,
                 direction_norm_sq,
@@ -7526,6 +7793,17 @@ impl std::fmt::Display for ArrowSchurError {
                     "arrow-Schur: adaptive proximal correction failed: {reason}"
                 )
             }
+            // The cause renders through `Debug`, so a refusal at a certified rung is
+            // never read as the relocatable non-PD Schur refusal it may wrap.
+            ArrowSchurError::RefusedAtCertifiedShift {
+                proximal_ridge,
+                cause,
+            } => write!(
+                f,
+                "arrow-Schur: the proximal ridge {proximal_ridge:e} is certified factorable \
+                 from the system's declared bounds and the solve still refused, so no larger \
+                 shift can cure it: {cause:?}"
+            ),
         }
     }
 }

@@ -265,3 +265,8 @@ include!("constant_curvature_kappa_jet_fd_tests.rs");
 // criterion is correct on the one cell where the truth's range IS the auto
 // heuristic's — the cell the acceptance fixture happens to use.
 include!("constant_curvature_kappa_box_probe_tests.rs");
+
+// #2953: the n-block exact-joint design cache keeps a realizer's trial refusal
+// typed, so the outer search retreats from it instead of aborting the fit.
+// Self-contained `#[cfg(test)] mod`.
+include!("n_block_realization_refusal_2953_tests.rs");

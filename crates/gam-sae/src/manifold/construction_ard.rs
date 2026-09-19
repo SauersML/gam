@@ -9,6 +9,37 @@ use gam_math::constrained_partition::{
 use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 use gam_terms::latent::CoordinatePriorSupport;
 
+/// `(log M(κ, P), d log M / d log κ)`: the log volume one periodic coordinate of period `P`
+/// holds under the von Mises energy matched to curvature `κ` at its mode (#2933 F07).
+///
+/// ```text
+///   M(κ, P) = ∫₀ᴾ exp[−(κ/k²)(1 − cos k·u)] du = P·e^{−η}·I0(η),   k = 2π/P,  η = κP²/(2π)²
+///   d log M / d log κ = η·(I1(η)/I0(η) − 1)
+/// ```
+///
+/// (substitute `x = k·u`, `du = (P/2π)·dx`, and `∫₀^{2π} e^{η cos x} dx = 2π·I0(η)`).
+///
+/// One formula covers every curvature, with no switch and no threshold:
+///
+/// * as `κ → 0`, `M → P`: the coordinate's own volume, which no Laplace factor may exceed;
+/// * as `η → ∞`, `M → √(2π/κ)`: the Gaussian Laplace factor, with relative excess
+///   `1/(8η) + O(η⁻²)`;
+/// * the transition scale `κ ~ (2π/P)²` comes out of the integral itself.
+///
+/// This is the one owner of a compact coordinate's integral. The ARD prior's periodic
+/// normalizer calls it with `κ = α` ([`SaeManifoldTerm::ard_log_partition`]), and a posterior
+/// that integrates a periodic coordinate calls it with that coordinate's curvature.
+///
+/// `η` is formed in log space, because `η` and `κ` can leave the float range while `log M`
+/// stays representable. The centered Bessel primitive evaluates `−η + log I0(η)` as one
+/// quantity, so its derivative keeps the exact `−½` large-`η` limit after `I1/I0` has rounded
+/// to one.
+pub(crate) fn circle_log_marginal(log_kappa: f64, period: f64) -> (f64, f64) {
+    let log_eta = log_kappa + 2.0 * (period.ln() - std::f64::consts::TAU.ln());
+    let (centered_log_i0, _, scaled_derivative) = bessel_i0_centered_terms_from_log_abs(log_eta);
+    (period.ln() + centered_log_i0, scaled_derivative)
+}
+
 /// Per-row log partition of one atom's ARD coordinate prior and its
 /// log-precision derivatives (see [`SaeManifoldTerm::ard_log_partition`]).
 pub(crate) struct ArdLogPartition {
@@ -81,23 +112,14 @@ impl SaeManifoldTerm {
                     let Some(period) = prior_periods[axis] else {
                         return Err(format!("ARD log partition: periodic axis {axis} has no prior period"));
                     };
-                    // Evaluate η = αP²/(2π)² in log space: both η and the
-                    // intermediate κ² can leave the float range even when the
-                    // centered log-partition remains representable. The partition
-                    // over one period is `Z(α) = ∫₀ᴾ exp[-V] dt = P·e^{-η}·I0(η)`
-                    // (sub `u=κt`, `dt = P/(2π) du`), so `log Z = log P − η + log I0(η)`,
-                    // which tends to `½·log(2π/α)` as η → ∞ and is paired the way the
-                    // line's `½·log 2π` is. The constants are ρ-independent.
-                    let log_eta =
-                        log_alpha[axis] + 2.0 * (period.ln() - std::f64::consts::TAU.ln());
-                    let (centered_log_i0, _, scaled_derivative) =
-                        bessel_i0_centered_terms_from_log_abs(log_eta);
-                    // d/d(log α) of `-η + log I0(η)` is `η·(I1/I0−1)`. The centered
-                    // primitive evaluates the complete product, so its `−½` large-η
-                    // limit survives after the ordinary ratio has rounded to one and
-                    // even when η itself is not representable.
-                    log_precision_gradient[axis] = scaled_derivative;
-                    period.ln() + centered_log_i0 - 0.5 * std::f64::consts::TAU.ln()
+                    // The partition over one period is the circle integral of the prior's
+                    // own energy `V = (α/k²)(1 − cos k·t)`, `Z(α) = M(α, P)`, which tends to
+                    // `½·log(2π/α)` as η → ∞ and is paired the way the line's `½·log 2π`
+                    // is. The constants are ρ-independent.
+                    let (log_volume, log_curvature_derivative) =
+                        circle_log_marginal(log_alpha[axis], period);
+                    log_precision_gradient[axis] = log_curvature_derivative;
+                    log_volume - 0.5 * std::f64::consts::TAU.ln()
                 }
                 CoordinatePriorSupport::Interval { lo, hi } => {
                     let root = alpha[axis].sqrt();
@@ -253,6 +275,12 @@ impl SaeManifoldTerm {
     /// Validate the ARD table against this term's atom geometry and materialize
     /// each physical precision exactly once. This is the structural choke point
     /// shared by assembly, value, traces, exact-Hessian, and IFT channels.
+    ///
+    /// #2822 — every coordinate atom carries a full block. The ARD prior is the
+    /// proper coordinate prior: without it a row's coordinate posterior is improper,
+    /// and the criterion has no lower bound along that coordinate. So an empty block
+    /// is refused here, where every criterion path first reads the table, rather than
+    /// read as a prior that is switched off.
     pub(crate) fn validated_ard_precisions(
         &self,
         rho: &SaeManifoldRho,
@@ -267,10 +295,12 @@ impl SaeManifoldTerm {
         for (atom, coordinate) in self.assignment.coords.iter().enumerate() {
             let stored = rho.log_ard[atom].len();
             let dimension = coordinate.latent_dim();
-            if stored != 0 && stored != dimension {
+            if stored != dimension {
                 return Err(format!(
-                    "ARD rho atom {atom} has {stored} axes; expected 0 (disabled) or \
-                     latent dimension {dimension}"
+                    "ARD rho atom {atom} has {stored} axes but its coordinate has latent \
+                     dimension {dimension}: every coordinate atom carries a full log_ard block, \
+                     because the ARD prior is the proper coordinate prior its rows' posteriors \
+                     need (#2822)"
                 ));
             }
         }
@@ -379,28 +409,14 @@ impl SaeManifoldTerm {
     /// `α = n/‖t‖²` rule dropped; the corrected Mackay/Fellner-Schall fixed
     /// point is `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))`.
     ///
-    /// At `K ≥ ARD_TRACE_HUTCHINSON_MIN_ATOMS` the exact selected-inverse diagonal
-    /// (one dense `K×K` Schur solve per latent coordinate — `O(total_t·K²) ≈
-    /// O(K³)` at massive `K`) is replaced by the matrix-free Hutchinson estimate
-    /// [`Self::latent_block_inverse_diagonal_hutchinson`]; below it the exact
-    /// diagonal is used unchanged (bit-for-bit tests preserved).
+    /// The diagonal is exact at every `K`: `latent_block_inverse_diagonal` pays
+    /// `K` Schur applies once plus each coordinate's touched border columns, the
+    /// order of the Schur factorization the cache already holds (#2900 row 6.18).
     pub(crate) fn ard_inverse_traces(
         &self,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        let inv_diag = if self.k_atoms() >= Self::ARD_TRACE_HUTCHINSON_MIN_ATOMS {
-            // Massive-K: `total_t` dense Schur solves is infeasible — estimate the
-            // whole latent inverse diagonal matrix-free with one full-arrow solve
-            // per Hutchinson probe (the grouped sums below tolerate the stochastic
-            // error, as this feeds a Fellner–Schall / dispersion denominator).
-            Self::latent_block_inverse_diagonal_hutchinson(
-                cache,
-                Self::ARD_TRACE_HUTCHINSON_PROBES,
-                Self::ARD_TRACE_HUTCHINSON_SEED,
-            )?
-        } else {
-            cache.latent_block_inverse_diagonal()?
-        };
+        let inv_diag = cache.latent_block_inverse_diagonal()?;
         Ok(self.accumulate_latent_inverse_diagonal(cache, &inv_diag, |_, _, _| 1.0))
     }
 
@@ -606,86 +622,6 @@ impl SaeManifoldTerm {
             }
         }
         Ok(traces)
-    }
-
-    /// Atom-count threshold at/above which [`Self::ard_inverse_traces`] switches
-    /// from the exact selected-inverse latent diagonal (one dense `K×K` Schur
-    /// solve per latent coordinate — the `O(total_t·K²) ≈ O(K³)` massive-`K`
-    /// wall) to the matrix-free Hutchinson stochastic-diagonal estimator
-    /// [`Self::latent_block_inverse_diagonal_hutchinson`]. Set to match the
-    /// smoothness-dof Hutchinson gate ([`Self::SMOOTHNESS_DOF_HUTCHINSON_MIN_ATOMS`]),
-    /// well above every exact-path test fixture so ordinary-`K` behaviour — and
-    /// its bit-for-bit tests — is unchanged; the estimator engages only in the
-    /// massive dictionary regime (`K` up to 32k).
-    pub(crate) const ARD_TRACE_HUTCHINSON_MIN_ATOMS: usize = 2048;
-    /// Rademacher probe count for the Hutchinson latent-inverse-diagonal
-    /// estimator. One [`ArrowFactorCache::full_inverse_apply`] per probe yields
-    /// the WHOLE diagonal at once, so this is the total full-arrow solve count
-    /// that replaces the exact `total_t` per-coordinate Schur solves.
-    pub(crate) const ARD_TRACE_HUTCHINSON_PROBES: usize = 64;
-    /// Fixed base seed so the ARD-trace estimate is bit-reproducible across REML
-    /// outer iterations (cf. the SLQ log-det and smoothness-dof seeds).
-    pub(crate) const ARD_TRACE_HUTCHINSON_SEED: u64 = 0x5AED_A3D0_1ACE_9C01;
-
-    /// Matrix-free Hutchinson estimate of `diag((H⁻¹)_tt)` — the SAME quantity
-    /// [`ArrowFactorCache::latent_block_inverse_diagonal`] returns EXACTLY, but at
-    /// `O(num_probes · matvec)` instead of the exact `O(total_t · K²)`.
-    ///
-    /// The exact selected-inverse builds the latent inverse diagonal one
-    /// coordinate at a time, each coordinate paying a dense `K×K` Schur solve;
-    /// over all `total_t = Σ_i d_i` latent coordinates that is `O(total_t·K²) ≈
-    /// O(K³)` at massive `K` (32k). This estimator replaces the per-coordinate
-    /// loop with `num_probes` full-arrow solves: for a Rademacher probe `z` over
-    /// the `t`-block (`E[z zᵀ] = I`), `u_t = (H⁻¹)_tt z` — the `t`-block of
-    /// `H⁻¹·[z; 0]`; the trailing `w_β = 0` drops the border coupling out of the
-    /// `t`-block — so the Hadamard product `z ⊙ u_t` has expectation exactly
-    /// `diag((H⁻¹)_tt)` (off-diagonal `i≠j` terms are mean-zero under
-    /// `E[z_i z_j] = 0`). Averaging over probes gives the unbiased diagonal. Each
-    /// probe is one [`ArrowFactorCache::full_inverse_apply`] (per-row solves, one
-    /// Schur solve, and any gauge-deflation correction), so it applies the same
-    /// assembled curvature operator as the exact path.
-    ///
-    /// Probes run serially and accumulate in a fixed order, so for a fixed
-    /// `(seed, num_probes)` the estimate is bit-reproducible (the REML determinism
-    /// contract, matching the SLQ log-det and smoothness-dof Hutchinson paths).
-    pub(crate) fn latent_block_inverse_diagonal_hutchinson(
-        cache: &ArrowFactorCache,
-        num_probes: usize,
-        seed: u64,
-    ) -> Result<Array1<f64>, ArrowSchurError> {
-        let total_len = cache.delta_t_len();
-        let k = cache.k;
-        let probes = num_probes.max(1);
-        let mut out = Array1::<f64>::zeros(total_len);
-        let mut z = Array1::<f64>::zeros(total_len);
-        let w_beta_zero = Array1::<f64>::zeros(k);
-        for probe in 0..probes {
-            // Deterministic Rademacher probe (±1) over the t-block, seeded by
-            // `seed + probe` so the whole estimate is reproducible.
-            let mut state = seed.wrapping_add(probe as u64);
-            let mut bits = 0u64;
-            let mut remaining = 0u32;
-            for zi in z.iter_mut() {
-                if remaining == 0 {
-                    bits = gam_linalg::utils::splitmix64(&mut state);
-                    remaining = 64;
-                }
-                *zi = if bits & 1 == 1 { 1.0 } else { -1.0 };
-                bits >>= 1;
-                remaining -= 1;
-            }
-            // u_t = (H⁻¹)_tt z (w_β = 0 ⇒ the border coupling drops from the
-            // t-block); this applies the full assembled inverse.
-            let (u_t, _u_beta) = cache.full_inverse_apply(z.view(), w_beta_zero.view())?;
-            for i in 0..total_len {
-                out[i] += z[i] * u_t[i];
-            }
-        }
-        let inv_p = 1.0 / (probes as f64);
-        for v in out.iter_mut() {
-            *v *= inv_p;
-        }
-        Ok(out)
     }
 
     pub(crate) fn ard_log_precision_explicit_derivatives(
@@ -1137,5 +1073,187 @@ impl SaeManifoldTerm {
             }
         }
         Ok(traces)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::TAU;
+
+    /// Periods the pins exercise: the harmonic basis's unit period, a quotient atom's half
+    /// period (#2933 F25), and a period in radians.
+    const PERIODS: [f64; 3] = [1.0, 0.5, TAU];
+
+    /// `(M, E[η(1 − cos k·u)])` for the energy `(κ/k²)(1 − cos k·u)` by the periodic trapezoid
+    /// rule on `nodes` equispaced points of one period.
+    ///
+    /// On a full period the rule's only error is aliasing: `e^{η cos x} = I0(η) + 2Σₙ Iₙ(η)cos nx`,
+    /// and `nodes` points integrate every `cos nx` exactly unless `nodes` divides `n`, so the
+    /// relative error is `2Σₘ I_{m·nodes}(η)/I0(η)`, below `exp(−nodes²/(2η))` for `nodes > η` and
+    /// below `(η/2)^nodes/nodes!` for `η ≤ 1`.
+    fn trapezoid_circle_moments(kappa: f64, period: f64, nodes: usize) -> (f64, f64) {
+        let k = TAU / period;
+        let eta = kappa / (k * k);
+        let mut mass = 0.0_f64;
+        let mut energy = 0.0_f64;
+        for node in 0..nodes {
+            let x = TAU * node as f64 / nodes as f64;
+            let e = eta * (1.0 - x.cos());
+            let weight = (-e).exp();
+            mass += weight;
+            energy += e * weight;
+        }
+        (mass * period / nodes as f64, energy / mass)
+    }
+
+    /// The trapezoid node count and the relative rounding budget of the pins below. `γ_n =
+    /// nε/(1 − nε)` bounds the positive sums. Each summand carries the absolute error `2ηε` of
+    /// `η(1 − cos x)` plus `ε` of its own `exp`, so the mass is good to `(3η + 1)ε` relative
+    /// (every summand's exponent is at most `2η`).
+    const NODES: usize = 4096;
+
+    fn gamma(n: usize) -> f64 {
+        let ne = n as f64 * f64::EPSILON;
+        ne / (1.0 - ne)
+    }
+
+    /// The node count must put the aliasing term below one ulp: `nodes² ≥ 2η·ln(4/ε)`.
+    fn assert_nodes_resolve(eta: f64) {
+        let needed = (2.0 * eta * (4.0 / f64::EPSILON).ln()).sqrt();
+        assert!(
+            (NODES as f64) > needed.max(eta),
+            "trapezoid rule with {NODES} nodes does not resolve eta={eta:e} (needs > {needed:e})"
+        );
+    }
+
+    #[test]
+    fn circle_log_marginal_equals_the_quadrature_of_its_integral_2933_f07() {
+        for &period in &PERIODS {
+            let k = TAU / period;
+            for exponent in -12..=6 {
+                let eta = 10.0_f64.powf(0.5 * exponent as f64);
+                assert_nodes_resolve(eta);
+                let kappa = eta * k * k;
+                let (log_value, derivative) = circle_log_marginal(kappa.ln(), period);
+                let (mass, mean_energy) = trapezoid_circle_moments(kappa, period, NODES);
+                // Quadrature budget (see `NODES`) plus the closed form's own rounding: the
+                // `ln` of `P`, the centered Bessel term and their sum, and `ln` of the mass.
+                let value_band = gamma(NODES)
+                    + (3.0 * eta + 1.0) * f64::EPSILON
+                    + 4.0 * f64::EPSILON * (1.0 + period.ln().abs() + log_value.abs());
+                assert!(
+                    (log_value - mass.ln()).abs() <= value_band,
+                    "P={period} eta={eta:e}: closed form log M={log_value:.17e}, quadrature \
+                     {:.17e}, |diff|={:.3e} > band {value_band:.3e}",
+                    mass.ln(),
+                    (log_value - mass.ln()).abs(),
+                );
+                // `d log M / d log κ = −E[η(1 − cos k·u)]` under the matched von Mises law.
+                let derivative_band = (2.0 * gamma(NODES) + 2.0 * f64::EPSILON) * mean_energy
+                    + 2.0 * eta * f64::EPSILON
+                    + 4.0 * f64::EPSILON * derivative.abs();
+                assert!(
+                    (derivative + mean_energy).abs() <= derivative_band,
+                    "P={period} eta={eta:e}: closed-form d log M/d log kappa={derivative:.17e}, \
+                     quadrature {:.17e}, |diff|={:.3e} > band {derivative_band:.3e}",
+                    -mean_energy,
+                    (derivative + mean_energy).abs(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn circle_log_marginal_is_the_volume_at_zero_curvature_and_laplace_at_large_2933_f07() {
+        for &period in &PERIODS {
+            let k = TAU / period;
+            // κ = 0 exactly: the coordinate's own volume, with no curvature score.
+            let (log_value, derivative) = circle_log_marginal(f64::NEG_INFINITY, period);
+            assert_eq!(log_value.to_bits(), period.ln().to_bits(), "P={period}: log M(0) != log P");
+            assert_eq!(derivative.to_bits(), 0.0_f64.to_bits(), "P={period}: score at kappa = 0");
+            for exponent in [-12, -8, -4, -1, 0, 1] {
+                let eta = 10.0_f64.powi(exponent);
+                let kappa = eta * k * k;
+                let (log_value, _) = circle_log_marginal(kappa.ln(), period);
+                // `1 ≤ I0(η) ≤ e^η` for η ≥ 0, so `log P − η ≤ log M ≤ log P` exactly.
+                let rounding = 4.0 * f64::EPSILON * (1.0 + period.ln().abs());
+                assert!(
+                    log_value <= period.ln() + rounding && log_value >= period.ln() - eta - rounding,
+                    "P={period} eta={eta:e}: log M={log_value:.17e} leaves [log P - eta, log P]"
+                );
+            }
+            for exponent in [1, 3, 6, 12] {
+                let eta = 10.0_f64.powi(exponent);
+                let kappa = eta * k * k;
+                let (log_value, derivative) = circle_log_marginal(kappa.ln(), period);
+                let laplace = 0.5 * (TAU / kappa).ln();
+                // `e^{−η}I0(η)√(2πη) = 1 + 1/(8η) + 9/(128η²) + …` with positive terms, so the
+                // excess over the Laplace factor lies in `[0, (1 + 1/η)/(8η)]` for η ≥ 10.
+                let excess = log_value - laplace;
+                let rounding = 4.0 * f64::EPSILON * (1.0 + log_value.abs() + laplace.abs());
+                let bound = (1.0 + 1.0 / eta) / (8.0 * eta);
+                assert!(
+                    excess >= -rounding && excess <= bound + rounding,
+                    "P={period} eta={eta:e}: log M - log sqrt(2pi/kappa) = {excess:.3e} leaves \
+                     [0, {bound:.3e}]"
+                );
+                // The derivative tends to the Laplace factor's −½ from below:
+                // `η(I1/I0 − 1) = −½ − 1/(8η) − 1/(8η²) − 25/(128η³) − …`, inside
+                // `(1 + 2/η)/(8η)` of −½ for η ≥ 25/16.
+                let score_bound = (1.0 + 2.0 / eta) / (8.0 * eta);
+                assert!(
+                    (derivative + 0.5).abs() <= score_bound + 4.0 * f64::EPSILON,
+                    "P={period} eta={eta:e}: d log M/d log kappa = {derivative:.17e}, not -1/2 \
+                     within {score_bound:.3e}"
+                );
+            }
+            // A curvature whose `κ` and `η` overflow still returns the Laplace factor in log
+            // space, `log M = ½·log 2π − ½·log κ`.
+            let log_kappa = 1.0e3;
+            let (log_value, derivative) = circle_log_marginal(log_kappa, period);
+            let laplace = 0.5 * (TAU.ln() - log_kappa);
+            assert!(
+                (log_value - laplace).abs() <= 4.0 * f64::EPSILON * (1.0 + log_kappa),
+                "P={period}: log M at log kappa=1e3 is {log_value:.17e}, Laplace {laplace:.17e}"
+            );
+            assert_eq!(derivative.to_bits(), (-0.5_f64).to_bits(), "P={period}: overflow score");
+        }
+    }
+
+    #[test]
+    fn ard_log_partition_periodic_factor_is_the_circle_marginal_2933_f07() {
+        let supports = [
+            CoordinatePriorSupport::Circle { period: 1.0 },
+            CoordinatePriorSupport::Line,
+            CoordinatePriorSupport::Circle { period: 1.0 },
+        ];
+        // The second periodic axis is priced at the quotient's half period (#2933 F25).
+        let periods = [Some(1.0), None, Some(0.5)];
+        for log_alpha_value in [-40.0, -6.0, 0.0, 6.0, 800.0] {
+            let log_alpha = Array1::from_vec(vec![log_alpha_value; 3]);
+            let alpha = log_alpha.mapv(f64::exp);
+            let partition =
+                SaeManifoldTerm::ard_log_partition(&supports, &periods, log_alpha.view(), alpha.view())
+                    .expect("ARD log partition of a circle/line/circle atom");
+            for (axis, period) in [(0, 1.0), (2, 0.5)] {
+                let (log_volume, score) = circle_log_marginal(log_alpha_value, period);
+                let paired = log_volume - 0.5 * TAU.ln();
+                assert_eq!(
+                    partition.per_factor[axis].to_bits(),
+                    paired.to_bits(),
+                    "log alpha={log_alpha_value}: axis {axis} partition {} != circle marginal {paired}",
+                    partition.per_factor[axis],
+                );
+                assert_eq!(
+                    partition.log_precision_gradient[axis].to_bits(),
+                    score.to_bits(),
+                    "log alpha={log_alpha_value}: axis {axis} score {} != {score}",
+                    partition.log_precision_gradient[axis],
+                );
+            }
+            // The line axis keeps its Gaussian normalizer.
+            assert_eq!(partition.per_factor[1].to_bits(), (-0.5 * log_alpha_value).to_bits());
+        }
     }
 }

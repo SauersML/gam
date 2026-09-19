@@ -68,11 +68,6 @@ pub(super) fn safe_sum2(a: f64, b: f64) -> f64 {
 }
 
 #[inline]
-pub(super) fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
-    safe_sum2(safe_sum2(a, b), c)
-}
-
-#[inline]
 pub(super) fn safe_product3(a: f64, b: f64, c: f64) -> f64 {
     let mut factors = [a, b, c];
     factors.sort_by(|lhs, rhs| lhs.abs().total_cmp(&rhs.abs()));

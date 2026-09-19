@@ -1,4 +1,4 @@
-"""Generate the canonical v6 ``ManifoldSAE`` serialization fixtures (#2091).
+"""Generate the canonical v10 ``ManifoldSAE`` serialization fixtures (#2091).
 
 The fixtures pin the JSON contract owned by Rust's ``ManifoldSaePayload``. The
 representative payload exercises every optional surface: mixed atom topologies,
@@ -6,7 +6,7 @@ TopK routing, a smooth-gate threshold, output-Fisher steering state, the selecte
 ``ρ*`` fields, and every diagnostic/certificate report block.
 
 The fitted model is the Rust-owned ``ManifoldSAE`` PyO3 class. Accordingly this
-generator builds the JSON-compatible v6 payload
+generator builds the JSON-compatible v10 payload
 directly, so fixture generation needs neither a fit nor a compiled extension.
 
 The covariance fixture persists the compact per-channel factors consumed by the
@@ -47,7 +47,7 @@ def _trust_atom(seed: float) -> dict[str, Any]:
 
 
 def build_payload() -> dict[str, Any]:
-    """Build a representative canonical v6 payload.
+    """Build a representative canonical v8 payload.
 
     Shapes: N=5 rows, p=4 channels, K=3 atoms.
       atom 0: periodic, M0=5 (H=2 -> 2H+1), d0=1  (carries coords_u_arc + band)
@@ -99,7 +99,6 @@ def build_payload() -> dict[str, Any]:
                 "assignments": assignments[:, k].tolist(),
                 "coords": coords[k].tolist(),
                 "coords_u_arc": None if u_arc is None else u_arc.tolist(),
-                "evidence": -12.5 - k,
                 "active_dim": d[k],
                 "decoder_covariance_channel_factors": None,
                 "shape_band_coords": (
@@ -159,7 +158,7 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v7",
+        "schema": "gamfit.ManifoldSAE/v10",
         "atoms": atoms,
         "assignment": "topk",
         "assignment_label": "topk",
@@ -191,6 +190,8 @@ def build_payload() -> dict[str, Any]:
         "solver_plan": {"stages": ["seed", "refine"], "max_outer": 3},
         "dispersion": 1.07,
         "metric_provenance": "OutputFisherDownstream",
+        "shape_covariance_operator": "observed_information_conditional_on_fitted_frames",
+        "shape_covariance_frame_conditioning_reason": "unframed_observed_information_not_admitted",
         "fisher_mass_residual": fisher_mass_residual.tolist(),
         "atom_two_lens": {
             "presence": [0.1, 0.2, 0.3],
@@ -301,6 +302,8 @@ def build_covariance_payload() -> dict[str, Any]:
         indices = np.arange(channel, side, p_out)
         factors[channel] = covariance[np.ix_(indices, indices)]
     atom["decoder_covariance_channel_factors"] = factors.tolist()
+    payload["shape_covariance_operator"] = "observed_information_marginal_over_learned_frames"
+    payload["shape_covariance_frame_conditioning_reason"] = None
     return payload
 
 

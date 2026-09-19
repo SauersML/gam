@@ -137,23 +137,11 @@ pub enum BlockQuadratureRefusal {
     /// that underflows to zero, so the rule has passed the largest order whose
     /// nodes all carry representable mass.
     UnrepresentableOrder { axis: usize, order: usize },
-    /// At `order`, which sets the axis's running minimum, the contraction rate into that
-    /// minimum cannot carry the paired difference below the target at any order the rule
-    /// can represent (#784). Either the minimum did not move (`projected_resolving_order`
-    /// is `None`), or the order the rate projects exceeds `max_representable_order`. The
-    /// rounding band of the paired differences is not yet measured, so a minimum held at
-    /// the rule's rounding floor is reported as not contracting too.
+    /// The axis was evaluated at every order through `max_representable_order` and is
+    /// still unresolved there, so no representable order is left to raise it to (#784).
+    /// `running_minimum` is the smallest paired difference the axis showed at any of
+    /// those orders. The refusal is measured at the ceiling, never projected from a rate.
     UnresolvableAtRepresentableOrders {
-        order: usize,
-        contraction_rate: f64,
-        projected_resolving_order: Option<usize>,
-        max_representable_order: usize,
-    },
-    /// The axis reached `max_representable_order` without setting a new running minimum
-    /// since `running_minimum` was measured, so no representable order is left to raise
-    /// it to (#784). A minimum set at that order is judged by
-    /// [`Self::UnresolvableAtRepresentableOrders`] first.
-    NoNewMinimumThroughRepresentableOrders {
         order: usize,
         running_minimum: f64,
         max_representable_order: usize,
@@ -189,32 +177,13 @@ impl std::fmt::Display for BlockQuadratureRefusal {
             ),
             Self::UnresolvableAtRepresentableOrders {
                 order,
-                contraction_rate,
-                projected_resolving_order,
-                max_representable_order,
-            } => match projected_resolving_order {
-                Some(projected) => write!(
-                    f,
-                    "at order {order} the contraction rate into the running minimum \
-                     {contraction_rate:.4e} projects resolution at order {projected}, past the largest \
-                     representable Gauss–Hermite order {max_representable_order}"
-                ),
-                None => write!(
-                    f,
-                    "at order {order} the running minimum does not contract (rate \
-                     {contraction_rate:.4e}; rounding band not yet measured), so no representable \
-                     order (up to {max_representable_order}) resolves the axis"
-                ),
-            },
-            Self::NoNewMinimumThroughRepresentableOrders {
-                order,
                 running_minimum,
                 max_representable_order,
             } => write!(
                 f,
-                "no new minimum through the largest representable Gauss–Hermite order: the axis \
-                 reached order {order} (of {max_representable_order}) with its paired difference \
-                 still above its running minimum {running_minimum:.4e}"
+                "unresolved through the largest representable Gauss–Hermite order: the axis \
+                 reached order {order} (of {max_representable_order}), and its smallest paired \
+                 difference at any order was {running_minimum:.4e}"
             ),
             Self::Integration(reason) => f.write_str(reason),
         }
@@ -315,17 +284,23 @@ fn axis_resolved(paired_error: f64, resolution_target: f64) -> bool {
 ///
 /// The search ends when every axis is resolved, or with a typed refusal naming the
 /// unresolved axis:
-/// - when an unresolved axis, at an order that sets its running minimum, contracts too
-///   slowly to reach its target at a representable order ([`BlockQuadratureRefusal::UnresolvableAtRepresentableOrders`],
-///   see `unresolvable_at_representable_orders`). The rule is streamed, so no memory
-///   ceiling stops a search whose axis never contracts; without this stop it raises the
-///   axis one order at a time until its rule underflows;
-/// - when the axis to raise already sits at the largest representable order, having set no
-///   new running minimum there ([`BlockQuadratureRefusal::NoNewMinimumThroughRepresentableOrders`]).
-///   An error that rises and never returns to its minimum is never judged by the rate,
-///   and a stop before that order would need information the measurements do not carry;
+/// - when the axis to raise already sits at the largest representable order and is
+///   still unresolved there ([`BlockQuadratureRefusal::UnresolvableAtRepresentableOrders`]).
+///   Each step raises one axis by one order, so the search makes at most
+///   `m·(max_representable_order − 3)` requests before every axis is resolved or one is
+///   refused;
 /// - or when the corrector refuses the next orders (a one-node chunk the memory budget
 ///   does not admit, or a rule past the representable order).
+///
+/// No refusal is projected from a measured rate. The paired difference at order `o` is
+/// `max(|Q_o − Q_{o−1}|, |Q_o − Q_{o−2}|)`, and a Gauss–Hermite rule of order `k` is
+/// exact only through degree `2k − 1`. So through the first orders the paired difference
+/// has the size of the lower rules' own errors, and a ratio of two of them measures which
+/// degrees rules two orders apart integrate, not how fast the axis contracts. On the q5
+/// fixture's eight axes the first judged ratio, 4 → 5, was ×0.45 to ×0.94, and the next,
+/// 5 → 6, was ×0.044 to ×0.14 (job 1215221). A stop that projected from the first ratio
+/// refused the q6 and q8 blocks at order 5, where each axis's own one-dimensional ladder
+/// at the mode resolves at order 9 or 11 (job 1232529).
 pub fn select_block_quadrature_orders(
     corrector: &dyn LaplaceMarginalCorrector,
     target: &dyn BlockExcessTarget,
@@ -359,29 +334,6 @@ pub fn select_block_quadrature_orders(
         let resolution_target = marginal.value.abs().min(next_order_remainder);
         for (axis, &error) in marginal.axis_quadrature_errors.iter().enumerate() {
             errors_by_order[axis].insert(axis_orders[axis], error);
-        }
-        // An unresolved axis whose contraction into its running minimum cannot reach its
-        // target at a representable order ends the search now, typed, instead of being
-        // raised one order at a time until its rule underflows (#784).
-        for (axis, &error) in marginal.axis_quadrature_errors.iter().enumerate() {
-            if axis_resolved(error, resolution_target) {
-                continue;
-            }
-            if let Some(cause) = unresolvable_at_representable_orders(
-                &errors_by_order[axis],
-                axis_orders[axis],
-                error,
-                resolution_target,
-                max_representable_order,
-            ) {
-                return Err(BlockQuadratureOrderRefusal {
-                    axis,
-                    axis_orders,
-                    paired_error: error,
-                    resolution_target,
-                    cause,
-                });
-            }
         }
         let mut next: Option<(usize, f64)> = None;
         let mut projected_nodes = Some(1usize);
@@ -435,9 +387,8 @@ pub fn select_block_quadrature_orders(
             projected_remaining_raises: remaining,
             projected_node_count,
         });
-        // The axis to raise already sits at the largest representable order. A running
-        // minimum set there is judged above, and at any rate it projects past that order,
-        // so this axis set no new minimum and has no representable order left (#784).
+        // The axis to raise already sits at the largest representable order, unresolved
+        // there, so no representable order is left to raise it to (#784).
         if axis_orders[axis] >= max_representable_order {
             let running_minimum = errors_by_order[axis]
                 .values()
@@ -447,7 +398,7 @@ pub fn select_block_quadrature_orders(
                 axis,
                 paired_error: marginal.axis_quadrature_errors[axis],
                 resolution_target,
-                cause: BlockQuadratureRefusal::NoNewMinimumThroughRepresentableOrders {
+                cause: BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order: axis_orders[axis],
                     running_minimum,
                     max_representable_order,
@@ -464,6 +415,9 @@ pub fn select_block_quadrature_orders(
 /// contraction rate (#784): `ln(e/τ) / ln(1/q̂)`, where `q̂` is the slower of the
 /// axis's last two measured ratios `e(o)/e(o−1)` and `e(o−1)/e(o−2)`. An axis with no
 /// measured ratio yet, or with a measured ratio that does not contract, projects `+∞`.
+/// The projection only orders the raises and is published as evidence. It never refuses
+/// an axis, since its early ratios are not the axis's contraction (see
+/// [`select_block_quadrature_orders`]).
 fn projected_remaining_raises(
     errors_by_order: &BTreeMap<usize, f64>,
     order: usize,
@@ -486,64 +440,6 @@ fn projected_remaining_raises(
         (error / resolution_target).ln() / rate.recip().ln()
     } else {
         f64::INFINITY
-    }
-}
-
-/// Whether an unresolved axis cannot resolve at any order the rule can represent (#784).
-///
-/// The axis is judged on its running minimum `e_min(o) = min_{k ≤ o} e(k)`, and only at
-/// an order that sets it (`e(o) ≤ e_min(o − 1)`). A pre-asymptotic Gauss–Hermite error can
-/// rise for a few orders before it contracts (a scale the rule does not span yet, an
-/// oscillatory integrand), and a rise sets no minimum, so it is never judged. At a fresh
-/// minimum the rate is the step into it, `q = e(o)/e(o − 1) ≤ 1`. Across a bump that step
-/// is the fastest contraction the measurements show. At rate `q` the axis needs
-/// `⌈ln(e/τ) / ln(1/q)⌉` more raises. It is refused typed when `q = 1` (the minimum did
-/// not move), or when the projected order exceeds `max_representable_order`, where the
-/// search would reach an underflowing rule first. The corrector measures
-/// `max_representable_order` from its rule builder, so no order ceiling is chosen here.
-///
-/// The geometric model is optimistic. For an analytic integrand the Gauss–Hermite error
-/// decays like `exp(−c√n)`, more slowly than any fixed per-order rate, so the true
-/// resolving order is at least the projected one: the stop is for termination, not an
-/// accuracy estimate. An axis whose error rises and never returns to its minimum is not
-/// judged here. The search refuses it once it reaches the largest representable order
-/// ([`BlockQuadratureRefusal::NoNewMinimumThroughRepresentableOrders`]). The rounding band of
-/// the paired differences is not yet measured, so a minimum held at the rule's rounding
-/// floor refuses as not contracting.
-fn unresolvable_at_representable_orders(
-    errors_by_order: &BTreeMap<usize, f64>,
-    order: usize,
-    error: f64,
-    resolution_target: f64,
-    max_representable_order: usize,
-) -> Option<BlockQuadratureRefusal> {
-    let previous = *errors_by_order.get(&order.checked_sub(1)?)?;
-    let running_minimum = errors_by_order
-        .range(..order)
-        .map(|(_, &measured)| measured)
-        .fold(f64::INFINITY, f64::min);
-    if !(error <= running_minimum) {
-        return None;
-    }
-    let contraction_rate = error / previous;
-    if !contraction_rate.is_finite() {
-        return None;
-    }
-    let projected_resolving_order = if contraction_rate < 1.0 {
-        let raises = ((error / resolution_target).ln() / contraction_rate.recip().ln()).ceil();
-        // `as` saturates a projection past `usize`, which is past every representable order.
-        Some(order.saturating_add(raises.max(0.0) as usize))
-    } else {
-        None
-    };
-    match projected_resolving_order {
-        Some(projected) if projected <= max_representable_order => None,
-        _ => Some(BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
-            order,
-            contraction_rate,
-            projected_resolving_order,
-            max_representable_order,
-        }),
     }
 }
 

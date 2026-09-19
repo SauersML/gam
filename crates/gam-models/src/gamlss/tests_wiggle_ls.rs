@@ -603,6 +603,130 @@ pub(crate) fn binomial_location_scale_expected_info_derivatives_match_finite_dif
     assert_close_matrix(&analytic_second, &fd_second, 1e-7, "expected d2I");
 }
 
+/// gam#2922: the explicit-ψ Jeffreys terms used to take the observed `hessian_psi` as the motion
+/// of the Jeffreys information, and this family's information is the expected one. On a design
+/// hyperparameter moving the threshold design the observed motion fails a Richardson difference of
+/// the expected information along that motion, on the bar the Bernoulli marginal-slope family's
+/// expected-information pins hold, and the family supplies no motion of its own, so the explicit-ψ
+/// Jeffreys terms refuse it instead of substituting the observed one.
+#[test]
+pub(crate) fn binomial_location_scale_observed_psi_motion_is_not_the_expected_information_motion_2922()
+{
+    let base = binomial_location_scale_base_fixture();
+    let n = base.n;
+    let family = BinomialLocationScaleFamily {
+        y: base.y,
+        weights: base.weights,
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        threshold_design: Some(base.threshold_design.clone()),
+        log_sigma_design: Some(base.log_sigma_design.clone()),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        jeffreys_armed: false,
+    };
+    let specs = vec![base.threshold_spec, base.log_sigma_spec];
+    let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
+        .design
+        .as_dense_ref()
+        .expect("threshold dense design")
+        .to_owned();
+    let x_ls = specs[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA]
+        .design
+        .as_dense_ref()
+        .expect("log-sigma dense design")
+        .to_owned();
+    let beta_t = Array1::from_iter((0..x_t.ncols()).map(|j| 0.35 - 0.03 * j as f64));
+    let beta_ls = Array1::from_iter((0..x_ls.ncols()).map(|j| -0.15 + 0.02 * j as f64));
+    let x_psi = Array2::from_shape_fn((n, x_t.ncols()), |(i, j)| 0.4 * ((i + 3 * j) as f64 * 0.53).sin());
+    let derivative_blocks = vec![
+        vec![CustomFamilyBlockPsiDerivative {
+            penalty_index: None,
+            x_psi: x_psi.clone(),
+            s_psi: Array2::zeros((x_t.ncols(), x_t.ncols())),
+            s_psi_components: None,
+            s_psi_penalty_components: None,
+            x_psi_psi: None,
+            s_psi_psi: None,
+            s_psi_psi_components: None,
+            s_psi_psi_penalty_components: None,
+            implicit_operator: None,
+            implicit_axis: 0,
+            implicit_group_id: None,
+        }],
+        Vec::new(),
+    ];
+    let states_at = |design_t: &Array2<f64>| {
+        vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: design_t.dot(&beta_t),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: x_ls.dot(&beta_ls),
+            },
+        ]
+    };
+    let states = states_at(&x_t);
+    let hyper_layout = crate::custom_family::CustomFamilyHyperLayout::new(
+        derivative_blocks.clone(),
+        Vec::new(),
+        Array1::zeros(1),
+    )
+    .expect("design hyper layout");
+    assert!(!family.joint_jeffreys_information_matches_observed_hessian());
+    assert!(
+        matches!(
+            family
+                .joint_jeffreys_information_psi_derivative(&states, &specs, &hyper_layout, 0)
+                .expect("psi derivative hook"),
+            crate::custom_family::JeffreysInformationMotion::Unpublished { .. }
+        ),
+        "the family supplies no expected-information psi motion, so the explicit-psi Jeffreys terms refuse it"
+    );
+    let observed = family
+        .exact_newton_joint_psi_terms_for_specs(&states, &specs, &derivative_blocks, 0)
+        .expect("observed psi terms")
+        .expect("the design axis publishes psi terms");
+    let observed = match observed.hessian_psi_operator.as_ref() {
+        Some(operator) => operator.mul_mat(&Array2::<f64>::eye(x_t.ncols() + x_ls.ncols())),
+        None => observed.hessian_psi,
+    };
+    let information_at = |t: f64| {
+        let moved = &x_t + &(&x_psi * t);
+        let mut moved_specs = specs.clone();
+        moved_specs[BinomialLocationScaleFamily::BLOCK_T].design =
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(moved.clone()));
+        family
+            .joint_jeffreys_information_with_specs(&states_at(&moved), &moved_specs)
+            .expect("expected information")
+            .expect("expected information available")
+    };
+    let step = 1e-3;
+    let coarse = (information_at(step) - information_at(-step)) / (2.0 * step);
+    let fine = (information_at(0.5 * step) - information_at(-0.5 * step)) / step;
+    let scale = observed
+        .iter()
+        .chain(fine.iter())
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    assert!(
+        scale > 1e-6,
+        "the psi motion carries no curvature on this fixture ({scale:.3e})"
+    );
+    let misses = observed
+        .indexed_iter()
+        .filter(|&((row, column), &want)| {
+            let value = (4.0 * fine[[row, column]] - coarse[[row, column]]) / 3.0;
+            let uncertainty = (fine[[row, column]] - coarse[[row, column]]).abs() / 3.0;
+            let denominator = scale.max(want.abs()).max(value.abs());
+            !((want - value).abs() <= 1e-5 * denominator + 4.0 * uncertainty)
+        })
+        .count();
+    assert!(
+        misses > 0,
+        "the observed psi motion matched the expected information's difference, so this fixture shows no gap"
+    );
+}
+
 /// Layer-5 deliverable (gam#979 / gam#1020): the Tier-B Jeffreys term built
 /// on the EXPECTED Fisher information must NOT reward probit saturation,
 /// whereas the OBSERVED-information Jeffreys term DOES — which is the long
@@ -2376,7 +2500,6 @@ pub(crate) fn gaussian_location_scale_joint_hessian_is_observed_and_psi_layers_m
                 wiggle_knots: family.wiggle_knots.clone(),
                 wiggle_degree: family.wiggle_degree,
                 policy: gam_runtime::resource::ResourcePolicy::default_library(),
-                cached_row_scalars: std::sync::RwLock::new(None),
                 jeffreys_armed: true,
             };
             let eta_mu_t = xmu_t.dot(&states[0].beta);

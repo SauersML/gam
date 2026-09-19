@@ -191,8 +191,8 @@ pub(crate) fn apply_survival_generated_regressor_correction(
         a_block,
         naive.view(),
     )?;
-    // gam#2943: the correction reaches the inference block's copies and their
-    // standard errors in the same step as the top-level matrices.
+    // gam#2943: the correction applies to the one published covariance store,
+    // whose standard errors derive from it (#2955).
     fit.add_coefficient_covariance_correction(&correction)
         .map_err(|err| format!("survival marginal-slope generated-regressor: {err}"))?;
     log::info!(
@@ -210,10 +210,7 @@ fn withhold_covariance(fit: &mut UnifiedFitResult, reason: &str) {
     fit.covariance_conditional = None;
     fit.covariance_corrected = None;
     if let Some(inference) = fit.inference.as_mut() {
-        inference.beta_covariance = None;
-        inference.beta_standard_errors = None;
-        inference.beta_covariance_corrected = None;
-        inference.beta_standard_errors_corrected = None;
+        inference.factorized_standard_errors = None;
     }
     let declined = gam_solve::estimate::CovarianceDeclined::
         SurvivalMarginalSlopeGeneratedRegressorSensitivityUnavailable {

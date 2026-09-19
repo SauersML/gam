@@ -3,7 +3,8 @@
 Three public APIs all claim to expose the same REML/LAML marginal-likelihood
 quantity for a fitted model:
 
-* ``Model.evidence`` / ``Summary.reml_score`` — the model's own reported score.
+* ``Model.evidence`` (now ``Model.conditional_aic``, #2946) / ``Summary.reml_score``
+  — the model's own reported score.
 * ``Model.bayes_factor_vs`` — pairwise Bayes factor between two fits.
 * ``gamfit.compare_models`` — the multi-model comparison table.
 
@@ -14,9 +15,10 @@ the raw score with ``with_tierney_kadane_normalizer_from_view``) ranks fits on a
 
     raw_reml + (-0.5 * null_dim * ln(2*pi) + 0.5 * null_space_logdet),
 
-while ``Model.evidence`` / ``Summary.reml_score`` (``model_evidence``,
+while ``Model.evidence`` / ``Summary.reml_score`` (``model_evidence``, now
+``model_conditional_aic``,
 ``crates/gam-pyffi/src/lib.rs``) and ``Model.bayes_factor_vs``
-(``bayes_factor_log_diff`` -> ``log_bayes_factor``) use the *raw* minimized
+(``bayes_factor_log_diff`` -> ``criterion_gap``) use the *raw* minimized
 ``reml_score`` with no normalizer.
 
 The normalizer term cancels in a delta only when both models share the same
@@ -33,7 +35,8 @@ not stress the normalizer). The fix is direction-agnostic: route all three
 entry points through the same score. These assertions only require *consistency*
 between the paths, so they pass whichever score the maintainer settles on.
 
-Update (#2079): the maintainer settled ``Model.evidence`` and
+Update (#2079): the maintainer settled ``Model.evidence`` (now
+``Model.conditional_aic``) and
 ``Model.bayes_factor_vs`` on the Occam-penalised conditional-AIC *ranking* score
 (``-2*loglik + 2*edf``) that ``compare_models`` ranks its ``winner`` on — so
 that the two per-model APIs can no longer contradict the declared winner when a
@@ -41,7 +44,7 @@ model is augmented with a pure-noise smooth. That ranking score is exposed by
 ``compare_models`` through the ``ranking`` list (its ``delta`` / Bayes-factor
 columns), NOT through the raw ``score_table['reml_score']`` headline (which,
 along with ``Summary.reml_score``, still reports the un-penalised REML/LAML
-evidence). The consistency assertions below therefore compare ``evidence`` /
+evidence). The consistency assertions below therefore compare ``conditional_aic`` /
 ``bayes_factor_vs`` against the ``ranking`` columns; the raw ``score_table`` /
 ``Summary.reml_score`` path is checked separately for its own self-consistency.
 """
@@ -125,20 +128,23 @@ def test_compare_models_score_matches_model_own_score() -> None:
         "in only one path)"
     )
 
-    # #2079: Model.evidence reports the conditional-AIC RANKING score, which
-    # compare_models exposes as the ``ranking`` ``delta`` (each model's ranking
-    # score minus the winner's). So evidence differences must reproduce the
-    # ranking deltas exactly -- the two are on one score.
+    # #2079: Model.conditional_aic reports the conditional-AIC RANKING score,
+    # which compare_models exposes as the ``ranking`` ``delta`` (each model's
+    # ranking score minus the winner's). So conditional-AIC differences must
+    # reproduce the ranking deltas exactly -- the two are on one score.
     ranking = {row[0]: row for row in comparison["ranking"]}
     winner = comparison["winner"]
-    winner_evidence = {"smooth": m_smooth.evidence, "poly": m_poly.evidence}[winner]
+    winner_aic = {"smooth": m_smooth.conditional_aic, "poly": m_poly.conditional_aic}[
+        winner
+    ]
     for name, model in (("smooth", m_smooth), ("poly", m_poly)):
         ranking_delta = ranking[name][2]
         assert ranking_delta == pytest.approx(
-            model.evidence - winner_evidence, rel=1e-9, abs=1e-9
+            model.conditional_aic - winner_aic, rel=1e-9, abs=1e-9
         ), (
             f"compare_models ranking delta {ranking_delta!r} for {name!r} "
-            f"disagrees with Model.evidence gap {model.evidence - winner_evidence!r}"
+            f"disagrees with Model.conditional_aic gap "
+            f"{model.conditional_aic - winner_aic!r}"
         )
 
 

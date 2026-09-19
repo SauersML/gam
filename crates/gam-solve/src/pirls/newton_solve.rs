@@ -1638,17 +1638,40 @@ pub(super) fn constraint_geometry_is_certified(
         && kkt.complementarity <= crate::estimate::reml::outer_eval::KKT_TOL_COMP
 }
 
-pub(crate) fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
+/// Structural nonzeros of a dense matrix's upper triangle: every entry that is
+/// not exactly `0.0`. This is the count the sparse path's penalty pattern keeps
+/// (`value != 0.0` in `sparse_system`), so the dense-reject diagnostic and the
+/// sparse-native statistics report one quantity. A magnitude cutoff would make
+/// the count of `λ·S` move with `λ` while its pattern does not (#2469).
+pub(crate) fn count_dense_upper_nnz(matrix: &Array2<f64>) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
     for col in 0..p {
         for row in 0..=col {
-            if matrix[[row, col]].abs() > tol {
+            if matrix[[row, col]] != 0.0 {
                 nnz += 1;
             }
         }
     }
     nnz
+}
+
+#[cfg(test)]
+mod structural_nnz_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// #2469: the count is the pattern of `λ·S`, whatever `λ` is. A tridiagonal
+    /// penalty scaled by `1e-14` has five structural upper-triangle entries, and the
+    /// `1e-12` magnitude cutoff this replaced counted none of them.
+    #[test]
+    fn dense_upper_nnz_counts_the_pattern_at_any_penalty_scale_2469() {
+        let s = array![[2.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 2.0]];
+        for lambda in [1.0e-14, 1.0, 1.0e14] {
+            assert_eq!(count_dense_upper_nnz(&s.mapv(|value| lambda * value)), 5);
+        }
+        assert_eq!(count_dense_upper_nnz(&Array2::<f64>::zeros((3, 3))), 0);
+    }
 }
 
 pub(crate) fn estimate_sparse_native_decision(
@@ -1659,7 +1682,7 @@ pub(crate) fn estimate_sparse_native_decision(
     linear_constraints_original: Option<&LinearInequalityConstraints>,
 ) -> SparsePirlsDecision {
     let p = x_original.ncols();
-    let nnz_s_lambda = count_dense_upper_nnz(s_lambda, 1e-12);
+    let nnz_s_lambda = count_dense_upper_nnz(s_lambda);
     let dense_reject = |reason: &'static str, nnz_x: usize| SparsePirlsDecision {
         path: PirlsLinearSolvePath::DenseTransformed,
         reason,
@@ -1697,7 +1720,7 @@ pub(crate) fn estimate_sparse_native_decision(
                 chunks_processed += 1;
                 match x_original.try_row_chunk(start..end) {
                     Ok(rows) => {
-                        nnz = nnz.saturating_add(rows.iter().filter(|v| v.abs() > 1e-12).count());
+                        nnz = nnz.saturating_add(rows.iter().filter(|v| **v != 0.0).count());
                     }
                     Err(_) => {
                         nnz = nnz.saturating_add((end - start).saturating_mul(x_original.ncols()));

@@ -988,6 +988,28 @@ pub(crate) fn matern_aniso_extended_radial_scalars(
     }
 }
 
+/// `d³t/dr³` of the third-order scalar `t` of
+/// [`matern_aniso_extended_radial_scalars`], for a kernel that admits the
+/// third-order operator, else `None`. The second η-derivative of the
+/// third-order tensor's `t'/r` factor needs it.
+///
+/// With `a = s r`, `t = s⁴ e^{−a} T(a)`, and `d/dr [s^m e^{−a} P(a)] =
+/// s^{m+1} e^{−a} (P' − P)(a)`, so `t''' = s⁷ e^{−a} ((D − 1)³ T)(a)`:
+///   ν = 5/2: T = 1/3,               (D − 1)³T = −1/3;
+///   ν = 7/2: T = (a + 1)/15,        (D − 1)³T = (2 − a)/15;
+///   ν = 9/2: T = (a² + 3a + 3)/105, (D − 1)³T = a(3 − a)/105.
+pub(crate) fn matern_third_order_t_rrr(r: f64, length_scale: f64, nu: MaternNu) -> Option<f64> {
+    // Coefficients of (D − 1)³T in powers of `a`.
+    let (s, [c0, c1, c2]) = match nu {
+        MaternNu::Half | MaternNu::ThreeHalves => return None,
+        MaternNu::FiveHalves => (5.0_f64.sqrt() / length_scale, [-1.0 / 3.0, 0.0, 0.0]),
+        MaternNu::SevenHalves => (7.0_f64.sqrt() / length_scale, [2.0 / 15.0, -1.0 / 15.0, 0.0]),
+        MaternNu::NineHalves => (3.0 / length_scale, [0.0, 3.0 / 105.0, -1.0 / 105.0]),
+    };
+    let a = s * r;
+    Some(s.powi(7) * (-a).exp() * (c0 + a * (c1 + a * c2)))
+}
+
 #[inline(always)]
 pub(crate) fn hessian_operator_entry(
     q: f64,
@@ -1034,6 +1056,240 @@ pub(crate) fn third_order_gram_pair(
     j.t * l.t * (3.0 * d + 6.0) * u_dot_v
         + 3.0 * u_dot_v * (j.t * l.t_r * r_v + j.t_r * l.t * r_u)
         + j.t_r * l.t_r * u_dot_v * u_dot_v * u_dot_v / (r_u * r_v)
+}
+
+/// The metric sums one displacement pair contributes to the third-order Gram
+/// under the anisotropic metric `w = centered_aniso_metric_weights(η)`.
+///
+/// In that metric `r² = Σ w_a h_a²` and `∂r/∂x_a = w_a h_a / r`, so with
+/// `g = w∘h` the third derivative of `φ(r)` is
+///   `T_abc = t·(δ_ab w_a g_c + δ_ac w_a g_b + δ_bc w_b g_a) + (t'/r)·g_a g_b g_c`.
+/// A constant linear change of variables keeps every derivative order and only
+/// rescales it, so the operator exists wherever the isotropic one does. The
+/// contraction of `T(u)` with `T(v)` over `a, b, c` is
+///   t_j t_l (3 W S + 6 Q) + 3S (t_j t'_l M_v/|v| + t'_j t_l M_u/|u|) + t'_j t'_l S³/(|u||v|),
+/// with `S = Σ w_a² u_a v_a`, `W = Σ w_a²`, `Q = Σ w_a⁴ u_a v_a` and
+/// `M_u = Σ w_a³ u_a²`. At unit weights these are `u·v`, `d`, `u·v` and `|u|²`,
+/// which is [`third_order_gram_pair`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ThirdOrderMetricPair {
+    inner: f64,
+    trace: f64,
+    quartic: f64,
+    cubic_u: f64,
+    cubic_v: f64,
+}
+
+impl ThirdOrderMetricPair {
+    pub(crate) fn new(u: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>, weights: &[f64]) -> Self {
+        let mut pair = Self {
+            inner: 0.0,
+            trace: 0.0,
+            quartic: 0.0,
+            cubic_u: 0.0,
+            cubic_v: 0.0,
+        };
+        for (axis, &w) in weights.iter().enumerate() {
+            let w2 = w * w;
+            let uv = u[axis] * v[axis];
+            pair.inner += w2 * uv;
+            pair.trace += w2;
+            pair.quartic += w2 * w2 * uv;
+            pair.cubic_u += w2 * w * u[axis] * u[axis];
+            pair.cubic_v += w2 * w * v[axis] * v[axis];
+        }
+        pair
+    }
+}
+
+/// [`third_order_gram_pair`] under an anisotropic metric; `r_u` and `r_v` are
+/// the metric distances and `pair` the displacements' metric sums.
+#[inline(always)]
+pub(crate) fn third_order_gram_pair_in_metric(
+    j: ThirdOrderRadial,
+    r_u: f64,
+    l: ThirdOrderRadial,
+    r_v: f64,
+    pair: &ThirdOrderMetricPair,
+) -> f64 {
+    if r_u <= 0.0 || r_v <= 0.0 {
+        return 0.0;
+    }
+    let s = pair.inner;
+    j.t * l.t * (3.0 * pair.trace * s + 6.0 * pair.quartic)
+        + 3.0 * s * (j.t * l.t_r * pair.cubic_v / r_v + j.t_r * l.t * pair.cubic_u / r_u)
+        + j.t_r * l.t_r * s * s * s / (r_u * r_v)
+}
+
+/// The rows of a symmetric third-order tensor in `d` axes: each index triple
+/// `a ≤ b ≤ c` once, weighted by the square root of its permutation count, so
+/// the Gram of the compressed rows equals the full `Σ_abc` contraction with
+/// `C(d+2, 3)` rows per point instead of `d³`.
+pub(crate) fn third_order_symmetric_rows(d: usize) -> Vec<([usize; 3], f64)> {
+    let mut rows = Vec::new();
+    for a in 0..d {
+        for b in a..d {
+            for c in b..d {
+                let permutations: f64 = if a == c {
+                    1.0
+                } else if a == b || b == c {
+                    3.0
+                } else {
+                    6.0
+                };
+                rows.push(([a, b, c], permutations.sqrt()));
+            }
+        }
+    }
+    rows
+}
+
+/// One entry `T_abc` of the metric third-derivative tensor
+/// ([`ThirdOrderMetricPair`]) at displacement `h`, with its η-derivatives.
+///
+/// Each monomial of `T_abc` is a product of axis weights and displacements
+/// whose weights carry `e^{2η}` factors: `δ_ab w_a g_c` scales as
+/// `e^{2η_a + 2η_c}`, and `g_a g_b g_c` as `e^{2η_a + 2η_b + 2η_c}`. So
+/// `∂/∂η_e` multiplies a monomial by twice the number of its exponent axes equal
+/// to `e`. The radial factors move through `r`, with `∂r/∂η_e = s_e/r` and
+/// `s_e = w_e h_e²`, the convention the mass, tension and stiffness η-rows use.
+struct ThirdOrderMetricEntry {
+    /// The three Kronecker monomials, each with its two exponent axes.
+    kronecker: [(f64, [usize; 2]); 3],
+    cubic: f64,
+    axes: [usize; 3],
+}
+
+impl ThirdOrderMetricEntry {
+    fn new(axes: [usize; 3], h: &[f64], weights: &[f64]) -> Self {
+        let [a, b, c] = axes;
+        let g = |axis: usize| weights[axis] * h[axis];
+        let monomial = |equal: bool, weight_axis: usize, g_axis: usize| {
+            if equal {
+                weights[weight_axis] * g(g_axis)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            kronecker: [
+                (monomial(a == b, a, c), [a, c]),
+                (monomial(a == c, a, b), [a, b]),
+                (monomial(b == c, b, a), [b, a]),
+            ],
+            cubic: g(a) * g(b) * g(c),
+            axes,
+        }
+    }
+
+    /// `Σ` over the Kronecker monomials of `m(e)·m(f)·monomial`, where `m(axis)`
+    /// is twice the count of the monomial's exponent axes equal to it and
+    /// `m(None) = 1`.
+    fn kronecker_sum(&self, e: Option<usize>, f: Option<usize>) -> f64 {
+        self.kronecker
+            .iter()
+            .map(|(value, exponent_axes)| {
+                exponent_multiplier(exponent_axes, e) * exponent_multiplier(exponent_axes, f) * value
+            })
+            .sum()
+    }
+
+    fn cubic_term(&self, e: Option<usize>, f: Option<usize>) -> f64 {
+        exponent_multiplier(&self.axes, e) * exponent_multiplier(&self.axes, f) * self.cubic
+    }
+}
+
+fn exponent_multiplier(exponent_axes: &[usize], axis: Option<usize>) -> f64 {
+    match axis {
+        None => 1.0,
+        Some(axis) => 2.0 * exponent_axes.iter().filter(|&&exponent| exponent == axis).count() as f64,
+    }
+}
+
+/// The radial factors of [`ThirdOrderMetricEntry`] at one metric distance:
+/// `t` and `σ = t'/r`, and the radial derivatives the η-chain rule needs.
+struct ThirdOrderMetricRadial {
+    r: f64,
+    t: f64,
+    t_r: f64,
+    t_rr: f64,
+    sigma: f64,
+    sigma_r: f64,
+    sigma_rr: f64,
+}
+
+impl ThirdOrderMetricRadial {
+    fn new(r: f64, t: f64, t_r: f64, t_rr: f64, t_rrr: f64) -> Self {
+        let (sigma, sigma_r, sigma_rr) = if r > 0.0 {
+            (
+                t_r / r,
+                (t_rr * r - t_r) / (r * r),
+                (t_rrr * r * r - 2.0 * t_rr * r + 2.0 * t_r) / (r * r * r),
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        Self {
+            r,
+            t,
+            t_r,
+            t_rr,
+            sigma,
+            sigma_r,
+            sigma_rr,
+        }
+    }
+
+    /// `∂f/∂η_e` of a radial `f` with radial derivative `f_r`.
+    fn first(&self, f_r: f64, s: &[f64], e: usize) -> f64 {
+        f_r * s[e] / self.r
+    }
+
+    /// `∂²f/∂η_e∂η_f = (f_rr r − f_r) s_e s_f / r³ + 2 δ_ef f_r s_e / r`.
+    fn second(&self, f_r: f64, f_rr: f64, s: &[f64], e: usize, f: usize) -> f64 {
+        let r = self.r;
+        let diagonal = if e == f { 2.0 * f_r * s[e] / r } else { 0.0 };
+        (f_rr * r - f_r) * s[e] * s[f] / (r * r * r) + diagonal
+    }
+
+    fn value_of(&self, entry: &ThirdOrderMetricEntry) -> f64 {
+        if self.r <= 0.0 {
+            return 0.0;
+        }
+        self.t * entry.kronecker_sum(None, None) + self.sigma * entry.cubic_term(None, None)
+    }
+
+    fn eta_first_of(&self, entry: &ThirdOrderMetricEntry, s: &[f64], e: usize) -> f64 {
+        if self.r <= 0.0 {
+            return 0.0;
+        }
+        let t_e = self.first(self.t_r, s, e);
+        let sigma_e = self.first(self.sigma_r, s, e);
+        t_e * entry.kronecker_sum(None, None)
+            + self.t * entry.kronecker_sum(Some(e), None)
+            + sigma_e * entry.cubic_term(None, None)
+            + self.sigma * entry.cubic_term(Some(e), None)
+    }
+
+    fn eta_second_of(&self, entry: &ThirdOrderMetricEntry, s: &[f64], e: usize, f: usize) -> f64 {
+        if self.r <= 0.0 {
+            return 0.0;
+        }
+        let t_e = self.first(self.t_r, s, e);
+        let t_f = self.first(self.t_r, s, f);
+        let t_ef = self.second(self.t_r, self.t_rr, s, e, f);
+        let sigma_e = self.first(self.sigma_r, s, e);
+        let sigma_f = self.first(self.sigma_r, s, f);
+        let sigma_ef = self.second(self.sigma_r, self.sigma_rr, s, e, f);
+        t_ef * entry.kronecker_sum(None, None)
+            + t_e * entry.kronecker_sum(Some(f), None)
+            + t_f * entry.kronecker_sum(Some(e), None)
+            + self.t * entry.kronecker_sum(Some(e), Some(f))
+            + sigma_ef * entry.cubic_term(None, None)
+            + sigma_e * entry.cubic_term(Some(f), None)
+            + sigma_f * entry.cubic_term(Some(e), None)
+            + self.sigma * entry.cubic_term(Some(e), Some(f))
+    }
 }
 
 #[inline(always)]
@@ -1195,6 +1451,21 @@ pub(crate) struct MaternCrossPenaltyContext {
     pub(crate) op0_s_first_raw: Vec<Array2<f64>>,
     pub(crate) op1_s_first_raw: Vec<Array2<f64>>,
     pub(crate) op2_s_first_raw: Vec<Array2<f64>>,
+    /// The third-order operator's data, when the kernel carries it.
+    pub(crate) third_order: Option<MaternThirdOrderCrossData>,
+}
+
+/// The third-order block's operator and Gram data for
+/// [`MaternCrossPenaltyContext::compute_pair`]: its symmetric rows
+/// ([`third_order_symmetric_rows`]), the projected operator and per-axis
+/// η-rows, and the raw Gram with its norm and raw first derivatives.
+pub(crate) struct MaternThirdOrderCrossData {
+    pub(crate) rows: Vec<([usize; 3], f64)>,
+    pub(crate) d3: Array2<f64>,
+    pub(crate) d3_eta_proj: Vec<Array2<f64>>,
+    pub(crate) s_raw: Array2<f64>,
+    pub(crate) c: f64,
+    pub(crate) s_first_raw: Vec<Array2<f64>>,
 }
 
 impl MaternCrossPenaltyContext {
@@ -1219,6 +1490,8 @@ impl MaternCrossPenaltyContext {
         let mut d0_cross_raw = Array2::<f64>::zeros((p, p));
         let mut d1_cross_raw = Array2::<f64>::zeros((p * d, p));
         let mut d2_cross_raw = Array2::<f64>::zeros((p * d * d, p));
+        let n3 = self.third_order.as_ref().map_or(0, |third| third.rows.len());
+        let mut d3_cross_raw = Array2::<f64>::zeros((p * n3, p));
         let metric_weights = centered_aniso_metric_weights(&self.aniso_log_scales);
 
         for k in 0..p {
@@ -1228,6 +1501,22 @@ impl MaternCrossPenaltyContext {
                 let (r, s_vec) = aniso_distance_and_components(&ci, &cj, &self.aniso_log_scales);
                 let (_, _, t, dt_dr, d2t_dr2) =
                     matern_aniso_extended_radial_scalars(r, self.length_scale, self.nu)?;
+                if let Some(third) = self.third_order.as_ref() {
+                    let t_rrr = matern_third_order_t_rrr(r, self.length_scale, self.nu)
+                        .ok_or_else(|| {
+                            BasisError::InvalidInput(format!(
+                                "Matérn nu={:?} admits no third-order operator",
+                                self.nu
+                            ))
+                        })?;
+                    let radial = ThirdOrderMetricRadial::new(r, t, dt_dr, d2t_dr2, t_rrr);
+                    let h: Vec<f64> = (0..d).map(|axis| ci[axis] - cj[axis]).collect();
+                    for (row, (axes, multiplicity)) in third.rows.iter().enumerate() {
+                        let entry = ThirdOrderMetricEntry::new(*axes, &h, &metric_weights);
+                        d3_cross_raw[[k * n3 + row, j]] =
+                            multiplicity * radial.eta_second_of(&entry, &s_vec, axis_a, axis_b);
+                    }
+                }
                 let s_a = s_vec[axis_a];
                 let s_b = s_vec[axis_b];
                 let sa_sb = s_a * s_b;
@@ -1309,12 +1598,24 @@ impl MaternCrossPenaltyContext {
             ),
             self.op2_c,
         );
+        let mut crosses = vec![s0_cross, s1_cross, s2_cross];
+        if let Some(third) = self.third_order.as_ref() {
+            let d3_cross_proj = self.project_operator(&d3_cross_raw, p * n3);
+            crosses.push(normalize_penalty_cross_psi_derivative(
+                &third.s_raw,
+                &third.s_first_raw[axis_a],
+                &third.s_first_raw[axis_b],
+                &gram_cross_psi_derivative_from_operator(
+                    &third.d3,
+                    &third.d3_eta_proj[axis_a],
+                    &third.d3_eta_proj[axis_b],
+                    &d3_cross_proj,
+                ),
+                third.c,
+            ));
+        }
 
-        active_operator_penalty_derivatives(
-            &self.active_penalties,
-            &[s0_cross, s1_cross, s2_cross],
-            "Matérn-aniso-cross",
-        )
+        active_operator_penalty_derivatives(&self.active_penalties, &crosses, "Matérn-aniso-cross")
     }
 }
 
@@ -1338,8 +1639,8 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     let dim = eta.len();
     assert_eq!(dim, d);
 
-    // Per-axis: build raw D0, D1, and full-Hessian D2 plus their eta_a
-    // first/second derivatives.
+    // Per-axis: build raw D0, D1, full-Hessian D2 and, for a kernel that admits
+    // it, the third-derivative D3, plus their eta_a first/second derivatives.
     let mut d0_raw = Array2::<f64>::zeros((p, p));
     let mut d1_raw = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw = Array2::<f64>::zeros((p * d * d, p));
@@ -1359,18 +1660,35 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         }
     }
     let metric_weights = centered_aniso_metric_weights(eta);
+    // The third-order operator's rows, compressed over the symmetric index
+    // triples, under the same (ν, d) gate as the forward collocation builder, so
+    // both carry the block at every η. Empty for a kernel without it.
+    let third_rows: Vec<([usize; 3], f64)> = if nu.admits_third_order_operator() && d > 0 {
+        third_order_symmetric_rows(d)
+    } else {
+        Vec::new()
+    };
+    let n3 = third_rows.len();
+    let mut d3_raw = Array2::<f64>::zeros((p * n3, p));
+    let mut d3_raw_eta: Vec<Array2<f64>> =
+        (0..dim).map(|_| Array2::zeros((p * n3, p))).collect();
+    let mut d3_raw_eta2: Vec<Array2<f64>> =
+        (0..dim).map(|_| Array2::zeros((p * n3, p))).collect();
 
     struct CenterRowAccumulator {
         pub(crate) k: usize,
         pub(crate) d0: Array1<f64>,
         pub(crate) d1: Array2<f64>,
         pub(crate) d2: Array2<f64>,
+        pub(crate) d3: Array2<f64>,
         pub(crate) d0_eta: Vec<Array1<f64>>,
         pub(crate) d1_eta: Vec<Array2<f64>>,
         pub(crate) d2_eta: Vec<Array2<f64>>,
+        pub(crate) d3_eta: Vec<Array2<f64>>,
         pub(crate) d0_eta2: Vec<Array1<f64>>,
         pub(crate) d1_eta2: Vec<Array2<f64>>,
         pub(crate) d2_eta2: Vec<Array2<f64>>,
+        pub(crate) d3_eta2: Vec<Array2<f64>>,
     }
 
     let row_accumulators: Vec<CenterRowAccumulator> = (0..p)
@@ -1388,6 +1706,10 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
             let mut d1_eta2: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((d, p))).collect();
             let mut d2_eta2: Vec<Array2<f64>> =
                 (0..dim).map(|_| Array2::zeros((d * d, p))).collect();
+            let mut d3 = Array2::<f64>::zeros((n3, p));
+            let mut d3_eta: Vec<Array2<f64>> = (0..dim).map(|_| Array2::zeros((n3, p))).collect();
+            let mut d3_eta2: Vec<Array2<f64>> =
+                (0..dim).map(|_| Array2::zeros((n3, p))).collect();
 
             for j in 0..p {
                 let cj: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
@@ -1395,6 +1717,27 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
 
                 let (phi, q, t, dt_dr, d2t_dr2) =
                     matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
+
+                // --- D₃ (third derivatives, symmetric rows) and its η-rows ---
+                if n3 > 0 {
+                    let t_rrr = matern_third_order_t_rrr(r, length_scale, nu).ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "Matérn nu={nu:?} admits no third-order operator"
+                        ))
+                    })?;
+                    let radial = ThirdOrderMetricRadial::new(r, t, dt_dr, d2t_dr2, t_rrr);
+                    let h: Vec<f64> = (0..d).map(|axis| ci[axis] - cj[axis]).collect();
+                    for (row, (axes, multiplicity)) in third_rows.iter().enumerate() {
+                        let entry = ThirdOrderMetricEntry::new(*axes, &h, &metric_weights);
+                        d3[[row, j]] = multiplicity * radial.value_of(&entry);
+                        for a in 0..dim {
+                            d3_eta[a][[row, j]] =
+                                multiplicity * radial.eta_first_of(&entry, &s_vec, a);
+                            d3_eta2[a][[row, j]] =
+                                multiplicity * radial.eta_second_of(&entry, &s_vec, a, a);
+                        }
+                    }
+                }
 
                 // --- D₀ ---
                 d0[j] = phi;
@@ -1470,12 +1813,15 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
                 d0,
                 d1,
                 d2,
+                d3,
                 d0_eta,
                 d1_eta,
                 d2_eta,
+                d3_eta,
                 d0_eta2,
                 d1_eta2,
                 d2_eta2,
+                d3_eta2,
             })
         })
         .collect::<Result<Vec<_>, BasisError>>()?;
@@ -1487,6 +1833,17 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         d2_raw
             .slice_mut(s![k * d * d..(k + 1) * d * d, ..])
             .assign(&row.d2);
+        d3_raw
+            .slice_mut(s![k * n3..(k + 1) * n3, ..])
+            .assign(&row.d3);
+        for a in 0..dim {
+            d3_raw_eta[a]
+                .slice_mut(s![k * n3..(k + 1) * n3, ..])
+                .assign(&row.d3_eta[a]);
+            d3_raw_eta2[a]
+                .slice_mut(s![k * n3..(k + 1) * n3, ..])
+                .assign(&row.d3_eta2[a]);
+        }
 
         for a in 0..dim {
             d0_raw_eta[a].row_mut(k).assign(&row.d0_eta[a]);
@@ -1538,6 +1895,21 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     let d0 = pad(d0_kernel, p, true);
     let d1 = pad(d1_kernel, p * d, false);
     let d2 = pad(d2_kernel, p * d * d, false);
+    // The third-order rows, projected and padded like D₂'s; absent when the
+    // kernel carries no third-order operator.
+    let third_order = (n3 > 0).then(|| {
+        (
+            pad(project(d3_raw), p * n3, false),
+            d3_raw_eta
+                .into_iter()
+                .map(|m| pad(project(m), p * n3, false))
+                .collect::<Vec<_>>(),
+            d3_raw_eta2
+                .into_iter()
+                .map(|m| pad(project(m), p * n3, false))
+                .collect::<Vec<_>>(),
+        )
+    });
 
     // Project and pad all per-axis operator derivative matrices upfront,
     // so they remain available for cross-term computation.
@@ -1612,6 +1984,10 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     let op0_info = compute_operator_info(&d0, &d0_eta_all, &d0_eta2_all);
     let op1_info = compute_operator_info(&d1, &d1_eta_all, &d1_eta2_all);
     let op2_info = compute_operator_info(&d2, &d2_eta_all, &d2_eta2_all);
+    let op3 = third_order.map(|(d3, d3_eta_all, d3_eta2_all)| {
+        let info = compute_operator_info(&d3, &d3_eta_all, &d3_eta2_all);
+        (d3, d3_eta_all, info)
+    });
 
     // Build penalty candidates and determine which are active (using axis-0
     // normalized Gram, which is axis-independent).
@@ -1631,7 +2007,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         (op2_info.s_raw.clone(), 1.0)
     };
 
-    let candidates = vec![
+    let mut candidates = vec![
         PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 s0_norm,
@@ -1663,29 +2039,46 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
             op: None,
         },
     ];
+    if let Some((_, _, info)) = op3.as_ref() {
+        let (s3_norm, c3) = if info.c.is_finite() && info.c > 0.0 {
+            (info.s_raw.mapv(|v| v / info.c), info.c)
+        } else {
+            (info.s_raw.clone(), 1.0)
+        };
+        candidates.push(PenaltyCandidate {
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s3_norm,
+                "Matérn anisotropic third-order penalty",
+            )?,
+            source: PenaltySource::OperatorThirdOrder,
+            normalization_scale: c3,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
     let filtered = filter_penalty_candidates(candidates)?;
 
     // Build per-axis results.
     let mut per_axis_results = Vec::with_capacity(dim);
     for a in 0..dim {
-        let pen_first = active_operator_penalty_derivatives(
-            &filtered.active,
-            &[
-                op0_info.s_first[a].clone(),
-                op1_info.s_first[a].clone(),
-                op2_info.s_first[a].clone(),
-            ],
-            "Matérn-aniso",
-        )?;
-        let pen_second = active_operator_penalty_derivatives(
-            &filtered.active,
-            &[
-                op0_info.s_second[a].clone(),
-                op1_info.s_second[a].clone(),
-                op2_info.s_second[a].clone(),
-            ],
-            "Matérn-aniso",
-        )?;
+        let mut first_blocks = vec![
+            op0_info.s_first[a].clone(),
+            op1_info.s_first[a].clone(),
+            op2_info.s_first[a].clone(),
+        ];
+        let mut second_blocks = vec![
+            op0_info.s_second[a].clone(),
+            op1_info.s_second[a].clone(),
+            op2_info.s_second[a].clone(),
+        ];
+        if let Some((_, _, info)) = op3.as_ref() {
+            first_blocks.push(info.s_first[a].clone());
+            second_blocks.push(info.s_second[a].clone());
+        }
+        let pen_first =
+            active_operator_penalty_derivatives(&filtered.active, &first_blocks, "Matérn-aniso")?;
+        let pen_second =
+            active_operator_penalty_derivatives(&filtered.active, &second_blocks, "Matérn-aniso")?;
         per_axis_results.push((pen_first, pen_second));
     }
 
@@ -1711,6 +2104,14 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         op0_s_first_raw: op0_info.s_first_raw,
         op1_s_first_raw: op1_info.s_first_raw,
         op2_s_first_raw: op2_info.s_first_raw,
+        third_order: op3.map(|(d3, d3_eta_proj, info)| MaternThirdOrderCrossData {
+            rows: third_rows,
+            d3,
+            d3_eta_proj,
+            s_raw: info.s_raw,
+            c: info.c,
+            s_first_raw: info.s_first_raw,
+        }),
     });
     let cross_provider = AnisoPenaltyCrossProvider::new(move |a: usize, b: usize| {
         let (axis_a, axis_b) = if a < b { (a, b) } else { (b, a) };
@@ -3415,8 +3816,8 @@ pub(crate) fn build_matern_collocation_operator_matrices(
     // - one exp(-a) and small polynomials per pair,
     // - NaN-safe phi'(r)/r without dividing by r for nu>=3/2,
     // - exact Hessian rows for the stiffness operator, not just the Laplacian,
-    // - exact third-derivative rows for the third-order operator when the kernel
-    //   admits it (isotropic, nu>=5/2).
+    // - the exact third-derivative Gram for the third-order operator when the
+    //   kernel admits it (nu>=5/2, under either metric).
     let p = centers.nrows();
     let d = centers.ncols();
     let row_scales = if let Some(w) = collocationweights {
@@ -3580,12 +3981,12 @@ pub(crate) fn build_matern_collocation_operator_matrices(
             })?;
     }
     // Gram of the third-derivative operator for a kernel that admits it,
-    // accumulated in closed form over the collocation points. The anisotropic
-    // η-derivative path (`build_matern_operator_penalty_aniso_derivatives`)
-    // carries mass, tension and stiffness only, so the metric must be isotropic
-    // here for the forward and derivative topologies to agree.
-    let third_order_raw = if nu.admits_third_order_operator() && aniso_log_scales.is_none() && d > 0
-    {
+    // accumulated in closed form over the collocation points. Admission depends
+    // on ν alone: the anisotropic metric only rescales the operator
+    // (`ThirdOrderMetricPair`), and the η-derivative path
+    // (`build_matern_operator_penalty_aniso_derivatives`) carries the same block,
+    // so the penalty topology is one function of (ν, d) at every η (#2953).
+    let third_order_raw = if nu.admits_third_order_operator() && d > 0 {
         let mut gram = Array2::<f64>::zeros((p, p));
         let mut displacement = Array2::<f64>::zeros((p, d));
         let mut distance = vec![0.0_f64; p];
@@ -3596,25 +3997,56 @@ pub(crate) fn build_matern_collocation_operator_matrices(
                 for c in 0..d {
                     displacement[[j, c]] = centers[[k, c]] - centers[[j, c]];
                 }
-                let r = stable_euclidean_norm(displacement.row(j).iter().copied());
+                // The same metric distance the D₀–D₂ rows above use.
+                let r = if let Some(eta) = aniso_log_scales {
+                    aniso_distance_and_components(
+                        centers
+                            .row(k)
+                            .as_slice()
+                            .expect("centers is standard-layout, so every row is contiguous"),
+                        centers
+                            .row(j)
+                            .as_slice()
+                            .expect("centers is standard-layout, so every row is contiguous"),
+                        eta,
+                    )
+                    .0
+                } else {
+                    stable_euclidean_norm(displacement.row(j).iter().copied())
+                };
                 let (_, _, t, t_r, _) = matern_aniso_extended_radial_scalars(r, length_scale, nu)?;
                 distance[j] = r;
                 radial[j] = ThirdOrderRadial { t, t_r };
             }
             for j in 0..p {
                 for l in j..p {
-                    let u_dot_v: f64 = (0..d)
-                        .map(|c| displacement[[j, c]] * displacement[[l, c]])
-                        .sum();
-                    let value = weight
-                        * third_order_gram_pair(
+                    let pair = match metric_weights.as_deref() {
+                        Some(weights) => third_order_gram_pair_in_metric(
                             radial[j],
                             distance[j],
                             radial[l],
                             distance[l],
-                            u_dot_v,
-                            d,
-                        );
+                            &ThirdOrderMetricPair::new(
+                                displacement.row(j),
+                                displacement.row(l),
+                                weights,
+                            ),
+                        ),
+                        None => {
+                            let u_dot_v: f64 = (0..d)
+                                .map(|c| displacement[[j, c]] * displacement[[l, c]])
+                                .sum();
+                            third_order_gram_pair(
+                                radial[j],
+                                distance[j],
+                                radial[l],
+                                distance[l],
+                                u_dot_v,
+                                d,
+                            )
+                        }
+                    };
+                    let value = weight * pair;
                     gram[[j, l]] += value;
                     if l != j {
                         gram[[l, j]] += value;
@@ -3819,48 +4251,69 @@ mod third_order_operator_tests {
 
     /// The κ-derivative builder carries the third-order block last, and its
     /// ψ-derivatives match central differences of the forward third-order
-    /// penalty in ψ = −log ℓ.
+    /// penalty in ψ = −log ℓ, under the isotropic metric and an anisotropic one
+    /// (#2953).
     #[test]
     fn third_order_penalty_psi_derivatives_match_the_forward_penalty() {
         let centers = centers_2d();
         let length_scale: f64 = 0.8;
         let nu = MaternNu::FiveHalves;
-        let third_order_penalty = |ell: f64| -> Array2<f64> {
-            let ops =
-                build_matern_collocation_operator_matrices(centers.view(), None, ell, nu, false, None, None)
-                    .expect("Matérn collocation operators");
-            let gram = ops
-                .third_order_gram
-                .expect("ν = 5/2 admits the third-order operator");
-            normalize_penalty(&symmetrize(&gram)).0
-        };
-        let (first, second) =
-            build_matern_operator_penalty_psi_derivatives(centers.view(), length_scale, nu, false, None, None)
-                .expect("Matérn ψ-derivatives");
-        assert_eq!(first.len(), 4, "mass, tension, stiffness and third-order blocks");
-        assert_eq!(second.len(), 4, "mass, tension, stiffness and third-order blocks");
-        let psi0 = -length_scale.ln();
-        let step = 1e-4;
-        let plus = third_order_penalty((-(psi0 + step)).exp());
-        let minus = third_order_penalty((-(psi0 - step)).exp());
-        let center = third_order_penalty(length_scale);
-        let fd_first = (&plus - &minus) / (2.0 * step);
-        let fd_second = (&plus - &(&center * 2.0) + &minus) / (step * step);
-        let relative = |analytic: &Array2<f64>, reference: &Array2<f64>| -> f64 {
-            let gap = (analytic - reference).iter().map(|v| v * v).sum::<f64>().sqrt();
-            let scale = reference.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
-            gap / scale
-        };
-        let first_gap = relative(&first[3], &fd_first);
-        let second_gap = relative(&second[3], &fd_second);
-        assert!(first_gap < 1e-5, "∂S₃/∂ψ mismatch: relative gap {first_gap:.3e}");
-        assert!(second_gap < 1e-3, "∂²S₃/∂ψ² mismatch: relative gap {second_gap:.3e}");
+        let eta = [0.3, -0.3];
+        for aniso in [None, Some(&eta[..])] {
+            let third_order_penalty = |ell: f64| -> Array2<f64> {
+                let ops = build_matern_collocation_operator_matrices(
+                    centers.view(),
+                    None,
+                    ell,
+                    nu,
+                    false,
+                    None,
+                    aniso,
+                )
+                .expect("Matérn collocation operators");
+                let gram = ops
+                    .third_order_gram
+                    .expect("ν = 5/2 admits the third-order operator");
+                normalize_penalty(&symmetrize(&gram)).0
+            };
+            let (first, second) = build_matern_operator_penalty_psi_derivatives(
+                centers.view(),
+                length_scale,
+                nu,
+                false,
+                None,
+                aniso,
+            )
+            .expect("Matérn ψ-derivatives");
+            assert_eq!(first.len(), 4, "{aniso:?}: mass, tension, stiffness and third-order blocks");
+            assert_eq!(second.len(), 4, "{aniso:?}: mass, tension, stiffness and third-order blocks");
+            let psi0 = -length_scale.ln();
+            let step = 1e-4;
+            let plus = third_order_penalty((-(psi0 + step)).exp());
+            let minus = third_order_penalty((-(psi0 - step)).exp());
+            let center = third_order_penalty(length_scale);
+            let fd_first = (&plus - &minus) / (2.0 * step);
+            let fd_second = (&plus - &(&center * 2.0) + &minus) / (step * step);
+            let relative = |analytic: &Array2<f64>, reference: &Array2<f64>| -> f64 {
+                let gap = (analytic - reference).iter().map(|v| v * v).sum::<f64>().sqrt();
+                let scale = reference.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+                gap / scale
+            };
+            let first_gap = relative(&first[3], &fd_first);
+            let second_gap = relative(&second[3], &fd_second);
+            assert!(first_gap < 1e-5, "{aniso:?} ∂S₃/∂ψ mismatch: relative gap {first_gap:.3e}");
+            assert!(second_gap < 1e-3, "{aniso:?} ∂²S₃/∂ψ² mismatch: relative gap {second_gap:.3e}");
+        }
     }
 
-    /// Only smooth isotropic kernels (ν ≥ 5/2) carry the third-order operator.
+    /// Only smooth kernels (ν ≥ 5/2) carry the third-order operator, and the
+    /// penalty topology is one function of (ν, d): an anisotropic metric
+    /// rescales the operator but never removes it (#2953). The η-derivative
+    /// builder carries the same four blocks.
     #[test]
-    fn third_order_operator_is_admitted_only_for_isotropic_smooth_kernels() {
+    fn the_penalty_topology_does_not_depend_on_the_metric_2953() {
         let centers = centers_2d();
+        let eta = [0.2, -0.2];
         let sources = |nu: MaternNu, aniso: Option<&[f64]>| -> Vec<PenaltySource> {
             build_matern_operator_penalty_candidates(centers.view(), 0.8, nu, false, None, aniso)
                 .expect("Matérn operator candidates")
@@ -3869,6 +4322,11 @@ mod third_order_operator_tests {
                 .collect()
         };
         assert!(!sources(MaternNu::ThreeHalves, None).contains(&PenaltySource::OperatorThirdOrder));
+        assert_eq!(
+            sources(MaternNu::ThreeHalves, None),
+            sources(MaternNu::ThreeHalves, Some(&eta)),
+            "nu=3/2: the metric must not change the topology"
+        );
         for nu in [
             MaternNu::FiveHalves,
             MaternNu::SevenHalves,
@@ -3879,9 +4337,236 @@ mod third_order_operator_tests {
                 Some(&PenaltySource::OperatorThirdOrder),
                 "nu={nu:?}"
             );
+            assert_eq!(
+                sources(nu, None),
+                sources(nu, Some(&eta)),
+                "nu={nu:?}: the metric must not change the topology"
+            );
+            let (per_axis, _, _) =
+                build_matern_operator_penalty_aniso_derivatives(centers.view(), 0.8, nu, false, None, &eta)
+                    .expect("Matérn η-derivatives");
+            for (axis, (first, second)) in per_axis.iter().enumerate() {
+                assert_eq!(first.len(), 4, "nu={nu:?} axis {axis}: four first-derivative blocks");
+                assert_eq!(second.len(), 4, "nu={nu:?} axis {axis}: four second-derivative blocks");
+            }
+        }
+    }
+
+    /// The metric third-derivative entry is the isotropic one in the warped
+    /// coordinates: with `y = A h`, `A = diag(√w)`, `∂/∂x_a = A_aa ∂/∂y_a`, so
+    /// `T_abc(h; w) = √(w_a w_b w_c)·T^iso_abc(y)` at `r = |y|`.
+    fn metric_entry_oracle(
+        t: f64,
+        t_r: f64,
+        h: &[f64],
+        weights: &[f64],
+        axes: [usize; 3],
+    ) -> f64 {
+        let y: Vec<f64> = h.iter().zip(weights).map(|(h, w)| w.sqrt() * h).collect();
+        let r = stable_euclidean_norm(y.iter().copied());
+        let [a, b, c] = axes;
+        (weights[a] * weights[b] * weights[c]).sqrt()
+            * third_derivative_operator_entry(t, t_r, r, &y, a, b, c)
+    }
+
+    /// Production's metric entry (`ThirdOrderMetricEntry`) and the forward
+    /// builder's closed-form metric Gram both equal the change-of-variables
+    /// oracle, entry by entry and as `D₃ᵀD₃` of the materialized operator.
+    #[test]
+    fn the_metric_third_order_operator_is_the_rescaled_isotropic_one_2953() {
+        let centers = centers_2d();
+        let (p, d) = centers.dim();
+        let length_scale = 0.8;
+        let eta = [0.3, -0.3];
+        let weights = centered_aniso_metric_weights(&eta);
+        for nu in [
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            let mut operator = Array2::<f64>::zeros((p * d * d * d, p));
+            for k in 0..p {
+                for j in 0..p {
+                    let h: Vec<f64> = (0..d).map(|c| centers[[k, c]] - centers[[j, c]]).collect();
+                    let r = aniso_distance_and_components(
+                        centers.row(k).as_slice().expect("contiguous row"),
+                        centers.row(j).as_slice().expect("contiguous row"),
+                        &eta,
+                    )
+                    .0;
+                    let (_, _, t, t_r, t_rr) = matern_aniso_extended_radial_scalars(r, length_scale, nu)
+                        .expect("Matérn radial scalars");
+                    let t_rrr = matern_third_order_t_rrr(r, length_scale, nu).expect("ν ≥ 5/2");
+                    let radial = ThirdOrderMetricRadial::new(r, t, t_r, t_rr, t_rrr);
+                    for a in 0..d {
+                        for b in 0..d {
+                            for c in 0..d {
+                                let oracle = metric_entry_oracle(t, t_r, &h, &weights, [a, b, c]);
+                                let entry = radial
+                                    .value_of(&ThirdOrderMetricEntry::new([a, b, c], &h, &weights));
+                                assert!(
+                                    (entry - oracle).abs() <= 1e-12 * (1.0 + oracle.abs()),
+                                    "nu={nu:?} ({k},{j}) axes=({a},{b},{c}): entry={entry:.12e} \
+                                     oracle={oracle:.12e}"
+                                );
+                                operator[[((k * d + a) * d + b) * d + c, j]] = oracle;
+                            }
+                        }
+                    }
+                }
+            }
+            let materialized = operator.t().dot(&operator);
+            let ops = build_matern_collocation_operator_matrices(
+                centers.view(),
+                None,
+                length_scale,
+                nu,
+                false,
+                None,
+                Some(&eta),
+            )
+            .expect("Matérn collocation operators");
+            let gram = ops
+                .third_order_gram
+                .expect("the metric keeps the third-order operator");
+            let gap = (&gram - &materialized).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let scale = materialized.iter().map(|v| v * v).sum::<f64>().sqrt();
             assert!(
-                !sources(nu, Some(&[0.2, -0.2])).contains(&PenaltySource::OperatorThirdOrder),
-                "nu={nu:?} anisotropic"
+                gap <= 1e-12 * scale,
+                "nu={nu:?}: metric closed-form Gram differs from D₃ᵀD₃ by {gap:.3e} (scale {scale:.3e})"
+            );
+        }
+    }
+
+    /// At η = 0 the anisotropic term is the isotropic one, so its third-order
+    /// Gram must be too: the metric form reduces to `third_order_gram_pair`.
+    #[test]
+    fn the_third_order_gram_is_continuous_at_the_isotropic_metric_2953() {
+        let centers = centers_2d();
+        for nu in [
+            MaternNu::FiveHalves,
+            MaternNu::SevenHalves,
+            MaternNu::NineHalves,
+        ] {
+            let gram = |aniso: Option<&[f64]>| {
+                build_matern_collocation_operator_matrices(centers.view(), None, 0.8, nu, false, None, aniso)
+                    .expect("Matérn collocation operators")
+                    .third_order_gram
+                    .expect("ν ≥ 5/2 admits the third-order operator")
+            };
+            let isotropic = gram(None);
+            let unit_metric = gram(Some(&[0.0, 0.0]));
+            let gap = (&unit_metric - &isotropic).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let scale = isotropic.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!(
+                gap <= 1e-13 * scale,
+                "nu={nu:?}: unit-metric Gram differs from the isotropic one by {gap:.3e} (scale {scale:.3e})"
+            );
+        }
+    }
+
+    /// The η-derivative builder's third-order blocks (per-axis first and
+    /// second, and the cross pair) match central differences of the normalized
+    /// third-order penalty in the metric's log weights. The reference penalty
+    /// takes the weights `e^{2η}` as given, which is the builder's derivative
+    /// convention (`s_a = w_a h_a²`); at the centred base point they are the
+    /// forward builder's weights.
+    #[test]
+    fn the_third_order_eta_derivatives_match_central_differences_2953() {
+        let centers = centers_2d();
+        let (p, d) = centers.dim();
+        let length_scale = 0.8;
+        let eta0 = [0.25, -0.25];
+        for nu in [MaternNu::FiveHalves, MaternNu::SevenHalves] {
+            let penalty = |eta: [f64; 2]| -> Array2<f64> {
+                let weights: Vec<f64> = eta.iter().map(|value| (2.0 * value).exp()).collect();
+                let mut gram = Array2::<f64>::zeros((p, p));
+                let mut displacement = Array2::<f64>::zeros((p, d));
+                let mut distance = vec![0.0_f64; p];
+                let mut radial = vec![ThirdOrderRadial { t: 0.0, t_r: 0.0 }; p];
+                for k in 0..p {
+                    for j in 0..p {
+                        for c in 0..d {
+                            displacement[[j, c]] = centers[[k, c]] - centers[[j, c]];
+                        }
+                        let r = stable_euclidean_norm(
+                            (0..d).map(|c| weights[c].sqrt() * displacement[[j, c]]),
+                        );
+                        let (_, _, t, t_r, _) =
+                            matern_aniso_extended_radial_scalars(r, length_scale, nu)
+                                .expect("Matérn radial scalars");
+                        distance[j] = r;
+                        radial[j] = ThirdOrderRadial { t, t_r };
+                    }
+                    for j in 0..p {
+                        for l in 0..p {
+                            gram[[j, l]] += third_order_gram_pair_in_metric(
+                                radial[j],
+                                distance[j],
+                                radial[l],
+                                distance[l],
+                                &ThirdOrderMetricPair::new(
+                                    displacement.row(j),
+                                    displacement.row(l),
+                                    &weights,
+                                ),
+                            );
+                        }
+                    }
+                }
+                normalize_penalty(&symmetrize(&gram)).0
+            };
+            let (per_axis, _, cross) = build_matern_operator_penalty_aniso_derivatives(
+                centers.view(),
+                length_scale,
+                nu,
+                false,
+                None,
+                &eta0,
+            )
+            .expect("Matérn η-derivatives");
+            let relative = |analytic: &Array2<f64>, reference: &Array2<f64>| -> f64 {
+                let gap = (analytic - reference).iter().map(|v| v * v).sum::<f64>().sqrt();
+                let scale = reference.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+                gap / scale
+            };
+            let step = 1e-4;
+            let shifted = |moves: &[(usize, f64)]| {
+                let mut eta = eta0;
+                for &(axis, delta) in moves {
+                    eta[axis] += delta;
+                }
+                penalty(eta)
+            };
+            let center = penalty(eta0);
+            for axis in 0..d {
+                let plus = shifted(&[(axis, step)]);
+                let minus = shifted(&[(axis, -step)]);
+                let fd_first = (&plus - &minus) / (2.0 * step);
+                let fd_second = (&plus - &(&center * 2.0) + &minus) / (step * step);
+                let (first, second) = &per_axis[axis];
+                assert_eq!(first.len(), 4, "nu={nu:?}: mass, tension, stiffness and third order");
+                let first_gap = relative(&first[3], &fd_first);
+                let second_gap = relative(&second[3], &fd_second);
+                assert!(
+                    first_gap < 1e-5,
+                    "nu={nu:?} ∂S₃/∂η_{axis} mismatch: relative gap {first_gap:.3e}"
+                );
+                assert!(
+                    second_gap < 1e-3,
+                    "nu={nu:?} ∂²S₃/∂η_{axis}² mismatch: relative gap {second_gap:.3e}"
+                );
+            }
+            let fd_cross = (&shifted(&[(0, step), (1, step)]) - &shifted(&[(0, step), (1, -step)])
+                - &shifted(&[(0, -step), (1, step)])
+                + &shifted(&[(0, -step), (1, -step)]))
+                / (4.0 * step * step);
+            let analytic_cross = cross.evaluate(0, 1).expect("Matérn cross η-derivatives");
+            assert_eq!(analytic_cross.len(), 4, "nu={nu:?}: four cross blocks");
+            let cross_gap = relative(&analytic_cross[3], &fd_cross);
+            assert!(
+                cross_gap < 1e-3,
+                "nu={nu:?} ∂²S₃/∂η₀∂η₁ mismatch: relative gap {cross_gap:.3e}"
             );
         }
     }

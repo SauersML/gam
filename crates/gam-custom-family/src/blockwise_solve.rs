@@ -1720,6 +1720,55 @@ pub(crate) fn block_quadratic_penalty(beta: &Array1<f64>, s_lambda: &Array2<f64>
     0.5 * beta.dot(&s_lambda.dot(beta))
 }
 
+/// [`block_quadratic_penalty`] beside the magnitude its summation accumulates,
+/// `½ Σ_ij |β_i S_ij β_j|`, from one explicit pass over the entries.
+///
+/// The value is the same `½βᵀS_λβ` summed in a different order, so the two agree
+/// within `accumulation_growth(p²)` of that magnitude on each side. The magnitude,
+/// not `max|S_λ|·‖β‖₁²`, is what bounds the rounding of the value (gam#2959). The
+/// constrained fixed-point certificate reads it once per accepted cycle; the
+/// objective evaluation itself stays on the BLAS form.
+pub(crate) fn block_quadratic_penalty_with_accumulation(
+    beta: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+) -> (f64, f64) {
+    let mut value = 0.0_f64;
+    let mut magnitude = 0.0_f64;
+    for ((row, column), &entry) in s_lambda.indexed_iter() {
+        let term = beta[row] * entry * beta[column];
+        value += term;
+        magnitude += term.abs();
+    }
+    (0.5 * value, 0.5 * magnitude)
+}
+
+/// [`total_quadratic_penalty`] beside the magnitude its summations accumulate, for
+/// block coefficients given per block. The full-width bundle reads the blocks
+/// concatenated in block order, which is the layout `flatten_state_betas` writes.
+pub(crate) fn total_quadratic_penalty_with_accumulation(
+    betas: &[Array1<f64>],
+    s_lambdas: &[Array2<f64>],
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
+) -> (f64, f64) {
+    let mut value = 0.0_f64;
+    let mut magnitude = 0.0_f64;
+    for (beta, s_lambda) in betas.iter().zip(s_lambdas.iter()) {
+        let (block_value, block_magnitude) =
+            block_quadratic_penalty_with_accumulation(beta, s_lambda);
+        value += block_value;
+        magnitude += block_magnitude;
+    }
+    if let Some(bundle) = joint_full_width
+        && !bundle.is_empty()
+    {
+        let beta_flat: Array1<f64> = betas.iter().flat_map(|beta| beta.iter().copied()).collect();
+        let (joint_value, joint_magnitude) = bundle.quadratic_with_accumulation(beta_flat.view());
+        value += joint_value;
+        magnitude += joint_magnitude;
+    }
+    (value, magnitude)
+}
+
 pub(crate) fn block_penalized_hessian_vector(
     spec: &ParameterBlockSpec,
     work: &BlockWorkingSet,
@@ -1827,10 +1876,19 @@ pub(crate) fn truncate_block_step_to_metric_radius(
     }
 }
 
+/// Fewest blocks for which [`total_quadratic_penalty`] maps the per-block penalties
+/// on rayon workers.
+///
+/// Work bound (#2469): result-invariant. Both sides evaluate every block with
+/// `block_quadratic_penalty` and sum the values in block order with the same
+/// `Iterator::sum`, so the total is bit-identical on either side.
 pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS: usize = 4;
 
-// Avoid Rayon overhead for a few tiny blocks; this approximates the dense
-// mat-vec work in βᵀSβ before splitting independent block penalties.
+/// Least dense mat-vec work in `βᵀSβ` for which [`total_quadratic_penalty`] maps the
+/// per-block penalties on rayon workers, so a few tiny blocks avoid the fork/join cost.
+///
+/// Work bound (#2469): result-invariant, for the reason at
+/// [`TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS`].
 pub(crate) const TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK: usize = 16_384;
 
 pub(crate) fn total_quadratic_penalty_parallel_worthwhile(
@@ -1871,7 +1929,11 @@ pub(crate) fn total_quadratic_penalty(
             .map(|(state, s_lambda)| {
                 block_quadratic_penalty(&state.beta, s_lambda)
             })
-            .reduce(|| 0.0, |left, right| left + right)
+            // Collect in block order and sum serially, the order the serial side sums
+            // in, so the parallel map changes the schedule and never the total.
+            .collect::<Vec<f64>>()
+            .into_iter()
+            .sum()
     } else {
         states
             .iter()
@@ -2485,6 +2547,44 @@ pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<u
     }
     let cutoff = crate::joint_newton::joint_hessian_numerical_eigenvalue_floor(max_abs, p);
     Some(evals.iter().filter(|x| x.abs() < cutoff).count())
+}
+
+#[cfg(test)]
+mod quadratic_penalty_accumulation_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// gam#2959. The explicit entry pass returns the BLAS form's value within the
+    /// rounding both evaluations can carry, `γ_{p²}` of the accumulated magnitude
+    /// for each, and a magnitude that is the real summed scale: on this cancelling
+    /// block the value is orders below it.
+    #[test]
+    fn block_quadratic_penalty_accumulation_matches_the_blas_value_2959() {
+        let s_lambda = array![
+            [4.0e6, -3.99e6, 0.0],
+            [-3.99e6, 4.0e6, 1.0],
+            [0.0, 1.0, 2.0]
+        ];
+        let beta = array![237.0, 236.5, -0.25];
+        let (value, magnitude) = block_quadratic_penalty_with_accumulation(&beta, &s_lambda);
+        let blas = block_quadratic_penalty(&beta, &s_lambda);
+        let p = beta.len();
+        let band = 2.0 * gam_linalg::roundoff::accumulation_growth(p * p) * magnitude;
+        let gap = (value - blas).abs();
+        assert!(
+            gap <= band,
+            "explicit value {value:e} against BLAS {blas:e}: gap {gap:.3e} exceeds {band:.3e}"
+        );
+        assert!(
+            magnitude >= value.abs(),
+            "the accumulated magnitude {magnitude:e} must bound the value {value:e}"
+        );
+        assert!(
+            magnitude > 100.0 * value.abs(),
+            "the fixture must cancel, or it cannot show the magnitude is the summed scale \
+             (value {value:e}, magnitude {magnitude:e})"
+        );
+    }
 }
 
 #[cfg(test)]

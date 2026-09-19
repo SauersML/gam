@@ -70,6 +70,8 @@ fn fit_request_document_from_fit_args(
         transformation_normal: args.transformation_normal.then_some(true),
         weights: args.weights_column.clone(),
         z_column: args.z_column.clone(),
+        residual_columns: (!args.residual_columns.is_empty())
+            .then(|| args.residual_columns.clone()),
         ..crate::config_resolve::FitRequestConfigDocument::default()
     };
     crate::config_resolve::FitRequestDocument::new(formula, config)
