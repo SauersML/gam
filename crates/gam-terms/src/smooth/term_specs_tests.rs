@@ -78,32 +78,49 @@ mod joint_unpenalized_dim_tests {
     }
 
     #[test]
-    fn non_materialized_penalty_falls_back_conservatively() {
-        // A penalty whose stored block is not p_local × p_local (e.g. a
-        // Kronecker tensor factor). With ≥2 penalties the conservative joint
-        // dim is 0 (never over-rejecting).
-        let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
-        let factor: Array2<f64> = array![[1.0]]; // wrong shape for p_local=2
-        let mixed_penalties = [
-            active_penalty(full, 1, 1, 0, PenaltySource::Primary),
+    fn tensor_product_penalties_read_the_materialized_kronecker_blocks() {
+        // te(x, z) with 3×2 margins: S_x ⊗ I and I ⊗ S_z. Their joint null
+        // space is null(S_x) ⊗ null(S_z), 1 × 1 = 1-dimensional, which the
+        // retired fallback reported as 0 for any ≥2-penalty term it did not
+        // materialize.
+        let s_x = array![[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]];
+        let s_z = array![[1.0, -1.0], [-1.0, 1.0]];
+        let kron = |a: &Array2<f64>, b: &Array2<f64>| {
+            let (ra, ca) = a.dim();
+            let (rb, cb) = b.dim();
+            Array2::from_shape_fn((ra * rb, ca * cb), |(i, j)| {
+                a[[i / rb, j / cb]] * b[[i % rb, j % cb]]
+            })
+        };
+        let penalties = [
             active_penalty(
-                factor.clone(),
+                kron(&s_x, &Array2::eye(2)),
+                4,
                 2,
                 0,
-                1,
                 PenaltySource::TensorMarginal { dim: 0 },
             ),
+            active_penalty(
+                kron(&Array2::eye(3), &s_z),
+                3,
+                3,
+                1,
+                PenaltySource::TensorMarginal { dim: 1 },
+            ),
         ];
-        assert_eq!(joint_unpenalized_dim(2, &mixed_penalties), 0);
-        // With a single non-materialized penalty, fall back to its own null dim.
-        let factor_penalties = [active_penalty(
-            factor,
-            2,
-            2,
-            0,
-            PenaltySource::TensorMarginal { dim: 0 },
-        )];
-        assert_eq!(joint_unpenalized_dim(4, &factor_penalties), 2);
+        assert_eq!(joint_unpenalized_dim(6, &penalties), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "on a 2-coefficient term")]
+    fn a_penalty_block_of_the_wrong_shape_is_a_construction_defect() {
+        let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
+        let wrong: Array2<f64> = array![[1.0]];
+        let penalties = [
+            active_penalty(full, 1, 1, 0, PenaltySource::Primary),
+            active_penalty(wrong, 1, 0, 1, PenaltySource::TensorMarginal { dim: 0 }),
+        ];
+        joint_unpenalized_dim(2, &penalties);
     }
 }
 
