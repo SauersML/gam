@@ -4546,7 +4546,7 @@ fn manifold_sae_list2<'py>(
 fn manifold_sae_report(py: Python<'_>, value: &Option<serde_json::Value>) -> PyResult<PyObject> {
     match value {
         None => Ok(py.None()),
-        Some(v) => json_value_to_py(py, v.clone()),
+        Some(v) => json_value_to_py(py, v),
     }
 }
 
@@ -5138,7 +5138,7 @@ impl ManifoldSaeCore {
         let json_str = self.inner.to_json().map_err(py_value_error)?;
         let value: serde_json::Value =
             serde_json::from_str(&json_str).map_err(|e| py_value_error(e.to_string()))?;
-        json_value_to_py(py, value)
+        json_value_to_py(py, &value)
     }
 
     /// The canonical JSON payload string (what `save()` writes).
@@ -5253,7 +5253,7 @@ impl ManifoldSaeCore {
         out.set_item("atom_functionals", atom_functionals)?;
         out.set_item(
             "diagnostics",
-            json_value_to_py(py, self.inner.diagnostics.clone())?,
+            json_value_to_py(py, &self.inner.diagnostics)?,
         )?;
         out.set_item("cotrain", manifold_sae_report(py, &self.inner.cotrain)?)?;
         out.set_item("primitives", self.inner.primitive_names.clone())?;
@@ -5827,7 +5827,7 @@ impl ManifoldSaeCore {
             Some(payload) => {
                 let value = serde_json::to_value(payload)
                     .map_err(|error| py_value_error(error.to_string()))?;
-                json_value_to_py(py, value)
+                json_value_to_py(py, &value)
             }
             None => Ok(py.None()),
         }
@@ -5853,7 +5853,7 @@ impl ManifoldSaeCore {
     fn geometry_plans(&self, py: Python<'_>) -> PyResult<PyObject> {
         let value = serde_json::to_value(&self.inner.geometry_plans)
             .map_err(|error| py_value_error(error.to_string()))?;
-        json_value_to_py(py, value)
+        json_value_to_py(py, &value)
     }
     #[getter]
     fn fisher_factors<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
@@ -6120,7 +6120,7 @@ impl ManifoldSaeCore {
     // --- diagnostic / certificate report-block getters -------------------
     #[getter]
     fn diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.inner.diagnostics.clone())
+        json_value_to_py(py, &self.inner.diagnostics)
     }
     #[getter]
     fn solver_plan(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -6180,7 +6180,7 @@ impl ManifoldSaeCore {
     fn structured_residual_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_py(
             py,
-            serde_json::Value::Array(self.inner.structured_residual_diagnostics.clone()),
+            &serde_json::Value::Array(self.inner.structured_residual_diagnostics.clone()),
         )
     }
 }

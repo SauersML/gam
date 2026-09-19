@@ -17,7 +17,7 @@ impl ManifoldCrosscoderCore {
 #[pymethods]
 impl ManifoldCrosscoderCore {
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.wire_value()?)
+        json_value_to_py(py, &self.wire_value()?)
     }
 
     fn to_json(&self) -> PyResult<String> {
@@ -92,7 +92,7 @@ impl ManifoldCrosscoderCore {
             .collateral_curve(atom, axis, &doses)
             .map_err(py_value_error)?;
         let value = serde_json::to_value(&curve).map_err(|error| py_value_error(error.to_string()))?;
-        json_value_to_py(py, value)
+        json_value_to_py(py, &value)
     }
 }
 
@@ -169,7 +169,7 @@ impl ManifoldBehaviorCore {
 #[pymethods]
 impl ManifoldBehaviorCore {
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, self.wire_value()?)
+        json_value_to_py(py, &self.wire_value()?)
     }
 
     fn to_json(&self) -> PyResult<String> {
