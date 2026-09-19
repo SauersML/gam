@@ -164,7 +164,8 @@ class Summary:
     formula : str
         The Wilkinson formula string the model was fitted with.
     family_name : str
-        Human-readable family + link label, e.g. ``"Gaussian Identity"``.
+        Human-readable family + link label, e.g. ``"Gaussian Identity"``;
+        an expectile fit reports its estimator, e.g. ``"Expectile(tau=0.9)"``.
     model_class : str
         Internal model class, e.g. ``"standard"`` / ``"marginal-slope"``.
     n_obs : int or None
