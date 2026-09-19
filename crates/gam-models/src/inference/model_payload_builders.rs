@@ -320,6 +320,35 @@ fn standard_conformal_penalty(
     }
 }
 
+/// The comparable REML/LAML criterion of a standard fit: its raw criterion
+/// plus the Tierney-Kadane normalizer over its realized penalty null space,
+/// formed exactly as the saved payload forms it, so two fits of the same data
+/// at different basis resolutions are ranked on one scale (lower is better).
+/// `Ok(None)` when the fit has no finite criterion.
+pub(crate) fn standard_fit_comparable_reml_score(
+    result: &StandardFitResult,
+) -> Result<Option<f64>, String> {
+    let Some(raw_reml_score) = result.fit.reml_score() else {
+        return Ok(None);
+    };
+    let topology = RealizedRawPenaltyTopology::from_standard_fit(
+        &result.design,
+        result.wiggle_knots.as_ref(),
+        result.wiggle_degree,
+        result.wiggle_penalty_metadata.as_ref(),
+    )?;
+    let (null_space_dim, null_space_logdet) = gam_solve::estimate::null_space_normalizer_metadata(
+        topology.coefficient_dim,
+        &topology.penalties,
+        &result.fit,
+    )?;
+    gam_solve::topology_selector::comparable_reml_score(
+        raw_reml_score,
+        Some(null_space_dim as f64),
+        Some(null_space_logdet),
+    )
+}
+
 /// Assemble the one canonical saved payload for a standard formula fit.
 pub fn assemble_standard_payload(
     inputs: StandardPayloadInputs<'_>,
@@ -1609,7 +1638,7 @@ fn fit_expanded_formula_to_payload(
     // this request becomes the first fitted design below. Other estimator
     // materializers do not consume this standard-only orchestration field.
     let mut dispatch_config = fit_config.clone();
-    dispatch_config.spatial_center_counts = Some(Vec::new());
+    dispatch_config.adaptive_resolution = Some(Vec::new());
     let formula_for_fingerprint = formula.clone();
     let materialized = materialize(&formula, dataset, &dispatch_config)?;
     let request = materialized.request;

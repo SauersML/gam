@@ -124,9 +124,10 @@ Required options: `min` and `max` (finite, `min < max`).
 ### bounded() priors
 
 `bounded()` accepts one of `prior=`, `target=`+`strength=`, or no
-prior:
+prior option:
 
 ```
+bounded(x, min=-1, max=1)                  # default: prior=shrinkage
 bounded(x, min=0, max=1, prior=uniform)
 bounded(x, min=0, max=1, prior=center)
 bounded(x, min=0, max=1, target=0.5, strength=3)
@@ -134,7 +135,16 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
 
 `prior=` values:
 
-- `none` — flat on the transformed scale, no penalty.
+- `shrinkage` (the default when no prior option is given) — a Gaussian
+  prior on the latent logit coordinate of the interval transform,
+  centred at the null, with its precision estimated by REML like any
+  other smoothing parameter. A coefficient the data do not support is
+  shrunk back to the null. The null is `0` when `min < 0 < max`. When
+  zero lies outside the box it is not an admissible value, and the
+  prior centres at the box midpoint `(min + max) / 2`, the point of the
+  interval map that favours neither bound.
+- `none` — flat on the transformed scale, no penalty: the constrained
+  maximum-likelihood fit.
 - `uniform` (aliases `log-jacobian`, `log_jacobian`, `jacobian`) — flat
   on the original scale, applied as a log-Jacobian correction.
 - `center` — `Beta(2, 2)` toward the midpoint.
