@@ -58,9 +58,19 @@
 //!     Var(U) = φ · Z̃ᵀ W_F Z̃ =: φ · V,     T = Uᵀ V⁻ U / φ.
 //! ```
 //!
-//! `T` is referred to `χ²_r` when the dispersion is known and to `F(r, ν)` when
-//! it is estimated — the same `Known`/`Estimated` split, for the same reason, as
-//! [`crate::inference::smooth_test`].
+//! `T` is referred to `χ²_r` when the dispersion is known, the same
+//! `Known`/`Estimated` split as [`crate::inference::smooth_test`]. When the
+//! dispersion is estimated from the fit's `ν` residual d.f., the residual sum
+//! `ν·φ̂` already contains the tested directions' share `T·φ̂`. So the
+//! reference is the added-variable `F`:
+//!
+//! ```text
+//!     F = (T / r) / ((ν − T) / (ν − r))   on (r, ν − r) d.f.,
+//! ```
+//!
+//! whose denominator is the part of the residual sum the numerator does not
+//! use. It is exact for an unpenalized Gaussian fit; `T/r` against `F(r, ν)`
+//! would divide by a scale containing its own numerator and read conservative.
 //!
 //! # Why the UNPENALIZED Gram, and not `H⁻¹`
 //!
@@ -200,8 +210,9 @@ pub struct BasisAdequacyInput<'a> {
     /// `φ̂` — the fitted dispersion. `1.0` for families that carry their
     /// dispersion inside the IRLS weight.
     pub dispersion: f64,
-    /// Denominator d.f. for the `Estimated`-scale `F` reference. Ignored on the
-    /// `Known` branch.
+    /// `ν` — the residual d.f. `φ̂` was estimated on. The `Estimated`-scale
+    /// reference is `F(r, ν − r)`, since `r` of those d.f. carry the tested
+    /// directions. Ignored on the `Known` branch.
     pub residual_df: Option<f64>,
     pub scale: SmoothTestScale,
 }
@@ -216,7 +227,8 @@ pub struct BasisAdequacyResult {
     /// fitted design already spanned, so it reports how much genuinely new
     /// resolution the alternative carried.
     pub rank: usize,
-    /// `P(χ²_rank > T)`, or the matching `F` tail when the scale is estimated.
+    /// `P(χ²_rank > T)`, or, when the scale is estimated, the added-variable
+    /// `F(rank, ν − rank)` tail at `(T/rank)·(ν − rank)/(ν − T)`.
     pub p_value: f64,
 }
 
@@ -226,6 +238,7 @@ pub struct BasisAdequacyResult {
 /// test: mismatched shapes, a non-finite entry anywhere in the assembled
 /// quadratic form, a non-positive dispersion, no estimable enrichment direction
 /// left after projection, or an `Estimated` scale with no usable residual d.f.
+/// (none, `ν ≤ rank`, or `T ≥ ν`).
 /// An absent verdict is a caller-visible "not measured", which is the only
 /// honest report when the geometry is missing.
 pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisAdequacyResult> {
@@ -450,7 +463,22 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
             let residual_df = input
                 .residual_df
                 .filter(|value| value.is_finite() && *value > 0.0)?;
-            fisher_snedecor_sf(statistic / reference_df, reference_df, residual_df)
+            // `φ̂` was estimated from the fit's residual sum `ν·φ̂`, and the
+            // residual's projection onto the tested directions, `T·φ̂` on `r`
+            // d.f., is part of that sum. `T/r` against `F(r, ν)` therefore divides
+            // by a scale that contains its own numerator: the ratio is
+            // `(ν/r)·Beta(r/2, (ν − r)/2)`, bounded and conservative at every
+            // level. The scale that is independent of the numerator is the rest
+            // of the sum, `(ν − T)·φ̂` on `ν − r` d.f., which gives the classical
+            // added-variable `F` (exact for an unpenalized Gaussian fit). With
+            // `ν ≤ r` or `T ≥ ν`, nothing is left to estimate that scale from.
+            let independent_df = residual_df - reference_df;
+            let independent_sum = residual_df - statistic;
+            if !(independent_df > 0.0 && independent_sum > 0.0) {
+                return None;
+            }
+            let f_statistic = (statistic / reference_df) / (independent_sum / independent_df);
+            fisher_snedecor_sf(f_statistic, reference_df, independent_df)
         }
     };
     if !p_value.is_finite() {
@@ -1235,6 +1263,94 @@ mod tests {
             out.row_mut(local).assign(&matrix.row(row));
         }
         out
+    }
+
+    /// With the scale estimated, the p-value is the classical added-variable
+    /// `F` test. Take an unpenalized least-squares fit, `φ̂ = RSS₀/ν` with
+    /// `ν = n − p`, and an enrichment of width `r` outside `span(X)`. The exact
+    /// reference is `F = ((RSS₀ − RSS₁)/r) / (RSS₁/(ν − r))` on `(r, ν − r)`
+    /// d.f., where `RSS₁` is the residual sum of squares after also fitting
+    /// `Z`.
+    ///
+    /// Referring `T/r` to `F(r, ν)` instead divides by a `φ̂` whose residual
+    /// sum contains the numerator. The ratio is then `(ν/r)·Beta`, bounded and
+    /// under-dispersed, and it reads conservative at every level.
+    #[test]
+    fn estimated_scale_p_value_is_the_exact_added_variable_f_test() {
+        let n = 60;
+        let mut rng = Lcg(20_260_919);
+        let mut design = Array2::<f64>::zeros((n, 2));
+        let mut enrichment = Array2::<f64>::zeros((n, 3));
+        let mut y = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let x = (row as f64 + 0.5) / n as f64;
+            design[(row, 0)] = 1.0;
+            design[(row, 1)] = x;
+            enrichment[(row, 0)] = x * x;
+            enrichment[(row, 1)] = x * x * x;
+            enrichment[(row, 2)] = (6.0 * x).sin();
+            y[row] = 0.5 + 2.0 * x + 0.4 * x * x + 0.3 * rng.next_normal();
+        }
+        let residual_sum = |columns: &Array2<f64>| {
+            let beta = invert_symmetric(&columns.t().dot(columns)).dot(&columns.t().dot(&y));
+            let residual = &y - &columns.dot(&beta);
+            residual.dot(&residual)
+        };
+        let rss_null = residual_sum(&design);
+        let rss_alternative =
+            residual_sum(&ndarray::concatenate![ndarray::Axis(1), design, enrichment]);
+        let (p, r) = (design.ncols() as f64, enrichment.ncols() as f64);
+        let residual_df = n as f64 - p;
+        let exact_f = ((rss_null - rss_alternative) / r) / (rss_alternative / (residual_df - r));
+        let exact = fisher_snedecor_sf(exact_f, r, residual_df - r);
+
+        let harness = GaussianHarness::new(design, enrichment, y, 0.0);
+        let mut input = harness.input();
+        input.dispersion = rss_null / residual_df;
+        input.residual_df = Some(residual_df);
+        input.scale = SmoothTestScale::Estimated;
+        let out = basis_adequacy_score_test(input).expect("three estimable directions");
+        assert_eq!(out.rank, 3);
+        // The score statistic itself is `(RSS₀ − RSS₁)/φ̂`: in the Gaussian
+        // identity case the residual's projection onto `span(Z̃)` IS the drop in
+        // residual sum from fitting `Z`.
+        let expected_statistic = (rss_null - rss_alternative) / (rss_null / residual_df);
+        assert!(
+            (out.statistic - expected_statistic).abs() <= 1e-9 * expected_statistic,
+            "statistic {} against {expected_statistic}",
+            out.statistic
+        );
+        assert!(
+            (out.p_value - exact).abs() <= 1e-9 * exact.max(1e-12),
+            "p-value {} against the exact added-variable F tail {exact}",
+            out.p_value
+        );
+    }
+
+    /// The estimated-scale branch refuses when the fit's residual d.f. cannot
+    /// hold the tested directions: `ν ≤ r` leaves no degrees of freedom for a
+    /// scale estimate independent of the numerator.
+    #[test]
+    fn estimated_scale_refuses_when_the_residual_df_cannot_hold_the_rank() {
+        let n = 40;
+        let mut rng = Lcg(7);
+        let mut design = Array2::<f64>::zeros((n, 2));
+        let mut enrichment = Array2::<f64>::zeros((n, 3));
+        let mut y = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let x = (row as f64 + 0.5) / n as f64;
+            design[(row, 0)] = 1.0;
+            design[(row, 1)] = x;
+            enrichment[(row, 0)] = x * x;
+            enrichment[(row, 1)] = x * x * x;
+            enrichment[(row, 2)] = (6.0 * x).sin();
+            y[row] = 0.5 + 2.0 * x + rng.next_normal();
+        }
+        let harness = GaussianHarness::new(design, enrichment, y, 0.0);
+        let mut input = harness.input();
+        input.scale = SmoothTestScale::Estimated;
+        input.residual_df = Some(3.0);
+        assert_eq!(basis_adequacy_score_test(input), None);
     }
 
     /// Shape and finiteness guards refuse rather than returning a stand-in.
