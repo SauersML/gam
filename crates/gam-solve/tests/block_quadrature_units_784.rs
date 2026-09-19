@@ -18,8 +18,9 @@ use std::sync::{Mutex, PoisonError};
 
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::laplace_sampler_contract::{
-    BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureOrderStep,
-    BlockQuadratureRefusal, LaplaceMarginalCorrector, set_laplace_marginal_corrector,
+    BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments, BlockQuadratureOrderRefusal,
+    BlockQuadratureOrderStep, BlockQuadratureRefusal, CompositeAxisMarginal, CompositeAxisPartition,
+    LaplaceMarginalCorrector, set_laplace_marginal_corrector,
 };
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_solve::estimate::{ExternalOptimOptions, evaluate_externalgradient};
@@ -138,6 +139,33 @@ impl LaplaceMarginalCorrector for QuadraticCoefficientProbe {
                 e_t_neg_score: Array2::zeros((rows, m)),
             }),
         })
+    }
+
+    /// A one-axis piece is probed as the order-four rule would be, and resolves at the
+    /// whole-axis partition.
+    fn composite_axis_marginal_correction(
+        &self,
+        target: &dyn BlockExcessTarget,
+        partition: CompositeAxisPartition<'_>,
+    ) -> Result<CompositeAxisMarginal, BlockQuadratureOrderRefusal> {
+        let resolution_target = match partition {
+            CompositeAxisPartition::Adapt {
+                next_order_remainder,
+            } => next_order_remainder,
+            CompositeAxisPartition::Latched(_) => f64::INFINITY,
+        };
+        self.block_quadrature_marginal_correction(target, &[4])
+            .map(|marginal| CompositeAxisMarginal {
+                marginal,
+                breakpoints: Vec::new(),
+            })
+            .map_err(|cause| BlockQuadratureOrderRefusal {
+                axis: 0,
+                axis_orders: vec![4],
+                paired_error: f64::INFINITY,
+                resolution_target,
+                cause,
+            })
     }
 
     /// The probe reports every axis resolved at the first rule it is asked for, so the
