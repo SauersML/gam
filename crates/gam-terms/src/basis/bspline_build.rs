@@ -125,7 +125,7 @@ pub fn build_bspline_basis_1d(
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis,
+            num_basis, ..
         } => {
             if let Some((boundary_start, boundary_end, _)) = spec.boundary.period() {
                 let scale = (boundary_end - boundary_start).abs().max(1.0);
@@ -2482,12 +2482,15 @@ fn rebuild_double_penalty_nullspace_in_constrained_chart(
         primary_candidate.normalization_scale,
         "physical constrained B-spline roughness",
     )?;
-    if primary_constrained.nrows() == 0 {
-        crate::bail_invalid_basis!(
-            "double-penalty B-spline primary roughness has an empty coefficient chart"
-        );
-    }
     let p = primary_constrained.nrows();
+    if p == 0 {
+        // A frozen chart with no columns: the collection's gauge found every
+        // coefficient direction of this design carried by other terms (a
+        // factor-by level with a single row). The coefficient space is empty,
+        // so every candidate is already the empty quadratic and there is no
+        // null space left to rebuild a ridge on.
+        return Ok(candidates);
+    }
     for candidate in &mut candidates {
         if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
             // Undo the raw-chart Frobenius normalizations before rebuilding.

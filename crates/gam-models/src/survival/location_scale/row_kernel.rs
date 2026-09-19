@@ -2718,12 +2718,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the unit-axis
     /// direction read from the channel cache (`axis_direction_from_channel_cache`),
     /// the `sls_row_third_generated_with_plan` contraction the per-row hook
-    /// reaches through `sls_row_third_generated`, the same pullback order, and the
-    /// chunk-ordered reduction of `RowSet::All::par_try_reduce_fold`. A row without
-    /// an exact kernel (non-positive weight) is the per-row hook's all-zero matrix,
-    /// whose pullback adds nothing. Only the full-data unit-weight `RowSet::All`
-    /// case is accelerated; a subsample declines (`None`) so the generic
-    /// Horvitz–Thompson per-axis path runs.
+    /// reaches through `sls_row_third_generated`, the same Horvitz–Thompson row
+    /// weight and pullback order, and the chunk-ordered reduction of
+    /// `RowSet::par_try_reduce_fold` over the row set's walk positions. A row
+    /// without an exact kernel (non-positive weight) is the per-row hook's
+    /// all-zero matrix, whose pullback adds nothing. Every `RowSet` is handled.
     fn directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -2736,25 +2735,22 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 self.n_coefficients(),
             )));
         }
-        let crate::row_kernel::RowSet::All = rows else {
-            return None;
-        };
         Some((|| {
-            let n = gam_math::jet_tower::RowProgram::n_rows(self);
-            // Per row, shared by every axis: the primary values and outer derivative plan.
-            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>)>> = (0..n)
+            let m = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
+            // Per walk position, shared by every axis: the primary values and outer derivative plan.
+            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>)>> = (0..m)
                 .into_par_iter()
-                .map(|row| {
+                .map(|position| {
                     Ok(self
-                        .row_nll_inputs_opt(row)?
+                        .row_nll_inputs_opt(rows.row_at(position).0)?
                         .map(|(primary, kernel)| (primary, sls_outer_plan::<5>(&kernel))))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
+            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..m)
                 .into_par_iter()
-                .map(|row| self.cached_channel_rows(row))
+                .map(|position| self.cached_channel_rows(rows.row_at(position).0))
                 .collect();
-            let n_chunks = arrow_row_chunk_count(n);
+            let n_chunks = arrow_row_chunk_count(m);
             (0..p)
                 .into_par_iter()
                 .map(|a| {
@@ -2763,17 +2759,18 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .into_par_iter()
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
-                                let end = (start + ARROW_ROW_CHUNK).min(n);
+                                let end = (start + ARROW_ROW_CHUNK).min(m);
                                 let mut acc = Array2::<f64>::zeros((p, p));
-                                for row in start..end {
-                                    let Some((primary, plan)) = fixed[row].as_ref() else {
+                                for position in start..end {
+                                    let Some((primary, plan)) = fixed[position].as_ref() else {
                                         continue;
                                     };
+                                    let weight = rows.row_at(position).1;
                                     let direction =
-                                        axis_direction_from_channel_cache(&chans[row], a);
+                                        axis_direction_from_channel_cache(&chans[position], a);
                                     let third =
                                         sls_row_third_generated_with_plan(primary, plan, &direction);
-                                    pullback_from_channel_cache(&chans[row], &third, 1.0, &mut acc);
+                                    pullback_from_channel_cache(&chans[position], &third, weight, &mut acc);
                                 }
                                 acc
                             })
@@ -2805,11 +2802,10 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// `jacobian_action` for `u`, the unit-axis direction read from the channel cache
     /// (`axis_direction_from_channel_cache`, as the override above does), the
     /// `sls_row_fourth_generated_with_plan` contraction the per-row hook reaches through
-    /// `sls_row_fourth_generated`, the same pullback order, and the chunk-ordered reduction
-    /// of `RowSet::All::par_try_reduce_fold`. A row without an exact kernel (non-positive
-    /// weight) is the per-row hook's all-zero matrix, whose pullback adds nothing. Only the
-    /// full-data unit-weight `RowSet::All` case is accelerated; a subsample declines
-    /// (`None`) so the generic Horvitz–Thompson per-axis path runs.
+    /// `sls_row_fourth_generated`, the same Horvitz–Thompson row weight and pullback order,
+    /// and the chunk-ordered reduction of `RowSet::par_try_reduce_fold` over the row set's
+    /// walk positions. A row without an exact kernel (non-positive weight) is the per-row
+    /// hook's all-zero matrix, whose pullback adds nothing. Every `RowSet` is handled.
     fn second_directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -2823,20 +2819,18 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 d_beta_u.len(),
             )));
         }
-        let crate::row_kernel::RowSet::All = rows else {
-            return None;
-        };
         Some((|| {
             crate::row_kernel::RowKernel::<SLS_ROW_K>::warm_up_directional_caches(
                 self,
                 gam_problem::EvalMode::ValueGradientHessian,
             )?;
-            let n = gam_math::jet_tower::RowProgram::n_rows(self);
-            // Per row, shared by every axis: the primary values and outer derivative plan,
-            // and the fixed direction's primary projection `J·u`.
-            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>, [f64; SLS_ROW_K])>> = (0..n)
+            let m = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
+            // Per walk position, shared by every axis: the primary values and outer derivative
+            // plan, and the fixed direction's primary projection `J·u`.
+            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>, [f64; SLS_ROW_K])>> = (0..m)
                 .into_par_iter()
-                .map(|row| {
+                .map(|position| {
+                    let row = rows.row_at(position).0;
                     Ok(self.row_nll_inputs_opt(row)?.map(|(primary, kernel)| {
                         (
                             primary,
@@ -2848,11 +2842,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                     }))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
+            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..m)
                 .into_par_iter()
-                .map(|row| self.cached_channel_rows(row))
+                .map(|position| self.cached_channel_rows(rows.row_at(position).0))
                 .collect();
-            let n_chunks = arrow_row_chunk_count(n);
+            let n_chunks = arrow_row_chunk_count(m);
             (0..p)
                 .into_par_iter()
                 .map(|a| {
@@ -2861,15 +2855,16 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .into_par_iter()
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
-                                let end = (start + ARROW_ROW_CHUNK).min(n);
+                                let end = (start + ARROW_ROW_CHUNK).min(m);
                                 let mut acc = Array2::<f64>::zeros((p, p));
-                                for row in start..end {
-                                    let Some((primary, plan, direction_u)) = fixed[row].as_ref()
+                                for position in start..end {
+                                    let Some((primary, plan, direction_u)) = fixed[position].as_ref()
                                     else {
                                         continue;
                                     };
+                                    let weight = rows.row_at(position).1;
                                     let direction_a =
-                                        axis_direction_from_channel_cache(&chans[row], a);
+                                        axis_direction_from_channel_cache(&chans[position], a);
                                     let fourth = sls_row_fourth_generated_with_plan(
                                         primary,
                                         plan,
@@ -2877,9 +2872,9 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                                         &direction_a,
                                     );
                                     pullback_from_channel_cache(
-                                        &chans[row],
+                                        &chans[position],
                                         &fourth,
-                                        1.0,
+                                        weight,
                                         &mut acc,
                                     );
                                 }

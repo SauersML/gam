@@ -144,6 +144,7 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
             radians: false,
             method: SphereMethod::Harmonic,
             max_degree: Some(l),
+            adaptive_degree: false,
             wahba_kernel: Default::default(),
             identifiability: Default::default(),
         };
@@ -276,6 +277,7 @@ fn sphere_harmonic_design_rows_are_finite_at_poles_and_seam() {
         radians: false,
         method: SphereMethod::Harmonic,
         max_degree: Some(6),
+        adaptive_degree: false,
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
     };

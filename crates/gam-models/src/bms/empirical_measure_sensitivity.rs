@@ -604,14 +604,12 @@ pub(crate) fn rigid_empirical_score_zeta_channels(
     for i in 0..n {
         let marginal = super::family::bernoulli_marginal_link_map(base_link, marginal_eta[i])?;
         let g = slope_eta[i];
-        let a = super::gradient_paths::empirical_intercept_from_marginal(
-            marginal.mu,
+        let a = super::gradient_paths::empirical_intercept(
             marginal.q,
             g,
             s,
             &grid.nodes,
             &grid.weights,
-            None,
         )?;
         let observed_slope = s * g;
 

@@ -53,12 +53,12 @@ def test_two_level_string_response_is_auto_detected_as_binomial():
 def test_three_label_response_still_asks_for_a_family():
     x, event = _outcome()
     labels = ["maybe" if i % 7 == 0 else ("yes" if e else "no") for i, e in enumerate(event)]
-    with pytest.raises(gamfit.errors.GamError, match="multinomial"):
+    with pytest.raises(gamfit.errors.FormulaError, match="multinomial"):
         gamfit.fit({"x": x, "y": labels}, "y ~ s(x)")
 
 
 @pytest.mark.parametrize("family", [None, "binomial", "gaussian", "poisson"])
 def test_single_row_reports_too_few_rows(family):
     kwargs = {} if family is None else {"family": family}
-    with pytest.raises(gamfit.errors.GamError, match="too few rows"):
+    with pytest.raises(gamfit.errors.DataError, match="too few rows"):
         gamfit.fit({"x": [0.5], "y": [1.0]}, "y ~ s(x)", **kwargs)

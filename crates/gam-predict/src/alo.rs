@@ -1168,6 +1168,9 @@ fn compute_gaussian_location_scale_alo(
     let response_scale = model.payload().gaussian_response_scale.ok_or_else(|| {
         invalid("saved Gaussian location-scale ALO is missing its response standardization scale")
     })?;
+    let sigma_floor =
+        gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(model.payload())
+            .map_err(|error| invalid(format!("saved Gaussian location-scale ALO: {error}")))?;
 
     let mut observed_hessians = Vec::with_capacity(n);
     let mut scores = Vec::with_capacity(n);
@@ -1183,6 +1186,7 @@ fn compute_gaussian_location_scale_alo(
             eta_log_sigma: eta_scale[row],
             prior_weight: observations.prior_weights[row],
             response_scale,
+            sigma_floor,
             wiggle_basis: basis_row.as_slice().expect("basis row contiguous"),
             wiggle_basis_d1: basis_d1_row
                 .as_slice()

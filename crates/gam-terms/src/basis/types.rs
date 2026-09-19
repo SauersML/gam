@@ -29,7 +29,7 @@ impl SendPtr {
 /// Re-export of the neutral basis-error contract. #1521: `BasisError` lives
 /// in `gam-problem` so `EstimationError` can wrap it (`#[from]`) without a
 /// back-edge; gam-terms re-exports it to preserve `gam_terms::basis::BasisError`.
-pub use gam_problem::BasisError;
+pub use gam_problem::{BasisError, CovariateSpan};
 
 // ============================================================================
 // Unified Basis Generation API
@@ -229,10 +229,17 @@ pub enum BSplineKnotSpec {
     PeriodicUniform {
         data_range: (f64, f64),
         num_basis: usize,
+        /// `true` when nobody chose `num_basis`: it is the formula default's
+        /// starting resolution, which the standard formula workflow refines
+        /// from the converged fit's own evidence (see
+        /// [`BSplineKnotSpec::Automatic`]'s `adaptive`). An explicit `k=` is
+        /// `false` and honoured verbatim.
+        #[serde(default)]
+        adaptive: bool,
     },
     Automatic {
         /// Internal-knot count. Always resolved by the caller (the formula
-        /// default is `heuristic_knots_for_column`); the basis builder has no
+        /// default is `pilot_internal_knots_for_column`); the basis builder has no
         /// second, row-count-based default of its own.
         num_internal_knots: usize,
         placement: BSplineKnotPlacement,
@@ -507,13 +514,11 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 }
 
 /// Sample-size growth exponent of the production center budget:
-/// [`default_num_centers`] grows as `n^0.4`, and the adaptive pilot grows at the
-/// same rate so the two scale together.
+/// [`default_num_centers`] grows as `n^0.4`.
 const CENTER_GROWTH_EXPONENT: f64 = 0.4;
 
 /// Rows per center below which a center count is not data-supported. The
-/// production budget's `min(K_MIN, n / 8)` floor engages only at this density,
-/// and the adaptive pilot anchors its growth at the same density.
+/// production budget's `min(K_MIN, n / 8)` floor engages only at this density.
 const ROWS_PER_SUPPORTED_CENTER: usize = 8;
 
 /// Conservative center count for a *secondary* (distributional) predictor's
@@ -535,68 +540,128 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
-/// The low-rank thin-plate resolution `k = 10 * 3^(d - 1)` for a `d`-dimensional
-/// spatial smooth (30 centers in 2-D): mgcv's default basis size for thin-plate
-/// and Duchon splines. It is the adaptive pilot's starting size
-/// ([`starting_num_centers`]) and the implicit cap on an inferred Duchon center
-/// count.
-pub fn low_rank_center_resolution(d: usize) -> usize {
-    let exponent = u32::try_from(d.saturating_sub(1)).unwrap_or(u32::MAX);
-    10usize.saturating_mul(3usize.saturating_pow(exponent))
+/// Rank of the penalized function space that `n` rows resolve under an
+/// order-`m` roughness penalty in `d` dimensions: the smallest integer
+/// `r >= n^{d/(2m+d)}`.
+///
+/// This is the rate at which the effective dimension of an order-`m`
+/// penalized smoother on `d` covariates grows at its REML/GCV-optimal
+/// smoothing parameter: the eigenvalues of an order-`m` roughness penalty over
+/// a `d`-dimensional domain grow as `j^{2m/d}`, so the count of directions the
+/// optimally smoothed fit keeps grows as `n^{d/(2m+d)}` (Wahba, Utreras;
+/// Claeskens, Krivobokova & Opsomer 2009 for penalized splines). A basis whose
+/// penalized span holds fewer directions biases the fit before λ is chosen; one
+/// holding more is harmless because the penalty shrinks what the data do not
+/// support. It is therefore the smallest data-derived basis resolution — the
+/// *pilot* — and the adequacy loop grows past it only on the fit's own evidence.
+///
+/// Computed exactly in integers wherever the powers fit in `u128`, so a sample
+/// size that is a perfect power (`n = 10^5`, `m = 2`, `d = 1`) is not bumped
+/// past its exact rank by floating-point rounding.
+pub fn penalized_resolution_rank(n: usize, d: usize, m: usize) -> usize {
+    let d = d.max(1) as u32;
+    let q = 2u32.saturating_mul(m.max(1) as u32).saturating_add(d);
+    least_root_bound(n, d, q)
 }
 
-/// Starting center count for saturation-driven spatial fitting.
-///
-/// The structural minimum (`d + 1` polynomial directions plus one radial
-/// direction) is only enough to make the algebra identifiable. It is not an
-/// adequate pilot function space: structure orthogonal to that single radial
-/// direction is absorbed into the residual, so REML can legitimately shrink
-/// the direction and report EDF below its ceiling even when the surface is
-/// badly under-resolved (#1689). The pilot therefore starts from the low-rank
-/// resolution `k0 = 10 * 3^(d - 1)` while the sample holds at most eight rows
-/// per pilot center (`n <= 8 * k0`, the density at which the production
-/// budget's floor engages), and beyond that grows at the production budget's
-/// own `n^0.4` rate: `ceil(k0 * (n / (8 * k0))^0.4)`.
-///
-/// A constant pilot cannot track the resolution more data supports, and the
-/// growth loop cannot always see what a pilot misses. On the #1561 2-D
-/// default-rank Duchon fixture at n=1500 a 30-center pilot reaches truth rmse
-/// 0.0214 against 0.0137–0.0142 for 49–187 centers, while its EDF sits 1.25
-/// below capacity, the REML resolution of that EDF is 0.31, and the #2774
-/// lack-of-fit test reads p = 0.156: no evidence the fit keeps says "grow". The
-/// grown pilot is 63 centers there, and 37 at the fixture's n=400 arm, between
-/// the 30- and 60-center fits that both already beat mgcv.
-///
-/// Capped by [`default_num_centers`] so the pilot never exceeds the validated
-/// production basis.
-pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    let low_rank_resolution = low_rank_center_resolution(d);
-    let supported_rows = low_rank_resolution.saturating_mul(ROWS_PER_SUPPORTED_CENTER);
-    let pilot = if n > supported_rows {
-        let density_ratio = n as f64 / supported_rows as f64;
-        (low_rank_resolution as f64 * density_ratio.powf(CENTER_GROWTH_EXPONENT)).ceil() as usize
-    } else {
-        low_rank_resolution
-    };
-    pilot.min(default_num_centers(n, d)).min(n).max(1)
-}
-
-/// Next evidence-backed center count for a saturated spatial basis, bounded by
-/// the already validated production-default resolution.
-///
-/// Growth is geometric so the number of certified refits is logarithmic. The
-/// ceiling is supplied by the owning workflow because it depends on the
-/// spatial family/dimension and resource plan; the standard formula workflow
-/// uses [`default_num_centers`]. Adaptive resolution may therefore avoid work
-/// below the previous default, but can never turn an ordinary fit into an
-/// unvalidated row-rank dense basis. `None` means the validated function-space
-/// ceiling has been reached.
-pub fn expanded_num_centers(current: usize, ceiling: usize) -> Option<usize> {
-    if current >= ceiling {
-        return None;
+/// The least integer `r >= 1` with `r^den >= n^num` (`n` itself for `n <= 1`),
+/// exact in integers wherever the powers fit in `u128`.
+fn least_root_bound(n: usize, num: u32, den: u32) -> usize {
+    if n <= 1 {
+        return n;
     }
-    let expanded = current.saturating_mul(2).min(ceiling);
-    (expanded > current).then_some(expanded)
+    let g = greatest_common_divisor(num, den);
+    let (num, den) = (num / g, den / g);
+    let resolves = |r: usize| -> bool {
+        match ((r as u128).checked_pow(den), (n as u128).checked_pow(num)) {
+            (Some(lhs), Some(rhs)) => lhs >= rhs,
+            _ => f64::from(den) * (r as f64).ln() >= f64::from(num) * (n as f64).ln(),
+        }
+    };
+    let estimate = (n as f64).powf(f64::from(num) / f64::from(den));
+    let mut rank = (estimate.floor() as usize).max(1);
+    while rank > 1 && resolves(rank - 1) {
+        rank -= 1;
+    }
+    while !resolves(rank) {
+        rank += 1;
+    }
+    rank
+}
+
+fn greatest_common_divisor(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a.max(1)
+}
+
+/// The least derivative order `m` whose roughness penalty is a reproducing
+/// kernel norm on `d`-dimensional space: `2m > d`, i.e. `m = ⌊d/2⌋ + 1`.
+///
+/// A radial smooth's penalty must at least embed its function space in the
+/// continuous functions (Duchon's condition), so this is the smoothness a
+/// radial basis can be assumed to carry without reading its kernel options.
+/// It is the most demanding admissible order for the pilot's rank, since a
+/// rougher order leaves more directions for the fit to resolve.
+pub const fn minimal_embedding_order(d: usize) -> usize {
+    d / 2 + 1
+}
+
+/// Starting center count for evidence-driven spatial fitting.
+///
+/// The term's unpenalized polynomial null space (`nullspace_dim` columns) plus
+/// the [`penalized_resolution_rank`] of its minimal-embedding-order penalty:
+/// the smallest basis whose penalized span holds every direction an optimally
+/// smoothed fit on `n` rows keeps. It grows with `n` without bound other than
+/// the row count (a center is a row); the adequacy loop refines it further only
+/// when the converged fit's own evidence says the surface is under-resolved
+/// (#1689).
+pub fn starting_num_centers(n: usize, d: usize, nullspace_dim: usize) -> usize {
+    let rank = penalized_resolution_rank(n, d, minimal_embedding_order(d));
+    nullspace_dim.saturating_add(rank).min(n).max(1)
+}
+
+/// One level of uniform nested refinement of a knot grid: every one of the
+/// `internal_knots + 1` intervals is split at its midpoint, giving
+/// `2 * internal_knots + 1` internal knots.
+///
+/// Nesting is what makes the refined fit comparable to the current one: the
+/// old spline space is a subspace of the new, so the refined REML fit can only
+/// resolve *more*, and the evidence comparison in the adequacy loop decides
+/// whether it did. Splitting each interval once is the least refinement that
+/// is both nested and uniform — an integer refinement ratio is required for
+/// nesting and one split per interval is the smallest integer ratio above one.
+pub const fn refined_internal_knots(internal_knots: usize) -> usize {
+    internal_knots.saturating_mul(2).saturating_add(1)
+}
+
+/// One level of uniform nested refinement of a periodic knot grid: each of the
+/// `num_basis` intervals around the loop is split once (see
+/// [`refined_internal_knots`]).
+pub const fn refined_periodic_basis(num_basis: usize) -> usize {
+    num_basis.saturating_mul(2)
+}
+
+/// One level of refinement of a radial center set: every existing center's
+/// cell receives one new center, the radial analogue of splitting every knot
+/// interval once. The old centers are kept, so the new span contains the old.
+pub const fn refined_num_centers(centers: usize) -> usize {
+    centers.saturating_mul(2)
+}
+
+/// One level of refinement of a spherical-harmonic basis of maximum degree
+/// `max_degree`: the least degree whose non-constant harmonic span
+/// `L(L + 2)` at least matches one refinement of the current span (every
+/// existing direction paired with one new one), mirroring
+/// [`refined_num_centers`] for the harmonic chart.
+pub fn refined_harmonic_degree(max_degree: usize) -> usize {
+    let target = refined_num_centers(max_degree.saturating_mul(max_degree.saturating_add(2)));
+    let mut degree = max_degree.saturating_add(1);
+    while degree.saturating_mul(degree.saturating_add(2)) < target {
+        degree += 1;
+    }
+    degree
 }
 
 /// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
@@ -2664,29 +2729,40 @@ pub(crate) fn design_cross_and_gram(
     Ok((cross, gram))
 }
 
-pub(crate) fn positive_spectral_whitener_from_gram(
+/// The orthonormal coefficient frame of the positive part of `gram`.
+///
+/// Returns the eigenvectors of `gram` whose eigenvalues exceed the relative
+/// rank tolerance `α·ε·n·max_eval`, as an `(n × keep)` matrix with
+/// orthonormal columns. Directions at or below the tolerance are *dropped*:
+/// they carry nothing of the design's column space on the rows `gram` was
+/// formed from, and removing them keeps the post-transform orthogonality
+/// residual at the genuine floating-point limit.
+///
+/// # Why a frame and not a whitener
+///
+/// This used to return `U₊·Λ₊^{-1/2}`, the chart in which the realized
+/// design is orthonormal on the FIT rows. That chart is conditioned on where
+/// the fit rows happen to fall, and nothing downstream is invariant to it:
+///
+/// * a direction with little energy on the fit rows — a basis function whose
+///   support sits in a gap of the data, as every level of a sparse
+///   `s(x, by=factor)` has — is scaled by `1/√λ`, so its column is O(1) on the
+///   fit rows and `‖X_new u‖/√λ` at a new row inside the gap: 2·10⁵ measured
+///   on a nine-row level;
+/// * the penalty is carried by congruence, `TᵀST`, so its spectrum picks up
+///   the same `1/λ` spread (4·10¹⁰ on that level), and every penalty-rank
+///   decision downstream is relative to the largest eigenvalue. Genuinely
+///   penalized directions are read as null, handed to the null-space ridge,
+///   and fitted without their curvature penalty — which is what then
+///   extrapolates across the gap.
+///
+/// An orthonormal `T` is norm-preserving, so `TᵀST` interlaces the spectrum
+/// of `S` and a rank decision made on it is the one made on `S`. The realized
+/// span is the same as the whitener's; only the coordinate chart differs,
+/// and it is the one the local sum-to-zero constraint already uses.
+pub(crate) fn positive_spectral_frame_from_gram(
     gram: &Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    // Inverse-square-root for the positive part of `gram`. Eigenvalues at or
-    // below the relative rank tolerance `α·ε·n·max_eval` are *dropped*: the
-    // returned whitener has shape `(n × keep)` where `keep` counts strictly
-    // positive eigendirections of `gram`.
-    //
-    // Dropping (rather than ridging) is what makes the result a true
-    // square-root inverse on the column space of `gram`. This whitener is
-    // used by `stabilized_orthogonality_transform_from_gram` to make a
-    // pre-existing transform `K_raw` orthonormal under the W-inner product:
-    // when some columns of `K_raw` map to zero (or near-zero) under `B`, the
-    // constrained Gram `K_raw^T G K_raw` is rank-deficient. Ridging those
-    // tail directions with `1/sqrt(ε)` produced spurious basis columns
-    // whose coefficient norms blew up to `~1/sqrt(ε)` while their image in
-    // `B` was floating-point zero, contaminating downstream linear algebra
-    // (in particular it forced `smooth.rs` to widen the post-transform
-    // orthogonality residual tolerance to absorb a `cond ≈ 1/sqrt(ε)`
-    // rounding floor). Dropping these directions is the right behavior:
-    // they contribute nothing to `B`'s column space, and removing them
-    // tightens the orthogonality residual back down to the genuine
-    // floating-point limit.
     let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(BasisError::LinalgError)?;
     let n = gram.nrows();
     let max_eval = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
@@ -2707,7 +2783,7 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     if keep == 0 {
         let min_ev = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
         return Err(BasisError::ConstraintNullspaceCollapsed {
-            site: "positive_spectral_whitener_from_gram",
+            site: "positive_spectral_frame_from_gram",
             cross_rank: 0,
             coeff_dim: gram.nrows(),
             cross_frobenius: gram.iter().map(|v| v * v).sum::<f64>().sqrt(),
@@ -2719,12 +2795,7 @@ pub(crate) fn positive_spectral_whitener_from_gram(
     // `eigh` returns eigenvalues in ascending order, so the largest `keep`
     // eigenvalues live at the tail.
     let eig_start = eigenvalues.len() - keep;
-    let kept_vectors = eigenvectors.slice(s![.., eig_start..]).to_owned();
-    let mut inv_sqrt = Array2::<f64>::zeros((keep, keep));
-    for (out_i, eig_i) in (eig_start..eigenvalues.len()).enumerate() {
-        inv_sqrt[[out_i, out_i]] = 1.0 / eigenvalues[eig_i].sqrt();
-    }
-    Ok(fast_ab(&kept_vectors, &inv_sqrt))
+    Ok(eigenvectors.slice(s![.., eig_start..]).to_owned())
 }
 
 pub(crate) fn stabilized_orthogonality_transform_from_gram(
@@ -2735,8 +2806,8 @@ pub(crate) fn stabilized_orthogonality_transform_from_gram(
         let gt = fast_ab(gram, transform);
         fast_atb(transform, &gt)
     };
-    let whitening = positive_spectral_whitener_from_gram(&constrained_gram)?;
-    Ok(fast_ab(transform, &whitening))
+    let frame = positive_spectral_frame_from_gram(&constrained_gram)?;
+    Ok(fast_ab(transform, &frame))
 }
 
 pub(crate) fn orthogonality_transform_from_cross_and_gram(
@@ -2746,7 +2817,7 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
     // Compute null(M^T) directly on M = B^T W C (k × q) via column-pivoted QR.
     // Working in the original k-dim coefficient space rather than first
     // whitening by B^T B avoids a fundamental failure mode: when B is heavily
-    // collinear, `positive_spectral_whitener_from_gram` truncates the design
+    // collinear, `positive_spectral_frame_from_gram` truncates the design
     // column-space to a `keep`-dim subspace, and if `keep <= q` the subsequent
     // nullspace search has no room — even though dim null(M^T) = k - rank(M)
     // ≥ k - q is always positive when k > q. The constraint nullspace is a
@@ -2770,11 +2841,12 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
         });
     }
 
-    // Make the constrained design B*K_raw orthonormal under the W-inner product.
-    // If the constrained Gram K_raw^T G K_raw is rank-deficient (because some
-    // directions in null(M^T) collapse under B), the spectral whitener drops
-    // them — that is the right behavior: a degenerate column never contributes
-    // to B's column space and shouldn't appear in the reparameterized basis.
+    // Restrict K_raw to the directions the design actually spans. If the
+    // constrained Gram K_raw^T G K_raw is rank-deficient (because some
+    // directions in null(M^T) collapse under B), the spectral frame drops
+    // them — a degenerate column never contributes to B's column space and
+    // shouldn't appear in the reparameterized basis. The kept directions stay
+    // orthonormal in coefficient space (see `positive_spectral_frame_from_gram`).
     stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
 }
 
@@ -3014,7 +3086,7 @@ pub struct ParametricResidualization {
 ///
 /// — column operations on a block whose partner is in the model — so it makes
 /// `X̃ᵀWC = 0` exactly while the joint span is untouched. The rank of `X̃` falls
-/// by `dim(col X ∩ col C)` and by nothing else, so the whitener below drops
+/// by `dim(col X ∩ col C)` and by nothing else, so the spectral frame below drops
 /// precisely the directions the deletion is entitled to drop and no others.
 ///
 /// It is also CONTINUOUS in the containment residual, which the delete/don't
@@ -3145,7 +3217,7 @@ pub(crate) fn parametric_residualization_for_design(
             residual_gram[[j, i]] = averaged;
         }
     }
-    let coefficient_transform = positive_spectral_whitener_from_gram(&residual_gram)?;
+    let coefficient_transform = positive_spectral_frame_from_gram(&residual_gram)?;
 
     // Restate the correction against the RAW constraint columns: with
     // `Ĉ = C·diag(1/‖c_j‖)`, `Ĉ·B̂·T = C·(diag(1/‖c_j‖)·B̂·T)`.
@@ -3243,34 +3315,88 @@ mod saturation_escalation_tests {
     use super::*;
 
     #[test]
-    fn starting_count_is_a_supported_low_rank_pilot_capped_by_default() {
-        // Up to eight rows per pilot center the pilot is the low-rank resolution.
-        assert_eq!(starting_num_centers(240, 2), 30);
-        assert_eq!(starting_num_centers(80, 1), 10);
-        // Beyond that density it grows at the production budget's n^0.4 rate,
-        // ceil(30 * (n / 240)^0.4) in 2-D (#1561).
-        assert_eq!(starting_num_centers(400, 2), 37);
-        assert_eq!(starting_num_centers(800, 2), 49);
-        assert_eq!(starting_num_centers(1500, 2), 63);
-        assert_eq!(starting_num_centers(100_000, 1), 174);
-        assert!(starting_num_centers(100_000, 1) <= default_num_centers(100_000, 1));
-        // The generic conditioning ceiling is `n / 4` and therefore reports
-        // zero below four rows; the pilot retains the basis-wide one-center
-        // degenerate minimum, which materialization subsequently raises to the
-        // exact polynomial floor for the requested family.
-        assert_eq!(starting_num_centers(3, 5), 1);
-        assert_eq!(starting_num_centers(1, 2), 1);
+    fn resolution_rank_is_the_exact_penalized_rate() {
+        // Cubic-spline penalty (m = 2) on one axis: ceil(n^{1/5}).
+        assert_eq!(penalized_resolution_rank(100, 1, 2), 3);
+        assert_eq!(penalized_resolution_rank(1_000, 1, 2), 4);
+        assert_eq!(penalized_resolution_rank(10_000, 1, 2), 7);
+        // n = 10^5 is an exact fifth power: the rank is exactly 10, not the
+        // 11 a floating-point `ceil(10.000000000000002)` would give.
+        assert_eq!(penalized_resolution_rank(100_000, 1, 2), 10);
+        assert_eq!(penalized_resolution_rank(100_001, 1, 2), 11);
+        // Thin-plate order in 2-D (m = 2): ceil(n^{1/3}); 1000 is a cube.
+        assert_eq!(penalized_resolution_rank(1_000, 2, 2), 10);
+        assert_eq!(penalized_resolution_rank(1_001, 2, 2), 11);
+        assert_eq!(penalized_resolution_rank(0, 2, 2), 0);
+        assert_eq!(penalized_resolution_rank(1, 2, 2), 1);
+        // Growth is unbounded in n: no constant ceiling.
+        let mut previous = 0;
+        for exponent in 2..=9 {
+            let rank = penalized_resolution_rank(10usize.pow(exponent), 1, 2);
+            assert!(rank >= previous);
+            previous = rank;
+        }
+        assert!(penalized_resolution_rank(1_000_000_000, 1, 2) >= 63);
+        // Very high dimensions fall back to the log comparison without
+        // overflow and still satisfy r^den >= n^num.
+        let rank = penalized_resolution_rank(1_000_000, 16, 9);
+        assert!((rank as f64).ln() * 34.0 >= 16.0 * (1.0e6f64).ln() - 1e-9);
+        assert!(((rank - 1) as f64).ln() * 34.0 < 16.0 * (1.0e6f64).ln());
     }
 
     #[test]
-    fn saturated_expansion_doubles_then_pins_at_validated_ceiling() {
-        assert_eq!(expanded_num_centers(30, 157), Some(60));
-        assert_eq!(expanded_num_centers(120, 157), Some(157));
-        assert_eq!(expanded_num_centers(157, 157), None);
-        assert_eq!(
-            expanded_num_centers(usize::MAX - 1, usize::MAX),
-            Some(usize::MAX)
-        );
+    fn minimal_embedding_order_is_the_least_rkhs_order() {
+        assert_eq!(minimal_embedding_order(1), 1);
+        assert_eq!(minimal_embedding_order(2), 2);
+        assert_eq!(minimal_embedding_order(3), 2);
+        assert_eq!(minimal_embedding_order(4), 3);
+        for d in 1..20 {
+            assert!(2 * minimal_embedding_order(d) > d);
+            assert!(2 * (minimal_embedding_order(d) - 1) <= d);
+        }
+    }
+
+    #[test]
+    fn starting_count_is_nullspace_plus_resolution_rank() {
+        // 2-D thin plate: 3 null directions + ceil(n^{1/3}).
+        assert_eq!(starting_num_centers(400, 2, 3), 3 + 8);
+        assert_eq!(starting_num_centers(1_500, 2, 3), 3 + 12);
+        assert_eq!(starting_num_centers(100_000, 2, 3), 3 + 47);
+        // No constant low-rank resolution: the pilot tracks n in every
+        // dimension, where `10 * 3^(d-1)` pinned it.
+        assert!(starting_num_centers(100_000, 2, 3) > starting_num_centers(10_000, 2, 3));
+        assert!(starting_num_centers(10_000, 2, 3) > starting_num_centers(1_000, 2, 3));
+        // Bounded only by the row count, never by the production heuristic
+        // budget: at n = 16 that budget's `n / 4` conditioning cap would hold
+        // a 2-D thin plate below its 3 null directions plus a penalized span.
+        assert_eq!(starting_num_centers(16, 2, 3), 3 + 3);
+        assert!(starting_num_centers(16, 2, 3) > default_num_centers(16, 2));
+        for (n, d) in [(20, 2), (100, 4), (100_000, 1), (5_000, 16)] {
+            assert!(starting_num_centers(n, d, d + 1) <= n);
+        }
+        assert_eq!(starting_num_centers(3, 5, 6), 3);
+        assert_eq!(starting_num_centers(1, 2, 3), 1);
+    }
+
+    #[test]
+    fn refinement_is_one_nested_uniform_split() {
+        // K internal knots bound K + 1 intervals; splitting each once leaves
+        // 2(K + 1) intervals, i.e. 2K + 1 internal knots, and every old knot
+        // is still a knot.
+        assert_eq!(refined_internal_knots(0), 1);
+        assert_eq!(refined_internal_knots(4), 9);
+        assert_eq!(refined_periodic_basis(6), 12);
+        assert_eq!(refined_num_centers(15), 30);
+        // Harmonic degree: L(L+2) non-constant directions; 3 -> 15 directions,
+        // the refined degree is the least with at least 30.
+        assert_eq!(refined_harmonic_degree(3), 5);
+        assert_eq!(refined_harmonic_degree(0), 1);
+        for l in 1..30usize {
+            let refined = refined_harmonic_degree(l);
+            assert!(refined * (refined + 2) >= 2 * l * (l + 2));
+            assert!((refined - 1) * (refined + 1) < 2 * l * (l + 2) || refined == l + 1);
+        }
+        assert_eq!(refined_internal_knots(usize::MAX), usize::MAX);
     }
 
     #[test]
@@ -3603,12 +3729,140 @@ mod containment_tests {
             "the residualization's span must be inside the deletion's"
         );
         // And the correction is genuinely inert here: with the constant in the
-        // span, the whitener already produced a block orthogonal to it.
+        // span, the spectral frame already produced a block orthogonal to it.
         let cross = realized.t().dot(&intercept);
         let relative = cross.iter().map(|v| v * v).sum::<f64>().sqrt()
             / (realized.iter().map(|v| v * v).sum::<f64>().sqrt()
                 * intercept.iter().map(|v| v * v).sum::<f64>().sqrt());
         assert!(relative < 1.0e-14, "got {relative:e}");
+    }
+
+    /// Linear hat functions on `knots`, evaluated at `x`: a partition of unity
+    /// with local support, the shape of every B-spline by-level block.
+    fn hat_basis(x: &[f64], knots: &[f64]) -> Array2<f64> {
+        let mut basis = Array2::<f64>::zeros((x.len(), knots.len()));
+        for (row, &xi) in x.iter().enumerate() {
+            for (col, &center) in knots.iter().enumerate() {
+                let left = if col == 0 { center } else { knots[col - 1] };
+                let right = if col + 1 == knots.len() { center } else { knots[col + 1] };
+                let value = if xi <= center && center > left {
+                    (xi - left) / (center - left)
+                } else if xi >= center && right > center {
+                    (right - xi) / (right - center)
+                } else if xi == center {
+                    1.0
+                } else {
+                    0.0
+                };
+                basis[[row, col]] = value.max(0.0);
+            }
+        }
+        basis
+    }
+
+    /// The fz0072 shape: a by-level whose rows leave a gap in the covariate, so
+    /// one basis function barely touches the fit rows. The collection gauge's
+    /// coefficient transform must be an orthonormal frame on BOTH arms:
+    ///
+    /// * the realized row at a new point inside the gap stays the size of the
+    ///   raw basis row, instead of being amplified by `1/√λ` of the starved
+    ///   direction (the whitened chart's failure, measured below as the
+    ///   negative control);
+    /// * the congruence-carried penalty `TᵀST` interlaces the spectrum of `S`,
+    ///   so a rank decision made on it is the one made on `S`.
+    #[test]
+    fn the_collection_gauge_is_an_orthonormal_frame_across_a_data_gap() {
+        let knots: Vec<f64> = (0..11).map(|k| k as f64 / 10.0).collect();
+        // Fit rows on [0, 0.402] ∪ [0.598, 1]: the hat centred at 0.5 is
+        // touched only at its two outermost rows, at height 0.02.
+        let fit_x: Vec<f64> = (0..20)
+            .map(|i| 0.402 * i as f64 / 19.0)
+            .chain((0..20).map(|i| 0.598 + 0.402 * i as f64 / 19.0))
+            .collect();
+        let basis = hat_basis(&fit_x, &knots);
+        let gap_row = hat_basis(&[0.5], &knots);
+        let gap_norm = gap_row.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let intercept = Array2::<f64>::ones((fit_x.len(), 1));
+        // Second-difference penalty on the hat coefficients.
+        let p = knots.len();
+        let mut diff = Array2::<f64>::zeros((p - 2, p));
+        for r in 0..p - 2 {
+            diff[[r, r]] = 1.0;
+            diff[[r, r + 1]] = -2.0;
+            diff[[r, r + 2]] = 1.0;
+        }
+        let penalty = diff.t().dot(&diff);
+        let (penalty_evals, _) = FaerEigh::eigh(&penalty, Side::Lower).expect("penalty");
+        let penalty_top = penalty_evals.iter().cloned().fold(0.0_f64, f64::max);
+
+        let residualized =
+            parametric_residualization_for_design(&dense(basis.clone()), intercept.view(), None)
+                .expect("residualize")
+                .coefficient_transform;
+        let deleted =
+            orthogonality_transform_for_design(&dense(basis.clone()), intercept.view(), None)
+                .expect("delete");
+        for (arm, transform) in [("residualize", &residualized), ("delete", &deleted)] {
+            let m = transform.ncols();
+            assert_eq!(m, p - 1, "{arm}: the hats contain the constant, so one direction goes");
+            let gram = transform.t().dot(transform);
+            let off_identity = (&gram - &Array2::<f64>::eye(m))
+                .iter()
+                .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            assert!(
+                off_identity <= (p as f64) * 16.0 * f64::EPSILON,
+                "{arm}: TᵀT must be the identity, off by {off_identity:e}"
+            );
+            let realized_gap = gap_row.dot(transform);
+            let realized_norm = realized_gap.iter().map(|v| v * v).sum::<f64>().sqrt();
+            assert!(
+                realized_norm <= gap_norm * (1.0 + 1.0e-12),
+                "{arm}: a gap row must not grow under the gauge: {realized_norm} vs {gap_norm}"
+            );
+            // Cauchy interlacing for the compression `TᵀST` of `S`:
+            // λ_k(S) ≤ λ_k(TᵀST) ≤ λ_{k+p−m}(S), ascending.
+            let (compressed, _) =
+                FaerEigh::eigh(&transform.t().dot(&penalty).dot(transform), Side::Lower)
+                    .expect("compressed penalty");
+            let slack = (p as f64) * 64.0 * f64::EPSILON * penalty_top;
+            for k in 0..m {
+                assert!(
+                    compressed[k] >= penalty_evals[k] - slack
+                        && compressed[k] <= penalty_evals[k + p - m] + slack,
+                    "{arm}: eigenvalue {k} of TᵀST ({:e}) left [{:e}, {:e}]",
+                    compressed[k],
+                    penalty_evals[k],
+                    penalty_evals[k + p - m]
+                );
+            }
+        }
+
+        // Negative control: the whitened chart `U₊Λ₊^{-1/2}` this replaced
+        // (on the delete arm the realized Gram in the frame chart IS `Λ₊`, so
+        // re-whitening it reconstructs that chart up to a rotation) amplifies
+        // the gap row by the starved direction's `1/√λ`. Without this the
+        // fixture could pass by having no starved direction at all.
+        let fit_gram = {
+            let realized = basis.dot(&deleted);
+            realized.t().dot(&realized)
+        };
+        let (evals, evecs) = FaerEigh::eigh(&fit_gram, Side::Lower).expect("fit gram");
+        let smallest = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let largest = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let whitened_gap_norm = {
+            let mut whitener = evecs.clone();
+            for (col, &ev) in evals.iter().enumerate() {
+                whitener.column_mut(col).mapv_inplace(|v| v / ev.sqrt());
+            }
+            let row = gap_row.dot(&deleted).dot(&whitener);
+            row.iter().map(|v| v * v).sum::<f64>().sqrt()
+        };
+        assert!(
+            largest / smallest > 1.0e2 && whitened_gap_norm > 10.0 * gap_norm,
+            "the fixture must starve a direction: condition {:e}, whitened gap row {whitened_gap_norm} \
+             vs raw {gap_norm}",
+            largest / smallest
+        );
     }
 }
 

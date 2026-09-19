@@ -636,6 +636,107 @@ impl Drop for MemoryReservation {
     }
 }
 
+/// Reusable scratch values whose retained memory is always on the governor's
+/// ledger (gam#2989).
+///
+/// A caller checks a value out for one evaluation and the pool takes it back
+/// afterwards, so the pool holds at most as many values as ran at once. A value
+/// is kept for reuse only while the governor admits the bytes it retains, and
+/// that reservation lives exactly as long as the idle value does. A value the
+/// ledger does not admit is freed on check-in, so the next checkout builds a
+/// fresh one. Dropping the pool frees every idle value and its reservation, so
+/// scratch owned by one fit ends with that fit instead of living on in
+/// thread-locals for the life of the process.
+pub struct GovernedScratchPool<T> {
+    governor: MemoryGovernor,
+    context: &'static str,
+    make: fn() -> T,
+    retained_bytes_of: fn(&T) -> usize,
+    idle: Mutex<Vec<(T, MemoryReservation)>>,
+}
+
+impl<T> GovernedScratchPool<T> {
+    /// `make` builds a fresh value, and `retained_bytes_of` reports the bytes a
+    /// value holds from the allocator while it sits idle.
+    pub fn new(
+        governor: MemoryGovernor,
+        context: &'static str,
+        make: fn() -> T,
+        retained_bytes_of: fn(&T) -> usize,
+    ) -> Self {
+        Self {
+            governor,
+            context,
+            make,
+            retained_bytes_of,
+            idle: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Run `evaluate` on a checked-out value, then return it to the pool.
+    pub fn with<R>(&self, evaluate: impl FnOnce(&mut T) -> R) -> R {
+        let checked_out = self
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let (mut value, held) = match checked_out {
+            Some((value, reservation)) => (value, Some(reservation)),
+            None => ((self.make)(), None),
+        };
+        let result = evaluate(&mut value);
+        self.check_in(value, held);
+        result
+    }
+
+    fn check_in(&self, value: T, held: Option<MemoryReservation>) {
+        let bytes = (self.retained_bytes_of)(&value);
+        let reservation = match held {
+            Some(reservation) if reservation.bytes() == bytes => reservation,
+            held => {
+                drop(held);
+                match self.governor.try_reserve(bytes, self.context) {
+                    Ok(reservation) => reservation,
+                    // The ledger cannot carry this value idle: free it.
+                    Err(_) => return,
+                }
+            }
+        };
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((value, reservation));
+    }
+
+    /// Bytes the idle values retain, all of them reserved on the ledger.
+    pub fn retained_bytes(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(_, reservation)| reservation.bytes())
+            .sum()
+    }
+
+    /// Number of idle values.
+    pub fn idle_len(&self) -> usize {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl<T> std::fmt::Debug for GovernedScratchPool<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GovernedScratchPool")
+            .field("context", &self.context)
+            .field("idle", &self.idle_len())
+            .field("retained_bytes", &self.retained_bytes())
+            .finish()
+    }
+}
+
 /// The memory one outer search of a parallel multistart runs on (SPEC 10).
 ///
 /// A multistart starts a search only once the governor has granted the search's
@@ -1679,5 +1780,66 @@ mod governor_budget_is_capacity_determined_2702_tests {
         }
         assert_eq!(governor.reserved_bytes(), 0);
         assert_eq!(request().expect("admissible again"), before);
+    }
+}
+
+#[cfg(test)]
+mod governed_scratch_pool_2989_tests {
+    use super::*;
+
+    fn retained(value: &Vec<u8>) -> usize {
+        value.capacity()
+    }
+
+    #[test]
+    fn idle_scratch_is_charged_and_released_with_the_pool_2989() {
+        let governor = MemoryGovernor::with_budget_bytes(1 << 20);
+        let pool = GovernedScratchPool::new(governor.clone(), "test scratch", Vec::new, retained);
+        pool.with(|scratch| scratch.reserve_exact(4096));
+        assert_eq!(pool.idle_len(), 1);
+        let charged = pool.retained_bytes();
+        assert!(charged >= 4096);
+        assert_eq!(governor.reserved_bytes(), charged);
+
+        // A warm checkout reuses the idle value and keeps its charge.
+        pool.with(|scratch| assert!(scratch.capacity() >= 4096));
+        assert_eq!(pool.idle_len(), 1);
+        assert_eq!(governor.reserved_bytes(), charged);
+
+        // Growth re-charges the value at its new size.
+        pool.with(|scratch| scratch.reserve_exact(4 * 4096));
+        assert!(pool.retained_bytes() >= 4 * 4096);
+        assert_eq!(governor.reserved_bytes(), pool.retained_bytes());
+
+        drop(pool);
+        assert_eq!(governor.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn scratch_the_ledger_cannot_carry_is_freed_on_check_in_2989() {
+        let governor = MemoryGovernor::with_budget_bytes(1024);
+        let pool = GovernedScratchPool::new(governor.clone(), "test scratch", Vec::new, retained);
+        pool.with(|scratch| scratch.reserve_exact(4096));
+        assert_eq!(pool.idle_len(), 0);
+        assert_eq!(governor.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn concurrent_checkouts_retain_one_value_each_2989() {
+        let governor = MemoryGovernor::with_budget_bytes(1 << 20);
+        let pool = GovernedScratchPool::new(governor.clone(), "test scratch", Vec::new, retained);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    pool.with(|scratch| {
+                        scratch.reserve_exact(1024);
+                        barrier.wait();
+                    })
+                });
+            }
+        });
+        assert_eq!(pool.idle_len(), 3);
+        assert_eq!(governor.reserved_bytes(), pool.retained_bytes());
     }
 }

@@ -810,6 +810,7 @@ pub(crate) fn gaussian_diagonal_row_kernel(
     location_eta: f64,
     eta_log_sigma: f64,
     obs_weight: f64,
+    sigma_floor: f64,
     ln2pi: f64,
 ) -> Result<GaussianDiagonalRowKernel, String> {
     if !y.is_finite() || !location_eta.is_finite() || !eta_log_sigma.is_finite() {
@@ -828,6 +829,14 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         }
         .into());
     }
+    if !(sigma_floor.is_finite() && sigma_floor > 0.0) {
+        return Err(GamlssError::InvalidInput {
+            reason: format!(
+                "Gaussian location-scale requires a finite positive σ floor; got {sigma_floor}"
+            ),
+        }
+        .into());
+    }
     if obs_weight == 0.0 {
         return Ok(GaussianDiagonalRowKernel {
             log_likelihood: 0.0,
@@ -841,14 +850,16 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         });
     }
 
-    // logb noise link σ = b + exp(η) bounds σ ≥ b > 0 by construction, so the
+    // logb noise link σ = b + exp(η), with `b = sigma_floor` the fit's
+    // measurement-resolution bound (`gaussian_resolution_sigma_floor`), bounds
+    // σ ≥ b > 0 by construction, so the
     // Gaussian location-scale objective ½Σ(y−μ)²/σ² + Σlog σ is bounded below
     // for any finite data. Its working weight 1/σ² is bounded by 1/b², so
     // H_μμ has bounded condition number — no after-the-fact floor or cap is
     // needed (the previous (1e-12, 1e24) clamp was a numerical bandaid for the
     // pure-exp link's σ→0 singularity and is structurally unnecessary here).
     // ApproxKind: Exact — working weight analytically bounded in (0, 1/b²].
-    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(eta_log_sigma);
+    let SigmaJet1 { sigma, d1 } = logb_sigma_jet1_scalar(sigma_floor, eta_log_sigma);
     if !sigma.is_finite() || sigma <= 0.0 {
         return Err(GamlssError::row_geometry_unrepresentable(row, "Gaussian scale link", eta_log_sigma, sigma));
     }
