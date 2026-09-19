@@ -7585,71 +7585,99 @@ fn predict_encoded_table_conformal_impl(
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
 
-/// #1098 Gaussian full-conformal prediction set at frozen `Sλ` — no
-/// calibration fold.
+/// #1098 full-conformal prediction set at the frozen penalty — no calibration
+/// fold.
 ///
 /// Evaluated by `gam_predict::conformal_routes::full_conformal_prediction_columns`
 /// on the prediction rows and the labeled rows, both projected onto the model
-/// schema.
+/// schema, with the model's offset column resolved on each.
 fn predict_encoded_table_full_conformal_impl(
     model: &FittedModel,
     source: EncodedDataset,
     training_source: EncodedDataset,
     conformal_level: f64,
-) -> Result<String, String> {
+) -> Result<String, gam_predict::conformal_routes::FullConformalError> {
     let dataset = dataset_with_model_schema_from_encoded(model, &source)?;
     let training = dataset_with_model_schema_from_encoded(model, &training_source)?;
     let test_col_map = dataset.column_map();
     let training_col_map = training.column_map();
+    let test_offset =
+        resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())
+            .map_err(|err| err.to_string())?;
+    let training_offset =
+        resolve_offset_column(&training, &training_col_map, model.offset_column.as_deref())
+            .map_err(|err| err.to_string())?;
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
         model,
         &gam_predict::conformal_routes::DesignRows {
             data: dataset.values.view(),
             col_map: &test_col_map,
+            offset: &test_offset,
         },
         &gam_predict::conformal_routes::DesignRows {
             data: training.values.view(),
             col_map: &training_col_map,
+            offset: &training_offset,
         },
         conformal_level,
     )?;
+    let likelihood = model_likelihood_spec(&model);
+    let interval_method = if likelihood.is_gaussian_identity() {
+        format!(
+            "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
+             distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
+             ρ-re-selecting fit and is certified per row only where \
+             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
+            conformal_level * 100.0
+        )
+    } else {
+        format!(
+            "full-conformal at frozen smoothing parameters by certified augmented refits \
+             (exact ≥{:.0}% set given the frozen penalty, score |∂ℓ/∂η|, seeded tie \
+             randomization; a union of conformal_set_components intervals whose envelope is \
+             posterior_mean_lower/upper; frozen_rho_certified=0: no GLM certificate for the \
+             λ step)",
+            conformal_level * 100.0
+        )
+    };
     serde_json::to_string(&PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
         point_columns: None,
-        family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
-        interval_method: Some(format!(
-            "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
-             distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
-             ρ-re-selecting fit and is certified per row only where \
-             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
-            conformal_level * 100.0
-        )),
+        family: family_link_kind(&likelihood).to_string(),
+        interval_method: Some(interval_method),
         covariance_source: None,
         point_covariance_source: None,
         point_covariance_note: None,
     })
-    .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
+    .map_err(|err| {
+        gam_predict::conformal_routes::FullConformalError::Failed(format!(
+            "failed to serialize full-conformal prediction payload: {err}"
+        ))
+    })
 }
 
 /// Full-conformal prediction intervals at frozen smoothing parameters — no
 /// held-out calibration fold required (#1098 / #942 Layer 1).
 ///
 /// Routes `predict(interval='conformal', training_data=...)` to the exact
-/// full-conformal set: the saved model carries only the frozen `p x p` penalty
-/// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
-/// contain the response column — supply the design and responses the set
-/// augments. The set is exact given the frozen `Sλ`; the distribution-free finite-sample
+/// full-conformal set: the saved model carries only the frozen `p x p` penalty,
+/// and the labeled `(training_headers, training_rows)` — which must contain the
+/// response column — supply the design and responses the set augments.
+/// Gaussian-identity, Bernoulli-logit, Poisson-log, negative-binomial-log and
+/// Gamma-log standard models are supported, with or without an offset. The set
+/// is exact given the frozen penalty; the distribution-free finite-sample
 /// ≥`conformal_level` marginal-coverage theorem additionally requires the
 /// symmetric ρ-re-selecting fit and is certified per row only where the
-/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
-/// REML branch through the augmented optimum). Returns the same column JSON as
-/// `predict_table` plus that certificate column.
+/// returned `frozen_rho_certified` column is 1.0 (Gaussian REML only). Returns
+/// the same column JSON as `predict_table` plus `conformal_set_components` and
+/// that certificate column.
 ///
-/// Raises a descriptive Python exception for ineligible models (non-Gaussian,
-/// weighted, scan-routed, …) directing the user to split conformal.
+/// Raises `InvalidConfigurationError` for ineligible models (prior weights —
+/// pointing to split conformal with `calibration=` — unsupported family,
+/// scan-routed, …) and `ValueError` for a numerical failure.
 #[pyfunction(signature = (model, headers, rows, training_headers, training_rows, conformal_level=0.9))]
 fn predict_table_full_conformal(
     py: Python<'_>,
@@ -7660,6 +7688,7 @@ fn predict_table_full_conformal(
     training_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
 ) -> PyResult<String> {
+    use gam_predict::conformal_routes::FullConformalError;
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     training_rows
@@ -7667,9 +7696,17 @@ fn predict_table_full_conformal(
         .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let training = training_rows.dataset.clone();
-    detach_py_result(py, "predict_table_full_conformal", move || {
-        predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level)
-    })
+    detach_typed_py_result(
+        py,
+        "predict_table_full_conformal",
+        move || predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level),
+        |_, err| match err {
+            FullConformalError::PriorWeights { .. } | FullConformalError::Unsupported(_) => {
+                InvalidConfigurationError::new_err(err.to_string())
+            }
+            FullConformalError::Failed(msg) => py_value_error(msg),
+        },
+    )
 }
 
 /// #1057 Posterior-predictive replicate sampling — `model.sample_replicates`.

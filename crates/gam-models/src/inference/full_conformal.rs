@@ -101,9 +101,11 @@
 //! `c`-array bounds ‖D_βH\[v\]‖ along the step, giving a computable Newton
 //! attraction radius) — the corrector cannot silently skip a basin. Score
 //! crossings between steps are localized by bisection on the corrected
-//! path. Discrete families (Binomial, Poisson) are FINITE: full conformal is
-//! exact by enumerating the response support — no homotopy subtlety at all —
-//! and this module carries no enumeration arm.
+//! path. Discrete families (Binomial, Poisson, negative binomial) are
+//! FINITE or have a provable tail: full conformal is exact by enumerating the
+//! response support. That arm, together with the certified Gamma walk, lives
+//! in [`super::full_conformal_glm`]; the predict route uses it for every
+//! non-Gaussian fit.
 //!
 //! # Layer 3 contract: the ρ-response and the frozen-ρ certificate
 //!
@@ -173,7 +175,9 @@
 //!
 //! No flags. The predict path requests full conformal exactly like split
 //! conformal (`conformal_level`), and the dispatcher picks: exact Layer 1
-//! for Gaussian-identity fits, homotopy beyond. PRIORITY ORDER MATTERS and
+//! for Gaussian-identity fits, the enumeration / certified-walk arm of
+//! [`super::full_conformal_glm`] for the Binomial, Poisson, negative
+//! binomial and Gamma log/logit fits. PRIORITY ORDER MATTERS and
 //! is a design decision, not an
 //! optimization: the cheap frozen-ρ exact set runs FIRST, the certificate
 //! is computed, and only on certificate REFUSAL does the engine touch the
@@ -202,6 +206,26 @@ use opt::{BacktrackConfig, backtracking_line_search};
 pub struct ConformalInterval {
     pub lo: f64,
     pub hi: f64,
+}
+
+/// The rank threshold `τ = α(n + 1)` a conformal p-value is compared with
+/// (member iff `(1 + #dominating) > τ`).
+///
+/// `α` arrives as `1 − level` from a decimal level, and neither the level nor
+/// the subtraction is exact in binary: at the nominal `level = 0.9` the product
+/// is `5.999…` rather than `6`, which would let one more rank in and over-cover
+/// by exactly `1/(n + 1)`. The two roundings put `α` within `ε` of the decimal
+/// it stands for, and the product adds `ε·τ/2`; a `τ` that close to an integer
+/// is that integer.
+pub fn conformal_rank_threshold(alpha: f64, n_augmented: usize) -> f64 {
+    let n1 = n_augmented as f64;
+    let tau = alpha * n1;
+    let nearest = tau.round();
+    if (tau - nearest).abs() <= f64::EPSILON * (n1 + tau) {
+        nearest
+    } else {
+        tau
+    }
 }
 
 /// The exact full-conformal prediction set: a finite union of closed
@@ -319,12 +343,11 @@ impl ExactGaussianFullConformal {
 
     /// Membership at candidate z: conformal p-value `(1 + count)/(n+1) > α`.
     fn member(&self, z: f64, alpha: f64) -> bool {
-        let n1 = (self.n + 1) as f64;
-        (1.0 + self.dominating_count(z) as f64) > alpha * n1
+        (1.0 + self.dominating_count(z) as f64) > conformal_rank_threshold(alpha, self.n + 1)
     }
 
     fn required_dominating_count(&self, alpha: f64) -> usize {
-        let threshold = alpha * (self.n + 1) as f64;
+        let threshold = conformal_rank_threshold(alpha, self.n + 1);
         for count in 0..=self.n {
             if 1.0 + count as f64 > threshold {
                 return count;
@@ -1530,16 +1553,16 @@ const GLM_HOMOTOPY_MAX_HALVINGS: usize = 24;
 const GLM_CORRECTOR_MAX_ITERS: usize = 80;
 
 /// Maximum damped-Newton iterations for a cold augmented GLM fit.
-const GLM_NEWTON_MAX_ITERS: usize = 200;
+pub(crate) const GLM_NEWTON_MAX_ITERS: usize = 200;
 
 /// Maximum Armijo backtracking halvings per cold Newton iteration.
-const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+pub(crate) const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
 
 /// Strict scale-invariant KKT tolerance declaring convergence, applied to the
 /// RAW penalized gradient via [`GlmHomotopyFullConformal::kkt_converged`]
 /// (dimension-scaled OR natural-scale relative — the same certificate the main
 /// P-IRLS solver uses). NOT a tolerance on the preconditioned Newton step.
-const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+pub(crate) const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
 
 /// Near-stationary acceptance tolerance: a stalled iterate sitting at the
 /// floating-point floor of the raw gradient is still accepted when it
@@ -1558,14 +1581,14 @@ const GLM_CONTRACTION_ACCEPT: f64 = 0.5;
 /// Armijo sufficient-decrease constant for the cold-fit line search —
 /// sourced from the shared optimizer constants so the workspace has exactly
 /// one `c₁`.
-const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
+pub(crate) const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 /// `η` location of the extrema of the logistic third derivative
 /// `b‴(η) = σ(1−σ)(1−2σ)`: `σ = (3±√3)/6 ⇔ η = ±ln(2+√3)`.
 const LOGIT_THIRD_DERIV_CRITICAL_ETA: f64 = 1.316_957_896_924_816_6;
 
 #[inline]
-fn vec_norm(v: &Array1<f64>) -> f64 {
+pub(crate) fn vec_norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
@@ -2454,6 +2477,21 @@ impl ExactFullConformalPenalty {
         Ok(Self {
             s_lambda: m - gram,
         })
+    }
+
+    /// Wrap an already-recovered frozen penalty. The GLM arm recovers it from
+    /// the observed-information Gram with
+    /// [`super::full_conformal_glm::penalty_from_normal_and_gram`].
+    pub fn from_s_lambda(s_lambda: Array2<f64>) -> Result<Self, String> {
+        if s_lambda.nrows() != s_lambda.ncols() {
+            return Err("exact full conformal penalty: Sλ is not square".to_string());
+        }
+        Ok(Self { s_lambda })
+    }
+
+    /// The frozen penalty `Sλ` (p × p).
+    pub fn s_lambda(&self) -> &Array2<f64> {
+        &self.s_lambda
     }
 
     /// Coefficient dimension `p`.

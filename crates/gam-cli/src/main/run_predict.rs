@@ -1412,22 +1412,33 @@ fn run_predict_conformal(
             return Err("--training-data and --calibration are mutually exclusive".to_string());
         }
         (Some(training_path), None) => {
-            let extras = vec![response_column("--training-data")?];
+            let mut extras = vec![response_column("--training-data")?];
+            extras.extend(effective_offset_column.map(str::to_string));
             let training = load_datasetwith_model_schema_extra(training_path, model, &extras)?;
             require_dataset_rows("predict --training-data", training_path, training.values.nrows())?;
             let training_col_map = training.column_map();
+            let (training_offset, _) = resolve_predict_offsets(
+                model,
+                &training,
+                &training_col_map,
+                effective_offset_column,
+                None,
+            )?;
             gam_predict::conformal_routes::full_conformal_prediction_columns(
                 model,
                 &gam_predict::conformal_routes::DesignRows {
                     data: ds.values.view(),
                     col_map,
+                    offset: predict_offset,
                 },
                 &gam_predict::conformal_routes::DesignRows {
                     data: training.values.view(),
                     col_map: &training_col_map,
+                    offset: &training_offset,
                 },
                 args.level,
-            )?
+            )
+            .map_err(|err| err.to_string())?
         }
         (None, Some(calibration_path)) => {
             let response = response_column("--calibration")?;
@@ -1475,6 +1486,7 @@ fn run_predict_conformal(
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",
+        "conformal_set_components",
         "frozen_rho_certified",
     ]
     .into_iter()

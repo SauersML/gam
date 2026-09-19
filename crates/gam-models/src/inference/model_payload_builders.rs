@@ -276,9 +276,14 @@ impl RealizedRawPenaltyTopology {
     }
 }
 
-/// The frozen penalty the exact full-conformal set of an eligible standard fit
-/// needs, recovered as `Sλ = M₀ − XᵀX` from the unit-weight training Gram. Only
-/// the p × p penalty is persisted: the labeled rows the set is built on are
+/// The frozen penalty the full-conformal set of an eligible standard fit needs.
+/// For Gaussian identity it is recovered as `Sλ = M₀ − XᵀX` from the unit-weight
+/// training Gram; for the GLM families of
+/// [`crate::inference::full_conformal_glm`] as `φ·(H − XᵀW_H X)` from the
+/// observed-information weights `W_H` the converged P-IRLS Hessian was built
+/// from, which puts it on the unit-dispersion likelihood the conformal refits
+/// minimize. Offsets are allowed: they enter only the linear predictor. Only the
+/// p × p penalty is persisted: the labeled rows the set is built on are
 /// supplied again at prediction time, so the saved model never grows with `n`.
 fn standard_conformal_penalty(
     fit_config: &FitConfig,
@@ -290,26 +295,45 @@ fn standard_conformal_penalty(
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
     });
+    // The conformal refits minimize the plain penalized likelihood: a shifted
+    // prior mean or an inequality-constrained coefficient space is a different
+    // fitting map.
+    let shifted_prior = design
+        .penalties
+        .iter()
+        .any(|penalty| !matches!(penalty.prior_mean, gam_problem::CoefficientPriorMean::Zero));
+    let constrained = design.linear_constraints.is_some()
+        || design
+            .coefficient_lower_bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.iter().any(|bound| bound.is_finite()));
     if expectile
-        || !family.is_gaussian_identity()
         || fit_config.weight_column.is_some()
-        || fit_config.offset_column.is_some()
         || fit_config.flexible_link
-        || design.affine_offset.iter().any(|value| *value != 0.0)
+        || shifted_prior
+        || constrained
     {
         return None;
     }
     let normal_matrix = fit.penalized_hessian()?;
-    let unit_weights = Array1::<f64>::ones(design.design.nrows());
     // The penalty may legitimately be unavailable (the Gram cannot be formed
     // for this design). `None` is the contract, but the reason is what explains
     // a fit that ships without exact full-conformal intervals.
-    let penalty = design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
-        crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
-            &gram,
-            normal_matrix,
-        )
-    });
+    let penalty = if family.is_gaussian_identity() {
+        let unit_weights = Array1::<f64>::ones(design.design.nrows());
+        design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
+            crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
+                &gram,
+                normal_matrix,
+            )
+        })
+    } else if let Some(glm) =
+        crate::inference::full_conformal_glm::ConformalGlmFamily::from_likelihood(family)
+    {
+        glm_conformal_penalty(glm, fit, design, normal_matrix)
+    } else {
+        return None;
+    };
     match penalty {
         Ok(penalty) => Some(penalty),
         Err(reason) => {
@@ -317,6 +341,57 @@ fn standard_conformal_penalty(
             None
         }
     }
+}
+
+fn glm_conformal_penalty(
+    glm: crate::inference::full_conformal_glm::ConformalGlmFamily,
+    fit: &UnifiedFitResult,
+    design: &TermCollectionDesign,
+    normal_matrix: &Array2<f64>,
+) -> Result<crate::inference::full_conformal::ExactFullConformalPenalty, String> {
+    let pirls = fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .ok_or_else(|| "the fit retains no P-IRLS observed-information weights".to_string())?;
+    let n = design.design.nrows();
+    if pirls.finalweights.len() != n {
+        return Err(format!(
+            "P-IRLS observed-information weights have {} rows but the design has {n}",
+            pirls.finalweights.len()
+        ));
+    }
+    if normal_matrix.nrows() != design.design.ncols() {
+        return Err(format!(
+            "penalized Hessian is {0}×{0} but the design has {1} columns",
+            normal_matrix.nrows(),
+            design.design.ncols()
+        ));
+    }
+    let weights = pirls.finalweights.to_owned();
+    let gram = design.design.diag_xtw_x(&weights)?;
+    // The P-IRLS weights carry the Gamma dispersion as `w/φ`; the other
+    // supported families have unit dispersion.
+    let scale = match glm {
+        crate::inference::full_conformal_glm::ConformalGlmFamily::GammaLog => pirls
+            .likelihood
+            .resolved_scale()
+            .and_then(|scale| scale.gamma_phi())
+            .map_err(|err| err.to_string())?,
+        _ => 1.0,
+    };
+    let penalized: Vec<std::ops::Range<usize>> = design
+        .penalties
+        .iter()
+        .map(|penalty| penalty.col_range.clone())
+        .collect();
+    let s_lambda = crate::inference::full_conformal_glm::penalty_from_normal_and_gram(
+        normal_matrix,
+        &gram,
+        &penalized,
+        scale,
+    )?;
+    crate::inference::full_conformal::ExactFullConformalPenalty::from_s_lambda(s_lambda)
 }
 
 /// Assemble the one canonical saved payload for a standard formula fit.

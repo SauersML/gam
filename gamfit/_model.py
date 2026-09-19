@@ -185,20 +185,30 @@ class Model:
             --conformal``. Exactly one of ``training_data`` or ``calibration``
             is required. With ``training_data`` it is the exact full-conformal
             set at the fitted (frozen) smoothing parameters (#942 Layer 1):
-            every labeled row is used for both fitting and calibration, the
-            set is exact *given* the frozen penalty, and it costs one Cholesky
-            per test point with zero refits. It needs a Gaussian-identity model
-            fitted without prior weights, offsets, or a link wiggle. The saved
-            model carries only the ``p x p`` frozen penalty, never per-row
-            training data, so the labeled rows are passed again here. Because the
-            smoothing parameters were selected from all training responses, the
-            finite-sample ``conformal_level`` coverage theorem applies only
-            where the per-row ``frozen_rho_certified`` output column is 1.0 (the
-            Layer-3 certificate that freezing the global smoothing parameter
-            matches the honest ρ-re-selecting set, under a grid-checked
-            Lipschitz assumption); rows with 0.0 carry no finite-sample
-            guarantee, and the bounds report the outer envelope of the
-            (possibly multi-interval) set. With ``calibration`` it is the
+            every labeled row is used for both fitting and calibration and the
+            set is exact *given* the frozen penalty. Gaussian-identity models
+            cost one Cholesky per test point with zero refits; Bernoulli-logit
+            (the set is a subset of ``{0, 1}``), Poisson-log and
+            negative-binomial-log (candidates enumerated up to a data-derived
+            tail beyond which none can conform; NB theta frozen at its fitted
+            value) and Gamma-log (Pearson score, so the set is a band in
+            ``y / mu``) refit the augmented penalized likelihood per candidate.
+            Discrete ties are broken by a seeded uniform so the set is exact
+            rather than conservative. Offsets are honoured. A model fitted with
+            prior weights raises ``InvalidConfigurationError``: the candidate
+            point has no weight, so use ``calibration=`` (split conformal)
+            instead. The saved model carries only the ``p x p`` frozen penalty,
+            never per-row training data, so the labeled rows are passed again
+            here. Because the smoothing parameters were selected from all
+            training responses, the finite-sample ``conformal_level`` coverage
+            theorem applies only where the per-row ``frozen_rho_certified``
+            output column is 1.0 (the Layer-3 certificate that freezing the
+            global smoothing parameter matches the honest ρ-re-selecting set,
+            Gaussian REML only; every GLM row reports 0.0); rows with 0.0 carry
+            no finite-sample certificate for the smoothing step. The set is a
+            union of ``conformal_set_components`` intervals and the bounds
+            report its outer envelope (NaN for an empty randomized set). With
+            ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
