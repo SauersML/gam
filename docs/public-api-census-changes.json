@@ -4464,5 +4464,18 @@
     },
     "reason": "#2469: cloglog_posterior_meanwith_deriv_gamma_reference was a pub(crate) test-module reference built on cloglog_survival_gamma_reference, the Gamma/Mellin-Barnes route this commit deletes (see docs/source-removal-changes.json). The integrated cloglog pin now grades the router against 50-digit mpmath references instead.",
     "evidence": "At 651eabad3f, git grep -w finds cloglog_posterior_meanwith_deriv_gamma_reference only inside quadrature.rs's test module: its declaration and one call in test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case, which this commit deletes. public_api_census.py in gate dy6 run spec-lead-q1-g1 refused exactly this one removal."
+  },
+  {
+    "base": "9ba55dfa343f27b1a78f3c9dde7c71dfbeb7889f",
+    "removed": {
+      "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1,
+      "crates/gam-inference/src/model_comparison.rs::corrected_edf": 1,
+      "crates/gam-inference/src/model_comparison.rs::rho_uncertainty_df": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_format_float": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_normalize_exponent": 1,
+      "crates/gam-pyffi/src/io/summary_render.rs::summary_trim_float": 1
+    },
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary has one owner. build_model_summary was the CLI's second summary builder (the gam_solve ModelSummary Display path); `gam summary` now renders saved_model_summary's payload through gam_models::inference::summary_text::render_summary_text, the same function gamfit's Model.summary() prints. corrected_edf and rho_uncertainty_df moved (not dropped) to gam_solve::estimate::information_criteria so the conditional/corrected AIC in the summary and in gam-inference model comparison are one computation (UnifiedFitResult::akaike_criteria / corrected_edf). The three pyffi float helpers were a private %g re-implementation; floats now go through gam_report::format_significant.",
+    "evidence": "After this change git grep -w finds build_model_summary only in a historical doc sentence in saved_summary.rs; summary_format_float, summary_normalize_exponent and summary_trim_float have no references; corrected_edf and rho_uncertainty_df are defined in crates/gam-solve/src/estimate/information_criteria.rs and their callers (gam-inference model_comparison, gam-cli run_diagnose) call that definition. public_api_census.py refused exactly these six removals."
   }
 ]

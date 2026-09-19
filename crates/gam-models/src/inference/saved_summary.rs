@@ -261,7 +261,7 @@ mod whitening_gram_tests {
 ///
 /// This is marshalling, not a second summary: the table comes from
 /// `gam_solve::estimate::smooth_term_summary_rows`, the one walk of the
-/// fit's penalty layout that the in-process CLI summary also uses (#2470). Its
+/// fit's penalty layout (#2470), and `gam summary` renders this payload. Its
 /// contract is unchanged — random-effect smooths report `edf` only (their
 /// boundary variance-component test is not a Wald χ²), and penalized smooth
 /// terms get the Wood (2013) rank-truncated Wald statistic and p-value.
