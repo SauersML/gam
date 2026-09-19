@@ -1795,6 +1795,7 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
                 &waypoint,
                 self.rho_prior,
                 inner,
+                EvalMode::ValueOnly,
             )
             .map_err(|error| {
                 AnchoredContinuationRefusal::WaypointEvaluationFailed {
@@ -1957,6 +1958,7 @@ impl<F: CustomFamily + Clone + Send + Sync + 'static> RefinedContinuationPath
                 self.rho,
                 self.rho_prior,
                 inner,
+                EvalMode::ValueOnly,
             )
             .map_err(|error| {
                 AnchoredContinuationRefusal::WaypointEvaluationFailed {
