@@ -92,7 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, unit_measure_deviance_and_log_kernel_from_eta, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -2254,6 +2254,74 @@ mod tests {
         .expect("fixed-Gaussian strict eta likelihood");
         assert_eq!(data_kernel, strict_kernel);
         assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
+    }
+
+    #[test]
+    fn unit_measure_single_pass_objective_is_bit_identical_to_the_two_pass_objective() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(2_026_091_9);
+        let n = 4096usize;
+        let eta = Array1::from_iter((0..n).map(|_| -6.0 + 8.0 * rng.random::<f64>()));
+        let bernoulli_y = eta.mapv(|e| {
+            let p = 1.0 / (1.0 + (-e).exp());
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
+        });
+        let bernoulli_w = Array1::from_iter((0..n).map(|i| if i % 97 == 0 { 0.0 } else { 1.0 }));
+        let trials = Array1::from_iter((0..n).map(|i| (1 + i % 9) as f64));
+        let trials_y = Array1::from_iter(
+            (0..n).map(|i| (rng.random::<f64>() * (trials[i] + 1.0)).floor().min(trials[i]) / trials[i]),
+        );
+        let poisson_eta = eta.mapv(|e| 0.25 * e);
+        let poisson_y = poisson_eta.mapv(|e| (rng.random::<f64>() * 2.0 * e.exp()).floor());
+        let poisson_w = Array1::from_iter((0..n).map(|_| 0.5 + rng.random::<f64>()));
+
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let log = InverseLink::Standard(StandardLink::Log);
+        let binomial = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            logit.clone(),
+        ));
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            log.clone(),
+        ));
+        let cases = [
+            ("bernoulli", &binomial, &logit, &bernoulli_y, &eta, &bernoulli_w),
+            ("binomial trials", &binomial, &logit, &trials_y, &eta, &trials),
+            ("poisson", &poisson, &log, &poisson_y, &poisson_eta, &poisson_w),
+        ];
+        for (label, likelihood, link, y, eta, w) in cases {
+            let deviance =
+                calculate_deviance_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("two-pass deviance");
+            let log_kernel =
+                pirls_data_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view(), deviance)
+                    .expect("two-pass data log-kernel");
+            let (fused_deviance, fused_log_kernel) =
+                unit_measure_deviance_and_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("single-pass objective")
+                    .expect("unit-measure family takes the single pass");
+            assert_eq!(fused_deviance.to_bits(), deviance.to_bits(), "{label} deviance");
+            assert_eq!(fused_log_kernel.to_bits(), log_kernel.to_bits(), "{label} log-kernel");
+        }
+
+        let profiled_gaussian = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(
+            unit_measure_deviance_and_log_kernel_from_eta(
+                poisson_y.view(),
+                &poisson_eta,
+                &profiled_gaussian,
+                &profiled_gaussian.spec.link,
+                poisson_w.view(),
+            )
+            .expect("profiled Gaussian is declined, not rejected")
+            .is_none()
+        );
     }
 
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
