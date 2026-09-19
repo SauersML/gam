@@ -7,7 +7,8 @@ use super::cohort::{
     design_rows, expand_nodes,
 };
 use super::covariance::{
-    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_moments, ridge_profile,
+    DirectionEvidence, DirectionProfile, empirical_bayes_ridge, quartic_direction_moments,
+    ridge_profile,
 };
 use super::family::{
     DecisionIntegral, Directional, EventHistoryFamily, EventHistoryFit, EventHistorySpec,
@@ -3903,6 +3904,12 @@ fn the_latent_block_carries_fixed_loading_priors_and_free_rates() {
     let rate = super::family::rate_from_chart(band, &initial[4]);
     assert!((rate - 0.9_f64.exp()).abs() < 1e-12 * 0.9_f64.exp());
     assert_eq!(latent.nullspace_dims, vec![3, 3]);
+}
+
+/// [`quartic_direction_moments`] as `(ln ∫, E[t²], E[t⁴])`.
+fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64) {
+    let moments = quartic_direction_moments(mu, information, lambda);
+    (moments.log_integral, moments.second, moments.fourth)
 }
 
 #[test]

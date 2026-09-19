@@ -276,13 +276,6 @@ fn direction_information(
     (information, information_slope)
 }
 
-/// [`quartic_direction_moments`] as `(ln ∫, E[t²], E[t⁴])`.
-#[cfg(test)]
-pub(crate) fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64) {
-    let moments = quartic_direction_moments(mu, information, lambda);
-    (moments.log_integral, moments.second, moments.fourth)
-}
-
 /// The moments of one direction's penalised integrand and the channels
 /// their rounding is charged on.
 ///
@@ -294,10 +287,10 @@ pub(crate) fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f
 /// `γ_m · (C_i + |shift| + 1)`, and a ratio of weighted sums carries the
 /// weighted means of those relative roundings of its numerator and
 /// denominator plus the sums' own growth.
-struct DirectionMoments {
-    log_integral: f64,
-    second: f64,
-    fourth: f64,
+pub(crate) struct DirectionMoments {
+    pub(crate) log_integral: f64,
+    pub(crate) second: f64,
+    pub(crate) fourth: f64,
     /// The maximiser of the penalised integrand on `t ≥ 0`.
     mode: f64,
     /// Terms in the quadrature sums.
@@ -377,7 +370,7 @@ fn trapezoidal_moments(
 /// far below roundoff, and it extends to where the integrand has fallen
 /// sixty nats below its peak, which is `e⁻⁶⁰` of it. The sums are formed in
 /// log space.
-fn quartic_direction_moments(mu: f64, information: f64, lambda: f64) -> DirectionMoments {
+pub(crate) fn quartic_direction_moments(mu: f64, information: f64, lambda: f64) -> DirectionMoments {
     let a = mu - lambda;
     let j = information;
     let g = |t: f64| 0.5 * a * t * t - 0.25 * j * t * t * t * t;
