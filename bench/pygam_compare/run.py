@@ -79,22 +79,27 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
     return rss, threads
 
 
-def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+def run_isolated(
+    cmd: list[str],
+    cwd: str,
+    timeout_s: float,
+    memcap_mb: float,
+    env_extra: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run one worker subprocess, policing the safety net; return its record."""
+    """Run one worker subprocess under the pinned thread env and the safety net.
+
+    The worker must print one ``RESULT {json}`` line. Returns that object with
+    the harness fields added: ``status`` (the worker's own, or ``timeout`` /
+    ``memcap`` when the safety net killed the process tree, or ``crash`` when
+    it exited without a RESULT line), ``returncode``, ``proc_wall_s``,
+    ``peak_tree_rss_mb``, ``peak_threads``, ``load_start``/``load_end`` and,
+    for any status but ``ok``, ``stderr_tail``.
+    """
     env = dict(os.environ)
     env.update(THREAD_ENV)
     env.pop("PYTHONPATH", None)
-    cmd = [
-        sys.executable,
-        str(WORKER),
-        lib,
-        cell.family,
-        str(cell.n),
-        cell.design,
-        str(seed),
-    ]
+    if env_extra:
+        env.update(env_extra)
     load_start = os.getloadavg()
     t0 = time.perf_counter()
     proc = subprocess.Popen(
@@ -133,11 +138,6 @@ def run_rep(
         else:
             status = str(rec.get("status", "error"))
     rec.update(
-        lib=lib,
-        family=cell.family,
-        n=cell.n,
-        design=cell.design,
-        seed=seed,
         status=status,
         returncode=proc.returncode,
         proc_wall_s=wall,
@@ -148,6 +148,24 @@ def run_rep(
     )
     if status != "ok":
         rec["stderr_tail"] = stderr[-2000:]
+    return rec
+
+
+def run_rep(
+    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+) -> dict[str, Any]:
+    """Run one worker subprocess, policing the safety net; return its record."""
+    cmd = [
+        sys.executable,
+        str(WORKER),
+        lib,
+        cell.family,
+        str(cell.n),
+        cell.design,
+        str(seed),
+    ]
+    rec = run_isolated(cmd, cwd, timeout_s, memcap_mb)
+    rec.update(lib=lib, family=cell.family, n=cell.n, design=cell.design, seed=seed)
     return rec
 
 
