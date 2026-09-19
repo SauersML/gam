@@ -706,11 +706,11 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         serde_json::from_str(request_json)
             .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let selected_covariance = gam::inference::effects::select_covariance(
-        &fit,
-        gam::inference::effects::CovarianceSource::SmoothingCorrected,
-    )
-    .map_err(|error| error.to_string())?;
+    // The band prices its SEs off the covariance the fit publishes, as
+    // `summary()` and `partial_dependence` do (#2779); a fit whose correction
+    // is typed unavailable reports the conditional band under that label.
+    let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
+        .map_err(|error| error.to_string())?;
     let payload = model.payload();
     let schema = payload
         .data_schema
@@ -1441,6 +1441,13 @@ fn basis_adequacy_dataset_json_impl(
         }
     };
     let family = model.likelihood();
+    // The refit below is a plain standard fit at the frozen spec — no link
+    // wiggle and no latent-coordinate estimation — so its row law is the
+    // canonical family's whenever the likelihood is.
+    let canonical_family =
+        gam::families::fit_orchestration::drivers::basis_adequacy_canonical_family(
+            &family, false, false,
+        );
     let fitted = gam::families::fit_orchestration::drivers::fit_term_collection_forspec(
         standard.data.view(),
         standard.y.view(),
@@ -1457,6 +1464,11 @@ fn basis_adequacy_dataset_json_impl(
         &fitted.design,
         &spec,
         &fitted.fit,
+        &gam::families::fit_orchestration::drivers::BasisAdequacyResponse {
+            y: standard.y.view(),
+            prior_weights: standard.weights.view(),
+            canonical_family,
+        },
     );
     let payload = BasisAdequacyPayload {
         level: gam::families::fit_orchestration::drivers::BASIS_ADEQUACY_NOTE_LEVEL,

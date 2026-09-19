@@ -361,6 +361,13 @@ pub trait IndependentOuterSearch<F> {
     /// A member for one search: its per-fit state fresh, as a newly built family
     /// has it, and its memory choices read from `lane`.
     fn outer_search_member(&self, lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> F;
+
+    /// The starts searched beside the fit's own derived start, each a common
+    /// log-smoothing level `ℓ` for every coordinate (`+∞` names the upper face of
+    /// the search box). The runner projects each into the search box and drops
+    /// duplicates. Empty means the family's surface has no second certified basin
+    /// on record, and the fit runs one search.
+    fn additional_outer_start_levels(&self) -> Vec<f64>;
 }
 
 /// User-defined family contract for multi-block generalized models.
@@ -593,22 +600,6 @@ pub trait CustomFamily {
         OuterDerivativePolicy {
             capability: self.exact_outer_derivative_order(specs, options),
         }
-    }
-
-    /// Family-specific outer seeding policy.
-    ///
-    /// The default preserves the generic custom-family behavior. Families with
-    /// a strong warm start can override this to keep seed screening from
-    /// dominating the fit.
-    fn outer_seed_config(&self, n_params: usize) -> gam_problem::SeedConfig {
-        if n_params == 0 {
-            return gam_problem::SeedConfig::default();
-        }
-        let mut config = gam_problem::SeedConfig::default();
-        config.max_seeds = if n_params <= 4 { 6 } else { 4 };
-        config.seed_budget = 1;
-        config.screen_max_inner_iterations = 2;
-        config
     }
 
     /// The family's members for a parallel multistart, when it has them

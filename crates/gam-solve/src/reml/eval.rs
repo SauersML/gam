@@ -949,6 +949,7 @@ impl<'a> RemlState<'a> {
         // exactly once for value, ρ-derivatives, and τ components alike.
         let pld = bundle.penalty_pseudologdet_original(
             &self.canonical_penalties,
+            &self.penalty_unit_spectra(),
             lambdas_slice,
             self.p,
         )?;
@@ -1044,16 +1045,22 @@ impl<'a> RemlState<'a> {
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     ///
-    /// `rho_domain` is the box the outer arm searched and certified against
-    /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`: a
-    /// proposal outside it is not a model, so it carries zero importance weight
-    /// and is never handed to the inner solve. A railed coordinate's Laplace
-    /// proposal is near-flat, so without this its draws land hundreds of
-    /// log-units past the face, where P-IRLS has no valid minimum to report.
+    /// `continuation` carries the box the outer arm searched and certified
+    /// against (the #2812 resolvability domain). That box is a numerical device,
+    /// not the support of `π(ρ|y)`: a draw outside it is still a model, the one
+    /// its saturated terms' limit fits give, and carries its mass. Such a draw
+    /// is valued by the criterion's affine continuation from the face
+    /// ([`CriterionContinuation`]), so the inner solve is only ever asked for
+    /// `ρ` inside the box, where P-IRLS has a resolvable minimum to report. A
+    /// draw past a literal face, or one the criterion cannot value, refuses the
+    /// diagnostic (or fails the escalation tier) with its reason; no draw is
+    /// dropped.
+    ///
+    /// [`CriterionContinuation`]: crate::estimate::rho_domain::CriterionContinuation
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
-        rho_domain: &(Array1<f64>, Array1<f64>),
+        continuation: &crate::estimate::rho_domain::CriterionContinuation,
         allow_escalation: bool,
         n_samples: Option<usize>,
     ) -> (
@@ -1094,20 +1101,21 @@ impl<'a> RemlState<'a> {
                 );
             }
         };
-        let in_domain = |rho: &Array1<f64>| {
-            rho.iter().enumerate().all(|(k, &value)| {
-                rho_domain.0.get(k).is_none_or(|&lower| value >= lower)
-                    && rho_domain.1.get(k).is_none_or(|&upper| value <= upper)
-            })
+        let cost = |rho: &Array1<f64>| {
+            self.without_persistent_warm_start_store(|| self.compute_cost(rho))
+                .map_err(|error| error.to_string())
+        };
+        // NUTS leapfrog gradients need the criterion value and gradient at the
+        // same rho; compute them through one value+gradient outer evaluation so
+        // the inner PIRLS solve and IFT state are shared by construction.
+        let cost_and_gradient = |rho: &Array1<f64>| {
+            self.without_persistent_warm_start_store(|| self.compute_cost_and_gradient(rho))
+                .map_err(|error| error.to_string())
         };
         let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
-            &|rho| {
-                in_domain(rho)
-                    .then(|| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()))
-                    .flatten()
-            },
+            &|rho| continuation.value(rho, cost, cost_and_gradient),
             n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
@@ -1158,35 +1166,22 @@ impl<'a> RemlState<'a> {
                 Some(escalator.escalate_rho_posterior(
                     final_rho,
                     &outer_hessian,
+                    // The prior is analytic in ρ, so it is read at the draw
+                    // itself; only the LAML part is continued from the face.
                     &mut |rho| {
-                        if !in_domain(rho) {
-                            return None;
-                        }
-                        self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
-                            .and_then(|cost| {
-                                self.rho_prior_distribution_correction(rho)
-                                    .ok()
-                                    .map(|(prior_cost, _)| cost + prior_cost)
-                            })
+                        let laml = continuation.value(rho, cost, cost_and_gradient)?;
+                        let (prior_cost, _) = self
+                            .rho_prior_distribution_correction(rho)
+                            .map_err(|error| error.to_string())?;
+                        Ok(laml + prior_cost)
                     },
                     &mut |rho| {
-                        if !in_domain(rho) {
-                            return None;
-                        }
-                        self.without_persistent_warm_start_store(|| {
-                            // NUTS leapfrog gradients need the criterion value and
-                            // gradient at the same rho; compute them through one
-                            // value+gradient outer evaluation so the inner PIRLS
-                            // solve and IFT state are shared by construction.
-                            self.compute_cost_and_gradient(rho).ok()
-                        })
-                        .and_then(|(cost, gradient)| {
-                            self.rho_prior_distribution_correction(rho)
-                                .ok()
-                                .map(|(prior_cost, prior_gradient)| {
-                                    (cost + prior_cost, gradient + prior_gradient)
-                                })
-                        })
+                        let (laml, gradient) =
+                            continuation.value_and_gradient(rho, cost_and_gradient)?;
+                        let (prior_cost, prior_gradient) = self
+                            .rho_prior_distribution_correction(rho)
+                            .map_err(|error| error.to_string())?;
+                        Ok((laml + prior_cost, gradient + prior_gradient))
                     },
                 ))
             }
