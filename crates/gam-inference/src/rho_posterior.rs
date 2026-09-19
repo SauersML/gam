@@ -85,7 +85,7 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        criterion: &dyn Fn(&Array1<f64>) -> Result<f64, String>,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal> {
         rho_posterior_adequacy(rho_hat, outer_hessian, criterion, n_samples)
@@ -95,8 +95,9 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
-        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
-        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
+                  + Send),
     ) -> RhoPosteriorEscalation {
         escalate_rho_posterior(rho_hat, outer_hessian, criterion, criterion_and_grad)
     }
@@ -214,7 +215,7 @@ pub(crate) fn enumerate_gh_product(
 }
 
 /// One normalized node from the quadrature core: `(ρ, cost, normalized weight,
-/// normalized log-weight)`. Infeasible nodes carry `cost = +∞` and zero weight.
+/// normalized log-weight)`.
 struct NormalizedQuadratureNode {
     rho: Array1<f64>,
     cost: f64,
@@ -225,7 +226,9 @@ struct NormalizedQuadratureNode {
 /// Tier-1 quadrature core (#938): whiten by the exact outer Hessian, enumerate
 /// the Gauss-Hermite product grid, reweight each node by the exact profiled
 /// criterion `exp(−V(ρ_m) + V(ρ̂) + ½‖z_m‖²) × GH-weight`, and normalize.
-/// `rho_posterior_quadrature` is its criterion-closure adapter.
+/// `rho_posterior_quadrature` is its criterion-closure adapter. Every node
+/// carries rule mass, so a node the criterion cannot value, or values as
+/// non-finite, fails the rule rather than being dropped from it.
 fn quadrature_nodes_core<E>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
@@ -234,7 +237,7 @@ fn quadrature_nodes_core<E>(
     mut eval_node: E,
 ) -> Result<(Vec<NormalizedQuadratureNode>, f64), EstimationError>
 where
-    E: FnMut(&Array1<f64>) -> Result<Option<f64>, EstimationError>,
+    E: FnMut(&Array1<f64>) -> Result<f64, String>,
 {
     let k = rho_hat.len();
     if k == 0 || outer_hessian.nrows() != k || outer_hessian.ncols() != k {
@@ -283,32 +286,25 @@ where
             }
             rho[i] += acc;
         }
-        let (cost, log_weight) = match eval_node(&rho)? {
-            Some(cost) if cost.is_finite() => {
-                let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
-                (cost, log_base_weight - cost + cost_hat + half_norm_sq)
-            }
-            // Infeasible node: zero importance weight, never fatal.
-            _ => (f64::INFINITY, f64::NEG_INFINITY),
-        };
-        if log_weight.is_finite() {
-            max_log_weight = max_log_weight.max(log_weight);
+        let cost = eval_node(&rho).map_err(|detail| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "rho_posterior_quadrature: criterion unavailable at node {rho:?}: {detail}"
+            ))
+        })?;
+        if !cost.is_finite() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "rho_posterior_quadrature: criterion at node {rho:?} is {cost}"
+            )));
         }
+        let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
+        let log_weight = log_base_weight - cost + cost_hat + half_norm_sq;
+        max_log_weight = max_log_weight.max(log_weight);
         raw_nodes.push((rho, cost, log_weight));
-    }
-    if !max_log_weight.is_finite() {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "rho_posterior_quadrature: all quadrature nodes were non-finite".to_string(),
-        ));
     }
     let mut total = 0.0;
     let mut scaled = Vec::with_capacity(raw_nodes.len());
     for (_, _, log_weight) in &raw_nodes {
-        let w = if log_weight.is_finite() {
-            (*log_weight - max_log_weight).exp()
-        } else {
-            0.0
-        };
+        let w = (*log_weight - max_log_weight).exp();
         total += w;
         scaled.push(w);
     }
@@ -363,8 +359,8 @@ fn mixture_moments(nodes: &[RhoMixtureNode], k: usize) -> (Array1<f64>, Array2<f
 /// then normalized. The result is `π(ρ|y)` as a discrete mixture of conditional
 /// Gaussians with its moment summary.
 ///
-/// * `criterion` — the `OuterObjective::eval_cost` contract (`None` for
-///   infeasible `ρ`, which gets zero weight). Each call is one warm inner
+/// * `criterion` — the `OuterObjective::eval_cost` contract, or the reason it
+///   cannot value a node, which fails the rule. Each call is one warm inner
 ///   profile solve.
 /// * `nodes_per_axis` — 3 or 5; pass `None` to auto-select (5 for `K ≤ 2`,
 ///   3 for `K ≤ 4` — at most 125 criterion evaluations either way).
@@ -375,19 +371,17 @@ pub(crate) fn rho_posterior_quadrature<F>(
     nodes_per_axis: Option<usize>,
 ) -> Result<RhoPosteriorMixture, EstimationError>
 where
-    F: FnMut(&Array1<f64>) -> Option<f64>,
+    F: FnMut(&Array1<f64>) -> Result<f64, String>,
 {
     let k = rho_hat.len();
     let nodes_per_axis = nodes_per_axis.unwrap_or(if k <= 2 { 5 } else { 3 });
-    let cost_hat = criterion(rho_hat).ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "rho_posterior_quadrature: criterion is infeasible at rho_hat itself".to_string(),
-        )
+    let cost_hat = criterion(rho_hat).map_err(|detail| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "rho_posterior_quadrature: criterion is unavailable at rho_hat itself: {detail}"
+        ))
     })?;
     let (core_nodes, effective_sample_size) =
-        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, |rho| {
-            Ok(criterion(rho))
-        })?;
+        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, criterion)?;
     let nodes: Vec<RhoMixtureNode> = core_nodes
         .into_iter()
         .map(|node| RhoMixtureNode {
@@ -411,8 +405,9 @@ where
 /// `ρ̂` (the `hmc` module's whitening design reused one level up).
 ///
 /// * `criterion_and_grad` — `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, both EXACT
-///   (the engine's LAML value and ρ-gradient); `None` for infeasible `ρ`. Each
-///   call is one warm inner profile solve + IFT gradient.
+///   (the engine's LAML value and ρ-gradient), or the reason it cannot value a
+///   position, which fails the run. Each call is one warm inner profile solve +
+///   IFT gradient.
 /// * `n_samples` — post-warmup draws per chain. Warmup ends when adaptation has
 ///   stabilized and the chains agree.
 /// * `seed` — deterministic seeding: the seed feeds the same splitmix64 chain /
@@ -426,7 +421,7 @@ pub(crate) fn rho_posterior_nuts<F>(
     seed: u64,
 ) -> Result<RhoPosteriorSamples, EstimationError>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     let k = rho_hat.len();
     let config = crate::hmc_io::NutsConfig {
@@ -487,8 +482,8 @@ pub fn escalate_rho_posterior<F, G>(
     criterion_and_grad: G,
 ) -> RhoPosteriorEscalation
 where
-    F: FnMut(&Array1<f64>) -> Option<f64>,
-    G: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<f64, String>,
+    G: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     let k = rho_hat.len();
     if k == 0 {
@@ -536,17 +531,19 @@ where
 /// * `outer_hessian` — the exact outer Hessian `H_ρ` of the criterion at `ρ̂`
 ///   (`K × K`, SPD). The proposal covariance is `H_ρ⁻¹`.
 /// * `criterion` — evaluates the outer criterion `−log π(ρ|y)` (the LAML/REML
-///   objective) at a trial `ρ`; returns `None` for infeasible `ρ`. This is the
+///   objective) at a trial `ρ`, or says why it cannot. This is the
 ///   `OuterObjective::eval_cost` contract, supplied by the caller that retains
-///   (or rebuilds) the objective.
+///   (or rebuilds) the objective. Every draw carries proposal mass, so the
+///   diagnostic is refused at the first draw it cannot value, never formed
+///   from the rest.
 /// * `n_samples` — proposal draw count `M` (defaults to 64 when `None`).
 ///
 /// Returns `Ok(None)` when `K = 0`: there is nothing to grade. Returns the typed
 /// [`RhoPosteriorRefusal`] naming the site when the diagnostic cannot be formed —
 /// an outer Hessian whose shape does not match `ρ̂` or that is not positive
-/// definite, an infeasible or non-finite criterion at `ρ̂`, no proposal draw with a
-/// finite criterion, too few finite weights for the Pareto tail fit, a non-finite
-/// tail shape, or smoothed weights that do not normalize.
+/// definite, an unavailable or non-finite criterion at `ρ̂` or at a draw, a failed
+/// Pareto tail fit, a non-finite tail shape, or smoothed weights that do not
+/// normalize.
 pub fn rho_posterior_adequacy<F>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
@@ -554,7 +551,7 @@ pub fn rho_posterior_adequacy<F>(
     n_samples: Option<usize>,
 ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>
 where
-    F: Fn(&Array1<f64>) -> Option<f64>,
+    F: Fn(&Array1<f64>) -> Result<f64, String>,
 {
     let k = rho_hat.len();
     if k == 0 {
@@ -567,7 +564,8 @@ where
             k,
         });
     }
-    let cost_hat = criterion(rho_hat).ok_or(RhoPosteriorRefusal::CriterionInfeasibleAtRhoHat)?;
+    let cost_hat = criterion(rho_hat)
+        .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtRhoHat { detail })?;
     if !cost_hat.is_finite() {
         return Err(RhoPosteriorRefusal::CriterionNotFiniteAtRhoHat);
     }
@@ -578,7 +576,7 @@ where
 
     let mut rng = DetNormal::new(ADEQUACY_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);
-    for _ in 0..m {
+    for draw in 0..m {
         let z: Array1<f64> = Array1::from_iter((0..k).map(|_| rng.normal()));
         // ρ_m = ρ̂ + L_inv z.
         let mut rho_m = rho_hat.clone();
@@ -591,36 +589,20 @@ where
         }
         let half_norm_sq = 0.5 * z.iter().map(|&v| v * v).sum::<f64>();
         // log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖².
-        let log_w = match criterion(&rho_m) {
-            Some(c) if c.is_finite() => -c + cost_hat + half_norm_sq,
-            // Infeasible / non-finite criterion ⇒ zero importance weight.
-            _ => f64::NEG_INFINITY,
-        };
-        raw_weights.push(log_w);
+        let cost = criterion(&rho_m)
+            .map_err(|detail| RhoPosteriorRefusal::CriterionUnavailableAtDraw { draw, detail })?;
+        if !cost.is_finite() {
+            return Err(RhoPosteriorRefusal::CriterionNotFiniteAtDraw { draw });
+        }
+        raw_weights.push(-cost + cost_hat + half_norm_sq);
     }
 
     // Stabilize and exponentiate: subtract the max log-weight (cancels in the
     // self-normalized weights and the Pareto fit).
-    let max_lw = raw_weights
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
-    if !max_lw.is_finite() {
-        return Err(RhoPosteriorRefusal::NoFiniteProposal);
-    }
-    let weights: Vec<f64> = raw_weights
-        .iter()
-        .map(|&lw| {
-            if lw.is_finite() {
-                (lw - max_lw).exp()
-            } else {
-                0.0
-            }
-        })
-        .collect();
+    let max_lw = raw_weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = raw_weights.iter().map(|&lw| (lw - max_lw).exp()).collect();
 
-    let psis = pareto_smooth_weights(&weights).ok_or(RhoPosteriorRefusal::TooFewFiniteWeights)?;
+    let psis = pareto_smooth_weights(&weights).ok_or(RhoPosteriorRefusal::TailFitUnavailable)?;
     let k_hat = psis.k_hat;
     if !k_hat.is_finite() {
         return Err(RhoPosteriorRefusal::TailShapeNotFinite);
@@ -686,7 +668,7 @@ mod tests {
                     q += d[i] * h[[i, j]] * d[j];
                 }
             }
-            Some(0.5 * q)
+            Ok(0.5 * q)
         };
         let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(256))
             .expect("diagnostic formed")
@@ -718,7 +700,7 @@ mod tests {
         // logarithmically, so far in the tail π(ρ)/proposal(ρ) → ∞.
         let crit = |rho: &Array1<f64>| {
             let r = rho[0];
-            Some((1.0 + r * r).ln())
+            Ok((1.0 + r * r).ln())
         };
         let graded = rho_posterior_adequacy(&rho_hat, &h, crit, Some(512))
             .expect("diagnostic formed")
@@ -762,7 +744,7 @@ mod tests {
         let h = array![[1.0]];
         let crit = |rho: &Array1<f64>| {
             let d = rho[0] - 1.0;
-            Some(0.5 * d * d)
+            Ok(0.5 * d * d)
         };
         let a = rho_posterior_adequacy(&rho_hat, &h, crit, Some(64))
             .expect("a formed")
@@ -811,7 +793,7 @@ mod tests {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
         assert!(matches!(
-            rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), None),
+            rho_posterior_adequacy(&rho_hat, &h, |_| Ok(0.0), None),
             Ok(None)
         ));
     }
@@ -839,7 +821,7 @@ mod tests {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(whitening_factor_from_outer_hessian(&h).is_err());
-        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Some(0.0), Some(64))
+        let refusal = rho_posterior_adequacy(&rho_hat, &h, |_| Ok(0.0), Some(64))
             .expect_err("a singular outer Hessian must be refused");
         assert!(
             matches!(refusal, RhoPosteriorRefusal::HessianNotPositiveDefinite { .. }),

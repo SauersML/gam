@@ -43,10 +43,11 @@ pub(crate) struct RemlOuterGpuInput {
     pub gradient_tolerance: GradientTolerance,
     /// Hard cap on outer BFGS iterations.
     pub max_iterations: usize,
-    /// Relative improvement floor of the walk's cost-stall stop: an accepted
-    /// step buys nothing when it improves the best value by at most
-    /// `rel_tol·(1 + |best|)`. The host BFGS arm derives the same floor (#2817).
-    pub cost_stall_rel_tol: f64,
+    /// Absolute resolution of the walk's cost-stall stop: an accepted step
+    /// buys nothing when it improves the best value by at most this much. The
+    /// host BFGS arm uses the same criterion resolution, `τ_stat = 1/(2n)`, or
+    /// 0 when the route declares no size (#2817).
+    pub cost_stall_resolution: f64,
     /// Projected-gradient band a cost stall must clear to count as stationary
     /// rather than as a non-converged floor. Mirrors the host arm's band.
     pub cost_stall_projected_grad_tol: f64,
@@ -175,6 +176,13 @@ where
         EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
     })?;
     let bounds = crate::rho_optimizer::outer_bounds(&input.bounds.0, &input.bounds.1)?;
+    // opt's cost stall takes its improvement floor relative to the incumbent,
+    // `rel_tol·(1 + |best|)`, and has no absolute form. Expressed at the seed,
+    // the floor equals the criterion resolution where the walk starts; it
+    // moves with `(1 + |best|)/(1 + |seed|)` as the walk descends, which on a
+    // walk that ends inside the stall window is the ratio of two nearly equal
+    // costs.
+    let cost_stall_rel_tol = input.cost_stall_resolution / (1.0 + input.seed_objective.abs());
     let seed_sample = FirstOrderSample {
         value: input.seed_objective,
         gradient: input.seed_gradient,
@@ -209,7 +217,7 @@ where
         // iteration count (#2817). Whether that point is stationary rides on its
         // termination, below.
         .with_cost_stall(CostStallConfig::new(
-            input.cost_stall_rel_tol,
+            cost_stall_rel_tol,
             crate::rho_optimizer::COST_STALL_WINDOW,
             input.cost_stall_projected_grad_tol,
         ));
@@ -270,7 +278,7 @@ mod tests {
             bounds: (Array1::<f64>::zeros(0), Array1::<f64>::zeros(0)),
             gradient_tolerance: GradientTolerance::absolute(1.0e-6),
             max_iterations: 10,
-            cost_stall_rel_tol: 1.0e-7,
+            cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
             axis_step_caps: None,
             admission: dummy_admission(0),
@@ -302,7 +310,7 @@ mod tests {
             bounds: (Array1::from_elem(4, -10.0), Array1::from_elem(4, 10.0)),
             gradient_tolerance: GradientTolerance::absolute(1.0e-8),
             max_iterations: 100,
-            cost_stall_rel_tol: 1.0e-7,
+            cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
             axis_step_caps: None,
             admission: dummy_admission(4),
@@ -331,7 +339,7 @@ mod tests {
             bounds: (Array1::from(vec![-1.0]), Array1::from(vec![1.0])),
             gradient_tolerance: GradientTolerance::absolute(1.0e-8),
             max_iterations: 10,
-            cost_stall_rel_tol: 1.0e-7,
+            cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
             axis_step_caps: None,
             admission: dummy_admission(1),

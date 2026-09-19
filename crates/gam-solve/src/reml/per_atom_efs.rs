@@ -219,16 +219,28 @@ pub struct PerAtomEfsConfig {
     /// Per-coordinate lower/upper bounds on ρ.
     pub lower: Array1<f64>,
     pub upper: Array1<f64>,
+    /// Absolute resolution of the criterion, `τ_stat = 1/(2n)`, or 0 when the
+    /// route declares no size: an improvement no larger than this is not
+    /// progress.
+    pub criterion_resolution: f64,
 }
 
 impl PerAtomEfsConfig {
-    /// Build from the bounds and budget the generic outer config supplies.
-    pub fn new(tolerance: f64, max_iter: usize, lower: Array1<f64>, upper: Array1<f64>) -> Self {
+    /// Build from the bounds, budget and criterion resolution the generic
+    /// outer config supplies.
+    pub fn new(
+        tolerance: f64,
+        max_iter: usize,
+        lower: Array1<f64>,
+        upper: Array1<f64>,
+        criterion_resolution: f64,
+    ) -> Self {
         Self {
             tolerance,
             max_iter,
             lower,
             upper,
+            criterion_resolution,
         }
     }
 }
@@ -484,10 +496,9 @@ pub fn run_per_atom_efs(
     // The progress certificate the dense fixed-point walk carries (#2817): a
     // window that bought no resolved improvement and no smaller step since the
     // previous one ends the walk as a stall, instead of the iteration count.
-    // Floor and window are the ones the outer cost-stall guard derives from the
-    // same outer tolerance.
+    // Resolution and window are the ones the outer cost-stall guard uses.
     let mut progress = crate::rho_optimizer::FixedPointProgress::new(
-        (cfg.tolerance * 1.0e-2).max(crate::rho_optimizer::COST_STALL_REL_TOL_FLOOR),
+        cfg.criterion_resolution,
         crate::rho_optimizer::COST_STALL_WINDOW,
     );
 
@@ -736,6 +747,7 @@ mod tests {
             200,
             Array1::from_elem(dim, -50.0),
             Array1::from_elem(dim, 50.0),
+            0.0,
         )
     }
 

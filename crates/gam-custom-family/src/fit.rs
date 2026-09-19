@@ -2884,7 +2884,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_require_measured_psd(need_outer_hessian)
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
-        .with_rel_cost_tolerance(options.outer_rel_cost_tol)
         .with_max_iter(options.outer_max_iter)
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
