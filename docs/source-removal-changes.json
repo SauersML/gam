@@ -1927,5 +1927,13 @@
     ],
     "reason": "gam#3037: the flexible survival location-scale time block declared its coordinate cone and, appended to it by append_linear_constraints, one derivative-guard row per training row. The cone implies every one of those rows (the I-spline derivative design is non-negative entrywise, every column carrying it is bounded at zero, and the offsets encode the guard), so the block now declares the cone alone. The flexible path was its only caller, so the concatenation helper is deleted with it.",
     "evidence": "At the base, git grep finds append_linear_constraints only in crates/gam-models/src/survival/location_scale/time_block.rs: its declaration and its one call in prepare_identified_time_block's flexible path, which this commit replaces with the cone. No bench, script, example or Python file names it. source_removal_guard.py, run without this acknowledgement, refused exactly this one identity (public, 0 production occurrences)."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
+    "items": [
+      "crates/gam-models/src/bms/estimated_latent_law.rs:fn:closed_form_survival_anchor_log_probabilities"
+    ],
+    "reason": "gam#2926 (moving-law certificate at the fitted law's anchor): the certificate scores a rigid survival row at the intercept the fit solved on its own law. closed_form_survival_anchor_log_probabilities(q, b, law) computed the closed-form intercept q·sqrt(1 + b²) itself, which is the fit's anchor only when the fitted law is Gaussian. It becomes survival_anchor_log_probabilities(alpha, b, law), which takes the intercept: calibration.rs's rigid arm passes solve_anchor(q, s·b, fitted law), the root the fit solved (#2983), or the closed form on the Gaussian law, where the two coincide.",
+    "evidence": "source_removal_guard.py and public_api_census.py each reported exactly this one identity at base de9b43848b (gateDr4 on acl42), and both passed with this entry at base 136b8383a5 (gateD5). git grep -w closed_form_survival_anchor_log_probabilities finds no occurrence under crates, src or tests at the head tree; survival_anchor_log_probabilities is declared at crates/gam-models/src/bms/estimated_latent_law.rs:253 and called at moving_law_rule.rs:1580, survival/marginal_slope/calibration.rs:197 and timepoint_exact/law_node_tests.rs:490, whose the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926 pins the intercept it takes."
   }
 ]
