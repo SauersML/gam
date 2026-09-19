@@ -1,0 +1,56 @@
+[7s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.2920e163). This indicates a numerical instability.
+[7s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.9038e102). This indicates a numerical instability.
+[7s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3258e106). This indicates a numerical instability.
+[7s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.8270e88). This indicates a numerical instability.
+[7s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.6211e200). This indicates a numerical instability.
+[8s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.5456e236). This indicates a numerical instability.
+[8s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -9.8893e178). This indicates a numerical instability.
+[9s] P-IRLS could not certify a valid minimum: LM step search exhausted (gradient norm 2.189e4, iter 48 of configured budget 300)
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.2854e95). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1891e192). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0261e192). This indicates a numerical instability.
+[19s] P-IRLS could not certify a valid minimum: max iterations reached (gradient norm 1.958e6, iter 300 of configured budget 300)
+[19s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.3398e254). This indicates a numerical instability.
+[20s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3612e181). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.4284e154). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.3116e98). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.2175e100). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.9442e84). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.4476e191). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1830e222). This indicates a numerical instability.
+[5m 57s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1992e168). This indicates a numerical instability.
+[6m 05s] P-IRLS could not certify a valid minimum: LM step search exhausted (gradient norm 8.319e3, iter 19 of configured budget 300)
+[6m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.8345e91). This indicates a numerical instability.
+[6m 05s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.3542e183). This indicates a numerical instability.
+[6m 06s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0335e180). This indicates a numerical instability.
+[6m 16s] P-IRLS could not certify a valid minimum: max iterations reached (gradient norm 5.807e8, iter 300 of configured budget 300)
+[6m 16s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.0901e281). This indicates a numerical instability.
+[6m 16s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.2101e242). This indicates a numerical instability.
+[6m 16s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -9.1749e173). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.6657e178). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.9912e114). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.5716e115). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.4053e98). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.9673e219). This indicates a numerical instability.
+[10m 43s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1470e257). This indicates a numerical instability.
+[10m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.0364e195). This indicates a numerical instability.
+[10m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.2808e33). This indicates a numerical instability.
+[10m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3188e104). This indicates a numerical instability.
+[10m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.1987e210). This indicates a numerical instability.
+[10m 44s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.1056e211). This indicates a numerical instability.
+[10m 45s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3146e276). This indicates a numerical instability.
+[10m 45s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -4.9100e198). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.0906e175). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.6378e112). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.4811e114). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -3.0087e94). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.8524e218). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -5.1112e254). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.2344e190). This indicates a numerical instability.
+[14m 34s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3802e33). This indicates a numerical instability.
+[14m 35s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -6.4726e104). This indicates a numerical instability.
+[14m 35s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -1.3637e210). This indicates a numerical instability.
+[14m 35s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -8.5700e207). This indicates a numerical instability.
+[14m 41s] P-IRLS could not certify a valid minimum: max iterations reached (gradient norm 3.041e8, iter 300 of configured budget 300)
+[14m 41s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.7211e274). This indicates a numerical instability.
+[14m 41s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -7.2515e194). This indicates a numerical instability.

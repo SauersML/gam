@@ -1,0 +1,75 @@
+== after 5 reps, secs 100
+ pyGAM default lam=0.6        P(p<.05)=0.200  P(p<.01)=0.000  median p=0.327
+ pyGAM gridsearch(GCV)        P(p<.05)=0.000  P(p<.01)=0.000  median p=0.290
+ gamfit p_value_corrected     P(p<.05)=0.000  P(p<.01)=0.000  median p=0.547
+ gamfit p_value_conditional   P(p<.05)=0.000  P(p<.01)=0.000  median p=0.388
+== after 10 reps, secs 203
+ pyGAM default lam=0.6        P(p<.05)=0.100  P(p<.01)=0.000  median p=0.651
+ pyGAM gridsearch(GCV)        P(p<.05)=0.000  P(p<.01)=0.000  median p=0.637
+ gamfit p_value_corrected     P(p<.05)=0.000  P(p<.01)=0.000  median p=0.542
+ gamfit p_value_conditional   P(p<.05)=0.000  P(p<.01)=0.000  median p=0.396
+== after 15 reps, secs 318
+ pyGAM default lam=0.6        P(p<.05)=0.067  P(p<.01)=0.000  median p=0.683
+ pyGAM gridsearch(GCV)        P(p<.05)=0.000  P(p<.01)=0.000  median p=0.722
+ gamfit p_value_corrected     P(p<.05)=0.067  P(p<.01)=0.000  median p=0.540
+ gamfit p_value_conditional   P(p<.05)=0.067  P(p<.01)=0.067  median p=0.388
+== after 20 reps, secs 419
+ pyGAM default lam=0.6        P(p<.05)=0.050  P(p<.01)=0.000  median p=0.680
+ pyGAM gridsearch(GCV)        P(p<.05)=0.000  P(p<.01)=0.000  median p=0.713
+ gamfit p_value_corrected     P(p<.05)=0.050  P(p<.01)=0.000  median p=0.538
+ gamfit p_value_conditional   P(p<.05)=0.050  P(p<.01)=0.050  median p=0.385
+== after 25 reps, secs 519
+ pyGAM default lam=0.6        P(p<.05)=0.080  P(p<.01)=0.000  median p=0.677
+ pyGAM gridsearch(GCV)        P(p<.05)=0.040  P(p<.01)=0.000  median p=0.704
+ gamfit p_value_corrected     P(p<.05)=0.040  P(p<.01)=0.000  median p=0.454
+ gamfit p_value_conditional   P(p<.05)=0.080  P(p<.01)=0.040  median p=0.264
+== after 30 reps, secs 613
+ pyGAM default lam=0.6        P(p<.05)=0.100  P(p<.01)=0.033  median p=0.592
+ pyGAM gridsearch(GCV)        P(p<.05)=0.067  P(p<.01)=0.033  median p=0.613
+ gamfit p_value_corrected     P(p<.05)=0.067  P(p<.01)=0.000  median p=0.438
+ gamfit p_value_conditional   P(p<.05)=0.100  P(p<.01)=0.033  median p=0.252
+== after 35 reps, secs 697
+ pyGAM default lam=0.6        P(p<.05)=0.086  P(p<.01)=0.029  median p=0.527
+ pyGAM gridsearch(GCV)        P(p<.05)=0.057  P(p<.01)=0.029  median p=0.508
+ gamfit p_value_corrected     P(p<.05)=0.086  P(p<.01)=0.000  median p=0.440
+ gamfit p_value_conditional   P(p<.05)=0.114  P(p<.01)=0.029  median p=0.255
+== after 40 reps, secs 786
+ pyGAM default lam=0.6        P(p<.05)=0.100  P(p<.01)=0.025  median p=0.519
+ pyGAM gridsearch(GCV)        P(p<.05)=0.075  P(p<.01)=0.025  median p=0.503
+ gamfit p_value_corrected     P(p<.05)=0.100  P(p<.01)=0.000  median p=0.438
+ gamfit p_value_conditional   P(p<.05)=0.150  P(p<.01)=0.025  median p=0.254
+== after 45 reps, secs 877
+ pyGAM default lam=0.6        P(p<.05)=0.089  P(p<.01)=0.022  median p=0.527
+ pyGAM gridsearch(GCV)        P(p<.05)=0.067  P(p<.01)=0.022  median p=0.508
+ gamfit p_value_corrected     P(p<.05)=0.089  P(p<.01)=0.000  median p=0.454
+ gamfit p_value_conditional   P(p<.05)=0.133  P(p<.01)=0.022  median p=0.260
+== after 50 reps, secs 962
+ pyGAM default lam=0.6        P(p<.05)=0.080  P(p<.01)=0.020  median p=0.528
+ pyGAM gridsearch(GCV)        P(p<.05)=0.060  P(p<.01)=0.020  median p=0.511
+ gamfit p_value_corrected     P(p<.05)=0.080  P(p<.01)=0.000  median p=0.448
+ gamfit p_value_conditional   P(p<.05)=0.120  P(p<.01)=0.020  median p=0.257
+== after 55 reps, secs 1049
+ pyGAM default lam=0.6        P(p<.05)=0.073  P(p<.01)=0.018  median p=0.590
+ pyGAM gridsearch(GCV)        P(p<.05)=0.055  P(p<.01)=0.018  median p=0.564
+ gamfit p_value_corrected     P(p<.05)=0.073  P(p<.01)=0.000  median p=0.441
+ gamfit p_value_conditional   P(p<.05)=0.109  P(p<.01)=0.018  median p=0.255
+== after 60 reps, secs 1131
+ pyGAM default lam=0.6        P(p<.05)=0.067  P(p<.01)=0.017  median p=0.547
+ pyGAM gridsearch(GCV)        P(p<.05)=0.050  P(p<.01)=0.017  median p=0.518
+ gamfit p_value_corrected     P(p<.05)=0.083  P(p<.01)=0.000  median p=0.437
+ gamfit p_value_conditional   P(p<.05)=0.117  P(p<.01)=0.017  median p=0.254
+== after 65 reps, secs 1226
+ pyGAM default lam=0.6        P(p<.05)=0.062  P(p<.01)=0.015  median p=0.527
+ pyGAM gridsearch(GCV)        P(p<.05)=0.046  P(p<.01)=0.015  median p=0.515
+ gamfit p_value_corrected     P(p<.05)=0.077  P(p<.01)=0.000  median p=0.438
+ gamfit p_value_conditional   P(p<.05)=0.123  P(p<.01)=0.015  median p=0.254
+== after 70 reps, secs 1289
+ pyGAM default lam=0.6        P(p<.05)=0.057  P(p<.01)=0.014  median p=0.519
+ pyGAM gridsearch(GCV)        P(p<.05)=0.043  P(p<.01)=0.014  median p=0.529
+ gamfit p_value_corrected     P(p<.05)=0.071  P(p<.01)=0.000  median p=0.441
+ gamfit p_value_conditional   P(p<.05)=0.114  P(p<.01)=0.014  median p=0.254
+== after 75 reps, secs 1352
+ pyGAM default lam=0.6        P(p<.05)=0.053  P(p<.01)=0.013  median p=0.511
+ pyGAM gridsearch(GCV)        P(p<.05)=0.040  P(p<.01)=0.013  median p=0.538
+ gamfit p_value_corrected     P(p<.05)=0.080  P(p<.01)=0.000  median p=0.438
+ gamfit p_value_conditional   P(p<.05)=0.133  P(p<.01)=0.027  median p=0.254
