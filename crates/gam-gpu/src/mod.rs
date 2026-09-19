@@ -138,6 +138,10 @@ pub struct GpuDecision {
     pub kernel: GpuKernel,
     pub use_gpu: bool,
     pub reason: &'static str,
+    /// The capability the requested model needs and the device kernel lacks,
+    /// when that is why the device kernel was not selected
+    /// ([`GpuEligibility::CapabilityMissing`]).
+    pub missing_capability: Option<&'static str>,
 }
 
 static POLICY: OnceLock<GpuPolicy> = OnceLock::new();
@@ -200,6 +204,12 @@ pub fn cuda_selected() -> Result<bool, GpuError> {
 pub enum GpuEligibility {
     /// Vendor backend is not compiled into this build for this kernel.
     BackendNotCompiled,
+    /// The device kernel does not compute the requested model: `missing`
+    /// names the capability the model needs that the kernel's declaration
+    /// lacks. Only the CPU kernel computes this model's quantity, so `auto`
+    /// selects it and `required` is refused. This is a property of the kernel
+    /// and the model, never of the host, so no runtime probe is consulted.
+    CapabilityMissing { missing: &'static str },
     /// Backend is compiled in, but the workload (n, m, ...) is below the
     /// runtime threshold for this kernel.
     WorkloadBelowThreshold,
@@ -236,37 +246,89 @@ pub fn decide(
     // compile-time eligibility.  Without this, `decide()` would claim
     // GPU when the kernel is "compiled in" even though lossless resolution
     // observed typed absence. Probe faults are returned rather than being
-    // hidden behind the CPU route.
-    let runtime_available = device_runtime::GpuRuntime::resolve(policy)?.is_some();
+    // hidden behind the CPU route. The stages are ordered by what they cost to
+    // evaluate — capability and build, then size, then the device — and the
+    // device is probed only when the answer still depends on it. A kernel that
+    // does not compute the model, or is not compiled in, is never selected
+    // under any policy, and `auto` never selects a kernel below its size
+    // threshold, so none of those creates a CUDA context: under `required` the
+    // missing capability or backend is the refusal, not whatever device the
+    // host happens to lack.
+    let runtime_available = match (policy, eligibility) {
+        (_, GpuEligibility::CapabilityMissing { .. } | GpuEligibility::BackendNotCompiled)
+        | (GpuPolicy::Off, _)
+        | (GpuPolicy::Auto, GpuEligibility::WorkloadBelowThreshold) => false,
+        (GpuPolicy::Auto, GpuEligibility::Eligible)
+        | (
+            GpuPolicy::Required,
+            GpuEligibility::WorkloadBelowThreshold | GpuEligibility::Eligible,
+        ) => device_runtime::GpuRuntime::resolve(policy)?.is_some(),
+    };
+    Ok(decide_under(policy, runtime_available, kernel, eligibility))
+}
+
+/// The decision [`decide`] makes, as a function of the policy, whether a
+/// runtime resolved, and the kernel's eligibility for the requested model.
+pub fn decide_under(
+    policy: GpuPolicy,
+    runtime_available: bool,
+    kernel: GpuKernel,
+    eligibility: GpuEligibility,
+) -> GpuDecision {
     let (use_gpu, reason) = match (policy, eligibility) {
         (GpuPolicy::Off, _) => (false, "cpu-gpu-policy-off"),
         (GpuPolicy::Auto, GpuEligibility::BackendNotCompiled) => {
             (false, "cpu-gpu-backend-not-compiled")
         }
-        (GpuPolicy::Auto, _) if !runtime_available => (false, "cpu-gpu-runtime-unavailable"),
+        (GpuPolicy::Auto, GpuEligibility::CapabilityMissing { .. }) => {
+            (false, "cpu-gpu-kernel-lacks-capability")
+        }
+        // The reason names the first stage that fails: size before the device.
         (GpuPolicy::Auto, GpuEligibility::WorkloadBelowThreshold) => {
             (false, "cpu-workload-below-gpu-threshold")
+        }
+        (GpuPolicy::Auto, GpuEligibility::Eligible) if !runtime_available => {
+            (false, "cpu-gpu-runtime-unavailable")
         }
         (GpuPolicy::Auto, GpuEligibility::Eligible) => (true, "gpu-auto-supported"),
         (GpuPolicy::Required, GpuEligibility::BackendNotCompiled) => {
             (false, "cpu-gpu-required-unsupported")
+        }
+        (GpuPolicy::Required, GpuEligibility::CapabilityMissing { .. }) => {
+            (false, "cpu-gpu-required-capability-missing")
         }
         // Under `required`, the workload-threshold gate is intentionally bypassed:
         // the user explicitly asked for GPU regardless of size.
         (GpuPolicy::Required, GpuEligibility::WorkloadBelowThreshold)
         | (GpuPolicy::Required, GpuEligibility::Eligible) => (true, "gpu-required-supported"),
     };
-    Ok(GpuDecision {
+    let missing_capability = match eligibility {
+        GpuEligibility::CapabilityMissing { missing } => Some(missing),
+        GpuEligibility::BackendNotCompiled
+        | GpuEligibility::WorkloadBelowThreshold
+        | GpuEligibility::Eligible => None,
+    };
+    GpuDecision {
         policy,
         kernel,
         use_gpu,
         reason,
-    })
+        missing_capability,
+    }
 }
 
 impl GpuDecision {
     pub fn require_supported(&self) -> Result<(), String> {
         if self.policy == GpuPolicy::Required && !self.use_gpu {
+            if let Some(missing) = self.missing_capability {
+                return Err(format!(
+                    "gpu=required requested kernel '{}', which does not compute this model: \
+                     the model needs {missing}, which the device kernel does not implement \
+                     ({}). Use gpu=\"auto\" or gpu=\"off\" to run it on the CPU kernel",
+                    self.kernel.as_str(),
+                    self.reason
+                ));
+            }
             return Err(format!(
                 "gpu=required requested kernel '{}' but no supported device backend is available ({})",
                 self.kernel.as_str(),
@@ -278,11 +340,12 @@ impl GpuDecision {
 
     pub fn log(self) {
         log::debug!(
-            "[GPU backend] kernel={} policy={} selected={} reason={}",
+            "[GPU backend] kernel={} policy={} selected={} reason={} missing_capability={}",
             self.kernel.as_str(),
             self.policy.as_str(),
             self.use_gpu,
-            self.reason
+            self.reason,
+            self.missing_capability.unwrap_or("none")
         );
     }
 }
@@ -465,9 +528,93 @@ mod policy_tests {
             kernel: GpuKernel::DenseXtWX,
             use_gpu: false,
             reason: "gpu-required-unsupported",
+            missing_capability: None,
         };
         let err = decision.require_supported().unwrap_err();
         assert!(err.contains("dense-xtwx"));
         assert!(err.contains("gpu=required"));
+    }
+
+    /// gam#3000: a device kernel that does not compute the requested model is
+    /// never selected, on any host, and `required` is refused naming what the
+    /// model needs. The capability outranks every host fact: with a runtime
+    /// or without one, the decision and its reason are the same.
+    #[test]
+    fn a_kernel_lacking_the_model_capability_is_never_selected_3000() {
+        let missing = "the discrete-grid latent integral";
+        let eligibility = GpuEligibility::CapabilityMissing { missing };
+        for runtime_available in [false, true] {
+            let auto = decide_under(
+                GpuPolicy::Auto,
+                runtime_available,
+                GpuKernel::MarginalSlopeRows,
+                eligibility,
+            );
+            assert!(!auto.use_gpu);
+            assert_eq!(auto.reason, "cpu-gpu-kernel-lacks-capability");
+            assert_eq!(auto.missing_capability, Some(missing));
+            assert!(auto.require_supported().is_ok());
+
+            let required = decide_under(
+                GpuPolicy::Required,
+                runtime_available,
+                GpuKernel::MarginalSlopeRows,
+                eligibility,
+            );
+            assert!(!required.use_gpu);
+            assert_eq!(required.reason, "cpu-gpu-required-capability-missing");
+            let refusal = required.require_supported().unwrap_err();
+            assert!(refusal.contains("gpu=required"), "{refusal}");
+            assert!(refusal.contains("marginal-slope-rows"), "{refusal}");
+            assert!(refusal.contains(missing), "{refusal}");
+
+            let off = decide_under(
+                GpuPolicy::Off,
+                runtime_available,
+                GpuKernel::MarginalSlopeRows,
+                eligibility,
+            );
+            assert!(!off.use_gpu);
+            assert_eq!(off.reason, "cpu-gpu-policy-off");
+            assert!(off.require_supported().is_ok());
+        }
+        // The eligible model on the same kernel still reaches the device.
+        let eligible = decide_under(
+            GpuPolicy::Auto,
+            true,
+            GpuKernel::MarginalSlopeRows,
+            GpuEligibility::Eligible,
+        );
+        assert!(eligible.use_gpu);
+        assert_eq!(eligible.missing_capability, None);
+    }
+
+    /// The `auto` reason names the first stage that fails, in the order the
+    /// stages cost to evaluate: capability, size, then the device. A size
+    /// refusal reads the same with or without a runtime, because `decide`
+    /// does not probe for it.
+    #[test]
+    fn auto_reasons_follow_capability_size_device_order_3000() {
+        let kernel = GpuKernel::MarginalSlopeRows;
+        for runtime_available in [false, true] {
+            let below = decide_under(
+                GpuPolicy::Auto,
+                runtime_available,
+                kernel,
+                GpuEligibility::WorkloadBelowThreshold,
+            );
+            assert!(!below.use_gpu);
+            assert_eq!(below.reason, "cpu-workload-below-gpu-threshold");
+            let required_below = decide_under(
+                GpuPolicy::Required,
+                runtime_available,
+                kernel,
+                GpuEligibility::WorkloadBelowThreshold,
+            );
+            assert!(required_below.use_gpu, "required bypasses the size stage");
+        }
+        let no_device = decide_under(GpuPolicy::Auto, false, kernel, GpuEligibility::Eligible);
+        assert!(!no_device.use_gpu);
+        assert_eq!(no_device.reason, "cpu-gpu-runtime-unavailable");
     }
 }

@@ -29,10 +29,11 @@ to first call and raise a clean ``ImportError`` if torch is missing.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from types import ModuleType
 from typing import Any
 
 
-def _require_torch() -> Any:
+def _require_torch() -> ModuleType:
     try:
         import torch
     except ImportError as err:
@@ -191,9 +192,12 @@ class PenaltyDescriptor(ABC):
             return NotImplemented
         return CompositePenalty(self, other)
 
-    def __radd__(self, other: "PenaltyDescriptor") -> "PenaltyDescriptor":
+    def __radd__(self, other: "PenaltyDescriptor | int") -> "PenaltyDescriptor":
+        # ``sum(penalties)`` starts from the int ``0``.
         if other == 0:
             return self
+        if not isinstance(other, PenaltyDescriptor):
+            return NotImplemented
         return self.__add__(other)
 
 
