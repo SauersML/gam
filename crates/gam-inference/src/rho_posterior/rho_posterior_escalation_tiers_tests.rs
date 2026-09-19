@@ -58,7 +58,7 @@ fn quadrature_reproduces_laplace_moments_on_gaussian_quadratic() {
     let mixture = rho_posterior_quadrature(
         &rho_hat,
         &h,
-        |rho| Some(gaussian_quadratic(rho, &rho_hat, &h)),
+        |rho| Ok(gaussian_quadratic(rho, &rho_hat, &h)),
         None,
     )
     .expect("tier-1 quadrature on a Gaussian quadratic must succeed");
@@ -110,7 +110,7 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
             &rho_hat,
             &h,
             |rho: &Array1<f64>| {
-                Some((
+                Ok((
                     gaussian_quadratic(rho, &rho_hat, &h),
                     gaussian_quadratic_grad(rho, &rho_hat, &h),
                 ))

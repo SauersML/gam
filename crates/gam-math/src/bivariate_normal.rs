@@ -68,10 +68,12 @@
 //!   increases the error.
 //! - **Relative accuracy.** The core does not claim it for `Φ₂ ≲ ε`. The sum `Φ(h)Φ(k) + T` cancels when `ρ < 0` in
 //!   the lower tails, and so do the `ρ < −½` difference and the negative-correlation pieces of `ρ > ½`.
-//!   [`bivariate_normal_cdf_with_complement_bounded`] certifies a relative bound where `ρ ≤ 0` and both constraints are
-//!   active, through the positive form of `positive_form`.
+//!   [`bivariate_normal_cdf_with_complement_bounded`] and [`bivariate_normal_interval_probability`] take the apex tree
+//!   of `apex_form` instead: one route with an a-priori bound that scales with the value, at plain-evaluation cost.
 
-mod positive_form;
+mod apex_form;
+#[cfg(test)]
+mod positive_form_tests;
 
 use crate::double_double::SMALLEST_SUBNORMAL;
 use crate::probability::{normal_cdf, normal_pdf};
@@ -150,24 +152,12 @@ pub struct BivariateNormalPartials {
     pub d_rho_rounding: f64,
 }
 
-/// Which guarantee a [`BoundedProbability`]'s `rounding` carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoundingContract {
-    /// The value and its rounding come from a certified enclosure of `Φ₂` with a positive lower end, so `rounding`
-    /// scales with the value and `rounding/value` bounds its relative error.
-    Relative,
-    /// `rounding` is [`BIVARIATE_NORMAL_CDF_ERROR_BOUND`], the core's absolute contract. It certifies no relative digit
-    /// of a value at or below it.
-    Absolute,
-}
-
 /// A probability with a bound on its error at the computed arguments.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoundedProbability {
     pub value: f64,
-    /// A bound on `|value − Φ₂|`, absolute whatever `contract` says.
+    /// A bound on `|value − Φ₂|`.
     pub rounding: f64,
-    pub contract: RoundingContract,
 }
 
 /// The largest `|asin ρ|` the core rule evaluates: `asin ½`.
@@ -435,21 +425,16 @@ pub fn bivariate_normal_cdf_with_complement(
     ))
 }
 
-/// `Φ₂(h, k; ρ)` from a caller-resolved `1 − ρ²`, as in [`bivariate_normal_cdf_with_complement`], with the smaller of
-/// two derived error bounds.
+/// `Φ₂(h, k; ρ)` from a caller-resolved `1 − ρ²`, as in [`bivariate_normal_cdf_with_complement`], through the apex
+/// tree (module `apex_form`), with an a-priori bound on its error at the computed arguments.
 ///
-/// - **Certified region:** `ρ ≤ 0`, finite `h` and `k`, `complement > 0`, and `α₁ = −(h − ρk)/c` and
-///   `α₂ = −(k − ρh)/c` both resolved nonnegative (the apex is the design point). There the positive form (module
-///   `positive_form`) encloses `Φ₂` with no cancellation, and its bound scales with the value.
-/// - **Choice:** that bound is returned as [`RoundingContract::Relative`] when it is below
-///   [`BIVARIATE_NORMAL_CDF_ERROR_BOUND`].
-/// - **Outside the certified region**, or where the certificate declines (no admissible ellipse, a subnormal density, a
-///   failed enclosure) or its bound is the larger: the value is exactly [`bivariate_normal_cdf_with_complement`]'s,
-///   with `rounding = BIVARIATE_NORMAL_CDF_ERROR_BOUND` and [`RoundingContract::Absolute`]. That bound rests on one ulp
-///   per `sin`, `asin` and `erfc` call, a measurement of the platform library rather than a derivation.
+/// - **Relative.** Where the tree's leaves and sums carry the value, the bound scales with it however small it is, at
+///   the cost of a few dozen `exp` and Mills-ratio evaluations. A difference's bound scales with its minuend `Φ(h)`.
+/// - **The contract.** First order in `u`, on the cited `libm::exp` contract and the derived normal-table bounds. An
+///   interval straddling zero adds the one ulp per `erf` the core charges its `erfc`.
 ///
-/// Neither bound includes the caller's argument error. In particular `complement` is taken as `1 − ρ²` of the same
-/// correlation.
+/// The bound does not include the caller's argument error. In particular `complement` is taken as `1 − ρ²` of the
+/// same correlation.
 pub fn bivariate_normal_cdf_with_complement_bounded(
     h: f64,
     k: f64,
@@ -458,50 +443,57 @@ pub fn bivariate_normal_cdf_with_complement_bounded(
 ) -> Result<BoundedProbability, BivariateNormalError> {
     validate(&[("h", h), ("k", k)], rho)?;
     validate_complement(complement)?;
-    if let Some(bounded) = positive_form::relative_orthant(h, k, rho, complement)
-        && bounded.rounding < BIVARIATE_NORMAL_CDF_ERROR_BOUND
-    {
-        return Ok(bounded);
-    }
-    Ok(BoundedProbability {
-        value: cdf_on_rule(
-            h,
-            k,
-            Correlation::from_complement(rho, complement),
-            &CORE_RULE,
-        ),
-        rounding: BIVARIATE_NORMAL_CDF_ERROR_BOUND,
-        contract: RoundingContract::Absolute,
-    })
+    Ok(apex_form::orthant(
+        h,
+        k,
+        Correlation::from_complement(rho, complement),
+    ))
 }
 
-/// `P(X ≤ h, lower ≤ Y ≤ upper)`.
+/// `P(X ≤ h, lower ≤ Y ≤ upper)`, with a bound on its error at the computed arguments.
 ///
-/// A finite interval is a difference of two distribution functions taken on the tail side of zero: the
-/// reflection `Y → −Y` when `lower ≥ 0`. So a small interval in the upper tail keeps its mass instead of
-/// being subtracted from `Φ(h)`. It errs by at most `2·BIVARIATE_NORMAL_CDF_ERROR_BOUND + ε/2`.
+/// A finite interval is a difference of two orthants of the apex tree taken on the tail side of zero: the reflection
+/// `Y → −Y` when `lower ≥ 0`. So a small interval in the upper tail keeps its mass instead of being subtracted from
+/// `Φ(h)`. A half-infinite interval is one orthant, with the bound of
+/// [`bivariate_normal_cdf_with_complement_bounded`]. A difference's bound is the sum of its orthants' plus the
+/// subtraction's rounding.
 pub fn bivariate_normal_interval_probability(
     h: f64,
     lower: f64,
     upper: f64,
     rho: f64,
-) -> Result<f64, BivariateNormalError> {
+) -> Result<BoundedProbability, BivariateNormalError> {
     validate(&[("h", h), ("lower", lower), ("upper", upper)], rho)?;
     if !(lower < upper) {
-        return Ok(0.0);
+        return Ok(BoundedProbability {
+            value: 0.0,
+            rounding: 0.0,
+        });
     }
-    let (rule, correlation) = (&*CORE_RULE, Correlation::from_rho(rho));
+    let correlation = Correlation::from_rho(rho);
     let reflected = correlation.negated();
-    let probability = if lower == f64::NEG_INFINITY {
-        cdf_on_rule(h, upper, correlation, rule)
-    } else if upper == f64::INFINITY {
-        cdf_on_rule(h, -lower, reflected, rule)
-    } else if lower >= 0.0 {
-        cdf_on_rule(h, -lower, reflected, rule) - cdf_on_rule(h, -upper, reflected, rule)
-    } else {
-        cdf_on_rule(h, upper, correlation, rule) - cdf_on_rule(h, lower, correlation, rule)
+    let difference = |minuend: BoundedProbability, subtrahend: BoundedProbability| {
+        let value = minuend.value - subtrahend.value;
+        BoundedProbability {
+            value: value.clamp(0.0, 1.0),
+            rounding: minuend.rounding + subtrahend.rounding + UNIT_ROUNDOFF * value.abs(),
+        }
     };
-    Ok(probability.clamp(0.0, 1.0))
+    Ok(if lower == f64::NEG_INFINITY {
+        apex_form::orthant(h, upper, correlation)
+    } else if upper == f64::INFINITY {
+        apex_form::orthant(h, -lower, reflected)
+    } else if lower >= 0.0 {
+        difference(
+            apex_form::orthant(h, -lower, reflected),
+            apex_form::orthant(h, -upper, reflected),
+        )
+    } else {
+        difference(
+            apex_form::orthant(h, upper, correlation),
+            apex_form::orthant(h, lower, correlation),
+        )
+    })
 }
 
 /// `φ₂(h, k; ρ)` for `|ρ| < 1`, with its rounding bound (derived at [`BivariateNormalPartials`]). The quadratic
@@ -1069,18 +1061,28 @@ mod tests {
     #[test]
     fn interval_probability_retains_upper_tail_mass() {
         let expected = normal_cdf(-10.0) - normal_cdf(-12.0);
+        // `Φ(−10) − Φ(−12)` at 40 digits (mpmath); `expected` above is 9e−15 of it off.
+        let truth = 7.619_853_022_384_043_953_895_664e-24;
         for (h, rho, fraction) in [(f64::INFINITY, 0.3, 1.0), (0.0, 0.0, 0.5), (12.0, 1.0, 1.0), (0.0, -1.0, 1.0)] {
             let actual = bivariate_normal_interval_probability(h, 10.0, 12.0, rho).unwrap();
-            assert!((actual / (fraction * expected) - 1.0).abs() <= 8.0 * f64::EPSILON, "h={h} rho={rho}");
+            let target = fraction * truth;
+            assert!(
+                (actual.value - target).abs() <= actual.rounding + f64::EPSILON * target,
+                "h={h} rho={rho} {actual:?} truth={target:e}"
+            );
+            assert!(actual.rounding <= 1.0e-13 * actual.value, "h={h} rho={rho} {actual:?}");
         }
         let semi_infinite = bivariate_normal_interval_probability(0.0, 10.0, f64::INFINITY, 0.0).unwrap();
-        assert!((semi_infinite / (0.5 * normal_cdf(-10.0)) - 1.0).abs() <= 8.0 * f64::EPSILON);
+        // `Φ(−10)/2` at 40 digits (mpmath).
+        let half_tail = 0.5 * 7.619_853_024_160_526_065_973_343e-24;
+        assert!((semi_infinite.value - half_tail).abs() <= semi_infinite.rounding + f64::EPSILON * half_tail);
         let singular = bivariate_normal_cdf(12.0, -10.0, -1.0).unwrap();
         assert!((singular / expected - 1.0).abs() <= 8.0 * f64::EPSILON);
         for &(h, lower, upper, rho) in &[(0.3, -1.0, 0.5, 0.6), (-0.4, 0.2, 2.5, -0.8), (1.1, -3.0, -0.5, 0.95)] {
             let actual = bivariate_normal_interval_probability(h, lower, upper, rho).unwrap();
             let difference = bivariate_normal_cdf(h, upper, rho).unwrap() - bivariate_normal_cdf(h, lower, rho).unwrap();
-            assert!((actual - difference).abs() <= 2.0 * BIVARIATE_NORMAL_CDF_ERROR_BOUND, "h={h} [{lower}, {upper}] rho={rho}");
+            let allowed = actual.rounding + 2.0 * BIVARIATE_NORMAL_CDF_ERROR_BOUND;
+            assert!((actual.value - difference).abs() <= allowed, "h={h} [{lower}, {upper}] rho={rho}");
         }
     }
 

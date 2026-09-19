@@ -48,13 +48,9 @@ fn quartic_eval(theta: &Array1<f64>) -> OuterEval {
 }
 
 fn permuted_search(initial_rho: Array1<f64>) -> OuterProblem {
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(initial_rho)
         .with_max_iter(1)
         // Keys out of order: the search runs with the two coordinates swapped.
