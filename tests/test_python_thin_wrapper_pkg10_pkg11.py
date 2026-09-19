@@ -77,6 +77,30 @@ def test_python_owns_no_basis_defaults_or_multinomial_entry() -> None:
     assert hasattr(rust, "resolve_basis_locations_1d")
 
 
+@pytest.mark.parametrize(
+    ("family", "multinomial"),
+    [
+        ("multinomial", True),
+        ("Categorical", True),
+        ("softmax", True),
+        ("multinomial_logit", True),
+        ("categorical-logit", True),
+        ("binomial", False),
+        ("gaussian", False),
+        (None, False),
+    ],
+)
+def test_multinomial_spelling_list_lives_in_the_engine(
+    family: str | None, multinomial: bool
+) -> None:
+    # The sklearn classifier's binary/multi-class split asks the engine
+    # predicate `fit_table` and the CLI route on; Python keeps no copy.
+    assert not hasattr(_api, "MULTINOMIAL_FAMILY_NAMES")
+    assert _api.is_multinomial_family(family) is multinomial
+    if family is not None:
+        assert rust_module().is_multinomial_family_name(family) is multinomial
+
+
 def _three_class_table(n: int = 240) -> dict[str, typing.Any]:
     rng = np.random.default_rng(20260919)
     x = rng.uniform(-2.0, 2.0, n)
