@@ -780,7 +780,7 @@ fn d2_portfolio_loses_at_measured_parameter_parity_2502() {
 /// `+inf` is the documented infeasible encoding — so the open question is WHICH
 /// of the four channels that can emit it actually fires here. `eval` collapses
 /// all four into one value, so reading the value cannot answer it, and
-/// `log::debug!` cannot either: a `--lib` test binary installs no logger backend.
+/// `log::trace!` cannot either: a `--lib` test binary installs no logger backend.
 ///
 /// This calls the criterion the objective calls, on a term this test builds
 /// itself, and matches the TYPED outcome:

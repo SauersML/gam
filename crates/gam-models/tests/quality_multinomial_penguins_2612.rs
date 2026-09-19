@@ -84,7 +84,7 @@ struct StderrLogger;
 
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -115,7 +115,7 @@ fn init_parallelism() {
     // owned by another test in this binary; branch on it rather than discarding
     // it with `let _ =`, which the scanner also rejects.
     if log::set_logger(&STDERR_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 

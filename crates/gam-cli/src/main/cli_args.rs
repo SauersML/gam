@@ -9,17 +9,11 @@ pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
 
-    /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
-    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
-    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
-    /// Unrecognized levels are rejected by the argument parser.
-    #[arg(
-        long,
-        global = true,
-        value_name = "LEVEL",
-        value_parser = parse_log_level_cli
-    )]
-    pub(crate) log_level: Option<log::LevelFilter>,
+    /// Show solver diagnostics on stderr: `-v` for the per-iteration solver
+    /// trace (`[OUTER …]`, `[PIRLS …]`, …), `-vv` for the finer trace-level
+    /// records as well. Without it a run writes only its results and errors.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub(crate) verbose: u8,
 }
 
 #[derive(Args, Debug)]
@@ -742,17 +736,13 @@ pub(crate) fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-pub(crate) fn parse_log_level_cli(raw: &str) -> Result<log::LevelFilter, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" => Ok(log::LevelFilter::Off),
-        "error" => Ok(log::LevelFilter::Error),
-        "warn" => Ok(log::LevelFilter::Warn),
-        "info" => Ok(log::LevelFilter::Info),
-        "debug" => Ok(log::LevelFilter::Debug),
-        "trace" => Ok(log::LevelFilter::Trace),
-        other => Err(format!(
-            "unsupported --log-level '{other}'; accepted values: off, error, warn, info, debug, trace"
-        )),
+/// The stderr log filter a `-v` count asks for. Library diagnostics are all
+/// `debug`/`trace` records, so the unflagged level shows none of them.
+pub(crate) fn log_level_for_verbosity(verbose: u8) -> log::LevelFilter {
+    match verbose {
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Debug,
+        _ => log::LevelFilter::Trace,
     }
 }
 

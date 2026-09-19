@@ -458,7 +458,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 |bytes| match governor.try_reserve(bytes, "reduced-Schur touched-pair partials") {
                     Ok(reservation) => Some(reservation),
                     Err(refusal) => {
-                        log::debug!("[reduced Schur] {refusal}");
+                        log::trace!("[reduced Schur] {refusal}");
                         None
                     }
                 },
@@ -515,7 +515,7 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                     {
                         if let Some(ctx) = gam_gpu::device_runtime::cuda_context_for(ordinal) {
                             if let Err(err) = ctx.bind_to_thread() {
-                                log::debug!(
+                                log::trace!(
                                     "arrow-schur tile {ordinal}: CUDA context bind failed ({err}); \
                                      this tile reduces on the CPU"
                                 );
@@ -2706,7 +2706,7 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
             Ok(Some(matvec)) => return Ok(Some(matvec)),
             Ok(None) => {}
             Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {
-                log::debug!("resident evidence matvec build: device unavailable; CPU matvec");
+                log::trace!("resident evidence matvec build: device unavailable; CPU matvec");
             }
             Err(failure) => {
                 return Err(device_failure_as_arrow_error(
@@ -3398,7 +3398,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         reason: "rational surrogate inverse-probe bundle solve failed".to_string(),
                     })?;
                     if !cg_report.converged() {
-                        log::warn!(
+                        log::debug!(
                             "rational surrogate inverse-probe bundle: weakest reduced-Schur CG \
                              reached relative residual {:.3e} against tolerance {:.3e} after \
                              {} of {} iterations (preconditioner {:?}); every trace contracted \
@@ -3899,7 +3899,7 @@ fn dense_lane_exact_a_pencil_log_det<B: BatchedBlockSolver + Sync>(
         )));
     }
     if resolution_crossings > 0 {
-        log::warn!(
+        log::debug!(
             "[dense lane exact-A] numerical resolution limit: {resolution_crossings} of {dim} \
              pencil directions clear √ε but not their own numerical resolution; the band \
              prices them at the metric's curvature"
@@ -4039,7 +4039,7 @@ fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
         // #2731 — under `UnitDeflation` the evidence operator is a PSD majorizer, so a
         // certified negative mode is a numerically null direction: unit stiffness, as
         // `unit_deflation_ritz_conditioning` pins the modes it resolves.
-        log::info!(
+        log::debug!(
             "[rational unit deflation] pinned a bottom mode its fixed-step conditioning \
              missed at unit stiffness: raw curvature {raw:.6e} ({} directions pinned)",
             directions.len() + 1
@@ -4083,7 +4083,7 @@ fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
                 });
             }
         };
-        log::info!(
+        log::debug!(
             "[rational exact-A] priced a bottom mode its fixed-step conditioning missed: raw \
              curvature {raw:.6e}, majorizer {majorizer:.6e}, clamp {clamp:.6e}, priced \
              {priced:.6e} ({} directions priced)",

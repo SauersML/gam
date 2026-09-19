@@ -1245,7 +1245,7 @@ impl SaeManifoldTerm {
         let certificate = match verdict {
             ArrowOrbitPencilVerdict::Certified(certificate) => certificate,
             ArrowOrbitPencilVerdict::Refused(refusal) => {
-                log::info!("[SAE-ARROW-ORBIT] atom={atom} orbits={orbits} dim={dim} refused: {refusal}");
+                log::debug!("[SAE-ARROW-ORBIT] atom={atom} orbits={orbits} dim={dim} refused: {refusal}");
                 return Err(refuse(refusal));
             }
         };
@@ -1334,7 +1334,7 @@ impl SaeManifoldTerm {
             let integral = geometry.orbit_generators[index]
                 .integrand(coupling_forms[0], coupling_forms[1], coupling_forms[2])
                 .integrate()?;
-            log::info!(
+            log::debug!(
                 "[SAE-ARROW-ORBIT] atom={} priced: nodes={} log I={:.6e} log det N={:.6e} \
                  coupling=[{:.3e}, {:.3e}, {:.3e}]",
                 geometry.orbit_generators[index].atom,
@@ -1356,7 +1356,7 @@ impl SaeManifoldTerm {
         }
         geometry.log_det_correction =
             -log_gram_det - 2.0 * log_integrals + orbits as f64 * std::f64::consts::TAU.ln();
-        log::info!(
+        log::debug!(
             "[SAE-ARROW-ORBIT] certified: τ_cert={:.6e} δ={:.3e} λ_min(Φ)≥{:.3e} ½log|A_s|={:.6e} \
              correction={:.6e} orbit curvatures {:?} against edges {:?}",
             geometry.certificate.threshold,

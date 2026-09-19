@@ -158,6 +158,17 @@ impl<'a> RemlState<'a> {
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
     }
 
+    /// Whether the #784 correction is latched into this fit's criterion. Its
+    /// value and exact ρ-gradient are spliced, but `Δ_b` has no analytic
+    /// ρ-Hessian, so a latched criterion declares none: the search continues on
+    /// BFGS curvature and the smoothing correction is typed-unavailable, as for
+    /// a non-canonical Firth link.
+    pub(crate) fn block_correction_latched(&self) -> bool {
+        self.block_correction_admission
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    }
+
     pub(crate) fn block_correction_admission_deferred(&self) -> bool {
         *self.block_correction_decision_guard() == BlockCorrectionDecision::DeferredToOptimum
     }
@@ -279,7 +290,7 @@ impl<'a> RemlState<'a> {
         // DECLINE the splice — value AND gradient together — rather than
         // approximate.
         if n_ext > 0 {
-            log::debug!(
+            log::trace!(
                 "[#784] block-local fallback declined before the skewness diagnostic: \
                  {n_ext} external (ψ) coordinate(s) present and the ψ-exact gradient \
                  channels are not implemented; splicing a ψ-truncated gradient would \
@@ -295,7 +306,7 @@ impl<'a> RemlState<'a> {
             reml_spec(&self.config.likelihood).response,
             ResponseFamily::Beta { .. }
         ) {
-            log::debug!(
+            log::trace!(
                 "[#784] block-local fallback declined before the skewness diagnostic: \
                  Beta family has no exponential-family score identity for the exact \
                  gradient channels"
@@ -337,7 +348,7 @@ impl<'a> RemlState<'a> {
         if latched_block_dim.is_none() && !verdict.fallback_required() {
             if *self.block_correction_decision_guard() == BlockCorrectionDecision::DecidingAtOptimum
             {
-                log::info!(
+                log::debug!(
                     "[#784] block-local correction DECLINED for this fit at its certified Laplace \
                      optimum: max|γ|={:.4e} against τ={:.4e} (#1082)",
                     verdict.max_abs_skewness,
@@ -485,6 +496,7 @@ impl<'a> RemlState<'a> {
             weights_obs_log_abs,
             y: self.y.to_owned(),
             prior_weights: self.weights.to_owned(),
+            row_measures: crate::pirls::DevianceRowMeasure::rows(self.weights.view(), -phi.ln()),
             likelihood: likelihood.clone(),
             inverse_link,
             phi,
@@ -503,7 +515,10 @@ impl<'a> RemlState<'a> {
         // lower rule resolves min(|Δ|, 1/n_eff²), and latched beside the block
         // dimension. Under a latched admission the orders are the model's, so
         // every ρ integrates against the same nodes and the value, gradient and
-        // moments share one measure.
+        // moments share one measure. The paired lower rules then switch nothing
+        // (#2748), so a latched evaluation integrates the fine rule alone and
+        // carries the admission's paired errors as its certificate: on a
+        // three-axis block the lower rules are five times the fine rule's nodes.
         let laplace_floor = if n_eff > 0.0 {
             1.0 / n_eff
         } else {
@@ -593,9 +608,10 @@ impl<'a> RemlState<'a> {
             };
             let mut quadrature = match &latched_quadrature {
                 Some(latch) => corrector
-                    .block_quadrature_marginal_correction(
+                    .block_quadrature_marginal_correction_at_certified_orders(
                         piece_target,
                         &latch.axis_orders[first_axis..first_axis + width],
+                        &latch.axis_quadrature_errors[first_axis..first_axis + width],
                     )
                     .map_err(|refusal| EstimationError::InvalidInput(refusal.to_string()))?,
                 None => match gam_problem::laplace_sampler_contract::select_block_quadrature_orders(
@@ -677,8 +693,8 @@ impl<'a> RemlState<'a> {
         // it.
         //
         // It decides ADMISSION and nothing else (#2748). Once the fit has
-        // latched an admission, this test is reported and no longer switches:
-        // a rule that drops the whole `Δ_b` whenever the paired rules disagree
+        // latched an admission, the latched evaluations carry the admission's
+        // errors, which this test resolved, and it no longer switches: a rule that drops the whole `Δ_b` whenever the paired rules disagree
         // is a second predicate on ρ, and it re-introduces exactly the jump the
         // latch exists to remove — measured toggling 143 times against 235
         // admissions inside ONE `haberman_5yr` fit. A quadrature error that
@@ -703,7 +719,7 @@ impl<'a> RemlState<'a> {
                     },
                 });
             }
-            log::info!(
+            log::debug!(
                 "[#784] block-local correction spliced UNRESOLVED (admission already latched, \
                  #2748): paired Gauss-Hermite error {:.4e} does not resolve \
                  min(|Δ|, 1/n_eff²)={:.4e} (|Δ_b|={abs_value:.4e}, m={m}, axis split={axis_split}, \
@@ -728,6 +744,7 @@ impl<'a> RemlState<'a> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
                 axis_orders: axis_orders.clone(),
+                axis_quadrature_errors: axis_quadrature_errors.clone(),
                 axis_split,
             });
             let mut decision = self.block_correction_decision_guard();
@@ -735,7 +752,7 @@ impl<'a> RemlState<'a> {
                 *decision = BlockCorrectionDecision::AdmittedAtOptimum;
             }
             drop(decision);
-            log::info!(
+            log::debug!(
                 "[#784] block-local correction ADMITTED for this fit: block dimension m={m}, \
                  axis split={axis_split} and axis orders {:?} are now the model's, and the \
                  tau={:.3} activation no longer switches the criterion on and off along the \
@@ -745,7 +762,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        log::info!(
+        log::debug!(
             "[#784] deterministic block-local Gauss-Hermite correction ENGAGED: \
              m={m}, axis split={axis_split}, max|γ|={:.3}, τ={:.3}, Δ_b={:.4e} \
              (mixed-axis Φ={:.4e}), axis orders={:?}, nodes={node_count} \
@@ -1187,6 +1204,7 @@ fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784Bloc
         weights_obs: target.weights_obs.clone(),
         weights_obs_log_abs: target.weights_obs_log_abs.clone(),
         y: target.y.clone(),
+        row_measures: target.row_measures.clone(),
         prior_weights: target.prior_weights.clone(),
         likelihood: target.likelihood.clone(),
         inverse_link: target.inverse_link.clone(),

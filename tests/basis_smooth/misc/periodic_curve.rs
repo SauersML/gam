@@ -91,7 +91,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: gam::terms::smooth::ShapeConstraint::None,
+        shape: gam::terms::smooth::ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let mut spec = TermCollectionSpec {

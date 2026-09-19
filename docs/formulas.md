@@ -268,7 +268,7 @@ difference-penalized P-spline of the same dimension.
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
 | `domain` | data range | `[lower, upper]` interval the spline is built on. See [Fixing the spline's interval](#spline-domain). |
-| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`. See [Shape-constrained smooths](#shape-constrained-smooths). |
+| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`, or a list of them that must all hold (`[monotone_increasing, concave]`). See [Shape-constrained smooths](#shape-constrained-smooths). |
 
 Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
@@ -356,6 +356,9 @@ y ~ s(x, shape=monotone_increasing)   # f'(x) >= 0 on the knot range
 y ~ s(x, shape=monotone_decreasing)   # f'(x) <= 0
 y ~ s(x, shape=convex)                # f''(x) >= 0
 y ~ s(x, shape=concave, k=12)         # f''(x) <= 0
+y ~ s(x, shape=[monotone_increasing, concave])      # both at once
+y ~ te(x, z, shape=[monotone_increasing, none])     # increasing in x at every z
+y ~ s(x, by=g, shape=monotone_increasing)           # every level of factor g
 ```
 
 Accepted spellings (case and hyphens are ignored): `none`;
@@ -363,7 +366,8 @@ Accepted spellings (case and hyphens are ignored): `none`;
 `mpi`); `monotone_decreasing` (`monotonic_decreasing`, `decreasing`,
 `mono_dec`, `mpd`); `convex` (`cvx`); `concave` (`ccv`). From Python,
 `gamfit.fit(..., constraints={"s(x)": "monotone_increasing"})` rewrites the
-formula into the same `shape=` option.
+formula into the same `shape=` option; a Python list or tuple value becomes a
+bracketed list.
 
 The constraint is exact, not a penalty and not a check on a grid of points.
 The B-spline coefficients are written as `β = C·δ`, where `δ` holds
@@ -383,10 +387,38 @@ sums to zero over the training rows and the intercept carries the level.
 the constant stays in the chart as an unbounded level coordinate. `linear`
 is refused because removing a linear trend is not compatible with the cone.
 
-Only open 1-D B-spline `s(x)` smooths accept `shape=`. Periodic
-(`cyclic()`), cubic-regression (`bs='cr'`/`'cs'`) and boundary-conditioned
-bases, thin-plate/Duchon/Matérn/sphere smooths, and tensor products reject a
-non-`none` shape with an error.
+**Lists.** `shape=[a, b]` imposes every listed shape. A single shape keeps
+the `δ ≥ 0` chart above; a list enters the solver as the merged inequality
+rows `A·β ≥ 0`, written in the same centred chart (difference rows annihilate
+constants, so centring leaves them exact). Duplicate atoms are merged, and a
+monotone row made redundant by a curvature constraint is dropped: under
+`concave` a spline is non-decreasing exactly when its last slope is, so only
+that endpoint row is kept. Contradictions are refused with the class they
+would force: `monotone_increasing` with `monotone_decreasing` leaves only a
+constant, `convex` with `concave` only an affine function.
+
+**Tensor products.** `te(x, z, shape=[s_x, s_z])` takes one entry per
+margin, in margin order; each is a shape, `none`, or a list. A constrained
+margin contributes its exact 1-D cone Kroneckered with identities on the
+other margins (`I ⊗ A_x ⊗ I`), so the surface has that shape along the
+margin at every value of the others. Every margin of a shaped `te()` is an
+open B-spline: with no `bs=` all margins default to `ps` rather than `cr`,
+and `bs='cr'` on a shaped margin is refused (its coefficients are knot
+values, not control points). `ti()` is refused, because its slices average
+to zero over the other margins, and a monotone slice with zero average is
+identically zero. A single entry for a multi-margin `te()` is refused with
+the entry count it needs.
+
+**`by=`.** With a factor `by=`, every level's curve carries the full cone
+on its own coefficient block. With a numeric `by=z` the cone constrains
+`f` in `z·f(x)`, so the product has the stated shape in `x` only where
+`z ≥ 0`, and the mirrored shape where `z < 0`.
+
+Only open 1-D B-spline `s(x)` smooths, `te()` products of them, and either
+with `by=` accept `shape=`. Periodic (`cyclic()`), cubic-regression
+(`bs='cr'`/`'cs'`) and boundary-conditioned bases, and
+thin-plate/Duchon/Matérn/sphere smooths reject a non-`none` shape with an
+error.
 
 ### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
 

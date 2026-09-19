@@ -708,7 +708,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             // identical entries.
             static DD_NOT_TAKEN_LOGGED: std::sync::Once = std::sync::Once::new();
             DD_NOT_TAKEN_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] BMS rigid directional_derivative BLAS-3 path NOT taken: RowSet is a \
                      subsample (generic per-row Horvitz-Thompson scatter)"
                 );
@@ -826,7 +826,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             // so an unguarded line floods the biobank fit log.
             static H_NOT_TAKEN_LOGGED: std::sync::Once = std::sync::Once::new();
             H_NOT_TAKEN_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] BMS rigid hessian_dense BLAS-3 path NOT taken: sparse design \
                      (marginal_sparse={marginal_sparse} slope_sparse={slope_sparse}) \
                      -> generic per-row scatter"
