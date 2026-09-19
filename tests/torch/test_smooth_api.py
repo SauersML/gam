@@ -382,15 +382,27 @@ def test_fit_and_frozen_forward_split_a_non_list_points_sequence_alike():
     # while the frozen forward split it per smooth.
     import collections
 
-    t, y = _inputs()
-    smooths = [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)]
-    ref = gt.fit([t, t], y, smooths)
-    res = gt.fit(collections.deque([t, t]), y, smooths)
+    # The identified two-periodic fixture above, on two distinct inputs, so a
+    # copied or reordered split changes the fit.
+    n = 80
+    t1 = torch.arange(n, dtype=torch.float64) / n
+    t2 = torch.remainder(
+        0.137 + 0.6180339887498948 * torch.arange(n, dtype=torch.float64),
+        1.0,
+    )
+    y = torch.sin(2.0 * torch.pi * t1) + 0.6 * torch.cos(2.0 * torch.pi * t2)
+    y = y - y.mean()
+    smooths = [
+        gt.PeriodicSplineCurve(n_knots=7, degree=3),
+        gt.PeriodicSplineCurve(n_knots=8, degree=3),
+    ]
+    ref = gt.fit([t1, t2], y, smooths)
+    res = gt.fit(collections.deque([t1, t2]), y, smooths)
     for a, b in zip(res.coefficients, ref.coefficients, strict=True):
         torch.testing.assert_close(a, b)
     model = gt.GAM(smooths)
-    model.freeze(collections.deque([t, t]), y)
-    torch.testing.assert_close(model(collections.deque([t, t])), model([t, t]))
+    model.freeze(collections.deque([t1, t2]), y)
+    torch.testing.assert_close(model(collections.deque([t1, t2])), model([t1, t2]))
 
 
 @pytest.mark.parametrize("bad", ["ndarray", "entry"])
