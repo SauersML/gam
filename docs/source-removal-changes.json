@@ -1470,5 +1470,22 @@
     ],
     "reason": "gam#3002: warm_start_from carried a saved model's point to one route through the outer cache seam. OuterWarmStart staged the point as a one-entry cache session in a scratch directory (from_model, session, required, consumed, and its Debug fmt), and RequiredWarmStart was the flag the consuming route set. That made the point the sole seed of every search that read the options, including searches whose criterion the point is not certified for (an unarmed evidence fit, a pilot). One mechanism replaces them. gam_model_api::WarmStart carries the point, its certified value and whether the inputs are the parent's; resolve_warm_start builds it; OuterProblem::with_warm_start offers it to every search, which accepts it only where it is certified for its own criterion (resume_prior_certificate), or joins it to an independent multistart on other inputs. The suite test and its certified_point helper are replaced by four tests of the new contract (resume with no outer iteration and the parent's bits, join on other data with V at most cold, another dimension bit-cold, the three refusals).",
     "evidence": "git grep -w OuterWarmStart and RequiredWarmStart at the landing tree find nothing under crates, src, tests or gamfit, and none of .consumed(), warm_start.required() or OuterWarmStart:: remains; gam-pyffi's geometry_ffi.rs, the only caller of from_model, calls resolve_warm_start. The fmt removed is OuterWarmStart's own Debug impl (the 1269 production occurrences are other fmt fns). Gate on acn112 (strike-wall lane, 6 cores) at 5bd6913b9b on 55212405d7: without this entry source_removal_guard.py refused exactly these 9 items, and with it verified 1714 -> 1738 Rust items with 9 guarded removals; test_census 12085 -> 12093 tests; cargo check --workspace --all-targets and cargo build --workspace --lib RC 0; gam-solve rho_optimizer:: 440 of 440 with the four gam#3002 multistart pins; gam-models suite warm_start_from 4 of 4; gam-custom-family lib 347 of 347; the gam-models materialize and payload tests 106 of 108, whose two failures are the Gaussian location-scale tests that fail identically on unpatched main (gam#2959 comment)."
+  },
+  {
+    "base": "90997536f9efaf6966720a03a92522337ccfe9bf",
+    "items": [
+      "crates/gam-sae/examples/mpd_induction_registry.rs:fn:float64_array",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:fn:payload",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:fn:read_array",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:fn:stored_tensor",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:fn:use_map",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:struct:Config",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:struct:Export",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:struct:ExportFile",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:struct:Tensor",
+      "crates/gam-sae/examples/mpd_induction_registry.rs:struct:Use"
+    ],
+    "reason": "#2951 S2a: the registry-export reader moves out of mpd_induction_registry.rs into the shared crates/gam-sae/examples/support/induction_export.rs, which the registry example now #[path]-includes, so the S2a and S2b examples read an export through the same loader. The moved items are the five functions float64_array, payload, read_array, stored_tensor and use_map, and the five records Export, Config, Tensor, Use and ExportFile. In the shared module the records and float64_array are pub, load_export (new) returns the export with its TensorRegistry and a weight reader, and the other four functions are its private helpers.",
+    "evidence": "Direct gate dx2 run mpd-lead-ind-g4 (direct-dx2-mpd-lead-ind-g4.log) at 6340572d96, with this unit in the carried induction stack (tree 3f22c187): RC_CHECK 0 (workspace, all targets, so the registry example and its includes compile under deny(warnings)), RC_PYFFI 0, 379/379 parameter_decomposition:: tests, DONE_SENTINEL_0. Each moved item is declared in crates/gam-sae/examples/support/induction_export.rs, added by the same landing."
   }
 ]
