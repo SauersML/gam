@@ -3660,6 +3660,19 @@ where
                 )
             }))
             .collect();
+            let certified_railed_rho: Vec<usize> = outer_result
+                .criterion_certificate
+                .as_ref()
+                .map(|certificate| {
+                    certificate
+                        .lambdas_railed
+                        .iter()
+                        .copied()
+                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
+                        .filter(|&index| index < final_rho.len())
+                        .collect()
+                })
+                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 // The box the outer arm searched and the shipped-point
@@ -3696,6 +3709,10 @@ where
                 // error, refusing fits this certificate accepted (#2428). Empty
                 // when the certificate cleared nothing.
                 &measured_hessian_error,
+                // The coordinates the certificate judged railed on a face of
+                // that same box: the cubature conditions on them at the face
+                // instead of stepping off it.
+                &certified_railed_rho,
             )?;
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
