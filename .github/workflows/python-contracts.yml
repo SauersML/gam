@@ -29,6 +29,8 @@ on:
       # without waiting on the multi-hour Rust suite in test.yml.
       - "tests/**"
       - "gamfit/**"
+      # The gamfit-vs-pyGAM harness: its smoke test runs in the bench step.
+      - "bench/pygam_compare/**"
       - "src/inference/model.rs"
       - "src/inference/predict/mod.rs"
       - "src/inference/predict/standard.rs"
@@ -207,11 +209,28 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py" -v --tb=short
 
-      - name: Run bench-package Python tests (#1512 orphans)
+      - name: Install bench-only requirements into an isolated venv (pyGAM)
+        id: bench-venv
         if: ${{ !cancelled() && steps.extension.outcome == 'success' && steps.test-extras.outcome == 'success' }}
+        # bench/pygam_compare's smoke test runs real pyGAM fits, so pyGAM must be
+        # installed; it is a bench-only dependency (never a gamfit runtime dep).
+        # A --system-site-packages venv sees the gamfit wheel and the test extras
+        # but keeps pyGAM's `scipy<1.17` pin out of the interpreter the full
+        # tests/ triage below runs on, so installing it cannot change that
+        # inventory's numbers.
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python -m venv --system-site-packages bench-venv
+          bench-venv/bin/python -m pip install -r "$GITHUB_WORKSPACE/bench/pygam_compare/requirements.txt"
+
+      - name: Run bench-package Python tests (#1512 orphans)
+        if: ${{ !cancelled() && steps.extension.outcome == 'success' && steps.test-extras.outcome == 'success' && steps.bench-venv.outcome == 'success' }}
         # `bench/` holds five pytest files — 26 test functions covering the
         # manifold-zoo geometry contracts, the exact analytic handoff, the zoo
-        # figure records and the synthetic-SAE metrics — and they ran in NO CI
+        # figure records and the synthetic-SAE metrics (plus, since, the
+        # gamfit-vs-pyGAM harness smoke test in bench/pygam_compare, which is
+        # why this step runs on the bench venv above) — and they ran in NO CI
         # job. `pyproject.toml` sets `testpaths = ["tests"]`, and BOTH
         # directory-level steps pass an explicit `tests/` target, which
         # overrides testpaths entirely; no step ever named `bench`. This is the
@@ -233,7 +252,7 @@ jobs:
           set -euo pipefail
           mkdir -p benchpath
           ln -sfn "$GITHUB_WORKSPACE/bench" benchpath/bench
-          PYTHONPATH="$PWD/benchpath" python -m pytest "$GITHUB_WORKSPACE/bench" \
+          PYTHONPATH="$PWD/benchpath" bench-venv/bin/python -m pytest "$GITHUB_WORKSPACE/bench" \
             -p no:cacheprovider -v --tb=short
 
       - name: Install full-suite test runners (xdist + timeout)
