@@ -105,7 +105,7 @@ pub enum WorkflowError {
     },
     /// A formula referenced a column that does not exist in the input data.
     /// Carries the structured payload through to the FFI boundary so the
-    /// Python side can raise `gamfit.ColumnNotFoundError` with `column`,
+    /// Python side can raise `gamfit.errors.ColumnNotFoundError` with `column`,
     /// `role`, `available`, `similar`, and `tsv_hint` attributes — issue
     /// #305 / #343 (typed-dispatch migration; no string classification at
     /// the boundary).
@@ -1075,7 +1075,7 @@ impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError 
 /// Typed lift from term-builder errors. `TermBuilderError::ColumnNotFound`
 /// preserves the structured fields (name, role, available, similar,
 /// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
-/// `gamfit.ColumnNotFoundError` with attributes set from the payload —
+/// `gamfit.errors.ColumnNotFoundError` with attributes set from the payload —
 /// not from re-parsed prose. Other variants degrade into the closest
 /// generic workflow bucket; the dedicated typed channels for those
 /// failure classes can be added incrementally as their dispatch arrives.

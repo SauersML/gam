@@ -193,7 +193,7 @@ pub enum DataError {
     DegenerateColumn { column: String, problem: String },
     /// A formula or call site references a column name that is not present in
     /// the input data. Structured so the FFI boundary can raise a typed
-    /// Python exception (`gamfit.ColumnNotFoundError`) carrying the missing
+    /// Python exception (`gamfit.errors.ColumnNotFoundError`) carrying the missing
     /// name, available columns, and similarity suggestions as attributes —
     /// not as a parsed-back-out substring of the human display text.
     ///

@@ -17,7 +17,7 @@ import gamfit
 
 
 def _atoms(F: int = 3, ball_dim: int = 4):
-    return gamfit.PoincareAtoms(F=F, ball_dim=ball_dim)
+    return gamfit.torch.PoincareAtoms(F=F, ball_dim=ball_dim)
 
 
 def test_self_distance_is_exact_zero_single_row() -> None:

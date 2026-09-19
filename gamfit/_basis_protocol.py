@@ -1,8 +1,8 @@
 """Uniform callable-basis protocol for gamfit descriptors.
 
-Every basis descriptor in the public surface — :class:`gamfit.Duchon`,
-:class:`gamfit.BSpline`, :class:`gamfit.Matern`, :class:`gamfit.Pca`,
-:class:`gamfit.TensorBSpline`, :class:`gamfit.PeriodicSplineCurve` — gains
+Every basis descriptor in the public surface — :class:`gamfit.smooth.Duchon`,
+:class:`gamfit.smooth.BSpline`, :class:`gamfit.smooth.Matern`, :class:`gamfit.smooth.Pca`,
+:class:`gamfit.smooth.TensorBSpline`, :class:`gamfit.smooth.PeriodicSplineCurve` — gains
 three methods with a single uniform contract:
 
 * ``evaluate(*coords) -> Tensor`` of shape ``(B, M)``.

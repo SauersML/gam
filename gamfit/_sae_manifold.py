@@ -360,13 +360,6 @@ def flat_block_assignment(gating: str) -> str:
     return str(rust_module().sae_flat_block_assignment(str(gating)))
 
 
-def plot(atom: Any, **kwargs: Any) -> Any:
-    """Plot SAE atoms through the visualization-only Python helper."""
-    from . import _sae_viz
-
-    return _sae_viz.plot(atom, **kwargs)
-
-
 __all__ = [
     "GumbelTemperatureSchedule",
     "ManifoldSAE",
@@ -375,7 +368,6 @@ __all__ = [
     "gumbel_geometric_schedule",
     "gumbel_linear_schedule",
     "gumbel_reciprocal_iter_schedule",
-    "plot",
     "sae_manifold_certify_external",
     "sae_manifold_fit",
 ]

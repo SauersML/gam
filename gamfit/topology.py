@@ -1,4 +1,10 @@
-"""Small public constructors for common manifold topology candidates."""
+"""Topology candidates for latent-coordinate fits, and data-driven topology selection.
+
+The constructors (:func:`Circle`, :func:`Cylinder`, :func:`Torus`,
+:func:`Sphere`, :func:`EuclideanPatch`) return smooth descriptors for common
+closed and open latent geometries; :func:`select_topology` and
+:class:`TopologyAutoSelector` score such candidates against data.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +21,25 @@ from .smooth import (
 )
 
 
-__all__ = ["Circle", "Cylinder", "Torus", "Sphere", "EuclideanPatch"]
+__all__ = [
+    "BasisSpec",
+    "Circle",
+    "Cylinder",
+    "EuclideanPatch",
+    "ScoreKind",
+    "ScoreScale",
+    "SelectTopologyResult",
+    "Sphere",
+    "TopologyAutoSelector",
+    "TopologyAutoSelectorRank",
+    "TopologyAutoSelectorResult",
+    "TopologyCandidateFailure",
+    "TopologySelectionError",
+    "TopologyStack",
+    "Torus",
+    "select_topology",
+    "stack_topologies",
+]
 
 
 def _make_topology(
@@ -98,7 +122,7 @@ def Circle(
     -------
     Smooth
         ``PeriodicSplineCurve`` descriptor suitable for
-        :func:`gamfit.select_topology` candidates or ``smooths=`` mappings.
+        :func:`gamfit.topology.select_topology` candidates or ``smooths=`` mappings.
     """
     return _make_topology("circle", name=name, n_knots=n_knots, degree=degree, penalty_order=penalty_order, output_dim=output_dim, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
@@ -192,3 +216,21 @@ def EuclideanPatch(
         Duchon smooth descriptor marked with the requested Euclidean dimension.
     """
     return _make_topology("euclidean_patch", d=d, name=name, n_centers=n_centers, centers=centers, m=m, length_scale=length_scale, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
+
+
+# The selector builds its candidates from the constructors above, so it is
+# imported after they are defined.
+from ._select_topology import (  # noqa: E402
+    BasisSpec,
+    ScoreKind,
+    ScoreScale,
+    SelectTopologyResult,
+    TopologyAutoSelector,
+    TopologyAutoSelectorRank,
+    TopologyAutoSelectorResult,
+    TopologyCandidateFailure,
+    TopologySelectionError,
+    TopologyStack,
+    select_topology,
+    stack_topologies,
+)

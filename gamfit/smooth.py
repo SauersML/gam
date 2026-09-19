@@ -221,7 +221,7 @@ class Duchon(Smooth):
         ``‖w‖^(2p) · (κ² + ‖w‖²)^s`` with ``κ = 1/length_scale``,
         which is closer to a Matérn for finite kernels at high d.
         Honored on both the formula API and the primitive numpy API
-        (``gamfit.duchon_basis`` / ``gamfit.duchon_function_norm_penalty``);
+        (``gamfit.basis.duchon_basis`` / ``gamfit.basis.duchon_function_norm_penalty``);
         the hybrid kernel keeps the polynomial nullspace order **linear in
         d**, letting the same smooth scale cleanly to d=8, 16, 32, 64
         without ratcheting the nullspace to absorb the Wendland CPD
@@ -302,7 +302,7 @@ class BSpline(Smooth):
     ``knots=K`` asks for ``K`` interior knots, so an open basis of degree
     ``d`` spans ``K + d + 1`` functions and a periodic one has ``K + d + 1``
     cyclic controls — the reading the formula DSL gives ``s(x, knots=K)`` /
-    ``cyclic(x, knots=K)`` and :func:`gamfit.bspline_basis` gives its
+    ``cyclic(x, knots=K)`` and :func:`gamfit.basis.bspline_basis` gives its
     ``knots=K``. ``None`` auto-derives: direct evaluation places ``10``
     quantile interior knots from the evaluated points, while the tabular fit
     path lets the Rust engine choose the count from the fitted column
@@ -954,7 +954,7 @@ class LatentCoord:
     diffeomorphism ``t ↦ φ(t)`` (any reparameterization can be absorbed
     into a re-fit of β). This makes the inner Hessian *rank-deficient*
     along the gauge orbit and IFT breaks. Supply ``aux_prior`` or pair this
-    block with an :class:`gamfit.IsometryPenalty` before fitting. ARD via
+    block with an :class:`gamfit.penalties.IsometryPenalty` before fitting. ARD via
     ``dim_selection=True`` is useful for pruning axes after the gauge is
     pinned, but it is rotation-symmetric and is not itself a gauge fix.
 
@@ -1006,7 +1006,7 @@ class LatentCoord:
     Examples
     --------
     >>> import gamfit
-    >>> t = gamfit.LatentCoord(
+    >>> t = gamfit.smooth.LatentCoord(
     ...     n=N, d=4, init="pca",
     ...     aux_prior={"u": rgb, "family": "ridge", "strength": "auto"},
     ... )

@@ -241,7 +241,7 @@ pub(crate) struct CrosscoderArgs {
 #[derive(Args, Debug)]
 pub(crate) struct ParameterDecompositionArgs {
     /// Versioned `gam.mpd-request` JSON document: the same bytes
-    /// `gamfit.run_parameter_decomposition` sends.
+    /// `gamfit.sae.run_parameter_decomposition` sends.
     #[arg(long, value_name = "REQUEST.json")]
     pub(crate) request: PathBuf,
 

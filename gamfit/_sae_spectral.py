@@ -491,7 +491,7 @@ def audit_sae(
     report = dict(payload)
     report["checkpoint"] = checkpoint_meta
     report["route_source"] = route_meta
-    report["api"] = "gamfit.audit_sae"
+    report["api"] = "gamfit.sae.audit_sae"
     return report
 
 

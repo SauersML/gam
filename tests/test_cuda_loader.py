@@ -8,7 +8,7 @@ from gamfit._cuda import CudaDiagnostics
 
 
 def test_cuda_diagnostics_shape() -> None:
-    info = gamfit.cuda_diagnostics()
+    info = gamfit.cuda.cuda_diagnostics()
     assert isinstance(info["platform"], str)
     assert isinstance(info["mapped"], dict)
     assert isinstance(info["conflicts"], dict)
@@ -20,7 +20,7 @@ def test_cuda_diagnostics_shape() -> None:
 
 
 def test_cuda_diagnostics_format_mentions_conflicts() -> None:
-    text = gamfit.format_cuda_diagnostics()
+    text = gamfit.cuda.format_cuda_diagnostics()
     assert "gamfit CUDA diagnostics:" in text
     assert "CUDA library conflicts:" in text
 
@@ -120,7 +120,7 @@ def test_cuda_subprocess_library_dirs_include_packaged_nvrtc(
     monkeypatch.setattr(_cuda.sys, "platform", "linux")
     monkeypatch.setattr(_cuda, "_nvidia_roots", lambda: (root,))
 
-    dirs = gamfit.cuda_subprocess_library_dirs()
+    dirs = gamfit.cuda.cuda_subprocess_library_dirs()
 
     assert str((root / "cuda_nvrtc" / "lib").resolve()) in dirs
     assert str((root / "cuda_runtime" / "lib").resolve()) in dirs
@@ -137,7 +137,7 @@ def test_cuda_subprocess_env_prepends_packaged_dirs_and_preserves_existing(
     monkeypatch.setattr(_cuda.sys, "platform", "linux")
     monkeypatch.setattr(_cuda, "_nvidia_roots", lambda: (root,))
 
-    env = gamfit.cuda_subprocess_env({"LD_LIBRARY_PATH": "/usr/local/cuda/lib64"})
+    env = gamfit.cuda.cuda_subprocess_env({"LD_LIBRARY_PATH": "/usr/local/cuda/lib64"})
 
     assert env["LD_LIBRARY_PATH"].split(":") == [
         str(nvrtc_dir.resolve()),
@@ -206,7 +206,7 @@ def test_cuda_diagnostics_pins_full_key_set() -> None:
     caught here instead of in a downstream KeyError such as #229.
     """
 
-    info = gamfit.cuda_diagnostics()
+    info = gamfit.cuda.cuda_diagnostics()
     assert set(info.keys()) == set(_CUDA_DIAGNOSTICS_KEYS), (
         "cuda_diagnostics() key set drifted from the documented schema; "
         "any change here must be paired with format_cuda_diagnostics() and "

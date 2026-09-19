@@ -5,7 +5,7 @@ Two public selectors are exposed:
 * :func:`select_topology` builds candidate formulas around an
   ``s(..., type=AUTO)`` smooth and ranks fitted models by evidence-like scores.
 * :class:`TopologyAutoSelector` is a multi-fit orchestrator for selecting the
-  topology of one :class:`gamfit.LatentCoord` block while preserving the rest
+  topology of one :class:`gamfit.smooth.LatentCoord` block while preserving the rest
   of the caller's fit configuration.
 """
 
@@ -1056,7 +1056,7 @@ def _single_latent(
         name, latent = requested, latents[requested]
     if not isinstance(latent, LatentCoord):
         raise TypeError(
-            "TopologyAutoSelector latents entries must be gamfit.LatentCoord"
+            "TopologyAutoSelector latents entries must be gamfit.smooth.LatentCoord"
         )
     return str(name), latent
 

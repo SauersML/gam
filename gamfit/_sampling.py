@@ -353,10 +353,11 @@ class PosteriorSamples:
                 str(p.get("model_class", self.model_class)), link_spec)
 
     def plot_trace(self, *, coefficients: Any = None, max_panels: int = 8) -> Any:
-        import matplotlib.pyplot as plt
+        from ._matplotlib import pyplot
         import numpy as np
         import pandas as pd
 
+        plt = pyplot()
         selection = json.loads(_call(
             "posterior_trace_selection_json",
             json.dumps({

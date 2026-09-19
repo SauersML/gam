@@ -283,7 +283,7 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
     )
 
     log(f"{task.name}: fitting sae_manifold_fit in a {x_fit_chart.shape[1]}-dim chart with the shard")
-    sae = gamfit.sae_manifold_fit(
+    sae = gamfit.sae.sae_manifold_fit(
         x_fit_chart,
         K=1,
         d_atom=1,

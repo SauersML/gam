@@ -1,6 +1,6 @@
 """Unified GAM fit for torch — one entry point for any smooth, any dimensionality.
 
-The user describes smooth-term specs (:class:`gamfit.Smooth` subclasses) and
+The user describes smooth-term specs (:class:`gamfit.basis.Smooth` subclasses) and
 calls :func:`fit`. The library constructs the right basis matrices and
 penalty matrices internally per spec, dispatches to Gaussian REML
 (single-smooth or joint additive depending on input shape), and returns a
@@ -288,7 +288,7 @@ def _build_design_penalty(
 
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
     """
-    from .. import duchon_function_norm_penalty
+    from .._api import duchon_function_norm_penalty
 
     points = _coerce_2d(points, "points")
     N = points.shape[0]

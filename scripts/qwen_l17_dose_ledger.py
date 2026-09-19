@@ -16,7 +16,7 @@ For each feature (weekday, month, color):
    output-Fisher factor from ``gamfit.torch.harvest``. The weights stay bfloat16
    and the harvest takes its math in float32. Rows and factors are cached as
    ``harvest_cache_{feature}_L{layer}_n{rows}.npz`` and re-used when present.
-2. **Chart.** ``gamfit.sae_manifold_fit`` fits one circle atom for
+2. **Chart.** ``gamfit.sae.sae_manifold_fit`` fits one circle atom for
    ``fit_iterations`` iterations in a train-only PCA chart of ``chart_dim``
    dimensions, with the projected shard installed.
 3. **Bases.** A seeded permutation draws ``bases`` base prompts from the
@@ -343,7 +343,7 @@ def run_feature(
         provenance="output_fisher",
     )
     log(f"{task.name}: fitting one circle atom in a {x_fit_chart.shape[1]}-dim chart with the shard")
-    sae = gamfit.sae_manifold_fit(
+    sae = gamfit.sae.sae_manifold_fit(
         x_fit_chart,
         K=1,
         d_atom=1,

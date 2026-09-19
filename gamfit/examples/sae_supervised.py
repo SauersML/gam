@@ -3,7 +3,7 @@
 `sae_supervised(X, Y, supervised_mask, ...)` is pure orchestration:
 
 1. Fit a manifold SAE on the **full** ``X`` (supervised + unsupervised
-   rows) via the Rust kernel ``gamfit.sae_manifold_fit``.
+   rows) via the Rust kernel ``gamfit.sae.sae_manifold_fit``.
 2. Extract the per-row latent assignments produced by that kernel.
 3. Fit a GLM head on the supervised slice of those latents via
    ``gamfit.fit`` against ``Y[supervised_mask]``.
