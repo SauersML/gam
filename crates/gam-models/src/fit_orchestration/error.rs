@@ -170,8 +170,9 @@ impl std::fmt::Display for WorkflowError {
                 ..
             } => write!(
                 f,
-                "spatial term '{term}' remains under-resolution-uncertain at {current_centers} \
-                 centers: the {attempted_centers}-center certification refit failed ({reason})"
+                "smooth term '{term}' remains under-resolution-uncertain at resolution \
+                 {current_centers} (centers, or internal knots for a B-spline): the \
+                 resolution-{attempted_centers} certification refit failed ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
             WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
