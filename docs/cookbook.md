@@ -373,8 +373,9 @@ shrinks its slope to zero, and `y ~ s(x) + z` ties with `y ~ s(x)`. Only
 
 The candidates must share a family; `compare_models` refuses to rank, say,
 a Poisson fit against a negative binomial one. Basis size is not a
-candidate either: `k` is an upper bound, so check it with
-`model.basis_check(data)` instead of comparing `k=10` against `k=20` (see
+candidate either: a default `s(x)` sizes its own basis, and a fixed `k` is
+an upper bound, so check it with `model.basis_check(data)` instead of
+comparing `k=10` against `k=20` (see
 [Choosing `k`](formulas.md#choosing-k)).
 
 ## Per-group trajectories (factor by smooth)
