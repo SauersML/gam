@@ -46,24 +46,24 @@ def test_shape_controlled_census_replays_the_exact_full_pipeline() -> None:
         matrix.fill(np.nan)
         return {"seed": seed, "checksum": float(snapshot.sum())}
 
-    result = gamfit.run_shape_controlled_census(
+    result = gamfit.sae.run_shape_controlled_census(
         activations,
         pipeline,
         control_seed=2262,
         pipeline_seed=17,
     )
-    assert isinstance(result, gamfit.ShapeControlledCensus)
+    assert isinstance(result, gamfit.sae.ShapeControlledCensus)
     assert len(calls) == 3
     assert [seed for _, seed in calls] == [17, 17, 17]
     np.testing.assert_array_equal(calls[0][0], pristine)
     np.testing.assert_array_equal(activations, pristine)
 
-    expected_shuffle = gamfit.shape_matched_control(
+    expected_shuffle = gamfit.sae.shape_matched_control(
         pristine,
         "per_dimension_shuffle",
         seed=result.control_seed,
     )
-    expected_hadamard = gamfit.shape_matched_control(
+    expected_hadamard = gamfit.sae.shape_matched_control(
         pristine,
         "covariance_exact_hadamard",
         seed=result.control_seed,
@@ -84,10 +84,10 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         return matrix.shape, seed
 
     with pytest.raises(TypeError, match="control_seed"):
-        gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
+        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
     with pytest.raises(ValueError, match="pipeline_seed"):
-        gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
-    accepted = gamfit.run_shape_controlled_census(
+        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
+    accepted = gamfit.sae.run_shape_controlled_census(
         np.ones((4, 2)),
         pipeline,
         control_seed=np.uint64(17),
@@ -95,15 +95,15 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
     )
     assert accepted.pipeline_seed == 23
     with pytest.raises(ValueError, match="finite"):
-        gamfit.run_shape_controlled_census(
+        gamfit.sae.run_shape_controlled_census(
             np.array([[1.0, np.nan], [2.0, 3.0]]), pipeline
         )
     with pytest.raises(TypeError, match="complex dtype"):
-        gamfit.run_shape_controlled_census(
+        gamfit.sae.run_shape_controlled_census(
             np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
         )
     with pytest.raises(TypeError, match="complex dtype"):
-        gamfit.run_shape_controlled_census([[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline)
+        gamfit.sae.run_shape_controlled_census([[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline)
 
 
 def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
@@ -141,7 +141,7 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
         calls.append((matrix.copy(), seed))
         return matrix.dtype, matrix.shape, seed
 
-    result = gamfit.run_shape_controlled_census(
+    result = gamfit.sae.run_shape_controlled_census(
         activations,
         pipeline,
         control_seed=2262,
@@ -151,12 +151,12 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     assert [seed for _, seed in calls] == [17, 17, 17]
     assert all(matrix.dtype == np.float32 for matrix, _ in calls)
 
-    shuffle = gamfit.shape_matched_control_f32(
+    shuffle = gamfit.sae.shape_matched_control_f32(
         activations,
         "per_dimension_shuffle",
         seed=result.control_seed,
     )
-    repeated_shuffle = gamfit.shape_matched_control_f32(
+    repeated_shuffle = gamfit.sae.shape_matched_control_f32(
         activations,
         "per_dimension_shuffle",
         seed=result.control_seed,
@@ -169,12 +169,12 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
             np.sort(shuffle[:, col]), np.sort(activations[:, col])
         )
 
-    hadamard = gamfit.shape_matched_control_f32(
+    hadamard = gamfit.sae.shape_matched_control_f32(
         activations,
         "covariance_exact_hadamard",
         seed=result.control_seed,
     )
-    repeated_hadamard = gamfit.shape_matched_control_f32(
+    repeated_hadamard = gamfit.sae.shape_matched_control_f32(
         activations,
         "covariance_exact_hadamard",
         seed=result.control_seed,
@@ -223,7 +223,7 @@ def test_native_contiguous_source_is_shared_but_callbacks_are_private(
         callback_matrices.append(matrix)
         return matrix.shape[0]
 
-    gamfit.run_shape_controlled_census(original, pipeline)
+    gamfit.sae.run_shape_controlled_census(original, pipeline)
     assert original.flags.writeable
     assert len(native_sources) == 2
     assert all(np.shares_memory(source, original) for source in native_sources)
@@ -268,7 +268,7 @@ def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
         seen_dtypes.append(matrix.dtype)
         return seed
 
-    gamfit.run_shape_controlled_census(counted_source, pipeline)
+    gamfit.sae.run_shape_controlled_census(counted_source, pipeline)
     assert counted_source.conversions == 1
     assert seen_dtypes == [np.dtype(np.float64)] * 3
 
@@ -290,7 +290,7 @@ def test_label_shuffle_margin_null_rebuilds_every_draw_and_is_exactly_reproducib
         )
         return {"circular_margin": float(np.var(np.diff(class_means)))}
 
-    first = gamfit.run_label_shuffle_margin_null(
+    first = gamfit.sae.run_label_shuffle_margin_null(
         data,
         labels,
         pipeline,
@@ -300,7 +300,7 @@ def test_label_shuffle_margin_null_rebuilds_every_draw_and_is_exactly_reproducib
     )
     first_labels = [value.copy() for value in seen_labels]
     seen_labels.clear()
-    second = gamfit.run_label_shuffle_margin_null(
+    second = gamfit.sae.run_label_shuffle_margin_null(
         data,
         labels,
         pipeline,
@@ -328,13 +328,13 @@ def test_label_shuffle_margin_null_rejects_uncalibrated_contracts():
     data = np.arange(16, dtype=np.float64).reshape(8, 2)
     labels = np.repeat([0, 1], 4)
     with pytest.raises(ValueError, match="n_draws must be positive"):
-        gamfit.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=0)
+        gamfit.sae.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=0)
     with pytest.raises(ValueError, match="at least two distinct labels"):
-        gamfit.run_label_shuffle_margin_null(
+        gamfit.sae.run_label_shuffle_margin_null(
             data, np.zeros(8), lambda *_: {"circular_margin": 0.0}
         )
     with pytest.raises(TypeError, match="circular_margin"):
-        gamfit.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=1)
+        gamfit.sae.run_label_shuffle_margin_null(data, labels, lambda *_: {}, n_draws=1)
 
 
 def test_layer_transport_fit_reaches_python():
@@ -342,7 +342,7 @@ def test_layer_transport_fit_reaches_python():
     t = np.sort(rng.uniform(0.0, 2.0 * math.pi, size=200))
     # Identity-ish circle->circle map plus small wiggle: degree 1, low defect.
     s = (t + 0.05 * np.sin(t)) % (2.0 * math.pi)
-    report = gamfit.layer_transport_fit(t, s, "circle", "circle")
+    report = gamfit.sae.layer_transport_fit(t, s, "circle", "circle")
     assert report["degree"] == 1
     assert report["topology_preserved"] is True
     assert report["isometry_defect"] >= 0.0
@@ -361,7 +361,7 @@ def test_fit_transport_object_inverts_and_composes():
     # g_A(t) = t + 0.25*sin(2*pi*t)/(2*pi): h' = 1 + 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     a_warp = frm + 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_a = gamfit.fit_transport(frm, a_warp, "interval", "interval")
+    g_a = gamfit.sae.fit_transport(frm, a_warp, "interval", "interval")
     assert g_a.topology_preserved is True
     assert g_a.isometry_defect >= 0.0
     assert set(g_a.report().keys()) >= {
@@ -381,7 +381,7 @@ def test_fit_transport_object_inverts_and_composes():
     # g_B(t) = t - 0.25*sin(2*pi*t)/(2*pi): h' = 1 - 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     b_warp = frm - 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_b = gamfit.fit_transport(frm, b_warp, "interval", "interval")
+    g_b = gamfit.sae.fit_transport(frm, b_warp, "interval", "interval")
     # Targets in g_A's image; recover the pre-image and compose.
     t_true = np.array([0.2, 0.5, 0.8])
     y = g_a.eval(t_true)
@@ -404,7 +404,7 @@ def test_fit_transport_invert_rejects_non_finite_targets():
     # scale, and therefore has no identifiable smoothing parameter or posterior;
     # that unrelated refusal used to prevent this test from reaching invert().
     target = 0.5 * frm + 0.01 * np.sin(2.0 * math.pi * frm)
-    g = gamfit.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
     for bad in (np.nan, np.inf, -np.inf):
         with pytest.raises(ValueError):
             g.invert(np.array([bad]))
@@ -418,7 +418,7 @@ def test_fit_transport_invert_rejects_folded_map():
     # A clear fold: rises then falls (a non-monotone, fold-bearing map).
     target = np.sin(2.0 * math.pi * frm)
     lo, hi = float(target.min()), float(target.max())
-    g = gamfit.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
     assert g.topology_preserved is False
     with pytest.raises(ValueError):
         g.invert(np.array([0.5 * (lo + hi)]))
@@ -429,7 +429,7 @@ def test_fit_transport_degree_minus_one_circle_round_trips():
     # through the Python API.
     t = np.linspace(0.0, 2.0 * math.pi, 256, endpoint=False)
     s = (-t + 0.4 + 0.15 * np.sin(t)) % (2.0 * math.pi)
-    g = gamfit.fit_transport(t, s, "circle", "circle")
+    g = gamfit.sae.fit_transport(t, s, "circle", "circle")
     assert g.degree == -1
     assert g.topology_preserved is True
     probe = (np.arange(7) + 0.5) * (2.0 * math.pi / 7.0)
@@ -441,10 +441,10 @@ def test_fit_transport_degree_minus_one_circle_round_trips():
 
 def test_structure_discovery_gate_and_certificate():
     # split-LR log e-value is just the likelihood gap.
-    assert gamfit.split_likelihood_log_e(-8.0, -10.0) == pytest.approx(2.0)
+    assert gamfit.sae.split_likelihood_log_e(-8.0, -10.0) == pytest.approx(2.0)
 
     # Gate certifies once the running e-process supremum crosses 1/alpha.
-    gate = gamfit.atom_birth_gate(0.05)
+    gate = gamfit.sae.atom_birth_gate(0.05)
     assert gate.certified() is False
     gate.absorb_shard(-8.0, -10.0)  # log e = 2.0
     gate.absorb_shard(-8.0, -10.0)  # cumulative 4.0 > log(1/0.05)
@@ -454,11 +454,11 @@ def test_structure_discovery_gate_and_certificate():
     assert verdict["log_e"] == pytest.approx(4.0)
 
     # e-BH dictionary certificate confirms the overwhelming claim only.
-    confirmed = gamfit.e_bh_dictionary_certificate([25.0, 0.01, -0.2, 0.0], 0.05)
+    confirmed = gamfit.sae.e_bh_dictionary_certificate([25.0, 0.01, -0.2, 0.0], 0.05)
     assert confirmed == [0]
 
     # p->e calibration is the conservative 1/p lower bound family.
-    assert gamfit.log_e_from_p_value(0.04) == pytest.approx(math.log(2.5))
+    assert gamfit.sae.log_e_from_p_value(0.04) == pytest.approx(math.log(2.5))
 
 
 def test_kl_optimal_probe_design_reaches_python():
@@ -471,7 +471,7 @@ def test_kl_optimal_probe_design_reaches_python():
     predicted_alt = np.array([[4.0, 4.0], [1.0, 0.2]])
     fisher = np.array([[2.0, 0.0], [0.0, 0.5]])
 
-    selected = gamfit.select_probe_by_expected_evidence(
+    selected = gamfit.sae.select_probe_by_expected_evidence(
         delta, predicted_null, predicted_alt, fisher
     )
     assert selected is not None
@@ -479,11 +479,11 @@ def test_kl_optimal_probe_design_reaches_python():
     assert selected["expected_log_growth"] == pytest.approx(1.01)
     assert selected["delta"] == [0.0, 1.0]
 
-    assert gamfit.expected_resolution_budget(0.05, 1.01) == pytest.approx(
+    assert gamfit.sae.expected_resolution_budget(0.05, 1.01) == pytest.approx(
         -math.log(0.05) / 1.01
     )
 
-    from_zero = gamfit.plan_probe_for_contested_claim(
+    from_zero = gamfit.sae.plan_probe_for_contested_claim(
         delta, predicted_null, predicted_alt, fisher, 0.05
     )
     assert from_zero is not None
@@ -493,14 +493,14 @@ def test_kl_optimal_probe_design_reaches_python():
         from_zero["budget_from_scratch"]
     )
 
-    halfway = gamfit.plan_probe_for_contested_claim(
+    halfway = gamfit.sae.plan_probe_for_contested_claim(
         delta, predicted_null, predicted_alt, fisher, 0.05, current_log_e=1.5
     )
     assert halfway is not None
     assert halfway["budget_remaining"] == pytest.approx((-math.log(0.05) - 1.5) / 1.01)
     assert halfway["budget_remaining"] < from_zero["budget_remaining"]
 
-    blind = gamfit.plan_probe_for_contested_claim(
+    blind = gamfit.sae.plan_probe_for_contested_claim(
         delta[:1], predicted_null[:1], predicted_alt[:1], fisher, 0.05
     )
     assert blind is None
@@ -512,7 +512,7 @@ def test_lawley_bartlett_factor_exponential_fixture():
     n = 32
     design = np.ones((n, 1))
     eta = np.full(n, 0.4)
-    out = gamfit.lawley_bartlett_factor(
+    out = gamfit.inference.lawley_bartlett_factor(
         design, "gamma", eta, 0, 1, 1.0, dispersion=1.0, lr_statistic=5.0
     )
     assert out["bartlett_factor"] == pytest.approx(1.0 + 1.0 / (6.0 * n), rel=1e-8)
@@ -529,7 +529,7 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
     penalty = np.diag([0.0, 3.0])
     rho_cov = np.array([[0.8]])
 
-    conditional = gamfit.lawley_bartlett_factor(
+    conditional = gamfit.inference.lawley_bartlett_factor(
         design,
         "poisson",
         eta,
@@ -539,7 +539,7 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
         penalty=penalty,
         lr_statistic=4.0,
     )
-    estimated = gamfit.lawley_bartlett_factor_estimated_lambda(
+    estimated = gamfit.inference.lawley_bartlett_factor_estimated_lambda(
         design,
         "poisson",
         eta,
@@ -566,7 +566,7 @@ def test_lawley_bartlett_factor_estimated_lambda_reaches_python():
     assert estimated["p_value_corrected"] >= 0.0
 
     with pytest.raises(ValueError, match="rho_cov must be symmetric"):
-        gamfit.lawley_bartlett_factor_estimated_lambda(
+        gamfit.inference.lawley_bartlett_factor_estimated_lambda(
             design,
             "poisson",
             eta,
@@ -611,7 +611,12 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
     ):
         assert key in row, f"smooth_significance row missing '{key}'"
     # Poisson carries closed-form Lawley jets, so the correction auto-applies.
-    assert row["correction_provenance"] == "lawley_lr_estimated_lambda"
+    # The term's λ̂ selection is replayed in its reference, which already carries
+    # the estimation of λ; only the fixed-λ factor applies on top of it, and the
+    # ρ-variation lane (which would count that estimation a second time) is not
+    # entered.
+    assert row["correction_provenance"] == "lawley_lr_fixed_lambda"
+    assert row["bartlett_factor_conditional"] is None and row["rho_variation_shift"] is None
     # The corrected statistic is the raw LR divided by the Bartlett factor.
     assert row["statistic_corrected"] == pytest.approx(
         row["statistic_lr"] / row["bartlett_factor"], rel=1e-9
@@ -640,7 +645,7 @@ def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
     x = np.column_stack([np.ones(n), rng.normal(size=n)])
     eta = x @ np.array([0.3, 1.1])
     y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
-    out = gamfit.glm_full_conformal(x, y, s_lambda, x_star, "bernoulli", alpha)
+    out = gamfit.inference.glm_full_conformal(x, y, s_lambda, x_star, "bernoulli", alpha)
     assert out["n_augmented"] == n + 1
     assert set(out["candidates"]) == {0.0, 1.0}
     # p-values are honest conformal p-values in (0, 1]; membership = p > alpha.
@@ -665,7 +670,7 @@ def test_glm_full_conformal_bernoulli_reaches_python_and_covers():
         yt = (rng.uniform(size=n_small) < 1.0 / (1.0 + np.exp(-et))).astype(float)
         p_star = 1.0 / (1.0 + np.exp(-(x_star @ beta_true)))
         y_star = float(rng.uniform() < p_star)
-        res = gamfit.glm_full_conformal(xt, yt, s_lambda, x_star, "bernoulli", alpha)
+        res = gamfit.inference.glm_full_conformal(xt, yt, s_lambda, x_star, "bernoulli", alpha)
         if y_star in res["members"]:
             covered += 1
     # Allow a small Monte-Carlo slack below the nominal 1 - alpha = 0.8.

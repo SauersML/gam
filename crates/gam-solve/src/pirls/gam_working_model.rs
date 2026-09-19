@@ -82,6 +82,12 @@ pub(crate) struct GamWorkingModel<'a> {
     /// fixed within the inner solve, refreshing across outer iterations (a fresh
     /// working model is built per inner solve). Issue #771.
     pub(crate) tweedie_phi_locked: bool,
+    /// Whether the Gaussian (non-identity link) or inverse Gaussian dispersion
+    /// `phi` has been estimated and frozen for this inner P-IRLS solve. `phi`
+    /// scales the whole data term (`W ∝ prior/φ`, score `∝ 1/φ`), so, like the
+    /// Tweedie `phi`, it is estimated once from the warm-start η and held fixed
+    /// within the inner solve so the product `φ·λ` stays a stationary target.
+    pub(crate) dispersion_phi_locked: bool,
     /// Whether the Negative-Binomial overdispersion `theta` has been estimated
     /// and frozen for the duration of this inner P-IRLS solve. `theta` enters the
     /// working weight `W = μθ/(θ+μ)` (the NB2 Fisher information) and the working
@@ -309,6 +315,7 @@ impl<'a> GamWorkingModel<'a> {
             gamma_shape_locked: false,
             beta_phi_locked: false,
             tweedie_phi_locked: false,
+            dispersion_phi_locked: false,
             negbin_theta_locked: false,
             quadctx,
             glm_first_step_gram,
@@ -834,7 +841,6 @@ impl<'a> GamWorkingModel<'a> {
                     // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
-                        &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
                     );
@@ -843,7 +849,6 @@ impl<'a> GamWorkingModel<'a> {
                     // computes Xᵀ·diag(w)·X directly without sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_signed(
                         weights,
-                        &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
                     );
@@ -896,7 +901,7 @@ impl<'a> GamWorkingModel<'a> {
                 .take()
                 .expect("frozen first-step Gram present by the guard above");
             self.glm_first_step_gram_consumed = true;
-            log::debug!(
+            log::trace!(
                 "[frozen-glm-gram] serving first Fisher-step XᵀWX n-free (p={})",
                 xtwx.nrows()
             );
@@ -1239,6 +1244,29 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             }
         }
 
+        // Estimate the Gaussian (non-identity link) / inverse Gaussian dispersion
+        // φ once from the warm-start η and freeze it for this inner solve, exactly
+        // as the Tweedie φ above: φ scales the working weight and the score
+        // uniformly, so holding it fixed keeps φ·λ — hence β̂ — stationary.
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Dispersion {
+                estimated: true,
+                ..
+            }
+        ) && !self.dispersion_phi_locked
+        {
+            let phi = estimate_dispersion_phi_from_eta(
+                &self.likelihood.spec.response,
+                &self.likelihood.spec.link,
+                self.y,
+                &self.workspace.eta_buf,
+                self.priorweights,
+            )?;
+            self.likelihood = self.likelihood.clone().with_dispersion_phi(phi);
+            self.dispersion_phi_locked = true;
+        }
+
         // Estimate the Negative-Binomial overdispersion `theta` once from the
         // warm-start η and freeze it for this inner solve (issue #802). `theta`
         // enters the working weight `W = μθ/(θ+μ)` (the NB2 Fisher information)
@@ -1403,7 +1431,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // exact Jeffreys coefficient Hessian. The factor is built in the
             // correct (transformed) coefficient basis.
             let factor = self.ensure_firth_design_factor()?;
-            let (hat_diag, jeffreys_logdet, firth_score_shift, firth_hessian) =
+            let (hat_diag, jeffreys_logdet, jeffreys_eta_score, firth_hessian) =
                 jeffreys_pirls_diagnostics_and_hessian_from_factor(
                     &factor,
                     &self.link_kind,
@@ -1414,21 +1442,31 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
             };
-            // Apply the link-general Firth working-response shift `Δ_i` built by
-            // the operator (`½ (w'_i/w_i) h_diag_i`). PIRLS then solves
-            // `Xᵀ W (z* − η) = 0`, so the Firth term it adds to the score is
-            // `Σ_i w_i Δ_i x_i = ½ Σ_i w'_i h_diag_i x_i = ∂Φ/∂β` — exactly the
-            // Jeffreys score the outer REML differentiates. For the canonical
-            // logit `Δ_i` equals the historical `h_i (½ − μ_i)/w_i`; for probit /
-            // cloglog it carries the correct non-canonical `w'_i/w_i` instead of
-            // the logit-pinned `(½ − μ_i)`, so the inner mode and the outer
-            // objective no longer disagree.
+            // Turn the Jeffreys linear-predictor score `g_i = ∂Φ/∂η_i =
+            // ½ w'_i h_diag_i` into a working-response shift. PIRLS forms its
+            // score as `Xᵀ W (η − z)` with the SAME score weights
+            // `W_i = lastweights_i`, so the shift `Δ_i = g_i / W_i` adds exactly
+            // `Σ_i W_i Δ_i x_i = Xᵀ g = ∂Φ/∂β` — the Jeffreys score the
+            // objective value `−Φ` and the curvature `HΦ` differentiate.
+            //
+            // `W_i` is the prior-weighted Fisher weight `a_i w_i`, while
+            // `h_diag_i` already carries `a_i` once through the operator's
+            // `A^{1/2} X` design. A shift divided by the family weight `w_i`
+            // alone therefore scaled row i's Jeffreys score by `a_i` a second
+            // time: harmless for unit weights, but under any other prior weight
+            // the score no longer matched `Φ`, the Newton step stopped being a
+            // descent direction for the Firth-penalized objective, and the LM
+            // step search exhausted at every ρ. Dividing by the score weight
+            // itself keeps one prior weight per row, so a weight-2 row is
+            // exactly a duplicated row. For the canonical logit `Δ_i` is the
+            // historical `h_i (½ − μ_i)/w_i`; for probit / cloglog it carries
+            // the non-canonical `w'_i/w_i`.
             ndarray::Zip::from(&mut self.lastz)
-                .and(&firth_score_shift)
+                .and(&jeffreys_eta_score)
                 .and(&self.lastweights)
-                .par_for_each(|zi, &delta_i, &wi| {
+                .par_for_each(|zi, &score_i, &wi| {
                     if wi > 0.0 {
-                        *zi += delta_i;
+                        *zi += score_i / wi;
                     }
                 });
         }

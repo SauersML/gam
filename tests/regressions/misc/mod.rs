@@ -72,4 +72,5 @@ mod regression_1082_block_correction_decided_at_optimum;
 mod regression_2644_outer_criterion_conditioning;
 mod regression_2726_joint_psi_seed_shares_theta0;
 mod regression_2748_block_correction_continuity;
+mod regression_poisson_te_block_axis_split;
 mod reml_locscale_mu_bound_2356;

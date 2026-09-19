@@ -92,9 +92,10 @@ fn spec_at(length_scale: MaternLengthScale) -> TermCollectionSpec {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

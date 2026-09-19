@@ -24,9 +24,12 @@ mod low_rank;
 mod newton_solve;
 mod penalty;
 mod pls_solver;
+mod residuals;
 mod reweight;
+mod row_pass;
 mod sparse_system;
 mod state;
+mod student_t;
 mod working_model_trait;
 mod workspace;
 
@@ -34,6 +37,8 @@ mod workspace;
 mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
+#[cfg(test)]
+mod residuals_tests;
 #[cfg(test)]
 mod sas_saturated_row_2733_tests;
 #[cfg(test)]
@@ -53,13 +58,21 @@ pub(crate) use dispersion::*;
 pub(crate) use family_state::*;
 // The count-response contract is needed by `gam-inference`'s HMC entry
 // points, which the `pub(crate)` glob above cannot reach; naming the two
-// items explicitly is what keeps that crate from carrying its own copy.
-pub use family_state::{certify_count_responses, valid_count_response};
+// items explicitly is what keeps that crate from carrying its own copy. The
+// reciprocal-link domain contract is shared the same way with the bounded
+// coefficient path in `gam-models`, so both solvers step-halve on one rule.
+pub use family_state::{
+    certify_count_responses, require_reciprocal_link_domain, reciprocal_power_link,
+    valid_count_response,
+};
 pub(crate) use gam_working_model::*;
+pub(crate) use row_pass::*;
 pub use glm_update::*;
 pub use low_rank::*;
 pub use newton_solve::*;
+pub use residuals::*;
 pub(crate) use sparse_system::*;
+pub(crate) use student_t::*;
 pub(crate) use working_model_trait::*;
 pub use workspace::*;
 
@@ -105,8 +118,7 @@ pub use state::{
 };
 
 // loop_driver owns: default_beta_guess_external, solve_intercept_for_prevalence,
-// assemble_pirls_result, stack_lambdaweighted_penalty_root_canonical,
-// build_sparse_native_reparam_result, canonical_prior_shift,
+// assemble_pirls_result, canonical_prior_shift,
 // PirlsProblem, PenaltyConfig, fit_model_for_fixed_rho,
 // fit_model_for_fixed_rho_with_adaptive_kkt, PirlsConfig, make_reparam_operator,
 // build_transformed_lower_bound_constraints*, build_transformed_linear_constraints*,
@@ -120,5 +132,3 @@ pub use loop_driver::{
     nfree_skip_row_element_touches,
 };
 
-/// Allow up to 128MB per thread for cached L-BFGS/PIRLS history.
-pub(crate) const PIRLS_CACHE_BYTE_BUDGET: usize = 128 * 1024 * 1024;

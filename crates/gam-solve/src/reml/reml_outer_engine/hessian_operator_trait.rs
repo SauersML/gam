@@ -1,5 +1,38 @@
 use super::*;
 
+/// A penalty drift `scale · rootᵀroot` embedded on the coefficient range
+/// `[start, end)`, carried by its root so the `p × p` matrix need not exist.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockRootDrift<'a> {
+    pub root: ArrayView2<'a, f64>,
+    pub start: usize,
+    pub end: usize,
+    pub scale: f64,
+}
+
+impl BlockRootDrift<'_> {
+    /// The embedded `p × p` drift, squared exactly as
+    /// `PenaltyCoordinate::scaled_dense_matrix` squares it.
+    pub fn to_dense(&self, p: usize) -> Array2<f64> {
+        let mut block = gam_problem::penalty_coordinate::penalty_root_gram(self.root);
+        block *= self.scale;
+        let mut out = Array2::<f64>::zeros((p, p));
+        out.slice_mut(ndarray::s![self.start..self.end, self.start..self.end])
+            .assign(&block);
+        out
+    }
+
+    /// Whether `other` names the same drift (same root storage, range, scale).
+    pub fn same_drift(&self, other: &BlockRootDrift<'_>) -> bool {
+        std::ptr::eq(self.root.as_ptr(), other.root.as_ptr())
+            && self.root.dim() == other.root.dim()
+            && self.root.strides() == other.root.strides()
+            && self.start == other.start
+            && self.end == other.end
+            && self.scale == other.scale
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
 // ═══════════════════════════════════════════════════════════════════════════
@@ -56,7 +89,7 @@ pub trait HessianFactorization: Send + Sync {
     /// native operator traces (notably sparse Cholesky) should override it.
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_operator: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );
@@ -96,7 +129,7 @@ pub trait HessianFactorization: Send + Sync {
         op: &dyn HyperOperator,
     ) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_matrix_operator_cross: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );
@@ -114,7 +147,7 @@ pub trait HessianFactorization: Send + Sync {
         right: &dyn HyperOperator,
     ) -> f64 {
         if left.is_implicit() || right.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_operator_cross: materializing implicit HyperOperator(s) — \
                  backend should provide a matrix-free override"
             );
@@ -183,7 +216,7 @@ pub trait HessianFactorization: Send + Sync {
     /// backends this equals `trace_hinv_operator`.
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_logdet_operator: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );
@@ -275,6 +308,28 @@ pub trait HessianFactorization: Send + Sync {
         }
         let y_j = self.solve_multi(h_j);
         -dense::trace_product(&y_j, &y_i)
+    }
+
+    /// Whether [`Self::trace_logdet_hessian_cross_block_roots`] contracts the
+    /// roots directly. Only then does a caller gain by keeping a block-local
+    /// penalty drift as its root instead of materializing it.
+    fn contracts_block_root_drifts(&self) -> bool {
+        false
+    }
+
+    /// [`Self::trace_logdet_hessian_cross`] for two penalty drifts given by
+    /// their roots. The default materializes both drifts, squared exactly as
+    /// `PenaltyCoordinate::scaled_dense_matrix` squares them.
+    fn trace_logdet_hessian_cross_block_roots(
+        &self,
+        a: BlockRootDrift<'_>,
+        b: BlockRootDrift<'_>,
+    ) -> f64 {
+        let dense_a = a.to_dense(self.dim());
+        if a.same_drift(&b) {
+            return self.trace_logdet_hessian_cross(&dense_a, &dense_a);
+        }
+        self.trace_logdet_hessian_cross(&dense_a, &b.to_dense(self.dim()))
     }
 
     /// Operator-backed mixed form of `trace_logdet_hessian_cross`.

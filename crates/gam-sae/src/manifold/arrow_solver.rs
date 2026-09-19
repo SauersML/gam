@@ -1555,7 +1555,7 @@ where
             // the iteration count no matter how long a cycle runs, and the
             // interval between lines grows with the cost already sunk.
             if iterations.is_power_of_two() {
-                log::info!(
+                log::debug!(
                     "[SAE-GMRES] dim={dim} restart={restart} iter={iterations} \
                      rel_residual={:.3e} target={:.3e} elapsed={:.1}s",
                     g[j + 1].abs() / b_norm,
@@ -1603,7 +1603,7 @@ where
         let roundoff_floor =
             certified_floor(solution.dot(&solution).sqrt(), operator_norm_estimate);
         cycles += 1;
-        log::info!(
+        log::debug!(
             "[SAE-GMRES] cycle {cycles} closed: dim={dim} restart={restart} iters={iterations} \
              rel_original_residual={:.3e} floor={:.3e} elapsed={:.1}s",
             original_norm / rhs_norm,

@@ -5,8 +5,6 @@ from typing import Any, Protocol, cast
 
 
 class _Pytest(Protocol):
-    def importorskip(self, modname: str) -> Any: ...
-
     def raises(self, expected_exception: type[BaseException], *, match: str) -> Any: ...
 
 
@@ -43,7 +41,7 @@ def test_normalize_table_dict_of_numpy_float64_arrays_renders_native_numbers() -
     # row lazily, for display. What survives — and is asserted here — is the
     # property itself: no rendered cell carries a NumPy repr, and a numpy
     # column encodes identically to the equivalent Python-list column.
-    np = pytest.importorskip("numpy")
+    import numpy as np
 
     x = np.array([-3.0, 0.5, 2.25], dtype=np.float64)
     y = np.array([1.0, -0.25, 3.5], dtype=np.float64)
@@ -72,7 +70,7 @@ def test_normalize_table_dict_of_numpy_float64_arrays_renders_native_numbers() -
 def test_normalize_table_numpy_float16_and_int_scalars_render_natively() -> None:
     # float16 also subclasses float with a type-named repr in NumPy 2.x;
     # numpy integers must not arrive as "np.int64(3)".
-    np = pytest.importorskip("numpy")
+    import numpy as np
 
     _, rows, _ = normalize_table(
         {
@@ -101,12 +99,11 @@ def test_normalize_table_numpy_float16_and_int_scalars_render_natively() -> None
 
 def test_numpy_scalars_in_a_categorical_column_carry_no_numpy_repr() -> None:
     # #387's hazard has ONE surviving path, and this covers it. Numeric columns
-    # no longer stringify at all, but `stringify_cell` is still the renderer for
-    # genuinely categorical columns — and a column that mixes a string with
-    # numerics ("object" dtype in pandas) sends numpy scalars straight through
-    # it. That is where "np.int64(1)" could still reach the Rust core as a
-    # level name, so that is where the guard belongs.
-    np = pytest.importorskip("numpy")
+    # never stringify, but a column that mixes a string with numerics ("object"
+    # dtype in pandas) labels its numbers as levels. That is where "np.int64(1)"
+    # could still reach the Rust core as a level name, so that is where the
+    # guard belongs.
+    import numpy as np
 
     headers, rows, _ = normalize_table(
         {
@@ -128,12 +125,14 @@ def test_numpy_scalars_in_a_categorical_column_carry_no_numpy_repr() -> None:
 
 
 def test_normalize_table_rejects_zero_row_mapping() -> None:
-    with pytest.raises(ValueError, match="table data cannot be empty"):
+    from gamfit.errors import DataError
+
+    with pytest.raises(DataError, match="has no observations"):
         normalize_table({"x": [], "y": []})
 
 
-def test_normalize_pandas_arrow_stream_excludes_row_index() -> None:
-    pd = pytest.importorskip("pandas")
+def test_normalize_pandas_frame_excludes_row_index() -> None:
+    import pandas as pd
 
     frame = pd.DataFrame(
         {"x": [1.0, 2.0, 3.0], "y": [4.0, 5.0, 6.0]},
@@ -197,7 +196,7 @@ def test_restore_output_table_dict_returns_prediction_result_with_field_access()
 
 
 def test_restore_output_table_supports_pyarrow_output() -> None:
-    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow
 
     restored = restore_output_table(
         {"mean": [1.0, 2.0], "linear_predictor": [0.0, 0.5]},
@@ -212,7 +211,7 @@ def test_restore_output_table_supports_pyarrow_output() -> None:
 
 
 def test_restore_output_table_prefers_pyarrow_training_kind() -> None:
-    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow
 
     restored = restore_output_table(
         {"mean": [1.0], "linear_predictor": [0.0]},
@@ -229,34 +228,31 @@ def test_restore_output_table_prefers_pyarrow_training_kind() -> None:
 # detected as categorical, matching pandas string/object-dtype behavior — so
 # numeric-string labels ("0", "1", "2") are NOT inferred numeric. A column of
 # int/float stays numeric (a genuinely-numeric by= covariate is preserved).
-def test_categorical_dtype_columns_dict_numeric_string_is_categorical() -> None:
-    from gamfit._tables import categorical_dtype_columns, table_columns
+def _categorical_columns(data: Any) -> set[str]:
+    """Columns the encoded table holds as categorical (sentinel-rendered)."""
+    headers, rows, _ = normalize_table(data)
+    first = rows[0]
+    return {
+        header
+        for header, cell in zip(headers, first)
+        if cell.startswith(CATEGORICAL_CELL_SENTINEL)
+    }
 
+
+def test_dict_numeric_string_column_is_categorical() -> None:
     data = {"g": ["0", "1", "2", "0", "1"], "y": [1.0, 2.0, 3.0, 4.0, 5.0]}
-    columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    assert "g" in categorical, f"numeric-string column must be categorical: {categorical}"
-    assert "y" not in categorical, f"float column must stay numeric: {categorical}"
+    assert _categorical_columns(data) == {"g"}
 
 
-def test_categorical_dtype_columns_dict_numeric_covariate_stays_numeric() -> None:
-    from gamfit._tables import categorical_dtype_columns, table_columns
-
+def test_dict_numeric_covariate_stays_numeric() -> None:
     # A genuinely-numeric by= covariate supplied as floats must NOT be treated
     # as categorical — only string-valued columns are.
-    data = {"age": [25.0, 30.0, 35.5], "y": [1.0, 2.0, 3.0]}
-    columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    assert categorical == frozenset(), f"numeric columns must stay numeric: {categorical}"
+    assert _categorical_columns({"age": [25.0, 30.0, 35.5], "y": [1.0, 2.0, 3.0]}) == set()
 
 
-def test_categorical_dtype_columns_records_numeric_string_is_categorical() -> None:
-    from gamfit._tables import categorical_dtype_columns, table_columns
-
+def test_records_numeric_string_column_is_categorical() -> None:
     recs = [{"g": "0", "y": 1.0}, {"g": "1", "y": 2.0}, {"g": "2", "y": 3.0}]
-    columns, kind = table_columns(recs)
-    categorical = categorical_dtype_columns(recs, kind, columns=columns)
-    assert "g" in categorical, f"records numeric-string must be categorical: {categorical}"
+    assert _categorical_columns(recs) == {"g"}
 
 
 # A MIXED string+numeric column is `object` dtype in pandas (→ categorical). The
@@ -264,55 +260,29 @@ def test_categorical_dtype_columns_records_numeric_string_is_categorical() -> No
 # typed-vs-untyped parity gap as #1467/#1468/#1469 one boundary further out: the
 # old "every non-null value must be str" rule saw the numeric and lowered the
 # whole column to a NUMERIC covariate, dropping the string levels.
-def test_categorical_dtype_columns_dict_mixed_string_numeric_is_categorical() -> None:
-    from gamfit._tables import categorical_dtype_columns, table_columns
-
-    data = {"g": ["a", 1, "b", 2], "y": [1.0, 2.0, 3.0, 4.0]}
-    columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    assert "g" in categorical, (
-        f"a mixed string+numeric column is object-dtype in pandas and must be "
-        f"categorical (not lowered to a numeric covariate): {categorical}"
-    )
-    assert "y" not in categorical, f"pure float column must stay numeric: {categorical}"
+def test_dict_mixed_string_numeric_column_is_categorical() -> None:
+    assert _categorical_columns({"g": ["a", 1, "b", 2], "y": [1.0, 2.0, 3.0, 4.0]}) == {"g"}
 
 
-def test_categorical_dtype_columns_dict_numeric_with_one_string_is_categorical() -> None:
+def test_dict_numeric_column_with_one_string_is_categorical() -> None:
     # The dual: a numeric column with a single stray string ("NA") is object in
-    # pandas (→ categorical); it must NOT be silently treated as numeric (which
-    # would make Rust fail to parse "NA" or mis-encode it).
-    from gamfit._tables import categorical_dtype_columns, table_columns
-
-    data = {"v": [1.0, 2.0, "NA", 4.0]}
-    columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    assert "v" in categorical, (
-        f"a numeric column carrying a non-numeric string is object-dtype in "
-        f"pandas and must be categorical: {categorical}"
-    )
+    # pandas (→ categorical); it must NOT be silently treated as numeric.
+    assert _categorical_columns({"v": [1.0, 2.0, "NA", 4.0]}) == {"v"}
 
 
-def test_categorical_dtype_columns_pure_bool_stays_numeric_but_bool_str_is_categorical() -> None:
+def test_pure_bool_column_stays_numeric_but_bool_str_is_categorical() -> None:
     # `bool` is not a `str`: a pure-bool column is `bool` dtype in pandas (numeric);
     # a bool+str mix is `object` (categorical). Pins both halves so the string
     # rule does not accidentally sweep in pure-bool columns.
-    from gamfit._tables import categorical_dtype_columns, table_columns
-
     data = {"flag": [True, False, True], "mixed": [True, "yes", False]}
-    columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, kind, columns=columns)
-    assert "flag" not in categorical, f"pure-bool column must stay numeric: {categorical}"
-    assert "mixed" in categorical, f"bool+str column is object-dtype → categorical: {categorical}"
+    assert _categorical_columns(data) == {"mixed"}
 
 
-def test_categorical_dtype_columns_pandas_numeric_string_still_categorical() -> None:
-    pd = pytest.importorskip("pandas")
-    from gamfit._tables import categorical_dtype_columns, table_columns
+def test_pandas_numeric_string_column_is_categorical() -> None:
+    import pandas as pd
 
     df = pd.DataFrame({"g": ["0", "1", "2"], "y": [1.0, 2.0, 3.0]})
-    columns, kind = table_columns(df)
-    categorical = categorical_dtype_columns(df, kind, columns=columns)
-    assert "g" in categorical, f"pandas regression guard: {categorical}"
+    assert _categorical_columns(df) == {"g"}
 
 
 def test_normalize_table_dict_numeric_string_stamps_categorical_sentinel() -> None:

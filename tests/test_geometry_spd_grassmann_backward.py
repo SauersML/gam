@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from gamfit import RustExtensionUnavailableError, manifolds
+from gamfit.errors import RustExtensionUnavailableError
+from gamfit import manifolds
 
 
 torch = pytest.importorskip("torch")

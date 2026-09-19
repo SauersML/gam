@@ -40,12 +40,8 @@ pub(crate) struct FirthSecondDirEyeCache {
 }
 
 impl<'a> RemlState<'a> {
-    pub(crate) fn xt_diag_x_dense_into(
-        x: &Array2<f64>,
-        diag: &Array1<f64>,
-        weighted: &mut Array2<f64>,
-    ) -> Array2<f64> {
-        super::assembly::xt_diag_x_dense_into(x, diag, weighted)
+    pub(crate) fn xt_diag_x_dense(x: &Array2<f64>, diag: &Array1<f64>) -> Array2<f64> {
+        super::assembly::xt_diag_x_dense(x, diag)
     }
 
     #[inline]
@@ -171,8 +167,7 @@ impl<'a> RemlState<'a> {
         let (evals_ir, evecs_ir) = fisher_reduced
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let max_eval = evals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
-        let tol = (r.max(1) as f64) * f64::EPSILON * max_eval;
+        let tol = Self::reduced_fisher_eigen_tolerance(&evals_ir);
         let mut kept_positive_direction = false;
         let mut half_log_det = 0.0_f64;
         for (eig_idx, &eig) in evals_ir.iter().enumerate() {
@@ -194,6 +189,44 @@ impl<'a> RemlState<'a> {
             });
         }
         Ok((k_reduced, half_log_det))
+    }
+
+    /// The half-log-determinant of [`Self::reduced_fisher_inverse_and_half_logdet`]
+    /// alone: the same factorization choice and retained spectrum, without
+    /// forming the inverse.
+    pub(crate) fn reduced_fisher_half_logdet(
+        fisher_reduced: &Array2<f64>,
+    ) -> Result<f64, EstimationError> {
+        let r = fisher_reduced.nrows();
+        assert_eq!(r, fisher_reduced.ncols());
+        if r == 0 {
+            return Ok(0.0);
+        }
+        if let Ok(chol) = fisher_reduced.cholesky(Side::Lower) {
+            let chol_diag = chol.diag();
+            if Self::cholesky_pivots_are_numerically_resolved(&chol_diag) {
+                return Ok(chol_diag.iter().map(|d| d.ln()).sum::<f64>());
+            }
+        }
+        let (evals_ir, _) = fisher_reduced
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let tol = Self::reduced_fisher_eigen_tolerance(&evals_ir);
+        let retained: Vec<f64> = evals_ir.iter().copied().filter(|&eig| eig > tol).collect();
+        if retained.is_empty() {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        Ok(retained.iter().map(|eig| 0.5 * eig.ln()).sum())
+    }
+
+    /// Eigenvalues of the reduced Fisher at or below the eigensolver's
+    /// resolution `r·ε·max(λ_max, 1)` are dropped from its pseudo-inverse and
+    /// log-determinant.
+    fn reduced_fisher_eigen_tolerance(evals_ir: &Array1<f64>) -> f64 {
+        let max_eval = evals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+        (evals_ir.len().max(1) as f64) * f64::EPSILON * max_eval
     }
 
     pub(crate) fn fill_fisher_weight_derivative_arrays(
@@ -574,7 +607,7 @@ impl FirthDenseOperator {
                 // The eigensolver resolves eigenvalues to `r·ε·λ_max`; a smallest one
                 // inside that band leaves I_r singular to working precision.
                 if rel <= eigvals_ir.len() as f64 * f64::EPSILON {
-                    log::warn!(
+                    log::debug!(
                         "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
                         min_ev,
                         max_ev,
@@ -2883,6 +2916,45 @@ impl FirthDenseOperator {
     }
 }
 
+impl JeffreysHalfLogDet {
+    /// Factor the unit-weight design `x_dense` once for evaluations under `link`.
+    pub fn new(link: &InverseLink, x_dense: &Array2<f64>) -> Result<Self, EstimationError> {
+        Ok(Self {
+            factor: FirthDenseOperator::build_design_factor_with_observation_weights(
+                x_dense, None,
+            )?,
+            link: link.clone(),
+        })
+    }
+
+    /// `½ log|I(η)|` on the identifiable subspace: the value
+    /// [`FirthDenseOperator::jeffreys_logdet`] reports for the same design,
+    /// link and `η`.
+    pub fn at(&self, eta: &Array1<f64>) -> Result<f64, EstimationError> {
+        let factor = &self.factor;
+        if eta.len() != factor.n {
+            crate::bail_invalid_estim!(
+                "Jeffreys log-density shape mismatch: nrows={}, eta_len={}",
+                factor.n,
+                eta.len()
+            );
+        }
+        if factor.r == 0 {
+            return Ok(0.0);
+        }
+        let mut w = Array1::<f64>::zeros(factor.n);
+        for (weight, &eta_i) in w.iter_mut().zip(eta.iter()) {
+            *weight = RemlState::fisher_weight_derivatives(&self.link, eta_i)?.0;
+        }
+        let fisher_reduced = gam_linalg::faer_ndarray::fast_xt_diag_x(&factor.x_reduced, &w);
+        let mut half_log_det = RemlState::reduced_fisher_half_logdet(&fisher_reduced)?;
+        for &metric_eig in &factor.metric_spectrum {
+            half_log_det -= 0.5 * metric_eig.ln();
+        }
+        Ok(half_log_det)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2900,18 +2972,12 @@ mod tests {
             &self.w * &self.h_diag
         }
 
-        /// Per-observation Firth working-response shift `Δ_i = ½·(w'_i/w_i)·h_diag_i`
-        /// (the link-general form; `w_i ≤ 0` rows get a zero shift). Matches the
-        /// Jeffreys score `½ Σ_i w'_i h_i x_i` the outer REML differentiates.
-        pub(crate) fn pirls_firth_score_shift(&self) -> Array1<f64> {
-            let mut shift = Array1::<f64>::zeros(self.w.len());
-            for i in 0..self.w.len() {
-                let wi = self.w[i];
-                if wi > 0.0 {
-                    shift[i] = 0.5 * (self.w1[i] / wi) * self.h_diag[i];
-                }
-            }
-            shift
+        /// Per-observation Jeffreys linear-predictor score
+        /// `∂Φ/∂η_i = ½·w'_i·h_diag_i`, so `∂Φ/∂β = Xᵀ(∂Φ/∂η)` is the Jeffreys
+        /// score the outer REML differentiates (`h_diag` carries the prior
+        /// weights once).
+        pub(crate) fn pirls_jeffreys_eta_score(&self) -> Array1<f64> {
+            0.5 * (&self.w1 * &self.h_diag)
         }
     }
 
@@ -3409,6 +3475,42 @@ mod tests {
                 hat_full[i],
                 hat_reduced[i]
             );
+        }
+    }
+
+    #[test]
+    fn value_only_jeffreys_log_density_matches_the_operator() {
+        // Full rank, and rank deficient (column 3 = column 1 + column 2), where
+        // the identifiable-subspace reduction decides the value.
+        let designs = [
+            array![
+                [1.0, -1.20, 0.30],
+                [1.0, -0.40, -0.80],
+                [1.0, 0.10, 0.45],
+                [1.0, 0.70, 1.10],
+                [1.0, 1.30, -0.25],
+            ],
+            array![
+                [1.0, -1.20, -0.20],
+                [1.0, -0.40, 0.60],
+                [1.0, 0.10, 1.10],
+                [1.0, 0.70, 1.70],
+                [1.0, 1.30, 2.30],
+            ],
+        ];
+        for x in &designs {
+            for link in [StandardLink::Logit, StandardLink::Probit] {
+                let link = InverseLink::Standard(link);
+                let density = JeffreysHalfLogDet::new(&link, x).expect("design factor");
+                for beta in [array![0.25, -0.50, 0.15], array![-2.0, 3.5, -1.25]] {
+                    let eta = x.dot(&beta);
+                    let expected = FirthDenseOperator::build_for_link(&link, x, &eta)
+                        .expect("operator")
+                        .jeffreys_logdet();
+                    let value = density.at(&eta).expect("value");
+                    assert_eq!(value.to_bits(), expected.to_bits(), "{link:?} β={beta}");
+                }
+            }
         }
     }
 

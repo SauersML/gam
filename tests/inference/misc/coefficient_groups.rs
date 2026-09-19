@@ -63,6 +63,7 @@ fn two_linear_term_spec() -> TermCollectionSpec {
         ],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 

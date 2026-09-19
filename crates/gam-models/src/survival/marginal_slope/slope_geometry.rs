@@ -926,7 +926,7 @@ impl SlopeRowGeometry<STATIC_SLOPE_PRIMARIES> for AnchoredStaticSlopeGeometry {
         let linear = observed.scale(inputs.z_sum);
         let [alpha0, alpha1, rate] =
             Self::anchored_channels(primaries, &observed, inputs).unwrap_or_else(|reason| {
-                log::debug!(
+                log::trace!(
                     "[survival-marginal-slope anchor] row {}: {reason}; the row is refused \
                      through its non-finite signed margin",
                     inputs.row

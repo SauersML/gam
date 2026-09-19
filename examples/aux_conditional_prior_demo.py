@@ -28,9 +28,9 @@ def main() -> None:
         data,
         "y ~ s(t, type='duchon', centers=32)",
         family="gaussian",
-        latents={"t": gamfit.LatentCoord(n=n, d=d, init=t_init)},
+        latents={"t": gamfit.smooth.LatentCoord(n=n, d=d, init=t_init)},
         penalties=[
-            gamfit.AuxConditionalPriorPenalty(
+            gamfit.penalties.AuxConditionalPriorPenalty(
                 lambda_per_row=lambda_per_row,
                 weight=2.0,
                 n_eff=n,

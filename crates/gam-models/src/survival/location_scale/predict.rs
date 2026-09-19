@@ -340,11 +340,14 @@ pub(crate) fn validate_predict_inverse_link(
     inverse_link: &InverseLink,
 ) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(StandardLink::Log) => {
-            Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "prediction does not support Standard(Log) for survival models".to_string(),
-            })
-        }
+        InverseLink::Standard(
+            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+        ) => Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!(
+                "prediction does not support the {} link for survival models",
+                link.name()
+            ),
+        }),
         InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -410,14 +413,17 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::LogLog) => -(-(-eta).exp()).exp_m1(),
         InverseLink::Standard(StandardLink::Cauchit) => 0.5 - eta.atan() / std::f64::consts::PI,
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
-        InverseLink::Standard(StandardLink::Log) => {
+        InverseLink::Standard(
+            StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared,
+        ) => {
             // SAFETY: survival families register only Probit/Logit/CLogLog/
             // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
-            // `validate_predict_inverse_link` rejects `Standard(Log)` upstream
+            // `validate_predict_inverse_link` rejects the log and reciprocal
+            // links upstream
             // so this arm is unreachable on a validated survival model. A NaN
             // sentinel here would silently corrupt the survival probability,
             // so fail loudly on a contract violation instead.
-            panic!("state-less log inverse link is invalid for survival prediction")
+            panic!("the log and reciprocal inverse links are invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)

@@ -9,7 +9,7 @@ identically. Inputs must be ``torch.Tensor`` — NumPy-array callers go through
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -17,8 +17,11 @@ import torch
 from .._frame_torch import from_numpy_like as _frame_from_numpy_like
 from .._frame_torch import to_numpy_f64 as _frame_to_numpy_f64
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
-def to_numpy_f64(value: torch.Tensor) -> Any:
+
+def to_numpy_f64(value: torch.Tensor) -> NDArray[np.float64]:
     """Convert a torch tensor to a contiguous f64 NumPy array on CPU.
 
     The autograd graph is *not* preserved — callers wanting differentiable
@@ -31,7 +34,7 @@ def to_numpy_f64(value: torch.Tensor) -> Any:
     return _frame_to_numpy_f64(value)
 
 
-def to_numpy_uintp(value: torch.Tensor) -> Any:
+def to_numpy_uintp(value: torch.Tensor) -> NDArray[np.uintp]:
     """Convert a torch tensor to a contiguous ``uintp`` NumPy array on CPU."""
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"expected torch.Tensor, got {type(value).__name__}")
@@ -55,4 +58,5 @@ def from_numpy_like(array: Any, ref: torch.Tensor) -> torch.Tensor:
     """
     if not isinstance(ref, torch.Tensor):
         raise TypeError("from_numpy_like requires a torch tensor as reference")
-    return _frame_from_numpy_like(array, ref)
+    tensor: torch.Tensor = _frame_from_numpy_like(array, ref)
+    return tensor

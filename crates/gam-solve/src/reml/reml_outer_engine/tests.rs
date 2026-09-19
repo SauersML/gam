@@ -5543,6 +5543,194 @@ pub(crate) fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
     );
 }
 
+/// A random-effect-shaped Hessian: a structurally diagonal level block
+/// `[0, 4)` coupled to two dense fixed-effect columns `[4, 6)`.
+fn random_effect_shaped_hessian() -> Array2<f64> {
+    array![
+        [3.0, 0.0, 0.0, 0.0, 1.0, 0.4],
+        [0.0, 2.5, 0.0, 0.0, 1.0, -0.3],
+        [0.0, 0.0, 4.0, 0.0, 1.0, 0.7],
+        [0.0, 0.0, 0.0, 1.5, 1.0, 0.1],
+        [1.0, 1.0, 1.0, 1.0, 6.0, 0.9],
+        [0.4, -0.3, 0.7, 0.1, 0.9, 3.0],
+    ]
+}
+
+#[test]
+pub(crate) fn sparse_takahashi_block_root_traces_match_dense_reference() {
+    let h = random_effect_shaped_hessian();
+    let h_sparse = gam_linalg_test_support::dense_to_upper_csc(&h);
+    let factor =
+        std::sync::Arc::new(gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap());
+    let sfactor = gam_linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
+    let taka =
+        std::sync::Arc::new(gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor).unwrap());
+    let sparse = SparseCholeskyOperator::new(factor, 0.0, h.nrows()).with_takahashi(taka);
+    let dense = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+    let embedded = |block: &Array2<f64>, start: usize| {
+        let mut full = Array2::<f64>::zeros(h.raw_dim());
+        let end = start + block.nrows();
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(block);
+        full
+    };
+
+    // A random-effect ridge root (one nonzero per row) on the level block,
+    // whose Gram is diagonal, and a coupling root on the fixed block.
+    let ridge_root = array![
+        [0.0, 1.3, 0.0, 0.0],
+        [0.7, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0],
+        [0.0, 0.0, 0.9, 0.0],
+    ];
+    let ridge_gram = gam_problem::penalty_coordinate::penalty_root_gram(ridge_root.view());
+    assert_eq!(ridge_gram, ridge_root.t().dot(&ridge_root));
+    assert!(
+        gam_problem::penalty_coordinate::penalty_root_gram_diagonal(ridge_root.view()).is_some()
+    );
+    let coupling_root = array![[0.6, -0.4], [0.2, 0.9], [1.1, 0.3]];
+    assert!(
+        gam_problem::penalty_coordinate::penalty_root_gram_diagonal(coupling_root.view())
+            .is_none()
+    );
+
+    for (root, start) in [(&ridge_root, 0usize), (&coupling_root, 4usize)] {
+        let end = start + root.ncols();
+        let block = root.t().dot(root);
+        let reference = dense.trace_hinv_product(&embedded(&block, start));
+        assert_relative_eq!(
+            sparse.trace_logdet_block_root(root.view(), start, end),
+            reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(
+            sparse.trace_logdet_block_local(&block, 1.7, start, end),
+            1.7 * reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+}
+
+#[test]
+pub(crate) fn sparse_block_root_logdet_cross_matches_dense_reference() {
+    let embedded = |p: usize, root: &Array2<f64>, start: usize| {
+        let mut full = Array2::<f64>::zeros((p, p));
+        let end = start + root.ncols();
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(&root.t().dot(root));
+        full
+    };
+    fn drift(root: &Array2<f64>, start: usize, scale: f64) -> BlockRootDrift<'_> {
+        BlockRootDrift {
+            root: root.view(),
+            start,
+            end: start + root.ncols(),
+            scale,
+        }
+    }
+    let sparse_operator = |h: &Array2<f64>, with_hessian: bool| {
+        let h_sparse = gam_linalg_test_support::dense_to_upper_csc(h);
+        let factor = std::sync::Arc::new(
+            gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let op = SparseCholeskyOperator::new(factor, 0.0, h.nrows());
+        if with_hessian {
+            op.with_hessian(std::sync::Arc::new(h_sparse))
+        } else {
+            op
+        }
+    };
+
+    // Levels [0, 4) carry a ridge root (one nonzero per row, diagonal Gram);
+    // `level_subset` weights levels 1..3 unevenly; `coupling_root` spans the
+    // two fixed columns and has a full Gram.
+    let ridge_root = array![
+        [0.0, 1.3, 0.0, 0.0],
+        [0.7, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0],
+        [0.0, 0.0, 0.9, 0.0],
+    ];
+    let level_subset = array![[0.0, 1.9], [0.4, 0.0], [0.0, 0.5]];
+    let coupling_root = array![[0.6, -0.4], [0.2, 0.9], [1.1, 0.3]];
+    let last_level = array![[1.4]];
+
+    // `H_GG` diagonal (the random-effect shape), `H_GG` with one level-level
+    // coupling, and a last level that nothing couples to (`N = ∅`).
+    let h = random_effect_shaped_hessian();
+    let mut h_coupled_levels = h.clone();
+    h_coupled_levels[[0, 1]] = 0.2;
+    h_coupled_levels[[1, 0]] = 0.2;
+    let mut h_isolated_level = h.clone();
+    for col in 4..6 {
+        h_isolated_level[[3, col]] = 0.0;
+        h_isolated_level[[col, 3]] = 0.0;
+    }
+
+    let cases: [(&Array2<f64>, (&Array2<f64>, usize), (&Array2<f64>, usize), bool); 6] = [
+        (&h, (&ridge_root, 0), (&ridge_root, 0), true),
+        (&h, (&ridge_root, 0), (&level_subset, 1), true),
+        (&h, (&level_subset, 1), (&level_subset, 1), true),
+        (&h, (&ridge_root, 0), (&coupling_root, 4), false),
+        (&h_coupled_levels, (&ridge_root, 0), (&level_subset, 1), false),
+        (&h_isolated_level, (&last_level, 3), (&last_level, 3), true),
+    ];
+    for (hessian, (root_a, start_a), (root_b, start_b), schur_applies) in cases {
+        let p = hessian.nrows();
+        let dense = DenseSpectralOperator::from_symmetric(hessian).unwrap();
+        let reference = dense.trace_hinv_product_cross(
+            &embedded(p, root_a, start_a),
+            &embedded(p, root_b, start_b),
+        );
+        let a = drift(root_a, start_a, 1.0);
+        let b = drift(root_b, start_b, 1.0);
+        let sparse = sparse_operator(hessian, true);
+
+        let h_sparse = gam_linalg_test_support::dense_to_upper_csc(hessian);
+        let schur = DiagonalBlockSchur::plan(&h_sparse, &a, &b);
+        assert_eq!(schur.is_some(), schur_applies);
+        if let Some(schur) = schur {
+            assert_relative_eq!(
+                schur.trace(&sparse),
+                reference,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+        assert_relative_eq!(
+            sparse.trace_hinv_block_root_cross_by_rows(&a, &b),
+            reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+
+        // The dispatched logdet cross carries both scales and the sign, with
+        // and without the Hessian pattern, and agrees with the default that
+        // materializes both drifts.
+        let (scale_a, scale_b) = (1.7, 0.3);
+        let a = drift(root_a, start_a, scale_a);
+        let b = drift(root_b, start_b, scale_b);
+        for op in [sparse, sparse_operator(hessian, false)] {
+            assert_relative_eq!(
+                op.trace_logdet_hessian_cross_block_roots(a, b),
+                -scale_a * scale_b * reference,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+        let default_path = DenseCholeskyOperator::from_positive_definite(hessian).unwrap();
+        assert!(!default_path.contracts_block_root_drifts());
+        assert_relative_eq!(
+            default_path.trace_logdet_hessian_cross_block_roots(a, b),
+            -scale_a * scale_b * reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+}
+
 #[test]
 pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
     let dense = DenseMatrixHyperOperator {
@@ -8952,4 +9140,72 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Contract: `GlmCurvatureCorrectionOperator`'s streamed `mul_mat`, its
+/// row-energy trace, and the cached trace shared across coordinates all equal
+/// the per-column `mul_vec` definition of `C = Xᵀ diag(d) X`. The cached slot is
+/// keyed on the design alone, so corrections with different `d` built on
+/// clones of one design share it, while a different design never reads it.
+/// The factor is wide enough that the design streams in more than one chunk.
+#[test]
+pub(crate) fn glm_curvature_correction_traces_match_column_matvecs() {
+    let n = 1100usize;
+    let p = 480usize;
+    let rank = 480usize;
+    let x_data = Array2::from_shape_fn((n, p), |(i, j)| {
+        ((i * 7 + j * 13) as f64 * 0.011).sin() + 0.02 * ((i + j) % 5) as f64
+    });
+    assert!(gam_runtime::resource::byte_balanced_row_chunk(p + rank, n) < n);
+    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.clone()));
+    let other_design =
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.mapv(|v| 0.5 * v)));
+    let factor = Array2::from_shape_fn((p, rank), |(i, k)| ((i * rank + k) as f64 * 0.017).cos());
+    let op = |x_design: &DesignMatrix, phase: f64| GlmCurvatureCorrectionOperator {
+        x_design: x_design.clone(),
+        neg_c_xv: Array1::from_shape_fn(n, |i| (i as f64 * 0.37 + phase).sin()),
+        p,
+    };
+    let ops = [op(&design, 0.0), op(&design, 1.3), op(&other_design, 2.1)];
+
+    let cache = ProjectedFactorCache::default();
+    for (idx, op) in ops.iter().enumerate() {
+        let mut column_products = Array2::<f64>::zeros((p, rank));
+        for col in 0..rank {
+            column_products
+                .column_mut(col)
+                .assign(&op.mul_vec(&factor.column(col).to_owned()));
+        }
+        let terms: Vec<f64> = factor
+            .iter()
+            .zip(column_products.iter())
+            .map(|(&f, &bf)| f * bf)
+            .collect();
+        let want: f64 = terms.iter().sum();
+        let magnitude: f64 = terms.iter().map(|t| t.abs()).sum();
+        // Every path accumulates `O(n · p · rank)` rounded products.
+        let band = (n * p * rank) as f64 * f64::EPSILON * magnitude.max(1.0);
+
+        let streamed = op.mul_mat(&factor);
+        let product_band = (n * p) as f64
+            * f64::EPSILON
+            * column_products.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+        let product_gap = (&streamed - &column_products)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            product_gap <= product_band,
+            "op {idx}: streamed C·F differs from column matvecs by {product_gap:.3e} (band {product_band:.3e})"
+        );
+        for (label, got) in [
+            ("uncached", op.trace_projected_factor(&factor)),
+            ("cached", op.trace_projected_factor_cached(&factor, &cache)),
+            ("cache hit", op.trace_projected_factor_cached(&factor, &cache)),
+        ] {
+            assert!(
+                (got - want).abs() <= band,
+                "op {idx} {label}: trace {got:.15e} vs column matvecs {want:.15e} (band {band:.3e})"
+            );
+        }
+    }
 }

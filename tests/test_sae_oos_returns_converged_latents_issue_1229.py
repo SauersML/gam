@@ -60,7 +60,7 @@ def _planted_circles(n: int = 60, d: int = 6, k: int = 3, seed: int = 0) -> np.n
 
 
 def _fit(X: np.ndarray, k: int = 3):
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=X,
         K=k,
         d_atom=1,

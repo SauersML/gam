@@ -37,7 +37,11 @@ class _FittedGamModule(nn.Module):
     at training time (the engine names columns ``x0``, ``x1``, ...) and returns
     the ``(N,)`` response-scale posterior mean, the vector
     :meth:`gamfit.Model.predict_array` returns with no interval.
+
+    ``_model`` is attached by the Rust ``torch_from_fitted`` constructor.
     """
+
+    _model: Model
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         if X.dim() != 2:
@@ -74,4 +78,5 @@ def from_fitted(model: "Model") -> nn.Module:
     >>> wrapped = from_fitted(model)
     >>> preds = wrapped(torch.as_tensor(X_test))
     """
-    return rust_module().torch_from_fitted(_FittedGamModule, model)
+    module: _FittedGamModule = rust_module().torch_from_fitted(_FittedGamModule, model)
+    return module

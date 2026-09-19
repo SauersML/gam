@@ -32,6 +32,25 @@ ShapeConstraintLiteral = Literal[
     "concave",
 ]
 
+# A shape request: one atom, a conjunction of atoms (``["monotone_increasing",
+# "concave"]``), or for a tensor product one entry per margin, each entry an
+# atom, ``None`` or a conjunction (``["monotone_increasing", None]``).
+ShapeConstraintSpec = ShapeConstraintLiteral | Sequence[Any]
+
+
+def shape_constraint_text(value: Any) -> str:
+    """Render a shape request as formula-DSL text (``"[a, [b, c]]"``).
+
+    Only marshals: the grammar, its meaning for the term it is attached to,
+    and every error live in Rust (``gam_terms::smooth::parse_shape_expr`` /
+    ``resolve_shape_spec``).
+    """
+    if value is None:
+        return "none"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(shape_constraint_text(v) for v in value) + "]"
+    return str(value)
+
 
 def _smooth_kind_name(cls: type) -> str:
     """Map a ``Smooth`` subclass to its canonical Rust ``kind`` discriminator.
@@ -100,30 +119,58 @@ class Smooth(_BasisDescriptor):
         explicitly enable or disable the null-space shrinkage penalty.
     shape_constraint : optional shape constraint on the fitted function.
         One of ``None`` / ``"none"`` (unconstrained, the default),
-        ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
+        ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere),
         ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
-        or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
-        the inner solver as joint linear inequalities ``A·β ≥ b`` on the
-        coefficient vector (the constraint matrix ``A`` is generated from
-        the basis on a dense 1D grid spanning the data range, so the
-        inequality at the grid points implies the constraint on the
-        smooth function under standard B-spline / radial-basis density
-        arguments). The solver is an active-set / interior-point method;
-        when the constraint is active at the cert exit the outer REML
-        score uses the tangent-projected LAML formulation so the smoothing
-        parameter is selected over the working subspace. This mirrors
-        mgcv's ``scop=...`` argument and the ``scam`` R library's shape-
-        constrained smooths. Currently restricted to univariate 1D smooths
-        (B-splines and thin-plate / Duchon with a single feature axis);
-        a multivariate spec on a constrained smooth will be rejected with
-        a clear error from the Rust core. Spherical-harmonic and tensor
-        smooths reject all non-``None`` shape constraints.
+        or ``"concave"`` (f''(x) ≤ 0), or a list of those imposed jointly
+        (``["monotone_increasing", "concave"]``). Contradictory pairs (both
+        monotone directions, or convex with concave) are rejected because
+        they force a constant or an affine function. The constraint is exact
+        and involves no evaluation grid: it is a cone on the raw B-spline
+        control points ``β``. The derivative of a degree-``d`` spline is a
+        degree-``d-1`` spline whose control points are ``d·(β[i+1] - β[i]) /
+        (t[i+d+1] - t[i+1])``, and B-splines are non-negative, so
+        non-negative consecutive control-point differences certify
+        ``f' ≥ 0`` on every knot span. Likewise, non-decreasing
+        control-polygon slopes (divided by the knot-dependent
+        Greville-abscissa gaps, so any knot placement is handled) certify
+        ``f'' ≥ 0``. For a single shape the engine reparameterizes
+        ``β = C·γ`` so the cone becomes the coordinate bounds ``γ_j ≥ 0`` on
+        the difference coordinates, and the penalized fit solves that
+        bound-constrained problem; a list of shapes enters the solver as the
+        merged, de-duplicated inequality rows ``A·β ≥ 0``. Either way the
+        term is centred like an unconstrained smooth (weighted sum-to-zero
+        over the training rows): ``C`` drops the constant level column,
+        which a clamped B-spline basis would duplicate with the intercept,
+        and the rows ``A`` are written in the centred chart, which leaves
+        every control-point difference unchanged. When constraints are
+        active at the optimum, the REML/LAML score is evaluated on the
+        subspace left free by the active face. The certificate is always
+        sufficient. It is also necessary when the constrained derivative is
+        piecewise linear (a monotone quadratic or a convex/concave cubic);
+        for higher degrees it is slightly conservative. A tensor-product
+        smooth takes one entry per margin in margin order, each an atom,
+        ``None`` or a list: ``["monotone_increasing", None]`` makes the
+        surface non-decreasing along the first margin at every value of the
+        second (the margin's cone Kroneckered with identities on the other
+        margins). Every margin of a shaped tensor must be an open B-spline
+        (``ps``/``bs``); with no ``bs=`` given all margins default to ``ps``
+        rather than ``cr``, whose coefficients are knot values, and ``ti()``
+        is rejected because its zero-average slices have no genuine shape.
+        With a factor ``by`` every level's curve carries the cone. With a
+        numeric ``by`` the cone is imposed on ``f``, so the term ``z·f(x)``
+        has the stated shape in ``x`` only where ``z ≥ 0`` (the mirrored
+        shape where ``z < 0``). Supported on open (``periodic=False``)
+        :class:`BSpline` smooths and :class:`TensorBSpline` products of
+        them, with or without ``by``. :class:`Duchon`, :class:`Matern`,
+        :class:`Sphere`, periodic B-splines and every other smooth kind
+        reject a non-``None`` shape constraint with an error from the Rust
+        core.
     """
 
     name: str | None = None
     by: Any | None = None
     double_penalty: bool | None = None
-    shape_constraint: ShapeConstraintLiteral | None = None
+    shape_constraint: ShapeConstraintSpec | None = None
     _gamfit_topology_dim: int | None = field(default=None, init=False, repr=False)
     _gamfit_tensor_k: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _gamfit_tensor_periods: tuple[str | None, str | None] | None = field(
@@ -162,7 +209,7 @@ class Smooth(_BasisDescriptor):
         if self.name is not None:
             out["name"] = str(self.name)
         if self.shape_constraint is not None:
-            out["shape_constraint"] = str(self.shape_constraint)
+            out["shape_constraint"] = shape_constraint_text(self.shape_constraint)
         # Emit ``double_penalty`` only when the user explicitly pins it.
         # ``None`` means "defer to the Rust/formula default", which keeps the
         # descriptor bridge bit-identical to the formula DSL while preserving
@@ -221,7 +268,7 @@ class Duchon(Smooth):
         ``‖w‖^(2p) · (κ² + ‖w‖²)^s`` with ``κ = 1/length_scale``,
         which is closer to a Matérn for finite kernels at high d.
         Honored on both the formula API and the primitive numpy API
-        (``gamfit.duchon_basis`` / ``gamfit.duchon_function_norm_penalty``);
+        (``gamfit.basis.duchon_basis`` / ``gamfit.basis.duchon_function_norm_penalty``);
         the hybrid kernel keeps the polynomial nullspace order **linear in
         d**, letting the same smooth scale cleanly to d=8, 16, 32, 64
         without ratcheting the nullspace to absorb the Wendland CPD
@@ -260,8 +307,10 @@ class Duchon(Smooth):
     def basis_size(self) -> int:
         """``K`` (the number of centers)."""
         if self.centers is None:
-            from ._api import _DEFAULT_BASIS_K
-            return int(_DEFAULT_BASIS_K)
+            raise ValueError(
+                "Duchon.basis_size: centers=None takes the formula default center count, "
+                "which depends on the data; pass an int or explicit centers to fix K"
+            )
         if isinstance(self.centers, int):
             return int(self.centers)
         import numpy as np
@@ -302,7 +351,7 @@ class BSpline(Smooth):
     ``knots=K`` asks for ``K`` interior knots, so an open basis of degree
     ``d`` spans ``K + d + 1`` functions and a periodic one has ``K + d + 1``
     cyclic controls — the reading the formula DSL gives ``s(x, knots=K)`` /
-    ``cyclic(x, knots=K)`` and :func:`gamfit.bspline_basis` gives its
+    ``cyclic(x, knots=K)`` and :func:`gamfit.basis.bspline_basis` gives its
     ``knots=K``. ``None`` auto-derives: direct evaluation places ``10``
     quantile interior knots from the evaluated points, while the tabular fit
     path lets the Rust engine choose the count from the fitted column
@@ -641,7 +690,7 @@ class Pca(Smooth):
         name: str | None = None,
         by: Any | None = None,
         double_penalty: bool = False,
-        shape_constraint: ShapeConstraintLiteral | None = None,
+        shape_constraint: ShapeConstraintSpec | None = None,
     ) -> None:
         self.name = name
         self.by = by
@@ -954,7 +1003,7 @@ class LatentCoord:
     diffeomorphism ``t ↦ φ(t)`` (any reparameterization can be absorbed
     into a re-fit of β). This makes the inner Hessian *rank-deficient*
     along the gauge orbit and IFT breaks. Supply ``aux_prior`` or pair this
-    block with an :class:`gamfit.IsometryPenalty` before fitting. ARD via
+    block with an :class:`gamfit.penalties.IsometryPenalty` before fitting. ARD via
     ``dim_selection=True`` is useful for pruning axes after the gauge is
     pinned, but it is rotation-symmetric and is not itself a gauge fix.
 
@@ -1006,7 +1055,7 @@ class LatentCoord:
     Examples
     --------
     >>> import gamfit
-    >>> t = gamfit.LatentCoord(
+    >>> t = gamfit.smooth.LatentCoord(
     ...     n=N, d=4, init="pca",
     ...     aux_prior={"u": rgb, "family": "ridge", "strength": "auto"},
     ... )

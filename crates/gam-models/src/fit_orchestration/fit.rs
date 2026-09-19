@@ -193,23 +193,13 @@ fn fit_standard_base(
     }
 }
 
-fn firth_can_rescue(error: &gam_solve::estimate::EstimationError) -> bool {
-    use gam_solve::estimate::EstimationError;
-    // The dominance report wraps the terminal certificate's refusal, and that refusal
-    // decided whether Firth could rescue the fit before the report existed (#2953).
-    if let EstimationError::DominatedCertifiedPlateau {
-        terminal_refusal, ..
-    } = error
-    {
-        return firth_can_rescue(terminal_refusal);
-    }
-    error.is_inner_solve_retreat()
-        || matches!(
-            error,
-            EstimationError::PrefitPerfectSeparationDetected { .. }
-                | EstimationError::PrefitLinearSeparationDetected { .. }
-                | EstimationError::RemlDidNotConverge { .. }
-        )
+/// The separation certificate that lets a binomial fit switch to the Jeffreys
+/// prior, or `None`. Only a proof that the likelihood has no finite maximizer
+/// changes the estimator: a solve that did not converge is reported as it is.
+fn firth_rescue_evidence(
+    error: &gam_solve::estimate::EstimationError,
+) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
+    error.separation_arming_evidence()
 }
 
 /// Whether an automatic Firth retry can use the same outer-coordinate model as
@@ -321,7 +311,7 @@ fn compose_raw_unit_map_into_gauge(
 #[cfg(test)]
 mod standard_convergence_gate_tests {
     use super::{
-        certified_retry_or_original, compose_raw_unit_map_into_gauge, firth_can_rescue,
+        certified_retry_or_original, compose_raw_unit_map_into_gauge, firth_rescue_evidence,
         firth_rescue_has_compatible_outer_coordinates, rescale_covariance_coordinates,
         rescale_precision_coordinates, survival_baseline_parameter_checkpoint,
         survival_pirls_status_is_certified,
@@ -444,23 +434,38 @@ mod standard_convergence_gate_tests {
     }
 
     #[test]
-    fn firth_retry_is_limited_to_separation_and_nonconvergence() {
-        assert!(firth_can_rescue(&EstimationError::PirlsDidNotConverge {
-            iterations: 20,
-            budget: 20,
-            stop: "max iterations reached".to_string(),
-            last_change: 1.0,
-        }));
-        assert!(firth_can_rescue(
-            &EstimationError::PrefitPerfectSeparationDetected {
+    fn firth_retry_is_limited_to_proven_separation() {
+        // A fit that did not converge is not evidence of separation, so it must
+        // not switch the estimator.
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::PirlsDidNotConverge {
+                iterations: 20,
+                budget: 20,
+                stop: "max iterations reached".to_string(),
+                last_change: 1.0,
+            }),
+            None
+        );
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::RemlOptimizationFailed(
+                "railed smoothing strength".to_string()
+            )),
+            None
+        );
+        assert!(
+            firth_rescue_evidence(&EstimationError::PrefitPerfectSeparationDetected {
                 column_index: 0,
                 threshold: 0.0,
                 positive_above_threshold: true,
-            }
-        ));
-        assert!(!firth_can_rescue(&EstimationError::InvalidInput(
-            "structural mismatch".to_string()
-        )));
+            })
+            .is_some()
+        );
+        assert_eq!(
+            firth_rescue_evidence(&EstimationError::InvalidInput(
+                "structural mismatch".to_string()
+            )),
+            None
+        );
     }
 
     #[test]
@@ -519,76 +524,65 @@ pub(crate) fn fit_standard_model(
         &mut request.spec,
     );
     if seeded > 0 {
-        log::info!(
+        log::debug!(
             "[#2750] screened the representer range of {seeded} auto measure-jet term(s) against \
              the response before the standard-fit dispatch"
         );
     }
 
-    // #1762: near-perfect linear separation drives the binomial REML/ARC
-    // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
-    // separation the coefficients want to run to infinity, the PIRLS working
-    // weights w = μ̂(1−μ̂) collapse to ~0 over the saturated majority of rows,
-    // and the inner solve can no longer certify a minimum at the small-λ REML
-    // optimum — so the outer optimizer wanders the flat valley, burns its
-    // cost-stall escapes, and reports NON-CONVERGED (the ~117s / |g|≫tol
-    // pathology; separation can also surface as a hard PerfectSeparation /
-    // PirlsDidNotConverge error). Firth's Jeffreys-prior penalty is the textbook
-    // remedy: it bounds the coefficients and keeps the working weights from
-    // collapsing, so the inner solve is well conditioned at every λ and the
-    // outer optimizer certifies quickly.
+    // #1762/#2273: a separated binomial design has no finite maximum
+    // likelihood, on every binomial link. The Jeffreys prior |I(β)|^½ bounds
+    // the coefficients there, so a Firth-capable binomial fit whose base fit
+    // refused with a pre-fit separation certificate is refit ONCE under it.
     //
-    // #2273: this pathology is NOT logit-specific. The coefficient runaway and
-    // Fisher-weight collapse under separation happen on EVERY binomial link
-    // (probit's Φ, cloglog, loglog, cauchit, and the stateful SAS/Beta-Logistic/
-    // Mixture links) — measured directly on the issue's n=6 exact-separation
-    // fixture, where the probit fit halts on a flat-valley stall (|g|≈1.9e2 ≫
-    // bound) and mints only under Firth. Firth's Jeffreys prior is a link-general
-    // remedy: it is defined for any binomial inverse link that exposes a
-    // Fisher-weight jet (exactly `LikelihoodSpec::supports_firth`, the same gate
-    // `--firth` validates against), so the reactive rescue must be armed for the
-    // whole Firth-capable binomial family, not just the logit special case — else
-    // the README's "Firth / Jeffreys bias reduction handles separation in
-    // binomial fits" promise silently fails to hold off the default link.
+    // The estimator changes only on that proof. A base fit that did not
+    // converge, railed a smoothing strength or had a trial point refused is a
+    // numerical failure of the penalized likelihood fit and is reported as it
+    // is: refitting a different model to get past it would hand back an
+    // estimator nobody asked for. The adopted fit records the certificate in
+    // `FitArtifacts::jeffreys_arming_evidence`, and every summary surface
+    // names the estimator and this reason.
     //
-    // Retry ONCE with Firth when a plain (non-Firth) Firth-capable binomial fit
-    // fails with typed separation/non-convergence evidence, and adopt it only if
-    // the retry itself carries both inner and outer convergence certificates. If
-    // the retry fails, return the ORIGINAL base error unchanged; a failed rescue
-    // can never replace its evidence or mint the abandoned base iterate.
-    // Structural errors and link-parameter outer problems are not
-    // Firth-retryable. The latter are declined before solving because the Firth
-    // outer derivative does not define their appended link coordinates (#2654).
+    // The retry is adopted only if it carries its own inner and outer
+    // certificates. If it fails, the ORIGINAL base error is returned; a failed
+    // rescue can never replace its evidence. Link-parameter outer problems are
+    // declined before solving because the Firth outer derivative does not
+    // define their appended link coordinates (#2654).
     let is_firth_capable_binomial = request.family.supports_firth();
     let base = fit_standard_base(&request, &request.family, &request.options);
     let fitted = match base {
         Ok(fitted) => fitted,
-        Err(original_error)
-            if is_firth_capable_binomial
+        Err(original_error) => {
+            let rescue_is_defined = is_firth_capable_binomial
                 && !request.options.firth_bias_reduction
-                && firth_rescue_has_compatible_outer_coordinates(&request.options)
-                && firth_can_rescue(&original_error) =>
-        {
+                && firth_rescue_has_compatible_outer_coordinates(&request.options);
+            let Some(evidence) = rescue_is_defined
+                .then(|| firth_rescue_evidence(&original_error))
+                .flatten()
+            else {
+                return Err(original_error.into());
+            };
             let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
             let firth = fit_standard_base(&request, &request.family, &firth_options);
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
-                Ok(firth_fitted) => {
-                    log::info!(
-                        "[#1762/#2273] Firth-capable binomial base fit ({}) failed with \
-                         retryable separation/non-convergence evidence ({original_report}); Firth \
-                         bias-reduction retry certified — adopting it (Firth edf {:.2}).",
+                Ok(mut firth_fitted) => {
+                    log::debug!(
+                        "[#1762/#2273] Firth-capable binomial base fit ({}) refused with a \
+                         separation certificate ({original_report}); the Jeffreys-prior refit \
+                         certified — adopting it (edf {:.2}).",
                         request.family.pretty_name(),
                         firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
                     );
+                    firth_fitted.fit.artifacts.jeffreys_arming_evidence = Some(evidence);
                     firth_fitted
                 }
                 Err(original_error) => {
                     let retry_report = firth_failure
                         .unwrap_or_else(|| "unknown retry failure".to_string());
-                    log::warn!(
+                    log::debug!(
                         "[#1762/#2273] Firth-capable binomial base fit ({}) failed \
                          ({original_report}); Firth retry also failed to certify \
                          ({retry_report}) — returning the original typed base evidence, not \
@@ -604,7 +598,7 @@ pub(crate) fn fit_standard_model(
                     // reduction or remove/reparameterize the separating column" --
                     // advice to do the thing that was just done automatically and
                     // failed. A caller following it gets the same refusal, and the
-                    // reason the rescue failed lives only in a `log::warn!`, which
+                    // reason the rescue failed lives only in a `log::debug!`, which
                     // is not present in a test panic message and is inert through
                     // the Python extension where this pathology is reported.
                     //
@@ -620,7 +614,6 @@ pub(crate) fn fit_standard_model(
                 }
             }
         }
-        Err(error) => return Err(error.into()),
     };
 
     let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
@@ -725,7 +718,7 @@ pub(crate) fn fit_standard_model(
             // (a real `Err` the caller sees), matching how the SAS / mixture
             // adaptive-link paths now report startup-validation failures
             // (#1571/#1572). The fit is NOT silently downgraded.
-            log::warn!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
+            log::debug!("[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e})");
             return Err(FitFailure::raised(gam_problem::FailureCategory::Convergence, format!(
                 "flexible/learnable link requested via link(type=flexible(...)) / \
                  linkwiggle(...), but the binomial mean link-wiggle joint solve did not \
@@ -870,7 +863,7 @@ fn require_location_scale_covariance_or_decline(
         return Ok(());
     }
     if let Some(decline) = fit.posterior_moment_decline() {
-        log::warn!(
+        log::debug!(
             "[{context}] preserving converged constrained fit with unavailable posterior moments: {}",
             decline.summary(),
         );
@@ -2494,7 +2487,7 @@ fn survival_unified_fit_result(
                 }
             }
             (Some(_), None, _) => {
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason=outer-hessian-not-published \
                      rho_dimension={}",
                     lambdas.len(),
@@ -3192,7 +3185,7 @@ fn load_survival_transformation_persistent_warm_start(
     {
         return None;
     }
-    log::info!("[warm-start-cache] restored survival transformation warm start key={key}");
+    log::debug!("[warm-start-cache] restored survival transformation warm start key={key}");
     let lm_lambda = record
         .last_pirls_lm_lambda
         .filter(|value| value.is_finite() && *value > 0.0);

@@ -107,10 +107,11 @@ fn termspec(request: Request) -> TermCollectionSpec {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
             frozen_parametric_residualization: None,
         }],
+        level: Default::default(),
     }
 }
 

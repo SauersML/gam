@@ -49,13 +49,13 @@
 //!   active-constraint projection, or a frame mismatch — anything that means
 //!   the caller's `H` is not the matrix assembled here),
 //! * a disagreement with the assembled log-determinant larger than the
-//!   assembled route's OWN error bound `p·ε·κ(H)` (the correction must be
-//!   explicable as that route's error, not as a different quantity).
+//!   assembled route's OWN error bound `p·ε·σ_max·tr(H⁻¹)` (the correction
+//!   must be explicable as that route's error, not as a different quantity).
 //!
 //! The gate that decides whether to pay for it at all is the same
 //! `√EPSILON` envelope the outer value-agreement audit is derived from
 //! (`rho_optimizer::run::outer_value_agreement_bound`): pay when the assembled
-//! route's error bound `p·ε·κ(H)` exceeds `√ε·(1+|log|H||)`, i.e. exactly when
+//! route's error bound `p·ε·σ_max·tr(H⁻¹)` exceeds `√ε·(1+|log|H||)`, i.e. exactly when
 //! the criterion cannot be reproduced to the tolerance its own consumers apply.
 
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -72,30 +72,110 @@ pub(crate) struct HessianRootInputs<'a> {
     pub weights: ArrayView1<'a, f64>,
     pub penalties: &'a [CanonicalPenalty],
     pub lambdas: &'a [f64],
+    /// Where the data half of the root is kept between evaluations on the
+    /// same `design`, or `None` to form it afresh.
+    pub data_root: Option<&'a DataRootCache>,
+}
+
+/// The data half of the root, `R_G` with `R_GᵀR_G = XᵀWX`, together with the
+/// weights it was formed at.
+///
+/// `R_G` depends only on the design and the weights, never on `λ`. When the
+/// weights repeat bit for bit across outer evaluations (Gaussian identity,
+/// whose working weights are the prior weights), the Gram and its
+/// eigendecomposition would be recomputed identically on every one of them.
+pub(crate) struct DataRoot {
+    weights: Array1<f64>,
+    rows: Vec<Array1<f64>>,
+}
+
+/// One design's memoized data root. It is keyed on the weights alone, so the
+/// owner must clear it whenever the design it borrows is replaced.
+#[derive(Default)]
+pub(crate) struct DataRootCache(std::sync::Mutex<Option<std::sync::Arc<DataRoot>>>);
+
+impl DataRootCache {
+    pub(crate) fn clear(&self) {
+        *self.0.lock().expect("data-root cache lock poisoned") = None;
+    }
+
+    fn lookup(&self, weights: ArrayView1<'_, f64>) -> Option<std::sync::Arc<DataRoot>> {
+        let guard = self.0.lock().expect("data-root cache lock poisoned");
+        guard
+            .as_ref()
+            .filter(|root| {
+                root.weights.len() == weights.len()
+                    && root
+                        .weights
+                        .iter()
+                        .zip(weights.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+            })
+            .map(std::sync::Arc::clone)
+    }
+
+    fn store(&self, root: std::sync::Arc<DataRoot>) {
+        *self.0.lock().expect("data-root cache lock poisoned") = Some(root);
+    }
+}
+
+/// `R_G` for `inputs`, served from `inputs.data_root` when it holds the root
+/// for these exact weights. The lock is never held while the root is formed.
+fn data_root_rows(inputs: &HessianRootInputs<'_>) -> Result<std::sync::Arc<DataRoot>, String> {
+    if let Some(cached) = inputs.data_root.and_then(|cache| cache.lookup(inputs.weights)) {
+        return Ok(cached);
+    }
+    let p = inputs.design.ncols();
+    let gram = gam_linalg::matrix::xt_diag_x_signed(
+        inputs.design,
+        gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&inputs.weights.to_owned())
+            .map_err(|e| format!("Hessian weights are not a valid signed-weight view: {e}"))?,
+    )
+    .map_err(|e| format!("forming the unpenalized Gram XtWX failed: {e}"))?
+    .to_dense();
+    if gram.nrows() != p || gram.ncols() != p {
+        return Err(format!(
+            "the unpenalized Gram is {}x{} against p={p}",
+            gram.nrows(),
+            gram.ncols()
+        ));
+    }
+    let root = std::sync::Arc::new(DataRoot {
+        weights: inputs.weights.to_owned(),
+        rows: psd_root_rows(&gram)?,
+    });
+    if let Some(cache) = inputs.data_root {
+        cache.store(std::sync::Arc::clone(&root));
+    }
+    Ok(root)
 }
 
 /// How far `Σ log σ_i` off the assembled spectrum can be from the truth.
 ///
-/// `eigh` perturbs `H` by `O(p·ε·‖H‖)`, and `Δ log|H| = tr(H⁻¹ΔH)`, so the
-/// bound is `p·ε·σ_max/σ_min` summed over the modes — `p·ε·κ` up to the same
-/// constant. This is the quantity the whole module is about, so it is derived
-/// here once and used both to decide whether to pay and to bound the accepted
-/// correction.
+/// `eigh` perturbs `H` by `‖ΔH‖₂ = O(p·ε·σ_max)`, and to first order
+/// `Δ log|H| = tr(H⁻¹ΔH)`, which for a positive definite `H` is at most
+/// `‖ΔH‖₂·tr(H⁻¹)`. The bound is therefore `p·ε·σ_max/σ_i` SUMMED over the
+/// modes. It is not `p·ε·κ`: every weak mode carries the full `ε·σ_max` of
+/// absolute error, so a spectrum with many modes near `σ_min` (a wide design,
+/// `p > n`, where the penalty alone holds up every direction the data do not
+/// reach) is off by their count times `p·ε·κ`. This is the quantity the whole
+/// module is about, so it is derived here once and used both to decide whether
+/// to pay and to bound the accepted correction.
 pub(crate) fn assembled_logdet_error_bound(spectrum: &[f64]) -> f64 {
     let p = spectrum.len();
     if p == 0 {
         return 0.0;
     }
     let mut max = 0.0_f64;
-    let mut min = f64::INFINITY;
+    let mut inverse_trace = 0.0_f64;
     for &s in spectrum {
         if !s.is_finite() || s <= 0.0 {
             return f64::INFINITY;
         }
         max = max.max(s);
-        min = min.min(s);
+        inverse_trace += s.recip();
     }
-    (p as f64) * f64::EPSILON * (max / min)
+    (p as f64) * f64::EPSILON * max * inverse_trace
 }
 
 /// `true` when the assembled spectrum resolves `log|H|` more tightly than the
@@ -163,7 +243,7 @@ pub(crate) fn root_scale_hessian_operator(
     ) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] declined: {reason}");
+            log::trace!("[2644-logdet] declined: {reason}");
             None
         }
     }
@@ -195,7 +275,7 @@ pub(crate) fn root_scale_hessian_operator_for_refused_assembly(
     match root_scale_hessian_operator_inner(inputs, h_assembled, None, mode) {
         Ok(value) => Some(value),
         Err(reason) => {
-            log::debug!("[2644-logdet] refused assembly stands: {reason}");
+            log::trace!("[2644-logdet] refused assembly stands: {reason}");
             None
         }
     }
@@ -260,24 +340,11 @@ fn root_scale_hessian_operator_inner(
     // hand back `O(ε‖H‖)` of absolute error and reproduce the very defect this
     // module exists to remove. The design is never densified: `xt_diag_x_signed`
     // streams it, so a lazy or operator-backed design works too.
-    let gram = gam_linalg::matrix::xt_diag_x_signed(
-        inputs.design,
-        gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&inputs.weights.to_owned())
-            .map_err(|e| format!("Hessian weights are not a valid signed-weight view: {e}"))?,
-    )
-    .map_err(|e| format!("forming the unpenalized Gram XtWX failed: {e}"))?
-    .to_dense();
-    if gram.nrows() != p || gram.ncols() != p {
-        return Err(format!(
-            "the unpenalized Gram is {}x{} against p={p}",
-            gram.nrows(),
-            gram.ncols()
-        ));
-    }
+    // `data_root_rows` forms it, or reuses the one formed at these exact
+    // weights on this design.
+    let data_root = data_root_rows(inputs)?;
     let mut rows: Vec<Array1<f64>> = Vec::with_capacity(3 * p);
-    for row in psd_root_rows(&gram)? {
-        rows.push(row);
-    }
+    rows.extend(data_root.rows.iter().cloned());
 
     // ── The penalty half. `CanonicalPenalty::root` is `rank × block_dim` with
     //    `S_k = rootᵀroot`, so `√λ_k · root` is exactly the block of `B` that
@@ -399,13 +466,13 @@ fn root_scale_hessian_operator_inner(
                 (logdet - assembled_logdet).abs(),
             ));
         }
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed: {logdet:.12e} (assembled {assembled_logdet:.12e}, \
              correction {:.3e}, assembled error bound {bound:.3e})",
             logdet - assembled_logdet,
         );
     } else {
-        log::debug!(
+        log::trace!(
             "[2644-logdet] installed over a refused assembly: {logdet:.12e} (root rounding band \
              {root_band:.3e})"
         );
@@ -526,6 +593,7 @@ mod tests {
             weights: weights.view(),
             penalties: std::slice::from_ref(&penalty),
             lambdas: &[lambda],
+            data_root: None,
         };
         let operator = root_scale_hessian_operator_for_refused_assembly(
             &inputs,
@@ -646,6 +714,7 @@ mod tests {
             weights: weights.view(),
             penalties: std::slice::from_ref(&penalty),
             lambdas: &[lambda],
+            data_root: None,
         };
         let sorted_spectrum = {
             let mut s = spectrum.clone();
@@ -704,7 +773,46 @@ mod tests {
         let spectrum = [1.0_f64, 2.0, 3.5, 10.0];
         let logdet: f64 = spectrum.iter().map(|s| s.ln()).sum();
         assert!(assembled_logdet_is_resolved(&spectrum, logdet));
-        assert!(assembled_logdet_error_bound(&spectrum) < 1.0e-14);
+        // Four modes at `κ = 10`: `4·ε·10·Σ 1/σ_i ≈ 76 ε`, a few dozen ulps.
+        assert!(assembled_logdet_error_bound(&spectrum) < 1.0e2 * f64::EPSILON);
+    }
+
+    /// The bound must cover every backward error `eigh` is allowed, including
+    /// the coherent one `ΔH = p·ε·σ_max·I` that moves all modes up together.
+    /// That one shifts `log|H|` by `Σ_i log(1 + p·ε·σ_max/σ_i)`, one term per
+    /// weak mode. A wide design (`p > n`) has a whole block of them: here 120
+    /// penalized modes at `2e11` beside 60 modes held up by the data alone, at
+    /// `0.2`–`0.4`, the spectrum of `20 × s(k = 10)` at `n = 100` near its REML
+    /// optimum. `p·ε·κ` prices only the weakest mode, so it is short by the
+    /// block's size. On that fit the root disagreed with the assembled value by
+    /// `0.58` where `16·p·ε·κ` allowed `0.55`, so the root was declined, those
+    /// probes fell back to the noisy assembled value, and the criterion jumped by
+    /// `0.3` between neighbouring `ρ` as the route switched.
+    #[test]
+    fn the_assembled_error_bound_covers_a_coherent_shift_of_every_weak_mode() {
+        let weak = 60usize;
+        let strong = 120usize;
+        let spectrum: Vec<f64> = (0..weak)
+            .map(|i| 0.2 + 0.2 * (i as f64) / (weak as f64))
+            .chain(std::iter::repeat(2.0e11).take(strong))
+            .collect();
+        let p = spectrum.len() as f64;
+        let max = spectrum.iter().fold(0.0_f64, |acc, &s| acc.max(s));
+        let min = spectrum.iter().fold(f64::INFINITY, |acc, &s| acc.min(s));
+        let shift = p * f64::EPSILON * max;
+        let moved: f64 = spectrum.iter().map(|s| (1.0 + shift / s).ln()).sum::<f64>();
+        let weakest_mode_only = p * f64::EPSILON * max / min;
+        assert!(
+            moved > 16.0 * weakest_mode_only,
+            "the fixture must be one where pricing only the weakest mode falls short: \
+             moved {moved:.3e}, weakest-mode bound {weakest_mode_only:.3e}"
+        );
+        let bound = assembled_logdet_error_bound(&spectrum);
+        assert!(
+            moved <= bound,
+            "a backward error eigh is allowed moved log|H| by {moved:.3e}, beyond the \
+             assembled route's own error bound {bound:.3e}"
+        );
     }
 
     /// `Q·diag(d)·Qᵀ` over the leading `d.len()` columns of `Q`, symmetrized.
@@ -774,6 +882,7 @@ mod tests {
             weights: weights.view(),
             penalties: std::slice::from_ref(&penalty),
             lambdas: &[lambda],
+            data_root: None,
         };
 
         let perturbed_h = &exact_h + &along_weak_mode(-0.015);
@@ -810,6 +919,77 @@ mod tests {
         );
     }
 
+    /// The data root `R_G` is a function of the design and the weights only.
+    /// Across evaluations at different `λ` with bit-identical weights (the
+    /// Gaussian-identity outer loop) it is formed once and reused, and the
+    /// operator priced from the reused root is bit-identical to one priced from
+    /// a freshly formed root. A change in any weight forms a new root.
+    #[test]
+    fn the_data_root_is_formed_once_per_weight_vector_and_reused_exactly() {
+        use super::super::reml_outer_engine::HessianFactorization;
+        let p = 6usize;
+        let q = dense_orthogonal(p);
+        let d_pen = [1.0_f64, 0.7, 0.44];
+        let d_data = [105.0_f64, 15.5, 8.1, 3.3, 1.03, 0.005];
+        let design = gam_linalg::matrix::DesignMatrix::from(scaled_mode_rows(&q, &d_data));
+        let penalty = CanonicalPenalty::from_dense_root(scaled_mode_rows(&q, &d_pen), p);
+        let cache = DataRootCache::default();
+        let price = |weights: &Array1<f64>, lambda: f64, cache: Option<&DataRootCache>| {
+            let gram = {
+                let rows = scaled_mode_rows(&q, &d_data);
+                let weighted = &rows * &weights.view().insert_axis(ndarray::Axis(1));
+                rows.t().dot(&weighted)
+            };
+            let h = gram + rotated_diagonal(&q, &d_pen).mapv(|v| v * lambda);
+            let inputs = HessianRootInputs {
+                design: &design,
+                weights: weights.view(),
+                penalties: std::slice::from_ref(&penalty),
+                lambdas: &[lambda],
+                data_root: cache,
+            };
+            root_scale_hessian_operator_for_refused_assembly(
+                &inputs,
+                &h,
+                PseudoLogdetMode::PositiveDefinite,
+            )
+            .expect("the root reproduces H and resolves every mode")
+            .logdet()
+        };
+        let cached_root = |cache: &DataRootCache, weights: &Array1<f64>| {
+            cache
+                .lookup(weights.view())
+                .expect("a root was stored for these weights")
+        };
+
+        let unit = Array1::<f64>::ones(p);
+        for lambda in [3.0e2_f64, 6.193e11] {
+            assert_eq!(
+                price(&unit, lambda, Some(&cache)).to_bits(),
+                price(&unit, lambda, None).to_bits(),
+                "a reused data root must price exactly what a fresh one prices (lambda={lambda})"
+            );
+        }
+        let first = cached_root(&cache, &unit);
+        price(&unit, 7.0, Some(&cache));
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &cached_root(&cache, &unit)),
+            "an evaluation at the same weights must reuse the stored root"
+        );
+
+        let mut moved = unit.clone();
+        moved[2] = 1.0 + f64::EPSILON;
+        assert!(cache.lookup(moved.view()).is_none());
+        assert_eq!(
+            price(&moved, 3.0e2, Some(&cache)).to_bits(),
+            price(&moved, 3.0e2, None).to_bits()
+        );
+        assert!(!std::sync::Arc::ptr_eq(&first, &cached_root(&cache, &moved)));
+
+        cache.clear();
+        assert!(cache.lookup(moved.view()).is_none());
+    }
+
     /// gam#2735. A root whose smallest singular value is inside its own rounding
     /// band cannot call `H` positive definite, so it must decline rather than
     /// price that roundoff as `2·log σ`. Here the sixth mode carries neither data
@@ -831,6 +1011,7 @@ mod tests {
             weights: weights.view(),
             penalties: std::slice::from_ref(&penalty),
             lambdas: &[lambda],
+            data_root: None,
         };
         assert!(
             root_scale_hessian_operator_for_refused_assembly(

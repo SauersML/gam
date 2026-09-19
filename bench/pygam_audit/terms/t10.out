@@ -1,0 +1,5 @@
+y ~ s(x) 1 pts: 0.0s
+y ~ s(x) 20 pts: 0.0s
+y ~ s(x, shape=monotone_increasing) 1 pts: 10.5s
+y ~ s(x, shape=monotone_increasing) 20 pts: 129.0s
+exit 0

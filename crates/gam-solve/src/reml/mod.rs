@@ -1,6 +1,5 @@
 use self::inner_strategy::GeometryBackendKind;
 use super::*;
-use crate::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::pirls::assemble_and_factor_sparse_penalized_system;
 use gam_linalg::sparse_exact::SparseExactFactor;
 use gam_problem::OuterEval;
@@ -17,6 +16,7 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
 // #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
@@ -1019,7 +1019,7 @@ mod tests {
 
     #[test]
     pub(crate) fn eval_cache_manager_stores_first_order_outer_eval() {
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let rho = array![0.25, -0.0];
         let rho_key = super::rho_key::sanitized_rhokey(&rho);
         let eval = OuterEval {
@@ -1075,7 +1075,7 @@ mod tests {
                     .all(|(x, y)| x.to_bits() == y.to_bits())
         };
 
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
 
         // (1) Round-trip fidelity: store at rho_a, then a forced hit must equal
         // the stored eval bit-for-bit (the "hit == miss" guarantee).
@@ -1123,7 +1123,7 @@ mod tests {
         // (3) Honest eviction: overflow the LRU with fresh keys. The
         // least-recently-used entry must be evicted and then MISS (forcing a
         // recompute), while a still-resident key returns its exact stored bits.
-        let cache = EvalCacheManager::new();
+        let cache = EvalCacheManager::new(0);
         let mut keys = Vec::new();
         let mut evals = Vec::new();
         for i in 0..OUTER_EVAL_LRU_CAPACITY {
@@ -4506,6 +4506,9 @@ pub(crate) struct SparseRemlDecision {
 pub(crate) struct SparseExactEvalData {
     pub(crate) factor: Arc<SparseExactFactor>,
     pub(crate) takahashi: Option<Arc<gam_linalg::sparse_exact::TakahashiInverse>>,
+    /// The upper-triangular penalized Hessian `factor` factors, so trace
+    /// kernels can read its sparsity pattern.
+    pub(crate) hessian: Arc<faer::sparse::SparseColMat<usize, f64>>,
     pub(crate) logdet_h: f64,
     pub(crate) logdet_s_pos: f64,
     pub(crate) penalty_rank: usize,
@@ -4612,6 +4615,19 @@ pub(crate) struct FirthDesignFactor {
     // rank r = ncols(q_basis); n = nrows(x_dense).
     pub(crate) r: usize,
     pub(crate) n: usize,
+}
+
+/// The Jeffreys log-density `½ log|I(β)|` of a fixed design under one inverse
+/// link, as a function of `η = Xβ` alone.
+///
+/// It holds the β-independent [`FirthDesignFactor`] and evaluates the same
+/// identifiable-subspace value [`FirthDenseOperator`] carries, without the
+/// Fisher inverse, hat diagonal, and weight derivatives only the gradient
+/// needs: the per-state cost is `X_rᵀ W X_r` and one factorization. A
+/// Metropolis ratio `|I(β')|^½ / |I(β)|^½` needs nothing more.
+pub struct JeffreysHalfLogDet {
+    pub(crate) factor: FirthDesignFactor,
+    pub(crate) link: InverseLink,
 }
 
 #[derive(Clone)]
@@ -4789,9 +4805,9 @@ pub(crate) struct EvalShared {
     /// hold the bare `RemlGeometry` label, so every consumer that reported
     /// `backend {:?}` reported a two-valued enum and nothing that could
     /// falsify it: `select_reml_geometry` measures a penalized-Hessian
-    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its six routes
-    /// and never measures it on the other five, and the label is identical
-    /// across all six. Storing the decision rather than its outcome makes a
+    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its routes
+    /// and never measures it on the others, and the label is identical
+    /// across all of them. Storing the decision rather than its outcome makes a
     /// bundle unrepresentable without the basis for its own label.
     pub(crate) geometry: SparseRemlDecision,
     /// The exact H_total matrix used for LAML cost computation.
@@ -4920,7 +4936,7 @@ pub(crate) fn applied_canonical_penalties_for(
     let projected = canonical_penalties
         .iter()
         .map(|penalty| {
-            split.project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+            split.projected_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| {
@@ -4929,18 +4945,19 @@ pub(crate) fn applied_canonical_penalties_for(
                  subspace failed: {error}"
             ))
         })?;
-    // `project_canonical` returns the penalty itself when the projection is
-    // below the root's own noise, so an all-unchanged result IS the identity
-    // and is handed back as the original `Arc` rather than as a copy.
-    if projected
-        .iter()
-        .zip(canonical_penalties.iter())
-        .all(|(a, b)| a.root == b.root && a.col_range == b.col_range)
-    {
-        Ok(Arc::clone(canonical_penalties))
-    } else {
-        Ok(Arc::new(projected))
+    // `projected_canonical` returns `None` when the projection is below the
+    // root's own noise, so an all-`None` result IS the identity and is handed
+    // back as the original `Arc` rather than as a copy.
+    if projected.iter().all(Option::is_none) {
+        return Ok(Arc::clone(canonical_penalties));
     }
+    Ok(Arc::new(
+        projected
+            .into_iter()
+            .zip(canonical_penalties.iter())
+            .map(|(projected, penalty)| projected.unwrap_or_else(|| penalty.clone()))
+            .collect(),
+    ))
 }
 
 impl EvalShared {
@@ -5091,9 +5108,11 @@ impl SparseRemlDecision {
 /// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
 /// records its own estimated footprint (the surviving n-length vectors plus
 /// the two p×p Hessians plus per-entry overhead) and the cache evicts in
-/// LRU order until the running total fits under the budget. An entry that
-/// individually exceeds the budget is rejected silently rather than poisoning
-/// the cache.
+/// LRU order until the running total fits under the budget. The newest entry
+/// is always kept, alone if it alone exceeds the budget, so the next
+/// evaluation at its ρ (a gradient after a value) reuses the solve: the cache
+/// holds at most the larger of its budget and one solve, which the evaluation
+/// that produced it held anyway.
 pub(crate) struct PirlsLruCache {
     // Stored tuple: (compacted result, last-touched clock, estimated bytes).
     pub(crate) map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
@@ -5125,19 +5144,10 @@ impl PirlsLruCache {
     pub(crate) fn insert(&mut self, key: Vec<u64>, value: Arc<PirlsResult>) {
         self.clock += 1;
         let bytes = pirls_result_cache_bytes(&value);
-        // Refuse entries that on their own already exceed the entire budget;
-        // caching one would force eviction of every other entry without
-        // leaving room for the new one anyway.
-        if bytes > self.byte_budget {
-            if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
-                self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
-            }
-            return;
-        }
         if let Some((_, _, prev_bytes)) = self.map.remove(&key) {
             self.current_bytes = self.current_bytes.saturating_sub(prev_bytes);
         }
-        while self.current_bytes + bytes > self.byte_budget {
+        while !self.map.is_empty() && self.current_bytes + bytes > self.byte_budget {
             let evict_key = self
                 .map
                 .iter()
@@ -5218,6 +5228,27 @@ impl PenaltySubspaceCacheKey {
     }
 }
 
+/// Byte budget of one fit's PIRLS result cache.
+///
+/// A cache hit saves one P-IRLS solve, and a solve costs passes over the
+/// design, so the memo may hold as many bytes as the dense design it
+/// memoizes and no more: at any `n` and any number of outer evaluations it is
+/// one further design-sized store, or the newest solve alone where one solve
+/// outgrows the design (see [`PirlsLruCache::insert`]). The
+/// host bound is the governor's stationary per-operation ceiling rather than
+/// live availability, so which evaluations hit the cache never depends on
+/// what else the machine is doing (SPEC-20).
+///
+/// A fixed budget was pyGAM audit speed F11: 128 MiB regardless of the
+/// design, so a Poisson fit at n = 1e5 with an 8.8 MB design pinned 133 MB of
+/// cached solves.
+pub(crate) fn pirls_cache_byte_budget(x: &DesignMatrix) -> usize {
+    let host_ceiling =
+        gam_runtime::resource::MemoryGovernor::global().single_materialization_cap_bytes();
+    gam_runtime::resource::dense_f64_bytes(x.nrows(), x.ncols())
+        .map_or(host_ceiling, |design_bytes| design_bytes.min(host_ceiling))
+}
+
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
 ///
 /// Mirrors what `compact_for_reml_cache` keeps:
@@ -5225,13 +5256,16 @@ impl PenaltySubspaceCacheKey {
 ///   solveworking_response, solvemu, solve_c_array, solve_d_array);
 /// * the p-length coefficient vector;
 /// * the two p×p Hessians (dense or CSC sparse);
-/// * the `ReparamResult` payload — the dominant scaling term beyond n, since
-///   it carries `s_transformed`, `qs`, and `e_transformed` as p×p / rank×p
-///   matrices.
+/// * the `ReparamResult` payload, the dominant term beyond n: besides
+///   `s_transformed`, `qs` and `e_transformed` it carries one rotated penalty
+///   per smoothing coordinate, each with a dense p×p Gram, so it grows as K·p²;
+/// * the p-length penalized gradient, the Firth hat diagonal and any
+///   transformed inequality constraints.
 /// A small constant overhead absorbs scalar fields, enum discriminants, and
-/// the HashMap entry. This errs on the conservative side: overestimation
-/// causes earlier eviction, never under-counting that would let the cache
-/// silently exceed the byte budget.
+/// the HashMap entry. Every array the entry owns is counted: an entry that
+/// under-reports lets the cache hold many times its byte budget (pyGAM audit
+/// speed F1: forty coordinates at p = 221 put 16 MB of rotated penalties in
+/// each entry against a 2.5 MB estimate, so the 128 MiB cache pinned 1.3 GB).
 pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     use std::mem::size_of;
     let n_array_elems = result.final_eta.len()
@@ -5243,12 +5277,24 @@ pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     let p = result.beta_transformed.0.len();
     let pen_h = symmetric_matrix_cache_bytes(&result.penalized_hessian_transformed);
     let stab_h = symmetric_matrix_cache_bytes(&result.stabilizedhessian_transformed);
-    let reparam = (result.reparam_result.s_transformed.len()
-        + result.reparam_result.qs.len()
-        + result.reparam_result.e_transformed.len()
-        + result.reparam_result.det1.len())
-        * size_of::<f64>();
-    n_array_elems * size_of::<f64>() + p * size_of::<f64>() + pen_h + stab_h + reparam + 1024
+    let firth = match &result.firth {
+        crate::pirls::FirthDiagnostics::Inactive => 0,
+        crate::pirls::FirthDiagnostics::Active { hat_diag, .. } => hat_diag.len(),
+    };
+    let constraints = result
+        .linear_constraints_transformed
+        .as_ref()
+        .map_or(0, |constraints| constraints.a.len() + constraints.b.len());
+    let small_arrays = n_array_elems
+        + p
+        + result.penalized_gradient_transformed.len()
+        + firth
+        + constraints;
+    small_arrays * size_of::<f64>()
+        + pen_h
+        + stab_h
+        + result.reparam_result.resident_bytes()
+        + 1024
 }
 
 pub(crate) fn symmetric_matrix_cache_bytes(m: &gam_linalg::matrix::SymmetricMatrix) -> usize {
@@ -5363,9 +5409,11 @@ pub(crate) struct EvalCacheManager {
 }
 
 impl EvalCacheManager {
-    pub(crate) fn new() -> Self {
+    /// `pirls_cache_byte_budget` is the fit's PIRLS result-cache budget,
+    /// derived once per fit by [`pirls_cache_byte_budget`].
+    pub(crate) fn new(pirls_cache_byte_budget: usize) -> Self {
         Self {
-            pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
+            pirls_cache: RwLock::new(PirlsLruCache::new(pirls_cache_byte_budget)),
             penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
@@ -5535,6 +5583,20 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
+/// The #784 block quadrature latched beside the admission (#2623): the
+/// Gauss–Hermite order of each block axis, and whether the block marginal is
+/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
+/// rule over the whole block. Beside them sit the paired-rule errors measured
+/// at that admission: the certificate every later evaluation at those orders
+/// carries, since the paired error no longer switches anything once the
+/// orders are latched (#2748).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockQuadratureLatch {
+    pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_quadrature_errors: Vec<f64>,
+    pub(crate) axis_split: bool,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5544,9 +5606,8 @@ pub(crate) struct RemlState<'a> {
     /// This is the single canonical penalty representation — no full-width
     /// `rank × p` roots are stored separately.
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
-    pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_block_count: Option<usize>,
+    pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,
@@ -5611,8 +5672,9 @@ pub(crate) struct RemlState<'a> {
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ.
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<Vec<usize>>>,
+    /// the value, gradient and moments, are one measure at every ρ. Whether the
+    /// block is integrated axis by axis is latched with them, for the same reason.
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///
@@ -5764,6 +5826,13 @@ pub(crate) struct RemlState<'a> {
     /// final reported fit still Pearson-refreshes `phi` at the converged η. Reset
     /// on `reset_surface`.
     pub(crate) frozen_beta_phi: Arc<AtomicU64>,
+
+    /// Gaussian (non-identity link) / inverse Gaussian dispersion `phi` frozen
+    /// for the λ search, bit-packed `f64`; `0` means "not yet frozen". Captured
+    /// once as the converged-η MLE `Σwd/Σw` and applied via
+    /// `GlmLikelihoodSpec::with_dispersion_phi_frozen_for_search`, exactly like
+    /// [`Self::frozen_tweedie_phi`]; the final reported fit refreshes it.
+    pub(crate) frozen_dispersion_phi: Arc<AtomicU64>,
 
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
@@ -5936,4 +6005,8 @@ pub(crate) struct RemlState<'a> {
     pub(crate) gaussian_dp_floor_scale_cache: std::sync::OnceLock<f64>,
     pub(crate) positive_weight_observation_count_cache: std::sync::OnceLock<usize>,
     pub(crate) rho_weight_anchor_cache: std::sync::OnceLock<f64>,
+    /// The data half `R_G` (`R_GᵀR_G = XᵀWX`) of the root-scale Hessian
+    /// operator, kept for the weights it was formed at. Keyed to `x`, so
+    /// `reset_surface` clears it.
+    pub(crate) data_root_cache: laml_logdet::DataRootCache,
 }
