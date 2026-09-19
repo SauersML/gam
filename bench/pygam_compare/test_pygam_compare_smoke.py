@@ -135,3 +135,22 @@ def test_timeout_is_a_listed_loss_not_a_skip() -> None:
     assert "0/1 ok, 1 timeout" in text
     losses = text.split("## Losses")[1]
     assert "status vs pygam " in losses and "status vs pygam_gs" in losses
+
+
+def test_n_predict_cells_are_reported_apart() -> None:
+    # Two cells that differ only in n_predict are separate report rows, and a
+    # post-fit metric gets its own table only once some rep measured it.
+    records = [
+        dict(_rec(lib, 0, pred_cpu_s=t), n_predict=m)
+        for m, t in ((100, 0.01), (1_000_000, 1.0))
+        for lib in ("gamfit", "pygam_gs")
+    ]
+    text = render(records)
+    assert "gaussian n=100 p1 n_predict=100" in text
+    assert "gaussian n=100 p1 n_predict=1e+06" in text
+    assert "## partial dependence CPU" not in text
+    records[0]["pd_cpu_s"] = 0.5
+    records[1]["pd_cpu_s"] = 0.25
+    assert "## partial dependence CPU" in render(records)
+    assert PLANS["postfit"].postfit
+    assert all(cell.n_predict is not None for cell in PLANS["postfit"].cells)

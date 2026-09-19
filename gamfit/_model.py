@@ -290,12 +290,12 @@ class Model:
         # interval='conformal' runs the gam_predict::conformal_routes column
         # builders `gam predict --conformal` uses: the exact full-conformal set
         # without a calibration fold, the split-conformal band with one. The
-        # returned JSON has the model-based predict column schema, so
+        # returned payload has the model-based predict column schema, so
         # shape_predict_response is unchanged.
         if interval == "conformal":
             try:
                 if calibration is None:
-                    raw = rust_module().predict_table_full_conformal(
+                    payload = rust_module().predict_table_full_conformal(
                         self._model_bytes, headers, rows, conformal_level
                     )
                 else:
@@ -308,7 +308,7 @@ class Model:
                         covariance_mode,
                         observation_interval,
                     )
-                    raw = rust_module().predict_table_conformal(
+                    payload = rust_module().predict_table_conformal(
                         self._model_bytes,
                         headers,
                         rows,
@@ -320,7 +320,7 @@ class Model:
             except Exception as exc:
                 raise map_exception(exc) from exc
             return shape_predict_response(
-                raw,
+                payload,
                 headers=headers,
                 rows=rows,
                 table_kind=table_kind,
@@ -334,7 +334,7 @@ class Model:
         if calibration is not None:
             raise ValueError('calibration= applies only to interval="conformal"')
         try:
-            raw = rust_module().predict_table(
+            payload = rust_module().predict_table(
                 self._prediction_model,
                 headers,
                 rows,
@@ -345,7 +345,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         return shape_predict_response(
-            raw,
+            payload,
             headers=headers,
             rows=rows,
             table_kind=table_kind,

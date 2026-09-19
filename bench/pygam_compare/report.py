@@ -43,7 +43,9 @@ COVERAGE_TARGET = 0.95
 SE_MULTIPLIER = 2.0
 
 Record = dict[str, Any]
-CellKey = tuple[str, int, str]
+# (family, n, design, n_predict); n_predict is None for a cell that predicts on
+# n held-out rows (every plan without an explicit n_predict).
+CellKey = tuple[str, int, str, int | None]
 
 
 @dataclass(frozen=True)
@@ -58,24 +60,33 @@ class Verdict:
         return "(status)" in self.text
 
 
+def _cell_key(r: Record) -> CellKey:
+    n_predict = r.get("n_predict")
+    return (
+        str(r["family"]),
+        int(r["n"]),
+        str(r["design"]),
+        None if n_predict is None else int(n_predict),
+    )
+
+
 def _cells(records: Iterable[Record]) -> list[CellKey]:
     seen: dict[CellKey, None] = {}
     for r in records:
-        seen.setdefault((str(r["family"]), int(r["n"]), str(r["design"])), None)
+        seen.setdefault(_cell_key(r), None)
     return list(seen)
 
 
 def _cell_name(cell: CellKey) -> str:
-    family, n, design = cell
-    return f"{family} n={n:g} {design}"
+    family, n, design, n_predict = cell
+    name = f"{family} n={n:g} {design}"
+    return name if n_predict is None else f"{name} n_predict={n_predict:g}"
 
 
 def _group(records: Iterable[Record]) -> dict[tuple[CellKey, str], list[Record]]:
     out: dict[tuple[CellKey, str], list[Record]] = defaultdict(list)
     for r in records:
-        out[((str(r["family"]), int(r["n"]), str(r["design"])), str(r["lib"]))].append(
-            r
-        )
+        out[(_cell_key(r), str(r["lib"]))].append(r)
     return out
 
 
@@ -184,6 +195,13 @@ SPEED_METRICS: tuple[tuple[str, str], ...] = (
     ("fit_s", "fit wall"),
     ("pred_cpu_s", "predict CPU"),
     ("interval_cpu_s", "interval CPU"),
+    # Post-fit operations, measured only by plans with ``postfit`` set.
+    ("pd_cpu_s", "partial dependence CPU"),
+    ("summary_cpu_s", "summary CPU"),
+    ("save_cpu_s", "save CPU"),
+    ("load_cpu_s", "load CPU"),
+    ("sample_cpu_s", "posterior sample CPU"),
+    ("sig_cpu_s", "smooth significance CPU"),
     ("proc_wall_s", "process wall (import+fit+predict)"),
     ("peak_rss_mb", "peak RSS"),
 )
@@ -266,6 +284,11 @@ def render(records: list[Record], metas: list[dict[str, Any]] | None = None) -> 
     lines += _table(["cell", *libs], rows) + [""]
 
     for metric, label in SPEED_METRICS:
+        if not any(r.get(metric) is not None for r in records):
+            # A metric no rep measured (a post-fit phase outside a postfit
+            # plan) has no table; a metric only some libraries report still
+            # gets one, so a missing gamfit value shows as a loss.
+            continue
         unit = " MiB" if metric.endswith("_mb") else " s"
         lines += [f"## {label} (median over ok reps)", ""]
         rows = []

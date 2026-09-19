@@ -953,11 +953,15 @@ fn numeric_matrix_f64<'py>(
 }
 
 #[pyfunction]
-fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
+fn marginal_slope_clip_probabilities<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
     Ok(values
-        .into_iter()
-        .map(|value| value.clamp(0.0, 1.0))
-        .collect())
+        .as_array()
+        .mapv(|value| value.clamp(0.0, 1.0))
+        .into_pyarray(py)
+        .unbind())
 }
 
 #[pyfunction]
@@ -1003,11 +1007,6 @@ fn flat_to_matrix_f64<'py>(
     let out = Array2::from_shape_vec((n_rows, n_cols), flat)
         .map_err(|err| py_value_error(format!("failed to reshape design matrix: {err}")))?;
     Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-fn vec_to_array1_f64<'py>(py: Python<'py>, values: Vec<f64>) -> PyResult<Py<PyArray1<f64>>> {
-    Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
 
 fn survival_prediction_matrix_from_rows(rows: Vec<Vec<f64>>, label: &str) -> PyResult<Array2<f64>> {
@@ -1755,7 +1754,7 @@ fn predict_table(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let model = Arc::clone(&model.model);
@@ -1767,7 +1766,8 @@ fn predict_table(
             covariance_mode,
             observation_interval,
         )
-    })
+    })?
+    .into_py(py)
 }
 
 #[pyfunction]
@@ -1878,14 +1878,14 @@ fn predict_table_conformal(
     calibration_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
     options_json: Option<String>,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     calibration_rows
         .require_headers(&calibration_headers)
         .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let calibration_dataset = calibration_rows.dataset.clone();
-    detach_py_result(py, "predict_table_conformal", move || {
+    let payload = detach_py_result(py, "predict_table_conformal", move || {
         predict_encoded_table_conformal_impl(
             &model_bytes,
             dataset,
@@ -1893,7 +1893,8 @@ fn predict_table_conformal(
             conformal_level,
             options_json.as_deref(),
         )
-    })
+    })?;
+    prediction_payload_into_py(py, payload)
 }
 
 #[pyfunction]
@@ -3756,79 +3757,6 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     // function is retrievable from Python; ordered after the mean columns.
     "noise_scale",
 ];
-
-struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
-
-impl<'de> Deserialize<'de> for OrderedPredictionColumnEntries {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct OrderedPredictionColumnVisitor;
-
-        impl<'de> Visitor<'de> for OrderedPredictionColumnVisitor {
-            type Value = OrderedPredictionColumnEntries;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a JSON object containing prediction columns")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut entries = Vec::with_capacity(access.size_hint().unwrap_or(0));
-                while let Some((key, value)) = access.next_entry::<String, serde_json::Value>()? {
-                    entries.push((key, value));
-                }
-                Ok(OrderedPredictionColumnEntries(entries))
-            }
-        }
-
-        deserializer.deserialize_map(OrderedPredictionColumnVisitor)
-    }
-}
-
-fn ordered_json_object_string(
-    entries: Vec<(String, serde_json::Value)>,
-) -> Result<String, serde_json::Error> {
-    let mut output = String::from("{");
-    for (index, (key, value)) in entries.into_iter().enumerate() {
-        if index > 0 {
-            output.push(',');
-        }
-        output.push_str(&serde_json::to_string(&key)?);
-        output.push(':');
-        output.push_str(&serde_json::to_string(&value)?);
-    }
-    output.push('}');
-    Ok(output)
-}
-
-#[pyfunction]
-fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
-    let OrderedPredictionColumnEntries(mut pending): OrderedPredictionColumnEntries =
-        serde_json::from_str(columns_json).map_err(|err| {
-            py_value_error(format!(
-                "ordered_prediction_columns: failed to parse columns JSON: {err}"
-            ))
-        })?;
-    let mut ordered = Vec::with_capacity(pending.len());
-    for preferred in PREFERRED_PREDICTION_COLUMNS {
-        if let Some(index) = pending
-            .iter()
-            .position(|entry| entry.0.as_str() == *preferred)
-        {
-            ordered.push(pending.remove(index));
-        }
-    }
-    ordered.extend(pending);
-    ordered_json_object_string(ordered).map_err(|err| {
-        py_value_error(format!(
-            "ordered_prediction_columns: failed to serialise columns JSON: {err}"
-        ))
-    })
-}
 
 /// Finalize topology candidate lifecycles through the typed Rust selector.
 ///

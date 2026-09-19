@@ -16,7 +16,7 @@ interleaved rep by rep, so slow drift in host load hits all of them alike.
 The per-rep timeout and memory cap are a HARNESS SAFETY NET, not a solver
 budget: they only stop a runaway rep from stalling the whole plan. A rep that
 trips either is recorded with that status, the remaining reps of the cell and
-every larger ``n`` of the same (lib, family, design) are recorded as
+every larger ``n`` of the same (lib, family, design, n_predict) are recorded as
 ``not_run_after_<status>``, and the report counts all of it against the
 library.
 """
@@ -80,7 +80,13 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
 
 
 def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+    lib: str,
+    cell: Cell,
+    seed: int,
+    timeout_s: float,
+    memcap_mb: float,
+    cwd: str,
+    postfit: bool = False,
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
     env = dict(os.environ)
@@ -95,6 +101,10 @@ def run_rep(
         cell.design,
         str(seed),
     ]
+    if cell.n_predict is not None:
+        cmd.append(str(cell.n_predict))
+    if postfit:
+        cmd.append("--postfit")
     load_start = os.getloadavg()
     t0 = time.perf_counter()
     proc = subprocess.Popen(
@@ -139,6 +149,7 @@ def run_rep(
         design=cell.design,
         seed=seed,
         status=status,
+        **({} if cell.n_predict is None else {"n_predict": cell.n_predict}),
         returncode=proc.returncode,
         proc_wall_s=wall,
         peak_tree_rss_mb=peak_tree_rss,
@@ -181,7 +192,7 @@ def run_plan(
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     records: list[dict[str, Any]] = []
-    # (lib, family, design) -> status that stopped it at some n
+    # (lib, family, design, n_predict) -> status that stopped it at some n
     stopped: dict[tuple[str, str, str], str] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pygam_compare_") as cwd,
@@ -190,7 +201,7 @@ def run_plan(
         for cell in plan.cells:
             for rep in range(plan.reps):
                 for lib in plan.libs:
-                    key = (lib, cell.family, cell.design)
+                    key = (lib, cell.family, cell.design, cell.n_predict)
                     if key in stopped:
                         rec: dict[str, Any] = dict(
                             lib=lib,
@@ -199,9 +210,16 @@ def run_plan(
                             design=cell.design,
                             seed=rep,
                             status=f"not_run_after_{stopped[key]}",
+                            **(
+                                {}
+                                if cell.n_predict is None
+                                else {"n_predict": cell.n_predict}
+                            ),
                         )
                     else:
-                        rec = run_rep(lib, cell, rep, plan.timeout_s, memcap_mb, cwd)
+                        rec = run_rep(
+                            lib, cell, rep, plan.timeout_s, memcap_mb, cwd, plan.postfit
+                        )
                         if rec["status"] in ("timeout", "memcap"):
                             stopped[key] = rec["status"]
                     records.append(rec)

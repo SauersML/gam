@@ -4800,7 +4800,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
-    module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
     module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
@@ -4915,7 +4914,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
-    module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
     module.add_function(wrap_pyfunction!(
         select_topology_candidate_lifecycle,
         module
@@ -7142,7 +7140,7 @@ fn predict_encoded_table_configured_impl(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
-) -> Result<String, PredictError> {
+) -> Result<TablePrediction, PredictError> {
     let model_class = model.predict_model_class();
     parse_covariance_mode(covariance_mode.as_deref()).map_err(PredictError::Other)?;
     let time_grid =
@@ -7204,12 +7202,12 @@ fn predict_dataset_with_options_impl(
     model_class: PredictModelClass,
     dataset: EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<String, String> {
+) -> Result<TablePrediction, String> {
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(model, &dataset, options);
     }
     let (columns, provenance) = predict_columns(model, dataset, options)?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(TablePrediction::Point(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(model),
         point_column: model_class.point_column(),
@@ -7228,8 +7226,7 @@ fn predict_dataset_with_options_impl(
             .map(|source| source.as_str().to_string()),
         point_covariance_source: provenance.point.map(|source| source.as_str().to_string()),
         point_covariance_note: provenance.point_note,
-    })
-    .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+    }))
 }
 
 /// Result-owned covariance provenance for a `predict_columns` call (#2296):
@@ -7540,7 +7537,7 @@ fn predict_encoded_table_conformal_impl(
     calibration_source: EncodedDataset,
     conformal_level: f64,
     options_json: Option<&str>,
-) -> Result<String, String> {
+) -> Result<PredictionPayload, String> {
     let model = load_model_impl(model_bytes)?;
     let options = parse_predict_options(options_json)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
@@ -7575,7 +7572,7 @@ fn predict_encoded_table_conformal_impl(
         parse_covariance_mode(options.covariance_mode.as_deref())?,
         options.observation_interval.unwrap_or(false),
     )?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
@@ -7588,7 +7585,6 @@ fn predict_encoded_table_conformal_impl(
         point_covariance_source: None,
         point_covariance_note: None,
     })
-    .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
 
 /// #1098 Gaussian full-conformal prediction set at frozen `Sλ` — no
@@ -7600,7 +7596,7 @@ fn predict_encoded_table_full_conformal_impl(
     model_bytes: &[u8],
     source: EncodedDataset,
     conformal_level: f64,
-) -> Result<String, String> {
+) -> Result<PredictionPayload, String> {
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
@@ -7609,7 +7605,7 @@ fn predict_encoded_table_full_conformal_impl(
         &dataset.column_map(),
         conformal_level,
     )?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
@@ -7626,7 +7622,6 @@ fn predict_encoded_table_full_conformal_impl(
         point_covariance_source: None,
         point_covariance_note: None,
     })
-    .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }
 
 /// Full-conformal prediction intervals at frozen smoothing parameters — no
@@ -7638,8 +7633,8 @@ fn predict_encoded_table_full_conformal_impl(
 /// ≥`conformal_level` marginal-coverage theorem additionally requires the
 /// symmetric ρ-re-selecting fit and is certified per row only where the
 /// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
-/// REML branch through the augmented optimum). Returns the same column JSON as
-/// `predict_table` plus that certificate column.
+/// REML branch through the augmented optimum). Returns the same column payload
+/// as `predict_table` plus that certificate column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to split conformal.
@@ -7650,12 +7645,13 @@ fn predict_table_full_conformal(
     headers: Vec<String>,
     rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    detach_py_result(py, "predict_table_full_conformal", move || {
+    let payload = detach_py_result(py, "predict_table_full_conformal", move || {
         predict_encoded_table_full_conformal_impl(&model_bytes, dataset, conformal_level)
-    })
+    })?;
+    prediction_payload_into_py(py, payload)
 }
 
 /// #1057 Posterior-predictive replicate sampling — `model.sample_replicates`.
@@ -7766,11 +7762,11 @@ fn generative_replicates_encoded_impl(
 }
 
 fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
-    let ordered = ordered_prediction_column_values(&columns);
+    let ordered = ordered_prediction_column_entries(columns);
     let n_cols = ordered.len();
-    let n_rows = ordered.first().map(|values| values.len()).unwrap_or(0);
+    let n_rows = ordered.first().map(|(_, values)| values.len()).unwrap_or(0);
     let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-    for (j, values) in ordered.into_iter().enumerate() {
+    for (j, (_, values)) in ordered.into_iter().enumerate() {
         if values.len() != n_rows {
             return Err("prediction columns have inconsistent lengths".to_string());
         }
@@ -7781,24 +7777,89 @@ fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, 
     Ok(out)
 }
 
-fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
+fn ordered_prediction_column_entries(
+    mut columns: BTreeMap<String, Vec<f64>>,
+) -> Vec<(String, Vec<f64>)> {
     // Single source of truth for the user-facing column order; the numpy
-    // (Array2) path and the Python dict path (`ordered_prediction_columns`)
-    // must agree, so both read `PREFERRED_PREDICTION_COLUMNS`.
-    let mut out = Vec::<Vec<f64>>::new();
-    let mut seen = BTreeSet::<&str>::new();
+    // (Array2) path and the Python dict path (`prediction_payload_into_py`)
+    // must agree, so both read `PREFERRED_PREDICTION_COLUMNS`. The columns are
+    // moved, never copied.
+    let mut out = Vec::with_capacity(columns.len());
     for key in PREFERRED_PREDICTION_COLUMNS.iter().copied() {
-        if let Some(values) = columns.get(key) {
-            out.push(values.clone());
-            seen.insert(key);
+        if let Some(entry) = columns.remove_entry(key) {
+            out.push(entry);
         }
     }
-    for (key, values) in columns {
-        if !seen.contains(key.as_str()) {
-            out.push(values.clone());
-        }
-    }
+    out.extend(columns);
     out
+}
+
+/// A table prediction as the engine produced it. Point payloads cross to
+/// Python as a dict of numpy columns; survival and competing-risks payloads
+/// keep their structured serializers and are decoded here, in Rust, so every
+/// `predict_table` result reaches Python as the same kind of object.
+enum TablePrediction {
+    Point(PredictionPayload),
+    Survival(String),
+    CompetingRisks(String),
+}
+
+impl TablePrediction {
+    fn into_py(self, py: Python<'_>) -> PyResult<PyObject> {
+        let (decoded, class) = match self {
+            Self::Point(payload) => return prediction_payload_into_py(py, payload),
+            Self::Survival(raw) => (
+                survival_prediction_payload_from_json(py, &raw)?,
+                "survival_prediction",
+            ),
+            Self::CompetingRisks(raw) => (
+                competing_risks_prediction_payload_from_json(py, &raw)?,
+                "competing_risks_prediction",
+            ),
+        };
+        decoded.bind(py).cast::<PyDict>()?.set_item("class", class)?;
+        Ok(decoded)
+    }
+}
+
+/// Hand a point payload to Python without a JSON round trip: scalar metadata
+/// as `str` values and `columns` as an insertion-ordered dict of float64
+/// arrays, each built from its moved `Vec<f64>` without a copy. Optional
+/// provenance keys are present only when set, matching the omitted-when-`None`
+/// wire shape the payload has always had.
+fn prediction_payload_into_py(py: Python<'_>, payload: PredictionPayload) -> PyResult<PyObject> {
+    let PredictionPayload {
+        columns,
+        model_class,
+        point_column,
+        point_shape,
+        family,
+        interval_method,
+        covariance_source,
+        point_covariance_source,
+        point_covariance_note,
+    } = payload;
+    let out = PyDict::new(py);
+    out.set_item("model_class", model_class)?;
+    out.set_item("point_column", point_column)?;
+    out.set_item("point_shape", point_shape)?;
+    out.set_item("family", family)?;
+    for (key, value) in [
+        ("interval_method", interval_method),
+        ("covariance_source", covariance_source),
+        ("point_covariance_source", point_covariance_source),
+        ("point_covariance_note", point_covariance_note),
+    ] {
+        if let Some(value) = value {
+            out.set_item(key, value)?;
+        }
+    }
+    let ordered = PyDict::new(py);
+    for (key, values) in ordered_prediction_column_entries(columns) {
+        ordered.set_item(key, values.into_pyarray(py))?;
+    }
+    out.set_item("columns", ordered)?;
+    Ok(out.into_any().unbind())
 }
 
 fn parse_sample_options(options_json: Option<&str>) -> Result<PySampleOptions, String> {
