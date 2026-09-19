@@ -818,7 +818,11 @@ def fit(
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
         ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
-        ``"negbin"`` / ``"nb"``. Binomial/Bernoulli link spellings accept
+        ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
+        ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
+        estimated by LAML jointly with the smoothing parameters; the fitted
+        values are reported as ``student_t_sigma`` / ``student_t_nu``).
+        Binomial/Bernoulli link spellings accept
         ``"-logit"``, ``"-probit"``, ``"-cloglog"``, or mgcv-style
         parentheses such as ``"bernoulli(probit)"``. Specialized values include
         ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,

@@ -39,11 +39,10 @@ use gam_math::special::gauss_legendre;
 /// `S_ij = ∫ B_i^{(order)} B_j^{(order)} dx` over the modeling interval
 /// `[t_degree, t_{num_basis}]`.
 ///
-/// This is the function-space replacement for
-/// [`create_difference_penalty_matrix`] in the P-spline builder: same shape
-/// (`num_basis × num_basis`, `num_basis = knots.len() − degree − 1`), same
-/// null-space dimension (`order`), but an exact functional of the represented
-/// spline rather than of its coefficient sequence.
+/// This is the P-spline builder's roughness penalty: shape
+/// `num_basis × num_basis` (`num_basis = knots.len() − degree − 1`), null-space
+/// dimension `order`, and an exact functional of the represented spline rather
+/// than of its coefficient sequence (SPEC: penalties go on the function).
 pub fn bspline_derivative_penalty_matrix(
     knot_vector: ArrayView1<f64>,
     degree: usize,

@@ -21,7 +21,7 @@ pub(crate) fn small_p_zero_decoder_stays_full_b() {
         phi[[row, row]] = 1.0;
         jet[[row, row, 0]] = 1.0;
     }
-    let smooth_penalty = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+    let smooth_penalty = gam_linalg_test_support::coefficient_difference_penalty(m, 2);
     let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "small-p-zero",
         SaeAtomBasisKind::EuclideanPatch,

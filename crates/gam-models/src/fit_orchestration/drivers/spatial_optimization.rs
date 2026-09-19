@@ -4995,7 +4995,8 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
-        | ResponseFamily::Gamma => gam_problem::SeedRiskProfile::GeneralizedLinear,
+        | ResponseFamily::Gamma
+        | ResponseFamily::StudentT { .. } => gam_problem::SeedRiskProfile::GeneralizedLinear,
     }
 }
 
