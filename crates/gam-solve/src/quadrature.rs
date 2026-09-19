@@ -3467,10 +3467,12 @@ pub(crate) fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
     gam_math::probability::normal_cdf(eta / denom)
 }
 
-/// Integral `∫_{I} exp(log_h(t)) dt / √(2π)` of one lobe of a Gaussian
-/// central-moment integrand over the half-line `t ≥ 0`, where `log_h` is
-/// strongly concave with curvature `≤ −1` (it carries the standard-normal
-/// kernel `−t²/2` plus a concave log-gap).
+/// Integral `∫_{t ≥ 0} exp(log_h(t)) dt / √(2π)` of one lobe of a Gaussian
+/// central-moment integrand over the half-line, where `log_h` is strongly
+/// concave with curvature `≤ −1` (it carries the standard-normal kernel
+/// `−t²/2` plus a concave log-gap) and rises to `+∞` slope as `t → 0⁺`.
+///
+/// `jet(t)` returns `(log_h, log_h′, log_h″)` at `t > 0`.
 ///
 /// Strong log-concavity makes the integral a well-conditioned target: the lobe
 /// is unimodal with peak `t̂`, and `h(t) ≤ h(t̂)·exp(−(t − t̂)²/2)`, so the
@@ -3480,95 +3482,83 @@ pub(crate) fn probit_posterior_mean(eta: f64, se_eta: f64) -> f64 {
 /// the lobe's absolute magnitude sits once exponentiated at the end — the log
 /// of the result is returned so callers can combine lobes before leaving the
 /// log domain.
-fn strongly_log_concave_half_line_log_integral(log_h: impl Fn(f64) -> f64) -> f64 {
-    // Unimodal on `t ≥ 0`: bracket the peak by doubling, then golden-section
-    // it. The doubling terminates because `log_h` falls at least quadratically
-    // past its peak; a non-finite probe means the lobe has left f64 range.
-    let lh = |t: f64| {
-        let v = log_h(t);
-        if v.is_nan() { f64::NEG_INFINITY } else { v }
-    };
-    let mut hi = 1.0_f64;
-    let mut log_peak = lh(hi);
-    loop {
-        let next = 2.0 * hi;
-        let v = lh(next);
-        // An underflowed probe stops an all-underflowed lobe from doubling
-        // forever, and the golden-section window `[0, 2·hi]` must stay finite.
-        if v < log_peak || v == f64::NEG_INFINITY || !(4.0 * next).is_finite() {
-            break;
+fn strongly_log_concave_half_line_log_integral(
+    start: f64,
+    jet: impl Fn(f64) -> (f64, f64, f64),
+) -> f64 {
+    // Peak: Newton on `log_h′ = 0` with the analytic curvature, kept inside a
+    // bracket `(a, b)` on which `log_h′` changes sign. `log_h′ → +∞` at `0⁺`
+    // gives `a = 0`; wherever `log_h′(t) > 0`, curvature `≤ −1` gives
+    // `t̂ ≤ t + log_h′(t)`, and wherever `log_h′(t) < 0`, `t̂ < t`. A Newton
+    // iterate outside the bracket is replaced by its midpoint, so the bracket
+    // shrinks every step and the iteration ends at f64 resolution of `t̂`.
+    let (mut a, mut b) = (0.0_f64, f64::INFINITY);
+    let mut t = start;
+    let (log_peak, curvature) = loop {
+        let (lh, d1, d2) = jet(t);
+        if !(lh.is_finite() && d1.is_finite() && d2.is_finite()) {
+            // `mu ± sigma·t` rounds to `mu`: the lobe sits below the f64
+            // resolution of the linear predictor and carries no mass there.
+            return f64::NEG_INFINITY;
         }
-        hi = next;
-        log_peak = v;
-    }
-    let (mut a, mut b) = (0.0_f64, 2.0 * hi);
-    let inv_phi = 0.5 * (5.0_f64.sqrt() - 1.0);
-    let mut c = b - inv_phi * (b - a);
-    let mut d = a + inv_phi * (b - a);
-    let (mut fc, mut fd) = (lh(c), lh(d));
-    while (b - a) > f64::EPSILON * b.max(1.0) {
-        if fc >= fd {
-            b = d;
-            d = c;
-            fd = fc;
-            c = b - inv_phi * (b - a);
-            fc = lh(c);
+        if d1 > 0.0 {
+            a = t;
+            b = b.min(t + d1);
+        } else if d1 < 0.0 {
+            b = t;
         } else {
-            a = c;
-            c = d;
-            fc = fd;
-            d = a + inv_phi * (b - a);
-            fd = lh(d);
+            break (lh, d2);
         }
-        log_peak = log_peak.max(fc).max(fd);
-    }
-    if !log_peak.is_finite() {
-        // Every probe underflowed: the lobe is zero at f64 resolution.
-        return f64::NEG_INFINITY;
-    }
-    let t_hat = 0.5 * (a + b);
+        let newton = t - d1 / d2;
+        let next = if newton > a && newton <= b { newton } else { 0.5 * (a + b) };
+        if (next - t).abs() <= f64::EPSILON * t {
+            break (lh, d2);
+        }
+        t = next;
+    };
+    let t_hat = t;
+    let lh = |t: f64| jet(t).0;
     let g = |t: f64| (lh(t) - log_peak).exp();
     let lo = (t_hat - NORMAL_ADAPTIVE_HALF_WIDTH).max(0.0);
     let hi = t_hat + NORMAL_ADAPTIVE_HALF_WIDTH;
+    // The peak-normalized lobe has Laplace mass `√(2π/|log_h″(t̂)|)`; scaling
+    // the tolerance by it makes the acceptance test relative, so a lobe
+    // sharper than the kernel is resolved as tightly as a wide one.
+    let tol = NORMAL_ADAPTIVE_TOL * (2.0 * std::f64::consts::PI / -curvature).sqrt();
     // Split the window at the peak so the maximum is a panel node and each
     // side is monotone.
     let half_panels = NORMAL_ADAPTIVE_INITIAL_PANELS / 2;
-    let integrate = |tol: f64| {
-        let mut total = 0.0;
-        for (left, right) in [(lo, t_hat), (t_hat, hi)] {
-            if right <= left {
-                continue;
-            }
-            let panel = (right - left) / half_panels as f64;
-            for p in 0..half_panels {
-                let pa = left + p as f64 * panel;
-                let pb = if p + 1 == half_panels { right } else { pa + panel };
-                let (fa, fb, fm) = (g(pa), g(pb), g(0.5 * (pa + pb)));
-                let whole = (pb - pa) / 6.0 * (fa + 4.0 * fm + fb);
-                total += adaptive_simpson_refine(
-                    &g,
-                    pa,
-                    pb,
-                    fa,
-                    fb,
-                    fm,
-                    whole,
-                    tol,
-                    NORMAL_ADAPTIVE_MAX_DEPTH,
-                );
-            }
+    let mut normalized = 0.0;
+    for (left, right) in [(lo, t_hat), (t_hat, hi)] {
+        if right <= left {
+            continue;
         }
-        total
-    };
-    let mut normalized = integrate(NORMAL_ADAPTIVE_TOL);
-    if normalized < 1.0 {
-        // The peak-normalized integrand is `1` at `t̂`, but a lobe sharper
-        // than the kernel can hold less than unit mass; make the tolerance
-        // relative so a narrow lobe is resolved as tightly as a wide one.
-        normalized = integrate(NORMAL_ADAPTIVE_TOL * normalized);
+        let panel = (right - left) / half_panels as f64;
+        for p in 0..half_panels {
+            let pa = left + p as f64 * panel;
+            let pb = if p + 1 == half_panels { right } else { pa + panel };
+            let (fa, fb, fm) = (g(pa), g(pb), g(0.5 * (pa + pb)));
+            let whole = (pb - pa) / 6.0 * (fa + 4.0 * fm + fb);
+            normalized += adaptive_simpson_refine(
+                &g,
+                pa,
+                pb,
+                fa,
+                fb,
+                fm,
+                whole,
+                tol,
+                NORMAL_ADAPTIVE_MAX_DEPTH,
+            );
+        }
     }
     log_peak + normalized.ln() - 0.5 * (2.0 * std::f64::consts::PI).ln()
 }
+
+/// Log-domain local jet of an increasing inverse link `p` about the centre
+/// `mu`, at the offset `u = x − mu ≠ 0`: `(ln|p(x) − p(mu)|, ln p′(x),
+/// p″(x)/p′(x))`.
+type LinkGapJet = (f64, f64, f64);
 
 /// `Var[p(η)]` for `η ~ N(mu, sigma²)` and an increasing inverse link `p`
 /// whose values `p` and `1 − p` are both log-concave (logit and probit).
@@ -3581,23 +3571,37 @@ fn strongly_log_concave_half_line_log_integral(log_h: impl Fn(f64) -> f64) -> f6
 /// `E[d]² ≤ E[d²]/2`, so the subtraction loses at most one bit.
 ///
 /// Splitting at `x = mu` gives two lobes in standardized coordinates
-/// `x = mu ± sigma·t`, `t ≥ 0`, with log-integrand `−t²/2 + k·ln|d|`. On each
-/// side `ln|d|` is concave (`ln(p(x) − p(mu))` for `x > mu` by log-concavity
-/// of `p`, `ln(p(mu) − p(x))` for `x < mu` by log-concavity of `1 − p`), so
-/// every lobe is strongly log-concave and is integrated in the log domain by
-/// [`strongly_log_concave_half_line_log_integral`]. `log_gap(x)` returns
-/// `ln|p(x) − p(mu)|`, evaluated without forming either probability so the
-/// gap keeps full relative precision in the tails.
-fn log_concave_link_posterior_variance(sigma: f64, mu: f64, log_gap: impl Fn(f64) -> f64) -> f64 {
+/// `x = mu + s·sigma·t`, `s = ±1`, `t ≥ 0`, with log-integrand
+/// `−t²/2 + k·ln|d|`. On each side `ln|d|` is concave (`ln(p(x) − p(mu))` for
+/// `x > mu` by log-concavity of `p`, `ln(p(mu) − p(x))` for `x < mu` by
+/// log-concavity of `1 − p`), so every lobe is strongly log-concave and is
+/// integrated in the log domain by
+/// [`strongly_log_concave_half_line_log_integral`]. With `q = p′(x)/|d(x)|`
+/// and `ℓ = p″(x)/p′(x)`, the lobe's derivatives in `t` are
+/// `−t + k·sigma·q` and `−1 + k·sigma·q·(s·sigma·ℓ − sigma·q)`; concavity of
+/// `ln|d|` is exactly `s·ℓ·q − q² ≤ 0`. `gap_jet(u)` returns the [`LinkGapJet`] at
+/// `x = mu + u`, evaluated without forming either probability so the gap keeps
+/// full relative precision in the tails.
+fn log_concave_link_posterior_variance(
+    sigma: f64,
+    gap_jet: impl Fn(f64) -> LinkGapJet,
+) -> f64 {
     if !(sigma.is_finite()) || sigma <= 0.0 {
         return 0.0;
     }
     let lobe = |side: f64, k: f64| {
-        strongly_log_concave_half_line_log_integral(|t: f64| {
-            if t <= 0.0 {
-                return f64::NEG_INFINITY;
-            }
-            -0.5 * t * t + k * log_gap(mu + side * sigma * t)
+        // As `sigma → 0` the gap is `p′(mu)·sigma·t` and the lobe is
+        // `t^k·e^{−t²/2}`, whose peak `√k` starts the peak iteration.
+        strongly_log_concave_half_line_log_integral(k.sqrt(), |t: f64| {
+            let (log_gap, log_density, density_log_slope) = gap_jet(side * sigma * t);
+            // `sigma·q ~ 1/t` near the centre, so it is formed in the log
+            // domain rather than as a product with the unbounded `q`.
+            let sq = (sigma.ln() + log_density - log_gap).exp();
+            (
+                -0.5 * t * t + k * log_gap,
+                -t + k * sq,
+                -1.0 + k * sq * (side * sigma * density_log_slope - sq),
+            )
         })
     };
     let (log_r1, log_l1) = (lobe(1.0, 1.0), lobe(-1.0, 1.0));
@@ -3608,32 +3612,35 @@ fn log_concave_link_posterior_variance(sigma: f64, mu: f64, log_gap: impl Fn(f64
     second - first * first
 }
 
-/// `ln|σ(x) − σ(mu)|` for the logistic `σ`, from
+/// [`LinkGapJet`] of the logistic `σ` about `mu`, from
 /// `σ(x) − σ(mu) = σ(x)σ(mu)(e^{−mu} − e^{−x})` with every factor kept in the
-/// log domain (`ln σ(z) = −softplus(−z)`).
+/// log domain (`ln σ(z) = −softplus(−z)`), `σ′ = σ(x)σ(−x)` and
+/// `σ″/σ′ = 1 − 2σ(x) = −tanh(x/2)`.
 #[inline]
-fn logit_log_gap(x: f64, mu: f64) -> f64 {
+fn logit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
     use gam_math::special::softplus;
-    let u = x - mu;
-    if u > 0.0 {
+    let x = mu + u;
+    let log_gap = if u > 0.0 {
         -softplus(-x) - softplus(mu) + (-(-u).exp_m1()).ln()
     } else if u < 0.0 {
         -softplus(-mu) - softplus(x) + (-(u).exp_m1()).ln()
     } else {
         f64::NEG_INFINITY
-    }
+    };
+    (log_gap, -softplus(-x) - softplus(x), -(0.5 * x).tanh())
 }
 
-/// `ln|Φ(x) − Φ(mu)|`, taking the difference on whichever tail keeps both
-/// probabilities away from `1` so it retains full relative precision.
+/// [`LinkGapJet`] of `Φ` about `mu`, taking the difference on whichever tail
+/// keeps both probabilities away from `1` so it retains full relative
+/// precision; `Φ′ = φ` and `φ′/φ = −x`.
 #[inline]
-fn probit_log_gap(x: f64, mu: f64) -> f64 {
+fn probit_gap_jet(mu: f64, u: f64) -> LinkGapJet {
     use gam_math::probability::{normal_cdf, normal_logcdf};
+    let x = mu + u;
     let (lo, hi) = if x < mu { (x, mu) } else { (mu, x) };
-    if !(hi > lo) {
-        return f64::NEG_INFINITY;
-    }
-    if hi <= 0.0 {
+    let log_gap = if !(hi > lo) {
+        f64::NEG_INFINITY
+    } else if hi <= 0.0 {
         let l_hi = normal_logcdf(hi);
         l_hi + (-(normal_logcdf(lo) - l_hi).exp_m1()).ln()
     } else if lo >= 0.0 {
@@ -3641,7 +3648,9 @@ fn probit_log_gap(x: f64, mu: f64) -> f64 {
         l_lo + (-(normal_logcdf(-hi) - l_lo).exp_m1()).ln()
     } else {
         (-(normal_cdf(lo) + normal_cdf(-hi))).ln_1p()
-    }
+    };
+    let log_density = -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    (log_gap, log_density, -x)
 }
 
 /// Posterior mean and variance of `σ(η)`, `η ~ N(eta, se_eta²)`.
@@ -3651,7 +3660,7 @@ fn probit_log_gap(x: f64, mu: f64) -> f64 {
 /// [`log_concave_link_posterior_variance`].
 pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64), EstimationError> {
     let (mean, _) = logit_posterior_meanwith_deriv(eta, se_eta)?;
-    let var = log_concave_link_posterior_variance(se_eta, eta, |x| logit_log_gap(x, eta));
+    let var = log_concave_link_posterior_variance(se_eta, |u| logit_gap_jet(eta, u));
     // `E[σ(η)]` averages values in `[0, 1]`; projecting the ~1e-12-accurate
     // integral onto that support can only move it toward the true value.
     Ok((mean.clamp(0.0, 1.0), var))
@@ -3662,7 +3671,7 @@ pub fn logit_posterior_meanvariance(eta: f64, se_eta: f64) -> Result<(f64, f64),
 /// [`log_concave_link_posterior_variance`].
 pub fn probit_posterior_meanvariance(eta: f64, se_eta: f64) -> (f64, f64) {
     let mean = probit_posterior_mean(eta, se_eta);
-    let var = log_concave_link_posterior_variance(se_eta, eta, |x| probit_log_gap(x, eta));
+    let var = log_concave_link_posterior_variance(se_eta, |u| probit_gap_jet(eta, u));
     (mean, var)
 }
 
