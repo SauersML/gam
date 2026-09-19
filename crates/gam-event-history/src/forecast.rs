@@ -702,9 +702,30 @@ impl KilledProcess for WindowIntegrand<'_> {
     }
 }
 
+/// The level-0 breakpoints of the window `pseudo` spans: its start, the
+/// covariate path's changes and the last horizon, and every time strictly
+/// inside it at which a risk-set centred fit's normaliser changes slope. That
+/// normaliser is linear between its reference grid's times
+/// (`EventHistoryFit::risk_set_normaliser_at`), so the intensities have a kink
+/// at each one. A Gauss-Legendre cell straddling a kink converges only
+/// algebraically in its width, so the gap between the cell and its halves no
+/// longer bounds the halves' error. With every grid time a breakpoint, each
+/// cell's integrand is smooth. None of them depends on the horizons.
+pub(crate) fn window_breakpoints(fit: &EventHistoryFit, pseudo: &SubjectHistory) -> Vec<f64> {
+    let (start, end) = (pseudo.entry, pseudo.exit);
+    let mut breakpoints = vec![start];
+    breakpoints.extend(mesh_cells(pseudo, false, 0).iter().map(|&(_, right)| right));
+    if let Some(snapshot) = fit.centring.as_ref() {
+        breakpoints.extend(snapshot.grid.times.iter().copied().filter(|&t| t > start && t < end));
+    }
+    breakpoints.sort_by(f64::total_cmp);
+    breakpoints.dedup();
+    breakpoints
+}
+
 /// The killed-process integration of one forecast window, on the grid
 /// filter under the fit's parameters. The window's level-0 breakpoints are
-/// its start, the covariate path's changes and the last horizon; the mesh,
+/// those of [`window_breakpoints`]; the mesh,
 /// its acceptance and the horizons are `integrator::integrate_window`'s. The
 /// fit's quadrature order serves only as the rule per cell, and its mesh
 /// refinement not at all.
@@ -798,12 +819,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         }),
         None => None,
     };
-    let mut breakpoints = vec![start];
-    breakpoints.extend(
-        mesh_cells(&pseudo, false, 0)
-            .iter()
-            .map(|&(_, right)| right),
-    );
+    let breakpoints = window_breakpoints(fit, &pseudo);
     let reached = integrate_window(&integrand, opened(gh)?, companion, &breakpoints, horizons)?;
     let n_h = horizons.len();
     let mut survival = vec![0.0; n_h];

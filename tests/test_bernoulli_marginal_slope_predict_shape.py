@@ -48,8 +48,6 @@ def _dispatch(
     monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
     return _predict_shape.shape_predict_response(
         raw,
-        headers=[],
-        rows=[],
         table_kind="pandas",
         training_table_kind="pandas",
         interval=interval,
@@ -199,8 +197,6 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
 
     out = _predict_shape.shape_predict_response(
         raw,
-        headers=[],
-        rows=[],
         table_kind="pandas",
         training_table_kind="pandas",
         interval=0.95,
