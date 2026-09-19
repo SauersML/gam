@@ -120,3 +120,64 @@ fn diagnose_rejects_removed_no_op_alo_flag() {
         stderr(&output)
     );
 }
+
+#[test]
+fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let training = scratch.path().join("training.csv");
+    let model = scratch.path().join("model.gam");
+    let out = scratch.path().join("predictions.csv");
+    let mut rows = String::from("y,x,g,k\n");
+    for i in 0..90 {
+        let x = f64::from(i) / 90.0;
+        let level = i % 3;
+        let y = (6.0 * x).sin() + f64::from(level) + 0.05 * f64::from(i % 7);
+        rows.push_str(&format!("{y},{x},L{level},{level}\n"));
+    }
+    std::fs::write(&training, rows).expect("write training fixture");
+    let fit = gam(&[
+        "fit",
+        training.to_str().expect("UTF-8 path"),
+        "y ~ s(x) + g + factor(k)",
+        "--out",
+        model.to_str().expect("UTF-8 path"),
+    ]);
+    assert!(fit.status.success(), "{}", stderr(&fit));
+
+    let predict = |name: &str, body: &str| {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, body).expect("write new-data fixture");
+        gam(&[
+            "predict",
+            model.to_str().expect("UTF-8 path"),
+            path.to_str().expect("UTF-8 path"),
+            "--out",
+            out.to_str().expect("UTF-8 path"),
+        ])
+    };
+    let cases = [
+        (
+            "nan.csv",
+            "x,g,k\n0.5,L0,0\nNaN,L1,1\n",
+            ["non-finite value at row 2, column 'x'", "help: Drop or impute"],
+        ),
+        (
+            "unseen_label.csv",
+            "x,g,k\n0.5,L0,0\n0.5,LNEW,1\n",
+            ["unseen level 'LNEW' in categorical column 'g' at row 2", "help: Map the label"],
+        ),
+        (
+            "unseen_code.csv",
+            "x,g,k\n0.5,L0,0\n0.5,L1,7\n",
+            ["unseen level '7' in categorical column 'k' at row 2", "help: Map the label"],
+        ),
+    ];
+    for (name, body, expected) in cases {
+        let output = predict(name, body);
+        assert_eq!(output.status.code(), Some(1), "{name}: {}", stderr(&output));
+        let error = stderr(&output);
+        for needle in expected {
+            assert!(error.contains(needle), "{name}: missing {needle:?} in\n{error}");
+        }
+    }
+}
