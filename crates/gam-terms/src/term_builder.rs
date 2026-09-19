@@ -1234,6 +1234,8 @@ fn push_factor_level_slope_terms(
                     flavour: FactorSmoothFlavour::LevelSlopes,
                     group_frozen_levels: None,
                     frozen_global_orthogonality: None,
+                    // A level slope is one linear piece per level by construction.
+                    adaptive: false,
                 },
             },
             shape: ShapeSpec::None,
