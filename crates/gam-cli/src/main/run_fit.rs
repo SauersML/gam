@@ -2,10 +2,10 @@ use super::*;
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     // GUARD (#2030): the geometry carrier's optional owned row evidence MUST
-    // survive compaction. Saved ALO explicitly requires `geometry.working`;
-    // `None` correctly means unavailable, while truncating a present vector
-    // would corrupt a valid single-diagonal fit. `FitInference` deliberately
-    // has no duplicate copy, so only this one source of truth is retained.
+    // survive compaction of the in-memory fit: `None` correctly means
+    // unavailable, while truncating a present vector would corrupt a valid
+    // single-diagonal fit. It is never serialized (a saved model carries no
+    // per-row training data), so compaction has nothing to gain from it.
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }
@@ -57,7 +57,6 @@ fn fit_request_document_from_fit_args(
         noise_formula: args.predict_noise.clone(),
         noise_offset: args.noise_offset_column.clone(),
         offset: args.offset_column.clone(),
-        precompute_conformal: Some(args.precompute_conformal),
         persistent_warm_start_root: args.persistent_warm_start_root.clone(),
         scale_dimensions: args.scale_dimensions.then_some(true),
         sigma_time_k: args.sigma_time_k,

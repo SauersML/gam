@@ -96,7 +96,6 @@ fn fit_marginal_slope_model(n: usize, seed: u64) -> FittedModel {
         // pins the rigid latent law so the anchor is the closed-form
         // `c(b)·q`, the branch whose curvature this test is about.
         frozen_score: true,
-        precompute_conformal: Some(false),
         ..FitConfig::default()
     };
     let payload = fit_formula_to_payload("y ~ s(x, k=6)".to_string(), &ds, &cfg)

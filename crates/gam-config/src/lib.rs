@@ -230,9 +230,6 @@ pub(crate) fn resolve_fit_request_config(
     if let Some(flag) = json_config.flexible_link {
         fit_config.flexible_link = flag;
     }
-    if let Some(flag) = json_config.precompute_conformal {
-        fit_config.precompute_conformal = Some(flag);
-    }
     if let Some(flag) = json_config.scale_dimensions {
         fit_config.scale_dimensions = flag;
     }
@@ -426,35 +423,6 @@ mod tests {
             error.to_string().contains("unknown field `outer_max_iter`"),
             "{error}"
         );
-    }
-
-    /// #2633: the conformal-precompute switch must reach `FitConfig` through the
-    /// shared wire document, which is the single path BOTH front ends use — the
-    /// CLI maps `--precompute-conformal` into this document and the Python FFI
-    /// parses the same JSON key. A knob only reachable from Rust would be the
-    /// front-end parity gap this campaign exists to remove.
-    #[test]
-    fn precompute_conformal_threads_from_the_wire_document_2633() {
-        // Absent means "use the default", which is to precompute. It must stay
-        // `None` rather than being materialized into `Some(true)`, so the core
-        // default remains the single source of truth for the behaviour.
-        let defaulted = resolved_json(json!({})).expect("empty config resolves");
-        assert_eq!(
-            defaulted.precompute_conformal, None,
-            "omitting the key must leave the core default untouched"
-        );
-
-        let off = resolved_json(json!({"precompute_conformal": false}))
-            .expect("precompute_conformal=false resolves");
-        assert_eq!(
-            off.precompute_conformal,
-            Some(false),
-            "an explicit false must reach FitConfig, or the substrates are still precomputed"
-        );
-
-        let on = resolved_json(json!({"precompute_conformal": true}))
-            .expect("precompute_conformal=true resolves");
-        assert_eq!(on.precompute_conformal, Some(true));
     }
 
     /// gnomon-c9: a converged reference fit needs tighter solver tolerances than

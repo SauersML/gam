@@ -1,7 +1,7 @@
 """A ``fit()`` model-spec field has one spelling: its dedicated keyword.
 
 ``config={...}`` carries only request fields without a dedicated keyword (for
-example ``group_metadata`` or ``precompute_conformal``). A ``config`` key that
+example ``group_metadata``). A ``config`` key that
 duplicates a keyword used to be silently overridden by the keyword, or silently
 taken when the keyword was left ``None``; it is now refused, naming the keyword
 to use. This test pins three properties:
@@ -107,10 +107,7 @@ def test_config_spelling_of_a_keyword_is_refused(config_key: str, keyword: str) 
 
 
 def test_config_key_without_a_keyword_passes_through() -> None:
-    payload = _payload(
-        config={"precompute_conformal": False, "group_metadata": {"g": {}}}
-    )
-    assert payload["precompute_conformal"] is False
+    payload = _payload(config={"group_metadata": {"g": {}}})
     assert payload["group_metadata"] == {"g": {}}
 
 

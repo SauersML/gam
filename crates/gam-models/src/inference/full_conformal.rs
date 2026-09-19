@@ -2415,20 +2415,90 @@ impl<'a> GlmHomotopyFullConformal<'a> {
     }
 }
 
-/// Persistable substrate for the EXACT Gaussian-identity full-conformal set
+/// Persisted frozen penalty for the EXACT Gaussian-identity full-conformal set
 /// (#942 Layer 1 + the Layer-3 frozen-ρ self-diagnostic).
 ///
 /// The exact full-conformal set has no test-point-independent
 /// factorization: every test covariate `x_*` enters the augmented normal matrix
-/// `M = XᵀX + x_*x_*ᵀ + Sλ`, so the substrate persists the training design `X`,
-/// response `y`, and the (frozen) penalty `Sλ` and rebuilds
-/// [`ExactGaussianFullConformal`] per test row — one Cholesky per test point,
-/// zero refits. Valid for any penalized smooth with an arbitrary `Sλ` and basis.
+/// `M = XᵀX + x_*x_*ᵀ + Sλ`, and every conformity score is a residual of one
+/// labeled row, so the set needs the labeled rows `(X, y)` themselves. A saved
+/// model therefore persists only the p × p frozen penalty `Sλ`; the labeled
+/// rows are supplied again at prediction time and joined to it in
+/// [`ExactFullConformalPenalty::with_labeled_rows`]. The saved model stays
+/// O(p²) whatever the training size.
 ///
 /// `Sλ` is recovered once at fit time from the converged penalized Hessian
 /// `M₀ = XᵀX + Sλ` (the Gaussian-identity, unit-weight, dispersion-unscaled
 /// normal matrix stored in `FitGeometry`) as `Sλ = M₀ − XᵀX`, so no penalty
 /// re-derivation is needed.
+///
+/// Older payloads persisted the training `x` and `y` beside `s_lambda` under
+/// the same field; deserialization reads `s_lambda` and ignores them.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ExactFullConformalPenalty {
+    /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
+    s_lambda: Array2<f64>,
+}
+
+impl ExactFullConformalPenalty {
+    /// Recover the frozen penalty `Sλ = M₀ − XᵀX` from the unit-weight training
+    /// Gram matrix `XᵀX` and the converged penalized normal matrix `M₀`.
+    pub fn from_gram_and_normal_matrix(
+        gram: &Array2<f64>,
+        m: &Array2<f64>,
+    ) -> Result<Self, String> {
+        let p = gram.nrows();
+        if gram.ncols() != p || m.nrows() != p || m.ncols() != p {
+            return Err("exact full conformal penalty: normal-matrix shape mismatch".to_string());
+        }
+        Ok(Self {
+            s_lambda: m - gram,
+        })
+    }
+
+    /// Coefficient dimension `p`.
+    pub fn p(&self) -> usize {
+        self.s_lambda.nrows()
+    }
+
+    /// Join the frozen penalty to labeled rows `(X, y)` for the per-test-row
+    /// exact set. Every row carries unit weight: only models trained without
+    /// prior weights persist this penalty.
+    ///
+    /// The rows need not be the training rows. The set is exact for whatever
+    /// labeled rows are supplied; with the training rows it is the frozen-λ
+    /// full-conformal set of the fit, and with rows the penalty was not
+    /// selected on the augmented scores are exchangeable, so the finite-sample
+    /// coverage theorem holds without the frozen-ρ certificate.
+    pub fn with_labeled_rows(
+        &self,
+        x: Array2<f64>,
+        y: Array1<f64>,
+    ) -> Result<ExactFullConformalSubstrate, String> {
+        if x.nrows() != y.len() {
+            return Err("exact full conformal substrate: row-count mismatch".to_string());
+        }
+        if x.ncols() != self.p() {
+            return Err(format!(
+                "exact full conformal substrate: labeled design has {} columns but the frozen \
+                 penalty has p={}",
+                x.ncols(),
+                self.p()
+            ));
+        }
+        Ok(ExactFullConformalSubstrate {
+            x,
+            y,
+            s_lambda: self.s_lambda.clone(),
+        })
+    }
+}
+
+/// Runtime substrate for the EXACT Gaussian-identity full-conformal set: the
+/// labeled design `X`, response `y`, and the frozen penalty `Sλ`. It rebuilds
+/// [`ExactGaussianFullConformal`] per test row — one Cholesky per test point,
+/// zero refits. Valid for any penalized smooth with an arbitrary `Sλ` and basis.
+/// It is never persisted (see [`ExactFullConformalPenalty`]).
 ///
 /// The frozen-ρ self-diagnostic treats the entire frozen penalty as carrying a
 /// single global log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ` and runs the
@@ -2442,13 +2512,13 @@ impl<'a> GlmHomotopyFullConformal<'a> {
 ///
 /// Unit prior weights are required, as everywhere in this module: a reweighted
 /// training row is not exchangeable with the test row.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ExactFullConformalSubstrate {
-    /// Training design `X` (n × p).
+    /// Labeled design `X` (n × p).
     x: Array2<f64>,
-    /// Training response `y` (n).
+    /// Labeled response `y` (n).
     y: Array1<f64>,
-    /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
+    /// Frozen penalty `Sλ` at the fitted smoothing parameters (p × p).
     s_lambda: Array2<f64>,
 }
 
@@ -3493,4 +3563,39 @@ mod tests {
         }
     }
 
+    /// A v26 payload persisted the training `x` and `y` beside `s_lambda` in the
+    /// conformal field. It must still load (reading `s_lambda` alone), and the
+    /// field it re-serializes to carries no per-row data.
+    #[test]
+    fn legacy_substrate_with_training_rows_loads_as_penalty_only() {
+        let n = 7usize;
+        let p = 3usize;
+        let x = Array2::<f64>::from_shape_fn((n, p), |(i, j)| (i * p + j) as f64 * 0.1);
+        let y = Array1::<f64>::from_shape_fn(n, |i| i as f64);
+        let s_lambda = Array2::<f64>::from_shape_fn((p, p), |(i, j)| if i == j { 2.0 } else { 0.0 });
+        let legacy = serde_json::json!({
+            "x": serde_json::to_value(&x).expect("x"),
+            "y": serde_json::to_value(&y).expect("y"),
+            "s_lambda": serde_json::to_value(&s_lambda).expect("s_lambda"),
+        });
+
+        let penalty: ExactFullConformalPenalty =
+            serde_json::from_value(legacy).expect("a v26 conformal substrate must load");
+        assert_eq!(penalty.p(), p);
+
+        let reencoded = serde_json::to_value(&penalty).expect("serialize penalty");
+        let keys: Vec<&str> = reencoded
+            .as_object()
+            .expect("penalty JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["s_lambda"], "only the p x p penalty is persisted");
+
+        let substrate = penalty
+            .with_labeled_rows(x.clone(), y.clone())
+            .expect("labeled rows of width p join the penalty");
+        assert_eq!(substrate.n(), n);
+        assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
+    }
 }

@@ -288,13 +288,15 @@ variance for Gamma, Beta, negative-binomial, and Tweedie:
 gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
 ```
 
-Conformal prediction intervals. `interval="conformal"` gives the exact
-full-conformal set (Gaussian-identity); with a held-out `calibration` table it
-gives the split-conformal band for any standard family, like
-`gam predict --conformal --calibration`:
+Conformal prediction intervals. `interval="conformal"` with the labeled
+`training_data` gives the exact full-conformal set (Gaussian-identity) at the
+frozen smoothing parameters; with a held-out `calibration` table it gives the
+split-conformal band for any standard family, like
+`gam predict --conformal --training-data` / `--calibration`. The saved model
+holds no per-row training data, so full conformal takes the rows again:
 
 ```python
-model.predict(test, interval="conformal", conformal_level=0.9)
+model.predict(test, interval="conformal", training_data=df, conformal_level=0.9)
 model.predict(test, interval="conformal", calibration=held_out, conformal_level=0.9)
 ```
 

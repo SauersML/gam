@@ -50,6 +50,7 @@ use crate::transformation_normal::{TransformationNormalFamily, TransformationNor
 use crate::wiggle::{WigglePenaltyMetadata, canonical_wiggle_function_penalties};
 use gam_data::{DataSchema, EncodedDataset};
 use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_linalg::matrix::LinearOperator;
 use gam_problem::BlockRole;
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
@@ -274,29 +275,16 @@ impl RealizedRawPenaltyTopology {
     }
 }
 
-fn response_for_standard_payload(formula: &str, dataset: &EncodedDataset) -> Option<Array1<f64>> {
-    let response = gam_terms::inference::formula_dsl::parse_formula(formula)
-        .ok()?
-        .response;
-    let column = *dataset.column_map().get(&response)?;
-    Some(dataset.values.column(column).to_owned())
-}
-
-fn standard_conformal_substrates(
-    formula: &str,
-    dataset: &EncodedDataset,
+/// The frozen penalty the exact full-conformal set of an eligible standard fit
+/// needs, recovered as `Sλ = M₀ − XᵀX` from the unit-weight training Gram. Only
+/// the p × p penalty is persisted: the labeled rows the set is built on are
+/// supplied again at prediction time, so the saved model never grows with `n`.
+fn standard_conformal_penalty(
     fit_config: &FitConfig,
     family: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     design: &TermCollectionDesign,
-) -> Option<crate::inference::full_conformal::ExactFullConformalSubstrate> {
-    // #2633: the substrate grows with the training rows. A caller that keeps
-    // its training data, or never asks for a conformal interval, can decline it;
-    // see `FitConfig::precompute_conformal` for the measured trade-off and why
-    // the default is to keep it.
-    if fit_config.precompute_conformal == Some(false) {
-        return None;
-    }
+) -> Option<crate::inference::full_conformal::ExactFullConformalPenalty> {
     let expectile = fit_config.family.as_deref().is_some_and(|family| {
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
@@ -310,28 +298,21 @@ fn standard_conformal_substrates(
     {
         return None;
     }
-    let y = response_for_standard_payload(formula, dataset)?;
-    let x = design.design.try_to_dense_arc("standard conformal design").ok()?;
     let normal_matrix = fit.penalized_hessian()?;
-    if x.nrows() != y.len()
-        || normal_matrix.nrows() != x.ncols()
-        || normal_matrix.ncols() != x.ncols()
-    {
-        return None;
-    }
-    let weights = Array1::<f64>::ones(y.len());
-    // The substrate may legitimately decline this design (rank, shape, or a
-    // non-invertible normal matrix). `None` is the contract, but the reason is
-    // what explains a fit that silently ships without conformal intervals.
-    match crate::inference::full_conformal::ExactFullConformalSubstrate::from_design_unit_weight_normal_matrix(
-        x.as_ref(),
-        &y,
-        &weights,
-        normal_matrix,
-    ) {
-        Ok(substrate) => Some(substrate),
+    let unit_weights = Array1::<f64>::ones(design.design.nrows());
+    // The penalty may legitimately be unavailable (the Gram cannot be formed
+    // for this design). `None` is the contract, but the reason is what explains
+    // a fit that ships without exact full-conformal intervals.
+    let penalty = design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
+        crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
+            &gram,
+            normal_matrix,
+        )
+    });
+    match penalty {
+        Ok(penalty) => Some(penalty),
         Err(reason) => {
-            log::debug!("exact full-conformal substrate unavailable: {reason}");
+            log::debug!("exact full-conformal penalty unavailable: {reason}");
             None
         }
     }
@@ -393,8 +374,7 @@ pub fn assemble_standard_payload(
         FittedEstimator::Likelihood => family.name().to_string(),
         FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
     };
-    let full_conformal =
-        standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
+    let full_conformal = standard_conformal_penalty(fit_config, &family, &fit, &design);
     let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
             "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()
