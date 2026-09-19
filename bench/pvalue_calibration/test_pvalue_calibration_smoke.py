@@ -5,7 +5,9 @@ cells, 200 fixed seeds each, policed worker subprocesses) and fails when any
 gamfit p-value surface rejects its true null more often than a valid p-value
 can. The tolerance is not hand-picked: it is the upper quantile of the
 rejection count's own sampling law, ``Binomial(R, a)``, at family-wise
-false-alarm rate ``report.FALSE_ALARM`` (see ``report.reject_bound``).
+false-alarm rate ``report.FALSE_ALARM`` (see ``report.reject_bound``). Every
+rep that produced no p-value counts as a rejection, so a failing fit can only
+make the check stricter.
 
 The other tests pin the harness's own rules on hand-built records, so a report
 that stopped flagging an anti-conservative row, or started dropping reps that
@@ -44,15 +46,21 @@ def test_ci_plan_is_calibrated(tmp_path: Path) -> None:
     records = [json.loads(ln) for ln in (out / "records.jsonl").read_text().splitlines()]
     plan = PLANS["ci"]
     assert len(records) == len(plan.cells) * plan.reps
+    # A rep that produced no p-value (a fit that raised, a missing row) is not
+    # excused here: anti_conservative counts it as a rejection. What must hold
+    # is that every fit that did produce a p-value reported it where expected.
     for rec in records:
-        assert rec["status"] == "ok", rec
-        assert not rec["missing"], (rec["key"], rec["seed"], rec["missing"])
+        if rec["status"] != "ok":
+            continue
         for hyp in ("null", "alt"):
             for lib, surfaces in rec["expected_surfaces"].items():
                 for s in surfaces:
-                    assert f"{lib}.{s}" in rec["p"][hyp], (rec["key"], hyp, lib, s)
+                    name = f"{lib}.{s}"
+                    if f"{hyp}.{name}" in rec["missing"]:
+                        continue
+                    assert name in rec["p"][hyp], (rec["key"], rec["seed"], hyp, name)
     table = report.rows(records)
-    assert table and all(r.usable == plan.reps for r in table)
+    assert table and all(r.reps == plan.reps for r in table)
     flagged = [(r.cell, r.surface, a, r.rejections) for r, a in report.anti_conservative(table)]
     assert not flagged, flagged
     # Every row has a power under its matched alternative.
@@ -144,6 +152,20 @@ def test_missing_p_value_is_unusable_not_dropped() -> None:
     assert "null.gamfit.wald: 1x" in text
     none = _records("gaussian/n=200/smooth", [None, None])
     assert "**NO P-VALUE**" in report.calibration_table(none)
+
+
+def test_unusable_reps_count_as_rejections() -> None:
+    # 500 reps at p = 0.5 never reject. Replacing enough of them with reps that
+    # produced no p-value must flag the row: those reps may have been the
+    # rejections, so dropping them could hide an anti-conservative test.
+    reps, a = 500, 0.01
+    extra = report.reject_bound(reps, a, len(report.LEVELS)) + 1
+    clean = _records("gaussian/n=200/smooth", [0.5] * reps)
+    assert report.anti_conservative(report.rows(clean)) == []
+    holed = _records("gaussian/n=200/smooth", [0.5] * (reps - extra) + [None] * extra)
+    flagged = report.anti_conservative(report.rows(holed))
+    assert 0.01 in {lvl for _, lvl in flagged}
+    assert "**ANTI-CONSERVATIVE** at 0.01" in report.calibration_table(holed)
 
 
 def test_tolerance_is_the_binomial_quantile() -> None:

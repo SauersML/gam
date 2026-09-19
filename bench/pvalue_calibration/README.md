@@ -128,6 +128,12 @@ A valid p-value exceeds it with family-wise probability at most 10⁻³. The
 tolerance comes from the rejection count's own sampling law, so it is not
 hand-picked, and it scales with R.
 
+A rep with no p-value counts as a rejection in this check: a fit that raised,
+a missing row, or a seed the safety net killed. Such a rep may have been a
+rejection, and a size taken only over the reps that succeeded is biased
+whenever failing correlates with extreme data. A row therefore passes only if
+it passes in that worst case, while its size columns are over the usable reps.
+
 The check is one-sided: conservative rows are valid and are never flagged. A
 row whose null reps all lack a p-value is **NO P-VALUE**.
 
@@ -148,9 +154,10 @@ counts those seeds as unusable.
 `test_pvalue_calibration_smoke.py` runs in `python-contracts.yml` (the bench
 step). It contains:
 
-- `test_ci_plan_is_calibrated`, which runs the `ci` plan end to end and fails
-  when any gamfit surface is flagged anti-conservative, any rep lacks a p-value,
-  or any row lacks a power;
+- `test_ci_plan_is_calibrated`, which runs the `ci` plan end to end. It fails
+  when any gamfit surface is flagged anti-conservative (counting every rep
+  without a p-value as a rejection), when a rep that fitted lacks an expected
+  surface, or when a row lacks a power;
 - tests that pin the harness's own rules on hand-built records: resume,
   safety-net records, seeding, the verdict bound, and unusable-rep accounting;
 - a test that `docs/pvalues.md`'s table equals the one generated from the

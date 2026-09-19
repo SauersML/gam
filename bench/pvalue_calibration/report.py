@@ -10,11 +10,15 @@ p-values from Uniform(0, 1), and the fraction of reps that produced a usable
 p-value at all. For the matched-alternative draws it gives the power at 0.05.
 
 A p-value is valid when ``P(p <= a) <= a`` under its null. The verdict tests
-exactly that, one-sidedly, at each level: with ``R`` usable null reps a valid
+exactly that, one-sidedly, at each level: over ``R`` null reps a valid
 p-value rejects at most ``Binomial(R, a)`` times, so a row is
 **ANTI-CONSERVATIVE** at ``a`` when its rejection count exceeds that law's
 upper ``1 - FALSE_ALARM / m`` quantile, ``m`` being the number of
-(row, level) checks in the report. The tolerance is the sampling law of the
+(row, level) checks in the report. A rep that produced no p-value (a fit that
+raised, a missing row, a chunk the safety net killed) counts as a rejection in
+that check: it may have been one, and a size taken over only the reps that
+succeeded is biased whenever failing correlates with the data being extreme.
+A row passes only if it passes in that worst case. The tolerance is the sampling law of the
 count itself (``a + ~z * MCSE``), not a hand-picked band, and the Bonferroni
 split keeps the chance that a calibrated harness flags anything at all at or
 below ``FALSE_ALARM`` however large the grid. A conservative p-value
@@ -79,9 +83,9 @@ class Row:
         return None if s is None else math.sqrt(s * (1 - s) / self.usable)
 
 
-def reject_bound(usable: int, level: float, checks: int) -> int:
+def reject_bound(reps: int, level: float, checks: int) -> int:
     """Largest rejection count a valid p-value reaches except with prob FALSE_ALARM / checks."""
-    return int(stats.binom.ppf(1.0 - FALSE_ALARM / checks, usable, level))
+    return int(stats.binom.ppf(1.0 - FALSE_ALARM / checks, reps, level))
 
 
 def _cell_sort(cell: str) -> tuple[Any, ...]:
@@ -139,14 +143,19 @@ def rows(records: Iterable[Record]) -> list[Row]:
 
 
 def anti_conservative(table: list[Row]) -> list[tuple[Row, float]]:
-    """Every (row, level) whose rejection count no valid p-value reaches."""
+    """Every (row, level) whose worst-case rejection count no valid p-value reaches.
+
+    The worst case counts every unusable rep as a rejection (see the module
+    docstring).
+    """
     checks = sum(1 for r in table if r.usable) * len(LEVELS)
     flagged = []
     for r in table:
         if not r.usable:
             continue
+        unusable = r.reps - r.usable
         for i, a in enumerate(LEVELS):
-            if r.rejections[i] > reject_bound(r.usable, a, checks):
+            if r.rejections[i] + unusable > reject_bound(r.reps, a, checks):
                 flagged.append((r, a))
     return flagged
 
@@ -261,15 +270,18 @@ def render(records: list[Record], meta: dict[str, Any] | None = None) -> str:
         "## Anti-conservative",
         "",
     ]
-    flagged = anti_conservative(rows(records))
+    table = rows(records)
+    checks = sum(1 for x in table if x.usable) * len(LEVELS)
+    flagged = anti_conservative(table)
     if flagged:
         for r, a in flagged:
             i = LEVELS.index(a)
             lines.append(
-                f"- `{r.cell}` {r.surface}: {r.rejections[i]}/{r.usable} "
-                f"rejections at {a:g} (size {r.size(i):.3f}); a valid p-value "
-                f"exceeds {reject_bound(r.usable, a, sum(1 for x in rows(records) if x.usable) * len(LEVELS))} "
-                "only with the stated false-alarm probability"
+                f"- `{r.cell}` {r.surface}: {r.rejections[i]} rejections at {a:g} "
+                f"over {r.usable} usable reps (size {r.size(i):.3f}) plus "
+                f"{r.reps - r.usable} unusable, of {r.reps}; a valid p-value "
+                f"exceeds {reject_bound(r.reps, a, checks)} only with the stated "
+                "false-alarm probability"
             )
     else:
         lines.append("None.")

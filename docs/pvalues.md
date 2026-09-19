@@ -142,7 +142,10 @@ How to read the table:
 - **verdict** is **ANTI-CONSERVATIVE** at `a` when the rejection count
   exceeds what a valid p-value reaches except with probability
   `10⁻³ / (number of checks)`. That bound is the Binomial(R, a) quantile, not
-  a hand-picked tolerance. Conservative rows are valid and are never flagged.
+  a hand-picked tolerance. A rep that produced no p-value counts as a
+  rejection in this check, so a row passes only if it would pass whatever
+  those reps would have reported. Conservative rows are valid and are never
+  flagged.
 
 The table below is generated from the committed baseline
 `bench/pvalue_calibration/baseline/quick/`; do not edit it by hand.

@@ -69,7 +69,7 @@ PLANS: dict[str, Plan] = {
                 Cell("gaussian", 200, "linear"),
             ),
             reps=200,
-            chunk=50,
+            chunk=25,
             timeout_s=900.0,
             libs=("gamfit",),
         ),
