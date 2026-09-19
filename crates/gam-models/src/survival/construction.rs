@@ -1035,13 +1035,7 @@ where
     let problem = contract
         .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
         .with_bounds(lower, upper)
-        .with_initial_rho(seed.clone())
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            num_auxiliary_trailing: dim,
-            ..Default::default()
-        });
+        .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(
         (),
         cost_fn,
@@ -1492,7 +1486,7 @@ pub fn build_survival_time_basis(
                         degree: knot_degree,
                         penalty_order: 2,
                         knotspec: BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
+                            num_internal_knots,
                             placement,
                             adaptive: false,
                         },
@@ -4741,7 +4735,7 @@ pub fn build_time_varying_survival_covariate_template(
         degree: time_degree,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
             adaptive: false,
         },

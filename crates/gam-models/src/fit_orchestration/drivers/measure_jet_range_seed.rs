@@ -294,15 +294,11 @@ fn screen_measure_jet_range(
         if !start.is_finite() {
             continue;
         }
-        let mut seed_config = gam_problem::SeedConfig::default();
-        seed_config.max_seeds = 1;
-        seed_config.seed_budget = 1;
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lower]), Array1::from_vec(vec![upper]))
-            .with_initial_rho(Array1::from_vec(vec![start.clamp(lower, upper)]))
-            .with_seed_config(seed_config);
+            .with_initial_rho(Array1::from_vec(vec![start.clamp(lower, upper)]));
         let mut objective = problem.build_objective(
             (),
             |_: &mut (), rho: &Array1<f64>| {
