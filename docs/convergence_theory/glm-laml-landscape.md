@@ -1,6 +1,6 @@
 # The LAML landscape for non-Gaussian GAMs (binomial logit, Poisson)
 
-Slug: `glm-laml-landscape`. Scripts: `SP/theory/glm-laml-landscape/{replica.py, face_stability.py, leak.py, sep_part_a.py, sep_part_a_hp.py, multistart_part_b.py}`, where SP is the session scratchpad. They run with `SP/theory/venv/bin/python`.
+Slug: `glm-laml-landscape`. Scripts: `SP/theory/glm-laml-landscape/{replica.py, face_stability.py, leak.py, sep_part_a.py, sep_part_a_hp.py, multistart_part_b.py, two_faces.py}`, where SP is the session scratchpad. They run with `SP/theory/venv/bin/python`.
 Failing clusters in scope:
 - **B-rail**: the ebm, sklearn and pymc binomial-logit tests on the prostate data. Examples: `quality_vs_interpretml_ebm_binomial_logit.rs:191` and `quality_vs_sklearn_binomial_logit.rs`.
 - **B-pymc**: `quality_vs_pymc_nuts_binomial_logit.rs` and `quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized.rs`. These fail with |Pg| = 9.6e-6 against a bound of 7.3e-6, unrailed at ρ₂ = 20.73.
@@ -28,7 +28,7 @@ Failing clusters in scope:
   - Delete the #784 splice.
   - Replace the hand ρ-box with the compactification t = e^{−ρ} on the +∞ side and λ = e^{ρ} on overlapping −∞ sides.
   - Evaluate near a face in the face chart, where λ never multiplies Sₖ in floating point.
-  - Certify with the face KKT (aₖ > 0 plus the reduced Newton system).
+  - Certify with the face KKT (aₖ > 0 plus the reduced Newton system). The certificate is local only: the replica has **two** certified minima, with face sets {2} and {1, 2} and ΔV = 1.9e-3, and 7 of 11 random starts land on the non-global one (§4).
   - If a beyond-Laplace correction is wanted, the only smooth candidate is the full tensor Tierney–Kadane / Shun–McCullagh O(n⁻¹) term, which is basis-invariant and has analytic derivatives.
 
 ---
@@ -81,9 +81,11 @@ For analyticity, ∇_βf(β, ρ) = 0 is an analytic system with Jacobian H ≻ 0
 
 V is not convex in ρ in general, even for canonical links.
 
-*Witness.* On the prostate replica, the analytic ρ-Hessian at ρ = (1, −1, 3, −2) has three negative diagonal entries. At ρ = 0 its spectrum contains −3.66 (§4).
+*Witness.* On the prostate replica, the analytic ρ-Hessian at ρ = (1, −1, 3, −2) has spectrum (−0.282, −0.016, 0.010, 2.86), and at ρ = 0 its spectrum contains −3.66. Stronger still, the replica has **two strict local minima of the compactified problem**, with face sets {2} and {1, 2}. They are separated by a barrier of 3.4e-3 in V (§4).
 
-*Structural reason.* Near a +∞ face with aₖ < 0, V ≈ V_face + aₖe^{−ρₖ} is concave in ρₖ. In general ½log|H| − ½log|S|₊ is a difference of functions of ρ with no convexity relation. Reiss & Ogden (2009, §4 and §5) show that REML for P-spline-type models can have multiple local optima (less often than GCV). Wood (2011, §1–2) motivates Newton with a Hessian-modification step because the LAML ρ-Hessian can be indefinite. The multistart count on the replica is in §4.
+*Structural reason.* Near a +∞ face with aₖ < 0, V ≈ V_face + aₖe^{−ρₖ} is concave in ρₖ. In general ½log|H| − ½log|S|₊ is a difference of functions of ρ with no convexity relation. Reiss & Ogden (2009, §4 and §5) show that REML for P-spline-type models can have multiple local optima (less often than GCV). Wood (2011, §1–2) motivates Newton with a Hessian-modification step because the LAML ρ-Hessian can be indefinite.
+
+*Mechanism of the second minimum.* Coordinate 1 is the null-space (linear) penalty of s(pc1). For large ρ₁ its face coefficient is small and positive (a₁ = 8.9e-4). With the free coordinates instead held at the interior optimum (ρ₀ = −2.186), the same coefficient is a₁ = −0.0105 < 0 (§4 table): the sign of aₖ depends on where the other coordinates sit. Along the profile path, V therefore rises from the interior minimum, peaks, and then falls to a face asymptote that sits 1.9e-3 above the interior value. Any face coordinate whose |aₖ| is small relative to the interior curvature can create such a spurious face minimum.
 
 ### Result 3 (the +∞ face is an analytic boundary point in t)
 
@@ -237,7 +239,41 @@ The replica uses the prostate train split (rows i%4 ≠ 0, n = 490). Each smooth
 
 The as-built value V differs from the true V by 1.9e-4. `leak.py` measures u_nᵀ(ZᵀPZ)u_n = 3.7e-16 and u_nᵀfl(RᵀR)u_n = 8.1e-17 against ‖S‖ = 11. Multiplied by λ = e^{22.73}, these give spurious ridges of 2.8e-6 and 6.1e-7. The rule λₖ·u·‖Sₖ‖ ≥ τ = 1e-8 is first met at ρₖ ≈ 15.2. Past that point the ρ-chart gradient of *every* coordinate is dominated by the leak. The failing tests sit at 22.73 (B-rail) and 20.73 (B-pymc), 1.3e3× and 1.8e2× past it.
 
-SEPARATION_AND_MULTISTART_PLACEHOLDER
+**Separation asymptotics** (`sep_part_a.py` at 40 digits, `sep_part_a_hp.py` at 120 digits). The setup is a 1-D logistic model η = βx, with xs = (−2, −1.1, −0.7, −0.3, 0.4, 0.9, 1.5, 2.2) and y = 1 iff x > 0. This is complete separation with margin m = 0.3. The "tie" variant adds a row at x = 0 with y = 1, which is quasi-complete separation. There is one penalty, S = 1.
+
+| ρ | β̂ | mβ̂/|ρ| | V − ½log|ρ| (no tie) | V − ½log|ρ| (tie) | ρ·∂V/∂ρ (no tie) |
+|---|---|---|---|---|---|
+| −10 | 19.90 | 0.597 | −0.1475 | +0.5457 | +0.457 |
+| −20 | 49.67 | 0.745 | −0.1133 | +0.5799 | +0.579 |
+| −40 | 113.5 | 0.852 | −0.0659 | +0.6273 | +0.554 |
+| −80 | 244.3 | 0.916 | −0.0370 | +0.6562 | +0.531 |
+| −160 | 508.5 | 0.954 | −0.0205 | +0.6726 | — |
+| −320 | 1039.5 | 0.975 | — | +0.6819 | +0.510 (tie) |
+
+- V − ½log|ρ| converges, and the ratio of its deviation to log|ρ|/|ρ| stays at 0.66–0.72, which matches the O(log|ρ|/|ρ|) rate.
+- mβ̂/|ρ| → 1.
+- ρ·∂V/∂ρ → ½, so ∂V/∂ρ ≈ 1/(2ρ) < 0. V increases toward −∞, which confirms Result 5(c) including its sign.
+- The tie changes V by exactly log 2 = 0.6931 at every ρ, as predicted.
+- Omitted entries (the ∂V/∂ρ central difference at ρ = −160, and the no-tie ρ = −320 fit) are cases where the replica's scalar damped Newton stalled on the flat objective, with λ ≈ e^{−320}. That is a limit of the replica's inner solver, not of the asymptotics. The reported entries agree between 40 and 120 digits to all printed places.
+
+**Non-convexity and multiple minima** (`multistart_part_b.py` and `two_faces.py`).
+
+- The ρ-Hessian at ρ = (1, −1, 3, −2) has spectrum (−0.282, −0.016, 0.010, 2.86): indefinite.
+- 11 starts uniform on [−6, 8]⁴ were run with eigenvalue-modified exact Newton and backtracking. A coordinate is treated as on its face once ρₖ > 12, and the free gradient is required to be ≤ 1e-8. Every run passed through indefinite iterates.
+- The runs ended at **two distinct KKT points of the compactified problem**:
+
+| face set F | free ρ̂ | V | face coefficients (exact-zero chart, −λₖ∂V/∂ρₖ at ρₖ = 8, 10, 12) | λ_min of the free ρ-Hessian | starts |
+|---|---|---|---|---|---|
+| {2} (the s(pc2) wiggle) | (−2.186, −3.084, ·, −4.667) | **309.484757** (global) | a₂ = +0.045937 | 0.017 | 4 |
+| {1, 2} (also the s(pc1) null-space penalty) | (−2.726, ·, ·, −4.697) | 309.486658 | a₁ = +0.000889, a₂ = +0.040959 | 0.467 | 7 |
+
+Both points satisfy every condition of the Result 4 certificate: the free gradient is 0, every aₖ > 0, and the free Hessian is ≻ 0. They differ by ΔV = 1.90e-3. The profile of V along ρ₁ (with ρ₂ on its face and ρ₀, ρ₃ re-optimized) is:
+
+| ρ₁ | −3.084 | −1 | +1 | +3 | +5 | +8 | +12 |
+|---|---|---|---|---|---|---|---|
+| V − 309.48 | 0.004757 | 0.008147 | 0.006965 | 0.006702 | 0.006664 | 0.006658 | 0.006658 |
+
+So there is a barrier of height 3.4e-3 between the interior minimum in ρ₁ and the ρ₁ = +∞ face. The second end point is a genuine local minimum, not a numerical artifact. The pc1 linear term is removed there. The majority of starts, 7 of 11, reach the *non-global* face. This is a concrete instance of Result 2 and of Open problem 4: **the local KKT certificate does not certify global optimality across faces.**
 
 ---
 
@@ -303,6 +339,8 @@ At the returned point with face set F, all of the following must hold:
 
 Face coordinates are reported as λₖ = ∞ ("fully smoothed to the null space"), not as ρₖ = 22.73.
 
+The certificate is **local**. §4 exhibits a replica with two certified points, F = {2} and F = {1, 2}, where 7 of 11 random starts reach the non-global one (ΔV = 1.9e-3). A derived partial check needs no constant. At a certified point with face set F, for each k ∈ F with the smallest aₖ, compare V_face(F) against the certified reduced minimum for F \ {k}, starting from the current free ρ. For each free coordinate j, likewise compare against F ∪ {j}. That is at most M extra reduced Newton solves, all with the same analytic machinery. The fit is returned at the lowest certified neighbour, and the comparison is logged. On the replica, reopening coordinate 1 from F = {1, 2} works only from the interior side of the barrier. Starting at ρ₁ ∈ {−6, −4, −3, −2.5, −2}, the reduced Newton reaches the global minimum 309.484757. Starting at ρ₁ ∈ {−1.5, −1, 0, 2}, it returns to the face. The choice of reopening start is therefore load-bearing. A natural derived start is the balance point λⱼ‖Dⱼ‖ = ‖X_rᵀWX_r‖, but that has not been tested here. The check does not guarantee global optimality in general (Open problem 4).
+
 ### 6.4 Derived tolerances (no magic constants)
 
 - **τ_g.** In the face chart, bound the forward error of each gradient entry with a running error bound (Higham 2002 §3). With γ_q = qu/(1 − qu), q = O(np), and u the unit roundoff,
@@ -332,5 +370,5 @@ By Result 1, Firth is needed only for separation in N_S (unpenalized directions)
 1. **Degenerate faces (aₖ = 0 within τ_a).** The second t-derivative Ṽ″(0) needs the O(t²) Schur terms and a W″ term. The closed form has not been derived here. It is non-generic, but "unsupported direction" data (Result 5d) sit exactly on it.
 2. **Non-compatible face sets.** When the U_r projectors of two face coordinates do not commute (e.g. tensor-product marginal penalties with overlapping ranges both at +∞), joint analyticity in (t_k, t_l) is not proved. The limit may depend on the direction of approach t_k/t_l.
 3. **Non-canonical links.** Result 3 holds with W replaced by the observed information, which includes (y − μ)-dependent terms, and c, d replaced by its η-derivatives. This report did not verify that the gamfit inner solve uses observed rather than expected information for non-canonical links. If it uses Fisher weights, the IFT drift ∂β̂/∂ρ = −H⁻¹Aβ̂ is inconsistent, and so is the whole gradient. This needs a check like `replica.py` on a probit or Gaussian-logit replica.
-4. **Multiple minima across faces.** Result 4(v) reduces the global problem to comparing finitely many face-reduced LAMLs, one per compatible face set. No bound on how many faces must be examined, other than 2^M, is known without extra structure.
+4. **Multiple minima across faces (now demonstrated).** The replica has two certified minima, with face sets {2} and {1, 2} and ΔV = 1.9e-3 (§4). Result 4(v) reduces the global problem to comparing finitely many face-reduced LAMLs, one per compatible face set. No bound on how many faces must be examined, other than 2^M, is known without extra structure. The face-neighbour check of §6.3 is a heuristic in that sense. It is also open whether the two minima are statistically distinguishable: ΔV = 1.9e-3 is far below any LAML-ratio significance scale. A principled rule might prefer the larger face set (the simpler model) inside a derived tolerance, but deriving that tolerance is open.
 5. **Separation plus face.** Separation in range(Sₖ) combined with Sₖ at a +∞ face gives g_r of order the separation margin, which makes aₖ very negative. Whether this interacts badly with Firth rescue (which changes f) is unexamined.
