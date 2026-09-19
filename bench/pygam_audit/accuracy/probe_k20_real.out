@@ -1,0 +1,10 @@
+mcycle                 dev       | default: 544.92 (edf 9.8) | k20: 551.92 (edf 12.2) | pygam_default: 556.34 | pygam_grid: 548.05 | k20-default d=+7.01+-10
+coal                   dev       | default: 1.1754 (edf 4.9) | k20: 1.1939 (edf 4.3) | pygam_default: 1.159 | pygam_grid: 1.1309 | k20-default d=+0.0185+-0.018
+faithful               dev       | default: 1.2792 (edf 7.1) | k20: 1.3018 (edf 8.2) | pygam_default: 1.2972 | pygam_grid: 1.3039 | k20-default d=+0.0226+-0.013
+hepatitis              dev       | default: 0.013108 (edf 4.9) | k20: 0.013021 (edf 5.0) | pygam_default: 0.012402 | pygam_grid: 0.013206 | k20-default d=-8.66e-05+-3.8e-05
+lidar                  dev       | default: 0.006779 (edf 8.5) | k20: 0.0067735 (edf 9.3) | pygam_default: 0.0068316 | pygam_grid: 0.0068149 | k20-default d=-5.49e-06+-1.5e-05
+gagurine               dev       | default: 0.097923 (edf 6.9) | k20: 0.097837 (edf 7.2) | pygam_default: 0.1026 | pygam_grid: 0.10298 | k20-default d=-8.63e-05+-9.6e-05
+   haberman default fail: IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=7.516e-6 |Pg|=
+   haberman default fail: IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=6.989e-3 |Pg|=
+   haberman k20 fail: IntegrationError: smoothing cubature proposal has no positive width; the automatic Firth/Jeffreys rescue WAS attempted and also failed to 
+   haberman k20 fail: IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.049e-1 |Pg|=

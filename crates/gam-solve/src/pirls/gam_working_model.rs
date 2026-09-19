@@ -1431,7 +1431,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             // exact Jeffreys coefficient Hessian. The factor is built in the
             // correct (transformed) coefficient basis.
             let factor = self.ensure_firth_design_factor()?;
-            let (hat_diag, jeffreys_logdet, firth_score_shift, firth_hessian) =
+            let (hat_diag, jeffreys_logdet, jeffreys_eta_score, firth_hessian) =
                 jeffreys_pirls_diagnostics_and_hessian_from_factor(
                     &factor,
                     &self.link_kind,
@@ -1442,21 +1442,31 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
             };
-            // Apply the link-general Firth working-response shift `Δ_i` built by
-            // the operator (`½ (w'_i/w_i) h_diag_i`). PIRLS then solves
-            // `Xᵀ W (z* − η) = 0`, so the Firth term it adds to the score is
-            // `Σ_i w_i Δ_i x_i = ½ Σ_i w'_i h_diag_i x_i = ∂Φ/∂β` — exactly the
-            // Jeffreys score the outer REML differentiates. For the canonical
-            // logit `Δ_i` equals the historical `h_i (½ − μ_i)/w_i`; for probit /
-            // cloglog it carries the correct non-canonical `w'_i/w_i` instead of
-            // the logit-pinned `(½ − μ_i)`, so the inner mode and the outer
-            // objective no longer disagree.
+            // Turn the Jeffreys linear-predictor score `g_i = ∂Φ/∂η_i =
+            // ½ w'_i h_diag_i` into a working-response shift. PIRLS forms its
+            // score as `Xᵀ W (η − z)` with the SAME score weights
+            // `W_i = lastweights_i`, so the shift `Δ_i = g_i / W_i` adds exactly
+            // `Σ_i W_i Δ_i x_i = Xᵀ g = ∂Φ/∂β` — the Jeffreys score the
+            // objective value `−Φ` and the curvature `HΦ` differentiate.
+            //
+            // `W_i` is the prior-weighted Fisher weight `a_i w_i`, while
+            // `h_diag_i` already carries `a_i` once through the operator's
+            // `A^{1/2} X` design. A shift divided by the family weight `w_i`
+            // alone therefore scaled row i's Jeffreys score by `a_i` a second
+            // time: harmless for unit weights, but under any other prior weight
+            // the score no longer matched `Φ`, the Newton step stopped being a
+            // descent direction for the Firth-penalized objective, and the LM
+            // step search exhausted at every ρ. Dividing by the score weight
+            // itself keeps one prior weight per row, so a weight-2 row is
+            // exactly a duplicated row. For the canonical logit `Δ_i` is the
+            // historical `h_i (½ − μ_i)/w_i`; for probit / cloglog it carries
+            // the non-canonical `w'_i/w_i`.
             ndarray::Zip::from(&mut self.lastz)
-                .and(&firth_score_shift)
+                .and(&jeffreys_eta_score)
                 .and(&self.lastweights)
-                .par_for_each(|zi, &delta_i, &wi| {
+                .par_for_each(|zi, &score_i, &wi| {
                     if wi > 0.0 {
-                        *zi += delta_i;
+                        *zi += score_i / wi;
                     }
                 });
         }

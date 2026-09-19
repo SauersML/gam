@@ -840,6 +840,7 @@ def fit(
     expectile_tau:
         Optional expectile level in the open interval ``(0, 1)`` for
         ``family="expectile"``, or a strictly increasing sequence of levels.
+        Passing it with any other family raises.
         A sequence is fitted jointly as one location-scale model whose level
         curves ``mu(x) + c_tau * E[sigma(x)]`` never cross; ``predict`` then
         returns an ``(n, K)`` array with one column per level. This is the

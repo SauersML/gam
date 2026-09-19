@@ -177,15 +177,34 @@ impl LinkFunction {
         ("betalogistic", Self::BetaLogistic),
     ];
 
-    /// Parse a link name: one of the canonical [`Self::name`]s, compared
-    /// case-insensitively. Returns `None` for any other spelling; callers
-    /// report it through [`UnknownLinkName`], whose message lists
-    /// [`Self::ALL`] and names the canonical spelling of a removed one.
+    /// The binomial links' family-qualified names (`binomial-probit`), so a
+    /// `--family` value is also a valid `--link` / `link(type=...)` / `link=`.
+    const fn family_qualified_name(self) -> Option<&'static str> {
+        match self {
+            Self::Logit => Some("binomial-logit"),
+            Self::Probit => Some("binomial-probit"),
+            Self::CLogLog => Some("binomial-cloglog"),
+            Self::LogLog
+            | Self::Cauchit
+            | Self::Sas
+            | Self::BetaLogistic
+            | Self::Identity
+            | Self::Log
+            | Self::Inverse
+            | Self::InverseSquared => None,
+        }
+    }
+
+    /// Parse a link name: one of the canonical [`Self::name`]s (or a binomial
+    /// link's family-qualified name), compared case-insensitively. Returns
+    /// `None` for any other spelling; callers report it through
+    /// [`UnknownLinkName`], whose message lists [`Self::ALL`] and names the
+    /// canonical spelling of a removed one.
     pub fn from_name(raw: &str) -> Option<Self> {
         let normalized = raw.trim().to_ascii_lowercase();
-        Self::ALL
-            .into_iter()
-            .find(|link| link.name() == normalized)
+        Self::ALL.into_iter().find(|link| {
+            link.name() == normalized || link.family_qualified_name() == Some(normalized.as_str())
+        })
     }
 
     /// The canonical link a refused spelling stands for: a removed alias, or
@@ -1299,7 +1318,8 @@ impl ResponseDegeneracy {
     pub fn message_for(&self, response_name: &str) -> String {
         match self.kind {
             ResponseDegeneracyKind::BinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: all values are 0 (no events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 0, no events). \
                  The maximum-likelihood logit is −∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -1308,7 +1328,8 @@ impl ResponseDegeneracy {
                 name = response_name,
             ),
             ResponseDegeneracyKind::BinomialAllOnes => format!(
-                "{family} response '{name}' is degenerate: all values are 1 (no non-events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 1, no non-events). \
                  The maximum-likelihood logit is +∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -4293,6 +4314,10 @@ mod tests {
                 link.name()
             );
         }
+        // The binomial family names name their link too.
+        assert_eq!(LinkFunction::from_name("binomial-logit"), Some(LinkFunction::Logit));
+        assert_eq!(LinkFunction::from_name("Binomial-CLogLog"), Some(LinkFunction::CLogLog));
+        assert_eq!(LinkFunction::from_name("binomial_probit"), None);
         assert_eq!(LinkFunction::from_name("sqrt"), None);
     }
 

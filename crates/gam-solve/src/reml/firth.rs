@@ -2972,18 +2972,12 @@ mod tests {
             &self.w * &self.h_diag
         }
 
-        /// Per-observation Firth working-response shift `Δ_i = ½·(w'_i/w_i)·h_diag_i`
-        /// (the link-general form; `w_i ≤ 0` rows get a zero shift). Matches the
-        /// Jeffreys score `½ Σ_i w'_i h_i x_i` the outer REML differentiates.
-        pub(crate) fn pirls_firth_score_shift(&self) -> Array1<f64> {
-            let mut shift = Array1::<f64>::zeros(self.w.len());
-            for i in 0..self.w.len() {
-                let wi = self.w[i];
-                if wi > 0.0 {
-                    shift[i] = 0.5 * (self.w1[i] / wi) * self.h_diag[i];
-                }
-            }
-            shift
+        /// Per-observation Jeffreys linear-predictor score
+        /// `∂Φ/∂η_i = ½·w'_i·h_diag_i`, so `∂Φ/∂β = Xᵀ(∂Φ/∂η)` is the Jeffreys
+        /// score the outer REML differentiates (`h_diag` carries the prior
+        /// weights once).
+        pub(crate) fn pirls_jeffreys_eta_score(&self) -> Array1<f64> {
+            0.5 * (&self.w1 * &self.h_diag)
         }
     }
 

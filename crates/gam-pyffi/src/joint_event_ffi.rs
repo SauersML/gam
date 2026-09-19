@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// A fitted or loaded joint event model.
-#[pyclass(name = "_JointEventModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_JointEventModel", frozen)]
 pub(crate) struct PyJointEventModel {
     model: Arc<JointEventModel>,
 }
