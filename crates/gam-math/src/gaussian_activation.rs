@@ -44,35 +44,42 @@
 //! log-CDF slope `λ(u) = φ(u)/Φ(u)` and its correction `q(u) = λ(u) + u`, as
 //! `Φ(u) = φ(u)/λ` and `1 + u/λ = q/λ`: ReLU `T = s φ(u) q/λ`, `T' = φ(u)/λ`;
 //! exact GELU `T = S φ(u) (q/λ − 1/A)`, `T' = φ(u) (1/λ + u/A)`. There
-//! `t Φ(u) + s φ(u)` cancels like `u²`, and `Φ(u) = ½ erfc(−u/√2)` multiplies
-//! the rounding of its argument by `u²`; `λ` and `q = −f''/λ` (`f = ln Φ`, so
-//! `f'' = −λ q`) come from the log-CDF owner at full relative precision.
+//! `t Φ(u) + s φ(u)` cancels like `u²`, so any `Φ` multiplies the rounding of its
+//! argument by `u²`; `λ` and `q = −f''/λ` (`f = ln Φ`, so `f'' = −λ q`) come from the
+//! log-CDF owner at full relative precision.
 //!
 //! # Rounding bounds
 //!
-//! [`gaussian_hermite_coefficients`] returns next to every coefficient a
-//! first-order bound on its absolute error, by running error analysis of the
-//! evaluation itself under the standard model: every `+ − × ÷ √` rounds by at
-//! most `u = ε/2` of its result.
+//! [`gaussian_hermite_coefficients`] returns next to every coefficient a bound on its
+//! absolute error, by running error analysis of the evaluation itself under the
+//! standard model, with nothing truncated: every `+ − × ÷ √` rounds by at most
+//! `u = ε/2` of its exact result, so `k` compositions by at most `γ_k = ku/(1 − ku)`; a
+//! product of two bounded quantities carries the product of their bounds; and every
+//! bound's own evaluation in `f64` is absorbed by `inflated`.
 //! - The standardized argument `x = t/s` (or `t/√(1 + s²)`) carries its own
 //!   rounding, which moves `φ(x) h_j(x)` by at most `φ (√j |h_{j−1}| + |x| |h_j|)`
 //!   per unit of argument error.
 //! - `φ` comes from the probability owner's `normal_pdf_bounded`, computed with
 //!   `libm::exp` and within `(5u + u²x⁴/8) φ`, resting on libm 0.2.16's cited `exp`
-//!   error analysis.
-//!   `Φ = ½ erfc(−x/√2)` rounds by `2u Φ + 2u |x| φ`, the second term from the
-//!   rounding of `−x/√2`. The `erfc` ulp is a measurement (see `bounded_normal_cdf`).
+//!   error analysis. An argument's own bound `e` moves it by at most
+//!   `e (|x̂| + e) φ(max(|x̂| − e, 0))`.
+//! - `Φ` comes from the probability owner's proven table route `normal_cdf_and_pdf`,
+//!   within `NORMAL_CDF_RELATIVE_ERROR` of the computed value plus
+//!   `NORMAL_CDF_UNDERFLOW_FLOOR`, with no libm call; an argument's bound `e` moves it
+//!   by at most `e φ(max(|x̂| − e, 0))`.
 //! - The left-tail forms read `1/λ` and `q/λ` from the probability owner's
 //!   `normal_left_tail_ratios`, whose bounds are derived without any libm call.
-//! - Each orthonormal step adds `3u (|x h_k| + √k |h_{k−1}|)/√(k+1) + 2u |h_{k+1}|`
-//!   to the propagated `(|x| e_k + √k e_{k−1})/√(k+1)`.
+//! - Each orthonormal step's local rounding is at most
+//!   `γ_3 (|x h_k| + √k |h_{k−1}|)/√(k+1) + γ_2 |h_{k+1}|`, and the recurrence's error is
+//!   bounded both by the absolute recursion and, past its oscillatory onset, in the
+//!   quadratic form each step preserves (see `HermiteRecurrence`).
 //! - Where `φ(x)` underflows, the coefficients of order ≥ 2 are returned as zero
 //!   with Cramér's inequality `|h_j(x)| e^{−x²/4} ≤ 1.0865`, so
 //!   `φ |h_j| ≤ 1.0865 (2π)^{−1/4} √φ` with `φ` below the smallest subnormal.
 //!
 //! It relies on its owners' contracts:
 //! - the cited libm 0.2.16 `exp` error analysis, through `normal_pdf_bounded`;
-//! - the measured `erfc` ulp, for `Φ` in the direct forms;
+//! - the proven constants of `normal_cdf_and_pdf`, for `Φ` in the direct forms;
 //! - the derived arctangent of `bounded_arctangent2`, for the zero-mean kernels' orthant angle,
 //!   which rests on IEEE-754 semantics only;
 //! - the derived bounds of `normal_left_tail_ratios`, which rest on IEEE-754 semantics only.
@@ -127,7 +134,10 @@ use crate::bivariate_normal::{
     bivariate_normal_cdf_with_complement_bounded,
 };
 use crate::double_double::BoundedDoubleDouble;
-use crate::probability::{normal_cdf, normal_left_tail_ratios, normal_pdf_bounded};
+use crate::probability::{
+    NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf, normal_left_tail_ratios,
+    normal_pdf_bounded,
+};
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth, inflated};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use std::fmt;
@@ -176,19 +186,24 @@ impl GaussianActivation {
     ///   rises on `(−√2, √2)` from its minimum to its maximum. By the symmetry
     ///   `σ'(−x) = 1 − σ'(x)`, `sup|σ'| = σ'(√2) = Φ(√2) + √2 φ(√2) = 1.1289…`.
     ///   It is evaluated with its rounding, and the square plus its bound is
-    ///   returned, so the bound holds. Rounding `√2` moves `σ'` only to second
-    ///   order, because `σ''(√2) = 0`.
+    ///   returned, so the bound holds. The stored `√2` is within `γ_1 √2` of the
+    ///   true one and enters as that interval, so the bound covers `σ'` at the
+    ///   true `√2` too, with no second-order term dropped.
     /// - SiLU has no closed form here, and `gaussian_gated` owns its expectations.
     #[inline]
     pub fn slope_bound_squared(self) -> Result<f64, GaussianActivationError> {
         match self {
             Self::Relu => Ok(1.0),
             Self::ExactGelu => {
-                let argument = Bounded::exact(std::f64::consts::SQRT_2);
+                let argument = Bounded {
+                    value: std::f64::consts::SQRT_2,
+                    bound: accumulation_growth(1) * std::f64::consts::SQRT_2,
+                };
                 let slope = bounded_normal_cdf(argument)
                     .add(argument.mul(bounded_normal_pdf(argument)));
                 let square = slope.mul(slope);
-                Ok(square.value + square.bound)
+                // The sum of the square and its bound rounds once more.
+                Ok(inflated(square.value + square.bound, 1))
             }
             Self::Silu => Err(GaussianActivationError::NoClosedForm { activation: self }),
         }
@@ -328,7 +343,7 @@ pub fn gaussian_smoothing_derivatives(
 /// At `s = 0` the smoothed activation is the constant `σ(t)`: `a_0 = σ(t)` and
 /// every other coefficient is zero, the kink included.
 ///
-/// `bounds[n]` receives a first-order bound on the absolute rounding error of
+/// `bounds[n]` receives a bound on the absolute rounding error of
 /// `coefficients[n]` (see the module's rounding bounds); both slices need one
 /// entry per order.
 #[inline]
@@ -376,7 +391,7 @@ pub struct PreactivationPair {
     pub covariance_rounding: f64,
 }
 
-/// `K = E[σ(X) σ(Y)]` and its covariance derivative, each with a first-order
+/// `K = E[σ(X) σ(Y)]` and its covariance derivative, each with a
 /// bound on its absolute rounding at the projected law.
 ///
 /// The bounds come from running error analysis of the closed forms under the
@@ -394,9 +409,9 @@ pub struct PairKernel {
     pub value: f64,
     /// `∂K/∂r = E[σ'(X) σ'(Y)]` at fixed means and variances (Price's theorem).
     pub covariance_derivative: f64,
-    /// A first-order bound on the absolute rounding of `value`.
+    /// A bound on the absolute rounding of `value`.
     pub value_rounding: f64,
-    /// A first-order bound on the absolute rounding of `covariance_derivative`.
+    /// A bound on the absolute rounding of `covariance_derivative`.
     pub covariance_derivative_rounding: f64,
     /// `true` when the plain route certified no digit, so `Φ₂` was re-evaluated by the bivariate normal owner's
     /// certified entry, at a few hundred times the plain cost. Callers count it to measure that cost.
@@ -455,7 +470,7 @@ pub fn pair_kernel(
     }
 }
 
-/// `∂K/∂v_x` and `∂K/∂v_y` of the pair kernel at fixed means and covariance, each with a first-order bound on its
+/// `∂K/∂v_x` and `∂K/∂v_y` of the pair kernel at fixed means and covariance, each with a bound on its
 /// absolute rounding in [`PairKernel`]'s convention.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PairKernelVariancePartials {
@@ -463,9 +478,9 @@ pub struct PairKernelVariancePartials {
     pub variance_x: f64,
     /// `∂K/∂v_y = ½·E[σ(X)·σ″(Y)]`.
     pub variance_y: f64,
-    /// A first-order bound on the absolute rounding of `variance_x`.
+    /// A bound on the absolute rounding of `variance_x`.
     pub variance_x_rounding: f64,
-    /// A first-order bound on the absolute rounding of `variance_y`.
+    /// A bound on the absolute rounding of `variance_y`.
     pub variance_y_rounding: f64,
 }
 
@@ -763,8 +778,13 @@ fn relu_smoothing(
 /// polynomials: Abramowitz and Stegun 22.14.17 give `K ≈ 1.086435`, rounded up.
 const CRAMER_BOUND: f64 = 1.0865;
 
-/// A computed value with a first-order bound on its absolute error: each
-/// operation adds its inputs' propagated bounds to its own rounding `u |result|`.
+/// The rounded operations any one [`Bounded`] bound expression takes: at most five to propagate its inputs' bounds
+/// (the quotient's `(e_a + |v| e_b)/(|b| − e_b)`), two for its own rounding term, and one for the sum.
+const BOUND_OPERATIONS: usize = 8;
+
+/// A computed value with a bound on its absolute error that holds without truncation: each operation adds its inputs'
+/// propagated bounds, their product where the operation multiplies them, and its own rounding `γ_1 |result|`, and the
+/// bound's own evaluation in `f64` is absorbed by [`inflated`] over [`BOUND_OPERATIONS`].
 #[derive(Clone, Copy, Debug)]
 struct Bounded {
     value: f64,
@@ -776,10 +796,12 @@ impl Bounded {
         Self { value, bound: 0.0 }
     }
 
+    /// `value = fl(op(â, b̂))` with `|op(â, b̂) − op(a, b)| ≤ propagated`: the exact result is within
+    /// `propagated + |fl(op) − op(â, b̂)|`, and one rounding is at most `u |op(â, b̂)| ≤ γ_1 |value|`.
     fn rounded(value: f64, propagated: f64) -> Self {
         Self {
             value,
-            bound: propagated + UNIT_ROUNDOFF * value.abs(),
+            bound: inflated(propagated + accumulation_growth(1) * value.abs(), BOUND_OPERATIONS),
         }
     }
 
@@ -798,25 +820,31 @@ impl Bounded {
         Self::rounded(self.value - other.value, self.bound + other.bound)
     }
 
+    /// `|ab − â b̂| ≤ |â| e_b + |b̂| e_a + e_a e_b`.
     fn mul(self, other: Self) -> Self {
         Self::rounded(
             self.value * other.value,
-            self.value.abs() * other.bound + other.value.abs() * self.bound,
+            self.value.abs() * other.bound + other.value.abs() * self.bound + self.bound * other.bound,
         )
     }
 
+    /// `|a/b − â/b̂| ≤ (e_a + |â/b̂| e_b)/|b|` with `|b| ≥ |b̂| − e_b`; a divisor not resolved from zero bounds nothing.
     fn div(self, other: Self) -> Self {
         let value = self.value / other.value;
-        Self::rounded(
-            value,
-            (self.bound + value.abs() * other.bound) / other.value.abs(),
-        )
+        let margin = other.value.abs() - other.bound;
+        let propagated = if margin > 0.0 {
+            (self.bound + value.abs() * other.bound) / margin
+        } else {
+            f64::INFINITY
+        };
+        Self::rounded(value, propagated)
     }
 
+    /// `|√a − √â| = |a − â|/(√a + √â) ≤ e/(√â + √(â − e)⁺)`, and `√e` at `â = 0`.
     fn sqrt(self) -> Self {
         let value = self.value.sqrt();
         let propagated = if value > 0.0 {
-            self.bound / (2.0 * value)
+            self.bound / (value + (self.value - self.bound).max(0.0).sqrt())
         } else {
             self.bound.sqrt()
         };
@@ -824,29 +852,42 @@ impl Bounded {
     }
 }
 
-/// `φ(x)` from the probability owner's certified [`normal_pdf_bounded`], computed with
-/// `libm::exp`. The argument's bound enters through `|φ'(x)| = |x| φ(x)`.
+/// An upper bound on `φ` over `|ξ| ≥ floor`: `φ(floor)` with its rounding.
+fn density_upper(floor: f64) -> f64 {
+    let (value, rounding) = normal_pdf_bounded(floor.max(0.0));
+    value + rounding
+}
+
+/// `φ(x)` from the probability owner's certified [`normal_pdf_bounded`], computed with `libm::exp`. The argument's
+/// bound `e` enters through `|φ'(ξ)| = |ξ| φ(ξ)` over `|ξ − x̂| ≤ e`, at most `(|x̂| + e) φ(max(|x̂| − e, 0))`.
 fn bounded_normal_pdf(argument: Bounded) -> Bounded {
     let (value, rounding) = normal_pdf_bounded(argument.value);
+    let moved = if argument.bound > 0.0 {
+        argument.bound
+            * (argument.value.abs() + argument.bound)
+            * density_upper(argument.value.abs() - argument.bound)
+    } else {
+        0.0
+    };
     Bounded {
         value,
-        bound: rounding + value * argument.value.abs() * argument.bound,
+        bound: inflated(rounding + moved, 4),
     }
 }
 
-/// `Φ(x) = ½ erfc(−x/√2)`: the `erfc` ulp, and the two rounded operations forming
-/// `−x/√2` (`2u` relative), which move `Φ` by at most `2u |x| φ(x)`. The `erfc` ulp is
-/// a MEASUREMENT, not a contract: libm 0.2.16 states less than one ulp only for `erf`,
-/// "by some experiment" (`src/math/erf.rs:43-44`). Until `Φ` routes through
-/// [`normal_left_tail_ratios`], this bound rests on that measured link.
+/// `Φ(x)` from the probability owner's proven table route [`normal_cdf_and_pdf`]: within
+/// [`NORMAL_CDF_RELATIVE_ERROR`] of the computed value plus [`NORMAL_CDF_UNDERFLOW_FLOOR`], with no libm call and no
+/// measured ulp. The argument's bound `e` enters through `Φ' = φ ≤ φ(max(|x̂| − e, 0))` over `|ξ − x̂| ≤ e`.
 fn bounded_normal_cdf(argument: Bounded) -> Bounded {
-    let value = normal_cdf(argument.value);
-    let (density, density_rounding) = normal_pdf_bounded(argument.value);
+    let (value, _) = normal_cdf_and_pdf(argument.value);
+    let moved = if argument.bound > 0.0 {
+        argument.bound * density_upper(argument.value.abs() - argument.bound)
+    } else {
+        0.0
+    };
     Bounded {
         value,
-        bound: 2.0 * UNIT_ROUNDOFF * value
-            + (density + density_rounding)
-                * (2.0 * UNIT_ROUNDOFF * argument.value.abs() + argument.bound),
+        bound: inflated(NORMAL_CDF_RELATIVE_ERROR * value + NORMAL_CDF_UNDERFLOW_FLOOR + moved, 3),
     }
 }
 
@@ -879,12 +920,11 @@ fn underflowed_hermite_function_bound() -> f64 {
 }
 
 /// The orthonormal Hermite recurrence `h_{k+1} = (x h_k − √k h_{k−1})/√(k+1)` at
-/// a computed argument, with a running first-order bound on each value's
-/// rounding.
+/// a computed argument, with a running bound on each value's rounding.
 ///
 /// A step rounds two products, the root `√k`, the subtraction, the root `√(k+1)`
-/// and the division. That is at most `3u (|x h_k| + √k |h_{k−1}|)` on the numerator
-/// and `2u |h_{k+1}|` on the quotient: the step's local error `δ_{k+1}`. The error
+/// and the division. That is at most `γ_3 (|x h_k| + √k |h_{k−1}|)` on the numerator
+/// and `γ_2 |h_{k+1}|` on the quotient: the step's local error `δ_{k+1}`. The error
 /// `ε_k = ĥ_k − h_k` then obeys the recurrence itself, `ε_{k+1} = a_k ε_k − c_k ε_{k−1}
 /// + δ_{k+1}` with `a_k = x/√(k+1)` and `c_k = √(k/(k+1))`, and two bounds on it hold.
 ///
@@ -926,7 +966,7 @@ struct HermiteRecurrence {
 
 /// The step form `F_k(u, v) = u² − a_k u v + c_k v²` of the Hermite recurrence at order `k`,
 /// with upper bounds on `|a_k|` and `c_k` and lower bounds on `det M_k = c_k − a_k²/4` and
-/// `λ_min(M_k)`, all first order in the unit roundoff; `None` while the determinant is not
+/// `λ_min(M_k)`, each widened by the rounding that forms it; `None` while the determinant is not
 /// resolved positive.
 #[derive(Clone, Copy, Debug)]
 struct StepForm {
@@ -1018,8 +1058,15 @@ impl HermiteRecurrence {
         let next = (self.argument * self.current - root * self.previous) / next_root;
         let numerator_magnitude =
             self.argument.abs() * self.current.abs() + root * self.previous.abs();
-        let local = 3.0 * UNIT_ROUNDOFF * numerator_magnitude / next_root + 2.0 * UNIT_ROUNDOFF * next.abs();
-        let absolute = (self.argument.abs() * self.current_error + root * self.previous_error) / next_root + local;
+        // Three roundings on the numerator and two on the quotient, and the bound's own five operations.
+        let local = inflated(
+            accumulation_growth(3) * numerator_magnitude / next_root + accumulation_growth(2) * next.abs(),
+            5,
+        );
+        let absolute = inflated(
+            (self.argument.abs() * self.current_error + root * self.previous_error) / next_root + local,
+            5,
+        );
         let upcoming = StepForm::at(self.argument, self.degree + 1);
         let (next_error, next_form_error) = match (self.form, upcoming) {
             (Some(form), Some(next_form)) => {
@@ -1125,12 +1172,18 @@ fn relu_hermite_coefficients(t: f64, scale: f64, coefficients: &mut [f64], bound
             * ((recurrence.degree as f64).sqrt() * recurrence.previous.abs()
                 + argument.abs() * recurrence.current.abs())
             * argument_bound;
-        *bound = scale
-            * (density * recurrence.current_error
-                + recurrence.current.abs() * normal_pdf_bounded(argument).1
-                + argument_term)
-            / normalizer
-            + 4.0 * UNIT_ROUNDOFF * value.abs();
+        let density_rounding = normal_pdf_bounded(argument).1;
+        // `|φ̂ ĥ − φ h| ≤ φ̂ e_h + |ĥ| e_φ + e_h e_φ`; four roundings form the value, and ten the bound.
+        *bound = inflated(
+            scale
+                * (density * recurrence.current_error
+                    + recurrence.current.abs() * density_rounding
+                    + recurrence.current_error * density_rounding
+                    + argument_term)
+                / normalizer
+                + accumulation_growth(4) * value.abs(),
+            10,
+        );
         recurrence.advance();
     }
 }
@@ -1261,17 +1314,23 @@ fn exact_gelu_hermite_coefficients(
         *slot = value;
         let bracket_error = (total.value * lower.1
             + lower.0.abs() * total.bound
-            + 3.0 * UNIT_ROUNDOFF * total.value * lower.0.abs())
+            + lower.1 * total.bound
+            + accumulation_growth(3) * total.value * lower.0.abs())
             / normalizer
             + recurrence.current_error
-            + UNIT_ROUNDOFF * bracket.abs();
+            + accumulation_growth(1) * bracket.abs();
         // ∂_x [A h_{n−2}/√(n(n−1)) − h_n] = A √(n−2) h_{n−3}/√(n(n−1)) − √n h_{n−1}.
         let argument_term = (total.value * (degree - 2.0).sqrt() * lowest.0.abs() / normalizer
             + degree.sqrt() * recurrence.previous.abs())
             * argument_bound;
-        *bound = factor.value.abs() * (bracket_error + argument_term)
-            + bracket.abs() * factor.bound
-            + UNIT_ROUNDOFF * value.abs();
+        // `|f̂ β̂ − f β| ≤ |f̂| e_β + |β̂| e_f + e_f e_β`, the product's rounding, and the bound's own twelve operations.
+        *bound = inflated(
+            factor.value.abs() * (bracket_error + argument_term)
+                + bracket.abs() * factor.bound
+                + factor.bound * (bracket_error + argument_term)
+                + accumulation_growth(1) * value.abs(),
+            12,
+        );
         lowest = lower;
         lower = (recurrence.previous, recurrence.previous_error);
         recurrence.advance();
@@ -1335,19 +1394,19 @@ fn pair_kernel_from(value: Bounded, derivative: Bounded) -> PairKernel {
 }
 
 /// `vw − r²` as the projection formed it: from two products and their exact
-/// rounding residuals, so it rounds by at most `3u` of itself.
+/// rounding residuals, so it rounds by at most `γ_3` of itself.
 fn bounded_residual(law: ProjectedCovariance) -> Bounded {
     Bounded {
         value: law.residual,
-        bound: 3.0 * UNIT_ROUNDOFF * law.residual,
+        bound: inflated(accumulation_growth(3) * law.residual, 1),
     }
 }
 
-/// `2π` rounded to a double, within `u` of itself.
+/// `2π` rounded to a double, within `γ_1` of itself.
 fn bounded_tau() -> Bounded {
     Bounded {
         value: TAU,
-        bound: UNIT_ROUNDOFF * TAU,
+        bound: inflated(accumulation_growth(1) * TAU, 1),
     }
 }
 
@@ -1870,7 +1929,7 @@ fn exact_gelu_biased_pair_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probability::normal_pdf;
+    use crate::probability::{normal_cdf, normal_pdf};
     use crate::quadrature::{
         GaussHermiteRule, gauss_hermite_rule, symmetric_tridiagonal_eigen_first_components,
     };
@@ -4057,9 +4116,78 @@ mod tests {
     }
 
     #[test]
+    fn bounded_operations_carry_the_second_order_terms_a_first_order_bound_drops() {
+        // Two quantities computed as 0 within 2⁻¹⁰ may both be 2⁻¹⁰: their product's error is then 2⁻²⁰, which a
+        // first-order bound, |â| e_b + |b̂| e_a = 0, drops entirely.
+        let small = Bounded {
+            value: 0.0,
+            bound: 2.0_f64.powi(-10),
+        };
+        let product = small.mul(small);
+        assert!(
+            product.bound >= 2.0_f64.powi(-20),
+            "the product of two zeros within 2^-10 bounds its error by {:e}, below 2^-20",
+            product.bound
+        );
+        // `√â` with `â = 10⁻⁸` within `10⁻⁸` may be `√0`: the error `10⁻⁴` is twice the first-order `e/(2√â)`.
+        let root = Bounded {
+            value: 1.0e-8,
+            bound: 1.0e-8,
+        }
+        .sqrt();
+        assert!(
+            root.bound >= 1.0e-4 * (1.0 - accumulation_growth(4)),
+            "√(1e-8 ± 1e-8) bounds its error by {:e}, below the 1e-4 its exact value may be off",
+            root.bound
+        );
+        // A divisor not resolved from zero bounds nothing.
+        let quotient = Bounded::exact(1.0).div(Bounded {
+            value: 1.0e-3,
+            bound: 2.0e-3,
+        });
+        assert!(quotient.bound.is_infinite(), "a quotient by 1e-3 ± 2e-3 claimed the bound {:e}", quotient.bound);
+        // An exact operand keeps the bound at the operation's own rounding, so the added terms cost nothing there.
+        let exact = Bounded::exact(3.0).mul(Bounded::exact(0.1));
+        assert!(
+            exact.bound <= inflated(accumulation_growth(1) * exact.value.abs(), BOUND_OPERATIONS),
+            "an exact product's bound {:e} exceeds its own rounding",
+            exact.bound
+        );
+    }
+
+    #[test]
+    fn bounded_normal_cdf_reads_the_proven_table_route_and_covers_its_arguments_bound() {
+        // Φ has one route here: the probability owner's table, not `½ erfc(−x/√2)` with a measured ulp.
+        for argument in [-37.0, -8.5, -1.3, -0.4, 0.0, 0.6, 0.8, 2.5, 7.0, 40.0] {
+            let bounded = bounded_normal_cdf(Bounded::exact(argument));
+            let (table, _) = normal_cdf_and_pdf(argument);
+            assert_eq!(bounded.value.to_bits(), table.to_bits(), "Φ({argument}) left the table route");
+            assert!(
+                bounded.bound >= NORMAL_CDF_RELATIVE_ERROR * table + NORMAL_CDF_UNDERFLOW_FLOOR,
+                "Φ({argument})'s bound {:e} is below the table's proven constant",
+                bounded.bound
+            );
+        }
+        // A bounded argument moves Φ by at most its bound times the density's sup over the interval: the computed Φ at
+        // the interval's ends lies within the bound plus both evaluations' own.
+        for (argument, bound) in [(0.3, 0.25), (-2.0, 0.5), (3.5, 1.0e-3)] {
+            let bounded = bounded_normal_cdf(Bounded { value: argument, bound });
+            for end in [argument - bound, argument + bound] {
+                let at_end = bounded_normal_cdf(Bounded::exact(end));
+                assert!(
+                    (at_end.value - bounded.value).abs() <= bounded.bound + at_end.bound,
+                    "Φ({argument} ± {bound}) = {:?} does not cover Φ({end}) = {:?}",
+                    bounded,
+                    at_end
+                );
+            }
+        }
+    }
+
+    #[test]
     fn left_tail_and_coefficient_bounds_hold_against_a_double_double_reference() {
-        // The a_0/a_1 bounds rest on derived owner contracts: normal_pdf's 5u, erfc's
-        // ulp, erfcx below 5e-16, and the log-CDF owner's λ and q. This pins them
+        // The a_0/a_1 bounds rest on derived owner contracts: normal_pdf's 5u, the proven
+        // Φ table's constant, erfcx below 5e-16, and the log-CDF owner's λ and q. This pins them
         // against double-double evaluations at the same computed arguments, where φ
         // is not subnormal. Mills' continued fraction is checked at doubled depth,
         // and |R_N − R_2N| bounds the reference's truncation.
