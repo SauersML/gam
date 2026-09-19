@@ -277,17 +277,23 @@ pub(crate) fn gaussian_location_scalewarm_start(
             "gaussian location-scale warm start could not estimate residual scale".to_string(),
         );
     }
-    // Warm-start σ̂ must clear the logb floor so the inverse link
-    //   η = log(σ − b)
-    // is finite. Use a relative cushion above b so the warm-start is in the
-    // smooth interior of the link domain.
-    let sigma_hat = (weighted_ss / weight_sum)
-        .sqrt()
-        .max(LOGB_SIGMA_FLOOR * 1.5);
+    // The warm start targets η = ln σ̂, i.e. σ₀ = b + σ̂ under σ = b + e^η. The
+    // floor b is the recording-grid bound δ/√12 (see `sigma_link`), which for a
+    // correctly specified model sits below the residual scale, so σ₀ exceeds σ̂
+    // by at most that quantization term; no clamp against b is needed. A zero
+    // residual scale means the mean interpolates every row, and there is no
+    // noise level to start the scale block from.
+    let sigma_hat = (weighted_ss / weight_sum).sqrt();
+    if !(sigma_hat > 0.0) {
+        return Err(format!(
+            "gaussian location-scale warm start: the penalized mean fit leaves no residual \
+             spread (σ̂ = {sigma_hat:.3e}), so there is no noise scale to start from"
+        ));
+    }
     let beta_log_sigma = if let Some(beta) = noise_beta_hint {
         beta.clone()
     } else {
-        let eta_sigma = (sigma_hat - LOGB_SIGMA_FLOOR).ln();
+        let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         solve_penalizedweighted_projection(
             &log_sigma_block.design,
@@ -1159,33 +1165,30 @@ pub struct GaussianLocationScaleFitResult {
     pub beta_link_wiggle: Option<Vec<f64>>,
     /// Response standardization factor applied internally during fitting.
     ///
-    /// The Gaussian location-scale path fits on `y / response_scale` so the
-    /// fixed log-σ soft floor `LOGB_SIGMA_FLOOR = 0.01` is *operationally*
-    /// scale-relative (1 % of the response spread) rather than absolute,
-    /// keeping κ = dlogσ/dη ≈ 1 across the realistic σ range and informing the
-    /// scale block like gamlss. The returned coefficient `blocks`, `beta`, and
-    /// link-wiggle knots/coefficients are already mapped back to **raw response
-    /// units** (the Location/Mean block scaled by `response_scale`, the Scale
-    /// block intercept shifted by `+ln(response_scale)`), so downstream
-    /// reconstruction `μ = X_mean·β` comes out in raw units with no further
-    /// rescaling.
+    /// The Gaussian location-scale path fits on `y / response_scale`. The
+    /// returned coefficient `blocks`, `beta`, and link-wiggle knots/coefficients
+    /// are already mapped back to **raw response units** (the Location/Mean
+    /// block scaled by `response_scale`, the Scale block intercept shifted by
+    /// `+ln(response_scale)`), so downstream reconstruction `μ = X_mean·β` comes
+    /// out in raw units with no further rescaling.
     ///
-    /// The σ reconstruction, however, **must scale the floor too** to stay
+    /// The σ reconstruction must scale the floor too to stay
     /// response-scale-equivariant (#884):
     ///
     /// ```text
-    /// σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_scale·β)
-    ///   = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal)).
+    /// σ = response_scale·sigma_floor + exp(X_scale·β)
+    ///   = response_scale·(sigma_floor + exp(η_internal)).
     /// ```
     ///
-    /// The intercept shift carries only the `exp(η)` term; reconstructing with a
-    /// raw `LOGB_SIGMA_FLOOR` instead of `response_scale·LOGB_SIGMA_FLOOR` leaves
-    /// the non-equivariant residual `LOGB_SIGMA_FLOOR·(1 − response_scale)`.
-    ///
-    /// This field records the factor that was applied for transparency,
-    /// covariance bookkeeping, and the equivariant σ-floor reconstruction; it is
-    /// `1.0` when no standardization was needed (degenerate constant response).
+    /// The intercept shift carries only the `exp(η)` term; the floor sits
+    /// outside the exponential, so it is carried by this factor instead.
     pub response_scale: f64,
+    /// The σ floor `b` of the link σ = b + exp(η), in standardized response
+    /// units: the recording-grid bound δ/√12 of the standardized response
+    /// (`sigma_link::gaussian_resolution_sigma_floor`). It is a property of the
+    /// data, so the raw-unit floor `response_scale·sigma_floor` is exactly the
+    /// raw grid bound δ_raw/√12.
+    pub sigma_floor: f64,
 }
 
 /// Exact coefficient-frame map for the frozen-basis binomial mean-wiggle
@@ -3509,6 +3512,8 @@ pub(crate) fn wiggle_basis_failure(reason: String) -> FitFailure {
 pub(crate) struct GaussianLocationScaleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3576,6 +3581,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
@@ -3621,6 +3627,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3729,6 +3737,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -4084,11 +4093,14 @@ pub(crate) fn fit_gaussian_location_scale_terms(
 ) -> Result<BlockwiseTermFitResult, FitFailure> {
     validate_gaussian_location_scale_termspec(data, &spec, "fit_gaussian_location_scale_terms")
         .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,
@@ -4111,11 +4123,14 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
         "fit_gaussian_location_scalewiggle_terms",
     )
     .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleWiggleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,

@@ -9,6 +9,10 @@ pub struct GaussianLocationScaleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Lower bound b on σ in the units of `y`, for the noise link
+    /// σ = b + exp(η): the Sheppard bound δ/√12 of the response's measurement
+    /// resolution δ (`gaussian_resolution_sigma_floor`).
+    pub sigma_floor: f64,
     /// Resource policy threaded into PsiDesignMap construction (and any other
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
@@ -34,6 +38,7 @@ impl Clone for GaussianLocationScaleFamily {
             weights: self.weights.clone(),
             mu_design: self.mu_design.clone(),
             log_sigma_design: self.log_sigma_design.clone(),
+            sigma_floor: self.sigma_floor,
             policy: self.policy.clone(),
             cached_row_scalars: std::sync::RwLock::new(
                 self.cached_row_scalars
@@ -93,6 +98,7 @@ impl GaussianLocationScaleFamily {
             etamu,
             eta_ls,
             &self.weights,
+            self.sigma_floor,
         )?);
         if let Ok(mut guard) = self.cached_row_scalars.write() {
             *guard = Some((etamu.clone(), eta_ls.clone(), Arc::clone(&rows)));
@@ -1028,6 +1034,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     etamu[i],
                     eta_log_sigma[i],
                     self.weights[i],
+                    self.sigma_floor,
                     ln2pi,
                 )
             })
@@ -1082,6 +1089,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 etamu[i],
                 eta_log_sigma[i],
                 self.weights[i],
+                self.sigma_floor,
                 ln2pi,
             )?
             .log_likelihood;
@@ -1130,6 +1138,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 etamu[i],
                 eta_log_sigma[i],
                 self.weights[i],
+                self.sigma_floor,
                 ln2pi,
             )?
             .log_likelihood;
@@ -1209,7 +1218,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .into());
         }
 
-        let sigma = eta_ls.mapv(logb_sigma_from_eta_scalar);
+        let sigma_floor = self.sigma_floor;
+        let sigma = eta_ls.mapv(|eta| logb_sigma_from_eta_scalar(sigma_floor, eta));
         let mut dw = Array1::<f64>::zeros(n);
         match block_idx {
             Self::BLOCK_MU => {
@@ -1241,7 +1251,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 let dw_vec: Vec<Result<f64, String>> = (0..n)
                     .into_par_iter()
                     .map(|i| {
-                        let d1 = crate::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]).d1;
+                        let d1 = crate::sigma_link::logb_sigma_jet1_scalar(self.sigma_floor, eta_ls[i]).d1;
                         gaussian_log_sigma_irlsinfo_directional_derivative(
                             i,
                             eta_ls[i],
@@ -1509,7 +1519,7 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
         let mu = block_states[Self::BLOCK_MU].eta.clone();
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let sigma = gamlss_rowwise_map(eta_log_sigma.len(), |i| {
-            logb_sigma_from_eta_scalar(eta_log_sigma[i])
+            logb_sigma_from_eta_scalar(self.sigma_floor, eta_log_sigma[i])
         });
         Ok(GenerativeSpec {
             mean: mu,

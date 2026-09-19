@@ -50,17 +50,6 @@ const N_GRID: usize = 50;
 const GRID_LO: f64 = 0.1;
 const GRID_HI: f64 = 4.9;
 
-/// gam's location-scale noise link floor: σ = LOGB_SIGMA_FLOOR + exp(η_scale),
-/// the same soft floor mgcv's `gaulss(b=0.01)` uses (see
-/// `gam::families::sigma_link::LOGB_SIGMA_FLOOR`). The scale block's predictor
-/// η_scale is therefore NOT log σ directly — the response-scale σ and its log
-/// must be reconstructed through this link, exactly as the sibling formula-path
-/// test (`quality_vs_gamlss_gaussian_location_scale`) does. Reading η_scale as
-/// log σ (dropping the floor) injects a coherent −LOGB_SIGMA_FLOOR/σ ≈ −1.5 %
-/// bias into gam's measured log σ that gamlss's floorless pure-log link does not
-/// carry, which is a measurement artifact, not a recovery deficit.
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
 /// True mean function μ(x) = 1 + sin(x).
 fn true_mu(x: f64) -> f64 {
     1.0 + x.sin()
@@ -238,15 +227,28 @@ fn gam_custom_family_location_scale_matches_gamlss() {
     let specs = vec![spec_mu, spec_sigma];
 
     let y_arr = Array1::from_vec(y.clone());
+    let weights = Array1::<f64>::ones(N);
+    // gam's location-scale noise link is σ = b + exp(η_scale), with b the
+    // recording-grid bound δ/√12 of the response the family is fit on (here the
+    // raw y, so b is in raw units). The scale block's predictor η_scale is
+    // therefore NOT log σ directly — σ and its log must be reconstructed through
+    // this link, exactly as the sibling formula-path test
+    // (`quality_vs_gamlss_gaussian_location_scale`) does. Reading η_scale as
+    // log σ (dropping the floor) biases gam's measured log σ by −b/σ, a
+    // measurement artifact that gamlss's floorless pure-log link does not carry.
+    let sigma_floor =
+        gam::families::sigma_link::gaussian_resolution_sigma_floor(y_arr.view(), weights.view())
+            .expect("simulated response has a recording resolution");
     let family = GaussianLocationScaleFamily {
         y: y_arr.clone(),
-        weights: Array1::ones(N),
+        weights,
         mu_design: Some(specs[GaussianLocationScaleFamily::BLOCK_MU].design.clone()),
         log_sigma_design: Some(
             specs[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
                 .design
                 .clone(),
         ),
+        sigma_floor,
         policy: ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
@@ -262,14 +264,14 @@ fn gam_custom_family_location_scale_matches_gamlss() {
     let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
 
     // Predictions on the 50-point grid (identity link for μ, logb link for σ).
-    // gam's scale link is σ = LOGB_SIGMA_FLOOR + exp(η_scale), so log σ(x) is
-    // log(LOGB_SIGMA_FLOOR + exp(X_σ β_σ)), NOT the raw predictor X_σ β_σ. We
+    // gam's scale link is σ = sigma_floor + exp(η_scale), so log σ(x) is
+    // log(sigma_floor + exp(X_σ β_σ)), NOT the raw predictor X_σ β_σ. We
     // reconstruct it through the actual link (as the sibling formula-path test
     // does); comparing on the log scale is the well-conditioned choice.
     let gam_mu_grid: Vec<f64> = grid_mu.dot(beta_mu).to_vec();
     let gam_log_sigma_grid: Vec<f64> = grid_sigma
         .dot(beta_ls)
-        .mapv(|e| (LOGB_SIGMA_FLOOR + e.exp()).ln())
+        .mapv(|e| (sigma_floor + e.exp()).ln())
         .to_vec();
 
     // Fitted (μ, σ) at the *training* points, for the LL comparison.
@@ -278,7 +280,7 @@ fn gam_custom_family_location_scale_matches_gamlss() {
         .to_vec();
     let gam_sigma_train: Vec<f64> = fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(|e| LOGB_SIGMA_FLOOR + e.exp())
+        .mapv(|e| sigma_floor + e.exp())
         .to_vec();
     let gam_ll = gaussian_locscale_ll(&y, &gam_mu_train, &gam_sigma_train);
 
@@ -502,15 +504,25 @@ fn gam_custom_family_location_scale_matches_gamlss_on_real_data() {
         let (spec_mu, test_mu) = pspline_block_split("mu", &x_all, n_train);
         let (spec_sigma, test_sigma) = pspline_block_split("log_sigma", &x_all, n_train);
         let specs = vec![spec_mu, spec_sigma];
+        let train_y = Array1::from_vec(train_gag.clone());
+        let train_weights = Array1::<f64>::ones(n_train);
+        // σ floor b = δ/√12 of the recorded GAG grid, in raw units (the family
+        // is fit on the raw response).
+        let sigma_floor = gam::families::sigma_link::gaussian_resolution_sigma_floor(
+            train_y.view(),
+            train_weights.view(),
+        )
+        .expect("training GAG has a recording resolution");
         let family = GaussianLocationScaleFamily {
-            y: Array1::from_vec(train_gag.clone()),
-            weights: Array1::ones(n_train),
+            y: train_y,
+            weights: train_weights,
             mu_design: Some(specs[GaussianLocationScaleFamily::BLOCK_MU].design.clone()),
             log_sigma_design: Some(
                 specs[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
                     .design
                     .clone(),
             ),
+            sigma_floor,
             policy: ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         };
@@ -526,11 +538,11 @@ fn gam_custom_family_location_scale_matches_gamlss_on_real_data() {
         let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
 
         // Held-out predictions: μ via identity link, σ via gam's logb scale link
-        // σ = LOGB_SIGMA_FLOOR + exp(η_scale) (not bare exp of the predictor).
+        // σ = sigma_floor + exp(η_scale) (not bare exp of the predictor).
         let gam_mu_test: Vec<f64> = test_mu.dot(beta_mu).to_vec();
         let gam_sigma_test: Vec<f64> = test_sigma
             .dot(beta_ls)
-            .mapv(|e| LOGB_SIGMA_FLOOR + e.exp())
+            .mapv(|e| sigma_floor + e.exp())
             .to_vec();
 
         // Constant-sigma context: gam's fitted mean on the training rows with the

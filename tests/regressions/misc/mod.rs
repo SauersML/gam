@@ -19,6 +19,7 @@ mod fingerprinter_type_tag_does_not_disambiguate;
 mod gamlss_joint_derivatives_fd_bug_hunt;
 mod inference_bug_hunt;
 mod inference_model;
+mod gaussian_location_scale_high_snr_noise_scale;
 mod large_scale_dense_regression_guard;
 mod linalg_low_rank_utils;
 mod linear_box_constraint_violated_by_internal_scaling;

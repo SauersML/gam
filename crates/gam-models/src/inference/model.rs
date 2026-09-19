@@ -120,7 +120,15 @@ use std::path::Path;
 // family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
 // carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
 // v26 binary refuses a v27 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 27;
+// v28 records the Gaussian location-scale σ floor (`gaussian_sigma_floor`): the recording-grid
+// bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
+// a serde default so every other family's v27 payload reads through; a Gaussian location-scale
+// payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
+pub const MODEL_PAYLOAD_VERSION: u32 = 28;
+
+/// The schema before the Gaussian location-scale σ floor record, whose only difference
+/// is that field's absence.
+const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 27;
 
 /// The schema before the coefficient-mode record (gam#2661), whose only difference is that
 /// field's absence.
@@ -168,8 +176,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 10] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 11] = [
     MODEL_PAYLOAD_VERSION,
+    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -611,6 +620,11 @@ pub struct FittedModelPayload {
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
+    /// Gaussian location-scale σ floor `b` of σ = b + exp(η) in standardized response
+    /// units (`sigma_link::gaussian_resolution_sigma_floor`); the raw-unit floor is
+    /// `gaussian_response_scale · gaussian_sigma_floor`. Required for that family.
+    #[serde(default)]
+    pub gaussian_sigma_floor: Option<f64>,
     #[serde(default)]
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
@@ -1053,6 +1067,7 @@ impl FittedModelPayload {
             noise_non_intercept_start: None,
             noise_projection_ridge_alpha: None,
             gaussian_response_scale: None,
+            gaussian_sigma_floor: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             linkwiggle_penalty_metadata: None,
@@ -1614,6 +1629,29 @@ fn validate_location_scale_saved_fit(
         });
     }
     Ok(())
+}
+
+/// The saved σ floor of a Gaussian location-scale model, in standardized response
+/// units. A payload without one was fitted before the floor became a property of
+/// the data (payload version 28) and predicts through a link this binary no longer
+/// has, so it is refused by name rather than read under any substitute floor.
+pub fn gaussian_location_scale_saved_sigma_floor(
+    payload: &FittedModelPayload,
+) -> Result<f64, FittedModelError> {
+    match payload.gaussian_sigma_floor {
+        Some(floor) if floor.is_finite() && floor > 0.0 => Ok(floor),
+        Some(floor) => Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "gaussian-location-scale gaussian_sigma_floor must be finite and positive, got {floor}"
+            ),
+        }),
+        None => Err(FittedModelError::MissingField {
+            reason: "gaussian-location-scale model is missing gaussian_sigma_floor: it was saved \
+                     before payload version 28, when σ = b + exp(η) used a fixed floor b instead \
+                     of the response's recording-grid bound. Refit with the current version."
+                .to_string(),
+        }),
+    }
 }
 
 fn validate_survival_saved_block_matches_payload(
@@ -4201,6 +4239,9 @@ impl FittedModel {
                 runtime.model_class,
                 runtime.link_wiggle.as_ref(),
             )?;
+            if matches!(runtime.model_class, PredictModelClass::GaussianLocationScale) {
+                gaussian_location_scale_saved_sigma_floor(self.payload())?;
+            }
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
                 .payload()
@@ -6013,6 +6054,9 @@ impl FittedModel {
         }
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v).map_err(corrupt)?;
+        }
+        if let Some(v) = self.gaussian_sigma_floor {
+            ensure_finite_scalar("gaussian_sigma_floor", v).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
             validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;

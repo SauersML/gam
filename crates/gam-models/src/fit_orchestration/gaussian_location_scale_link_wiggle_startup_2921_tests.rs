@@ -15,7 +15,6 @@ use super::entry::fit_model;
 use super::request::{FitRequest, FitResult, GaussianLocationScaleFitRequest, LinkWiggleConfig};
 use crate::custom_family::BlockwiseFitOptions;
 use crate::gamlss::{GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec};
-use gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
 use gam_solve::model_types::CurvatureAdmissibility;
 use gam_spec::WigglePenaltyConfig;
 use gam_terms::basis::{
@@ -244,7 +243,7 @@ fn read_fit(fit: &GaussianLocationScaleFitResult, table: &Table, label: &str) ->
     let eta_mu = &states[0].eta;
     let sigma = states[1]
         .eta
-        .mapv(|eta| fit.response_scale * LOGB_SIGMA_FLOOR + eta.exp());
+        .mapv(|eta| fit.response_scale * fit.sigma_floor + eta.exp());
     let (mu_from_basis, mu_from_states, wiggle_state_defect) =
         match (&fit.wiggle_knots, fit.wiggle_degree, &fit.beta_link_wiggle) {
             (Some(knots), Some(degree), Some(beta)) => {

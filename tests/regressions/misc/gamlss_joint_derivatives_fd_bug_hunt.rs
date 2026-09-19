@@ -108,6 +108,11 @@ fn gamlss_joint_derivatives_match_finite_difference() {
                 weights: w.clone(),
                 mu_design: Some(DesignMatrix::from(x.clone())),
                 log_sigma_design: Some(DesignMatrix::from(z.clone())),
+                sigma_floor: gam::families::sigma_link::gaussian_resolution_sigma_floor(
+                    y_g.view(),
+                    w.view(),
+                )
+                .expect("resolution σ floor of the Gaussian fixture"),
                 policy: ResourcePolicy::default_library(),
                 cached_row_scalars: std::sync::RwLock::new(None),
             }),
