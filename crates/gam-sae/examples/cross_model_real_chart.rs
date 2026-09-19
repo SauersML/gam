@@ -14,7 +14,6 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_atb};
-use gam_problem::SeedConfig;
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_sae::hybrid_split::build_hybrid_split_report;
@@ -326,11 +325,6 @@ fn fit_real_chart(
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(outer_iters)
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, label)
         .map_err(|err| format!("{label}: outer fit failed: {err}"))?;
     objective

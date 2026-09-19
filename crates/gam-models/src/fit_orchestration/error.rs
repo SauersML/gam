@@ -1191,6 +1191,15 @@ impl From<gam_data::DataError> for WorkflowError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            cell @ DataError::InvalidCell {
+                problem: gam_data::CellProblem::NonFinite,
+                ..
+            } => Self::InvalidConfig {
+                reason: cell.to_string(),
+            },
+            cell @ DataError::InvalidCell { .. } => Self::SchemaMismatch {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }
