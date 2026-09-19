@@ -6647,6 +6647,7 @@ mod tests {
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
                 outer_warm_start: None,
+                null_deviance: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
             },
