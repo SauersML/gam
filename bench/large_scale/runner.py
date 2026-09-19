@@ -1252,10 +1252,10 @@ def heartbeat_loop(proc: subprocess.Popen[bytes], cmd_preview: str, stop_event: 
 def _with_gam_instrumentation_level(cmd: list[str]) -> list[str]:
     """Ask the gam CLI for the log level this runner's phase summary parses.
 
-    Every aggregator in `_emit_phase_summary` reads `log::info!` markers
+    Every aggregator in `_emit_phase_summary` reads `log::debug!` markers
     (`[OUTER hessian-route]`, `[KAPPA-PHASE`, `[STAGE] outer eval end`, the
-    `[PIRLS ...]` family). The CLI logs at its quiet `Warn` default unless it
-    is asked otherwise, so without this the marker buffer is EMPTY on every
+    `[PIRLS ...]` family), which the CLI writes to stderr only under `-v`.
+    Without it the marker buffer is EMPTY on every
     real run and every one of those aggregations is silently inert — the exact
     failure gam#2617 was about, reintroduced through the invocation instead of
     through the filter. It is also what left a 40-minute large-scale CTN
@@ -1265,9 +1265,9 @@ def _with_gam_instrumentation_level(cmd: list[str]) -> list[str]:
     """
     if not cmd or Path(cmd[0]).name != "gam":
         return list(cmd)
-    if any(arg == "--log-level" or arg.startswith("--log-level=") for arg in cmd):
+    if any(arg == "--verbose" or re.fullmatch(r"-v+", arg) for arg in cmd):
         return list(cmd)
-    return [cmd[0], "--log-level", "info", *cmd[1:]]
+    return [cmd[0], "-v", *cmd[1:]]
 
 
 def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:

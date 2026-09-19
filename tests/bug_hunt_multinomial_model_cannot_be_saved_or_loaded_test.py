@@ -5,7 +5,7 @@ Issue #2078: `gamfit.fit(..., family="multinomial")` returns a
 `MultinomialModel` that fits and predicts in memory, but the public
 persistence API could not round-trip it:
 
-  * `MultinomialModel` defined no `save`/`dumps`, so `gamfit.save(m, path)`
+  * `MultinomialModel` defined no `save`/`dumps`, so `m.save(path)`
     raised `TypeError` and `m.dumps()` raised `AttributeError`.
   * `gamfit.loads` only ever rebuilt a plain `Model`; the multinomial payload
     has a different on-disk schema, so no branch could reconstruct a
@@ -47,7 +47,7 @@ def test_multinomial_model_save_load_round_trip():
 
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "multinomial.gam"
-        gamfit.save(m, path)          # raised TypeError before the fix
+        m.save(path)          # raised TypeError before the fix
         m2 = gamfit.load(path)
 
     assert type(m2) is MultinomialModel

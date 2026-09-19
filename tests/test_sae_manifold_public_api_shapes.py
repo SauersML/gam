@@ -19,7 +19,7 @@ def _fresh_fit_or_fail(z: np.ndarray):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
-            fit = gamfit.sae_manifold_fit(
+            fit = gamfit.sae.sae_manifold_fit(
                 X=z,
                 K=1,
                 d_atom=1,

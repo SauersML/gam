@@ -14,3 +14,5 @@ pub(crate) mod ffi_errors;
 
 
 pub(crate) mod finite_safe_json;
+
+pub(crate) mod python_log;

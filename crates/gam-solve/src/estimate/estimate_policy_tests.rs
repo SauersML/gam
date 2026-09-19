@@ -12,13 +12,12 @@ use super::evaluation::{
 use super::external_options::resolve_external_family;
 use super::optimizer::{
     external_reml_seed_config, freeze_lambda_search_nuisance_at_canonical_anchor,
-    standard_reml_search_prefers_gradient_only,
 };
 use super::penalty::REML_SEED_SCREENING_RHO_CAP;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
-    reject_prefit_unpenalized_rank_deficiency,
+    reject_prefit_unidentifiable_unpenalized_space, reject_prefit_unpenalized_rank_deficiency,
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;
@@ -82,21 +81,122 @@ fn generalized_external_reml_keeps_multistart_policy() {
     );
 }
 
-#[test]
-fn profiled_gaussian_search_consumes_exact_outer_curvature() {
-    assert!(
-        !standard_reml_search_prefers_gradient_only(true),
-        "quadratic Gaussian identity REML must route its available exact Hessian into search"
-    );
+/// Two-smooth fixture for the outer-curvature routing check: an intercept plus
+/// one Gaussian-bump block per covariate, each block under its own
+/// second-difference penalty.
+fn two_smooth_bump_design(n: usize) -> (Array2<f64>, Vec<Array2<f64>>, Vec<f64>) {
+    const BUMPS: usize = 8;
+    let width = 0.14;
+    let p = 1 + 2 * BUMPS;
+    let mut x = Array2::<f64>::zeros((n, p));
+    let mut signal = Vec::with_capacity(n);
+    for i in 0..n {
+        let x1 = (i as f64 + 0.5) / n as f64;
+        let x2 = ((i * 7919) % n) as f64 / n as f64;
+        x[[i, 0]] = 1.0;
+        for k in 0..BUMPS {
+            let c = k as f64 / (BUMPS - 1) as f64;
+            x[[i, 1 + k]] = (-(x1 - c).powi(2) / (2.0 * width * width)).exp();
+            x[[i, 1 + BUMPS + k]] = (-(x2 - c).powi(2) / (2.0 * width * width)).exp();
+        }
+        signal.push(1.3 * (2.0 * std::f64::consts::PI * x1).sin() + 0.8 * (x2 - 0.5));
+    }
+    let mut d = Array2::<f64>::zeros((BUMPS - 2, BUMPS));
+    for r in 0..BUMPS - 2 {
+        d[[r, r]] = 1.0;
+        d[[r, r + 1]] = -2.0;
+        d[[r, r + 2]] = 1.0;
+    }
+    let local = d.t().dot(&d);
+    let penalties = (0..2)
+        .map(|block| {
+            let mut s = Array2::<f64>::zeros((p, p));
+            let off = 1 + block * BUMPS;
+            s.slice_mut(ndarray::s![off..off + BUMPS, off..off + BUMPS])
+                .assign(&local);
+            s
+        })
+        .collect();
+    (x, penalties, signal)
 }
 
+/// Every standard family's λ-search consumes the declared exact outer
+/// Hessian (ARC/Newton), exactly as profiled Gaussian identity does. The
+/// retired #2359 split held non-Gaussian links to gradient-only BFGS, which
+/// rebuilt that curvature from secant pairs and needed 48-61 outer
+/// iterations on a one-smooth n=1000 logistic fit. Newton steps on the exact
+/// surface converge in a handful; the bound below sits far under the
+/// secant-rebuild count and far over the Newton count.
 #[test]
-fn non_gaussian_search_reserves_order_four_for_mint() {
-    assert!(
-        standard_reml_search_prefers_gradient_only(false),
-        "non-Gaussian families (including identity-link Student-t) must retain the \
-         optimize-3 / certify-4 derivative ceiling"
-    );
+fn non_gaussian_search_converges_in_newton_iterations() {
+    let n = 600;
+    let (x, penalties, signal) = two_smooth_bump_design(n);
+    let w = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let mut rng = StdRng::seed_from_u64(0x9a11_0c0de);
+    let binomial_y = Array1::from_iter(signal.iter().map(|&eta| {
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        f64::from(u8::from(rng.random::<f64>() < mu))
+    }));
+    let poisson_y = Array1::from_iter(signal.iter().enumerate().map(|(i, &eta)| {
+        let mu = (0.4 + 0.6 * eta).exp();
+        (mu + if i % 2 == 0 { 0.5 } else { -0.5 }).max(0.0).round()
+    }));
+    let cases: [(&str, LikelihoodSpec, &Array1<f64>); 2] = [
+        (
+            "binomial-logit",
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            &binomial_y,
+        ),
+        (
+            "poisson-log",
+            LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            &poisson_y,
+        ),
+    ];
+    for (name, family, y) in cases {
+        let opts = ExternalOptimOptions {
+            family,
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 200,
+            tol: 1e-7,
+            nullspace_dims: vec![2, 2],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            rho_prior: Default::default(),
+            persistent_warm_start_store: None,
+        };
+        let fit = optimize_external_designwith_heuristic_log_lambdas_andwarm_start(
+            y.view(),
+            w.view(),
+            x.clone(),
+            offset.view(),
+            penalties.iter().cloned().map(PenaltySpec::Dense).collect(),
+            None,
+            None,
+            &opts,
+        )
+        .unwrap_or_else(|error| panic!("{name}: fit failed: {error:?}"));
+        assert!(fit.outer_converged, "{name}: outer search must converge");
+        assert!(
+            fit.iterations <= 20,
+            "{name}: {} outer iterations; the exact-Hessian search converges in a \
+             handful, a secant rebuild of the same curvature takes several dozen",
+            fit.iterations
+        );
+    }
 }
 
 #[test]
@@ -512,6 +612,120 @@ fn prefit_binomial_separation_reads_through_a_scalar_ridge_but_not_a_basis_penal
     let basis = canonical_block(1..3);
     reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &basis)
         .expect("a multi-column basis penalty keeps its columns out of the certificate");
+}
+
+/// A double penalty's null-space ridge bounds its block's kernel the way a
+/// one-column ridge bounds a parametric column: the certificate reads the
+/// design along that kernel, and only along it. The block is three basis
+/// columns `(a, b, c)` with the roughness penalty on `u = (a − b)/√2` and `c`,
+/// and the ridge on `v = (a + b)/√2`. Neither `a` nor `b` separates alone.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::ones(y.len());
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let v = array![half, half, 0.0];
+    let u = array![half, -half, 0.0];
+    let e = array![0.0, 0.0, 1.0];
+    let outer = |a: &Array1<f64>| {
+        let column = a.view().insert_axis(ndarray::Axis(1));
+        column.dot(&column.t())
+    };
+    let roughness = outer(&u) + outer(&e);
+    let ridge = outer(&v);
+    let double_penalty = gam_terms::construction::canonicalize_penalty_specs(
+        &[roughness.clone(), ridge]
+            .into_iter()
+            .map(|local| PenaltySpec::Block {
+                local,
+                col_range: 1..4,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect::<Vec<_>>(),
+        &[1, 2],
+        4,
+        "prefit separation null-space ridge",
+    )
+    .expect("canonicalize the double penalty")
+    .0;
+    let design_from = |a: [f64; 4], b: [f64; 4]| {
+        let mut x = Array2::<f64>::ones((4, 4));
+        for row in 0..4 {
+            x[[row, 1]] = a[row];
+            x[[row, 2]] = b[row];
+            x[[row, 3]] = [0.5, -0.5, 0.25, -0.25][row];
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+
+    // a + b = (−2, −1, 1, 2) separates along the ridge's direction.
+    let kernel_separated = design_from([1.0, -2.0, 2.0, -1.0], [-3.0, 1.0, -1.0, 3.0]);
+    let err = reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &kernel_separated,
+        &double_penalty,
+    )
+    .expect_err("separation along the penalty null space must be certified");
+    match err {
+        EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin,
+            column_indices,
+            ..
+        } => {
+            assert!(min_signed_margin > 0.0, "margin {min_signed_margin}");
+            assert_eq!(column_indices, vec![0, 1, 2, 3]);
+        }
+        other => panic!("expected a linear separation certificate, got {other:?}"),
+    }
+
+    // a − b = (−2, −1, 1, 2) separates only along the roughness penalty's range.
+    let range_separated = design_from([1.0, -2.0, 2.0, -1.0], [3.0, -1.0, 1.0, -3.0]);
+    reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &range_separated,
+        &double_penalty,
+    )
+    .expect("a direction the roughness penalty bounds certifies nothing");
+
+    // Alone on its block, the roughness penalty leaves `v` unpenalized.
+    let roughness_only = gam_terms::construction::canonicalize_penalty_specs(
+        &[PenaltySpec::Block {
+            local: roughness,
+            col_range: 1..4,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        }],
+        &[1],
+        4,
+        "prefit separation unpenalized kernel",
+    )
+    .expect("canonicalize the roughness penalty")
+    .0;
+    assert!(matches!(
+        reject_prefit_binomial_separation(
+            &cfg,
+            y.view(),
+            w.view(),
+            &kernel_separated,
+            &roughness_only,
+        ),
+        Err(EstimationError::PrefitLinearSeparationDetected { .. })
+    ));
 }
 
 /// F4 (bench/pygam_audit): a smooth's null space is penalized only by its
@@ -2549,4 +2763,116 @@ fn estimated_nuisance_fits_land_in_the_same_place_cold_and_warm_2363() {
         "a warm cache changed WHERE the fit landed, not just how fast it got there:\n{}",
         failures.join("\n")
     );
+}
+
+/// A 10-column second-difference penalty block at `start..start + 10` of a
+/// `p`-column model, plus (double penalty) the projector onto its linear null
+/// space `span{1, t}`, as canonical penalties.
+fn wide_smooth_block_penalties(
+    start: usize,
+    p: usize,
+    double_penalty: bool,
+) -> Vec<gam_terms::construction::CanonicalPenalty> {
+    let k = 10;
+    let mut d = Array2::<f64>::zeros((k - 2, k));
+    for row in 0..k - 2 {
+        d[[row, row]] = 1.0;
+        d[[row, row + 1]] = -2.0;
+        d[[row, row + 2]] = 1.0;
+    }
+    let mut specs = vec![PenaltySpec::Block {
+        local: d.t().dot(&d),
+        col_range: start..start + k,
+        prior_mean: gam_problem::CoefficientPriorMean::Zero,
+        structure_hint: None,
+        op: None,
+    }];
+    if double_penalty {
+        let ones = Array1::<f64>::from_elem(k, 1.0 / (k as f64).sqrt());
+        let mut t = Array1::from_iter((0..k).map(|i| i as f64));
+        t -= t.mean().expect("nonempty");
+        t /= t.dot(&t).sqrt();
+        let mut null_projector = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..k {
+                null_projector[[i, j]] = ones[i] * ones[j] + t[i] * t[j];
+            }
+        }
+        specs.push(PenaltySpec::Block {
+            local: null_projector,
+            col_range: start..start + k,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        });
+    }
+    let nullspace_dims = vec![0; specs.len()];
+    gam_terms::construction::canonicalize_penalty_specs(
+        &specs,
+        &nullspace_dims,
+        p,
+        "sample-size identifiability",
+    )
+    .expect("canonicalize the smooth block penalties")
+    .0
+}
+
+#[test]
+fn prefit_sample_size_gate_counts_the_unpenalized_space_not_the_columns() {
+    // Intercept + one parametric slope (unpenalized) and two 10-column smooths:
+    // p = 22 columns. Double-penalized, the only unpenalized directions are the
+    // two parametric ones, so M_p = 2 and n = 3 rows already identify the fit
+    // even though p = 22 > n.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, true);
+    penalties.extend(wide_smooth_block_penalties(12, p, true));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(3).view(), p, &penalties)
+        .expect("n = 3 > M_p = 2 is identified at p = 22");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(2).view(), p, &penalties)
+            .expect_err("n = 2 = M_p leaves no residual contrast for REML");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            unpenalized_dim: 2,
+            total_columns: 22,
+        }
+    ));
+    // Zero-weight rows carry no information and do not count toward n.
+    let err = reject_prefit_unidentifiable_unpenalized_space(
+        array![1.0, 0.0, 1.0, 0.0].view(),
+        p,
+        &penalties,
+    )
+    .expect_err("two positive-weight rows are n = 2 whatever the row count");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 2,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn prefit_sample_size_gate_adds_single_penalty_null_spaces() {
+    // Singly penalized, each smooth leaves its linear trend {1, t} unpenalized:
+    // M_p = 2 parametric + 2 + 2 = 6.
+    let p = 22;
+    let mut penalties = wide_smooth_block_penalties(2, p, false);
+    penalties.extend(wide_smooth_block_penalties(12, p, false));
+    reject_prefit_unidentifiable_unpenalized_space(Array1::ones(7).view(), p, &penalties)
+        .expect("n = 7 > M_p = 6 is identified");
+    let err =
+        reject_prefit_unidentifiable_unpenalized_space(Array1::ones(6).view(), p, &penalties)
+            .expect_err("n = 6 = M_p is not identified");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+            n_observations: 6,
+            unpenalized_dim: 6,
+            total_columns: 22,
+        }
+    ));
 }

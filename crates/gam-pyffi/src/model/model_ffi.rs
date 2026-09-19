@@ -16,6 +16,7 @@ use gam::families::inference::saved_summary::{
     compare_saved_models, prediction_model_class_label, saved_model_report_input,
     saved_model_summary, saved_models_log_evidence_ratio, scan_introspection, scan_smooth_label,
 };
+use gam::families::inference::summary_text::render_summary_text;
 
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
@@ -152,9 +153,14 @@ struct PredictionPayload {
     model_class: String,
     /// Response-scale point column of this class (`PredictModelClass::point_column`).
     point_column: &'static str,
-    /// Point-payload shape of this class (`PredictModelClass::point_shape`); the
-    /// Python shaper branches on it instead of the class label.
+    /// Point-payload shape of this model (`FittedModel::prediction_point_shape`);
+    /// the Python shaper branches on it instead of the class label.
     point_shape: &'static str,
+    /// Ordered point columns of a multi-curve point (`expectile_curves`: one
+    /// column per expectile level, in increasing level order). Omitted for
+    /// single-column points, which `point_column` names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_columns: Option<Vec<String>>,
     /// Inverse-link family kind tag (`identity`, `logit`, `probit`, `log`, ...).
     family: String,
     /// Provenance of the returned prediction interval (#942). Present only on
@@ -210,11 +216,14 @@ struct SamplePayload {
     /// response-scale transforms (issue #1133).
     link_spec: String,
     /// The sampler that produced the draws, stamped by that sampler itself
-    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`, `"laplace"`,
-    /// `"truncated-laplace"`, or `"conjugate-gaussian"`. Callers use it to badge
-    /// the posterior or to warn when a class has fallen back to the approximate
-    /// path.
+    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`,
+    /// `"polya-gamma-jeffreys"`, `"laplace"`, `"truncated-laplace"`, or
+    /// `"conjugate-gaussian"`. Callers use it to badge the posterior or to warn
+    /// when a class has fallen back to the approximate path.
     method: String,
+    /// Metropolis acceptance rate of the draws (`PosteriorSampler::acceptance_rate`),
+    /// present only for a sampler with an accept/reject step.
+    acceptance_rate: Option<f64>,
     /// Whether `method` targets the model's exact posterior (the MCMC routes and
     /// the closed-form conjugate Gaussian route) rather than a Gaussian
     /// approximation of it (every Laplace form).
@@ -1388,6 +1397,31 @@ fn fit_table(
     // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
+    // The multinomial-logit family is a vector-response fit with its own
+    // driver and persistence envelope; route it here on the same predicate the
+    // CLI uses, so callers read the model kind off the returned bytes
+    // (`saved_model_kind`) instead of re-deriving it from the family name.
+    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    if fit_config
+        .family
+        .as_deref()
+        .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
+    {
+        if warm_start_model.is_some() {
+            return Err(py_value_error(
+                "warm_start_from is not supported for multinomial fits".to_string(),
+            ));
+        }
+        if fisher_rao_w.is_some() {
+            return Err(py_value_error(
+                "fisher_rao_w is not supported for multinomial fits".to_string(),
+            ));
+        }
+        let model_bytes = detach_pyresult(py, "fit_multinomial", move || {
+            fit_multinomial_dataset(&dataset, &formula, &fit_config)
+        })?;
+        return Ok(PyBytes::new(py, &model_bytes).unbind());
+    }
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let model_bytes = detach_workflow_result(py, "fit_table", move || {
         fit_dataset_impl(
@@ -1480,29 +1514,33 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
     }))
 }
 
-/// Human-readable inference advisories recorded while the model was fit — the
-/// mgcv-style "k reduced to the data support" / basis-degradation notes from the
-/// cr/cs/sz cap (#1541, #1542), and any other materialization advisory. The CLI
-/// prints these; this accessor lets gamfit surface the SAME notes as
-/// `GamInferenceWarning`s and via `model.notes` rather than dropping them at the
-/// FFI boundary (#1543). Returns an empty list for older payloads that predate
-/// the field (it deserializes via `#[serde(default)]`).
+/// The notes recorded while the model was fit, as `(advisories,
+/// informational)`. Advisories say the fitted model differs from the literal
+/// request — the "k reduced to the data support" / basis-degradation notes of
+/// the cr/cs/sz cap (#1541, #1542), a dropped scalar term, a failed basis
+/// adequacy check; gamfit raises them as `GamInferenceWarning`s. Informational
+/// notes record defaults the engine chose (the auto knot count of a default
+/// B-spline, per-margin tensor sizes); gamfit exposes them via `model.notes`
+/// and the summary but does not warn. Both lists are empty for payloads that
+/// predate the fields (they deserialize via `#[serde(default)]`).
 #[pyfunction]
-fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
+fn fit_notes_from_model(model_bytes: Vec<u8>) -> PyResult<(Vec<String>, Vec<String>)> {
     let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
         .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
-    let notes = saved
-        .get("payload")
-        .and_then(|payload| payload.get("inference_notes"))
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect::<Vec<String>>()
-        })
-        .unwrap_or_default();
-    Ok(notes)
+    let payload = saved.get("payload");
+    let notes = |key: &str| -> Vec<String> {
+        payload
+            .and_then(|payload| payload.get(key))
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok((notes("inference_notes"), notes("informational_notes")))
 }
 
 /// The LAML-estimated `(σ, ν)` of a scaled Student-t fit, read off the saved
@@ -1528,6 +1566,15 @@ fn required_saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyRes
 
 /// Schema tag of the response-geometry saved-model container (#2114).
 pub(crate) const RESPONSE_GEOMETRY_SCHEMA: &str = "gamfit.ResponseGeometryModel/v1";
+
+/// Whether `family` names the multinomial-logit family, by the one engine
+/// predicate `fit_table` and the CLI route on. Python front ends that must
+/// choose before fitting (the sklearn classifier's binary/multi-class split)
+/// ask here instead of keeping their own spelling list.
+#[pyfunction]
+fn is_multinomial_family_name(family: &str) -> bool {
+    gam::families::fit_orchestration::is_multinomial_family_name(family)
+}
 
 /// The kind of a saved gamfit model payload, read from its JSON header. A
 /// `gamfit.ManifoldSAE` schema of any version is `"manifold_sae"`, so a stale
@@ -1938,7 +1985,7 @@ fn competing_risks_cif_impl(
     let cumulative_hazard =
         ndarray::stack(Axis(0), &endpoint_views).map_err(shape_error_to_pyerr)?;
     // Typed engine path: `assemble_competing_risks_cif` returns
-    // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
+    // `Result<_, SurvivalError>`, dispatch to `gamfit.errors.SurvivalError`.
     let result =
         gam::families::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
             .map_err(survival_error_to_pyerr)?;
@@ -2018,7 +2065,7 @@ fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
 ) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
-    // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
+    // Typed engine path: `SurvivalError` → `gamfit.errors.SurvivalError` (issue
     // #343), no string flattening.
     let result = gam::families::survival::assemble_competing_risks_cif_from_endpoints(
         times,
@@ -2074,6 +2121,7 @@ fn sample_table(
     out.set_item("family_kind", payload.family_kind)?;
     out.set_item("link_spec", payload.link_spec)?;
     out.set_item("method", payload.method)?;
+    out.set_item("acceptance_rate", payload.acceptance_rate)?;
     out.set_item("exact", payload.exact)?;
     out.set_item("covariance_source", payload.covariance_source)?;
     Ok(out.unbind())
@@ -2981,35 +3029,35 @@ fn duchon_basis<'py>(
     Ok(built.design.to_dense().into_pyarray(py).unbind())
 }
 
-#[pyfunction(signature = (t, num_internal_knots, degree = 3))]
-fn auto_knots_1d<'py>(
+/// The knots or centers a 1-D basis-evaluation helper builds on `t`:
+/// `(locations, effective_order, shrunk)`. `knots_or_centers` is `None` (the
+/// formula front door's default for the kind on `t`), an integer size, or an
+/// explicit float64 vector; [`resolve_basis_locations_1d`] owns all three.
+#[pyfunction(signature = (t, basis_kind, knots_or_centers = None, order = 3, periodic = false))]
+fn resolve_basis_locations_1d<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
-    num_internal_knots: usize,
-    degree: usize,
-) -> PyResult<(Py<PyArray1<f64>>, usize, usize, bool)> {
-    // Issue #340: return the auto-shrunk effective `(degree, num_internal_knots)`
-    // alongside the knot vector so Python callers can observe when the engine
-    // had to downgrade their requested basis to fit small-n data.
-    let result = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
-        .map_err(basis_error_to_pyerr)?;
+    basis_kind: &str,
+    knots_or_centers: Option<&Bound<'py, PyAny>>,
+    order: usize,
+    periodic: bool,
+) -> PyResult<(Py<PyArray1<f64>>, usize, bool)> {
+    let kind = PositionBasisKind::parse(basis_kind).map_err(py_value_error)?;
+    let request = position_basis_locations_arg(knots_or_centers)?;
+    let resolved =
+        gam::terms::basis::position_basis::resolve_basis_locations_1d(
+            t.as_array(),
+            kind,
+            request,
+            order,
+            periodic,
+        )
+        .map_err(py_value_error)?;
     Ok((
-        result.knots.into_pyarray(py).unbind(),
-        result.degree,
-        result.num_internal_knots,
-        result.shrunk,
+        resolved.locations.into_pyarray(py).unbind(),
+        resolved.order,
+        resolved.shrunk,
     ))
-}
-
-#[pyfunction(signature = (t, num_centers))]
-fn auto_centers_1d<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
-    num_centers: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let centers =
-        auto_centers_1d_equal_mass(t.as_array(), num_centers).map_err(basis_error_to_pyerr)?;
-    Ok(centers.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
@@ -4173,7 +4221,7 @@ fn no_criterion_error(payload: &serde_json::Value, surface: &str) -> pyo3::PyErr
 enum RemlFitView<'py> {
     /// The `SummaryPayload` of a gamfit Model or its saved bytes.
     SavedSummary(serde_json::Value),
-    /// A summary mapping (a dict or `gamfit.Summary`) read through `.get`.
+    /// A summary mapping (a dict or `gamfit.results.Summary`) read through `.get`.
     Mapping(Bound<'py, PyAny>),
 }
 
@@ -5745,8 +5793,15 @@ fn position_basis_locations_arg(
         })?;
         return Ok(PositionBasisLocations::Count(count));
     }
-    let given: PyReadonlyArray1<'_, f64> = value.extract()?;
-    Ok(PositionBasisLocations::Given(given.as_array().to_owned()))
+    if let Ok(given) = value.extract::<PyReadonlyArray1<'_, f64>>() {
+        return Ok(PositionBasisLocations::Given(given.as_array().to_owned()));
+    }
+    let given: Vec<f64> = value.extract().map_err(|_| {
+        PyTypeError::new_err(
+            "knots_or_centers must be None, an integer basis size, or a 1-D float vector",
+        )
+    })?;
+    Ok(PositionBasisLocations::Given(Array1::from_vec(given)))
 }
 
 /// Read a position fit's `penalty`: `None`, the name of the kind's canonical
@@ -6212,6 +6267,7 @@ mod prediction_payload_tests {
             model_class: "standard".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "identity".to_string(),
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
@@ -6247,6 +6303,7 @@ mod prediction_payload_tests {
             model_class: "bernoulli marginal-slope".to_string(),
             point_column: "posterior_mean",
             point_shape: "estimand_explicit",
+            point_columns: None,
             family: "probit".to_string(),
             interval_method: None,
             covariance_source: None,

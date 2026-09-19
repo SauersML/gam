@@ -984,6 +984,7 @@ fn linear_spec() -> TermCollectionSpec {
         }],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -1280,7 +1281,7 @@ static STDOUT_LOGGER: StdoutLogger = StdoutLogger;
 
 fn install_test_logger() {
     if log::set_logger(&STDOUT_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 
@@ -3354,6 +3355,7 @@ fn intercept_only_spec() -> TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 

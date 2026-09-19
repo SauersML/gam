@@ -12,7 +12,7 @@ def main() -> None:
     t = np.linspace(-1.0, 1.0, 100)
     x = np.c_[t, np.maximum(t - 0.15, 0.0), np.maximum(-t - 0.2, 0.0)]
     x += 0.03 * rng.standard_normal(x.shape)
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         x,
         K=3,
         d_atom=2,

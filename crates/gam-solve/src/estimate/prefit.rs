@@ -236,6 +236,60 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     Ok(None)
 }
 
+/// Sample-size identifiability of a penalized fit.
+///
+/// Write `p` for the coefficient count and `M_p = p − rank(Σ_k S_k)` for the
+/// dimension of the penalty null space: the coefficient directions no penalty
+/// touches (intercept, parametric columns, the polynomial trend of a singly
+/// penalized smooth — zero for a double-penalized smooth, whose second penalty
+/// covers that trend). REML and LAML integrate those `M_p` directions out under
+/// a flat prior, so the criterion is the density of the `n − M_p` error
+/// contrasts orthogonal to the unpenalized column space: the Gaussian profiled
+/// scale is `φ̂ = (‖y − Xβ̂‖² + β̂ᵀSβ̂)/(n − M_p)`, and for any family the
+/// Laplace criterion's `λ`-dependence comes only from the residual the
+/// unpenalized directions cannot absorb. With `n ≤ M_p` there are no such
+/// contrasts: the unpenalized directions alone reproduce the data, and the
+/// criterion carries no information about `λ` (nor `φ`), so no smoothing
+/// parameter optimum exists to converge to. With `n > M_p` the fit is
+/// identified however large `p` is, because every penalized direction is pinned
+/// by its penalty rather than by the data; the total column count is not a
+/// constraint. (Whether the data identify the unpenalized directions — the rank
+/// of the unpenalized design — is the separate check
+/// [`reject_prefit_unpenalized_rank_deficiency`].)
+///
+/// Identified is not the same as smooth. Once the penalized directions REML may
+/// release span the `n − M_p` contrasts, the Gaussian marginal likelihood has a
+/// finite limit as `φ → 0`, since the random-effect covariance alone is then
+/// nonsingular. On some data REML's optimum lies at that limit and the fit
+/// interpolates. That is the criterion's answer, not an unidentified model, so
+/// this gate does not refuse it.
+///
+/// `n` counts positive-weight rows, the same count the REML objective uses, and
+/// the rank is the balanced structural rank the reparameterization and the
+/// criterion's `log|S|₊` use, so this gate and the criterion agree on `M_p`.
+pub(crate) fn reject_prefit_unidentifiable_unpenalized_space(
+    w: ArrayView1<'_, f64>,
+    p: usize,
+    penalties: &[CanonicalPenalty],
+) -> Result<(), EstimationError> {
+    let n_observations = w.iter().filter(|&&weight| weight > 0.0).count();
+    let penalty_rank = gam_terms::construction::balanced_penalty_structural_rank(
+        penalties
+            .iter()
+            .map(|penalty| (penalty.local_ref().view(), penalty.col_range.clone())),
+        p,
+    )?;
+    let unpenalized_dim = p.saturating_sub(penalty_rank);
+    if n_observations > unpenalized_dim {
+        return Ok(());
+    }
+    Err(EstimationError::PrefitUnpenalizedSpaceExceedsObservations {
+        n_observations,
+        unpenalized_dim,
+        total_columns: p,
+    })
+}
+
 pub(crate) fn reject_prefit_unpenalized_rank_deficiency(
     w: ArrayView1<'_, f64>,
     x_fit: &DesignMatrix,
@@ -440,203 +494,38 @@ fn certify_prefit_binomial_linear_separator(
     }))
 }
 
-/// One coordinate of the linear-separation search, `z_i = Σ_k weights[k]·x_i[columns[k]]`:
-/// a parametric column (weight one), or a direction of a penalty block's null space.
-#[derive(Clone, Debug, PartialEq)]
-struct PrefitSeparationCoordinate {
-    columns: Vec<usize>,
-    weights: Vec<f64>,
-    null_space: bool,
-}
-
-impl PrefitSeparationCoordinate {
-    fn column(col: usize) -> Self {
-        Self {
-            columns: vec![col],
-            weights: vec![1.0],
-            null_space: false,
-        }
-    }
-
-    fn value(&self, row: ArrayView1<'_, f64>) -> f64 {
-        self.columns
-            .iter()
-            .zip(&self.weights)
-            .map(|(&col, &weight)| weight * row[col])
-            .sum()
-    }
-}
-
-/// The directions of each multi-column penalty block on which the prior is flat,
-/// or bounded only by the block's null-space ridge.
-///
-/// A smooth's roughness penalty leaves its low-order polynomial part unpenalized,
-/// and a double-penalty smooth adds a second penalty on exactly that null space
-/// (Marra & Wood 2011). Along a separating direction in the null space REML sends
-/// the ridge's λ toward zero, as it does for a parametric column's one-column
-/// ridge (b7b874a2a), so the ridge bounds nothing there; without the ridge the
-/// prior is flat there to begin with. Either way the posterior is improper along
-/// a separator in that space. The null space is the smooth's polynomial part, not
-/// a basis expansion, so it cannot separate an arbitrary response (#2898).
-///
-/// A penalty is read as its block's null-space ridge when its rank and the rank
-/// of the rest of the block sum to the rank of the whole block (the ranges are
-/// complementary) and its rank is strictly the smaller (a tie names no ridge, so
-/// the block reads as unridged); the directions returned are then
-/// the null space of the rest of the block. A block with no such ridge returns
-/// the null space of the whole block. Ranks are read off each penalty's root,
-/// scaled to unit Frobenius norm so that no penalty's scale buries another's, by
-/// [`gam_linalg::roundoff::factor_rank_partition`].
-fn penalty_null_space_directions(
-    penalties: &[CanonicalPenalty],
-    p: usize,
-) -> Result<Vec<PrefitSeparationCoordinate>, EstimationError> {
-    let mut coordinates = Vec::new();
-    let mut visited: Vec<std::ops::Range<usize>> = Vec::new();
-    for penalty in penalties {
-        let range = penalty.col_range.clone();
-        if range.len() < 2 || range.end > p || visited.contains(&range) {
-            continue;
-        }
-        visited.push(range.clone());
-        let overlaps_another_block = penalties.iter().any(|other| {
-            other.col_range != range
-                && other.col_range.start < range.end
-                && range.start < other.col_range.end
-        });
-        if overlaps_another_block {
-            continue;
-        }
-        let block: Vec<&CanonicalPenalty> = penalties
-            .iter()
-            .filter(|other| other.col_range == range)
-            .collect();
-        let dim = range.len();
-        let mut roots = Vec::with_capacity(block.len());
-        for member in &block {
-            let frobenius = member.root.iter().map(|v| v * v).sum::<f64>().sqrt();
-            if member.root.ncols() != dim || !frobenius.is_finite() || frobenius <= 0.0 {
-                roots.clear();
-                break;
-            }
-            roots.push(member.root.mapv(|v| v / frobenius));
-        }
-        if roots.len() != block.len() {
-            continue;
-        }
-        let stacked_rank = |members: &mut dyn Iterator<Item = &Array2<f64>>| {
-            let members: Vec<_> = members.map(|root| root.view()).collect();
-            let stack = ndarray::concatenate(Axis(0), &members).map_err(|err| {
-                EstimationError::LayoutError(format!(
-                    "pre-fit null-space separation check failed to stack penalty roots: {err}"
-                ))
-            })?;
-            gam_linalg::roundoff::factor_rank_partition(&stack)
-                .map_err(EstimationError::EigendecompositionFailed)
-        };
-        let whole = stacked_rank(&mut roots.iter())?;
-        // A lone penalty has no rest of the block to be complementary to.
-        let ridge_candidates = if roots.len() > 1 { 0..roots.len() } else { 0..0 };
-        let mut ridge_released = false;
-        for ridge in ridge_candidates {
-            let ridge_rank = gam_linalg::roundoff::factor_rank_partition(&roots[ridge])
-                .map_err(EstimationError::EigendecompositionFailed)?
-                .rank;
-            let rest = stacked_rank(
-                &mut roots
-                    .iter()
-                    .enumerate()
-                    .filter(|&(k, _)| k != ridge)
-                    .map(|(_, root)| root),
-            )?;
-            if ridge_rank == 0 || ridge_rank >= rest.rank || ridge_rank + rest.rank != whole.rank
-            {
-                continue;
-            }
-            ridge_released = true;
-            push_null_directions(&mut coordinates, &range, &rest);
-        }
-        if !ridge_released {
-            push_null_directions(&mut coordinates, &range, &whole);
-        }
-    }
-    Ok(coordinates)
-}
-
-/// The right singular vectors past `partition.rank` span the null space of the
-/// partitioned factor's quadratic.
-fn push_null_directions(
-    coordinates: &mut Vec<PrefitSeparationCoordinate>,
-    range: &std::ops::Range<usize>,
-    partition: &gam_linalg::roundoff::FactorRankPartition,
-) {
-    for direction in partition.right_vectors.rows().into_iter().skip(partition.rank) {
-        coordinates.push(PrefitSeparationCoordinate {
-            columns: range.clone().collect(),
-            weights: direction.to_vec(),
-            null_space: true,
-        });
-    }
-}
-
 fn detect_prefit_binomial_linear_combination_separation_in_design(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
-    coordinates: &[PrefitSeparationCoordinate],
+    unpenalized_columns: &[bool],
 ) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
-    if x.nrows() != y.len() || x.nrows() != w.len() {
-        return Ok(None);
-    }
-    let p = x.ncols();
-    if coordinates
-        .iter()
-        .any(|coordinate| coordinate.columns.iter().any(|&col| col >= p))
-    {
+    if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return Ok(None);
     }
     let Some(class) = prefit_binary_response_classes(y, w) else {
         return Ok(None);
     };
-    let q = coordinates.len();
+    let column_indices = unpenalized_column_indices(unpenalized_columns);
+    let q = column_indices.len();
     if q == 0 {
         return Ok(None);
     }
 
-    // Certify in the design's own columns: the search coordinates only propose
-    // a direction, and the certificate's rounding band is read off the columns
-    // the fit actually multiplies.
-    let mut column_indices: Vec<usize> = coordinates
-        .iter()
-        .flat_map(|coordinate| coordinate.columns.iter().copied())
-        .collect();
-    column_indices.sort_unstable();
-    column_indices.dedup();
-    let certify = |direction: &[f64]| {
-        let mut beta = vec![0.0_f64; column_indices.len()];
-        for (coordinate, &d) in coordinates.iter().zip(direction) {
-            for (&col, &weight) in coordinate.columns.iter().zip(&coordinate.weights) {
-                let slot = column_indices
-                    .binary_search(&col)
-                    .expect("every coordinate column is in the certified support");
-                beta[slot] += d * weight;
-            }
-        }
-        certify_prefit_binomial_linear_separator(&class, x, &column_indices, &beta)
-    };
-
-    let Some(statistics) = prefit_coordinate_statistics(&class, x, coordinates)? else {
+    let Some(statistics) = prefit_column_statistics(&class, x, &column_indices)? else {
         return Ok(None);
     };
     for direction in prefit_threshold_separator_proposals(&statistics)? {
-        if let Some(diagnostic) = certify(&direction)? {
+        if let Some(diagnostic) =
+            certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)?
+        {
             return Ok(Some(diagnostic));
         }
     }
 
+    let p = x.ncols();
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
     let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
-    let mut z = vec![0.0_f64; q];
     let mut direction = vec![0.0_f64; q];
     let max_passes = (8 * q.max(1)).clamp(16, 128);
     for _ in 0..max_passes {
@@ -655,16 +544,14 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
                     continue;
                 };
                 let sign = if is_positive { 1.0 } else { -1.0 };
-                let row = chunk.row(local_row);
                 let mut dot = 0.0;
                 let mut magnitude = 0.0;
                 let mut row_norm_sq = 0.0;
-                for (local_col, coordinate) in coordinates.iter().enumerate() {
-                    let value = coordinate.value(row);
+                for (local_col, &global_col) in column_indices.iter().enumerate() {
+                    let value = chunk[[local_row, global_col]];
                     if !value.is_finite() {
                         return Ok(None);
                     }
-                    z[local_col] = value;
                     let term = direction[local_col] * value;
                     dot += term;
                     magnitude += term.abs();
@@ -684,25 +571,27 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
                     continue;
                 }
                 let update_scale = sign / row_norm_sq;
-                for (local_col, &value) in z.iter().enumerate() {
-                    direction[local_col] += update_scale * value;
+                for (local_col, &global_col) in column_indices.iter().enumerate() {
+                    direction[local_col] += update_scale * chunk[[local_row, global_col]];
                 }
             }
         }
         if mistakes == 0 {
-            break;
+            return certify_prefit_binomial_linear_separator(
+                &class,
+                x,
+                &column_indices,
+                &direction,
+            );
         }
     }
 
-    if let Some(diagnostic) = certify(&direction)? {
-        return Ok(Some(diagnostic));
-    }
-    Ok(prefit_null_space_quasi_separator(&statistics, coordinates))
+    certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)
 }
 
-/// Per-class extrema, Gram matrix and column sums of the search coordinates
-/// over the rows that carry a class, from one streaming pass over the design.
-struct PrefitCoordinateStatistics {
+/// Per-class extrema, Gram matrix and column sums of the design's `columns`
+/// over the rows that carry a class, from one streaming pass.
+struct PrefitColumnStatistics {
     min_pos: Vec<f64>,
     max_pos: Vec<f64>,
     min_neg: Vec<f64>,
@@ -710,13 +599,10 @@ struct PrefitCoordinateStatistics {
     gram: Array2<f64>,
     column_sums: Array1<f64>,
     active_rows: usize,
-    /// The largest `Σ_k |weights[k]·x_i[columns[k]]|` over classed rows: the
-    /// scale of the coordinate's rounding band.
-    max_magnitude: Vec<f64>,
 }
 
-impl PrefitCoordinateStatistics {
-    /// The coordinate's value when it takes one value on every classed row.
+impl PrefitColumnStatistics {
+    /// The column's value when it takes one value on every classed row.
     fn constant_value(&self, k: usize) -> Option<f64> {
         let value = self.min_pos[k];
         (value.is_finite()
@@ -727,15 +613,15 @@ impl PrefitCoordinateStatistics {
     }
 }
 
-/// `None` when a coordinate is not finite on some classed row.
-fn prefit_coordinate_statistics(
+/// `None` when a column is not finite on some classed row.
+fn prefit_column_statistics(
     class: &[Option<bool>],
     x: &DesignMatrix,
-    coordinates: &[PrefitSeparationCoordinate],
-) -> Result<Option<PrefitCoordinateStatistics>, EstimationError> {
-    let q = coordinates.len();
+    columns: &[usize],
+) -> Result<Option<PrefitColumnStatistics>, EstimationError> {
+    let q = columns.len();
     let p = x.ncols();
-    let mut statistics = PrefitCoordinateStatistics {
+    let mut statistics = PrefitColumnStatistics {
         min_pos: vec![f64::INFINITY; q],
         max_pos: vec![f64::NEG_INFINITY; q],
         min_neg: vec![f64::INFINITY; q],
@@ -743,7 +629,6 @@ fn prefit_coordinate_statistics(
         gram: Array2::<f64>::zeros((q, q)),
         column_sums: Array1::<f64>::zeros(q),
         active_rows: 0,
-        max_magnitude: vec![0.0; q],
     };
     let mut z = vec![0.0_f64; q];
     let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
@@ -762,20 +647,12 @@ fn prefit_coordinate_statistics(
                 continue;
             };
             statistics.active_rows += 1;
-            let row = chunk.row(local_row);
-            for (k, coordinate) in coordinates.iter().enumerate() {
-                let value = coordinate.value(row);
+            for (k, &column) in columns.iter().enumerate() {
+                let value = chunk[[local_row, column]];
                 if !value.is_finite() {
                     return Ok(None);
                 }
                 z[k] = value;
-                let magnitude: f64 = coordinate
-                    .columns
-                    .iter()
-                    .zip(&coordinate.weights)
-                    .map(|(&col, &weight)| (weight * row[col]).abs())
-                    .sum();
-                statistics.max_magnitude[k] = statistics.max_magnitude[k].max(magnitude);
                 if is_positive {
                     statistics.min_pos[k] = statistics.min_pos[k].min(value);
                     statistics.max_pos[k] = statistics.max_pos[k].max(value);
@@ -800,91 +677,19 @@ fn prefit_coordinate_statistics(
     Ok(Some(statistics))
 }
 
-/// A quasi-complete separator along one penalty null-space direction: the
-/// classes' values of `z_k` meet at a threshold `t` without crossing it,
-/// `max_neg ≤ t ≤ min_pos` (or mirrored), and some row lies strictly past it.
-/// Then `±(z_k − t)` is ≥ 0 on every row and > 0 on some, so the likelihood
-/// rises without bound along that direction toward a supremum it never
-/// attains, and the flat prior leaves the posterior improper there (Albert &
-/// Anderson 1984). The offset `t` must be expressible, so either `t = 0` or a
-/// parametric coordinate takes one nonzero value on every classed row.
-///
-/// Rows tied at the threshold have margin exactly zero, which no rounding band
-/// can certify, so the comparisons read the coordinate values as computed:
-/// identical design rows give identical values, and a row whose value the
-/// arithmetic cannot tell from `t` is tied to it. A strict separator is left to
-/// the exact certificate above; only null-space directions are read, because
-/// their null-space ridge keeps each inner problem bounded while REML drives
-/// its λ to its rail, so a flat-prior fit returns a railed optimum instead of
-/// refusing, and nothing downstream would engage the Jeffreys prior.
-fn prefit_null_space_quasi_separator(
-    statistics: &PrefitCoordinateStatistics,
-    coordinates: &[PrefitSeparationCoordinate],
-) -> Option<PrefitLinearSeparationDiagnostic> {
-    let constant = coordinates
-        .iter()
-        .enumerate()
-        .filter(|(_, coordinate)| !coordinate.null_space)
-        .find_map(|(j, _)| {
-            statistics
-                .constant_value(j)
-                .filter(|&value| value != 0.0)
-                .map(|_| j)
-        });
-    for (k, coordinate) in coordinates.iter().enumerate() {
-        if !coordinate.null_space {
-            continue;
-        }
-        let (min_pos, max_pos) = (statistics.min_pos[k], statistics.max_pos[k]);
-        let (min_neg, max_neg) = (statistics.min_neg[k], statistics.max_neg[k]);
-        // The row past the threshold must clear the coordinate's rounding band,
-        // or a direction the arithmetic cannot tell from constant would qualify.
-        let band = gam_linalg::roundoff::accumulation_growth(coordinate.columns.len())
-            * statistics.max_magnitude[k];
-        let threshold = if max_neg <= min_pos && max_pos - min_neg > band {
-            0.5 * (max_neg + min_pos)
-        } else if max_pos <= min_neg && max_neg - min_pos > band {
-            0.5 * (max_pos + min_neg)
-        } else {
-            continue;
-        };
-        let offset = if threshold == 0.0 {
-            None
-        } else if let Some(j) = constant {
-            Some(j)
-        } else {
-            continue;
-        };
-        let mut column_indices: Vec<usize> = coordinate
-            .columns
-            .iter()
-            .chain(offset.iter().flat_map(|&j| coordinates[j].columns.iter()))
-            .copied()
-            .collect();
-        column_indices.sort_unstable();
-        column_indices.dedup();
-        return Some(PrefitLinearSeparationDiagnostic {
-            min_signed_margin: 0.0,
-            num_unpenalized_columns: column_indices.len(),
-            column_indices,
-        });
-    }
-    None
-}
-
-/// Exact separator proposals, one per search coordinate whose values the two
-/// classes do not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap
-/// and `a` the least-squares representation of the constant in the coordinates.
+/// Exact separator proposals, one per column whose values the two classes do
+/// not interleave: `±(e_k − t·a)`, with `t` the midpoint of the gap and `a` the
+/// least-squares representation of the constant in the columns.
 ///
 /// The perceptron needs on the order of `(R/γ)²` updates, and a step response
 /// on a grid of `n` points has a margin `γ` near `R/n`, so it cannot find the
-/// separator of the very step it exists for. A threshold on one coordinate is
-/// that separator whenever the constant lies in the coordinates' span; when it
-/// does not, the proposal fails the certificate and nothing is claimed.
+/// separator of the very step it exists for. A threshold on one column is that
+/// separator whenever the constant lies in the columns' span; when it does not,
+/// the proposal fails the certificate and nothing is claimed.
 fn prefit_threshold_separator_proposals(
-    statistics: &PrefitCoordinateStatistics,
+    statistics: &PrefitColumnStatistics,
 ) -> Result<Vec<Vec<f64>>, EstimationError> {
-    let PrefitCoordinateStatistics {
+    let PrefitColumnStatistics {
         min_pos,
         max_pos,
         min_neg,
@@ -892,7 +697,6 @@ fn prefit_threshold_separator_proposals(
         gram,
         column_sums,
         active_rows,
-        ..
     } = statistics;
     let q = min_pos.len();
 
@@ -960,43 +764,352 @@ pub(crate) fn reject_prefit_binomial_separation(
     // one-column penalty block is a parametric effect's null-recovery ridge
     // (b7b874a2a): along a separating direction REML sends its λ toward zero, so it
     // bounds nothing there. Multi-column blocks are basis expansions, and enough
-    // basis columns separate any response, so their columns stay out (#2898).
+    // basis columns separate any response, so their columns stay out (#2898);
+    // only the directions inside them that no roughness penalty bounds are read
+    // (`penalty_free_block_frames`).
     let certified_columns = canonical_unpenalized_column_mask(
         penalties
             .iter()
             .filter(|penalty| penalty.col_range.len() > 1),
         x_fit.ncols(),
     );
-    if let Some(diagnostic) = detect_prefit_binomial_single_column_separation_in_design(
+    let frames = penalty_free_block_frames(penalties, x_fit.ncols());
+    if frames.is_empty() {
+        return reject_separation_along_columns(y, w, x_fit, &certified_columns, |columns| {
+            columns.to_vec()
+        });
+    }
+
+    let direct_columns = unpenalized_column_indices(&certified_columns);
+    let (projected, rounding) =
+        project_onto_penalty_free_directions(x_fit, &direct_columns, &frames)?;
+    let mut direct_mask = vec![false; projected.ncols()];
+    direct_mask[..direct_columns.len()].fill(true);
+    if let Some(diagnostic) =
+        detect_prefit_binomial_single_column_separation_in_design(y, w, &projected, &direct_mask)?
+    {
+        return Err(EstimationError::PrefitPerfectSeparationDetected {
+            column_index: direct_columns[diagnostic.column_index],
+            threshold: diagnostic.threshold,
+            positive_above_threshold: diagnostic.positive_above_threshold,
+        });
+    }
+    // The realized-design columns each projected column is read from, in the
+    // order `project_onto_penalty_free_directions` lays them out.
+    let supports: Vec<&[usize]> = direct_columns
+        .iter()
+        .map(std::slice::from_ref)
+        .chain(frames.iter().flat_map(|frame| {
+            std::iter::repeat_n(frame.columns.as_slice(), frame.frame.ncols())
+        }))
+        .collect();
+    let support = |projected_columns: &[usize]| {
+        let mut global: Vec<usize> = projected_columns
+            .iter()
+            .flat_map(|&column| supports[column].iter().copied())
+            .collect();
+        global.sort_unstable();
+        global.dedup();
+        global
+    };
+    reject_linear_separation_along_columns(
         y,
         w,
-        x_fit,
-        &certified_columns,
+        &projected,
+        &vec![true; projected.ncols()],
+        &support,
+    )?;
+    if let Some(diagnostic) = detect_prefit_binomial_null_space_quasi_separation(
+        y,
+        w,
+        &projected,
+        direct_columns.len(),
+        &rounding,
     )? {
+        return Err(EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin: diagnostic.min_signed_margin,
+            num_unpenalized_columns: diagnostic.num_unpenalized_columns,
+            column_indices: support(&diagnostic.column_indices),
+        });
+    }
+    Ok(())
+}
+
+/// A quasi-complete separator along one penalty-free smooth direction: the
+/// classes' values of a frame column `z_k` meet at a threshold `t` without
+/// crossing it, `max_neg ≤ t ≤ min_pos` (or mirrored), and some row lies
+/// strictly past it. Then `±(z_k − t)` is ≥ 0 on every row and > 0 on some, so
+/// the likelihood rises without bound along that direction toward a supremum
+/// it never attains, and the flat prior leaves the posterior improper there
+/// (Albert & Anderson 1984). The offset `t` must be expressible, so either
+/// `t = 0` or some projected column takes one nonzero value on every classed
+/// row (the intercept).
+///
+/// Rows tied at the threshold have margin exactly zero, which no rounding band
+/// can certify, so the comparisons read the projected values as computed:
+/// identical design rows give identical values, and a row whose value the
+/// arithmetic cannot tell from `t` is tied to it. The row past the threshold
+/// must clear both rows' rounding bands. Strict separators are the exact
+/// certificates' to find; only frame columns (from `first_frame_column` on) are
+/// read, because the null-space ridge keeps each inner problem bounded while
+/// REML drives its λ to the rail, so a flat-prior fit returns a railed optimum
+/// instead of refusing, and nothing downstream would engage the Jeffreys prior.
+fn detect_prefit_binomial_null_space_quasi_separation(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    projected: &DesignMatrix,
+    first_frame_column: usize,
+    rounding: &[f64],
+) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
+    if projected.nrows() != y.len() || projected.ncols() != rounding.len() {
+        return Ok(None);
+    }
+    let Some(class) = prefit_binary_response_classes(y, w) else {
+        return Ok(None);
+    };
+    let columns: Vec<usize> = (0..projected.ncols()).collect();
+    let Some(statistics) = prefit_column_statistics(&class, projected, &columns)? else {
+        return Ok(None);
+    };
+    let constant = (0..columns.len()).find(|&j| {
+        statistics
+            .constant_value(j)
+            .is_some_and(|value| value != 0.0)
+    });
+    for k in first_frame_column..columns.len() {
+        let (min_pos, max_pos) = (statistics.min_pos[k], statistics.max_pos[k]);
+        let (min_neg, max_neg) = (statistics.min_neg[k], statistics.max_neg[k]);
+        let band = 2.0 * rounding[k];
+        let threshold = if max_neg <= min_pos && max_pos - min_neg > band {
+            0.5 * (max_neg + min_pos)
+        } else if max_pos <= min_neg && max_neg - min_pos > band {
+            0.5 * (max_pos + min_neg)
+        } else {
+            continue;
+        };
+        let offset = if threshold == 0.0 {
+            None
+        } else if let Some(j) = constant {
+            Some(j)
+        } else {
+            continue;
+        };
+        let mut column_indices: Vec<usize> = std::iter::once(k).chain(offset).collect();
+        column_indices.sort_unstable();
+        return Ok(Some(PrefitLinearSeparationDiagnostic {
+            min_signed_margin: 0.0,
+            num_unpenalized_columns: column_indices.len(),
+            column_indices,
+        }));
+    }
+    Ok(None)
+}
+
+/// Raise the single-column certificate over `columns`, then the linear one;
+/// `support` maps the linear certificate's columns to the realized design's.
+fn reject_separation_along_columns(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    columns: &[bool],
+    support: impl Fn(&[usize]) -> Vec<usize>,
+) -> Result<(), EstimationError> {
+    if let Some(diagnostic) =
+        detect_prefit_binomial_single_column_separation_in_design(y, w, x, columns)?
+    {
         return Err(EstimationError::PrefitPerfectSeparationDetected {
             column_index: diagnostic.column_index,
             threshold: diagnostic.threshold,
             positive_above_threshold: diagnostic.positive_above_threshold,
         });
     }
-    // A smooth's null space (its intercept-free polynomial part) is penalized only
-    // by its double-penalty ridge, which REML releases along a separator exactly as
-    // it releases a one-column ridge, so its directions join the search.
-    let coordinates: Vec<PrefitSeparationCoordinate> =
-        unpenalized_column_indices(&certified_columns)
-            .into_iter()
-            .map(PrefitSeparationCoordinate::column)
-            .chain(penalty_null_space_directions(penalties, x_fit.ncols())?)
-            .collect();
+    reject_linear_separation_along_columns(y, w, x, columns, support)
+}
+
+fn reject_linear_separation_along_columns(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    columns: &[bool],
+    support: impl Fn(&[usize]) -> Vec<usize>,
+) -> Result<(), EstimationError> {
     if let Some(diagnostic) =
-        detect_prefit_binomial_linear_combination_separation_in_design(y, w, x_fit, &coordinates)?
+        detect_prefit_binomial_linear_combination_separation_in_design(y, w, x, columns)?
     {
         return Err(EstimationError::PrefitLinearSeparationDetected {
             min_signed_margin: diagnostic.min_signed_margin,
             num_unpenalized_columns: diagnostic.num_unpenalized_columns,
-            column_indices: diagnostic.column_indices,
+            column_indices: support(&diagnostic.column_indices),
         });
     }
-
     Ok(())
+}
+
+/// Directions inside one multi-column penalty block that no roughness penalty
+/// bounds, as an orthonormal frame over the block's penalized columns.
+#[derive(Clone, Debug)]
+struct PenaltyFreeFrame {
+    /// The realized design columns the frame's rows stand for.
+    columns: Vec<usize>,
+    /// `columns.len() × m`, orthonormal columns.
+    frame: Array2<f64>,
+}
+
+/// The directions of each multi-column penalty block that are either free of
+/// every penalty on the block or bounded only by a null-space ridge.
+///
+/// A null-space ridge is the one-column ridge's argument on a basis: it is the
+/// penalty on a block whose range is exactly the null space its companions
+/// leave, so along those directions it is the only bound, and along a
+/// separating one REML sends its λ toward zero. A double penalty ships the
+/// ridge beside its roughness penalty, and that pair is symmetric in every
+/// algebraic invariant (each one's range is the other's null space); the
+/// ridge is the smaller member, the low-order kernel of the roughness penalty
+/// it completes, and a pair of equal ranks names neither. A tensor product's
+/// margin penalty never qualifies: its companions leave free only part of
+/// its range. Blocks whose column ranges overlap another block's are read as
+/// before, not at all.
+fn penalty_free_block_frames(penalties: &[CanonicalPenalty], p: usize) -> Vec<PenaltyFreeFrame> {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for penalty in penalties {
+        let range = &penalty.col_range;
+        if range.len() > 1 && range.end <= p && !ranges.contains(range) {
+            ranges.push(range.clone());
+        }
+    }
+    let overlaps = |left: &std::ops::Range<usize>, right: &std::ops::Range<usize>| {
+        left.start < right.end && right.start < left.end
+    };
+
+    let mut frames = Vec::new();
+    for range in &ranges {
+        if ranges
+            .iter()
+            .any(|other| other != range && overlaps(other, range))
+        {
+            continue;
+        }
+        let members: Vec<&CanonicalPenalty> = penalties
+            .iter()
+            .filter(|penalty| {
+                penalty.col_range == *range && penalty.local.dim() == (range.len(), range.len())
+            })
+            .collect();
+        // A column no penalty on the block touches is already read on its own.
+        let unpenalized = canonical_unpenalized_column_mask(members.iter().copied(), p);
+        let local: Vec<usize> = (0..range.len())
+            .filter(|&column| !unpenalized[range.start + column])
+            .collect();
+        let dim = local.len();
+        if dim == 0 {
+            continue;
+        }
+        // Each penalty at unit spectral scale, so none hides under another's rounding band.
+        let normalized: Vec<(Array2<f64>, usize)> = members
+            .iter()
+            .filter_map(|penalty| {
+                let scale = penalty
+                    .positive_eigenvalues
+                    .iter()
+                    .fold(0.0_f64, |acc, &value| acc.max(value));
+                (scale.is_finite() && scale > 0.0).then(|| {
+                    let block = penalty
+                        .local
+                        .select(Axis(0), &local)
+                        .select(Axis(1), &local);
+                    (block / scale, penalty.positive_eigenvalues.len())
+                })
+            })
+            .collect();
+        let sum_except = |skip: Option<usize>| {
+            let mut sum = Array2::<f64>::zeros((dim, dim));
+            for (index, (matrix, _)) in normalized.iter().enumerate() {
+                if Some(index) != skip {
+                    sum += matrix;
+                }
+            }
+            sum
+        };
+        let Some(free) = super::rho_domain::psd_null_frame(&sum_except(None)) else {
+            continue;
+        };
+        let mut ridge_frames = Vec::new();
+        if normalized.len() > 1 {
+            for (ridge, (_, rank)) in normalized.iter().enumerate() {
+                let Some(companion_free) = super::rho_domain::psd_null_frame(&sum_except(Some(ridge)))
+                else {
+                    continue;
+                };
+                let ridge_only = companion_free.ncols() - free.ncols();
+                let companion_rank = dim - companion_free.ncols();
+                if ridge_only > 0 && ridge_only == *rank && *rank < companion_rank {
+                    ridge_frames.push(companion_free);
+                }
+            }
+        }
+        if ridge_frames.is_empty() && free.ncols() > 0 {
+            ridge_frames.push(free);
+        }
+        let columns: Vec<usize> = local.iter().map(|&column| range.start + column).collect();
+        frames.extend(ridge_frames.into_iter().map(|frame| PenaltyFreeFrame {
+            columns: columns.clone(),
+            frame,
+        }));
+    }
+    frames
+}
+
+/// `[X_direct, X_B1·F1, X_B2·F2, …]`: the design read along the directions the
+/// certificate may use, the direct columns first; and per column, the largest
+/// rounding band `γ_m Σ_j |x_ij f_j|` of any row's computed value (zero for a
+/// direct column, which is copied).
+fn project_onto_penalty_free_directions(
+    x: &DesignMatrix,
+    direct_columns: &[usize],
+    frames: &[PenaltyFreeFrame],
+) -> Result<(DesignMatrix, Vec<f64>), EstimationError> {
+    let width =
+        direct_columns.len() + frames.iter().map(|frame| frame.frame.ncols()).sum::<usize>();
+    let p = x.ncols();
+    let mut projected = Array2::<f64>::zeros((x.nrows(), width));
+    let mut rounding = vec![0.0_f64; width];
+    let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit binomial separation check failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let row = chunk.row(local_row);
+            let mut target = projected.row_mut(start + local_row);
+            for (column, &global) in direct_columns.iter().enumerate() {
+                target[column] = row[global];
+            }
+            let mut column = direct_columns.len();
+            for frame in frames {
+                let growth = gam_linalg::roundoff::accumulation_growth(frame.columns.len());
+                for direction in frame.frame.columns() {
+                    let mut value = 0.0;
+                    let mut magnitude = 0.0;
+                    for (&global, &weight) in frame.columns.iter().zip(direction.iter()) {
+                        let term = row[global] * weight;
+                        value += term;
+                        magnitude += term.abs();
+                    }
+                    target[column] = value;
+                    rounding[column] = rounding[column].max(growth * magnitude);
+                    column += 1;
+                }
+            }
+        }
+    }
+    Ok((
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(projected)),
+        rounding,
+    ))
 }

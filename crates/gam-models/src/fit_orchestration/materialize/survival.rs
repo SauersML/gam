@@ -12,7 +12,7 @@ pub(crate) fn materialize_survival<'a>(
     interval_right_col: Option<&str>,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     // Extract columns. `entry_col == None` is the right-censored shorthand
     // `Surv(time, event)`: every subject enters at time zero, so we
@@ -583,6 +583,7 @@ pub(crate) fn materialize_survival<'a>(
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     };
     // Both supplied and CTN-generated scores have an explicit column here.
@@ -718,21 +719,21 @@ pub(crate) fn materialize_survival<'a>(
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if marginal_slope_link_dev.is_some() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope routes its link deviation (formula-level linkwiggle(...) or a flexible link) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_score_warp.is_some() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope routes slope_formula linkwiggle(...) into its anchored internal score-warp block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_link_dev.is_none() && marginal_slope_score_warp.is_none() {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope rigid mode is algebraic closed-form exact".to_string(),
             );
         } else {
-            inference_notes.push(
+            inference_notes.inform(
                 "survival marginal-slope flexible score/link mode uses calibrated de-nested cubic transport cells with analytic value evaluation and calibrated survival normalization"
                     .to_string(),
             );

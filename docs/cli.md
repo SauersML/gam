@@ -17,13 +17,16 @@ gam --help
 | `gam diagnose MODEL DATA` | Compute approximate leave-one-out diagnostics. |
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
+| `gam summary MODEL` | Print the model's text summary (the same text as `print(model.summary())`). |
 | `gam compare MODEL... [--names NAME...]` | Rank saved models on the smoothing-corrected AIC and print the comparison as JSON (the document `gamfit.compare_models` returns). |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |
 | `gam crosscoder --anchor L=F --block L=F --atoms N --harmonics N --out REPORT.json` | Fit a row-aligned manifold crosscoder across activation matrices and write a GAM-SAE report. |
 | `gam transformation-score MODEL DATA [--out scores.csv]` | Evaluate a fitted conditional transformation model at observed responses. |
 
-Every subcommand also accepts `--log-level off|error|warn|info|debug|trace`
-(default `warn`).
+Every subcommand also accepts `-v/--verbose`: `-v` shows the solver's
+diagnostic trace (`[OUTER …]`, `[PIRLS …]`, …) on stderr, `-vv` adds the finer
+trace-level records. Without it a run writes only its results, its fit
+advisories and its errors.
 
 ## Fit
 
@@ -35,7 +38,7 @@ Common options:
 
 | Option | Meaning |
 | --- | --- |
-| `--family auto|gaussian|binomial-logit|binomial-probit|binomial-cloglog|latent-cloglog-binomial|poisson-log|negative-binomial|gamma-log|tweedie|beta|royston-parmar|expectile|multinomial` | Explicit response family. `auto` infers from the response. |
+| `--family auto|gaussian|binomial-logit|binomial-probit|binomial-cloglog|latent-cloglog-binomial|poisson-log|negative-binomial|gamma-log|inverse-gaussian|tweedie|beta|royston-parmar|expectile|multinomial` | Explicit response family. `auto` infers from the response. |
 | `--negative-binomial-theta VALUE` | Fixed size / overdispersion for negative-binomial fits. |
 | `--weights-column COLUMN` | Non-negative per-row likelihood weights. |
 | `--offset-column COLUMN` | Additive offset for the primary linear predictor. |

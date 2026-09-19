@@ -1927,7 +1927,7 @@ pub(crate) fn small_two_atom_periodic_term_at_shared_inner_state()
         1.0e-4,
     );
     if let Err(err) = drive_verdict {
-        log::debug!(
+        log::trace!(
             "small_two_atom_periodic_term_at_shared_inner_state: the drive refused, as #2681 \
              records it does on this fixture; the pinned state is whatever it left behind: {err:?}"
         );
@@ -2963,7 +2963,7 @@ pub(crate) fn small_two_atom_ordered_beta_bernoulli_term()
 /// false-reject bug; this test pins the invariant that forbids it.
 #[test]
 pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
-    // #2228 — both policies' refine rounds and polish steps are `log::info!`.
+    // #2228 — both policies' refine rounds and polish steps are `log::debug!`.
     gam_runtime::test_support::install_diagnostic_logger();
     let (term0, target, rho) = small_two_atom_periodic_term();
     let mut full = term0.clone();
