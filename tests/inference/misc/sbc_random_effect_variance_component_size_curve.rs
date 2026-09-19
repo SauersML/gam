@@ -26,6 +26,10 @@
 //!
 //! A power control fits the same design with a real group effect and requires
 //! the test to find it.
+//!
+//! A fit the outer optimizer does not certify has no p-value to score. It is
+//! reported and left out of the rates, and a gate with more than
+//! `MAX_FAILED_FIT_SHARE` of its fits failed fails outright.
 
 use csv::StringRecord;
 use gam::{
@@ -47,6 +51,11 @@ const KS_LEVEL: f64 = 0.01;
 const SEED: u64 = 0x2E_5EED_0000;
 const FORMULA: &str = "y ~ s(x1) + group(g)";
 const GROUP_TERM: &str = "g";
+/// A fit the outer optimizer refuses to certify returns an error, not a
+/// p-value. Those replications are reported, never counted as rejections or
+/// non-rejections; more than this share of them would leave the size or power
+/// estimate resting on a selected subsample.
+const MAX_FAILED_FIT_SHARE: f64 = 0.05;
 
 #[derive(Clone, Copy, Debug)]
 enum Family {
@@ -115,15 +124,14 @@ fn dataset(family: Family, rep: u64, group_sd: f64) -> gam::data::EncodedDataset
     .expect("encode dataset")
 }
 
-/// The group term's summary p-value.
-fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
+/// The group term's summary p-value, or the fit error that stopped it.
+fn group_p_value(family: Family, rep: u64, group_sd: f64) -> Result<f64, String> {
     let data = dataset(family, rep, group_sd);
     let config = FitConfig {
         family: Some(family.config_name().to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(FORMULA, &data, &config)
-        .unwrap_or_else(|e| panic!("{family:?} rep {rep}: fit failed: {e:?}"));
+    let result = fit_from_formula(FORMULA, &data, &config).map_err(|e| format!("{e:?}"))?;
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
@@ -152,7 +160,36 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
         "{family:?} rep {rep}: effective df {} outside (0, {N_LEVELS}]",
         row.ref_df
     );
-    p_value
+    Ok(p_value)
+}
+
+/// The p-values of `replications` seeded fits at group sd `group_sd`, after
+/// checking that at most `MAX_FAILED_FIT_SHARE` of the fits failed.
+fn usable_p_values(family: Family, replications: u64, group_sd: f64) -> Vec<f64> {
+    let outcomes: Vec<(u64, Result<f64, String>)> = (0..replications)
+        .into_par_iter()
+        .map(|rep| (rep, group_p_value(family, rep, group_sd)))
+        .collect();
+    let mut p_values = Vec::new();
+    let mut failed_fits = Vec::new();
+    for (rep, outcome) in outcomes {
+        match outcome {
+            Ok(p_value) => p_values.push(p_value),
+            Err(reason) => failed_fits.push(format!("rep {rep}: {reason}")),
+        }
+    }
+    eprintln!(
+        "{family:?} (group sd {group_sd}): {} usable fits, {} failed",
+        p_values.len(),
+        failed_fits.len()
+    );
+    assert!(
+        (failed_fits.len() as f64) <= MAX_FAILED_FIT_SHARE * replications as f64,
+        "{family:?}: {} of {replications} fits at group sd {group_sd} failed, first: {}",
+        failed_fits.len(),
+        failed_fits[0]
+    );
+    p_values
 }
 
 /// Two-sided one-sample Kolmogorov–Smirnov test of `values` against `U(0, 1)`:
@@ -186,10 +223,7 @@ fn ks_uniform(values: &[f64]) -> (f64, f64) {
 
 fn assert_null_size_within_monte_carlo_error(family: Family) {
     init_parallelism();
-    let p_values: Vec<f64> = (0..N_REPLICATIONS)
-        .into_par_iter()
-        .map(|rep| group_p_value(family, rep, 0.0))
-        .collect();
+    let p_values = usable_p_values(family, N_REPLICATIONS, 0.0);
     let m = p_values.len() as f64;
     let mut miscalibrated = Vec::new();
     let mut report = Vec::new();
@@ -245,19 +279,18 @@ fn a_real_group_effect_is_detected() {
     const N_POWER_REPLICATIONS: u64 = 40;
     const ALPHA: f64 = 0.05;
     init_parallelism();
-    let m = N_POWER_REPLICATIONS as f64;
-    let null_band = ALPHA + 2.0 * (ALPHA * (1.0 - ALPHA) / m).sqrt();
     for family in [Family::Gaussian, Family::Binomial, Family::Poisson] {
-        let rejections = (0..N_POWER_REPLICATIONS)
-            .into_par_iter()
-            .filter(|&rep| group_p_value(family, rep, 1.0) <= ALPHA)
-            .count();
+        let p_values = usable_p_values(family, N_POWER_REPLICATIONS, 1.0);
+        let m = p_values.len() as f64;
+        let null_band = ALPHA + 2.0 * (ALPHA * (1.0 - ALPHA) / m).sqrt();
+        let rejections = p_values.iter().filter(|&&p| p <= ALPHA).count();
         let power = rejections as f64 / m;
         eprintln!("{family:?}: power at α={ALPHA} is {power:.3} (null band {null_band:.3})");
         assert!(
             power > null_band,
-            "{family:?}: a group effect with sd 1 was rejected in {rejections}/{N_POWER_REPLICATIONS} \
-             fits at α={ALPHA}, not above the null band {null_band:.3}"
+            "{family:?}: a group effect with sd 1 was rejected in {rejections}/{} \
+             usable fits at α={ALPHA}, not above the null band {null_band:.3}",
+            p_values.len()
         );
     }
 }
