@@ -2029,6 +2029,7 @@ pub(crate) fn update_joint_trust_region_radius(
     objective_scale: f64,
     objective_tol: f64,
     measured_resolution: f64,
+    evaluation_roundoff_ceiling: f64,
     residual_above_tolerance: bool,
 ) -> JointTrustRegionUpdate {
     // Round-off-aware trust-region radius control, delegated to the shared
@@ -2230,11 +2231,35 @@ pub(crate) fn update_joint_trust_region_radius(
     // to be interior, `step_reached_boundary` is false and this stops. The
     // factor and the cap are the SHARED controller's own (`policy`), not a
     // second opinion about how fast a trust region should grow.
+    //
+    // "RESOLVABLE" MEANS ABOVE WHAT THE ARITHMETIC CAN CARRY, NOT ABOVE WHAT
+    // HAS BEEN SEEN (gam#2977 S2). This branch overrides a rejection, so its
+    // premise — the realized change is a fact about `β` — must hold for every
+    // rounding the evaluation could carry, and the only number that bounds
+    // that from above is the evaluation's own arithmetic ceiling
+    // `γ_m·Σ|terms| + logdet_roundoff` ([`ObjectiveAccumulation`]). `noise_floor`
+    // is a LOWER bound: before any ladder has measured, it is the `|F|·1e-14`
+    // fallback, which is exactly what a cancelling evaluation exceeds. Measured
+    // on gnomon#2370's 48-row location-scale fixture: floor `2.4e-14`, the
+    // evaluation's rounding `2.64e-11` (the witness measured it one ladder
+    // later), and a realized `+2.330e-11` accepted here as a decrease. That
+    // accept ended the ladder the witness needed, the noise-decided shrinks
+    // stood at `r = 1.160e-10`, the next cycle's exact face was declined as
+    // touching the ball, and the solve refused on a fully-rejected stall.
+    // Requiring the change to clear the ceiling keeps that attempt a
+    // rejection, so the ladder continues and the witness undoes its shrinks.
+    //
+    // The asymmetry is deliberate: the controller's own "indistinguishable ⇒
+    // `rho = 1`" test above stays on the lower bound, because treating a
+    // resolvable change as noise is the error in THAT direction. A
+    // non-finite ceiling (an evaluation this module cannot size) cannot
+    // certify any change, so the override does not fire.
     if !step.accepted
         && step.predicted_nonpositive
         && predicted_reduction.is_finite()
         && predicted_reduction >= 0.0
         && actual_reduction > noise_floor
+        && actual_reduction > evaluation_roundoff_ceiling
     {
         let region_is_the_binding_constraint = step_reached_boundary && residual_above_tolerance;
         let radius = if region_is_the_binding_constraint {

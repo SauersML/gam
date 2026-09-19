@@ -4577,6 +4577,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 old_objective,
                 objective_tol,
                 measured_objective_resolution,
+                accumulation.roundoff_ceiling(),
                 current_stationarity_residual > residual_tol,
             );
             trust_ratio_witness.observe(step_norm, trust_update.rho, predicted_reduction);
@@ -4656,6 +4657,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             old_objective,
                             objective_tol,
                             measured_objective_resolution,
+                            accumulation.roundoff_ceiling(),
                             current_stationarity_residual > residual_tol,
                         );
                         if block_update.radius >= *block_radius
