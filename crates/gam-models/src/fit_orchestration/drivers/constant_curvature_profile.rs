@@ -894,7 +894,14 @@ fn constant_curvature_kappa_profile_optimum(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
-    solve_constant_curvature_kappa_profile(y.len(), profile, options, kappa_min, kappa_max, term_idx)
+    solve_constant_curvature_kappa_profile(
+        y.len(),
+        profile,
+        options,
+        kappa_min,
+        kappa_max,
+        term_idx,
+    )
 }
 
 /// The κ solve of [`constant_curvature_kappa_profile_optimum`] on an already
@@ -907,8 +914,7 @@ fn solve_constant_curvature_kappa_profile(
     kappa_max: f64,
     term_idx: usize,
 ) -> Result<ConstantCurvatureOptimum, EstimationError> {
-    let problem =
-        constant_curvature_kappa_problem(n_obs, &profile, options, kappa_min, kappa_max);
+    let problem = constant_curvature_kappa_problem(n_obs, &profile, options, kappa_min, kappa_max);
     let mut objective = problem.build_objective(
         profile,
         |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {
