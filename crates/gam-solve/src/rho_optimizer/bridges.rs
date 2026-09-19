@@ -491,15 +491,6 @@ pub(crate) struct CostStallGuard {
     /// `None` before the first. What the next licence is judged against (see
     /// [`Self::license_continuation`]).
     continuation_incumbent: Option<(f64, f64)>,
-    /// Distance from the incumbent to the nearest trial evaluated since it
-    /// became the incumbent that did not replace it; `∞` when there is none.
-    /// Reset whenever the incumbent moves, since the distance is measured from
-    /// it, so it only ever falls while the incumbent stands.
-    nearest_rejected_trial: f64,
-    /// [`Self::nearest_rejected_trial`] as it stood when the previous window was
-    /// licensed; `∞` before the first licence. See
-    /// [`Self::license_continuation`].
-    nearest_rejected_trial_at_licence: f64,
     /// #2241 — the most recent trusted accepted iterates `(ρ_i, f_i)` (finite
     /// cost, inner solve converged), newest last, capped at `window + 1`
     /// entries. This is the raw evidence for the published probe scale: during
@@ -539,8 +530,6 @@ impl CostStallGuard {
             incumbent_at_last_escape: None,
             window_trials: Vec::new(),
             continuation_incumbent: None,
-            nearest_rejected_trial: f64::INFINITY,
-            nearest_rejected_trial_at_licence: f64::INFINITY,
             recent: std::collections::VecDeque::new(),
             exit,
         }
@@ -616,19 +605,7 @@ impl CostStallGuard {
     /// * resolved descent: the incumbent improved by more than the criterion's
     ///   resolution `rel_tol·(1 + |V|)`, the same floor that decides whether one
     ///   step counts as an improvement; or
-    /// * stationarity: the incumbent's projected gradient contracted; or
-    /// * contraction of the model's step: the incumbent did not move, and a
-    ///   trial evaluated since the previous licence lies strictly closer to it
-    ///   than every trial before that licence. Every trial of such a
-    ///   window was rejected, and a shrinking rejected step is the cubic
-    ///   regularization rising towards the step its model can predict: the
-    ///   search is converging on the incumbent's own neighbourhood, not
-    ///   grinding. A single start cannot hand a window that the regularization
-    ///   has not finished contracting to another start, so stopping there
-    ///   refused a point one accepted step from certifying (#2830's ordinary
-    ///   start stopped at |Pg| = 4.7e-1 after two windows of rejected steps
-    ///   whose length fell from 9.9 to 8.6 e-folds, the next accepted step
-    ///   converging);
+    /// * stationarity: the incumbent's projected gradient contracted;
     ///
     /// or when descent is still available at the incumbent itself: its reduced
     /// Hessian carries a negative eigenvalue beyond the criterion's curvature
@@ -653,10 +630,8 @@ impl CostStallGuard {
     ///
     /// Termination follows without a count. The criterion is bounded below on
     /// the declared domain, so resolved descent can be bought only finitely
-    /// often, every contraction licence strictly lowers the incumbent's
-    /// projected gradient, and every step-contraction licence strictly lowers
-    /// the nearest rejected trial's distance from an unmoved incumbent, both
-    /// floating-point values bounded below by zero. A
+    /// often, and every contraction licence strictly lowers the incumbent's
+    /// projected gradient, a floating-point value bounded below by zero. A
     /// saddle licence does NOT end by itself: this used to say the solver spends
     /// it, rejecting steps until the regularization reaches its ceiling and
     /// reporting `TrustRegionRejectFloor`, but opt at the pinned rev has that exit
@@ -674,17 +649,13 @@ impl CostStallGuard {
             None => true,
             Some((previous_value, previous_grad_norm)) => {
                 let resolution = self.rel_tol * (1.0 + self.best_value.abs());
-                let step_contracted = previous_value.to_bits() == self.best_value.to_bits()
-                    && self.nearest_rejected_trial < self.nearest_rejected_trial_at_licence;
                 previous_value - self.best_value > resolution
                     || self.best_grad_norm < previous_grad_norm
-                    || step_contracted
                     || self.best_hessian_psd == Some(false)
             }
         };
         if licensed {
             self.continuation_incumbent = Some((self.best_value, self.best_grad_norm));
-            self.nearest_rejected_trial_at_licence = self.nearest_rejected_trial;
         }
         licensed
     }
@@ -846,7 +817,6 @@ impl CostStallGuard {
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = staged_curvature;
         self.no_improve_streak = 0;
-        self.nearest_rejected_trial = f64::INFINITY;
         self.infeasible_streak = 0;
         self.window_trials.clear();
         self.accepted_iters = self.accepted_iters.saturating_add(1);
@@ -948,14 +918,10 @@ impl CostStallGuard {
             self.best_grad_norm = grad_norm;
             self.best_hessian_psd = hessian_psd;
             self.best_curvature = staged_curvature;
-            self.nearest_rejected_trial = f64::INFINITY;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
             self.publish_best_so_far();
-        } else if let Some(incumbent) = self.best_rho.as_ref() {
-            let distance = (rho - incumbent).mapv(|d| d * d).sum().sqrt();
-            self.nearest_rejected_trial = self.nearest_rejected_trial.min(distance);
         }
         // KKT-stationary-at-bound (#1082/#1237). On a near-separable multinomial
         // the outer REML criterion keeps decreasing as λ→0, so several log-λ
@@ -1254,7 +1220,6 @@ impl CostStallGuard {
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = self.staged_curvature.take();
-        self.nearest_rejected_trial = f64::INFINITY;
         self.no_improve_streak = self.window;
         self.publish_stall(rho, value, grad_norm)
     }

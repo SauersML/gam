@@ -42,7 +42,7 @@ fn optimum_3017() -> f64 {
     (A_MINUS_ONE_3017 / C_3017).ln()
 }
 
-/// The whole outer run on the #3017 criterion reaches its optimum, and ARC
+/// The whole outer run on the #3017 criterion certifies its optimum, and ARC
 /// from the seed reaches it itself. Before the repair the guard folded each of
 /// ARC's rejected trials as a non-improving step, filled two windows at the
 /// seed after six trials and stopped the seed's run there with
@@ -76,18 +76,14 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
     );
     let config = problem.config();
     let cap = obj.capability();
-    let the_plan = plan(&cap);
-    assert_eq!(the_plan.solver, Solver::Arc, "the fixture must run the dense ARC route");
-    let outcome = run_outer_with_plan(&mut obj, &config, "#3017 rejected trials", &cap, &the_plan, true)
+    assert_eq!(plan(&cap).solver, Solver::Arc, "the fixture must run the dense ARC route");
+    let result = run_outer(&mut obj, &config, "#3017 rejected trials")
         .expect("the #3017 criterion has an interior optimum the run must reach");
-    let result = match outcome {
-        PlanRunOutcome::Converged(result) => result,
-        other => panic!(
-            "the run must converge, not stop short: {:?}; evaluated {:?}",
-            std::mem::discriminant(&other),
-            obj.state.evaluated
-        ),
-    };
+    assert!(
+        result.converged(),
+        "the run must certify its optimum, not stop short; evaluated {:?}",
+        obj.state.evaluated
+    );
     let rho = result.rho[0];
     let evaluated = &obj.state.evaluated;
     assert!(
@@ -96,9 +92,8 @@ fn arc_reaches_the_optimum_through_a_run_of_rejected_trials_3017() {
         optimum_3017(),
     );
     // The seed's own ARC trajectory: every trial from the seed toward its
-    // overshooting first trial, before the seed loop leaves for another start.
-    // The defect stopped this trajectory at the seed, six trials in, and the
-    // run reached ρ* only because a later lattice start happened to.
+    // overshooting first trial, before any later evaluation of the run. The
+    // defect stopped this trajectory at the seed, six trials in.
     let first_trial = evaluated[1];
     let seed_trajectory: Vec<f64> = evaluated
         .iter()
