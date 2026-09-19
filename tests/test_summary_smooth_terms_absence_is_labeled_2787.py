@@ -16,7 +16,7 @@ pytest.importorskip("gamfit._rust")
 import gamfit
 from gamfit._summary import Summary
 
-_COLUMNS = ["name", "edf", "ref_df", "chi_sq", "p_value"]
+_COLUMNS = ["name", "edf", "ref_df", "chi_sq", "statistic", "p_value", "lambdas"]
 
 
 def _data() -> dict[str, Any]:
