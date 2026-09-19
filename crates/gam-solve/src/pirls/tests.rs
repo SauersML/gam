@@ -4481,8 +4481,8 @@ mod root_cause_tests {
             root[[r, r + 3]] = 1.0;
         }
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            local: root.t().dot(&root),
-            root,
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity: 0,
@@ -4519,7 +4519,6 @@ mod root_cause_tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p,
                     coefficient_lower_bounds: None,
