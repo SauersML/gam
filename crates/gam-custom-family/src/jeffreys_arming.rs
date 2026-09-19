@@ -77,7 +77,7 @@ pub fn fit_custom_family_arming_on_evidence_with_rho_prior<
                 Some(evidence) => (evidence, None),
             },
         };
-    log::info!(
+    log::debug!(
         "[custom-family] arming the Jeffreys/Firth prior on the unarmed fit's evidence: \
          {evidence:?}; warm start from the unarmed mode: {}",
         warm_specs.is_some(),

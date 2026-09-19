@@ -256,10 +256,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
         )));
     }
     let normalized = family_name.to_ascii_lowercase().replace('_', "-");
-    let multinomial = matches!(
-        normalized.as_str(),
-        "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
-    );
+    let multinomial = gam::families::fit_orchestration::is_multinomial_family_name(&normalized);
     let binomial_multi = matches!(
         normalized.as_str(),
         "binomial" | "binomial-logit" | "logistic"
@@ -557,7 +554,8 @@ fn fit_penalized_multinomial_pyfunc<'py>(
 // ---------------------------------------------------------------------------
 //
 // The high-level `gamfit.fit(data, formula, family='multinomial')` Python
-// entry routes through `fit_multinomial_formula_pyfunc` below. The Rust core
+// entry routes through `fit_table`, which calls `fit_multinomial_dataset`
+// below. The Rust core
 // in `gam::families::multinomial::fit_penalized_multinomial_formula` parses
 // the formula, materialises the term-collection design + penalty blocks the
 // same way the standard workflow does, one-hot-encodes the categorical
@@ -575,57 +573,40 @@ fn fit_penalized_multinomial_pyfunc<'py>(
 // FFI share one on-disk contract.
 use gam::families::multinomial::MultinomialModelEnvelope;
 
-/// Fit a penalized multinomial-logit GAM from a Wilkinson formula against
-/// a `headers + rows` table. Returns the bincode-free, serde-JSON model
-/// payload that `gamfit.MultinomialModel` deserialises and stores under
-/// `Model._model_bytes`.
+/// Fit a penalized multinomial-logit GAM from a Wilkinson formula against an
+/// encoded table and return the serde-JSON `MultinomialModelEnvelope` that
+/// `gamfit.MultinomialModel` stores under `_model_bytes`.
 ///
-/// `config_json` is the same canonical fit-config document every formula
-/// family consumes (`gam::config_resolve`). The typed core request honors
-/// `weights` as per-row case weights and rejects fields the softmax family
-/// cannot consume (offsets, noise formulas, manual Firth, ...) instead of
-/// silently dropping them.
-#[pyfunction(signature = (
-    headers,
-    rows,
-    formula,
-    config_json = None,
-))]
-fn fit_multinomial_formula_pyfunc<'py>(
-    py: Python<'py>,
-    headers: Vec<String>,
-    rows: PyRef<'py, PyEncodedTable>,
-    formula: String,
-    config_json: Option<String>,
-) -> PyResult<Py<PyBytes>> {
-    rows.require_headers(&headers).map_err(py_value_error)?;
-    let dataset = rows.dataset.clone();
-    let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
-        let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
-            .map_err(py_value_error)?;
-        let automatic = gam::families::fit_orchestration::expand_automatic_fit_formula(
-            &formula,
-            &dataset,
-            &fit_config,
-        )
-        .map_err(|err| py_value_error(err.to_string()))?;
-        // Typed engine path: `EstimationError` → matching `gamfit.*Error`
-        // subclass via `estimation_error_to_pyerr` (issue #343). The request
-        // carries the same defaults the CLI's `run_fit_multinomial` uses.
-        let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
-            &gam::families::multinomial::MultinomialFitRequest::new(
-                &dataset,
-                &automatic.formula,
-                &fit_config,
-            ),
-        )
-        .map_err(estimation_error_to_pyerr)?;
-        MultinomialModelEnvelope::new(saved)
-            .map_err(estimation_error_to_pyerr)?
-            .to_json_bytes()
-            .map_err(estimation_error_to_pyerr)
-    })?;
-    Ok(PyBytes::new(py, &bytes).unbind())
+/// `fit_table` calls this when the config family names the multinomial
+/// family (`is_multinomial_family_name`), the same predicate the CLI routes
+/// on. `fit_config` is the canonical fit-config document every formula family
+/// consumes; the typed core request honors `weights` as per-row case weights
+/// and rejects fields the softmax family cannot consume (offsets, noise
+/// formulas, manual Firth, ...) instead of silently dropping them. An automatic
+/// `.` term is expanded with the engine rule every front door shares.
+fn fit_multinomial_dataset(
+    dataset: &EncodedDataset,
+    formula: &str,
+    fit_config: &FitConfig,
+) -> PyResult<Vec<u8>> {
+    let automatic =
+        gam::families::fit_orchestration::expand_automatic_fit_formula(formula, dataset, fit_config)
+            .map_err(|err| py_value_error(err.to_string()))?;
+    // Typed engine path: `EstimationError` → matching `gamfit.*Error`
+    // subclass via `estimation_error_to_pyerr` (issue #343). The request
+    // carries the same defaults the CLI's `run_fit_multinomial` uses.
+    let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
+        &gam::families::multinomial::MultinomialFitRequest::new(
+            dataset,
+            &automatic.formula,
+            fit_config,
+        ),
+    )
+    .map_err(estimation_error_to_pyerr)?;
+    MultinomialModelEnvelope::new(saved)
+        .map_err(estimation_error_to_pyerr)?
+        .to_json_bytes()
+        .map_err(estimation_error_to_pyerr)
 }
 
 /// Predict class probabilities for a saved multinomial model. The returned

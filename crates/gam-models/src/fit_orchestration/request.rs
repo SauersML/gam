@@ -345,6 +345,9 @@ pub enum FitResult {
     Ctn(Box<crate::inference::model::FittedModelPayload>),
     Standard(StandardFitResult),
     GaussianLocationScale(GaussianLocationScaleFitResult),
+    /// Joint non-crossing multi-level expectile fit: a Gaussian location-scale
+    /// GAM plus one standardized expectile per requested level.
+    ExpectileLocationScale(ExpectileLocationScaleFitResult),
     BinomialLocationScale(BinomialLocationScaleFitResult),
     DispersionLocationScale(DispersionLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
@@ -379,6 +382,19 @@ pub enum FitResult {
     /// precision, and an exact per-row `predict`; the CLI/FFI save paths build
     /// the persistence payload from its `to_state` snapshot.
     ResidualCascade(gam_solve::residual_cascade::ResidualCascadeFit),
+}
+
+/// Joint multi-level expectile fit `e_τ(x) = μ(x) + c_τ·E[σ(x)]`.
+///
+/// `location_scale` is the REML/LAML-certified Gaussian location-scale GAM in
+/// raw response units; `standardized_expectiles[k]` is the prior-weighted
+/// empirical `levels[k]`-expectile `c_τ` of the standardized residuals
+/// `(yᵢ − μᵢ)/E[σᵢ]`. Levels are strictly increasing and so are the `c_τ`,
+/// which with `σ > 0` makes the curves ordered at every covariate value.
+pub struct ExpectileLocationScaleFitResult {
+    pub location_scale: GaussianLocationScaleFitResult,
+    pub levels: Vec<f64>,
+    pub standardized_expectiles: Vec<f64>,
 }
 
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
@@ -582,19 +598,22 @@ pub struct FitConfig {
     pub transformation_normal_config: Option<TransformationNormalConfig>,
     /// Optional non-negative per-row training weights column.
     pub weight_column: Option<String>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `family = "expectile"`.
+    /// Expectile levels `τ ∈ (0, 1)` for `family = "expectile"`.
     ///
-    /// When `family` resolves to `"expectile"` the fit minimizes the
-    /// Newey–Powell asymmetric squared loss `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with
-    /// `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, tracing the conditional
-    /// `τ`-expectile — the smooth analogue of the `τ`-quantile. `τ = 0.5`
-    /// reduces exactly to the Gaussian-identity mean fit. The whole penalized
-    /// smooth + REML `λ`-selection machinery is reused via a Least
-    /// Asymmetrically Weighted Squares (LAWS) outer loop. `None` defaults to
-    /// the median expectile `τ = 0.5` when the family is `"expectile"`; it is
-    /// ignored for every other family. The asymmetry may also be written inline
-    /// as `family = "expectile(0.9)"`, which fills this field at resolve time.
-    pub expectile_tau: Option<f64>,
+    /// When `family` resolves to `"expectile"` each level traces the
+    /// conditional `τ`-expectile — the minimizer of the Newey–Powell
+    /// asymmetric squared loss `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with `wᵢ(τ) = τ` if
+    /// `yᵢ > μᵢ` else `1 − τ`, the smooth analogue of the `τ`-quantile.
+    ///
+    /// One level is fitted directly by Least Asymmetrically Weighted Squares
+    /// (LAWS) over the penalized Gaussian-identity GAM; `τ = 0.5` reduces
+    /// exactly to the mean fit. Several levels (strictly increasing) are one
+    /// joint location-scale fit `e_τ(x) = μ(x) + c_τ·σ(x)` whose curves cannot
+    /// cross anywhere (see `fit_expectile_location_scale`). `None` defaults to
+    /// the single median level `[0.5]`. The levels may also be written inline
+    /// as `family = "expectile(0.9)"` or `family = "expectile(0.1, 0.9)"`;
+    /// both spellings together must agree.
+    pub expectile_tau: Option<Vec<f64>>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,
     /// A previously fitted CTN, applied unchanged to training and prediction.
@@ -686,27 +705,6 @@ pub struct FitConfig {
     /// resolution for that smooth only. This is in-process orchestration state,
     /// never a user knob or environment setting.
     pub spatial_center_counts: Option<Vec<Option<usize>>>,
-    /// Whether to precompute the distribution-free conformal substrates (#942
-    /// jackknife+, #1098 exact full-conformal) at fit time and persist them on
-    /// the saved model. `None` keeps the historical behaviour of precomputing
-    /// whenever the fit is eligible; `Some(false)` skips both.
-    ///
-    /// The trade-off, measured on `y ~ s(x1,k=6) + s(x2,k=6)` (#2633): the two
-    /// substrates are **94% of a saved Gaussian model at n=20,000** (10.2 MB of
-    /// 10.85 MB) and grow linearly with the training rows, because they are
-    /// per-row. Rebuilding both costs **~5.6 ms**, 0.3% of the fit that produced
-    /// them. So keeping them buys single-digit milliseconds at roughly half a
-    /// kilobyte per training row, forever — turning the flag off yields a **~16x
-    /// smaller** model (10.85 MB -> ~0.65 MB at n=20,000).
-    ///
-    /// It is opt-OUT rather than opt-in for one reason: rebuilding a substrate
-    /// needs the training design AND response back, and a saved model
-    /// deliberately does not carry the training rows. So a model that will be
-    /// shipped to a host that never sees the training data must keep them, or it
-    /// cannot produce a conformal interval at all. Turn this off when the caller
-    /// retains its training data, fits in batch, or never asks for conformal
-    /// intervals; leave it alone when the model has to stand on its own.
-    pub precompute_conformal: Option<bool>,
     /// Whether the fit computes and publishes a coefficient covariance (and the
     /// standard errors derived from it). `None` keeps each family's own
     /// default, which for every path that reaches this field today is "yes";
@@ -738,7 +736,6 @@ pub struct FitConfig {
 impl Default for FitConfig {
     fn default() -> Self {
         Self {
-            precompute_conformal: None,
             compute_covariance: None,
             warm_start: None,
             family: None,
@@ -815,7 +812,7 @@ pub struct UnidentifiedScalarTerm {
 /// The result of materializing a formula + config against a dataset.
 pub struct MaterializedModel<'a> {
     pub request: FitRequest<'a>,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms materialization removed as unidentified. Empty for every
     /// request that does not prune scalar terms.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,

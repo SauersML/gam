@@ -304,7 +304,7 @@ pub(crate) fn rank_seeds_with_screening(
     });
 
     let cascade_start = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[STAGE] {context}: seed screening cascade start seeds={} initial_cap={} stages={}",
         seeds.len(),
         initial_cap,
@@ -320,7 +320,7 @@ pub(crate) fn rank_seeds_with_screening(
             screening_cap.store(cap, Ordering::Relaxed);
             // Announce the evaluation before it runs: a slow inner solve is
             // otherwise silent until it ends (gam#2943).
-            log::info!(
+            log::debug!(
                 "[STAGE] {context}: seed-screen START stage={} seed={}/{} cap={}",
                 stage,
                 idx + 1,
@@ -332,7 +332,7 @@ pub(crate) fn rank_seeds_with_screening(
             let seed_elapsed = seed_started.elapsed().as_secs_f64();
             match result {
                 Ok(cost) if cost.is_finite() => {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s cost={:.6e}",
                         stage,
                         idx + 1,
@@ -344,7 +344,7 @@ pub(crate) fn rank_seeds_with_screening(
                     Ok(cost)
                 }
                 Ok(cost) => {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s cost=non-finite ({:.3e})",
                         stage,
                         idx + 1,
@@ -360,7 +360,7 @@ pub(crate) fn rank_seeds_with_screening(
                 // refused seed does not discard every finished screening solve
                 // (gam#2943). Any other error still ends the fit.
                 Err(error) if error.is_trial_point_infeasible() => {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s rejected: {error}",
                         stage,
                         idx + 1,
@@ -371,7 +371,7 @@ pub(crate) fn rank_seeds_with_screening(
                     Ok(f64::NAN)
                 }
                 Err(error) => {
-                    log::info!(
+                    log::debug!(
                         "[STAGE] {context}: seed-screen stage={} seed={}/{} cap={} elapsed={:.3}s fatal evaluator error: {error}",
                         stage,
                         idx + 1,
@@ -389,7 +389,7 @@ pub(crate) fn rank_seeds_with_screening(
              ranked,
              rejected,
          }| {
-            log::info!(
+            log::debug!(
                 "[STAGE] {context}: seed-screen stage={} cap={} elapsed={:.3}s ranked={} rejected={}",
                 stage,
                 cap,
@@ -398,7 +398,7 @@ pub(crate) fn rank_seeds_with_screening(
                 rejected,
             );
             if ranked > 0 && stage > 0 {
-                log::info!(
+                log::debug!(
                     "[OUTER] {context}: seed screening cap escalated from {} to {} \
                      (initial cap was too shallow for this problem; {}/{} seeds ranked)",
                     initial_cap,
@@ -417,7 +417,7 @@ pub(crate) fn rank_seeds_with_screening(
     let final_cap_used = cascade_result.final_cap;
     let stages_consumed = cascade_result.stages_consumed;
     let ranked = cascade_result.ranked_indices;
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: seed screening cascade complete elapsed={:.3}s stages_used={} final_cap={} ranked={}/{}",
         cascade_start.elapsed().as_secs_f64(),
         stages_consumed,
@@ -427,7 +427,7 @@ pub(crate) fn rank_seeds_with_screening(
     );
 
     if ranked.is_empty() {
-        log::warn!(
+        log::debug!(
             "[OUTER] {context}: no seed reached a finite screening cost within the declared \
              screening budget ({} seeds, {} rejected, {} capped stages up to cap {}); \
              keeping the generated order",
@@ -484,7 +484,7 @@ pub(crate) fn rank_seeds_with_screening(
             .into_iter()
             .partition(|seed| !seed_is_oversmoothing_boundary(seed, rho_dim, &upper));
         if !interior.is_empty() && !boundary.is_empty() {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: demoted {} over-smoothing boundary seed(s) below {} \
                  interior seed(s) so the outer descent does not originate on the flat \
                  ρ=bound plateau",
@@ -529,7 +529,7 @@ pub(crate) fn rank_seeds_with_screening(
             {
                 if most_flexible_idx != 0 {
                     let flexible = ordered.remove(most_flexible_idx);
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: promoted the most-flexible interior seed \
                          (Σρ={:.3}) to the front so the low-λ basin gets a full-budget \
                          solve (capped screening systematically under-ranks it)",
@@ -576,7 +576,7 @@ pub(crate) fn rank_seeds_with_screening(
                     && heaviest_idx > 1
                 {
                     let heavy = ordered.remove(heaviest_idx);
-                    log::info!(
+                    log::debug!(
                         "[OUTER] {context}: promoted the heaviest interior seed (Σρ={:.3}) to \
                          the second full-budget slot so a budget-limited non-Gaussian multi-start \
                          also solves the well-penalized basin (#1426: a non-separable λ→0 stall \
@@ -589,7 +589,7 @@ pub(crate) fn rank_seeds_with_screening(
         }
     }
 
-    log::debug!(
+    log::trace!(
         "[OUTER] {context}: seed screening ranked {}/{} candidates at cap={} \
          (initial cap={}, stages used={}); rejected={}",
         ordered.len() - rejected,

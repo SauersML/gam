@@ -120,11 +120,12 @@ pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
 };
 pub use smooth_term_summary::{
-    BlockPrologue, mean_predictor_block, smooth_term_summary_rows, smooth_term_summary_rows_after,
+    BlockPrologue, mean_predictor_block, smooth_pvalue_unavailable, smooth_term_summary_rows,
+    smooth_term_summary_rows_after,
 };
 pub use summary::{
     ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary,
+    ParametricTermSummary, SmoothPValueUnavailable, SmoothTermSummary,
 };
 
 #[cfg(test)]
@@ -133,6 +134,8 @@ mod binomial_reml_outer_cost_1575_tests;
 mod inner_residual_charge_2954_tests;
 #[cfg(test)]
 mod ridge_continuity_tests;
+#[cfg(test)]
+mod wide_design_reml_derivatives_tests;
 #[cfg(test)]
 mod continuous_order_tests;
 #[cfg(test)]

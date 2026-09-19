@@ -2243,7 +2243,7 @@ impl SaeManifoldTerm {
             wrote = true;
         }
         if telemetry_components > 0 {
-            log::debug!(
+            log::trace!(
                 "[SAE-BARRIER] separation curvature: components={telemetry_components} \
                  edges={telemetry_edges} carrier_values={telemetry_carrier_values} \
                  dense={dense_beta_curvature} in {:.3} s",

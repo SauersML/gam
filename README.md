@@ -159,8 +159,8 @@ against the frozen dictionary, memory `O(N·top_k)` — the LLM-scale path).
 Fits mint only from a converged, certificate-checked optimization.
 
 ```python no-exec
-fit = gamfit.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
-                              assignment="topk", top_k=8)   # K >> p, topology=auto
+fit = gamfit.sae.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
+                                  assignment="topk", top_k=8)   # K >> p, topology=auto
 census = Counter(fit.atom_topologies)     # which shapes the evidence kept
 codes = fit.encode(acts_new)              # sparse support + amplitude + coordinate
 curve = fit.atom_curve(k, ts)             # the atom's decoded manifold, sampled
@@ -288,13 +288,15 @@ variance for Gamma, Beta, negative-binomial, and Tweedie:
 gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
 ```
 
-Conformal prediction intervals. `interval="conformal"` gives the exact
-full-conformal set (Gaussian-identity); with a held-out `calibration` table it
-gives the split-conformal band for any standard family, like
-`gam predict --conformal --calibration`:
+Conformal prediction intervals. `interval="conformal"` with the labeled
+`training_data` gives the exact full-conformal set (Gaussian-identity) at the
+frozen smoothing parameters; with a held-out `calibration` table it gives the
+split-conformal band for any standard family, like
+`gam predict --conformal --training-data` / `--calibration`. The saved model
+holds no per-row training data, so full conformal takes the rows again:
 
 ```python
-model.predict(test, interval="conformal", conformal_level=0.9)
+model.predict(test, interval="conformal", training_data=df, conformal_level=0.9)
 model.predict(test, interval="conformal", calibration=held_out, conformal_level=0.9)
 ```
 
@@ -361,7 +363,7 @@ print the calibrated thresholds:
 
 ```python
 import gamfit
-print(gamfit.format_cuda_diagnostics())
+print(gamfit.cuda.format_cuda_diagnostics())
 ```
 
 The wheel is compiled against the CUDA 12 driver/userspace ABI. If PyTorch has

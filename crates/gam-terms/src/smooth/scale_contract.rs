@@ -1316,7 +1316,7 @@ mod tests {
                 frozen_parametric_residualization: None,
                 name: "scale-contract-wrapper".to_string(),
                 basis,
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             &mut BasisWorkspace::new(),
@@ -1692,9 +1692,10 @@ mod tests {
                 frozen_parametric_residualization: None,
                 name: "matern".to_string(),
                 basis: zoo_basis(BasisScaleFamily::Matern),
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
 
         let error = frozen

@@ -147,7 +147,7 @@ pub(crate) fn fit_survival_marginal_slope_terms(
             )));
         }
         refinements += 1;
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope latent-z] declared law compression refinement {refinements}: \
              {} of {} converged anchors missed 10⁻³·SE (largest {:e}); refining at {} of their \
              inputs and refitting (gam#2928)",
@@ -469,7 +469,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
     if let Some(compressed) = declared_law_compression.as_ref() {
         let grid = compressed.grid();
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope latent-z] declared latent law of {} atoms compressed to {} \
              nodes in {} bins for the anchor (gam#2928)",
             compressed.atoms(),
@@ -643,7 +643,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         &spec.time_block.derivative_offset_exit,
         probit_scale,
     );
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] baseline seed slope={:.6e} elapsed={:.3}s",
         baseline_slope,
         baseline_started.elapsed().as_secs_f64(),
@@ -1139,7 +1139,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if marginal_installed {
             hints_mut.marginal_beta = Some(pilot_marginal_beta.clone());
         }
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] #2627 location warm start: \
              time_installed={time_installed} (len={} vs design_exit={}), \
              marginal_installed={marginal_installed} (len={} vs marginal={}), \
@@ -1613,14 +1613,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             gam_solve::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
     if outer_cache_seed_available {
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
             n,
             setup.rho_dim(),
         );
     } else {
         let pilot_started = std::time::Instant::now();
-        log::info!(
+        log::debug!(
             "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} slope_p={}",
             n,
             design_exit.ncols(),
@@ -1696,7 +1696,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         hints_mut.slope_beta = Some(beta.clone());
                     }
                 }
-                log::info!(
+                log::debug!(
                     "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s hints_installed={}",
                     if converged { "converged" } else { "partial" },
                     cycles,
@@ -1730,7 +1730,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 // actually accept); outer-inner-fit does not because it operates
                 // at the penalised optimum where identifiability is a hard
                 // contract.
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope/pilot] end status=ignored-error elapsed={:.3}s error={}",
                     pilot_started.elapsed().as_secs_f64(),
                     err,
@@ -1762,7 +1762,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     }
 
     let derivative_probe_started = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] initial derivative probe start rho_dim={} log_kappa_dim={}",
         setup.rho_dim(),
         setup.log_kappa_dim(),
@@ -1854,7 +1854,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && joint_hessian.is_analytic()
         && psi_curvature_exact;
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] initial derivative probe end gradient_analytic={} hessian_analytic={} elapsed={:.3}s",
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
@@ -1943,7 +1943,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         Ok(layout)
     };
 
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope/outer] solve start rho_dim={} log_kappa_dim={} aux_dim={}",
         setup.rho_dim(),
         setup.log_kappa_dim(),
@@ -1997,7 +1997,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 "survival-marginal-slope outer-inner-fit: specs/designs length mismatch",
             );
             let eval_started = std::time::Instant::now();
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
                 theta.len(),
             );
@@ -2052,7 +2052,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     hints_mut.link_dev_beta = Some(block.beta.clone());
                 }
             }
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
                 eval_started.elapsed().as_secs_f64(),
                 fit.inner_cycles,
@@ -2067,7 +2067,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
          owned_value_mode| {
             use gam_problem::EvalMode;
             let eval_started = std::time::Instant::now();
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={} rows={}",
                 eval_mode,
                 theta.len(),
@@ -2085,13 +2085,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         if !exact_mode_branch.borrow_mut().install_seed(ws) {
-                            log::debug!(
+                            log::trace!(
                                 "[SMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
                             );
                         }
                     }
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             "[SMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
                         );
                     }
@@ -2134,7 +2134,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 )
             };
             let selection = if let Some(value_selection) = owned_value_mode {
-                log::info!(
+                log::debug!(
                     "[SMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
                 );
                 upgrade_custom_family_joint_hyper_mode_shared(
@@ -2152,7 +2152,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     .borrow_mut()
                     .candidates(effective_mode, theta, &rho);
                 if first_iterate {
-                    log::info!(
+                    log::debug!(
                         "[SMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                     );
                 }
@@ -2178,7 +2178,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     "exact survival marginal-slope inner solve did not converge".to_string()
                 );
             }
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope/outer-eval] end objective={:.6e} mode={:?} elapsed={:.3}s",
                 selection.result.objective,
                 eval_mode,
@@ -2207,7 +2207,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 // aborting, and without violating the analytic-route contract
                 // (an infeasible eval owes no Hessian). A genuinely feasible mode
                 // (analytic Hessian present) is byte-identical.
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope/outer-eval] no analytic outer Hessian at this ρ \
                      (pseudo-objective={:.6e}, mode={:?}) — the constrained inner mode is \
                      indefinite (not a Laplace mode); reporting the profiled objective as +∞ so \
@@ -2243,14 +2243,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let solved = match solved {
         Ok(s) => s,
         Err(e) => {
-            log::warn!(
+            log::debug!(
                 "[survival-marginal-slope/outer] solve FAILED n={n} elapsed={:.3}s reason={e}",
                 fit_started.elapsed().as_secs_f64(),
             );
             return Err(e);
         }
     };
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope/outer] solve end n={n} elapsed={:.3}s outer_iters={} inner_cycles={} certified",
         fit_started.elapsed().as_secs_f64(),
         solved.fit.outer_iterations,
@@ -2332,7 +2332,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             // Certifying solves each anchor's root on both laws.
             let (record, missed) =
                 compressed.certify_anchors(&anchors).map_err(FitFailure::numerical)?;
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] declared law compression ledger: {} atoms, {} \
                  bins, {} nodes; {} of {} converged anchors certified within 10⁻³ of their \
                  sampling standard error; largest certified error {:e} ({:e} standard errors); \
@@ -2486,7 +2486,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             ..
         } = &mut latent_law_consumed
         {
-            log::warn!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
                  the score fails the standard-normal adequacy screen (adequacy ledger, x = \
                  statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
@@ -2502,7 +2502,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         } = &mut latent_law_consumed
         {
             if certificate.closed_form_chosen {
-                log::info!(
+                log::debug!(
                     "[survival-marginal-slope latent-z] the closed form is certified at the \
                      converged fit: {} (gam#2926)",
                     certificate.summary()
@@ -2518,7 +2518,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                      {reason}",
                     certificate.summary()
                 );
-                log::warn!(
+                log::debug!(
                     "[survival-marginal-slope latent-z] the closed form stays uncertified: {missing} \
                      (gam#2926)"
                 );
@@ -2529,7 +2529,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     missing,
                 });
             } else {
-                log::info!(
+                log::debug!(
                     "[survival-marginal-slope latent-z] at the converged closed-form fit the \
                      estimated law is expected to be the more accurate anchor ({}); re-solving on \
                      it from the closed-form coefficients (gam#2926)",
@@ -2626,7 +2626,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .collect::<Result<Vec<_>, _>>()?;
         let certificate = candidates.certify(&spec.weights, &losses)?;
         if certificate.chosen == certificate.fitted {
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] the {} law is certified at the converged fit: \
                  {} (gam#2926)",
                 certificate.fitted.label(),
@@ -2639,7 +2639,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 *slot = Some(certificate);
             }
         } else {
-            log::info!(
+            log::debug!(
                 "[survival-marginal-slope latent-z] at the converged {} fit the moving-law \
                  certificate chooses the {} law ({}); re-solving on it from these coefficients \
                  (gam#2926)",

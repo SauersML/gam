@@ -9,7 +9,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);
-    let mut inference_notes = Vec::new();
+    let mut inference_notes = FitNotes::default();
 
     let noise_formula = config
         .noise_formula
@@ -69,10 +69,6 @@ pub(crate) fn materialize_location_scale<'a>(
         config.smooth_overrides.as_ref(),
         None,
     )?;
-    // Sample size vs basis rank, summed across the mean and log-σ smooths
-    // (#309). Both designs share the same n_rows.
-    check_smooth_capacity(&meanspec, y.len(), &parsed.response)?;
-    check_smooth_capacity(&log_sigmaspec, y.len(), &parsed.response)?;
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let mean_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;

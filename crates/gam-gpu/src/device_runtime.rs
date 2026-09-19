@@ -103,7 +103,7 @@ impl GpuRuntime {
             Ok(()) => probe_loaded_driver(),
             Err(GpuError::DriverLibraryUnavailable { reason }) => {
                 Self::record_cpu_reason(reason.clone());
-                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(&reason);
                 Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable { reason }))
             }
@@ -130,7 +130,7 @@ impl GpuRuntime {
             Ok(()) => {}
             Err(GpuError::DriverLibraryUnavailable { reason }) => {
                 Self::record_cpu_reason(reason.clone());
-                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(&reason);
                 return Ok(GpuAvailability::Absent(GpuAbsence::DriverUnavailable { reason }));
             }
@@ -153,7 +153,7 @@ impl GpuRuntime {
             if let Err(error) = crate::driver::require_cuda_compute_library(stem) {
                 let reason = format!("lib{stem} unavailable: {error}");
                 Self::record_cpu_reason(reason.clone());
-                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(&reason);
                 return Err(GpuError::RuntimeDependencyUnavailable { reason });
             }
@@ -167,7 +167,7 @@ impl GpuRuntime {
             if let Err(error) = require_cudarc_library(library) {
                 let reason = format!("cudarc cannot open lib{}: {error}", library.name());
                 Self::record_cpu_reason(reason.clone());
-                log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                log::debug!("[GPU] CUDA acceleration disabled: {reason}");
                 diagnostics::log_cuda_disabled(&reason);
                 return Err(GpuError::RuntimeDependencyUnavailable { reason });
             }
@@ -187,7 +187,7 @@ impl GpuRuntime {
                 if let Some(absence) = absence_from_driver_init_error(&error) {
                     let reason = absence.to_string();
                     Self::record_cpu_reason(reason.clone());
-                    log::info!("[GPU] CUDA acceleration disabled: {reason}");
+                    log::debug!("[GPU] CUDA acceleration disabled: {reason}");
                     diagnostics::log_cuda_disabled(&reason);
                     return Ok(GpuAvailability::Absent(absence));
                 }
@@ -349,7 +349,7 @@ impl GpuRuntime {
         // First reason wins: the earliest fallback is the one that explains the
         // rest. A later reason is dropped deliberately, and visibly.
         if let Err(dropped) = CPU_REASON.set(reason.into()) {
-            log::debug!(
+            log::trace!(
                 "CPU fallback reason already recorded as {:?}; keeping it and dropping '{dropped}'",
                 CPU_REASON.get().map(String::as_str)
             );
@@ -496,7 +496,7 @@ fn bind_and_touch_runtime(ordinal: usize, ctx: &Arc<CudaContext>) -> bool {
     }
     // `cudaSetDevice` in the runtime touch is cudarc's first libcudart call (#2972).
     if let Err(error) = require_cudarc_library(CudarcLibrary::Runtime) {
-        log::debug!("[GPU] cuda_context_for ordinal={ordinal}: {error}");
+        log::trace!("[GPU] cuda_context_for ordinal={ordinal}: {error}");
         return false;
     }
     let bound = ctx.bind_to_thread().is_ok();
@@ -565,7 +565,7 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
     Ok(GpuDeviceInfo {
         ordinal,
         name: result::device::get_name(device).unwrap_or_else(|err| {
-            log::debug!(
+            log::trace!(
                 "CUDA device {ordinal}: name query failed ({err}); using a positional label"
             );
             format!("CUDA device {ordinal}")

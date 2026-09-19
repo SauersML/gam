@@ -3,7 +3,7 @@
 //! RECOVERABLE infeasible-ρ probe the outer optimizer steers around, not a fatal
 //! error.
 //!
-//! Repro (from the issue): `gamfit.sae_manifold_fit` on
+//! Repro (from the issue): `gamfit.sae.sae_manifold_fit` on
 //! `X = rng.normal(size=(120, 32))`, `K = 6`, `d_atom = 1`,
 //! `atom_topology = "circle"`, `assignment = "ordered_beta_bernoulli"`, `alpha = "auto"`
 //! terminated the Python PROCESS with exit 137 (SIGKILL) — uncatchable by

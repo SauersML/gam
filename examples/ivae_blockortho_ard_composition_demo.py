@@ -17,13 +17,13 @@ def main() -> None:
     gamfit.fit(
         {"y": y.tolist()},
         "y ~ s(t, type='duchon', centers=24)",
-        latents={"t": gamfit.LatentCoord(n=n, d=d, init=t0)},
+        latents={"t": gamfit.smooth.LatentCoord(n=n, d=d, init=t0)},
         penalties=[
-            gamfit.IvaeRidgeMeanGauge(u, weight=4.0, n_eff=n, target="t"),
-            gamfit.BlockOrthogonalityPenalty(
+            gamfit.penalties.IvaeRidgeMeanGauge(u, weight=4.0, n_eff=n, target="t"),
+            gamfit.penalties.BlockOrthogonalityPenalty(
                 [[0, 1, 2], [3, 4, 5]], weight=12.0, n_eff=n, target="t"
             ),
-            gamfit.ARDPenalty(target="t"),
+            gamfit.penalties.ARDPenalty(target="t"),
         ],
     )
     print("fit latent GAM with iVAE, block orthogonality, and ARD penalties")

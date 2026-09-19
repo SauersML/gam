@@ -420,7 +420,7 @@ impl ResidualBlockRuntime {
                 .map_err(unavailable)?,
         };
         if let Some(model) = conditional.as_ref() {
-            log::info!(
+            log::debug!(
                 "[BMS residual repair] joint (z, r) covariance escalated to Σ(a): {} pair(s) fired \
                  the conditional gate",
                 model

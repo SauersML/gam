@@ -193,7 +193,7 @@ class InterchangeSwapDecoder(nn.Module):
     Examples
     --------
     >>> import torch
-    >>> from gamfit import InterchangeSwapDecoder
+    >>> from gamfit.torch import InterchangeSwapDecoder
     >>> dec = InterchangeSwapDecoder(D=8, F=4)
     >>> x_hat = dec(torch.randn(3, 4))
     >>> z_a, z_b = torch.randn(3, 4), torch.randn(3, 4)

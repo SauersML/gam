@@ -100,17 +100,17 @@ impl SaeManifoldTerm {
                     ) {
                         Ok(gated) => Some(gated),
                         Err(err) => {
-                            log::debug!("[SAE-ROOT] root step trial residual: {err}");
+                            log::trace!("[SAE-ROOT] root step trial residual: {err}");
                             None
                         }
                     },
                     Err(err) => {
-                        log::debug!("[SAE-ROOT] root step trial assembly: {err}");
+                        log::trace!("[SAE-ROOT] root step trial assembly: {err}");
                         None
                     }
                 },
                 Err(err) => {
-                    log::debug!("[SAE-ROOT] root step application: {err}");
+                    log::trace!("[SAE-ROOT] root step application: {err}");
                     None
                 }
             };
@@ -118,7 +118,7 @@ impl SaeManifoldTerm {
                 Some((trial_gate, trial_band))
                     if Self::root_gate_contracts(gate, gate_band, trial_gate, trial_band) =>
                 {
-                    log::info!(
+                    log::debug!(
                         "[SAE-ROOT] committed: gate ‖g‖ {gate:.6e} → {trial_gate:.6e} (bands \
                          {gate_band:.6e} → {trial_band:.6e})"
                     );
@@ -137,7 +137,7 @@ impl SaeManifoldTerm {
                             .band_refused_commits
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    log::info!(
+                    log::debug!(
                         "[SAE-ROOT] root at gate ‖g‖ {gate:.6e} (band {gate_band:.6e}): the exact \
                          Newton trial left (gate, band) = {other:?}"
                     );
@@ -227,7 +227,7 @@ impl SaeManifoldTerm {
             match self.factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options) {
                 Ok(factor) => factor,
                 Err(err) => {
-                    log::debug!("[SAE-ROOT] no root step: deflated evidence factor: {err}");
+                    log::trace!("[SAE-ROOT] no root step: deflated evidence factor: {err}");
                     return Ok(None);
                 }
             };
@@ -246,7 +246,7 @@ impl SaeManifoldTerm {
                 .0
                 .rounding_floor_stops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] root at its rounding floor: gate ‖g‖ {gate:.6e} is inside its \
                  formation band {gate_band:.6e}, so no step from it can be resolved"
             );
@@ -281,7 +281,7 @@ impl SaeManifoldTerm {
             let exact = match self.exact_a_evidence_system(target, rho_fixed, &sys, 1.0) {
                 Ok(exact) => exact,
                 Err(err) => {
-                    log::debug!("[SAE-ROOT] no root step: arrow exact-A system: {err}");
+                    log::trace!("[SAE-ROOT] no root step: arrow exact-A system: {err}");
                     return Ok(None);
                 }
             };
@@ -292,20 +292,20 @@ impl SaeManifoldTerm {
                         .0
                         .unfactorable_no_steps
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    log::info!(
+                    log::debug!(
                         "[SAE-ROOT] no root step: the arrow exact-A system does not factor at \
                          ridge 0, so it has no exact Newton step: {reason}"
                     );
                     return Ok(None);
                 }
                 Err(err) => {
-                    log::debug!("[SAE-ROOT] no root step: arrow exact-A solve: {err}");
+                    log::trace!("[SAE-ROOT] no root step: arrow exact-A solve: {err}");
                     return Ok(None);
                 }
             }
         };
         if !(step.t.iter().all(|v| v.is_finite()) && step.beta.iter().all(|v| v.is_finite())) {
-            log::debug!("[SAE-ROOT] no root step: the exact Newton step is not finite");
+            log::trace!("[SAE-ROOT] no root step: the exact Newton step is not finite");
             return Ok(None);
         }
         Self::remove_unit_stiffened_directions_from_flat(
@@ -520,7 +520,7 @@ impl SaeManifoldTerm {
                         &factor.cache,
                     )?;
                     if verdict.admits() {
-                        log::info!(
+                        log::debug!(
                             "[SAE-ROOT] accepted at the refined root [{}]: ‖g‖={:.6e} \
                              ‖Π⊥null g‖={:.6e} after {} inner iterations",
                             verdict.tag(),
@@ -536,19 +536,19 @@ impl SaeManifoldTerm {
                         .0
                         .uncertified_refinements
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    log::info!(
+                    log::debug!(
                         "[SAE-ROOT] the refined root does not certify [{}]: {verdict}; pricing the \
                          accepted state",
                         verdict.tag(),
                     );
                 }
-                Err(err) => log::info!(
+                Err(err) => log::debug!(
                     "[SAE-ROOT] the deflated evidence factor at the refined root failed ({err}); \
                      pricing the accepted state"
                 ),
             }
         } else {
-            log::info!(
+            log::debug!(
                 "[SAE-ROOT] the evidence re-entry at the refined state did not recur; pricing \
                  the accepted state"
             );

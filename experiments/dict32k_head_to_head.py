@@ -4,7 +4,7 @@ TopK-SAE, at deployment scale, over a sharded residual-stream corpus.
 Three arms, all at MATCHED decoder-scalar budget (``K·d``) and matched active-code
 count (``L0``), same epochs, same held-out split:
 
-  * **ARM A — block-sparse T1** (:class:`gamfit.BlockSparseDictStream`): ``n_blocks``
+  * **ARM A — block-sparse T1** (:class:`gamfit.sae.BlockSparseDictStream`): ``n_blocks``
     blocks of ``block_size`` orthonormal atoms (``K = n_blocks·block_size``),
     streamed multi-epoch over the shards, then ``to_fit(sample)`` →
     ``seed_manifest`` (the Tier-2 hand-off).
@@ -136,7 +136,7 @@ def run_arm_a(reader, test: np.ndarray, sample: np.ndarray, cfg: dict, out_prefi
     import gamfit
 
     t0 = time.time()
-    stream = gamfit.block_sparse_dictionary_fit_begin(
+    stream = gamfit.sae.block_sparse_dictionary_fit_begin(
         sample,
         cfg["n_blocks"],
         block_size=cfg["block_size"],

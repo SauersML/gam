@@ -203,16 +203,18 @@ pub(crate) fn resolved_resource_policy(
 }
 
 /// Parse, materialize, and fit a model in one call.
-/// Resolve the expectile asymmetry `τ` requested by `config`, if any.
+/// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(τ))` when `config.family` is `"expectile"` (optionally with
-/// an inline asymmetry, `"expectile(0.9)"`), `Ok(None)` for every other family,
-/// and `Err` when an expectile request carries an out-of-range `τ`. The inline
-/// form takes precedence over the explicit [`FitConfig::expectile_tau`] field
-/// only when both are present and disagree is rejected as a contradiction; when
-/// neither pins `τ`, the median expectile `τ = 0.5` (the ordinary mean fit) is
-/// the default.
-pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>, WorkflowError> {
+/// Returns `Ok(Some(levels))` when `config.family` is `"expectile"` (optionally
+/// with inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`),
+/// `Ok(None)` for every other family, and `Err` when an expectile request is
+/// malformed: a level outside `(0, 1)`, levels that are not strictly
+/// increasing, or inline levels that contradict [`FitConfig::expectile_tau`].
+/// When neither spelling pins the levels, the single median level `[0.5]` (the
+/// ordinary mean fit) is the default.
+pub fn expectile_levels_for_config(
+    config: &FitConfig,
+) -> Result<Option<Vec<f64>>, WorkflowError> {
     let Some(raw) = config.family.as_deref() else {
         return Ok(None);
     };
@@ -222,40 +224,110 @@ pub(crate) fn expectile_tau_for_config(config: &FitConfig) -> Result<Option<f64>
         return Ok(None);
     }
     let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline asymmetry: `expectile(0.9)`.
-    let inline_tau = if let Some(rest) = lower.strip_prefix("expectile(") {
+    // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
+    let inline_levels = if let Some(rest) = lower.strip_prefix("expectile(") {
         let inner = rest.strip_suffix(')').ok_or_else(|| {
             invalid(format!(
-                "expectile family asymmetry must be written as `expectile(τ)`; got `{trimmed}`"
+                "expectile family levels must be written as `expectile(τ)` or \
+                 `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
             ))
         })?;
-        let value: f64 = inner.trim().parse().map_err(|_| {
-            invalid(format!(
-                "expectile asymmetry `{}` is not a finite number",
-                inner.trim()
-            ))
-        })?;
-        Some(value)
+        let levels = inner
+            .split(',')
+            .map(|item| {
+                item.trim().parse::<f64>().map_err(|_| {
+                    invalid(format!(
+                        "expectile level `{}` is not a finite number",
+                        item.trim()
+                    ))
+                })
+            })
+            .collect::<Result<Vec<f64>, _>>()?;
+        Some(levels)
     } else {
         None
     };
-    let tau = match (inline_tau, config.expectile_tau) {
-        (Some(a), Some(b)) if (a - b).abs() > 0.0 => {
+    let levels = match (inline_levels, config.expectile_tau.clone()) {
+        (Some(a), Some(b)) if a != b => {
             return Err(invalid(format!(
-                "expectile asymmetry given both inline (`expectile({a})`) and via expectile_tau \
-                 ({b}); supply exactly one"
+                "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
+                 ({b:?}); supply exactly one"
             )));
         }
         (Some(a), _) => a,
         (None, Some(b)) => b,
-        (None, None) => 0.5,
+        (None, None) => vec![0.5],
     };
-    if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+    if levels.is_empty() {
+        return Err(invalid(
+            "expectile_tau must name at least one expectile level".to_string(),
+        ));
+    }
+    for &tau in &levels {
+        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
+            return Err(invalid(format!(
+                "expectile level τ must be finite and strictly in (0, 1); got {tau}"
+            )));
+        }
+    }
+    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(invalid(format!(
-            "expectile asymmetry τ must be finite and strictly in (0, 1); got {tau}"
+            "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
         )));
     }
-    Ok(Some(tau))
+    Ok(Some(levels))
+}
+
+/// Prior-weighted empirical `τ`-expectile of `z` in closed form.
+///
+/// The expectile is the unique root `c` of the strictly decreasing, piecewise
+/// linear estimating function
+/// `g(c) = τ·Σ_{zᵢ>c} pᵢ(zᵢ − c) − (1 − τ)·Σ_{zᵢ≤c} pᵢ(c − zᵢ)`.
+/// Sorting `z` and carrying the prefix sums `A = Σ p`, `B = Σ p·z` over the
+/// rows below the root's segment, `g` is linear on that segment and vanishes
+/// exactly at `c = [τ(Z − B) + (1 − τ)B] / [τ(P − A) + (1 − τ)A]` with totals
+/// `P`, `Z`. The segment is the first one whose right sorted endpoint has
+/// `g ≤ 0`; no iteration or tolerance is involved.
+fn weighted_empirical_expectile(z: &[f64], p: &[f64], tau: f64) -> Result<f64, String> {
+    if z.len() != p.len() || z.is_empty() {
+        return Err(format!(
+            "weighted expectile needs matching non-empty inputs; got {} values and {} weights",
+            z.len(),
+            p.len()
+        ));
+    }
+    if z.iter().any(|v| !v.is_finite()) || p.iter().any(|w| !w.is_finite() || *w < 0.0) {
+        return Err(
+            "weighted expectile needs finite values and finite non-negative weights".to_string(),
+        );
+    }
+    let mut order: Vec<usize> = (0..z.len()).collect();
+    order.sort_by(|&a, &b| z[a].total_cmp(&z[b]));
+    let total_p: f64 = p.iter().sum();
+    let total_z: f64 = z.iter().zip(p).map(|(v, w)| v * w).sum();
+    if !(total_p > 0.0) {
+        return Err("weighted expectile needs a positive total weight".to_string());
+    }
+    let root = |below_p: f64, below_z: f64| {
+        (tau * (total_z - below_z) + (1.0 - tau) * below_z)
+            / (tau * (total_p - below_p) + (1.0 - tau) * below_p)
+    };
+    let (mut below_p, mut below_z) = (0.0_f64, 0.0_f64);
+    for &i in &order {
+        let at = z[i];
+        let (upto_p, upto_z) = (below_p + p[i], below_z + p[i] * z[i]);
+        let g = tau * ((total_z - upto_z) - at * (total_p - upto_p))
+            - (1.0 - tau) * (at * upto_p - upto_z);
+        if g <= 0.0 {
+            // The root lies on the segment ending at `at`, whose lower set is
+            // the rows strictly before this one.
+            return Ok(root(below_p, below_z).min(at));
+        }
+        below_p = upto_p;
+        below_z = upto_z;
+    }
+    // Unreachable for positive total weight: g at the largest value is ≤ 0.
+    Ok(root(below_p, below_z))
 }
 
 /// Per-row asymmetric LAWS weight `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, scaled
@@ -391,7 +463,7 @@ fn expectile_kkt_residual(
 
 #[cfg(test)]
 mod expectile_convergence_tests {
-    use super::{ExpectileSignCycle, expectile_kkt_residual};
+    use super::{ExpectileSignCycle, expectile_kkt_residual, weighted_empirical_expectile};
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::array;
 
@@ -454,6 +526,70 @@ mod expectile_convergence_tests {
         )
         .expect("scaled KKT audit");
         assert!((base_kkt - scaled_kkt).abs() <= f64::EPSILON.sqrt());
+    }
+
+    /// `g(c)` from the doc comment of `weighted_empirical_expectile`.
+    fn expectile_estimating_function(z: &[f64], p: &[f64], tau: f64, c: f64) -> f64 {
+        z.iter()
+            .zip(p)
+            .map(|(&v, &w)| {
+                if v > c {
+                    tau * w * (v - c)
+                } else {
+                    -(1.0 - tau) * w * (c - v)
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn weighted_expectile_is_the_exact_root_of_the_estimating_function() {
+        let z = [0.3, -1.7, 2.4, 0.3, -0.2, 5.1, -3.3];
+        let p = [1.0, 0.5, 2.0, 0.0, 1.5, 0.25, 1.0];
+        for tau in [0.02, 0.1, 0.3, 0.5, 0.7, 0.9, 0.98] {
+            let c = weighted_empirical_expectile(&z, &p, tau).expect("expectile");
+            let scale: f64 = z.iter().zip(&p).map(|(v, w)| w * v.abs()).sum();
+            let g = expectile_estimating_function(&z, &p, tau, c);
+            assert!(g.abs() <= 1.0e-13 * scale, "tau={tau}: g(c)={g:e}");
+        }
+    }
+
+    #[test]
+    fn weighted_expectile_at_one_half_is_the_weighted_mean() {
+        let z = [4.0, -2.0, 1.0, 7.5];
+        let p = [1.0, 3.0, 0.5, 2.0];
+        let mean = z.iter().zip(&p).map(|(v, w)| v * w).sum::<f64>() / p.iter().sum::<f64>();
+        let c = weighted_empirical_expectile(&z, &p, 0.5).expect("expectile");
+        assert!((c - mean).abs() <= 1.0e-14 * mean.abs().max(1.0));
+    }
+
+    #[test]
+    fn weighted_expectile_is_strictly_increasing_in_the_level() {
+        let z = [0.9, -0.4, 1.3, -2.2, 0.1, 3.0];
+        let p = [1.0; 6];
+        let levels = [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99];
+        let values: Vec<f64> = levels
+            .iter()
+            .map(|&tau| weighted_empirical_expectile(&z, &p, tau).expect("expectile"))
+            .collect();
+        assert!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "expectiles not strictly increasing: {values:?}"
+        );
+        assert!(values[0] > -2.2 && values[values.len() - 1] < 3.0);
+    }
+
+    #[test]
+    fn weighted_expectile_ignores_zero_weight_rows_and_rejects_bad_input() {
+        let with_dead = weighted_empirical_expectile(&[1.0, 100.0, 3.0], &[1.0, 0.0, 1.0], 0.8)
+            .expect("expectile");
+        let without = weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
+        assert!((with_dead - without).abs() <= 1.0e-15);
+        assert!(weighted_empirical_expectile(&[], &[], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[0.0, 0.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, f64::NAN], &[1.0, 1.0], 0.5).is_err());
+        assert!(weighted_empirical_expectile(&[1.0, 2.0], &[1.0, -1.0], 0.5).is_err());
     }
 }
 
@@ -822,7 +958,8 @@ fn deterministic_gaussian_standard_fit(
             // the data pin every direction the face leaves free. When they do
             // not -- `free_dim > n` makes `A` singular by construction, since
             // `rank(X Z) <= n`, and a double-penalized smooth deliberately
-            // admits `p > n` (`bspline_basis_min_rows`) -- the unpenalized
+            // admits `p > n` (only `n > M_p` is required, see
+            // `reject_prefit_unidentifiable_unpenalized_space`) -- the unpenalized
             // interpolant the boundary was built from is not the optimum at
             // all: with a penalty on those directions the criterion's
             // `log|X'WX + S_λ| - log|S_λ|₊` terms move the optimum off the
@@ -1573,7 +1710,7 @@ pub fn fit_from_formula(
 /// authoritative materialization pass.
 pub struct FormulaFitResult {
     pub result: FitResult,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms the training rows could not identify, removed before the fit.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 }
@@ -1594,9 +1731,10 @@ pub fn fit_from_formula_with_notes(
         return fit_expanded_formula_with_notes(formula, data, config);
     }
     let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
-    let mut notes = automatic.notes;
-    notes.append(&mut outcome.inference_notes);
-    outcome.inference_notes = notes;
+    // The expansion is an advisory: the fitted formula is not the literal one.
+    let mut advisories = automatic.notes;
+    advisories.append(&mut outcome.inference_notes.advisories);
+    outcome.inference_notes.advisories = advisories;
     Ok(outcome)
 }
 
@@ -1608,7 +1746,10 @@ fn fit_expanded_formula_with_notes(
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
         let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
             formula.to_string(), data, config)?;
-        return Ok(FormulaFitResult { inference_notes: payload.inference_notes.clone(),
+        return Ok(FormulaFitResult { inference_notes: FitNotes {
+                                        advisories: payload.inference_notes.clone(),
+                                        informational: payload.informational_notes.clone(),
+                                    },
                                     unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
                                     result: FitResult::Ctn(Box::new(payload)) });
     }
@@ -1639,7 +1780,7 @@ pub(crate) fn fit_materialized_standard_with_notes(
     data: &Dataset,
     config: &FitConfig,
     request: StandardFitRequest<'_>,
-    inference_notes: Vec<String>,
+    inference_notes: FitNotes,
 ) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
@@ -1983,8 +2124,8 @@ fn fit_from_formula_once_with_notes(
     // `family = "expectile"`. Every other family falls through unchanged.
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
-            result: FitResult::Standard(result),
-            inference_notes: Vec::new(),
+            result: result.into_fit_result(),
+            inference_notes: FitNotes::default(),
             unidentified_scalar_terms: Vec::new(),
         });
     }
@@ -2095,7 +2236,7 @@ fn fit_materialized_once_with_notes(
 fn attach_basis_adequacy(
     result: FitResult,
     covariate_frame: Option<StandardFitData<'_>>,
-    mut inference_notes: Vec<String>,
+    mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
     let FitResult::Standard(mut standard) = result else {
@@ -2112,7 +2253,7 @@ fn attach_basis_adequacy(
             &standard.resolvedspec,
             &standard.fit,
         );
-        inference_notes.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
+        inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,
         ));
     }
@@ -2145,11 +2286,225 @@ pub(crate) fn fit_expectile_if_requested(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
-    match expectile_tau_for_config(config)? {
-        Some(tau) => Ok(Some(fit_expectile_laws(formula, data, config, tau)?)),
-        None => Ok(None),
+) -> Result<Option<ExpectileFit>, WorkflowError> {
+    let Some(levels) = expectile_levels_for_config(config)? else {
+        return Ok(None);
+    };
+    match levels.as_slice() {
+        [tau] => Ok(Some(ExpectileFit::Single(fit_expectile_laws(
+            formula, data, config, *tau,
+        )?))),
+        _ => Ok(Some(ExpectileFit::Joint(fit_expectile_location_scale(
+            formula, data, config, levels,
+        )?))),
     }
+}
+
+/// The two shapes an expectile request resolves to.
+pub(crate) enum ExpectileFit {
+    /// One level: the LAWS fit of that level alone.
+    Single(StandardFitResult),
+    /// Several levels: one joint non-crossing location-scale fit.
+    Joint(ExpectileLocationScaleFitResult),
+}
+
+impl ExpectileFit {
+    pub(crate) fn into_fit_result(self) -> FitResult {
+        match self {
+            Self::Single(result) => FitResult::Standard(result),
+            Self::Joint(result) => FitResult::ExpectileLocationScale(result),
+        }
+    }
+}
+
+/// The log-σ formula of a joint expectile fit: the caller's `noise_formula`, or
+/// else the mean formula's right-hand side, so `σ(x)` is as flexible as `μ(x)`.
+pub(crate) fn expectile_noise_formula(
+    formula: &str,
+    config: &FitConfig,
+) -> Result<String, WorkflowError> {
+    match config.noise_formula.as_deref() {
+        Some(noise) => Ok(noise.to_string()),
+        None => formula
+            .split_once('~')
+            .map(|(_, rhs)| rhs.trim().to_string())
+            .ok_or_else(|| WorkflowError::InvalidConfig {
+                reason: format!("expectile formula `{formula}` has no `~`"),
+            }),
+    }
+}
+
+/// Joint non-crossing multi-level expectile fit.
+///
+/// Fitting each level on its own lets the curves cross: nothing ties the
+/// separately penalized surfaces together, and under heteroscedasticity their
+/// slopes differ, so they meet as soon as the data (or an extrapolation) is far
+/// enough from the centre. The joint model is the location-scale expectile
+///
+/// ```text
+///   e_τ(x) = μ(x) + c_τ·σ(x),     y = μ(x) + σ(x)·ε,  ε ⟂ x,
+/// ```
+///
+/// under which every conditional expectile of `y | x` has exactly this form,
+/// with `c_τ` the `τ`-expectile of `ε`. `μ` and `σ` are the Gaussian
+/// location-scale GAM (`noise_formula`, defaulting to the mean formula's
+/// right-hand side), so both surfaces carry their own function penalties and
+/// REML/LAML-selected smoothing and come only from a certified fit. `c_τ` is the
+/// prior-weighted empirical `τ`-expectile of the standardized residuals
+/// `(yᵢ − μᵢ)/E[σᵢ]`, solved in closed form.
+///
+/// The expectile of a fixed sample is strictly increasing in `τ`, and
+/// `σ(x) > 0` everywhere (the link has a positive floor), so for `τ₁ < τ₂`
+/// `e_τ₂(x) − e_τ₁(x) = (c_τ₂ − c_τ₁)·σ(x) > 0` at *every* `x`, extrapolation
+/// included. Ordering is a property of the construction, never a post-hoc sort.
+///
+/// `σ` enters as its posterior mean `E[σ] = f + exp(m + v/2)` under the log-σ
+/// block's conditional Gaussian posterior `N(m, v)` — the same functional the
+/// predictor evaluates — and `μ` is identity-linked, so its plug-in is its
+/// posterior mean.
+fn fit_expectile_location_scale(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    levels: Vec<f64>,
+) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
+    use gam_linalg::matrix::DenseDesignOperator;
+    use gam_problem::BlockRole;
+
+    if config.frailty.is_active() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
+                .to_string(),
+        });
+    }
+    let noise_formula = expectile_noise_formula(formula, config)?;
+    let location_scale_config = FitConfig {
+        family: Some("gaussian".to_string()),
+        link: Some("identity".to_string()),
+        expectile_tau: None,
+        frailty: FrailtySpec::None,
+        noise_formula: Some(noise_formula),
+        ..config.clone()
+    };
+    let mat = materialize(formula, data, &location_scale_config)?;
+    let FitRequest::GaussianLocationScale(request) = mat.request else {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "joint expectile regression is only defined for a Gaussian location-scale \
+                     response (non-survival, non-latent)"
+                .to_string(),
+        });
+    };
+    if request.wiggle.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "expectile regression does not support flexible-link wiggle".to_string(),
+        });
+    }
+    let y = request.spec.y.clone();
+    let prior_weights = request.spec.weights.clone();
+    let mean_offset = request.spec.mean_offset.clone();
+    let log_sigma_offset = request.spec.log_sigma_offset.clone();
+    let FitResult::GaussianLocationScale(location_scale) =
+        fit_model(FitRequest::GaussianLocationScale(request))?
+    else {
+        return Err(raised_fit_failure(
+            FailureCategory::Invariant,
+            "joint expectile: the Gaussian location-scale request returned another fit kind"
+                .to_string(),
+        ));
+    };
+
+    let invariant = |reason: String| {
+        raised_fit_failure(FailureCategory::Invariant, format!("joint expectile: {reason}"))
+    };
+    let fit = &location_scale.fit;
+    let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)
+        .ok_or_else(|| invariant("fit has no location block".to_string()))?;
+    let beta_sigma = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .map(|block| block.beta.clone())
+        .ok_or_else(|| invariant("fit has no scale block".to_string()))?;
+    let mu = fit
+        .mean_design
+        .apply(beta_mu.view())
+        .map_err(|error| invariant(format!("could not evaluate the mean design: {error}")))?
+        + &mean_offset;
+    let eta_sigma = fit
+        .noise_design
+        .apply(beta_sigma.view())
+        .map_err(|error| invariant(format!("could not evaluate the log-σ design: {error}")))?
+        + &log_sigma_offset;
+    let n = y.len();
+    if mu.len() != n || eta_sigma.len() != n || prior_weights.len() != n {
+        return Err(invariant(format!(
+            "row counts disagree: y={n}, μ={}, η_σ={}, weights={}",
+            mu.len(),
+            eta_sigma.len(),
+            prior_weights.len()
+        )));
+    }
+    // Posterior variance of η_σ per row from the Scale block of the joint
+    // conditional covariance (coefficient layout `[mean | scale]`).
+    let p_mu = beta_mu.len();
+    let p_sigma = beta_sigma.len();
+    let log_sigma_variance = match fit.fit.beta_covariance() {
+        Some(covariance) => {
+            if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
+                return Err(invariant(format!(
+                    "covariance is {}x{}, smaller than the {} location-scale coefficients",
+                    covariance.nrows(),
+                    covariance.ncols(),
+                    p_mu + p_sigma
+                )));
+            }
+            let scale_block = covariance
+                .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
+                .to_owned();
+            fit.noise_design
+                .design
+                .quadratic_form_diag(&scale_block)
+                .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?
+        }
+        None => Array1::zeros(n),
+    };
+    let sigma_floor =
+        location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+    let standardized: Vec<f64> = (0..n)
+        .map(|i| {
+            let sigma = gam_model_kernels::sigma_link::logb_sigma_posterior_mean_with_floor_scalar(
+                sigma_floor,
+                eta_sigma[i],
+                log_sigma_variance[i],
+            );
+            (y[i] - mu[i]) / sigma
+        })
+        .collect();
+    let prior_weights = prior_weights.to_vec();
+    let standardized_expectiles = levels
+        .iter()
+        .map(|&tau| weighted_empirical_expectile(&standardized, &prior_weights, tau))
+        .collect::<Result<Vec<f64>, String>>()
+        .map_err(|reason| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {reason}"))
+        })?;
+    if standardized_expectiles
+        .windows(2)
+        .any(|pair| !(pair[0] < pair[1]))
+    {
+        return Err(raised_fit_failure(
+            FailureCategory::Input,
+            format!(
+                "joint expectile: the standardized residual expectiles {standardized_expectiles:?} \
+                 at levels {levels:?} are not strictly increasing — the standardized residuals \
+                 carry no spread to order the levels by"
+            ),
+        ));
+    }
+    Ok(ExpectileLocationScaleFitResult {
+        location_scale,
+        levels,
+        standardized_expectiles,
+    })
 }
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
@@ -2472,7 +2827,7 @@ fn publish_expectile_sandwich_covariance(
             ExpectileSandwichRequiresDenseCovariance {
                 coefficients: fit.beta.len(),
             };
-        log::warn!("[expectile] {}", declined.explain());
+        log::debug!("[expectile] {}", declined.explain());
         fit.covariance_corrected = None;
         if let Some(inference) = fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
@@ -2610,7 +2965,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -2785,7 +3140,7 @@ pub fn residual_cascade_fast_path(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;

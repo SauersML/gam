@@ -32,7 +32,7 @@ struct KappaTraceLogger;
 
 impl log::Log for KappaTraceLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         let message = record.args().to_string();
@@ -48,7 +48,7 @@ static KAPPA_TRACE_LOGGER: KappaTraceLogger = KappaTraceLogger;
 fn install_kappa_trace_logger() {
     // Losing the race to an already-installed logger leaves that logger in place.
     if log::set_logger(&KAPPA_TRACE_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 
@@ -158,9 +158,10 @@ fn fitted_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
                 feature_cols: vec![0, 1],
                 spec,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     let weights = Array1::<f64>::ones(data.nrows());
     let offset = Array1::<f64>::zeros(data.nrows());

@@ -110,9 +110,6 @@ class PosteriorPredictive:
         )
 
 
-_NO_MODEL: bytes = b""
-
-
 def _call(name: str, *args: Any) -> Any:
     from ._binding import rust_module
     from ._exceptions import map_exception
@@ -168,6 +165,9 @@ class PosteriorSamples:
     ess: float
     converged: bool
     method: str
+    # Metropolis acceptance rate of the draws; ``None`` for a sampler with no
+    # accept/reject step.
+    acceptance_rate: float | None
     exact: bool
     covariance_source: str
     model_class: str
@@ -175,7 +175,8 @@ class PosteriorSamples:
     config: SamplingConfig
     # Serialized exact inverse-link identity (JSON); see PosteriorPredictive.
     link_spec: str
-    _model_bytes: bytes = field(repr=False, compare=False, default=_NO_MODEL)
+    # Compiled fitted model (the ``Model``'s Rust handle) that drew these samples.
+    _model: Any = field(repr=False, compare=False, default=None)
     _name_index: Mapping[str, int] = field(repr=False, compare=False, default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -187,7 +188,7 @@ class PosteriorSamples:
         )
 
     @classmethod
-    def from_ffi_payload(cls, payload: Mapping[str, Any], *, model_bytes: bytes = _NO_MODEL) -> "PosteriorSamples":
+    def from_ffi_payload(cls, payload: Mapping[str, Any], *, model: Any = None) -> "PosteriorSamples":
         import numpy as np
         p = payload
         samples = np.asarray(p["samples"], dtype=np.float64)
@@ -203,12 +204,15 @@ class PosteriorSamples:
                    mean=np.asarray(p.get("posterior_mean", []), dtype=float),
                    std=np.asarray(p.get("posterior_std", []), dtype=float),
                    rhat=float(p["rhat"]), ess=float(p["ess"]), converged=bool(p["converged"]),
-                   method=str(p["method"]), exact=bool(p["exact"]),
+                   method=str(p["method"]),
+                   acceptance_rate=(None if p["acceptance_rate"] is None
+                                    else float(p["acceptance_rate"])),
+                   exact=bool(p["exact"]),
                    covariance_source=str(p["covariance_source"]),
                    model_class=str(p.get("model_class", "standard")),
                    family_kind=str(p.get("family_kind", "identity")),
                    link_spec=_required_link_spec(p, source="FFI sample payload"),
-                   config=_config_from_payload(p.get("config", {})), _model_bytes=model_bytes)
+                   config=_config_from_payload(p.get("config", {})), _model=model)
 
     @property
     def n_draws(self) -> int: return int(self.samples.shape[0])
@@ -219,8 +223,9 @@ class PosteriorSamples:
     @property
     def is_exact(self) -> bool:
         """Whether the draws target the exact posterior (NUTS, Polya-Gamma
-        Gibbs) rather than a Gaussian approximation of it (any Laplace form).
-        Decided by the sampler that ran, not by the model class."""
+        Gibbs, Polya-Gamma Gibbs with a Jeffreys Metropolis step) rather than
+        a Gaussian approximation of it (any Laplace form). Decided by the
+        sampler that ran, not by the model class."""
         return self.exact
 
     def __len__(self) -> int: return self.n_draws
@@ -264,6 +269,7 @@ class PosteriorSamples:
         return Summary.from_dict({
             "kind": "posterior_samples",
             "method": self.method,
+            "acceptance_rate": self.acceptance_rate,
             "exact": self.exact,
             "covariance_source": self.covariance_source,
             "model_class": self.model_class,
@@ -280,7 +286,7 @@ class PosteriorSamples:
 
     def _need_model(self) -> None:
         # allow-list (a): FFI input validation
-        if not self._model_bytes:
+        if self._model is None:
             raise RuntimeError("PosteriorSamples has no model context; predict requires the original Model. "
                                "Re-sample via Model.sample(...) or use Model.predict(...) directly.")
 
@@ -307,7 +313,7 @@ class PosteriorSamples:
         samples = np.ascontiguousarray(np.asarray(self.samples, dtype=np.float64))
         parsed = _call(
             "posterior_predict_bands_table",
-            self._model_bytes,
+            self._model,
             h,
             r,
             samples,
@@ -339,7 +345,7 @@ class PosteriorSamples:
         self._need_model()
         h, r = self._normalize(new_data)
         samples = np.ascontiguousarray(np.asarray(self.samples, dtype=np.float64))
-        p = _call("posterior_predict_table", self._model_bytes, h, r, samples)
+        p = _call("posterior_predict_table", self._model, h, r, samples)
         eta = np.asarray(p["eta"], dtype=float)
         mean = np.asarray(p["mean"], dtype=float)
         # allow-list (a): FFI input validation
@@ -353,10 +359,11 @@ class PosteriorSamples:
                 str(p.get("model_class", self.model_class)), link_spec)
 
     def plot_trace(self, *, coefficients: Any = None, max_panels: int = 8) -> Any:
-        import matplotlib.pyplot as plt
+        from ._matplotlib import pyplot
         import numpy as np
         import pandas as pd
 
+        plt = pyplot()
         selection = json.loads(_call(
             "posterior_trace_selection_json",
             json.dumps({
@@ -388,7 +395,10 @@ class PosteriorSamples:
 
     def __repr__(self) -> str:
         return (f"PosteriorSamples(n_draws={self.n_draws}, n_coeffs={self.n_coeffs}, "
-                f"method={self.method!r}, rhat={self.rhat:.4f}, ess={self.ess:.1f}, "
+                f"method={self.method!r}, "
+                + ("" if self.acceptance_rate is None
+                   else f"acceptance_rate={self.acceptance_rate:.4f}, ")
+                + f"rhat={self.rhat:.4f}, ess={self.ess:.1f}, "
                 f"converged={self.converged})")
 
     def _repr_html_(self) -> str:
