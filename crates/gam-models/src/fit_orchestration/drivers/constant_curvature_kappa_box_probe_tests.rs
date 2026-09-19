@@ -411,8 +411,9 @@ mod constant_curvature_kappa_range_identification_tests {
         // What the FIT writes back: the range this criterion profiles to at one
         // κ. Taken at the box's hyperbolic end, which is where `ℓ̂` is furthest
         // from the auto rule.
-        let derived = ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
-            .expect("profile is constructible from an auto-range spec");
+        let derived =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible from an auto-range spec");
         let anchor_kappa = -0.9 * cap;
         let (eta_at_anchor, _, _) = derived
             .minimize_over_eta(anchor_kappa)
@@ -453,9 +454,9 @@ mod constant_curvature_kappa_range_identification_tests {
                     b.to_string(),
                     "κ={kappa}: the two profiles refuse for different reasons"
                 ),
-                (a, b) => panic!(
-                    "κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}"
-                ),
+                (a, b) => {
+                    panic!("κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}")
+                }
             }
         }
     }
