@@ -29,6 +29,58 @@ fn stratum_run_end(
     }
 }
 
+/// The non-converged checkpoint a trust-region run leaves when it stops without a
+/// convergence claim but with the iterate it stopped at: its budget ran out, or its
+/// region (or cubic regularisation) reached the reject floor with no accepted step.
+///
+/// The run measured that iterate, and it is resumable work: the checkpoint slot
+/// retains it and the terminal certificate judges it from a fresh evaluation. A stop
+/// is never a failure that discards what the run measured (#2953: a dense ARC run
+/// whose regularisation saturated next to the prior mode, 7e4 below the point the fit
+/// then returned, used to end in `RemlOptimizationFailed` and lose its iterate). When
+/// the cost-stall guard saw a feasible iterate below the last one, that iterate is the
+/// checkpoint instead, so a degenerate box corner the trajectory wandered to does not
+/// over-shrink a supported penalty direction (#1371). Either way it is non-converged,
+/// so only the certify/reseed ladder can mint it (#1476).
+fn stopped_run_checkpoint(
+    context: &str,
+    stop: &str,
+    last_solution: Solution,
+    best_feasible: Option<CostStallExit>,
+    the_plan: OuterPlan,
+) -> OuterResult {
+    match best_feasible {
+        Some(best)
+            if best.value.is_finite()
+                && (!last_solution.final_value.is_finite()
+                    || best.value < last_solution.final_value) =>
+        {
+            log::warn!(
+                "[OUTER] {context}: {stop} last iterate (value={:.6e}) is worse than the best \
+                 feasible iterate seen (value={:.6e}); substituting the best iterate so a \
+                 degenerate box-corner does not over-shrink a supported penalty direction \
+                 (#1371). The substituted iterate is a non-converged checkpoint, never a \
+                 converged fit (#1476).",
+                last_solution.final_value,
+                best.value,
+            );
+            let mut result = outer_result_with_gradient_norm(
+                best.rho,
+                best.value,
+                // The run spent its whole budget; `best.iterations` is only the index of
+                // the iterate adopted here.
+                last_solution.iterations,
+                Some(best.grad_norm),
+                false,
+                the_plan,
+            );
+            result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
+            result
+        }
+        _ => solution_into_outer_result(last_solution, false, the_plan),
+    }
+}
+
 /// A one-shot reseed retry returns its own outcome, and that outcome knows only
 /// the reseed's iterations. Fold in what the enclosing attempt already spent, so
 /// the total covers every start (#2817).
@@ -1122,8 +1174,15 @@ pub(crate) fn run_outer_with_plan(
                                     None => "n/a".to_string(),
                                 },
                             );
-                            let mut result =
-                                solution_into_outer_result(report.solution, false, *the_plan);
+                            // The guard's own best feasible iterate is not published on
+                            // this route, so the stopped iterate is the checkpoint.
+                            let mut result = stopped_run_checkpoint(
+                                context,
+                                "matrix-free TR reject-floor",
+                                report.solution,
+                                None,
+                                *the_plan,
+                            );
                             result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
@@ -1371,40 +1430,38 @@ pub(crate) fn run_outer_with_plan(
                             // converged fit, so it flows into the checkpoint slot
                             // and the post-run certify/reseed ladder decides
                             // whether it can be minted (#1371, #1476).
-                            match best_exit {
-                                Some(best)
-                                    if best.value.is_finite()
-                                        && (!last_solution.final_value.is_finite()
-                                            || best.value < last_solution.final_value) =>
-                                {
-                                    log::warn!(
-                                        "[OUTER] {context}: ARC budget-exhaustion last iterate \
-                                         (value={:.6e}) is worse than the best feasible iterate \
-                                         seen (value={:.6e}); substituting the best iterate so a \
-                                         degenerate box-corner does not over-shrink a supported \
-                                         penalty direction (#1371). The substituted iterate is a \
-                                         non-converged checkpoint, never a converged fit.",
-                                        last_solution.final_value,
-                                        best.value,
-                                    );
-                                    let mut result = outer_result_with_gradient_norm(
-                                        best.rho,
-                                        best.value,
-                                        // The run spent its whole budget; `best.iterations`
-                                        // is only the index of the iterate adopted here.
-                                        last_solution.iterations,
-                                        Some(best.grad_norm),
-                                        false,
-                                        *the_plan,
-                                    );
-                                    result.origin =
-                                        OuterResultOrigin::ArcBestIterateSubstitution;
-                                    Ok(result)
-                                }
-                                _ => {
-                                    Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                                }
-                            }
+                            Ok(stopped_run_checkpoint(
+                                context,
+                                "ARC budget-exhaustion",
+                                *last_solution,
+                                best_exit,
+                                *the_plan,
+                            ))
+                        }
+                        // The cubic regularisation reached its ceiling with no accepted step
+                        // (#2953). `opt` hands back the iterate the run stopped at, so it is a
+                        // checkpoint like a budget exit, not a failure that loses it.
+                        Err(ArcError::TrustRegionRejectFloor { last_solution }) => {
+                            log::warn!(
+                                "[OUTER warning] {context}: ARC regularization reached its ceiling \
+                                 with no accepted step at final_value={:.6e} |g|={:.3e} | {}; the \
+                                 iterate is kept as a checkpoint for the terminal certificate \
+                                 (#2953)",
+                                last_solution.final_value,
+                                last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                                arc_census
+                                    .describe()
+                                    .unwrap_or_else(|| "no step observed".to_string()),
+                            );
+                            let best_exit =
+                                cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
+                            Ok(stopped_run_checkpoint(
+                                context,
+                                "ARC reject-floor",
+                                *last_solution,
+                                best_exit,
+                                *the_plan,
+                            ))
                         }
                         Err(ArcError::ObjectiveFailed { message })
                             if message == ARC_INFEASIBLE_STALL_SENTINEL =>

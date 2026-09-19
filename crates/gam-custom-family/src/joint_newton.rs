@@ -5322,19 +5322,22 @@ pub(crate) fn compute_kkt_refusal_report(
         .iter()
         .map(|maybe_rows| maybe_rows.as_ref().map(|v| v.len()).unwrap_or(0))
         .sum();
-    let any_block_has_constraints = block_constraints.iter().any(|c| c.is_some());
 
     let diagnosis = if hpen_spectrum_unavailable || hpen_nullity_at_rank_tol > 0 {
         KktRefusalDiagnosis::RankDeficientHPen
-    } else if any_block_has_constraints
-        && cached_active_sets.iter().any(|s| s.is_some())
-        && projected_residual_inf > residual_tol
-    {
-        // Well-conditioned H_pen, the user has bound constraints, the current
-        // active set already pinned some rows, yet the projected residual is
-        // still many tolerances above the threshold. The cert refused
-        // *because* the projection captured part of the multiplier but not
-        // all of it — i.e. the active set is missing a row.
+    } else if active_set_rows_total > 0 && projected_residual_inf > residual_tol {
+        // Well-conditioned H_pen, the current active set already pinned some
+        // rows, yet the projected residual is still many tolerances above the
+        // threshold. The cert refused *because* the projection captured part
+        // of the multiplier but not all of it — i.e. the active set is missing
+        // a row.
+        //
+        // The joint path scatters an EMPTY row list into every constrained
+        // block, so `Some(rows)` alone says only that a block has constraints.
+        // Counting rows is what makes "already pinned" true: with none pinned
+        // the projection captured nothing, and no row owns the residual
+        // (gam#3019: all 23 early-exit refusals of the survival link-deviation
+        // fixture, s4b job 1332832 arm A, had active_set_rows_total=0).
         KktRefusalDiagnosis::ActiveSetIncomplete
     } else {
         KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH

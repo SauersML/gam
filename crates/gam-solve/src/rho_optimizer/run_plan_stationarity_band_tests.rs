@@ -782,7 +782,8 @@ fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
 ///
 /// #2954 added the Newton-decrement verdict on rounding bands, the same exact
 /// curvature judged against the arithmetic's resolution instead of an n-scaled
-/// tolerance, in its deciding and its undecided form.
+/// tolerance, in its deciding and its undecided form. The typed refusals of its
+/// polish (#2954, #3012) are not stationarity standards and do not claim it.
 #[test]
 fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
     let rungs = [
@@ -795,6 +796,7 @@ fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
         StationarityBoundSource::NewtonDecrement,
         StationarityBoundSource::NewtonDecrementUndecided,
         StationarityBoundSource::RepresentabilityFace,
+        StationarityBoundSource::NewtonBacktrackUnresolved,
     ];
     let derived: Vec<&'static str> = rungs
         .iter()
@@ -837,6 +839,7 @@ fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
         | StationarityBoundSource::CallerRequirement
         | StationarityBoundSource::NewtonDecrement
         | StationarityBoundSource::NewtonDecrementUndecided
-        | StationarityBoundSource::RepresentabilityFace) = rung;
+        | StationarityBoundSource::RepresentabilityFace
+        | StationarityBoundSource::NewtonBacktrackUnresolved) = rung;
     }
 }
