@@ -438,8 +438,6 @@ __all__ = [
     "torch_smooth_dispatch_key",
     "transformation_score_table",
     "validate_formula_json",
-    "vec_to_array1_f64",
-    "weighted_auc_from_predictions",
     "weighted_sum_to_zero_transform",
     "whole_set_containment",
     "write_survival_csv",
@@ -2266,10 +2264,6 @@ def torch_smooth_dispatch_key(spec_kind: str) -> str: ...
 def transformation_score_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable) -> NDArray[np.float64]: ...
 
 def validate_formula_json(headers: Sequence[str], rows: _EncodedTable, formula: str, config_json: str | None) -> str: ...
-
-def vec_to_array1_f64(values: Sequence[float]) -> NDArray[np.float64]: ...
-
-def weighted_auc_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float], weights: Sequence[float]) -> float: ...
 
 def weighted_sum_to_zero_transform(basis: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
 

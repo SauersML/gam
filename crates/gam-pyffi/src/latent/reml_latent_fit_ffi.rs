@@ -3467,9 +3467,11 @@ fn curvature_inference_json(
 /// #1063 per-term LR significance report for every penalized smooth term:
 /// `statistic_lr`, `ref_df`, `bartlett_factor`,
 /// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`, and
+/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
 /// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`).
+/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
+/// Every row carries every key.
 ///
 /// Unlike `summary_json` (Wood rank-truncated **Wald** χ²), this computes a
 /// genuine **likelihood-ratio** statistic by a constrained refit dropping each

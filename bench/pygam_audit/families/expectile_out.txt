@@ -1,0 +1,7 @@
+gamfit    tau=0.05 RMSE 0.0859 cover95 0.807 time 1.22s
+gamfit    tau=0.50 RMSE 0.0617 cover95 0.947 time 0.23s
+gamfit    tau=0.95 RMSE 0.1007 cover95 0.727 time 1.70s
+pygam_gs  tau=0.05 RMSE 0.0819 cover95 1.000 time 38.89s
+pygam_gs  tau=0.50 RMSE 0.0564 cover95 0.960 time 25.21s
+pygam_gs  tau=0.95 RMSE 0.0902 cover95 1.000 time 41.76s
+grid points (of 300 ) where fitted expectiles cross: {'gamfit': 0, 'pygam_gs': 0}
