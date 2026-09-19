@@ -1492,7 +1492,7 @@ pub fn build_survival_time_basis(
                         degree: knot_degree,
                         penalty_order: 2,
                         knotspec: BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
+                            num_internal_knots,
                             placement,
                             adaptive: false,
                         },
@@ -4741,7 +4741,7 @@ pub fn build_time_varying_survival_covariate_template(
         degree: time_degree,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
             adaptive: false,
         },
