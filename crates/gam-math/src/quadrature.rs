@@ -271,24 +271,30 @@ pub fn standard_normal_gauss_hermite_rule(
         .collect())
 }
 
+/// Whether the order-`order` [`standard_normal_gauss_hermite_rule`] builds with every
+/// weight positive (#784). The extreme weight of an `n`-node rule decays like `e^{−2n}`, so
+/// past a few hundred nodes it underflows and the rule no longer represents its mass.
+pub fn standard_normal_gauss_hermite_order_is_representable(order: usize) -> bool {
+    standard_normal_gauss_hermite_rule(order)
+        .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
+}
+
 /// The largest order whose [`standard_normal_gauss_hermite_rule`] builds with every weight
-/// positive, where every lower order does too (#784). A block quadrature refuses the next
-/// order, so an order search that raises one order at a time stops exactly here.
+/// positive, where every lower order does too (#784): the order an order search that raises
+/// one order at a time and asks [`standard_normal_gauss_hermite_order_is_representable`] of
+/// the next order stops at.
 ///
 /// Measured once per process from this arithmetic and this rule builder, so no order
-/// ceiling is chosen. The scan ends because the extreme weight of an `n`-node rule decays
-/// like `e^{−2n}` and underflows at a few hundred nodes.
+/// ceiling is chosen. The scan builds every rule up to the first that underflows, `O(N³)`
+/// over a few hundred orders (about 0.6 s), so the order search never runs it: it asks
+/// only of the order it raises to.
 pub fn max_representable_standard_normal_gauss_hermite_order() -> usize {
     static MAX_REPRESENTABLE_ORDER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX_REPRESENTABLE_ORDER.get_or_init(|| {
-        let representable = |order: usize| {
-            standard_normal_gauss_hermite_rule(order)
-                .is_ok_and(|rule| rule.iter().all(|&(_, weight)| weight > 0.0))
-        };
         let mut order = 1usize;
         while order
             .checked_add(1)
-            .is_some_and(|next| representable(next))
+            .is_some_and(standard_normal_gauss_hermite_order_is_representable)
         {
             order += 1;
         }
