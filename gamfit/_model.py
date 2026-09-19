@@ -33,7 +33,9 @@ from ._survival import (
     term_blocks_for_model,
 )
 from ._tables import (
+    detect_table_kind,
     normalize_table,
+    numpy_table_width,
     restore_output_table,
     table_columns,
 )
@@ -165,7 +167,11 @@ class Model:
             Input rows in any format accepted by :func:`gamfit.fit`
             (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
-            cover every predictor referenced by the fitted formula.
+            cover every predictor referenced by the fitted formula. A 2-D
+            NumPy array is positional: a model fitted from an array reads its
+            columns as ``x0, x1, ...``; a model fitted from a named table binds
+            them to its predictor columns in training-table order, and needs
+            exactly that many columns.
         interval : float, "conformal", or None, default None
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
@@ -247,6 +253,9 @@ class Model:
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
+            ``"numpy"`` is a structured array with one named field per output
+            column, read by the same names as a DataFrame
+            (``pred["posterior_mean_lower"]``).
         id_column : str or None, default None
             Name of an identifier column in ``data`` to propagate as a row key
             in the output (so predictions can be joined back to the input).
@@ -301,12 +310,22 @@ class Model:
         required = rust_module().required_model_columns(self._prediction_model, False)
         if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
-        headers, rows, table_kind = normalize_table(data, required_columns=required)
+        positional_headers = None
+        if detect_table_kind(data) == "numpy":
+            try:
+                positional_headers = rust_module().positional_prediction_headers(
+                    self._prediction_model, numpy_table_width(data)
+                )
+            except Exception as exc:
+                raise map_exception(exc) from exc
+        headers, rows, table_kind = normalize_table(
+            data, required_columns=required, positional_headers=positional_headers
+        )
         row_ids = extract_row_ids(headers, rows, id_column)
         # interval='conformal' runs the gam_predict::conformal_routes column
         # builders `gam predict --conformal` uses: the exact full-conformal set
         # without a calibration fold, the split-conformal band with one. The
-        # returned JSON has the model-based predict column schema, so
+        # returned payload has the model-based predict column schema, so
         # shape_predict_response is unchanged.
         if interval == "conformal":
             # allow-list (a): FFI input validation.
@@ -318,7 +337,7 @@ class Model:
             try:
                 if training_data is not None:
                     train_headers, train_rows, _ = normalize_table(training_data)
-                    raw = rust_module().predict_table_full_conformal(
+                    payload = rust_module().predict_table_full_conformal(
                         self._prediction_model,
                         headers,
                         rows,
@@ -336,7 +355,7 @@ class Model:
                         covariance_mode,
                         observation_interval,
                     )
-                    raw = rust_module().predict_table_conformal(
+                    payload = rust_module().predict_table_conformal(
                         self._prediction_model,
                         headers,
                         rows,
@@ -348,7 +367,7 @@ class Model:
             except Exception as exc:
                 raise map_exception(exc) from exc
             return shape_predict_response(
-                raw,
+                payload,
                 table_kind=table_kind,
                 training_table_kind=self._training_table_kind,
                 interval=conformal_level,
@@ -362,7 +381,7 @@ class Model:
         if training_data is not None:
             raise ValueError('training_data= applies only to interval="conformal"')
         try:
-            raw = rust_module().predict_table(
+            payload = rust_module().predict_table(
                 self._prediction_model,
                 headers,
                 rows,
@@ -373,7 +392,7 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         return shape_predict_response(
-            raw,
+            payload,
             table_kind=table_kind,
             training_table_kind=self._training_table_kind,
             interval=interval,
