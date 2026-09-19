@@ -103,6 +103,23 @@ def test_shared_time_block_survival_tests_the_covariate_columns(likelihood):
     assert rows["s(noise)"]["p_value"] > 1e-3, rows["s(noise)"]
 
 
+def test_weibull_and_transformation_test_the_same_age_effect():
+    # Both baselines are correct for Weibull proportional-hazards data, so the
+    # two fits estimate one age effect and its Wald statistic nearly agrees.
+    # Reading the Weibull block from column 0 folded the `log t` coefficient
+    # into s(age) and inflated its statistic almost fivefold.
+    df = _survival_frame(seed=1)
+    chi_sq = {}
+    for likelihood in ("transformation", "weibull"):
+        model = gamfit.fit(
+            df,
+            "Surv(entry, exit, event) ~ s(age) + s(noise)",
+            survival_likelihood=likelihood,
+        )
+        chi_sq[likelihood] = _rows(model.summary())["s(age)"]["chi_sq"]
+    assert chi_sq["weibull"] == pytest.approx(chi_sq["transformation"], rel=0.1), chi_sq
+
+
 def test_location_scale_scale_only_covariate_holds_its_size():
     """A small seeded size check of the mean-predictor s(x) test when x moves
     only the noise scale (the full study is bench/pvalue_calibration/
