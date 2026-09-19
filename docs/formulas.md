@@ -43,6 +43,37 @@ transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
 fit options rather than `family=`.
 
+## Every remaining column (`.`)
+
+```
+y ~ .                                # one term per column, chosen from the data
+y ~ s(x, k=12) + .                   # explicit terms first, `.` covers the rest
+```
+
+`.` stands for every column no other part of the fit reads: not the
+response, a column an explicit term names, or a weights, offset or
+auxiliary-formula column. Each column gets a penalized term whose null
+space is penalized too, so a column that carries no signal shrinks to
+about zero effective degrees of freedom:
+
+| Column | Term |
+| --- | --- |
+| numeric, at least 3 distinct values | `s(col)` |
+| numeric with 2 distinct values (including bool) | `col` (penalized linear) |
+| categorical or string with repeated levels | `factor(col)` (random effect) |
+| categorical in which every level occurs once (a row id) | dropped, with a note |
+| a single value | dropped, with a note (the intercept already fits it) |
+
+Three distinct values is the smallest number a second-order
+difference-penalized smooth can separate from its linear null space.
+With two values the column can only enter linearly.
+
+`gam fit data.csv "y ~ ."`, `gamfit.fit(df, "y ~ .")` and
+`GAMRegressor().fit(X, y)` all use the same Rust rule. The expanded
+formula is printed to stderr by the CLI and reported as a
+`GamInferenceWarning`. It is also stored as `model.formula` (and
+`formula_` on the estimators).
+
 ## Linear and constrained coefficients
 
 ```
