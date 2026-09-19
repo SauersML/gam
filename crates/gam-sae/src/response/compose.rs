@@ -66,6 +66,47 @@
 //! (`e ≈ s²/(4|m|)` for `|m| ≫ s`) and equals the closure itself at `m = 0`. No deterministic bound is claimed for any
 //! other second-stage activation.
 //!
+//! # The enlarged state (exact)
+//!
+//! In a residual stack `out = z + G₁(z) + G₂(z + G₁(z))`, with `Gᵢ(y) = Uᵢ σ(bᵢ + Wᵢ y) + cᵢ` both reading and writing
+//! the stream `ℝ^d`, the second block's pre-activations are
+//!
+//! ```text
+//! c_k = b₂ₖ + w₂ₖᵀ c₁ + w₂ₖᵀ z + Σ_j R_kj σ(a_j),   R = W₂ U₁,   a = b₁ + W₁ z.
+//! ```
+//!
+//! Only the read units `N = {j : R_{·j} ≠ 0}` enter. On a frame `P̃` that retains their readers, `W₁,N (I − P̃) = 0`, so
+//! those `a_j` are functions of `P̃Z`. Given `P̃Z`, the pre-activations of BOTH blocks are then jointly Gaussian with the
+//! skip `(I − P̃)Z`. The stack is one residual block of width `h₁ + h₂` whose second-block biases move with the point,
+//! `b₂ + W₂ c₁ + R τ(P̃z)`, and over its units `u` ([`residual_stack_response`]):
+//!
+//! ```text
+//! E[out | P̃Z] = P̃z + c₁ + c₂ + U τ,
+//! E[‖out − E[out | P̃Z]‖²_M | P̃Z] = tr(M (I − P̃)) + 2 Σ_u (T_{v_u⊥} σ)'(μ_u) u_uᵀ M (I − P̃) w_u + tr(M U C Uᵀ),
+//! ```
+//!
+//! with `U = [U₁ U₂]`, `C` the units' covariance at the discarded law, and the Stein term
+//! `E[(I − P̃)Z σ(a_u) | P̃Z] = (I − P̃) w_u (T_{v_u⊥} σ)'(μ_u)`. The frame that retains the read readers is
+//! `Q̃ = orth[Q, W₁,Nᵀ]` ([`enlarged_frame`]).
+//!
+//! On any other frame the same evaluation is exact for the model `c'_k = c_k − ℓ_k`,
+//! `ℓ_k = Σ_{j ∈ N} R_kj (σ(a_j) − τ_j)`, which is coupled to the stack on one probability space. The Gaussian Poincaré
+//! inequality gives `‖σ(a_j) − τ_j‖_{L²} ≤ L √v_j⊥`, with `L² = sup|σ'|²`, and `σ` is `L`-Lipschitz. So at every point
+//!
+//! ```text
+//! ‖out − out'‖_{L², M} ≤ Λ = L² Σ_k ‖u₂ₖ‖_M Σ_{j ∈ N} |R_kj| √v_j⊥.
+//! ```
+//!
+//! The conditional mean then moves by at most `Λ` in `M`-norm, and the root conditional variance by at most `Λ`. On
+//! `Q̃`, `Λ` is the rounding of the retained read readers.
+//!
+//! The price:
+//! - `k̃ ≤ min(d, k + |N|)`. A dense second block reads every unit, and an expanding first block (`h₁ ≥ d − k`) then makes
+//!   `P̃ = I`, where nothing is compressed.
+//! - `V(P̃)` and `E(P̃)` have no pair-kernel closure, because the moving biases are not Gaussian in `P̃Z`. `E(P̃)` is the
+//!   average of the exact conditional variance over `P̃Z`, an outer integral over `k̃` dimensions.
+//! - One point costs `(h₁ + h₂)²` pair kernels.
+//!
 //! # Cost
 //!
 //! One retained point costs `h₁²` pair-kernel evaluations plus `O(h₁² q)` flops for `q` projected terms. Units are tiled,
@@ -79,9 +120,12 @@ use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{GaussianActivation, PreactivationPair, gaussian_smoothing_derivatives};
 use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_math::roundoff::inflated;
 use gam_runtime::resource::byte_balanced_row_chunk;
+use gam_solve::penalty_invariance::orthonormalize_columns;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
+use std::fmt;
 
 /// Compose an affine last stage `F₂(y) = A y + c` after a known block, with `matrix = A` (`q × p`), `offset = c` (`q`)
 /// and the output metric `metric` on `ℝ^q`.
@@ -130,7 +174,7 @@ pub fn quadratic_readout(
     require_length("quadratic form rows", first.output_dim(), form.nrows())?;
     require_length("quadratic form columns", first.output_dim(), form.ncols())?;
     require_finite("quadratic form", form.iter())?;
-    let law = DiscardedLaw::new(first, frame, points)?;
+    let law = DiscardedLaw::new(first, frame, points, None)?;
     let writers = first.writers();
     let mut conditional_means = fast_abt(&law.unit_means, &writers);
     conditional_means += &first.output_bias();
@@ -144,7 +188,7 @@ pub fn quadratic_readout(
     // With `L = Uᵀ` and `R = (A U)ᵀ`, `Σ_k diag(Lᵀ C R)_k = Σ_jl (Uᵀ A U)_jl C_jl = tr(A U C Uᵀ)`.
     let formed_writers = fast_ab(&form, &writers);
     let covariance_term = law
-        .covariance_diagonals(first, frame, writers.t(), formed_writers.t())?
+        .covariance_diagonals(first.readers(), first.activation(), frame, writers.t(), formed_writers.t())?
         .sum_axis(Axis(1));
     let exact = &mean_composition + &covariance_term;
     Ok(QuadraticReadout {
@@ -257,7 +301,7 @@ pub fn gaussian_closure_response(
     points: ArrayView2<'_, f64>,
 ) -> Result<GaussianClosureResponse, ResponseError> {
     require_length("second block input dimension", first.output_dim(), second.input_dim())?;
-    let law = DiscardedLaw::new(first, frame, points)?;
+    let law = DiscardedLaw::new(first, frame, points, None)?;
     let first_writers = first.writers();
     let second_readers = second.readers();
     let mut conditional_means = fast_abt(&law.unit_means, &first_writers);
@@ -266,7 +310,8 @@ pub fn gaussian_closure_response(
     preactivation_means += &second.biases();
     // `α = Uᵀ W₂ᵀ` (`h₁ × h₂`), so `diag(αᵀ C α)` holds every `s_k²`.
     let reads = fast_atb(&first_writers, &second_readers.t());
-    let mut preactivation_variances = law.covariance_diagonals(first, frame, reads.view(), reads.view())?;
+    let mut preactivation_variances =
+        law.covariance_diagonals(first.readers(), first.activation(), frame, reads.view(), reads.view())?;
     // A variance is never negative, so projecting a rounded value onto `[0, ∞)` never moves it farther from the exact one.
     preactivation_variances.mapv_inplace(|variance| variance.max(0.0));
     let activation = second.activation();
@@ -334,9 +379,248 @@ pub fn relu_two_moment_bound(mean: f64, variance: f64) -> f64 {
     0.5 * (second_moment_excess - gaussian_excess).max(gaussian_excess)
 }
 
-/// The first block's hidden pre-activation law at each retained point.
+/// A refusal of the residual-stack route.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResidualStackError {
+    Response(ResponseError),
+    /// The joint law of one unit from each block needs the pair kernel `E σ₁(X) σ₂(Y)`, and the kernel owner has it
+    /// only for one activation.
+    MixedActivations {
+        first: GaussianActivation,
+        second: GaussianActivation,
+    },
+}
+
+impl From<ResponseError> for ResidualStackError {
+    fn from(error: ResponseError) -> Self {
+        Self::Response(error)
+    }
+}
+
+impl fmt::Display for ResidualStackError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Response(error) => write!(f, "{error}"),
+            Self::MixedActivations { first, second } => write!(
+                f,
+                "a residual stack of a {first:?} block and a {second:?} block needs a mixed-activation pair kernel"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResidualStackError {}
+
+/// The first block's units that a second residual block reads, and a frame that retains their readers.
+#[derive(Debug, Clone)]
+pub struct EnlargedFrame {
+    /// `Q̃`, `d × k̃`: the caller's frame and then the read units' readers, orthonormalized in that order. A column whose
+    /// residual the projection arithmetic cannot resolve from zero is dropped, so `k̃ ≤ min(d, k + |N|)`.
+    pub frame: Array2<f64>,
+    /// `N`, increasing: the units `j` with `U₁[i, j] ≠ 0` at a coordinate `i` that some second-block reader reads.
+    pub read_units: Vec<usize>,
+}
+
+/// The enlarged frame `Q̃ = orth[Q, W₁,Nᵀ]` of the residual stack `z + G₁(z) + G₂(z + G₁(z))` for the caller's `frame`
+/// (`d × k`), on which [`residual_stack_response`] is exact. `first` is `G₁` and `second` is `G₂`.
+///
+/// `N` is decided on the factors of `R = W₂ U₁`, not on its computed entries. Unit `j` is unread exactly when every
+/// product `w₂ₖᵢ u₁ᵢⱼ` has a zero factor, so a computed zero of `R` from cancellation or underflow never drops a read unit.
+pub fn enlarged_frame(
+    first: &KnownBlock,
+    second: &KnownBlock,
+    frame: ArrayView2<'_, f64>,
+) -> Result<EnlargedFrame, ResidualStackError> {
+    require_residual_stack(first, second)?;
+    let input_dim = first.input_dim();
+    require_length("retained frame rows", input_dim, frame.nrows())?;
+    require_finite("retained frame", frame.iter())?;
+    let second_readers = second.readers();
+    let read_coordinates: Vec<usize> = (0..input_dim)
+        .filter(|&coordinate| second_readers.column(coordinate).iter().any(|&entry| entry != 0.0))
+        .collect();
+    let first_writers = first.writers();
+    let read_units: Vec<usize> = (0..first.width())
+        .filter(|&unit| {
+            read_coordinates
+                .iter()
+                .any(|&coordinate| first_writers[[coordinate, unit]] != 0.0)
+        })
+        .collect();
+    let rank = frame.ncols();
+    let first_readers = first.readers();
+    let mut columns = Array2::<f64>::zeros((input_dim, rank + read_units.len()));
+    columns.slice_mut(s![.., ..rank]).assign(&frame);
+    for (offset, &unit) in read_units.iter().enumerate() {
+        columns.column_mut(rank + offset).assign(&first_readers.row(unit));
+    }
+    let frame = orthonormalize_columns(&columns).unwrap_or_else(|| Array2::<f64>::zeros((input_dim, 0)));
+    Ok(EnlargedFrame { frame, read_units })
+}
+
+/// The conditional law of a residual stack's output given the input inside a frame, at retained points.
+#[derive(Debug, Clone)]
+pub struct ResidualStackResponse {
+    /// `E[out' | P̃Z = P̃z]`, `n × d`, for the model `out'` of the module docs.
+    pub conditional_mean: Array2<f64>,
+    /// `E[‖out' − E[out' | P̃Z]‖²_M | P̃Z = P̃z]`, length `n`.
+    pub conditional_variance: Array1<f64>,
+    /// `Λ ≥ ‖out − out'‖_{L², M}` at every point: the stack's conditional mean lies within `Λ` of `conditional_mean` in
+    /// `M`-norm, and its root conditional variance within `Λ` of `√conditional_variance`. On an [`EnlargedFrame`] it is
+    /// the rounding of the retained read readers.
+    pub state_leak: f64,
+}
+
+/// The conditional mean and variance of `out = z + G₁(z) + G₂(z + G₁(z))` given the input inside `frame` (`d × k`), at
+/// each row of `points` (`n × d`), with the state leak `Λ` that bounds their distance from the stack's own. They are
+/// exact on an [`EnlargedFrame`].
+///
+/// `first` is `G₁` and `second` is `G₂`. Both read and write `ℝ^d` and share one activation, and the stack writes into
+/// the second block's output space, so its metric `M` is the second block's.
+pub fn residual_stack_response(
+    first: &KnownBlock,
+    second: &KnownBlock,
+    frame: ArrayView2<'_, f64>,
+    points: ArrayView2<'_, f64>,
+) -> Result<ResidualStackResponse, ResidualStackError> {
+    require_residual_stack(first, second)?;
+    let input_dim = first.input_dim();
+    let first_law = DiscardedLaw::new(first, frame, points, None)?;
+    let second_readers = second.readers();
+    let first_writers = first.writers();
+    // `R = W₂ U₁` (`h₂ × h₁`). At point `i` the second block's biases are `b₂ + W₂ c₁ + R τᵢ`.
+    let reads = fast_ab(&second_readers, &first_writers);
+    let mut shifts = fast_abt(&first_law.unit_means, &reads);
+    shifts += &second_readers.dot(&first.output_bias());
+    let second_law = DiscardedLaw::new(second, frame, points, Some(shifts.view()))?;
+    let state_leak = state_leak(first, second, &first_law, reads.view())?;
+    let law = DiscardedLaw::stacked(&first_law, &second_law);
+    let readers = stack_rows(first.readers(), second_readers);
+    let writers = stack_columns(first_writers, second.writers());
+    let metric = second.metric();
+    let metric_writers = fast_ab(&metric, &writers);
+    let activation = first.activation();
+    let width = readers.nrows();
+
+    let mut conditional_mean = fast_abt(&fast_ab(&points, &frame), &frame);
+    conditional_mean += &fast_abt(&law.unit_means, &writers);
+    conditional_mean += &(&first.output_bias() + &second.output_bias());
+
+    let retained_skip: f64 = frame
+        .columns()
+        .into_iter()
+        .zip(fast_ab(&metric, &frame).columns())
+        .map(|(column, metric_column)| column.dot(&metric_column))
+        .sum();
+    let discarded_skip = metric.diag().sum() - retained_skip;
+    // `u_uᵀ M (I − Q Qᵀ) w_u`, formed from the discarded reader parts in tiles.
+    let mut skip_couplings = Array1::<f64>::zeros(width);
+    let tile = byte_balanced_row_chunk(input_dim, width);
+    for start in (0..width).step_by(tile) {
+        let end = (start + tile).min(width);
+        let residual =
+            &readers.slice(s![start..end, ..]) - &fast_abt(&law.coordinates.slice(s![start..end, ..]), &frame);
+        for (offset, residual_reader) in residual.axis_iter(Axis(0)).enumerate() {
+            skip_couplings[start + offset] = residual_reader.dot(&metric_writers.column(start + offset));
+        }
+    }
+    let stein_terms = law
+        .means
+        .axis_iter(Axis(0))
+        .into_par_iter()
+        .map(|means| {
+            let mut sum = 0.0;
+            for unit in 0..width {
+                let mut jet = [0.0; 2];
+                gaussian_smoothing_derivatives(activation, means[unit], law.discarded_variances[unit], &mut jet)
+                    .map_err(|error| ResponseError::Kernel {
+                        context: "Gaussian smoothing slope",
+                        error,
+                    })?;
+                sum += jet[1] * skip_couplings[unit];
+            }
+            Ok(sum)
+        })
+        .collect::<Result<Vec<f64>, ResponseError>>()?;
+    let unit_terms = law
+        .covariance_diagonals(readers.view(), activation, frame, writers.t(), metric_writers.t())?
+        .sum_axis(Axis(1));
+    // An expected squared norm is never negative, so projecting a rounded value onto `[0, ∞)` never moves it farther
+    // from the exact one.
+    let conditional_variance = stein_terms
+        .iter()
+        .zip(unit_terms.iter())
+        .map(|(&stein, &units)| (discarded_skip + 2.0 * stein + units).max(0.0))
+        .collect();
+    Ok(ResidualStackResponse {
+        conditional_mean,
+        conditional_variance,
+        state_leak,
+    })
+}
+
+/// Both blocks of a residual stack read and write `ℝ^d` and share one activation.
+fn require_residual_stack(first: &KnownBlock, second: &KnownBlock) -> Result<(), ResidualStackError> {
+    let input_dim = first.input_dim();
+    require_length("first residual block output dimension", input_dim, first.output_dim())?;
+    require_length("second residual block input dimension", input_dim, second.input_dim())?;
+    require_length("second residual block output dimension", input_dim, second.output_dim())?;
+    if first.activation() != second.activation() {
+        return Err(ResidualStackError::MixedActivations {
+            first: first.activation(),
+            second: second.activation(),
+        });
+    }
+    Ok(())
+}
+
+/// `Λ = L² Σ_k ‖u₂ₖ‖_M Σ_j |R_kj| √v_j⊥` of the module docs, formed as an upper bound on its exact value.
+fn state_leak(
+    first: &KnownBlock,
+    second: &KnownBlock,
+    first_law: &DiscardedLaw,
+    reads: ArrayView2<'_, f64>,
+) -> Result<f64, ResponseError> {
+    let lipschitz_squared = first
+        .activation()
+        .slope_bound_squared()
+        .map_err(|error| ResponseError::Kernel {
+            context: "activation slope bound",
+            error,
+        })?;
+    let input_dim = first.input_dim();
+    // `|R_kj| ≤ |R̂_kj| + γ_d (|W₂| |U₁|)_kj` for the computed `d`-term product (Higham, ASNA §3.1).
+    let absolute_reads = fast_ab(&second.readers().mapv(f64::abs), &first.writers().mapv(f64::abs));
+    let reads_bound = reads.mapv(f64::abs) + absolute_reads * accumulation_growth(input_dim);
+    // `√(v̂⊥ + e) ≥ √v⊥`, with `e` the bound on the discarded variance's error.
+    let deviations = (&first_law.discarded_variances + &first_law.discarded_variance_errors).mapv(f64::sqrt);
+    let writer_norms = (&second.writers() * &second.metric_writers())
+        .sum_axis(Axis(0))
+        .mapv(f64::sqrt);
+    let leak = lipschitz_squared * writer_norms.dot(&reads_bound.dot(&deviations));
+    // A sum of nonnegative terms rounds by at most `γ` of its longest chain, relative.
+    Ok(inflated(leak, input_dim + first.width() + second.width()))
+}
+
+/// `[top; bottom]`.
+fn stack_rows(top: ArrayView2<'_, f64>, bottom: ArrayView2<'_, f64>) -> Array2<f64> {
+    let mut stacked = Array2::<f64>::zeros((top.nrows() + bottom.nrows(), top.ncols()));
+    stacked.slice_mut(s![..top.nrows(), ..]).assign(&top);
+    stacked.slice_mut(s![top.nrows().., ..]).assign(&bottom);
+    stacked
+}
+
+/// `[left right]`.
+fn stack_columns(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> Array2<f64> {
+    let mut stacked = Array2::<f64>::zeros((left.nrows(), left.ncols() + right.ncols()));
+    stacked.slice_mut(s![.., ..left.ncols()]).assign(&left);
+    stacked.slice_mut(s![.., left.ncols()..]).assign(&right);
+    stacked
+}
+
+/// A block's hidden pre-activation law at each retained point.
 struct DiscardedLaw {
-    /// `μ_ij = b_j + w_jᵀ P zᵢ`, `n × h`.
+    /// `μ_ij = b_j + w_jᵀ P zᵢ`, plus the point's bias shift when one was given, `n × h`.
     means: Array2<f64>,
     /// `τ_ij = T_{v_j⊥} σ(μ_ij) = E[σ(a_j) | PZ = P zᵢ]`, `n × h`.
     unit_means: Array2<f64>,
@@ -355,10 +639,13 @@ struct DiscardedLaw {
 }
 
 impl DiscardedLaw {
+    /// The law at `points` (`n × d`), with `mean_shifts` (`n × h`, when given) added to every `μ_ij`: a bias that moves
+    /// with the point.
     fn new(
         block: &KnownBlock,
         frame: ArrayView2<'_, f64>,
         points: ArrayView2<'_, f64>,
+        mean_shifts: Option<ArrayView2<'_, f64>>,
     ) -> Result<Self, ResponseError> {
         let input_dim = block.input_dim();
         require_length("retained frame rows", input_dim, frame.nrows())?;
@@ -414,6 +701,9 @@ impl DiscardedLaw {
         // Row `i` of `points Q` is `zᵢᵀ Q`, so entry `(i, j)` of the product with `Rᵀ` is `w_jᵀ P zᵢ`.
         let mut means = fast_abt(&fast_ab(&points, &frame), &coordinates);
         means += &block.biases();
+        if let Some(shifts) = mean_shifts {
+            means += &shifts;
+        }
         let activation = block.activation();
         let mut unit_means = means.clone();
         unit_means
@@ -437,27 +727,42 @@ impl DiscardedLaw {
         })
     }
 
+    /// The law of two blocks' units read through one frame at the same points, the first block's units first.
+    fn stacked(first: &Self, second: &Self) -> Self {
+        let entries =
+            |top: &Array1<f64>, bottom: &Array1<f64>| -> Array1<f64> { top.iter().chain(bottom.iter()).copied().collect() };
+        Self {
+            means: stack_columns(first.means.view(), second.means.view()),
+            unit_means: stack_columns(first.unit_means.view(), second.unit_means.view()),
+            discarded_variances: entries(&first.discarded_variances, &second.discarded_variances),
+            discarded_variance_errors: entries(&first.discarded_variance_errors, &second.discarded_variance_errors),
+            reader_norms: entries(&first.reader_norms, &second.reader_norms),
+            residual_row_errors: entries(&first.residual_row_errors, &second.residual_row_errors),
+            coordinates: stack_rows(first.coordinates.view(), second.coordinates.view()),
+            frame_defect: first.frame_defect.max(second.frame_defect),
+        }
+    }
+
     /// `diag(Lᵀ C R)` at each retained point (`n × q`), for `left = L` and `right = R` (each `h × q`), where `C` is the
-    /// unit covariance of the module docs.
+    /// unit covariance of the module docs and `readers` (`h × d`) are the units this law was formed from.
     ///
     /// One tile of `t` units forms its rows of `Σ⊥` once for every point, as `(W_J − R_J Qᵀ) Wᵀ` (`t × h`); each point
     /// then holds one `h` row at a time. Points are summed tile by tile in order, so the value does not depend on the
     /// thread count.
     fn covariance_diagonals(
         &self,
-        block: &KnownBlock,
+        readers: ArrayView2<'_, f64>,
+        activation: GaussianActivation,
         frame: ArrayView2<'_, f64>,
         left: ArrayView2<'_, f64>,
         right: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, ResponseError> {
-        let readers = block.readers();
-        let activation = block.activation();
-        let input_dim = block.input_dim();
+        let input_dim = readers.ncols();
         let product_growth = accumulation_growth(input_dim);
         let (points, width) = self.means.dim();
         let terms = left.ncols();
         let mut diagonals = Array2::<f64>::zeros((points, terms));
-        let tile = byte_balanced_row_chunk(block.input_dim() + width, width);
+        let tile = byte_balanced_row_chunk(input_dim + width, width);
         for start in (0..width).step_by(tile) {
             let end = (start + tile).min(width);
             let residual =
