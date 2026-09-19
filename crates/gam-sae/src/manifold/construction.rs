@@ -953,30 +953,23 @@ impl SaeManifoldTerm {
 
     /// Apply the FFI-facing [`SaeFitConfig`] as the source of truth for this fit.
     ///
-    /// Distributes the config to its two authorities: the barrier strength override
-    /// onto the term (read by `separation_barrier_strength`), and the ordered Beta--Bernoulli-α
-    /// override onto the assignment (read by
-    /// `SaeAssignment::ordered_beta_bernoulli_prior_parameters`). A `None` field selects the canonical
-    /// data-derived or assignment-mode default. Call this after building the term
-    /// and before fitting; distinct terms remain isolated by construction.
+    /// Installs the barrier strength override onto the term (read by
+    /// `separation_barrier_strength`) and the backend policy. A `None` override selects the
+    /// canonical data-derived strengths. The ordered Beta--Bernoulli concentration is a
+    /// property of the [`AssignmentMode`] the term is built with, so it has no per-fit
+    /// override. Call this after building the term and before fitting; distinct terms remain
+    /// isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
         self.gpu_policy = config.gpu_policy;
-        self.assignment.set_ordered_beta_bernoulli_alpha_override(
-            config.ordered_beta_bernoulli_alpha_override,
-        );
     }
 
-    /// #1777 — the per-fit configuration currently in force on this term,
-    /// reconstructed from its two authorities (the term's barrier override and the
-    /// assignment's α override). Round-trips with [`Self::set_fit_config`].
+    /// #1777 — the per-fit configuration currently in force on this term. Round-trips with
+    /// [`Self::set_fit_config`].
     #[must_use]
     pub fn fit_config(&self) -> SaeFitConfig {
         SaeFitConfig {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: self
-                .assignment
-                .ordered_beta_bernoulli_alpha_override,
             gpu_policy: self.gpu_policy,
         }
     }

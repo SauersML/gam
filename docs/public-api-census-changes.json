@@ -4557,5 +4557,14 @@
     },
     "reason": "#3000 slice 2: the survival row jet's own admission, a bool from the fused-kernel threshold that ignored gpu=required and let G::ANCHORED / G::FOLLOW_UP_VARYING bypass the policy, is replaced by survival_rigid_row_vgh_decision in the same file. It decides through gam_gpu::decide_row_kernel from the row jet's declared SURVIVAL_ROWJET_CAPABILITY and returns the typed GpuDecision; its two callers now call rigid_row_jet_decision::<P, G>, which forwards to it.",
     "evidence": "public_api_census.py, run against this entry's base with the slice-2 commit as head, reports exactly this identity as removed (13561 public function declarations before and 13565 after at the gate base bd435db0df). git grep -c -w survival_rigid_row_vgh_device_selected finds 0 under crates, src and tests at the head tree; rigid_row_jet_device_admission_and_parity_2900 and rigid_row_jet_capability_follows_the_frame_declarations_3000 exercise the replacement and pass."
+  },
+  {
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
+    "removed": {
+      "crates/gam-sae/src/assignment.rs::set_ordered_beta_bernoulli_alpha_override": 1,
+      "crates/gam-sae/src/manifold/tests.rs::per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha": 1
+    },
+    "reason": "#2933 F06 / #1777: the ordered-beta-Bernoulli alpha override is deleted. SaeFitConfig and SaeAssignment carried ordered_beta_bernoulli_alpha_override, a second path to a state that AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable) already declares; set_ordered_beta_bernoulli_alpha_override was its setter. A fixed concentration is now declared only through the mode (learnable_alpha: false), so the override-specific tests (the overridden_* finalization and reactive-box twins, the OVERRIDE_ALPHA fixtures, and the per_fit_config barrier-and-alpha isolation test) go with it; the surviving fixed/learnable finalization, layout-refusal and zero-trace tests move to tests_alpha_persistence_2933.rs and cover the single remaining path.",
+    "evidence": "source_removal_guard.py and public_api_census.py against this base report exactly these identities. At the head tree git grep -w alpha_override finds no occurrence under crates, src or tests. cargo check -p gam-sae --tests and cargo check -p gam-pyffi pass; tests_alpha_persistence_2933 keeps fixed_alpha_finalizes_without_changing_the_objective_2933, learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933, a_layout_contradicting_the_concentration_is_refused_2933 and fixed_alpha_reactive_box_has_no_sparse_face_2933."
   }
 ]

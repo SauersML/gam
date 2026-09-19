@@ -1824,5 +1824,20 @@
     ],
     "reason": "#3000 slice 2: the survival row jet's own admission (a bool from the fused-kernel threshold, which ignored gpu=required and let G::ANCHORED / G::FOLLOW_UP_VARYING bypass the policy) is replaced by survival_rigid_row_vgh_decision in the same file, which decides through gam_gpu::decide_row_kernel from the row jet's declared SURVIVAL_ROWJET_CAPABILITY and returns the typed GpuDecision. Its two callers, SurvivalMarginalSlopeRowKernel::batched_value_grad_hess_all and rigid_row_jet_device_admission_and_parity_2900, now call rigid_row_jet_decision::<P, G>, which forwards to it.",
     "evidence": "In the landing tree the name occurs 0 times (git grep -c). The replacement is declared in crates/gam-models/src/gpu_kernels/survival_rowjet.rs and crates/gam-models/src/survival/marginal_slope/row_kernel.rs, added by the same landing, and rigid_row_jet_device_admission_and_parity_2900 plus rigid_row_jet_capability_follows_the_frame_declarations_3000 exercise it."
+  },
+  {
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
+    "items": [
+      "crates/gam-sae/src/assignment.rs:const:OVERRIDE_ALPHA",
+      "crates/gam-sae/src/assignment.rs:fn:set_ordered_beta_bernoulli_alpha_override",
+      "crates/gam-sae/src/manifold/tests.rs:fn:per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:const:OVERRIDE_ALPHA",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:a_layout_contradicting_the_effective_concentration_is_refused_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_fixed_alpha_finalizes_without_changing_the_objective_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_learnable_alpha_finalizes_at_the_override_concentration_2933",
+      "crates/gam-sae/src/manifold/tests_alpha_override_persistence_2933.rs:fn:overridden_learnable_alpha_reactive_box_matches_the_fixed_twin_2933"
+    ],
+    "reason": "#2933 F06 / #1777: the ordered-beta-Bernoulli alpha override is deleted. SaeFitConfig and SaeAssignment carried ordered_beta_bernoulli_alpha_override, a second path to a state that AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable) already declares; set_ordered_beta_bernoulli_alpha_override was its setter. A fixed concentration is now declared only through the mode (learnable_alpha: false), so the override-specific tests (the overridden_* finalization and reactive-box twins, the OVERRIDE_ALPHA fixtures, and the per_fit_config barrier-and-alpha isolation test) go with it; the surviving fixed/learnable finalization, layout-refusal and zero-trace tests move to tests_alpha_persistence_2933.rs and cover the single remaining path.",
+    "evidence": "source_removal_guard.py and public_api_census.py against this base report exactly these identities. At the head tree git grep -w alpha_override finds no occurrence under crates, src or tests. cargo check -p gam-sae --tests and cargo check -p gam-pyffi pass; tests_alpha_persistence_2933 keeps fixed_alpha_finalizes_without_changing_the_objective_2933, learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933, a_layout_contradicting_the_concentration_is_refused_2933 and fixed_alpha_reactive_box_has_no_sparse_face_2933."
   }
 ]
