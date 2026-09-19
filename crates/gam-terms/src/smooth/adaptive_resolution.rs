@@ -450,20 +450,20 @@ pub fn apply_adaptive_resolution(
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
+    let unsupported = |basis: &str| {
+        format!("adaptive resolution {resolution:?} cannot be written into a {basis} basis")
+    };
     match (basis, resolution) {
-        (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => {
-            if let BSplineKnotSpec::Automatic {
+        (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => match &mut spec.knotspec {
+            BSplineKnotSpec::Automatic {
                 num_internal_knots, ..
-            } = &mut spec.knotspec
-            {
-                *num_internal_knots = Some(*k);
-            }
-        }
-        (B::BSpline1D { spec, .. }, AdaptiveResolution::PeriodicBasis(b)) => {
-            if let BSplineKnotSpec::PeriodicUniform { num_basis, .. } = &mut spec.knotspec {
-                *num_basis = *b;
-            }
-        }
+            } => *num_internal_knots = Some(*k),
+            other => return Err(unsupported(&format!("B-spline {other:?}"))),
+        },
+        (B::BSpline1D { spec, .. }, AdaptiveResolution::PeriodicBasis(b)) => match &mut spec.knotspec {
+            BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis = *b,
+            other => return Err(unsupported(&format!("B-spline {other:?}"))),
+        },
         (B::FactorSmooth { spec }, AdaptiveResolution::InternalKnots(k)) => {
             match &mut spec.marginal.knotspec {
                 BSplineKnotSpec::Generate {
@@ -472,7 +472,7 @@ pub fn apply_adaptive_resolution(
                 BSplineKnotSpec::Automatic {
                     num_internal_knots, ..
                 } => *num_internal_knots = Some(*k),
-                _ => {}
+                other => return Err(unsupported(&format!("factor-smooth {other:?}"))),
             }
         }
         (B::TensorBSpline { feature_cols, spec }, AdaptiveResolution::MarginDims(dims)) => {
@@ -495,14 +495,14 @@ pub fn apply_adaptive_resolution(
                         })?;
                     }
                     BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis = dim,
-                    _ => {}
+                    other => return Err(unsupported(&format!("tensor margin {other:?}"))),
                 }
             }
         }
         (B::Sphere { spec, .. }, AdaptiveResolution::HarmonicDegree(l)) => {
             spec.max_degree = Some(*l);
         }
-        _ => {}
+        (other, _) => return Err(unsupported(&format!("{other:?}"))),
     }
     Ok(())
 }

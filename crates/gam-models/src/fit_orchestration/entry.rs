@@ -2159,12 +2159,12 @@ mod adaptive_spatial_resolution_tests {
         }
     }
 
-    fn knots_width(_: usize, resolution: &AdaptiveResolution) -> usize {
+    fn knots_width(resolution: &AdaptiveResolution) -> usize {
         match resolution {
             AdaptiveResolution::InternalKnots(k) => k + 4,
             AdaptiveResolution::MarginDims(dims) => dims.iter().product(),
-            AdaptiveResolution::Centers(c) => *c,
-            _ => unreachable!(),
+            AdaptiveResolution::Centers(c) | AdaptiveResolution::PeriodicBasis(c) => *c,
+            AdaptiveResolution::HarmonicDegree(l) => (l + 1).pow(2),
         }
     }
 
@@ -2239,7 +2239,7 @@ mod adaptive_spatial_resolution_tests {
                 request(2, InternalKnots(8), InternalKnots(17), false),
             ],
             12,
-            knots_width,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
         )
         .expect("rank remains for the first two terms");
         // The first term takes its whole 9-knot refinement, the second the 3
@@ -2255,7 +2255,7 @@ mod adaptive_spatial_resolution_tests {
         let accepted = fit_refinements_to_rank(
             vec![request(0, MarginDims(vec![5, 5]), MarginDims(vec![9, 9]), true)],
             30,
-            knots_width,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
         )
         .expect("a partial tensor refinement fits");
         // 7x7 adds 24 columns; 8x8 would add 39.
@@ -2268,7 +2268,7 @@ mod adaptive_spatial_resolution_tests {
         let error = fit_refinements_to_rank(
             vec![request(0, InternalKnots(8), InternalKnots(17), true)],
             0,
-            knots_width,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
         )
         .expect_err("a saturated basis with no residual rank is under-resolved");
         match error {
@@ -2294,7 +2294,7 @@ mod adaptive_spatial_resolution_tests {
         let accepted = fit_refinements_to_rank(
             vec![request(0, Centers(30), Centers(60), false)],
             0,
-            knots_width,
+            |_, resolution: &AdaptiveResolution| knots_width(resolution),
         )
         .expect("an unsaturated term is not under-resolved");
         assert!(accepted.is_empty());
@@ -2578,9 +2578,6 @@ fn fit_expectile_location_scale(
     config: &FitConfig,
     levels: Vec<f64>,
 ) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
-    use gam_linalg::matrix::DenseDesignOperator;
-    use gam_problem::BlockRole;
-
     if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
             reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"
@@ -2623,8 +2620,46 @@ fn fit_expectile_location_scale(
         ));
     };
 
+    let standardized_expectiles = joint_expectile_standardized_expectiles(
+        &location_scale,
+        y.view(),
+        prior_weights.view(),
+        mean_offset.view(),
+        log_sigma_offset.view(),
+        &levels,
+    )?;
+    Ok(ExpectileLocationScaleFitResult {
+        location_scale,
+        levels,
+        standardized_expectiles,
+    })
+}
+
+/// The level constants `c_τ` of a joint expectile fit: the prior-weighted
+/// empirical `τ`-expectiles of the standardized residuals `(yᵢ − μᵢ)/E[σᵢ]`,
+/// with `E[σᵢ] = f + exp(mᵢ + vᵢ/2)` under the log-σ block's conditional
+/// Gaussian posterior `N(mᵢ, vᵢ)`.
+///
+/// `vᵢ` comes from the Scale block of the fit's joint conditional covariance
+/// (coefficient layout `[mean | scale]`). That covariance is part of the
+/// estimand, so a fit without it is refused with a typed error instead of
+/// being standardized by the plug-in σ.
+fn joint_expectile_standardized_expectiles(
+    location_scale: &GaussianLocationScaleFitResult,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    mean_offset: ArrayView1<'_, f64>,
+    log_sigma_offset: ArrayView1<'_, f64>,
+    levels: &[f64],
+) -> Result<Vec<f64>, WorkflowError> {
+    use gam_linalg::matrix::DenseDesignOperator;
+    use gam_problem::BlockRole;
+
     let invariant = |reason: String| {
-        raised_fit_failure(FailureCategory::Invariant, format!("joint expectile: {reason}"))
+        raised_fit_failure(
+            FailureCategory::Invariant,
+            format!("joint expectile: {reason}"),
+        )
     };
     let fit = &location_scale.fit;
     let beta_mu = crate::inference::model::gaussian_location_scale_mean_beta(&fit.fit)
@@ -2654,29 +2689,41 @@ fn fit_expectile_location_scale(
         )));
     }
     // Posterior variance of η_σ per row from the Scale block of the joint
-    // conditional covariance (coefficient layout `[mean | scale]`).
+    // conditional covariance (coefficient layout `[mean | scale]`). `c_τ`
+    // integrates σ over this posterior, so a fit without it has no `c_τ`:
+    // a typed constrained-posterior decline is refused with its reason, and a
+    // missing covariance with no decline breaks the location-scale fit contract.
+    // Neither is ever read as zero posterior variance (the plug-in σ).
     let p_mu = beta_mu.len();
     let p_sigma = beta_sigma.len();
-    let log_sigma_variance = match fit.fit.beta_covariance() {
-        Some(covariance) => {
-            if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
-                return Err(invariant(format!(
-                    "covariance is {}x{}, smaller than the {} location-scale coefficients",
-                    covariance.nrows(),
-                    covariance.ncols(),
-                    p_mu + p_sigma
-                )));
-            }
-            let scale_block = covariance
-                .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
-                .to_owned();
-            fit.noise_design
-                .design
-                .quadratic_form_diag(&scale_block)
-                .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?
-        }
-        None => Array1::zeros(n),
-    };
+    fit.fit
+        .require_posterior_mean("joint expectile c_τ")
+        .map_err(|error| {
+            raised_fit_failure(FailureCategory::Input, format!("joint expectile: {error}"))
+        })?;
+    let covariance = fit.fit.beta_covariance().ok_or_else(|| {
+        invariant(
+            "c_τ integrates σ over the log-σ posterior, but the location-scale fit carries \
+             neither its joint posterior covariance nor a typed posterior-moment decline"
+                .to_string(),
+        )
+    })?;
+    if covariance.nrows() < p_mu + p_sigma || covariance.ncols() < p_mu + p_sigma {
+        return Err(invariant(format!(
+            "covariance is {}x{}, smaller than the {} location-scale coefficients",
+            covariance.nrows(),
+            covariance.ncols(),
+            p_mu + p_sigma
+        )));
+    }
+    let scale_block = covariance
+        .slice(ndarray::s![p_mu..p_mu + p_sigma, p_mu..p_mu + p_sigma])
+        .to_owned();
+    let log_sigma_variance = fit
+        .noise_design
+        .design
+        .quadratic_form_diag(&scale_block)
+        .map_err(|error| invariant(format!("log-σ posterior variance: {error}")))?;
     let sigma_floor =
         location_scale.response_scale * gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
     let standardized: Vec<f64> = (0..n)
@@ -2710,11 +2757,7 @@ fn fit_expectile_location_scale(
             ),
         ));
     }
-    Ok(ExpectileLocationScaleFitResult {
-        location_scale,
-        levels,
-        standardized_expectiles,
-    })
+    Ok(standardized_expectiles)
 }
 
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
@@ -3860,4 +3903,93 @@ pub fn fit_spline_scan_from_formula(
     gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(spline_scan_failure)
+}
+
+#[cfg(test)]
+mod joint_expectile_scale_posterior_tests {
+    use super::*;
+
+    const LEVELS: [f64; 3] = [0.1, 0.5, 0.9];
+
+    /// Heteroscedastic `y = sin(3x) + (0.3 + 0.6x)·ε`, `ε ~ N(0, 1)` from a
+    /// fixed LCG with Box–Muller, so the fixture is reproducible.
+    fn heteroscedastic_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x3056_2026_0919_0001;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|i| {
+                let x = i as f64 / (n as f64 - 1.0);
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let y = (3.0 * x).sin() + (0.3 + 0.6 * x) * z;
+                csv::StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    /// `c_τ` standardizes each residual by the posterior mean of σ, which needs
+    /// the Scale block of the joint covariance. The fitted `c_τ` is exactly the
+    /// covariance-integrated value, and the same fit with its covariance
+    /// removed is refused with a typed error — never standardized by the
+    /// plug-in σ as if the log-σ posterior variance were zero (#3056).
+    #[test]
+    fn joint_expectile_c_tau_requires_the_scale_block_posterior() {
+        let n = 200;
+        let data = heteroscedastic_dataset(n);
+        let config = FitConfig {
+            family: Some("expectile".to_string()),
+            expectile_tau: Some(LEVELS.to_vec()),
+            ..FitConfig::default()
+        };
+        let mut result = fit_expectile_location_scale("y ~ s(x)", &data, &config, LEVELS.to_vec())
+            .expect("joint expectile fit");
+        let y_index = data
+            .headers
+            .iter()
+            .position(|h| h == "y")
+            .expect("response column");
+        let y = data.values.column(y_index).to_owned();
+        let ones = Array1::<f64>::ones(n);
+        let zeros = Array1::<f64>::zeros(n);
+        let c_tau = |location_scale: &GaussianLocationScaleFitResult| {
+            joint_expectile_standardized_expectiles(
+                location_scale,
+                y.view(),
+                ones.view(),
+                zeros.view(),
+                zeros.view(),
+                &LEVELS,
+            )
+        };
+
+        assert!(
+            result.location_scale.fit.fit.beta_covariance().is_some(),
+            "a joint expectile fit carries its joint posterior covariance"
+        );
+        let integrated = c_tau(&result.location_scale).expect("c_τ with covariance");
+        assert_eq!(integrated, result.standardized_expectiles);
+
+        result.location_scale.fit.fit.covariance_conditional = None;
+        match c_tau(&result.location_scale) {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("joint posterior covariance"),
+                    "refusal must name the missing covariance: {message}"
+                );
+            }
+            Ok(plug_in) => panic!(
+                "c_τ without the scale-block covariance must be refused, got the plug-in \
+                 {plug_in:?} (integrated {integrated:?})"
+            ),
+        }
+    }
 }
