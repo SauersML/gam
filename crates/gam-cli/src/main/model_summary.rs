@@ -329,8 +329,13 @@ mod per_term_edf_tests {
             &std_fit.fit,
             std_fit.fit.weighted_gram(),
         );
-        let parametric_terms =
-            parametric_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit);
+        let parametric_terms = parametric_term_summary_rows(
+            &std_fit.design,
+            &std_fit.resolvedspec,
+            &std_fit.fit,
+            &|_, bits| f64::from_bits(bits).to_string(),
+        )
+        .coefficients;
 
         let edf_total = std_fit
             .fit

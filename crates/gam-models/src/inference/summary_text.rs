@@ -161,6 +161,68 @@ fn parametric_table(summary: &SummaryPayload, out: &mut String) {
         .collect::<Vec<_>>();
     out.push_str("Parametric coefficients:\n");
     write_table(out, &header, &rows);
+    for row in &summary.parametric_terms {
+        if let Some(reason) = row.p_value_unavailable {
+            writeln!(out, "  {}: {}", row.name, reason.explanation())
+                .expect("writing to a String cannot fail");
+        }
+    }
+    let penalized = summary
+        .parametric_terms
+        .iter()
+        .filter(|row| row.penalized)
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>();
+    if !penalized.is_empty() {
+        writeln!(
+            out,
+            "  Ridge-penalized ({}): Std. Error is the estimate's sampling SD under the null, \
+             with the ridge prior's own variance removed",
+            penalized.join(", ")
+        )
+        .expect("writing to a String cannot fail");
+    }
+    out.push('\n');
+    parametric_term_test_table(summary, out);
+}
+
+/// The joint Wald test of each parametric term, as `anova.gam` prints it: a
+/// factor with `L` levels on `L - 1` degrees of freedom. Printed only when
+/// some term spans more than one coefficient; otherwise every test repeats a
+/// coefficient row above.
+fn parametric_term_test_table(summary: &SummaryPayload, out: &mut String) {
+    if summary.parametric_term_tests.iter().all(|test| test.df <= 1) {
+        return;
+    }
+    let header = [
+        String::new(),
+        "df".to_string(),
+        summary.smooth_statistic.unwrap_or("statistic").to_string(),
+        "p-value".to_string(),
+        String::new(),
+    ];
+    let rows = summary
+        .parametric_term_tests
+        .iter()
+        .map(|test| {
+            [
+                test.name.clone(),
+                test.df.to_string(),
+                optional_number(test.statistic),
+                format_p_value(test.p_value),
+                significance_stars(test.p_value).to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    out.push_str("Parametric terms:\n");
+    write_table(out, &header, &rows);
+    // A one-coefficient term's reason is already printed under its row.
+    for test in summary.parametric_term_tests.iter().filter(|test| test.df > 1) {
+        if let Some(reason) = test.p_value_unavailable {
+            writeln!(out, "  {}: {}", test.name, reason.explanation())
+                .expect("writing to a String cannot fail");
+        }
+    }
     out.push('\n');
 }
 
@@ -328,9 +390,9 @@ mod tests {
     use super::*;
     use crate::inference::saved_summary::{
         SummaryEstimator, SummaryInformationCriteria, SummaryOuterCertificate,
-        SummaryParametricTermRow, SummarySmoothTermRow,
+        SummaryParametricTermRow, SummaryParametricTermTestRow, SummarySmoothTermRow,
     };
-    use gam_solve::estimate::SmoothPValueUnavailable;
+    use gam_solve::estimate::{ParametricPValueUnavailable, SmoothPValueUnavailable};
 
     fn smooth_row(name: &str, edf: f64, label: Option<&str>) -> SummarySmoothTermRow {
         SummarySmoothTermRow {
@@ -386,17 +448,28 @@ mod tests {
                     name: "Intercept".to_string(),
                     estimate: 1.5,
                     std_error: Some(0.05),
+                    penalized: false,
                     statistic: Some(30.0),
                     p_value: Some(1e-50),
+                    p_value_unavailable: None,
                 },
                 SummaryParametricTermRow {
                     name: "x1".to_string(),
                     estimate: -0.25,
                     std_error: Some(0.125),
+                    penalized: true,
                     statistic: Some(-2.0),
                     p_value: Some(0.0484),
+                    p_value_unavailable: None,
                 },
             ],
+            parametric_term_tests: vec![SummaryParametricTermTestRow {
+                name: "x1".to_string(),
+                df: 1,
+                statistic: Some(4.0),
+                p_value: Some(0.0484),
+                p_value_unavailable: None,
+            }],
             parametric_terms_unavailable: None,
             smooth_statistic: Some("F"),
             smooth_terms: vec![smooth_row("s(x2)", 4.875, None)],
@@ -442,6 +515,7 @@ Parametric coefficients:
            Estimate  Std. Error  t value  Pr(>|t|)
 Intercept       1.5        0.05       30   < 2e-16  ***
 x1            -0.25       0.125       -2    0.0484  *
+  Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 
 Approximate significance of smooth terms:
          edf  Ref.df        F  p-value       lambda
@@ -504,6 +578,64 @@ Convergence: certified; inner P-IRLS: Converged; 7 outer iterations; analytic_gr
             "{text}"
         );
         assert!(!text.contains("s(x1): shape-constrained"), "{text}");
+    }
+
+    /// A factor is tested once, jointly on its `L - 1` contrasts, in an
+    /// anova-style table under the coefficients; a withheld coefficient p-value
+    /// names its reason under the coefficient table.
+    #[test]
+    fn a_factor_prints_its_joint_term_test_and_a_withheld_pvalue_its_reason() {
+        let mut summary = fixed_small_model();
+        let contrast = |level: &str, estimate: f64, p_value: f64| SummaryParametricTermRow {
+            name: format!("g[{level}]"),
+            estimate,
+            std_error: Some(0.25),
+            penalized: false,
+            statistic: Some(estimate / 0.25),
+            p_value: Some(p_value),
+            p_value_unavailable: None,
+        };
+        summary.parametric_terms[1].statistic = None;
+        summary.parametric_terms[1].p_value = None;
+        summary.parametric_terms[1].p_value_unavailable =
+            Some(ParametricPValueUnavailable::BoundedCoefficient);
+        summary.parametric_terms.push(contrast("b", 0.5, 0.0484));
+        summary.parametric_terms.push(contrast("c", -0.125, 0.618));
+        summary.parametric_term_tests = vec![
+            SummaryParametricTermTestRow {
+                name: "x1".to_string(),
+                df: 1,
+                statistic: None,
+                p_value: None,
+                p_value_unavailable: Some(ParametricPValueUnavailable::BoundedCoefficient),
+            },
+            SummaryParametricTermTestRow {
+                name: "g".to_string(),
+                df: 2,
+                statistic: Some(2.5),
+                p_value: Some(0.0875),
+                p_value_unavailable: None,
+            },
+        ];
+        let text = render_summary_text(&summary);
+        let expected = "\
+Parametric coefficients:
+           Estimate  Std. Error  t value  Pr(>|t|)
+Intercept       1.5        0.05       30   < 2e-16  ***
+x1            -0.25       0.125       NA        NA
+g[b]            0.5        0.25        2    0.0484  *
+g[c]         -0.125        0.25     -0.5     0.618
+  x1: the coefficient is bounded, so the null can sit on the constraint boundary where the normal reference does not hold; no p-value is reported
+  Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
+
+Parametric terms:
+    df    F  p-value
+x1   1   NA       NA
+g    2  2.5   0.0875  .
+
+";
+        assert!(text.contains(expected), "{text}");
+        assert_eq!(text.matches("x1: the coefficient is bounded").count(), 1, "{text}");
     }
 
     /// Every absent quantity prints the reason the payload gives, never a number.

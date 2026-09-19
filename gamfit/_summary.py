@@ -63,6 +63,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "coefficients",
     "parametric_statistic",
     "parametric_terms",
+    "parametric_term_tests",
     "parametric_terms_unavailable",
     "smooth_statistic",
     "smooth_terms",
@@ -283,9 +284,20 @@ class Summary:
         the residual degrees of freedom) when the scale is estimated, ``"z"``
         when it is known.
     parametric_terms : list of dict
-        The intercept and linear-term coefficients, one record per coefficient
-        with ``name``, ``estimate``, ``std_error``, ``statistic`` and
-        ``p_value``.
+        The intercept, linear-term and factor-contrast coefficients, one record
+        per coefficient with ``name``, ``estimate``, ``std_error``,
+        ``penalized``, ``statistic`` and ``p_value``, plus
+        ``p_value_unavailable`` (the reason label) when no valid p-value
+        exists. For a ``penalized`` (ridge-carrying) coefficient
+        ``std_error`` is the estimate's sampling SD under the null with the
+        ridge prior's own variance removed, which is what the Wald statistic
+        is scaled by.
+    parametric_term_tests : list of dict
+        One joint Wald test per parametric term (not the intercept), with
+        ``name``, ``df``, ``statistic``, ``p_value`` and, when withheld,
+        ``p_value_unavailable``. A factor with ``L`` levels is tested once on
+        ``L - 1`` degrees of freedom; ``statistic`` is referred to the
+        distribution :attr:`smooth_statistic` names.
     parametric_terms_unavailable : str or None
         Why :attr:`parametric_terms` could not be built; the same causes as
         :attr:`smooth_terms_unavailable`.
@@ -414,6 +426,7 @@ class Summary:
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
     parametric_statistic: str | None = None
     parametric_terms: list[dict[str, Any]] = field(default_factory=list)
+    parametric_term_tests: list[dict[str, Any]] = field(default_factory=list)
     parametric_terms_unavailable: str | None = None
     smooth_statistic: str | None = None
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)

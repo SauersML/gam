@@ -119,11 +119,11 @@ pub(crate) use smoothing_correction::{
 pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
 };
-pub use parametric_term_summary::parametric_term_summary_rows;
+pub use parametric_term_summary::{ParametricTermTables, parametric_term_summary_rows};
 pub use smooth_term_summary::{smooth_pvalue_unavailable, smooth_term_summary_rows};
 pub use summary::{
-    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
-    ParametricTermSummary, SmoothPValueUnavailable, SmoothTermSummary,
+    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ParametricPValueUnavailable,
+    ParametricTermSummary, ParametricTermTest, SmoothPValueUnavailable, SmoothTermSummary,
 };
 
 #[cfg(test)]

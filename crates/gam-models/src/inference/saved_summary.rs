@@ -17,7 +17,9 @@ use gam_report::{
     CriterionStationarityRow, EdfBlockRow, MeasureJetSpectrumRow, ReportInput,
     SmoothingForensicsRow,
 };
-use gam_solve::estimate::{SmoothPValueUnavailable, UnifiedFitResult};
+use gam_solve::estimate::{
+    ParametricPValueUnavailable, SmoothPValueUnavailable, UnifiedFitResult,
+};
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::Array2;
 use serde::Serialize;
@@ -293,7 +295,7 @@ fn summary_term_tables(
 ) -> SummaryTermTables {
     match summary_design(model) {
         Ok((spec, design, ranges, factor_levels)) => SummaryTermTables {
-            parametric: Ok(parametric_rows(&design, spec, fit)),
+            parametric: Ok(parametric_rows(model, &design, spec, fit)),
             smooth: summary_smooth_terms(spec, &design, ranges, &factor_levels, fit),
         },
         Err(reason) => SummaryTermTables {
@@ -305,7 +307,7 @@ fn summary_term_tables(
 
 /// The two term tables of a summary, each with the reason it is absent.
 struct SummaryTermTables {
-    parametric: Result<Vec<SummaryParametricTermRow>, String>,
+    parametric: Result<SummaryParametricTables, String>,
     smooth: Result<Vec<SummarySmoothTermRow>, String>,
 }
 
@@ -362,21 +364,63 @@ fn summary_design(
     Ok((spec, design, ranges.as_slice(), factor_levels))
 }
 
+/// The parametric coefficient rows and the per-term tests of one summary.
+struct SummaryParametricTables {
+    coefficients: Vec<SummaryParametricTermRow>,
+    term_tests: Vec<SummaryParametricTermTestRow>,
+}
+
 fn parametric_rows(
+    model: &FittedModel,
     design: &gam_terms::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
-) -> Vec<SummaryParametricTermRow> {
-    gam_solve::estimate::parametric_term_summary_rows(design, spec, fit)
-        .into_iter()
-        .map(|row| SummaryParametricTermRow {
-            name: row.name,
-            estimate: row.estimate,
-            std_error: row.std_error,
-            statistic: row.statistic,
-            p_value: row.pvalue,
-        })
-        .collect()
+) -> SummaryParametricTables {
+    let payload = model.payload();
+    // A factor column's level codes are indices into the saved schema's level
+    // vocabulary; the row is labelled with the level the user wrote.
+    let level_label = |feature_col: usize, bits: u64| {
+        let code = f64::from_bits(bits);
+        payload
+            .training_headers
+            .as_ref()
+            .and_then(|headers| headers.get(feature_col))
+            .zip(payload.data_schema.as_ref())
+            .and_then(|(header, schema)| {
+                schema.columns.iter().find(|column| column.name == *header)
+            })
+            .filter(|_| code >= 0.0 && code.fract() == 0.0)
+            .and_then(|column| column.levels.get(code as usize).cloned())
+            .unwrap_or_else(|| format!("{code}"))
+    };
+    let tables =
+        gam_solve::estimate::parametric_term_summary_rows(design, spec, fit, &level_label);
+    SummaryParametricTables {
+        coefficients: tables
+            .coefficients
+            .into_iter()
+            .map(|row| SummaryParametricTermRow {
+                name: row.name,
+                estimate: row.estimate,
+                std_error: row.std_error,
+                penalized: row.penalized,
+                statistic: row.statistic,
+                p_value: row.pvalue,
+                p_value_unavailable: row.pvalue_unavailable,
+            })
+            .collect(),
+        term_tests: tables
+            .term_tests
+            .into_iter()
+            .map(|test| SummaryParametricTermTestRow {
+                name: test.name,
+                df: test.df,
+                statistic: test.statistic,
+                p_value: test.pvalue,
+                p_value_unavailable: test.pvalue_unavailable,
+            })
+            .collect(),
+    }
 }
 
 fn summary_smooth_terms(
@@ -619,6 +663,7 @@ fn scan_summary_payload(
         coefficients: Vec::new(),
         parametric_statistic: None,
         parametric_terms: Vec::new(),
+        parametric_term_tests: Vec::new(),
         parametric_terms_unavailable: None,
         smooth_statistic: None,
         smooth_terms,
@@ -814,10 +859,11 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     }
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let tables = summary_term_tables(model, &fit);
-    let (parametric_terms, parametric_terms_unavailable) = match tables.parametric {
-        Ok(rows) => (rows, None),
-        Err(reason) => (Vec::new(), Some(reason)),
-    };
+    let (parametric_terms, parametric_term_tests, parametric_terms_unavailable) =
+        match tables.parametric {
+            Ok(tables) => (tables.coefficients, tables.term_tests, None),
+            Err(reason) => (Vec::new(), Vec::new(), Some(reason)),
+        };
     let (smooth_terms, smooth_terms_unavailable) = match tables.smooth {
         Ok(rows) => (rows, None),
         Err(reason) => (Vec::new(), Some(reason)),
@@ -892,6 +938,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         coefficients,
         parametric_statistic: Some(if scale_is_estimated { "t" } else { "z" }),
         parametric_terms,
+        parametric_term_tests,
         parametric_terms_unavailable,
         smooth_statistic: Some(if scale_is_estimated { "F" } else { "Chi.sq" }),
         smooth_terms,
@@ -940,16 +987,59 @@ fn deviance_explained(fit: &UnifiedFitResult, model: &FittedModel) -> Result<Fit
     })
 }
 
-/// One row of the parametric-coefficient table: an intercept or linear-term
-/// coefficient with its Wald statistic, referred to the distribution
-/// `SummaryPayload::parametric_statistic` names.
+/// One row of the parametric-coefficient table: an intercept, linear-term or
+/// factor-contrast coefficient with its Wald statistic, referred to the
+/// distribution `SummaryPayload::parametric_statistic` names.
 #[derive(Serialize)]
 pub struct SummaryParametricTermRow {
     pub name: String,
     pub estimate: f64,
+    /// For a `penalized` coefficient, the null sampling standard deviation of
+    /// its estimate (its own ridge prior's variance removed); otherwise the
+    /// display covariance's standard error.
     pub std_error: Option<f64>,
+    /// The coefficient carries its own REML ridge prior.
+    pub penalized: bool,
     pub statistic: Option<f64>,
     pub p_value: Option<f64>,
+    /// Why `p_value` is absent, serialized as its label
+    /// (`"bounded_coefficient"`, ...); `None` exactly when it is present. See
+    /// [`gam_solve::estimate::ParametricPValueUnavailable`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_parametric_pvalue_unavailable"
+    )]
+    pub p_value_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+/// One joint Wald test of a parametric term: every coefficient of the term is
+/// zero, on `df` degrees of freedom. `statistic` is `F = W / df` referred to
+/// `F(df, n − edf)` when the scale is estimated, and `W` referred to `χ²_df`
+/// when it is known — the reference `SummaryPayload::smooth_statistic` names.
+#[derive(Serialize)]
+pub struct SummaryParametricTermTestRow {
+    pub name: String,
+    pub df: usize,
+    pub statistic: Option<f64>,
+    pub p_value: Option<f64>,
+    /// Why `p_value` is absent, serialized as its label
+    /// (`"bounded_coefficient"`, ...); `None` exactly when it is present. See
+    /// [`gam_solve::estimate::ParametricPValueUnavailable`].
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_parametric_pvalue_unavailable"
+    )]
+    pub p_value_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+fn serialize_parametric_pvalue_unavailable<S: serde::Serializer>(
+    reason: &Option<ParametricPValueUnavailable>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match reason {
+        Some(reason) => serializer.serialize_str(reason.label()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// The comparison candidate a saved model's summary defines, or the summary's
@@ -1228,8 +1318,12 @@ pub struct SummaryPayload {
     /// residual degrees of freedom) when the scale is estimated, `"z"` when it
     /// is known.
     pub parametric_statistic: Option<&'static str>,
-    /// Intercept and linear-term coefficients with their Wald tests.
+    /// Intercept, linear-term and factor-contrast coefficients with their
+    /// Wald tests.
     pub parametric_terms: Vec<SummaryParametricTermRow>,
+    /// One joint Wald test per parametric term (not the intercept): a factor
+    /// with `L` levels is tested once on `L − 1` degrees of freedom.
+    pub parametric_term_tests: Vec<SummaryParametricTermTestRow>,
     /// Why `parametric_terms` could not be built; the same causes as
     /// `smooth_terms_unavailable` short of the smoothing-parameter layout.
     #[serde(skip_serializing_if = "Option::is_none")]

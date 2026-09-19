@@ -2,12 +2,93 @@
 pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
+    /// The display covariance's standard error, or, for a coefficient that
+    /// carries its own ridge prior (`penalized`), the sampling standard deviation
+    /// of its estimate with that prior's term removed from the variance.
     pub std_error: Option<f64>,
+    /// The coefficient carries its own REML ridge prior (a linear term's
+    /// function-mass penalty), so `std_error` is its null sampling standard
+    /// deviation, not its posterior one.
+    pub penalized: bool,
     /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
     /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
     /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
     pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
+    /// Why `pvalue` is absent. `None` exactly when `pvalue` is present.
+    pub pvalue_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+/// The joint Wald test of one parametric term: every coefficient the term owns
+/// tested against zero together, as one anova-style row.
+///
+/// A factor with `L` levels owns `L - 1` treatment contrasts, and each contrast's
+/// own p-value answers a question about the reference level. The term row asks
+/// whether the factor matters at all, which does not depend on the coding.
+#[derive(Clone, Debug)]
+pub struct ParametricTermTest {
+    pub name: String,
+    /// The number of coefficients tested, the numerator degrees of freedom.
+    pub df: usize,
+    /// `W / df` referred to `F(df, residual_df)` when the fit's scale is
+    /// estimated; the Wald `W` referred to `χ²_df` when it is known, where
+    /// `W = bᵀ V⁻¹ b` over the term's coefficients and the null sampling
+    /// covariance of their estimate (the display block, less the term's own
+    /// ridge prior when it carries one).
+    pub statistic: Option<f64>,
+    pub pvalue: Option<f64>,
+    pub pvalue_unavailable: Option<ParametricPValueUnavailable>,
+}
+
+/// Why a parametric coefficient or term reports no Wald p-value.
+///
+/// Each variant names the missing input or the property of the term that leaves
+/// no valid reference distribution, so an absent p-value always says why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParametricPValueUnavailable {
+    /// The fit carries no coefficient covariance of its display definition.
+    NoCovariance,
+    /// The scale is estimated, so the reference is Student-t or F on the
+    /// residual degrees of freedom `n - edf`, and the fit has none left.
+    NoResidualDegreesOfFreedom,
+    /// The term's covariance block is not positive definite, so the Wald form
+    /// `bᵀ V⁻¹ b` does not exist: the coefficients are not identified.
+    SingularCovariance,
+    /// The coefficient carries a bound or bounded geometry. The null `β = 0`
+    /// can sit on that boundary, where the estimate cannot fall on both sides
+    /// of the null and the normal reference is not the null law.
+    BoundedCoefficient,
+}
+
+impl ParametricPValueUnavailable {
+    /// Serialized label carried into the model payload and the Python surface.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoCovariance => "no_covariance",
+            Self::NoResidualDegreesOfFreedom => "no_residual_degrees_of_freedom",
+            Self::SingularCovariance => "singular_covariance",
+            Self::BoundedCoefficient => "bounded_coefficient",
+        }
+    }
+
+    /// One-line explanation printed beside the summary table.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::NoCovariance => "the fit carries no coefficient covariance; no p-value is reported",
+            Self::NoResidualDegreesOfFreedom => {
+                "the scale is estimated and n - edf leaves no residual degrees of freedom for \
+                 the t or F reference; no p-value is reported"
+            }
+            Self::SingularCovariance => {
+                "the term's coefficient covariance is not positive definite, so its \
+                 coefficients are not identified; no p-value is reported"
+            }
+            Self::BoundedCoefficient => {
+                "the coefficient is bounded, so the null can sit on the constraint boundary \
+                 where the normal reference does not hold; no p-value is reported"
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

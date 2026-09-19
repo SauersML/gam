@@ -140,6 +140,12 @@ pub fn smooth_term_summary_rows(
             .map(|term| term.penalized)
             .unwrap_or(true);
         let k_pen = usize::from(penalized && !range.is_empty());
+        // An unpenalized block is a fixed factor: a parametric term, reported
+        // (and tested jointly) in the parametric tables, not here. It owns no
+        // penalty block, so the cursor does not move.
+        if !penalized {
+            continue;
+        }
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
