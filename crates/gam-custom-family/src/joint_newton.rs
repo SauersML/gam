@@ -1549,7 +1549,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         _ => false,
     };
     let logdet_jeffreys_hphi: Option<Array2<f64>> =
-        if !include_logdet_h || options.seed_screening || !family.joint_jeffreys_term_required() {
+        if !include_logdet_h || !family.joint_jeffreys_term_required() {
             None
         } else if let Some(hphi) = cached_jeffreys_hphi {
             if hphi.dim() != (total, total) {
@@ -1564,12 +1564,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             // second all-axis Jeffreys sweep at that identical coefficient point.
             Some(hphi.clone())
         } else if !outer_jeffreys_precheck_skips {
-            // Skipped during seed screening: this per-axis Jeffreys curvature
-            // (O(p · per-axis-Hdot)) augments the outer LAML logdet `½ log|H+Sλ+H_Φ|`,
-            // a refinement the screening SCORE does not need. Screening ranks seeds by
-            // the un-augmented `½ log|H+Sλ|` plus the value-only Firth penalty already
-            // in `penalty_value`; the load-bearing H_Φ is restored for the real fit
-            // (gam#729/#808).
+            // This per-axis Jeffreys curvature (O(p · per-axis-Hdot)) augments the
+            // outer LAML logdet `½ log|H+Sλ+H_Φ|` (gam#729/#808).
             match build_joint_jeffreys_subspace(family, specs, &ranges)? {
                 Some(z_joint) => {
                     custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?

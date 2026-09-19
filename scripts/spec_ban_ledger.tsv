@@ -44,17 +44,6 @@ box	crates/gam-solve/src/reml/reml_outer_engine/outer_entry_helpers.rs	clamp(+-E
 box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_GROW_FACTOR	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_SHRINK_FACTOR	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-terms/src/smooth/term_specs.rs	clamp(+-MAX_NUDGE)	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn baseline_centers [0.0,-3.0,3.0,-6.0,6.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn baseline_centers [0.0,2.0,4.0,-2.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn baseline_centers [0.0,2.0,4.0,6.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn global_shifts [-2.0,2.0,-4.0,4.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn global_shifts [0.0,2.0,4.0,-1.0,-2.0,-4.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-problem/src/seeding.rs	fn global_shifts [0.0,2.0,4.0,6.0,-2.0,-4.0]	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-solve/src/seeding.rs	let default_log_kappa	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-solve/src/seeding.rs	let default_log_tau	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-solve/src/seeding.rs	let log_kappa_grid	https://github.com/SauersML/gam/issues/2902
-grid	crates/gam-solve/src/seeding.rs	let nu_grid	https://github.com/SauersML/gam/issues/2902
 jitter	crates/gam-inference/src/hmc_io.rs	const MASS_MATRIX_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/fit_drivers.rs	escalate_ridge(	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/minimal_seed.rs	const RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090

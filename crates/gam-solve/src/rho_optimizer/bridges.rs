@@ -772,13 +772,14 @@ impl CostStallGuard {
         Some((noise_floor, probe_radius))
     }
 
-    /// The band the terminal certificate applies at criterion value `value`,
-    /// the only standard a stall's claim is judged by (#2817). One owner:
-    /// [`outer_stationarity_band_and_rung_at`](super::run::outer_stationarity_band_and_rung_at),
-    /// so the guard can never claim a point the certificate's first-order band
-    /// would refuse.
-    pub(crate) fn stationarity_band(&self, value: f64) -> f64 {
-        super::run::outer_stationarity_band_and_rung_at(&self.claim_config, value).bound
+    /// The declared band a stall's claim is judged by (#2817), from one owner:
+    /// [`outer_stationarity_band_and_rung`](super::run::outer_stationarity_band_and_rung).
+    /// The certificate's per-coordinate band is at least this one wherever
+    /// rounding is below the requested resolution (#2954), so the guard does
+    /// not claim a point the certificate's first-order band would refuse. No
+    /// criterion value enters.
+    pub(crate) fn stationarity_band(&self) -> f64 {
+        super::run::outer_stationarity_band_and_rung(&self.claim_config).bound
     }
 
     /// Register a precomputed feasible seed that the optimizer consumes from
@@ -997,7 +998,7 @@ impl CostStallGuard {
         // `opt::Arc`'s own gradient-tolerance check never trips here because it
         // tests the RAW gradient, which points out of the box forever.
         let kkt_stationary_at_bound =
-            grad_norm.is_finite() && grad_norm <= self.stationarity_band(value);
+            grad_norm.is_finite() && grad_norm <= self.stationarity_band();
         // With no incumbent yet the floor is `rel_tol·(1 + ∞) = ∞`. The first
         // observation IS an improvement: it is the first incumbent, whatever its
         // gradient, so it never counts toward a window. Counting it (through
@@ -1178,7 +1179,7 @@ impl CostStallGuard {
         }
         let (best_rho, best_value, best_grad_norm) =
             self.best_iterate_or(rho, self.best_value, self.best_grad_norm);
-        let band = self.stationarity_band(best_value);
+        let band = self.stationarity_band();
         if best_grad_norm.is_finite() && best_grad_norm <= band {
             return self.publish_stall(rho, best_value, best_grad_norm);
         }
@@ -1301,7 +1302,7 @@ impl CostStallGuard {
         // and the window's `σ̂/Δ`. None of those was derived, and a stall claimed
         // points the certificate then refused: EBM draw 20260542 at |Pg| 5.877e-4
         // under a score-relative term of 0.158, valley scan v2 at |Pg| 0.2289.
-        let band = self.stationarity_band(best_value);
+        let band = self.stationarity_band();
         let probe_scale = self.window_probe_scale();
         let converged = best_grad_norm.is_finite() && best_grad_norm <= band;
         if converged {
@@ -1743,7 +1744,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
@@ -1975,7 +1976,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // iterations, BEFORE invoking the inner solve. Cap stays fixed
         // within line-search cost probes (`eval_cost` never touches the
         // atomic). A cap of 0 means "no cap from this source"; the inner
-        // solver still honors `pirls_max_iterations` and the screening cap.
+        // solver still honors `pirls_max_iterations`.
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
@@ -2104,7 +2105,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         //
         // #1426: read the inner-PIRLS convergence flag for the solve THIS eval
         // just ran (the feedback atomics are updated by `execute_pirls_if_needed`
-        // after each non-screening solve, so the snapshot now reflects this ρ).
+        // after each inner solve, so the snapshot now reflects this ρ).
         // A non-finite / non-converged inner solve makes the reported
         // cost/gradient untrustworthy; the guard must not record it as
         // best-so-far nor count it toward a stall. `None` (no feedback wired)
@@ -2366,7 +2367,7 @@ impl OuterFirstOrderBridge<'_> {
                         guard.rel_tol,
                         guard.window,
                         guard.best_grad_norm,
-                        guard.stationarity_band(guard.best_value),
+                        guard.stationarity_band(),
                         guard.best_value,
                     );
                     return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
@@ -2381,7 +2382,7 @@ impl OuterFirstOrderBridge<'_> {
                         guard.rel_tol,
                         guard.window,
                         residual_grad_norm,
-                        guard.stationarity_band(guard.best_value),
+                        guard.stationarity_band(),
                         guard.best_value,
                     );
                     return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
@@ -2425,11 +2426,11 @@ pub(crate) const INNER_CAP_CEILING: usize = 64;
 ///   thrashing.
 ///
 /// A cap of 0 means "no cap from this source"; the inner solver still
-/// honors `pirls_max_iterations` and the screening cap. The cap is
+/// honors `pirls_max_iterations`. The cap is
 /// floored at 3 (anything less is below noise) and ceilinged at 64
 /// (the inner noise floor at large scale; further iters would be
 /// pure waste).
-/// Did the inner PIRLS for the most recent non-screening outer eval converge?
+/// Did the inner PIRLS for the most recent outer eval converge?
 ///
 /// Reads the inner-progress feedback snapshot the cap schedule already consumes.
 /// Returns the snapshot's `last_converged` flag, defaulting to `true` when there
@@ -2523,8 +2524,8 @@ pub(crate) fn first_order_inner_cap_schedule(
         return next.clamp(INNER_CAP_FLOOR, INNER_CAP_CEILING);
     }
 
-    // No feedback yet (first outer iter, or right after a screening
-    // bundle reset). Coarse iter-count fallback for the first 1-2
+    // No feedback yet (first outer iter, or right after a bundle
+    // reset). Coarse iter-count fallback for the first 1-2
     // outer iters so the cold-start cap is shallow even before the
     // adaptive signal kicks in.
     match accepted_iters {
@@ -2679,7 +2680,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
@@ -2820,7 +2821,7 @@ impl OuterSecondOrderBridge<'_> {
             let Some(guard) = self.cost_stall.as_ref() else {
                 return None;
             };
-            lower_bound_outward_active_count(x, gradient, bounds.as_ref(), guard.stationarity_band(cost))
+            lower_bound_outward_active_count(x, gradient, bounds.as_ref(), guard.stationarity_band())
                 >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
         };
         // #1426: `inner_converged` is the inner-PIRLS convergence flag for the
@@ -2918,7 +2919,7 @@ impl OuterSecondOrderBridge<'_> {
                     guard.rel_tol,
                     guard.window,
                     guard.best_grad_norm,
-                    guard.stationarity_band(guard.best_value),
+                    guard.stationarity_band(),
                     guard.best_value,
                 );
                 guard.defer_finite_second_order_stall();
@@ -2934,7 +2935,7 @@ impl OuterSecondOrderBridge<'_> {
                     guard.rel_tol,
                     guard.window,
                     residual_grad_norm,
-                    guard.stationarity_band(guard.best_value),
+                    guard.stationarity_band(),
                     guard.best_value,
                 );
                 guard.defer_finite_second_order_stall();
@@ -3187,7 +3188,7 @@ impl OuterSecondOrderBridge<'_> {
         let bounds = self.cost_stall_bounds.clone()?;
         let guard = self.cost_stall.as_mut()?;
         if !std::mem::take(&mut guard.strict_saddle_refusal)
-            || !(guard.best_grad_norm <= guard.stationarity_band(guard.best_value))
+            || !(guard.best_grad_norm <= guard.stationarity_band())
             || !guard.best_value.is_finite()
         {
             return None;
@@ -3196,7 +3197,7 @@ impl OuterSecondOrderBridge<'_> {
         let curvature = guard.best_curvature.clone()?;
         let value = guard.best_value;
         let grad_norm = guard.best_grad_norm;
-        let grad_threshold = guard.stationarity_band(value);
+        let grad_threshold = guard.stationarity_band();
         let iterations = guard.accepted_iters;
         let railed: Vec<usize> = curvature.railed.iter().map(|railed| railed.index).collect();
         let curvature_note = curvature.render(guard.claim_config.native_coordinate_order.as_deref());
@@ -3329,7 +3330,7 @@ impl OuterSecondOrderBridge<'_> {
                      (value={:.6e}).",
                     guard.window,
                     guard.best_grad_norm,
-                    guard.stationarity_band(guard.best_value),
+                    guard.stationarity_band(),
                     guard.best_value,
                 );
                 guard.revoke_published_convergence();
@@ -3343,7 +3344,7 @@ impl OuterSecondOrderBridge<'_> {
                      feasible iterate and reporting NON-CONVERGED (value={:.6e}).",
                     guard.window,
                     residual_grad_norm,
-                    guard.stationarity_band(guard.best_value),
+                    guard.stationarity_band(),
                     guard.best_value,
                 );
                 guard.revoke_published_convergence();
@@ -3961,7 +3962,7 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             feedback
                 .cap
-                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
         }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
@@ -4673,8 +4674,8 @@ impl OuterFixedPointBridge<'_> {
     /// "Stopped moving" is the map's own arithmetic: every ψ component of the
     /// step is at or below `√ε·(1 + |ψ_i|)`, below which a proposal computed from
     /// traces and logs cannot be told from roundoff. "Has not" is the
-    /// certificate's standard, the band `outer_stationarity_band_and_rung_at`
-    /// applies at this cost. Both used to be the absolute `config.tolerance`,
+    /// declared band `outer_stationarity_band_and_rung`, which no criterion
+    /// value scales (#2954). Both used to be the absolute `config.tolerance`,
     /// a raw gradient bound applied in step currency as well (#2817).
     fn reject_nonstationary_tiny_psi_step(
         &self,
@@ -4694,7 +4695,7 @@ impl OuterFixedPointBridge<'_> {
             .iter()
             .all(|&idx| step[idx].abs() <= f64::EPSILON.sqrt() * (1.0 + x[idx].abs()));
         let psi_grad_inf = psi_gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let band = super::run::outer_stationarity_band_and_rung_at(self.config, cost).bound;
+        let band = super::run::outer_stationarity_band_and_rung(self.config).bound;
         if psi_step_at_resolution && psi_grad_inf > band {
             let psi_step_inf = psi_indices
                 .iter()
