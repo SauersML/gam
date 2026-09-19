@@ -56,6 +56,7 @@ mod efs_fallback_routing_tests;
 mod hessian_operator;
 mod newton_polish;
 mod objective;
+mod outer_measurement;
 mod rail;
 pub mod rail_face;
 #[cfg(test)]
@@ -84,6 +85,7 @@ pub use run::OuterProblem;
 // Re-export the outer-loop result struct at `pub` (the blanket `run` re-export
 // above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
+pub use outer_measurement::OuterFirstOrderMeasurement;
 pub use run::{CertifiedOuterResult, MultistartOutcome, OuterResult, OuterResultOrigin};
 // Re-export the converged-via certificate vocabulary (#2235/#2241) so callers
 // that thread the termination verdict into their own payloads (gam-sae's

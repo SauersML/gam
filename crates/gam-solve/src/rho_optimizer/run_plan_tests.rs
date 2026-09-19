@@ -1006,7 +1006,7 @@ fn standard_reml_certificate_uses_fresh_uncapped_inner_state_2309() {
     assert_eq!(obj.state.reset_count, 1);
     assert_eq!(obj.state.evaluated_caps, vec![0]);
     assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
-    assert_eq!(result.final_gradient.as_ref(), Some(&array![37.0]));
+    assert_eq!(result.final_gradient(), Some(&array![37.0]));
 }
 
 /// Mixture/SAS regression for the augmented `[rho | link]` layout.  It proves
@@ -1097,7 +1097,7 @@ fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
     assert_eq!(obj.state.evaluated_caps, vec![0]);
     assert_eq!(obj.state.last_theta.as_ref(), Some(&theta_hat));
     assert_eq!(obj.state.feedback.cap.load(Ordering::Relaxed), 3);
-    assert_eq!(result.final_gradient.as_ref(), Some(&array![0.0, 37.0]));
+    assert_eq!(result.final_gradient(), Some(&array![0.0, 37.0]));
 }
 
 fn audit_gradient_only_roundoff_residual_2269(
@@ -6357,6 +6357,11 @@ mod run_plan_saddle_escape_tests;
 
 #[path = "stratum_boundary_2939_tests.rs"]
 mod stratum_boundary_2939_tests;
+
+// #2953: an outer result's gradient is a measurement at a point, and the
+// reproducibility floor reads it only at the point being certified.
+#[path = "run_plan_measurement_point_2953_tests.rs"]
+mod run_plan_measurement_point_2953_tests;
 
 /// #2370: an inverted per-coordinate ρ-box (lower > upper) must surface as a
 /// typed `EstimationError::InvalidInput` from the outer runner. The

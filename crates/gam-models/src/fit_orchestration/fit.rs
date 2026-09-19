@@ -2198,7 +2198,9 @@ fn optimize_survival_transformation_smoothing(
     let outer_iterations = result.iterations;
     let criterion_certificate = result.criterion_certificate;
     let outer_hessian = result.final_hessian;
-    let outer_gradient = result.final_gradient;
+    let outer_gradient = result
+        .final_measurement
+        .map(gam_solve::rho_optimizer::OuterFirstOrderMeasurement::into_gradient);
     let selected_rho = result.rho;
     if selected_rho.len() != num_smoothing {
         return Err(FitFailure::raised(

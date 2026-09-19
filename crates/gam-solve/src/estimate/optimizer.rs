@@ -2267,7 +2267,12 @@ where
 
             if rho_certificate_ok && theta_certificate_ok && pirls_certificate_ok {
                 outer_result.final_value = joint_cost;
-                outer_result.final_gradient = Some(rho_gradient);
+                outer_result.final_measurement =
+                    Some(crate::rho_optimizer::OuterFirstOrderMeasurement::new(
+                        final_rho.clone(),
+                        joint_cost,
+                        rho_gradient,
+                    ));
                 outer_result.final_grad_norm = Some(rho_residual);
                 log::debug!(
                     "[OUTER] negative-binomial joint optimum certified after {} round(s): \
@@ -3074,7 +3079,11 @@ where
         });
     }
     outer_result.final_value = final_value;
-    outer_result.final_gradient = Some(finalgrad);
+    outer_result.final_measurement = Some(crate::rho_optimizer::OuterFirstOrderMeasurement::new(
+        final_rho.clone(),
+        final_value,
+        finalgrad,
+    ));
     outer_result.final_grad_norm = Some(finalgrad_norm);
     let outer_converged = true;
 
@@ -3167,7 +3176,7 @@ where
             let rank_constancy = match (
                 not_evaluated,
                 outer_result.final_hessian.as_ref(),
-                outer_result.final_gradient.as_ref(),
+                outer_result.final_gradient(),
             ) {
                 (None, Some(hessian_rho), Some(gradient))
                     if hessian_rho.dim() == (gradient.len(), gradient.len()) =>
@@ -3613,8 +3622,7 @@ where
                 // correction applies a strictly stronger standard than the
                 // certificate did and can reject a fit the outer loop passed.
                 outer_result
-                    .final_gradient
-                    .as_ref()
+                    .final_gradient()
                     .unwrap_or(&no_outer_gradient),
                 // #2748: the rho-Hessian the CERTIFICATE judged, so the
                 // correction can measure how far its own fresh assembly of the

@@ -4805,6 +4805,13 @@ pub(crate) fn solution_into_outer_result(
     converged: bool,
     plan_used: OuterPlan,
 ) -> OuterResult {
+    let final_measurement = solution.final_gradient.map(|gradient| {
+        OuterFirstOrderMeasurement::new(
+            solution.final_point.clone(),
+            solution.final_value,
+            gradient,
+        )
+    });
     let mut result = OuterResult::new(
         solution.final_point,
         solution.final_value,
@@ -4813,7 +4820,7 @@ pub(crate) fn solution_into_outer_result(
         plan_used,
     );
     result.final_grad_norm = solution.final_gradient_norm;
-    result.final_gradient = solution.final_gradient;
+    result.final_measurement = final_measurement;
     result.final_hessian = solution.final_hessian;
     // #2547: carry the solver's own verdict instead of reconstructing one.
     // Every route that produces an `opt::Solution` funnels through here,
@@ -4919,6 +4926,8 @@ pub(crate) fn outer_result_with_gradient(
     converged: bool,
     plan_used: OuterPlan,
 ) -> OuterResult {
+    let final_measurement = final_gradient
+        .map(|gradient| OuterFirstOrderMeasurement::new(rho.clone(), final_value, gradient));
     let mut result = outer_result_with_gradient_norm(
         rho,
         final_value,
@@ -4927,7 +4936,7 @@ pub(crate) fn outer_result_with_gradient(
         converged,
         plan_used,
     );
-    result.final_gradient = final_gradient;
+    result.final_measurement = final_measurement;
     result
 }
 

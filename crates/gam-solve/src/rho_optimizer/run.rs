@@ -1551,8 +1551,9 @@ pub struct OuterResult {
     pub iterations: usize,
     /// Final gradient norm, when the solver computed an actual gradient.
     pub final_grad_norm: Option<f64>,
-    /// Final gradient when the solver is gradient-based.
-    pub final_gradient: Option<Array1<f64>>,
+    /// Final value and gradient when the solver is gradient-based, with the ρ
+    /// they were measured at.
+    pub final_measurement: Option<OuterFirstOrderMeasurement>,
     /// Final Hessian when the solver tracks one.
     pub final_hessian: Option<Array2<f64>>,
     /// Single authoritative termination lifecycle. Private so downstream
@@ -1759,7 +1760,7 @@ impl OuterResult {
             final_value,
             iterations,
             final_grad_norm: None,
-            final_gradient: None,
+            final_measurement: None,
             final_hessian: None,
             termination: OuterTermination::from_solver_claim(solver_claimed_convergence),
             plan_used,
@@ -1884,7 +1885,7 @@ impl CertifiedOuterResult {
     /// certificate. Downstream selected-profile finalizers use this to prove
     /// that a retained objective payload is the one certified at `rho()`.
     pub fn final_gradient(&self) -> Option<&Array1<f64>> {
-        self.result.final_gradient.as_ref()
+        self.result.final_gradient()
     }
 
     pub fn criterion_certificate(&self) -> &OuterCriterionCertificate {
@@ -3843,7 +3844,7 @@ fn certify_fixed_point_optimality(
 
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
-    result.final_gradient = None;
+    result.final_measurement = None;
     result.final_hessian = None;
 
     let certificate = OuterCriterionCertificate {
@@ -4047,7 +4048,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         };
         result.final_value = value;
         result.final_grad_norm = Some(0.0);
-        result.final_gradient = Some(Array1::zeros(0));
+        result.record_measurement_at_rho(value, Array1::zeros(0));
         result.final_hessian = None;
         result
             .termination
@@ -4370,19 +4371,18 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     )?;
 
     // The optimizer's own recorded best-iterate evidence, captured before the
-    // fresh certificate-time measurement overwrites it below. Together with
-    // `evaluation` this is a SECOND independent measurement of the objective
-    // at the same ρ — the raw material for the gradient-reproducibility floor
-    // further down, at zero additional objective evaluations.
-    let run_recorded_gradient = result.final_gradient.take();
-    let run_recorded_value = result.final_value;
+    // fresh certificate-time measurement overwrites it below. When it was taken
+    // at this ρ, it and `evaluation` are TWO independent measurements of the
+    // objective at one point — the raw material for the gradient-reproducibility
+    // floor further down, at zero additional objective evaluations.
+    let run_recorded = result.final_measurement.take();
 
     // Install measured first-order evidence before any fallible curvature
     // processing. If curvature is malformed, the retained resume checkpoint
     // still carries the exact value/gradient that caused certification to stop.
     result.final_value = evaluation.cost;
     result.final_grad_norm = Some(projected_grad_norm);
-    result.final_gradient = Some(evaluation.gradient);
+    result.record_measurement_at_rho(evaluation.cost, evaluation.gradient);
 
     // #2596 — a pass that spends LESS evidence must not produce a STRONGER
     // refusal than the pass that mints.
@@ -4710,28 +4710,49 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // observed as the SAME ρ returning |g| ∈ {2.5e-3 … 4.5e-2} across
     // consecutive evaluations while the objective stays flat to 1e-7.
     //
-    // The certifier already holds TWO independent measurements at this ρ: the
-    // optimizer's recorded best-iterate gradient (`run_recorded_gradient`) and
+    // The certifier may already hold TWO independent measurements at this ρ:
+    // the optimizer's recorded best-iterate measurement (`run_recorded`) and
     // the fresh certificate-time `evaluation` — so the instrument's
     // demonstrated noise costs ZERO additional objective evaluations (scripted
     // test objectives keep their exact call counts). A REAL residual gradient
     // reproduces (spread ≈ 0, no widening — genuine descent can never be
     // masked, and a deterministic objective yields bit-identical pairs), while
     // cancellation noise decorrelates (spread ~ |Pg|). The widening is gated
-    // on the two measurements' objective VALUES agreeing to the same relative
-    // floor the cost-stall guard uses, and the PSD gate below is unchanged.
+    // on the recorded measurement having been taken at exactly this ρ, and on
+    // the two measurements' objective VALUES agreeing to the same relative
+    // floor the cost-stall guard uses; the PSD gate below is unchanged.
+    //
+    // #2953: the point gate is what makes the spread a measure of noise. The
+    // gradients of two DIFFERENT points differ by the slope between them, and
+    // on a deterministic objective that is the only way the spread can be
+    // nonzero, so without the gate the floor widened exactly where the
+    // criterion was not flat.
     //
     // A decrement verdict is not widened here (#2954): measured gradient noise can
     // only make its decrement unresolvable, never make a resolvable decrease
     // stationary.
     if decrement_decided.is_none()
         && projected_grad_norm > stationarity_bound
-        && let Some(prior_gradient) = run_recorded_gradient.as_ref()
+        && let Some(prior) = run_recorded.as_ref()
+        && !prior.is_at(&result.rho)
+    {
+        log::info!(
+            "[CERTIFICATE] {context}: gradient-reproducibility floor not applied: the \
+             run-recorded measurement was taken at rho={:?}, not at the certified rho={:?} \
+             (#2953)",
+            prior.rho().to_vec(),
+            result.rho.to_vec(),
+        );
+    }
+    if decrement_decided.is_none()
+        && projected_grad_norm > stationarity_bound
+        && let Some(prior) = run_recorded.as_ref()
+        && prior.is_at(&result.rho)
         && layout
-            .validate_gradient_len(prior_gradient, "outer run-recorded gradient")
+            .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
             .is_ok()
-        && prior_gradient.iter().all(|value| value.is_finite())
-        && run_recorded_value.is_finite()
+        && prior.gradient().iter().all(|value| value.is_finite())
+        && prior.value().is_finite()
     {
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
         let objective_tol = config
@@ -4739,10 +4760,10 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             .unwrap_or(config.tolerance * 1.0e-2)
             .max(COST_STALL_REL_TOL_FLOOR)
             * (1.0 + evaluation.cost.abs());
-        let cost_drift = (run_recorded_value - evaluation.cost).abs();
+        let cost_drift = (prior.value() - evaluation.cost).abs();
         let prior_projected = project_gradient_vector(
             &result.rho,
-            prior_gradient,
+            prior.gradient(),
             Some(&rail_projection_bounds),
         );
         let spread = (&prior_projected - &projected_gradient)
@@ -4912,7 +4933,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                         .sum::<f64>()
                         .sqrt(),
                 );
-                result.final_gradient = Some(restored.gradient);
+                result.record_measurement_at_rho(restored.cost, restored.gradient);
                 let certificate = OuterCriterionCertificate {
                     stationarity: OuterStationarityCertificate::AsymptoteRail {
                         interior_projected_grad_norm,
@@ -5240,7 +5261,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                         .sum::<f64>()
                         .sqrt(),
                 );
-                result.final_gradient = Some(restored.gradient);
+                result.record_measurement_at_rho(restored.cost, restored.gradient);
                 let certificate = OuterCriterionCertificate {
                     stationarity: OuterStationarityCertificate::AsymptoteRail {
                         interior_projected_grad_norm,
@@ -5347,7 +5368,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     if certificate.is_stationary()
         && (!certificate.curvature_not_refused() || strict_curvature_refused)
         && let Some(hessian) = result.final_hessian.clone()
-        && let Some(gradient) = result.final_gradient.clone()
+        && let Some(gradient) = result.final_gradient().cloned()
     {
         probes_ran = true;
         let saddle_rho = result.rho.clone();
@@ -5457,8 +5478,8 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             // fail to happen at all.
             let escape_blocker = if result.final_hessian.is_none() {
                 Some("final_hessian=None (no terminal Hessian retained on this route)")
-            } else if result.final_gradient.is_none() {
-                Some("final_gradient=None (no terminal gradient retained on this route)")
+            } else if result.final_measurement.is_none() {
+                Some("final_measurement=None (no terminal gradient retained on this route)")
             } else {
                 None
             };
@@ -5771,7 +5792,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 .sum::<f64>()
                 .sqrt(),
         );
-        result.final_gradient = Some(restored.gradient);
+        result.record_measurement_at_rho(restored.cost, restored.gradient);
     }
     // #2235/#2241 — record WHICH certificate concluded this run. A
     // Fellner–Schall model-state fixed point was pre-stamped by the runner and

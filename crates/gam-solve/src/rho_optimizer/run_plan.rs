@@ -3240,9 +3240,12 @@ pub(crate) fn run_outer_with_plan(
                     continuation = DominanceContinuationStop::Exhausted {
                         final_value: retry_checkpoint.final_value,
                     };
+                    // The whole retry result, not its point and value alone: every
+                    // other field describes the point it stopped at, and a gradient
+                    // left from the incumbent's own point is how the #2953 floor
+                    // certified a non-stationary ρ.
                     if retry_checkpoint.final_value < incumbent.final_value {
-                        incumbent.rho = retry_checkpoint.rho;
-                        incumbent.final_value = retry_checkpoint.final_value;
+                        incumbent = retry_checkpoint;
                     }
                 }
                 Ok(PlanRunOutcome::DominatedPlateau(retry)) => {
@@ -3255,8 +3258,7 @@ pub(crate) fn run_outer_with_plan(
                         plateau_value: retry.plateau.final_value,
                     };
                     if retry.incumbent.final_value < incumbent.final_value {
-                        incumbent.rho = retry.incumbent.rho;
-                        incumbent.final_value = retry.incumbent.final_value;
+                        incumbent = retry.incumbent;
                     }
                 }
                 // The continuation certified under the screening certificate. It publishes

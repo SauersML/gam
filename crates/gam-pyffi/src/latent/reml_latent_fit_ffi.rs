@@ -61,7 +61,7 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
                     Some(value) => bound.setattr("final_grad_norm", value)?,
                     None => bound.setattr("final_grad_norm", py.None())?,
                 }
-                match result.final_gradient.as_ref() {
+                match result.final_gradient() {
                     Some(value) => {
                         bound.setattr("final_gradient", value.clone().into_pyarray(py))?
                     }
