@@ -71,7 +71,11 @@ class Rep:
 # One seeded rep per root cause this fuzzer found and fixed in the engine: the
 # smallest failing (case, family, n) of that cause's cluster in the "before"
 # run. Kept in ``quick`` forever, so the cause cannot come back unnoticed.
-FIXTURES: dict[str, Rep] = {}
+FIXTURES: dict[str, Rep] = {
+    # The latched #784 block was re-ranked by |gamma| at every rho, so the
+    # spliced criterion jumped where two directions' |gamma| crossed.
+    "block-correction-reselected": Rep(0, "binomial", 1000),
+}
 
 
 def _full() -> list[Rep]:

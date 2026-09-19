@@ -20,10 +20,10 @@
 //! through ρ avoids generically, so the criterion is continuous again and the
 //! frame-rotation channel differentiates exactly that motion.
 //!
-//! The fixture is the fuzzer's `case0/poisson/n100` training set (eight
+//! The fixture is that same `case0/binomial/n1000` training set (eight
 //! covariates, `bench/convergence_fuzz/dgp.py`, written with `repr` so every
 //! value round-trips exactly). Before the repair it was refused with
-//! `NOT STATIONARY (|Pg|=8.078e-6 > bound=1.490e-6)`.
+//! `NOT STATIONARY (|Pg|=1.065e-2 > bound=1.490e-5)`.
 //!
 //! The evaluation-level tests (#2623, #2748) build a fresh `RemlState` per
 //! call, so the latch there lives for one evaluation and never sees a later ρ;
@@ -34,7 +34,7 @@ use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/data/pygam_conv_fuzz_additive/case0_poisson_n100.csv"
+    "/tests/data/pygam_conv_fuzz_additive/case0_binomial_n1000.csv"
 );
 
 fn fixture_dataset() -> gam::data::EncodedDataset {
@@ -50,7 +50,7 @@ fn fixture_dataset() -> gam::data::EncodedDataset {
         .records()
         .map(|record| record.expect("fuzzer fixture row"))
         .collect();
-    assert_eq!(records.len(), 100, "case0/poisson/n100 carries 100 rows");
+    assert_eq!(records.len(), 1000, "case0/binomial/n1000 carries 1000 rows");
     encode_recordswith_inferred_schema(headers, records).expect("encode fuzzer fixture")
 }
 
@@ -59,23 +59,23 @@ fn latched_block_correction_keeps_its_block_and_the_fit_certifies() {
     init_parallelism();
     let data = fixture_dataset();
     let config = FitConfig {
-        family: Some("poisson".to_string()),
+        family: Some("binomial".to_string()),
         ..FitConfig::default()
     };
     let formula = "y ~ s(x0) + s(x1) + s(x2) + s(x3) + s(x4) + s(x5) + s(x6) + s(x7)";
     let fit = gam::fit_from_formula(formula, &data, &config).unwrap_or_else(|error| {
         panic!(
-            "`{formula}` on the fuzzer's case0/poisson/n100 must fit to a certified optimum. \
+            "`{formula}` on the fuzzer's case0/binomial/n1000 must fit to a certified optimum. \
              A latched #784 block that is re-selected at each rho jumps wherever two \
              directions' |gamma| cross, and no line search can cross that: {error}"
         )
     });
     let gam::FitResult::Standard(standard) = &fit else {
-        panic!("case0/poisson/n100 is a standard Poisson GAM fit");
+        panic!("case0/binomial/n1000 is a standard binomial GAM fit");
     };
     let reml_score = standard.fit.reml_score();
     assert!(
         reml_score.is_some_and(f64::is_finite),
-        "case0/poisson/n100 minted a fit with no finite REML/LAML criterion: {reml_score:?}"
+        "case0/binomial/n1000 minted a fit with no finite REML/LAML criterion: {reml_score:?}"
     );
 }
