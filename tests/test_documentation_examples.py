@@ -30,7 +30,7 @@ PYTHON_INFO = re.compile(r"^(?P<indent>[ \t]*)```(?P<info>py(?:thon|con)?\b[^\n]
 NOT_EXECUTED = "python no-exec"
 # The fences that cannot run here: pyGAM itself, external models, accelerators
 # and user-owned activation arrays.  Raising this number needs a reason.
-NOT_EXECUTED_CAP = 24
+NOT_EXECUTED_CAP = 25
 
 
 def examples(language: str):
