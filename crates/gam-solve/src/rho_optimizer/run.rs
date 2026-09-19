@@ -6033,20 +6033,24 @@ fn try_certify_asymptote_rail(
     // information exactly where its logdet pair cancels; and even when it
     // succeeds it speaks for ONE coordinate along ONE ray. The analytic route
     // forms the λ=∞ limit itself — the null-space-restricted fit, and the
-    // exact first-order form of the logdet and trace terms there — and its
-    // positive definiteness proves the whole face against every way of coming
-    // off it. When the objective cannot form that limit, or the proof does not
-    // hold, the measured-tail path below is unchanged.
+    // exact first-order form of the logdet and trace terms there — and proves
+    // the whole face against every way of coming off it: by that form's
+    // positive definiteness, or, when the released penalty ranges are
+    // independent (Σ rank A_j = q, every single-penalty face), by the exact
+    // KKT test c_j > τ_j on the linear first-order law. When the objective
+    // cannot form that limit, or the proof does not hold, the measured-tail
+    // path below is unchanged.
     match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
         Ok((rails, proof)) => {
             log::debug!(
-                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s): λ_min(C)={:.6e} \
-                 > margin {:.3e}, joint pencil ĉ={:.6e}, remaining value gap {:.3e}, estimand \
-                 travel {:.3e}",
+                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
+                 statistic {:.6e} > band {:.3e}, joint pencil ĉ={:.6e}, remaining value gap \
+                 {:.3e}, estimand travel {:.3e}",
                 inputs.context,
                 rails.len(),
-                proof.min_curvature,
-                proof.curvature_margin,
+                proof.route,
+                proof.statistic,
+                proof.band,
                 proof.joint_tail_constant,
                 proof.value_gap,
                 proof.estimand_travel,
@@ -6229,12 +6233,13 @@ fn try_certify_face_analytically(
             // move the criterion at all.
             value_gap: tail_constant * (-rho_k).exp(),
             estimand_travel_bound: proof.estimand_travel,
-            // The face was PROVEN, so the standard it cleared is the form's own
-            // eigen-backward-error margin — not a finite-difference floor, and
-            // not a quantity comparable with one.
+            // The face was PROVEN, so the standard it cleared is the route's
+            // own rounding band on the assembled form — not a finite-difference
+            // floor, and not a quantity comparable with one.
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: proof.min_curvature,
-                curvature_margin: proof.curvature_margin,
+                route: proof.route,
+                statistic: proof.statistic,
+                band: proof.band,
             },
         })
         .collect();
