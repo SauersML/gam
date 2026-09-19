@@ -123,6 +123,7 @@ def police(
     timeout_s: float,
     memcap_mb: float,
     threads: int | None = 1,
+    env_extra: dict[str, str] | None = None,
 ) -> Policed:
     """Run ``cmd`` under the thread env of ``threads`` (see ``thread_env``) and
     the harness safety net.
@@ -136,6 +137,8 @@ def police(
     env = {k: v for k, v in os.environ.items() if k not in THREAD_ENV}
     env.update(thread_env(threads))
     env.pop("PYTHONPATH", None)
+    if env_extra:
+        env.update(env_extra)
     t0 = time.perf_counter()
     with (
         tempfile.TemporaryFile("w+") as out,
@@ -149,9 +152,9 @@ def police(
         peak_threads = 0
         status = "ok"
         while proc.poll() is None:
-            rss, threads = _sample(_tree(ps))
+            rss, n_threads = _sample(_tree(ps))
             peak_tree_rss = max(peak_tree_rss, rss)
-            peak_threads = max(peak_threads, threads)
+            peak_threads = max(peak_threads, n_threads)
             elapsed = time.perf_counter() - t0
             if rss > memcap_mb:
                 status = "memcap"
@@ -180,6 +183,70 @@ def police(
         )
 
 
+def run_isolated(
+    cmd: list[str],
+    cwd: str,
+    timeout_s: float,
+    memcap_mb: float,
+    threads: int | None = 1,
+    env_extra: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run one worker subprocess under :func:`police`.
+
+    The worker must print one ``RESULT {json}`` line. Returns that object with
+    the harness fields added: ``status`` (the worker's own, or ``timeout`` /
+    ``memcap`` when the safety net killed the process tree, or ``crash`` when
+    it exited without a RESULT line), ``returncode``, ``proc_wall_s``,
+    ``peak_tree_rss_mb``, ``peak_threads``, ``load_start``/``load_end`` and,
+    for any status but ``ok``, ``stderr_tail``.
+    """
+    load_start = os.getloadavg()
+    run = police(cmd, cwd, timeout_s, memcap_mb, threads, env_extra)
+    status = run.status
+    rec: dict[str, Any] = {}
+    if status == "ok":
+        for line in run.stdout.splitlines():
+            if line.startswith("RESULT "):
+                rec = json.loads(line[len("RESULT ") :])
+        if not rec:
+            status = "crash"
+        else:
+            status = str(rec.get("status", "error"))
+    rec.update(
+        status=status,
+        returncode=run.returncode,
+        proc_wall_s=run.wall_s,
+        peak_tree_rss_mb=run.peak_tree_rss_mb,
+        peak_threads=run.peak_threads,
+        load_start=list(load_start),
+        load_end=list(os.getloadavg()),
+    )
+    if status != "ok":
+        rec["stderr_tail"] = run.stderr[-2000:]
+    return rec
+    rec: dict[str, Any] = {}
+    if status == "ok":
+        for line in run.stdout.splitlines():
+            if line.startswith("RESULT "):
+                rec = json.loads(line[len("RESULT ") :])
+        if not rec:
+            status = "crash"
+        else:
+            status = str(rec.get("status", "error"))
+    rec.update(
+        status=status,
+        returncode=run.returncode,
+        proc_wall_s=run.wall_s,
+        peak_tree_rss_mb=run.peak_tree_rss_mb,
+        peak_threads=run.peak_threads,
+        load_start=list(load_start),
+        load_end=list(os.getloadavg()),
+    )
+    if status != "ok":
+        rec["stderr_tail"] = run.stderr[-2000:]
+    return rec
+
+
 def run_rep(
     lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
 ) -> dict[str, Any]:
@@ -193,18 +260,7 @@ def run_rep(
         cell.design,
         str(seed),
     ]
-    load_start = os.getloadavg()
-    run = police(cmd, cwd, timeout_s, memcap_mb, cell.threads)
-    status = run.status
-    rec: dict[str, Any] = {}
-    if status == "ok":
-        for line in run.stdout.splitlines():
-            if line.startswith("RESULT "):
-                rec = json.loads(line[len("RESULT ") :])
-        if not rec:
-            status = "crash"
-        else:
-            status = str(rec.get("status", "error"))
+    rec = run_isolated(cmd, cwd, timeout_s, memcap_mb, threads=cell.threads)
     rec.update(
         lib=lib,
         family=cell.family,
@@ -213,16 +269,7 @@ def run_rep(
         threads=cell.threads,
         concurrency=cell.concurrency,
         seed=seed,
-        status=status,
-        returncode=run.returncode,
-        proc_wall_s=run.wall_s,
-        peak_tree_rss_mb=run.peak_tree_rss_mb,
-        peak_threads=run.peak_threads,
-        load_start=list(load_start),
-        load_end=list(os.getloadavg()),
     )
-    if status != "ok":
-        rec["stderr_tail"] = run.stderr[-2000:]
     return rec
 
 

@@ -313,6 +313,24 @@ impl<'a> RemlState<'a> {
             );
             return Ok(zero());
         }
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
+        if reml_robust_jeffreys_link(&self.config).is_some() {
+            log::debug!(
+                "[#784] block-local fallback declined before the skewness diagnostic: \
+                 Firth/Jeffreys bias reduction is active and the block target \
+                 integrates the plain penalized likelihood, not the Jeffreys-penalized one"
+            );
+            return Ok(zero());
+        }
 
         // Resolve the injected gam-inference corrector. When the inference tier
         // is not linked / registered, decline the correction (zero contribution) —

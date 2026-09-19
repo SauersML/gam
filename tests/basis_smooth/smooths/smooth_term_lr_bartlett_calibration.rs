@@ -12,7 +12,9 @@
 //!
 //!   (a) PROVENANCE — for a Poisson/log smooth (closed-form Lawley jets) the
 //!       reported significance is built from the Bartlett-corrected LR
-//!       (`correction_provenance == "lawley_lr_estimated_lambda"`,
+//!       (`correction_provenance == "lawley_lr_fixed_lambda"` when the
+//!       λ̂-selection replay carries the estimation of `λ`, else
+//!       `"lawley_lr_estimated_lambda"`;
 //!       `bartlett_factor > 1`,
 //!       `statistic_corrected == statistic_lr / bartlett_factor`).
 //!

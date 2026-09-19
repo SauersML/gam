@@ -141,7 +141,6 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -218,7 +217,6 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -284,7 +282,6 @@ fn gpu_pirls_gating_3_offset_parity() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -366,7 +363,6 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -451,7 +447,6 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -537,7 +532,6 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -621,7 +615,6 @@ fn gpu_pirls_gating_7_status_or_reduce() {
         },
         PenaltyConfig {
             canonical_penalties: &canonical,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
