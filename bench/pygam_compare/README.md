@@ -52,6 +52,12 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `gaussian_small` | n ∈ {1e2, 1e3, 1e4}, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} (the nightly Gaussian regression cells) | 3 |
+| `gaussian_1e5` | n=1e5, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} | 3 |
+| `gaussian_1e6` | n=1e6, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`}: wall, CPU and peak RSS at the largest scale | 3 |
+
+The workflow `.github/workflows/pygam-compare.yml` runs `quick` weekly and
+`gaussian_small` nightly; any plan can be dispatched by name.
 
 Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
 
