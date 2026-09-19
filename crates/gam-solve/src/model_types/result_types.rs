@@ -2982,7 +2982,8 @@ pub enum SmoothingCorrectionAbsence {
 /// mathematical reason (no ρ to integrate, or a certified `V_ρ` whose
 /// identified subspace makes the linearization exact) travels with the fit
 /// instead of reaching only a log. A cubature that fails is not a fallback:
-/// it is the typed `EstimationError::SmoothingCubatureRefused` (SPEC R21).
+/// it is the typed `EstimationError::SmoothingCubatureRefused` (SPEC.md: "In
+/// general, do not paper over solver issues.").
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SmoothingCorrectionFallback {
     pub reason: String,

@@ -1583,7 +1583,7 @@ impl<'a> RemlState<'a> {
         // certified. There is no trial left to refuse and the first-order
         // linearization is not the integral the fit reports, so a refusal is the
         // fit's typed `SmoothingCubatureRefused`, never a downgraded covariance
-        // (SPEC R21).
+        // (SPEC.md: "In general, do not paper over solver issues.").
         let calibrated_nodes = (|| -> Result<Vec<CalibratedSigmaNode>, EstimationError> {
         let centre_cost = self.compute_rho_posterior_cost_uncharged(final_rho)?;
         if !centre_cost.is_finite() {
