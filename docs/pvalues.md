@@ -48,8 +48,9 @@ further division by the dispersion.
 
 This is a first-order reference. Under a penalty the Wald statistic is itself
 a weighted sum of `χ²₁`, not a central `χ²` or `F`. For a term that REML shrinks
-to the boundary, the reported p-value is conservative, often with a point mass
-at 1.
+to the boundary, the statistic is near zero and the reported p-value near 1,
+so under the null this p-value piles up near 1 and is not uniform. The table
+below measures how far.
 
 ### The likelihood-ratio test in `smooth_significance(data)`
 
