@@ -1533,7 +1533,7 @@ fn fit_table(
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
     // A refused configuration is an `InvalidConfigurationError` here exactly as
-    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamfitError`.
     let fit_config = parse_fit_config(config_json.as_deref())
         .map_err(|reason| {
             workflow_error_to_pyerr(

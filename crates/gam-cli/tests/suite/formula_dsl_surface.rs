@@ -140,7 +140,12 @@ fn backtick_column_names_fit_and_c_is_refused_through_the_cli() {
         "--out",
         path_str(&model),
     ]);
-    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(gam::ErrorCategory::Formula.exit_code()),
+        "{}",
+        stderr(&out)
+    );
     let error = stderr(&out);
     assert!(error.contains("`C()` is not a term function"), "{error}");
     assert!(error.contains("factor(`site-id`)"), "{error}");
