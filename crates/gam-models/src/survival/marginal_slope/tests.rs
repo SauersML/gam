@@ -6805,6 +6805,57 @@ fn survival_dense_hessian_is_bitwise_invariant_to_the_worker_count_2337() {
     }
 }
 
+/// gam#3035: the dense Hessian and all-axes overrides agree with the generic
+/// per-row reductions on the full data and on a Horvitz–Thompson-weighted
+/// subsample. `n = 700` puts the subsample's walk past one 256-row chunk.
+#[test]
+fn rigid_survival_dense_overrides_match_generic_on_every_row_set_3035() {
+    let n = 700usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.37).sin() * 1.1).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.7 + 0.5 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+    let marginal_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+    let beta_marginal = Array1::from_vec(vec![0.18, -0.12]);
+    let beta_slope = Array1::from_vec(vec![-0.2, 0.13]);
+    for frailty in [None, Some(0.55_f64)] {
+        let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        family.marginal_design = DesignMatrix::from(marginal_design.clone());
+        family
+            .slope_layout
+            .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.65],
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal.clone(),
+                eta: marginal_design.dot(&beta_marginal),
+            },
+            ParameterBlockState {
+                beta: beta_slope.clone(),
+                eta: slope_design.dot(&beta_slope),
+            },
+        ];
+        let kernel = SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+            family,
+            block_states,
+        );
+        crate::test_support::row_set_overrides::assert_dense_overrides_match_generic(
+            &format!("rigid survival marginal-slope frailty={frailty:?}"),
+            &kernel,
+            &[0.4, -0.6, 0.3, 0.8, -0.2],
+            &[0.5, 0.3, -0.7, 0.9, -0.4],
+            1e-13,
+        );
+    }
+}
+
 /// gam#979 build-once equality contract for the rigid survival marginal-slope
 /// kernel.
 ///
@@ -6994,7 +7045,7 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
                 ((row + 3 * (a + b + c)) as f64 * 0.17).sin()
             })))
         }).collect();
-        let assembled = kernel.all_axes_primary_tensor_pullback(&tensors).unwrap();
+        let assembled = kernel.all_axes_primary_tensor_pullback(&RowSet::All, &tensors).unwrap();
         for axis in 0..p {
             let mut direction = vec![0.0; p];
             direction[axis] = 1.0;
@@ -7185,7 +7236,7 @@ fn rigid_survival_all_axes_tensor_pullback_is_accurate_and_width_invariant_2337(
             .num_threads(workers)
             .build()
             .expect("test worker pool")
-            .install(|| kernel.all_axes_primary_tensor_pullback(&tensors))
+            .install(|| kernel.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors))
             .expect("all-axes tensor pullback")
     };
     let one_worker = pullback(1);

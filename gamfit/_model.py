@@ -189,22 +189,24 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the exact full-conformal
-            set at the fitted (frozen) smoothing parameters (#942 Layer 1):
-            every labeled row is used for both fitting and calibration, the
-            set is exact *given* the frozen penalty, and it costs one Cholesky
-            per test point with zero refits. It needs a Gaussian-identity model
-            fitted without prior weights, offsets, or a link wiggle. The saved
-            model carries only the ``p x p`` frozen penalty, never per-row
-            training data, so the labeled rows are passed again here. Because the
-            smoothing parameters were selected from all training responses, the
-            finite-sample ``conformal_level`` coverage theorem applies only
-            where the per-row ``frozen_rho_certified`` output column is 1.0 (the
-            Layer-3 certificate that freezing the global smoothing parameter
-            matches the honest ρ-re-selecting set, under a grid-checked
-            Lipschitz assumption); rows with 0.0 carry no finite-sample
-            guarantee, and the bounds report the outer envelope of the
-            (possibly multi-interval) set. With ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set of
+            the fit that re-selects the smoothing strength by REML on the
+            training rows plus the candidate test row (#942 Layer 3): every
+            labeled row is used for both fitting and calibration, and the test
+            row is treated exactly like a training row, so the finite-sample
+            ``conformal_level`` coverage theorem holds. It costs one Cholesky
+            per test point plus a cold REML refit at each finite endpoint. It
+            needs a Gaussian-identity model fitted without prior weights,
+            offsets, or a link wiggle. The saved model carries only the
+            ``p x p`` frozen penalty and its smoothing-parameter count, never
+            per-row training data, so the labeled rows are passed again here.
+            The per-row ``conformal_certificate`` output column is 0
+            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
+            guarantee holds; a negative code is a typed refusal (several
+            smoothing parameters, a payload without the count, a degenerate
+            criterion) where the row carries the frozen-smoothing set with no
+            finite-sample guarantee. The bounds report the outer envelope of
+            the (possibly multi-interval) set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for

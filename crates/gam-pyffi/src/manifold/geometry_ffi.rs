@@ -7617,10 +7617,10 @@ fn predict_encoded_table_full_conformal_impl(
         point_columns: None,
         family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         interval_method: Some(format!(
-            "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
-             distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
-             ρ-re-selecting fit and is certified per row only where \
-             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
+            "full-conformal with REML re-selection of the smoothing strength on the \
+             augmented rows (finite-sample ≥{:.0}% coverage wherever \
+             conformal_certificate ≥ 0; a negative code is a typed refusal carrying \
+             the frozen-ρ set)",
             conformal_level * 100.0
         )),
         covariance_source: None,
@@ -7629,19 +7629,20 @@ fn predict_encoded_table_full_conformal_impl(
     })
 }
 
-/// Full-conformal prediction intervals at frozen smoothing parameters — no
-/// held-out calibration fold required (#1098 / #942 Layer 1).
+/// Full-conformal prediction intervals — no held-out calibration fold required
+/// (#1098 / #942 Layers 1 and 3).
 ///
 /// Routes `predict(interval='conformal', training_data=...)` to the exact
 /// full-conformal set: the saved model carries only the frozen `p x p` penalty
 /// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
 /// contain the response column — supply the design and responses the set
-/// augments. The set is exact given the frozen `Sλ`; the distribution-free finite-sample
-/// ≥`conformal_level` marginal-coverage theorem additionally requires the
-/// symmetric ρ-re-selecting fit and is certified per row only where the
-/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
-/// REML branch through the augmented optimum). Returns the same column payload
-/// as `predict_table` plus that certificate column.
+/// augments. Each row's set is that of the fit that re-selects the smoothing
+/// strength by REML on the augmented rows, which carries the distribution-free
+/// finite-sample ≥`conformal_level` marginal-coverage theorem. The returned
+/// `conformal_certificate` column is `0` (exact_frozen) or `1` (honest_refit)
+/// for such rows and a negative refusal code otherwise (the frozen-ρ set, no
+/// guarantee). Returns the same column payload as `predict_table` plus that
+/// column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to split conformal.

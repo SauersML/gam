@@ -3681,6 +3681,29 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// The row weights `W` of the data curvature `XᵀWX` that the penalized
+    /// Hessian `XᵀWX + S_λ` carries at `rho`. On the Gaussian identity link the
+    /// working weight is the prior weight, so no solve is needed; otherwise it
+    /// is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the cached P-IRLS
+    /// solve at `rho`, and a refused solve is returned as its error.
+    pub(crate) fn data_curvature_weights(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Ok(self.weights.to_owned());
+        }
+        let pilot = self.execute_pirls_if_needed(rho)?;
+        if pilot.solveweights.len() != self.weights.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "P-IRLS returned {} working weights for {} rows",
+                pilot.solveweights.len(),
+                self.weights.len()
+            )));
+        }
+        Ok(pilot.solveweights.to_owned())
+    }
+
     /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
     ///
     /// For each penalty block `j` this sets
@@ -3690,6 +3713,17 @@ impl<'a> RemlState<'a> {
     /// penalized Hessian `XᵀWX + λ_j S_j` at the same scale. Because `tr(XᵀWX)`
     /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
     /// scaled `λ_j` (no separate weight anchoring needed).
+    ///
+    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the pilot fit at
+    /// `base`, not the prior weight: only the working weight makes the seed
+    /// equivariant under a change of units of `y`. Rescaling `y → c·y` scales
+    /// the working weight of a non-log link by a power of `c` (`μ³/4` for the
+    /// inverse-Gaussian `1/μ²` link, `μ²` for the Gamma inverse link) and the
+    /// optimal `λ` with it; a prior-weight seed stays put, so in small units it
+    /// sits on the over-smoothing plateau `λ → ∞`, where the REML gradient
+    /// vanishes and the outer solve certifies the intercept-only fit. For the
+    /// Gaussian identity link the working weight IS the prior weight, so no
+    /// pilot fit is needed there.
     ///
     /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
     /// data-derived estimate, no lattice search. A smooth whose penalized
@@ -3702,22 +3736,34 @@ impl<'a> RemlState<'a> {
     /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
-    /// Returns `None` (caller keeps `base`) when the design Gram is unavailable
-    /// or its width does not match `p`.
+    /// Returns `Ok(None)` only when there is no smoothing coordinate to seed.
+    /// Every failure is an `Err` with its own type: the pilot P-IRLS solve at
+    /// `base` (the cached solve the caller's `compute_cost(&base)` also runs),
+    /// the design Gram diagonal, and a pilot or Gram whose length disagrees with
+    /// the problem's. The caller decides which of those a seed search can step
+    /// past; this function does not turn any of them into "no candidate".
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
         bounds: OrderedRhoBounds,
-    ) -> Option<Array1<f64>> {
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         let n_pen = self.canonical_penalties.len();
         let n_rho = base.len().min(n_pen);
         if n_rho == 0 {
-            return None;
+            return Ok(None);
         }
-        let weights = self.weights.to_owned();
-        let gram_diag = self.x.diag_gram(&weights).ok()?;
+        let weights = self.data_curvature_weights(base)?;
+        let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
+            ))
+        })?;
         if gram_diag.len() != self.p {
-            return None;
+            return Err(EstimationError::LayoutError(format!(
+                "analytic initial-sp seed: design Gram diagonal has {} entries, expected {}",
+                gram_diag.len(),
+                self.p
+            )));
         }
         // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
         // swap — an inverted box was refused where the start bounds are built (#2379).
@@ -3735,7 +3781,7 @@ impl<'a> RemlState<'a> {
                 rho[j] = bounds.clamp(rho_j);
             }
         }
-        Some(rho)
+        Ok(Some(rho))
     }
 
     /// Returns the effective Hessian and the ridge value used (if any).

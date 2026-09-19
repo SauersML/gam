@@ -132,6 +132,8 @@ fn gaussian_exact_full_conformal_covers_under_misspecification_and_is_efficient(
         &y_train,
         &prior_weights,
         &m0,
+        // The penalty is fixed, never selected: no strength to re-select.
+        0,
     )
     .expect("exact full-conformal substrate from unit-weight normal matrix");
 

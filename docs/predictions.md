@@ -148,13 +148,19 @@ limit:
 --calibration FILE) --level L` runs the same routes; exactly one of the two
 labeled tables is required.
 
-With `training_data` it is the exact full-conformal set at the fitted (frozen)
-smoothing parameters, for a Gaussian-identity model fitted without prior
-weights, offsets, or a link wiggle. The saved model keeps only the `p x p`
-frozen penalty `S_lambda`, never per-row training data, so the labeled rows
-(normally the training table, response column included) are passed again at
-predict time. The output adds `frozen_rho_certified`: the finite-sample
-coverage theorem holds on rows where it is 1.
+With `training_data` it is the full-conformal set of the fit that re-selects
+the smoothing strength by REML on the labeled rows plus the candidate test row,
+for a Gaussian-identity model fitted without prior weights, offsets, or a link
+wiggle. The test row is treated exactly like a training row, so the
+finite-sample coverage theorem holds. The saved model keeps only the `p x p`
+frozen penalty `S_lambda` and its smoothing-parameter count, never per-row
+training data, so the labeled rows (normally the training table, response
+column included) are passed again at predict time. The output adds
+`conformal_certificate`: `0` (exact_frozen, nothing to re-select) or `1`
+(honest_refit) where the guarantee holds, and a negative code for a typed
+refusal (`-1` several smoothing parameters, `-2` a model saved without the
+count, `-3` to `-6` a degenerate criterion or refit), where the row carries the
+frozen-smoothing set with no finite-sample guarantee.
 
 ```python
 import numpy as np
