@@ -1177,20 +1177,13 @@ pub(crate) const fn default_pca_chunk_size() -> usize {
 /// Random-effects term specification.
 ///
 /// The selected feature column is interpreted as a categorical grouping variable.
-/// The term contributes a one-hot dummy block with an identity penalty on group
-/// coefficients, equivalent to i.i.d. Gaussian random effects.
+/// The term contributes a full one-hot dummy block, one column per level, with
+/// a REML-estimated identity ridge on the group coefficients (i.i.d. Gaussian
+/// random effects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// If true, drop the lexicographically first group level to use treatment coding.
-    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
-    pub drop_first_level: bool,
-    /// If true, add a ridge penalty and estimate this block as a random effect.
-    /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
-    /// fixed categorical main effect.  The default preserves older saved models.
-    #[serde(default = "default_random_effect_penalized")]
-    pub penalized: bool,
     /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
     /// When present, prediction uses exactly these columns to avoid design drift.
     #[serde(default)]
@@ -1204,23 +1197,11 @@ pub struct RandomEffectTermSpec {
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
     /// out-of-vocabulary level at predict rather than being silently mapped to
-    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
-    /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
-    /// (#2137). For a string factor the typed schema encode rejects the unseen
-    /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
-    /// by `build_random_effect_block`, which owns the frozen vocabulary. The
-    /// `true` default preserves the pre-#2102 (uniformly lenient) behavior for
-    /// models serialized before this field existed.
-    #[serde(default = "default_random_effect_lenient_unseen")]
+    /// the factor's centering point (#2102/#2137). For a string factor the typed
+    /// schema encode rejects the unseen level upstream; for a numeric-coded
+    /// `factor(year)` the reject is enforced by `build_random_effect_block`,
+    /// which owns the frozen vocabulary.
     pub lenient_unseen: bool,
-}
-
-pub(crate) fn default_random_effect_penalized() -> bool {
-    true
-}
-
-pub(crate) fn default_random_effect_lenient_unseen() -> bool {
-    true
 }
 
 pub(crate) fn validate_measure_jet_positive_vec_len(
@@ -1267,7 +1248,7 @@ pub struct TermCollectionSpec {
 /// is the unpenalized all-ones column, and every other term is centred against
 /// it. A formula that removes the intercept (`0 + …`, `… - 1`) still keeps it
 /// when some term spans the constant: a fixed factor block (`+ g`,
-/// `factor(g)`, `C(g)`, or the main effect of a factor `by=`), a
+/// `factor(g)`, or the main effect of a factor `by=`), a
 /// pure-indicator interaction over the full level cross (`g:h`), or a
 /// B-spline / tensor smooth whose gauge would keep the constant (the default
 /// sum-to-zero centring, or `identifiability=none`). Such a model has the
@@ -6368,20 +6349,8 @@ pub fn build_random_effect_block(
         if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let start_idx = if spec.drop_first_level && levels.len() > 1 {
-            1usize
-        } else {
-            0usize
-        };
-        levels[start_idx..].to_vec()
+        levels
     };
-
-    if kept_levels.is_empty() {
-        crate::bail_invalid_basis!(
-            "random-effect term '{}' drops all levels; keep at least one level",
-            spec.name
-        );
-    }
 
     let q = kept_levels.len();
     let mut level_to_col = BTreeMap::<u64, usize>::new();
@@ -6400,14 +6369,11 @@ pub fn build_random_effect_block(
     // encode rejects the unseen level before we get here; a *numeric-coded*
     // `factor(year)` column, however, reaches Rust as a plain numeric column
     // with no categorical schema, so the operator that owns the frozen level
-    // vocabulary is the enforcement point that closes the same gap. Only when
-    // the full one-hot block is kept (`!drop_first_level`) does an absent level
-    // unambiguously mean "unseen" — with treatment coding the dropped baseline
-    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
-    // presence marks the predict/frozen context; at fit the vocabulary is
-    // derived from this very data, so no row is unseen.
-    let strict_unseen =
-        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    // vocabulary is the enforcement point that closes the same gap. The block
+    // keeps every level, so a level absent from the frozen set is unseen.
+    // `frozen_levels` presence marks the predict/frozen context; at fit the
+    // vocabulary is derived from this very data, so no row is unseen.
+    let strict_unseen = !spec.lenient_unseen && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);

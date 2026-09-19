@@ -75,24 +75,14 @@
 //! one-way ANOVA `F` on a balanced design. `D'` is the unpenalized residual and
 //! not the fit's `φ̂` because `φ̂` is computed from a residual the penalty shrank,
 //! whose law under `H₀` depends on the smoothing parameters REML chose.
-//!
-//! # An unpenalized block
-//!
-//! A random-effect block that carries no penalty (the treatment-coded factor
-//! main effect a factor `by=` smooth injects) is a FIXED effect: its null
-//! `b = 0` is interior, and the classical score test `uᵀV⁺u/φ ~ χ²_rank` — the
-//! nested `F(rank, ν)` when the scale is estimated — applies. It is reported
-//! under its own hypothesis label rather than silently sharing the
-//! variance-component one.
+
 
 use std::ops::Range;
 
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 use gam_linalg::matrix::DesignMatrix;
-use gam_math::probability::{
-    WeightedChiSquareTerm, chi_square_sf, fisher_snedecor_sf, signed_weighted_chi_square_sf,
-};
+use gam_math::probability::{WeightedChiSquareTerm, signed_weighted_chi_square_sf};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use serde::{Deserialize, Serialize};
 
@@ -108,16 +98,6 @@ pub enum RandomEffectTestScale {
     /// `φ` was estimated from the data, so the statistic is a ratio against the
     /// unpenalized residual sum of squares.
     Estimated,
-}
-
-/// Which null the reported p-value tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RandomEffectHypothesis {
-    /// `σ²_b = 0` for a penalized (random) block — the boundary null.
-    VarianceComponent,
-    /// `b = 0` for an unpenalized (fixed) block — an interior null.
-    FixedEffect,
 }
 
 /// Why a random-effect term has no p-value.
@@ -182,15 +162,12 @@ impl RandomEffectTestUnavailable {
 /// A computed random-effect test.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RandomEffectTest {
-    pub hypothesis: RandomEffectHypothesis,
-    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`.
-    ///
-    /// Variance component: `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known
-    /// scale and `D'/ν` for an estimated one. Fixed effect: `uᵀV⁺u/φ̂`.
+    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`:
+    /// `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known scale and `D'/ν` for
+    /// an estimated one.
     pub statistic: f64,
-    /// Variance component: the effective degrees of freedom `(Σμ)²/Σμ²` of the
-    /// spectral reference — `rank` exactly when the design is balanced.
-    /// Fixed effect: `rank`.
+    /// The effective degrees of freedom `(Σμ)²/Σμ²` of the spectral reference —
+    /// `rank` exactly when the design is balanced.
     pub reference_df: f64,
     /// Number of estimable directions of the term (eigenvalues of `V` above its
     /// rounding floor).
@@ -235,9 +212,6 @@ pub struct RandomEffectTestRecord {
 pub struct RandomEffectTermRequest {
     /// GLOBAL coefficient range of the term's block.
     pub range: Range<usize>,
-    /// Whether the block carries a penalty (a random effect) or not (a fixed
-    /// factor block).
-    pub penalized: bool,
 }
 
 /// The fit's row state, in the fit's own row and coefficient layout.
@@ -416,7 +390,6 @@ impl<'a> RandomEffectTestBasis<'a> {
         }
         let q = tested.len();
         Ok(PreparedTerm {
-            penalized: request.penalized,
             beta_tested: self.input.beta.slice(s![range]).to_owned(),
             tested,
             other,
@@ -474,7 +447,7 @@ impl<'a> RandomEffectTestBasis<'a> {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
         }
         let symmetric = 0.5 * (&term.fisher_projected + &term.fisher_projected.t());
-        let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&symmetric, Side::Lower)
+        let (eigenvalues, _) = strict_symmetric_eigh(&symmetric, Side::Lower)
             .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
         // `X̃_R` is a difference of two quantities of the size of `X_R`, so an
         // eigenvalue of `V` is resolved only above the rounding of that
@@ -500,91 +473,50 @@ impl<'a> RandomEffectTestBasis<'a> {
             }
         };
 
-        if term.penalized {
-            let statistic = term.score.dot(&term.score);
-            let weights: Vec<f64> = kept.iter().map(|&j| eigenvalues[j]).collect();
-            let weight_sum: f64 = weights.iter().sum();
-            let weight_square_sum: f64 = weights.iter().map(|w| w * w).sum();
-            let effective_df = weight_sum * weight_sum / weight_square_sum;
-            let mut terms: Vec<WeightedChiSquareTerm> = weights
-                .iter()
-                .map(|&weight| WeightedChiSquareTerm {
-                    weight,
-                    degrees_of_freedom: 1.0,
-                })
-                .collect();
-            let (tail, dispersion) = match self.scale {
-                ResolvedScale::Known(dispersion) => (
-                    signed_weighted_chi_square_sf(&terms, statistic / dispersion),
-                    dispersion,
-                ),
-                ResolvedScale::Estimated {
-                    residual_sum_of_squares,
-                    residual_df,
-                } => {
-                    terms.push(WeightedChiSquareTerm {
-                        weight: -statistic / residual_sum_of_squares,
-                        degrees_of_freedom: residual_df,
-                    });
-                    (
-                        signed_weighted_chi_square_sf(&terms, 0.0),
-                        residual_sum_of_squares / residual_df,
-                    )
-                }
-            };
-            let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
-            Ok(RandomEffectTest {
-                hypothesis: RandomEffectHypothesis::VarianceComponent,
-                statistic: statistic / dispersion * effective_df / weight_sum,
-                reference_df: effective_df,
-                rank,
-                residual_df,
-                p_value,
-                p_value_relative_error,
+        let statistic = term.score.dot(&term.score);
+        let weights: Vec<f64> = kept.iter().map(|&j| eigenvalues[j]).collect();
+        let weight_sum: f64 = weights.iter().sum();
+        let weight_square_sum: f64 = weights.iter().map(|w| w * w).sum();
+        let effective_df = weight_sum * weight_sum / weight_square_sum;
+        let mut terms: Vec<WeightedChiSquareTerm> = weights
+            .iter()
+            .map(|&weight| WeightedChiSquareTerm {
+                weight,
+                degrees_of_freedom: 1.0,
             })
-        } else {
-            let quadratic: f64 = kept
-                .iter()
-                .map(|&j| {
-                    let projection = eigenvectors.column(j).dot(&term.score);
-                    projection * projection / eigenvalues[j]
-                })
-                .sum();
-            let rank_df = rank as f64;
-            let (statistic, p_value) = match self.scale {
-                ResolvedScale::Known(dispersion) => {
-                    let statistic = quadratic / dispersion;
-                    (statistic, chi_square_sf(statistic, rank_df))
-                }
-                ResolvedScale::Estimated {
-                    residual_sum_of_squares,
-                    residual_df,
-                } => {
-                    let statistic = quadratic / (residual_sum_of_squares / residual_df);
-                    (
-                        statistic,
-                        fisher_snedecor_sf(statistic / rank_df, rank_df, residual_df),
-                    )
-                }
-            };
-            if !p_value.is_finite() {
-                return Err(RandomEffectTestUnavailable::TailUnresolved);
+            .collect();
+        let (tail, dispersion) = match self.scale {
+            ResolvedScale::Known(dispersion) => (
+                signed_weighted_chi_square_sf(&terms, statistic / dispersion),
+                dispersion,
+            ),
+            ResolvedScale::Estimated {
+                residual_sum_of_squares,
+                residual_df,
+            } => {
+                terms.push(WeightedChiSquareTerm {
+                    weight: -statistic / residual_sum_of_squares,
+                    degrees_of_freedom: residual_df,
+                });
+                (
+                    signed_weighted_chi_square_sf(&terms, 0.0),
+                    residual_sum_of_squares / residual_df,
+                )
             }
-            Ok(RandomEffectTest {
-                hypothesis: RandomEffectHypothesis::FixedEffect,
-                statistic,
-                reference_df: rank_df,
-                rank,
-                residual_df,
-                p_value,
-                p_value_relative_error: 0.0,
-            })
-        }
+        };
+        let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
+        Ok(RandomEffectTest {
+            statistic: statistic / dispersion * effective_df / weight_sum,
+            reference_df: effective_df,
+            rank,
+            residual_df,
+            p_value,
+            p_value_relative_error,
+        })
     }
 }
 
 struct PreparedTerm {
-    penalized: bool,
     tested: Vec<usize>,
     other: Vec<usize>,
     beta_tested: Array1<f64>,
@@ -692,6 +624,7 @@ fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
 mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_math::probability::fisher_snedecor_sf;
 
     struct Lcg(u64);
 
@@ -736,7 +669,6 @@ mod tests {
         y: &Array1<f64>,
         beta: &Array1<f64>,
         range: Range<usize>,
-        penalized: bool,
         scale: RandomEffectTestScale,
     ) -> Result<RandomEffectTest, RandomEffectTestUnavailable> {
         let n = design.nrows();
@@ -752,7 +684,7 @@ mod tests {
             scale,
         })?;
         basis
-            .test_terms(&[RandomEffectTermRequest { range, penalized }])
+            .test_terms(&[RandomEffectTermRequest { range }])
             .pop()
             .expect("one term requested")
     }
@@ -803,7 +735,6 @@ mod tests {
             &y,
             &beta,
             1..1 + levels,
-            true,
             RandomEffectTestScale::Estimated,
         )
         .expect("test runs");
@@ -821,33 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn unbalanced_fixed_effect_branch_is_the_nested_f_test() {
-        let levels = 5;
-        let mut rng = Lcg(11);
-        let groups: Vec<usize> = (0..83)
-            .map(|i| if i < levels { i } else { (rng.next_uniform() * rng.next_uniform() * levels as f64) as usize })
-            .collect();
-        let y: Array1<f64> = groups.iter().map(|_| rng.next_normal()).collect();
-        let design = intercept_and_groups(&groups, levels);
-        let beta = Array1::<f64>::zeros(design.ncols());
-        let test = gaussian_test(
-            &design,
-            &y,
-            &beta,
-            1..1 + levels,
-            false,
-            RandomEffectTestScale::Estimated,
-        )
-        .expect("test runs");
-        let (f, df1, df2) = anova_f(&groups, levels, &y);
-        assert_eq!(test.hypothesis, RandomEffectHypothesis::FixedEffect);
-        assert_eq!(test.rank, levels - 1);
-        assert!((test.statistic - f * df1).abs() < 1e-8 * f * df1, "{test:?} vs F={f}");
-        let expected = fisher_snedecor_sf(f, df1, df2);
-        assert!((test.p_value - expected).abs() <= 1e-9 * expected + 1e-14);
-    }
-
-    #[test]
     fn statistic_does_not_depend_on_where_the_fit_left_beta() {
         let levels = 8;
         let mut rng = Lcg(3);
@@ -861,7 +765,6 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             2..2 + levels,
-            true,
             RandomEffectTestScale::Estimated,
         )
         .expect("test runs");
@@ -873,7 +776,6 @@ mod tests {
             &y,
             &shifted,
             2..2 + levels,
-            true,
             RandomEffectTestScale::Estimated,
         )
         .expect("test runs");
@@ -904,7 +806,7 @@ mod tests {
             let mut sum = 0.0;
             for _ in 0..reps {
                 let y: Array1<f64> = (0..n).map(|i| 1.0 + x[i] + rng.next_normal()).collect();
-                let test = gaussian_test(&design, &y, &beta, 2..2 + levels, true, scale)
+                let test = gaussian_test(&design, &y, &beta, 2..2 + levels, scale)
                     .expect("test runs");
                 sum += test.p_value;
                 rejections_05 += usize::from(test.p_value < 0.05);
@@ -939,7 +841,6 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             2..2 + levels,
-            true,
             RandomEffectTestScale::Known { dispersion: 1.0 },
         )
         .expect("test runs");
@@ -959,7 +860,6 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             5..9,
-            true,
             RandomEffectTestScale::Known { dispersion: 1.0 },
         )
         .expect_err("no direction survives");
@@ -976,7 +876,6 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             1..7,
-            true,
             RandomEffectTestScale::Estimated,
         )
         .expect_err("no residual d.f.");
