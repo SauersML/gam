@@ -1961,6 +1961,39 @@ fn enrichment_pays_for_itself(row: &crate::fit_orchestration::drivers::BasisAdeq
     }
 }
 
+/// The smallest nested refinement of `current` that adds at least
+/// `directions` coefficients, within `support`, and never less than one level.
+///
+/// The lack-of-fit screen finds its evidence in a `directions`-dimensional
+/// alternative, so a smaller refinement can miss that structure entirely: a
+/// harmonic basis is orthogonal across degrees, so a degree-8 signal is
+/// invisible to every span below degree 8 and a one-level step shows no
+/// evidence gain. The refit's REML evidence still decides whether the larger
+/// basis is kept.
+fn refinement_spanning(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    values: ndarray::ArrayView2<'_, f64>,
+    current: &AdaptiveResolution,
+    support: &AdaptiveResolution,
+    directions: usize,
+) -> AdaptiveResolution {
+    let width =
+        |resolution: &AdaptiveResolution| {
+            gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+        };
+    let base = width(current);
+    let mut target = gam_terms::smooth::refined_adaptive_resolution(basis, current);
+    while width(&target).saturating_sub(base) < directions {
+        let next = gam_terms::smooth::refined_adaptive_resolution(basis, &target)
+            .clamped(support, current);
+        if !next.exceeds(&target) {
+            break;
+        }
+        target = next;
+    }
+    target
+}
+
 /// Share the design's residual rank between the requested refinements in
 /// formula order, so the refit keeps at least one residual degree of freedom
 /// (a `p >= n` design is not identified by the data, and the REML surface is
@@ -2100,11 +2133,22 @@ fn adaptive_refinements(
             realized.wald_unpenalized_dim(),
             resolution_tol,
         );
-        let lacks_fit = result
+        // The widest alternative in which the screen found structure that pays
+        // for itself: the refinement must add at least that many directions.
+        let lack_of_fit_directions = result
             .basis_adequacy
             .iter()
-            .any(|row| row.term_idx == term_index && enrichment_pays_for_itself(row));
-        let refined = gam_terms::smooth::refined_adaptive_resolution(basis, &current);
+            .filter(|row| row.term_idx == term_index && enrichment_pays_for_itself(row))
+            .filter_map(|row| row.enrichment_rank)
+            .max();
+        let lacks_fit = lack_of_fit_directions.is_some();
+        let refined = refinement_spanning(
+            basis,
+            values,
+            &current,
+            &support,
+            lack_of_fit_directions.unwrap_or(0),
+        );
         if let AdaptiveTermDecision::Refine(proposed) =
             adaptive_term_decision(&current, &refined, &support, saturated, lacks_fit)
         {

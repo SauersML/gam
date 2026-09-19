@@ -171,7 +171,11 @@ fn tensor_smooth_margins_grow_to_resolve_an_oscillating_surface() {
     for _ in 0..n {
         let (x, z): (f64, f64) = (ux.sample(&mut rng), ux.sample(&mut rng));
         truth.push(tensor_signal(x, z));
-        rows.push(vec![num(x), num(z), num(tensor_signal(x, z) + noise.sample(&mut rng))]);
+        rows.push(vec![
+            num(x),
+            num(z),
+            num(tensor_signal(x, z) + noise.sample(&mut rng)),
+        ]);
     }
     let data = dataset(&["x", "z", "y"], &rows);
     let (width, fitted) = fit("y ~ te(x, z)", &data);
@@ -215,7 +219,11 @@ fn harmonic_sphere_degree_grows_to_resolve_a_high_degree_harmonic() {
         let lat = s.asin().to_degrees();
         let lon: f64 = ulon.sample(&mut rng);
         truth.push(sphere_signal(lat));
-        rows.push(vec![num(lat), num(lon), num(sphere_signal(lat) + noise.sample(&mut rng))]);
+        rows.push(vec![
+            num(lat),
+            num(lon),
+            num(sphere_signal(lat) + noise.sample(&mut rng)),
+        ]);
     }
     let data = dataset(&["lat", "lon", "y"], &rows);
     let (width, fitted) = fit("y ~ sphere(lat, lon, method=harmonic)", &data);
