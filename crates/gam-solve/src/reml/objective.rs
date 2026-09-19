@@ -1353,16 +1353,13 @@ impl<'a> RemlState<'a> {
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Only the penalty-side `log|S|₊` machinery consumes the penalty
-        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
-        // and no longer needs `range(S_+)`. Its rank bounds H's identified rank
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // need `range(S_+)`. The penalty rank bounds H's identified rank
         // below, so it is computed before the Hessian operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet.as_ref())?);
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet.as_ref(),
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             free_basis_opt.as_ref(),
@@ -1769,15 +1766,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
-        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`. Its
-        // rank bounds H's identified rank, so it is computed before the operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet)?);
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // consume `range(S_+)`. The penalty rank bounds H's identified rank,
+        // so it is computed before the operator.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet,
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             // Original-basis assembly is only used when there are no active
@@ -1805,6 +1800,7 @@ impl<'a> RemlState<'a> {
             weights: pirls_result.finalweights.view(),
             penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
+            data_root: Some(&self.data_root_cache),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
