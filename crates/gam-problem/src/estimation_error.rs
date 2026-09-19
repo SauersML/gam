@@ -1009,6 +1009,31 @@ pub enum EstimationError {
         upper: f64,
     },
 
+    /// The penalized likelihood of a link whose range overshoots the family's
+    /// mean domain (identity Poisson, log binomial, ...) increases toward the
+    /// edge of the link's feasibility set, so its maximum is on that edge and
+    /// not at an interior stationary point. P-IRLS detects it at the iterate
+    /// where the Newton decrement has collapsed — the curvature diverges as a
+    /// mean approaches the edge of its domain — while the gradient has not,
+    /// and the step toward it was rejected for leaving the feasible set in the
+    /// same iteration. No interior mode exists to report, and a clamped one
+    /// would be a spurious mean.
+    #[error(
+        "The {link} link's likelihood maximum lies on the boundary of its feasibility set: \
+         after {iterations} P-IRLS iteration(s) the gradient norm is still \
+         {gradient_norm:.6e}, and the step toward the maximum leaves the feasible linear \
+         predictor (eta={eta:?} is outside [{lower}, {upper}]). There is no interior \
+         maximum to report."
+    )]
+    LinkFeasibilityBoundaryOptimum {
+        link: &'static str,
+        eta: f64,
+        lower: f64,
+        upper: f64,
+        iterations: usize,
+        gradient_norm: f64,
+    },
+
     #[error(
         "PIRLS row geometry is not representable at row {row}: {quantity} evaluated from \
          eta={eta:?} produced {value:?}"
@@ -1123,6 +1148,12 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {SEPARATION}"
             )),
+            Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
+                "The {link} link's range exceeds the family's mean domain and the data put \
+                 a fitted mean on the edge of that domain. Use a link whose range is the \
+                 whole mean domain (the canonical link), or remove the predictor or rows \
+                 that force the mean to the boundary."
+            )),
             Self::PrefitRankDeficientDesignDetected { column_indices, .. }
             | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
@@ -1179,6 +1210,10 @@ impl EstimationError {
             | Self::MultinomialSeparationDetected { .. }
             | Self::PirlsDidNotConverge { .. }
             | Self::FixedLambdaNewtonDidNotConverge { .. } => true,
+            // The inner maximum at THIS rho is on the link's feasibility
+            // boundary; a heavier penalty can pull it inside, as it can pull a
+            // quasi-separated fit back from infinity.
+            Self::LinkFeasibilityBoundaryOptimum { .. } => true,
             // A structural failure, an already-terminal outer verdict, or a
             // statement about the configuration, the data, or the prediction
             // request: none of these becomes true or false by moving rho.
@@ -1382,6 +1417,7 @@ impl EstimationError {
             Self::InvalidStabilization(_)
             | Self::BasisError(_)
             | Self::PerfectSeparationDetected { .. }
+            | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
@@ -1492,6 +1528,9 @@ impl EstimationError {
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
             Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
             Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::LinkFeasibilityBoundaryOptimum { .. } => {
+                "EstimationError::LinkFeasibilityBoundaryOptimum"
+            }
             Self::PirlsRowGeometryUnrepresentable { .. } => {
                 "EstimationError::PirlsRowGeometryUnrepresentable"
             }

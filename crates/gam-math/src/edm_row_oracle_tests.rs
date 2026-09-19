@@ -18,6 +18,8 @@
 //! be the η-derivative of the Bernoulli log-likelihood itself, so the oracle
 //! is anchored to the likelihood and not only to another score expression.
 
+#![cfg(test)]
+
 use crate::edm_row::{EdmRow, EdmVariance};
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::Tower4;

@@ -118,7 +118,10 @@ pub(crate) fn validate_survival_location_scale_spec(
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     match &spec.inverse_link {
         InverseLink::Standard(
-            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+            link @ (StandardLink::Log
+                | StandardLink::Sqrt
+                | StandardLink::Inverse
+                | StandardLink::InverseSquared),
         ) => {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
                 reason: format!(

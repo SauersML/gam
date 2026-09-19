@@ -1958,6 +1958,14 @@ pub fn integrated_inverse_link_mean_and_derivative(
             dmean_dmu: 1.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => {
+            let jet = sqrt_link_posterior_jet(mu, sigma)?;
+            Ok(IntegratedMeanDerivative {
+                mean: jet.mean,
+                dmean_dmu: jet.d1,
+                mode: jet.mode,
+            })
+        }
         LinkFunction::Inverse | LinkFunction::InverseSquared => {
             let jet = reciprocal_link_posterior_jet(link, mu, sigma)?;
             Ok(IntegratedMeanDerivative {
@@ -1967,6 +1975,30 @@ pub fn integrated_inverse_link_mean_and_derivative(
             })
         }
     }
+}
+
+/// Posterior mean of the square-root link's inverse `μ = η²` under
+/// `η ~ N(mu, sigma²)`, with its `mu`-derivatives: `E[η²] = mu² + sigma²`,
+/// exactly, so the jet is `(mu² + sigma², 2 mu, 2, 0)`.
+///
+/// The linear predictor itself must lie in the link's domain `η > 0`: the
+/// square-root link is the branch `η = √μ`, and a posterior centred on or
+/// below zero describes no mean on that branch.
+fn sqrt_link_posterior_jet(mu: f64, sigma: f64) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && sigma.is_finite() && sigma >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior mean requires a finite linear predictor inside its domain eta > 0 \
+             and a finite nonnegative standard error; got eta = {mu}, se = {sigma}",
+            LinkFunction::Sqrt.name()
+        )));
+    }
+    Ok(IntegratedInverseLinkJet {
+        mean: mu.mul_add(mu, sigma * sigma),
+        d1: 2.0 * mu,
+        d2: 2.0,
+        d3: 0.0,
+        mode: IntegratedExpectationMode::ExactClosedForm,
+    })
 }
 
 /// Posterior mean of a reciprocal-power inverse link, `μ = η^{-1}` or
@@ -2169,6 +2201,7 @@ pub(crate) fn integrated_inverse_link_jet(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
+        LinkFunction::Sqrt => sqrt_link_posterior_jet(mu, sigma),
         LinkFunction::Inverse | LinkFunction::InverseSquared => {
             reciprocal_link_posterior_jet(link, mu, sigma)
         }

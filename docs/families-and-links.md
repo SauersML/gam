@@ -27,11 +27,12 @@ count; the `>= 2` requirement is what separates counts from a binary column.)
 > signature and therefore auto-routes to Poisson/log. If you want it treated as
 > a continuous/Gaussian response, pass `family="gaussian"` explicitly.
 
-A link that several families admit does not choose the family. `log` is legal for
-Poisson, Tweedie, negative binomial, Gamma and inverse Gaussian, and `inverse` for
-Gaussian and Gamma. Pinning either link without a `family=` is an error that lists
-those families. A variance function is a modelling choice, so gamfit does not read
-it off whether `y` happens to be integer-valued:
+A link that several families admit does not choose the family. `log`, `sqrt`,
+`inverse` and `inverse-squared` are each legal for several response families
+(see [Link legality](#link-legality)), so pinning one of them without a
+`family=` is an error that says the link does not determine a response family
+and asks for one with `family=`. A variance function is a modelling choice, so
+gamfit does not read it off whether `y` happens to be integer-valued:
 
 ```python
 gamfit.fit(df, "count ~ s(x)")                 # integer counts -> Poisson/log (auto)
@@ -92,26 +93,29 @@ and rare-event Bernoulli data.
 
 Inverse link `exp(eta)`. Pair with `family="poisson"` for counts and
 `family="gamma"` or `family="inverse-gaussian"` for positive continuous
-responses.
+responses. With `family="gaussian"` it is a log-mean model with additive
+normal noise; with `family="binomial"` it is the relative-risk model, whose
+mean `exp(eta)` is a probability only on `eta < 0` (see
+[Feasibility sets](#feasibility-sets)).
 
 ```python
 gamfit.fit(df, "count ~ s(time)",
            family="poisson", link="log", offset="log_exposure")
+gamfit.fit(df, "case ~ s(age)", family="binomial", link="log")  # relative risk
 ```
 
 Pass the offset column via `offset=`; do not include it on the formula RHS.
 
+### `sqrt`
+
+Inverse link `eta^2` (`eta = sqrt(mu)`), the variance-stabilising link for
+counts. The mean map is only one-to-one on `eta > 0`, so that is its
+feasibility set in every family.
+
 ### `inverse`
 
-Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family and
-also legal for the Gaussian family. The mean is only defined on `eta > 0`.
-There is no hand-supplied bound: an inner Newton/PIRLS step or an outer
-trial point that would put any weighted row at `eta <= 0` is reported as an
-inverse-link domain violation, and the step is halved until every row is
-feasible again (the same retriable refusal every bounded link uses). A fit
-therefore only ever certifies at a mean that is positive at every observed
-row. Prediction away from the data can still produce `eta <= 0`; such points
-have no mean under this link and are refused rather than clipped.
+Inverse link `1 / eta` (alias `1/mu`), canonical for the Gamma family. The
+mean is only defined on `eta > 0`.
 
 ```python
 gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
@@ -120,30 +124,78 @@ gamfit.fit(df, "y ~ s(x)", family="gamma", link="inverse")
 ### `inverse-squared`
 
 Inverse link `eta^(-1/2)` (`eta = 1 / mu^2`, aliases `inv-squared` and
-`1/mu^2`), canonical for the inverse Gaussian family and legal only there.
-The `eta > 0` domain is handled exactly as for `inverse`.
+`1/mu^2`), canonical for the inverse Gaussian family. The mean is only
+defined on `eta > 0`.
 
 ### Link legality
 
-Each family admits a fixed set of links. An illegal pairing is refused with
-the family's legal links spelled out, generated from the same table the
-engine checks, e.g.
+Legality is decided by support: a link is legal for a family when the link's
+mean range meets the family's mean domain. The Gaussian, Poisson, Gamma and
+inverse Gaussian families all take the whole power/log ladder; binomial takes
+every probability link plus `log`. An illegal pairing is refused with the
+family's legal links spelled out, generated from the same table the engine
+checks, e.g.
 
 ```
-illegal likelihood cell: response `gamma` does not admit inverse link `identity`;
-legal links for `gamma`: log|inverse
+illegal likelihood cell: response `negative-binomial` does not admit inverse link `identity`;
+legal links for `negative-binomial`: log
 ```
 
 | family | legal links |
 | --- | --- |
-| gaussian | identity, inverse |
-| gamma | log, inverse |
-| inverse-gaussian | log, inverse-squared |
-| poisson, negative-binomial, tweedie | log |
+| gaussian, poisson, gamma, inverse-gaussian | identity, log, sqrt, inverse, inverse-squared |
+| binomial | logit, probit, cloglog, loglog, cauchit, log |
+| negative-binomial, tweedie | log |
+| beta | logit |
+
+`family="binomial", link="identity"` stays refused: a linear probability GAM
+is a Gaussian model and should be spelled as one (`family="gaussian"`).
 
 An unknown link name is refused with the whole vocabulary. Link names are
 case-insensitive and `_` is read as `-`, so `inverse_squared` and
 `Inverse-Squared` are the same link.
+
+### How non-canonical cells are fitted
+
+The canonical cells (Gaussian-identity, Poisson-log, Gamma-log,
+binomial-logit/probit/cloglog, …) keep their hand-written row kernels. Every
+other cell is fitted by one generic exponential-dispersion kernel composed
+from the family's variance function `V(mu)` and its derivatives and the
+link's inverse `mu(eta)` and its derivatives. It supplies the exact
+log-likelihood, score, observed information and the third and fourth
+eta-derivatives that REML/LAML needs, so a non-canonical cell gets the same
+exact outer gradient and Hessian as a canonical one. The hand-written kernels
+are the oracles it is tested against. These cells are always evaluated on the
+CPU.
+
+### Feasibility sets
+
+When a link's mean range is larger than the family's mean domain, the cell
+is legal but the linear predictor is restricted to a feasibility set:
+
+| cell | feasible `eta` |
+| --- | --- |
+| `sqrt`, `inverse`, `inverse-squared` (any family) | `eta > 0` |
+| `identity` for poisson, gamma, inverse-gaussian | `eta > 0` |
+| `log` for binomial | `eta < 0` |
+
+There is no hand-supplied bound, clamp or jitter. The starting linear
+predictor is built inside the set. An inner P-IRLS step or an outer trial
+point that would put any weighted row outside the set is reported as an
+inverse-link domain violation, and the step is halved until every row is
+feasible again. A fit therefore only ever certifies at a mean that lies in
+the family's domain at every observed row.
+
+When the likelihood's maximum lies on the boundary of the set, as in
+identity-Poisson with a group whose counts are all zero or log-binomial with
+a group whose outcomes are all one, there is no interior maximum. The fit
+fails with a typed error saying the maximum lies on the boundary of the
+link's feasibility set. It does not return the last feasible iterate. Use
+the family's canonical link, or remove the predictor or rows that force the
+mean to the edge.
+
+Prediction away from the data can still produce an infeasible `eta`. Such
+points have no mean under this link and are refused rather than clipped.
 
 ### Inverse Gaussian
 

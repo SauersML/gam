@@ -118,6 +118,18 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 out.push(e.powf(-exponent));
             }
         }
+        Some(LinkFunction::Sqrt) => {
+            // μ = η², the inverse of g(μ) = √μ, is a bijection only on η > 0; a
+            // non-positive η is outside the link's feasibility set.
+            for &e in eta {
+                if !(e > 0.0) {
+                    return Err(format!(
+                        "the sqrt link maps only eta > 0 to a positive mean; got eta={e}"
+                    ));
+                }
+                out.push(e * e);
+            }
+        }
         None => {
             return Err(gam_problem::UnknownLinkName(kind.to_string()).to_string());
         }
