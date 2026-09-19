@@ -4447,21 +4447,21 @@ impl<'a> RemlState<'a> {
             KKT_TOL_STAT
         };
         // Scale-invariant stationarity, matching the inner active-set solver's
-        // own acceptance contract (`stationarity_rel` in
-        // `solve_newton_direction_with_linear_constraints_impl`): the
-        // stationarity residual `‖grad − Aᵀλ‖∞` is certified relative to the
-        // gradient scale `‖grad‖∞`, not against a bare absolute floor. The
+        // own acceptance contract: the stationarity residual `‖grad − Aᵀλ‖∞` is
+        // certified relative to the gradient's natural scale — the magnitude of
+        // the operands whose cancellation formed it, stored on the diagnostics
+        // by the solve that formed `grad` — and only relative to it. The
         // profiled-REML / least-squares gradient is O(n) in magnitude even at a
         // genuine constrained optimum (issue #879), so the residual bottoms out
-        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that the fixed
-        // `5e-6` gate can never meet — even though the inner solver already
-        // converged on the relative ratio. We accept when EITHER the absolute
-        // residual is below the gate OR the relative ratio
-        // `stationarity / max(‖grad‖∞, 1)` is, so the outer gate stops on the
-        // same point the solver does instead of spuriously aborting a reachable
-        // constrained optimum (issue #989). `bounded()`, which solves via the
-        // exact-interval path rather than this active-set gate, was unaffected —
-        // hence the two documented ways to bound a coefficient disagreed.
+        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that a fixed
+        // `5e-6` bar can never meet — even though the inner solver already
+        // converged on the relative ratio. Judging the ratio alone, the outer
+        // gate stops on the same point the solver does instead of spuriously
+        // aborting a reachable constrained optimum (issue #989), and rescaling
+        // the objective by any factor leaves the verdict unchanged. `bounded()`,
+        // which solves via the exact-interval path rather than this active-set
+        // gate, was unaffected — hence the two documented ways to bound a
+        // coefficient disagreed.
         //
         // The dual-feasibility and complementarity channels carry the same
         // gradient units (`λ` solves `g = Aᵀλ` on unit rows) and are judged in
@@ -4523,12 +4523,12 @@ impl<'a> RemlState<'a> {
                 })
                 .unwrap_or_default();
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; ‖grad‖∞={:.3e}); active={}/{}{}{}{}",
+                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; gradient_scale={:.3e}); active={}/{}{}{}{}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
-                kkt.stationarity / gradient_scale.max(1.0),
+                kkt.stationarity / gradient_scale,
                 stationarity_tol,
                 if kkt.working_set_rank_deficient {
                     ", degenerate face"

@@ -172,27 +172,34 @@ pub(super) fn exact_newton_decrement_sq(
 /// gets the relaxed `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL`; a
 /// non-degenerate face is held to a strict band (`10 · kkt_tolerance`, the same
 /// near-stationary band `near_stationary_kkt` uses). Stationarity is checked
-/// scale-invariantly — absolute residual OR the relative ratio
-/// `stationarity / max(‖grad‖∞, 1)` within the band — exactly as the outer gate
-/// and the inner active-set solver do, so an O(n) gradient scale (issue #879)
-/// does not leave a converged optimum stranded above a fixed absolute band
-/// (issue #989). Returns `true` for an unconstrained fit (no constraint-KKT
-/// gate to honour) and when no constraint rows can be derived (no bound is
-/// finite).
+/// relative to `gradient_scale`, the natural scale of the operands that formed
+/// `gradient` ([`crate::active_set::exceeds_at_gradient_scale`]), exactly as the
+/// outer gate and the inner active-set solver do: an O(n) gradient scale (issue
+/// #879) does not leave a converged optimum stranded above a fixed absolute
+/// band (issue #989), and rescaling the objective does not move the verdict.
+/// Returns `true` for an unconstrained fit (no constraint-KKT gate to honour)
+/// and when no constraint rows can be derived (no bound is finite).
 pub(crate) fn constraint_kkt_admits_soft_accept(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     kkt_tolerance: f64,
 ) -> bool {
     // Mirror the exported-diagnostic construction in the result assembly (and
     // the outer gate's input): prefer explicit linear constraints, else derive
     // the constraint rows from the coordinate lower bounds.
     let diag = match options.linear_constraints.as_ref() {
-        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+        Some(lin) => Some(compute_constraint_kkt_diagnostics(
+            beta,
+            gradient,
+            gradient_scale,
+            lin,
+        )),
         None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
-            linear_constraints_from_lower_bounds(lb)
-                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+            linear_constraints_from_lower_bounds(lb).map(|lin| {
+                compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, &lin)
+            })
         }),
     };
     match diag {
@@ -203,16 +210,17 @@ pub(crate) fn constraint_kkt_admits_soft_accept(
             } else {
                 kkt_tolerance * 10.0
             };
-            // Scale-invariant stationarity, in lockstep with the outer gate
-            // (`enforce_constraint_kkt`) and the inner active-set solver: accept
-            // when EITHER the absolute residual OR the relative ratio
-            // `stationarity / max(‖grad‖∞, 1)` is within the band. An O(n)
-            // gradient scale (issue #879) leaves the absolute residual above any
-            // fixed band at a genuine optimum; gating only on it would refuse a
-            // converged soft-accept the outer gate now admits (issue #989).
-            let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
+            // Stationarity relative to the gradient's operand scale, through the
+            // one predicate the outer gate (`enforce_constraint_kkt`) and the
+            // inner active-set solver judge with. An O(n) gradient scale (issue
+            // #879) leaves the absolute residual above any fixed band at a
+            // genuine optimum (issue #989); the ratio does not move with it.
             kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                && (kkt.stationarity <= stationarity_band || stationarity_rel <= stationarity_band)
+                && !crate::active_set::exceeds_at_gradient_scale(
+                    kkt.stationarity,
+                    stationarity_band,
+                    kkt.gradient_scale,
+                )
         }
     }
 }
@@ -399,21 +407,16 @@ pub fn exact_newton_decrement_evidence(
 pub(crate) fn iterate_is_primal_feasible(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
-    gradient: &Array1<f64>,
 ) -> bool {
-    let diagnostics = match options.linear_constraints.as_ref() {
-        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+    let primal_feasibility = match options.linear_constraints.as_ref() {
+        Some(lin) => Some(crate::active_set::constraint_primal_feasibility(beta, lin)),
         None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
             linear_constraints_from_lower_bounds(lb)
-                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+                .map(|lin| crate::active_set::constraint_primal_feasibility(beta, &lin))
         }),
     };
-    match diagnostics {
-        None => true,
-        Some(kkt) => {
-            kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        }
-    }
+    primal_feasibility
+        .is_none_or(|value| value <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
 }
 
 /// `iteration_callback` is optional: most callers want the fit and nothing else,
@@ -1677,6 +1680,7 @@ where
                             && constraint_geometry_is_certified(
                                 beta.as_ref(),
                                 &final_state_ref.gradient,
+                                final_state_ref.gradient_natural_scale,
                                 options.linear_constraints.as_ref(),
                             )
                         {
@@ -1758,6 +1762,7 @@ where
                                 options,
                                 beta.as_ref(),
                                 &final_state_ref.gradient,
+                                final_state_ref.gradient_natural_scale,
                                 kkt_tolerance,
                             );
 
@@ -2328,11 +2333,7 @@ where
             // a Newton step and the strict-improvement guard below would be
             // certifying a different point than the one it measured (#2705
             // group B).
-            if !iterate_is_primal_feasible(
-                options,
-                polished_beta.as_ref(),
-                &polished_state.gradient,
-            ) {
+            if !iterate_is_primal_feasible(options, polished_beta.as_ref()) {
                 log::trace!(
                     "[PIRLS] undamped Newton polish step {} would leave the feasible \
                      set; stopping the refinement at the last feasible iterate",
@@ -2480,6 +2481,7 @@ where
         let geometry_certified = constraint_geometry_is_certified(
             beta.as_ref(),
             &state.gradient,
+            state.gradient_natural_scale,
             polish_inequalities.as_deref(),
         );
         if geometry_certified && state.certifies_kkt(final_projected_grad, kkt_tolerance) {
@@ -2515,6 +2517,7 @@ where
                     options,
                     beta.as_ref(),
                     &state.gradient,
+                    state.gradient_natural_scale,
                     kkt_tolerance,
                 ))
         {
@@ -2553,14 +2556,12 @@ where
     // enter this branch and pay only one cheap feasibility check.
     if let Some(lin) = options.linear_constraints.as_ref() {
         let primal_feasibility =
-            compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin)
-                .primal_feasibility;
+            crate::active_set::constraint_primal_feasibility(beta.as_ref(), lin);
         if primal_feasibility > crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
             let projected =
                 crate::active_set::project_point_strictly_into_feasible_cone(beta.as_ref(), lin)
                     .filter(|candidate| {
-                        compute_constraint_kkt_diagnostics(candidate, &state.gradient, lin)
-                            .primal_feasibility
+                        crate::active_set::constraint_primal_feasibility(candidate, lin)
                             <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
                     });
             match projected {
@@ -2712,11 +2713,23 @@ where
         constraint_kkt: options
             .linear_constraints
             .as_ref()
-            .map(|lin| compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, lin))
+            .map(|lin| {
+                compute_constraint_kkt_diagnostics(
+                    beta.as_ref(),
+                    &state.gradient,
+                    state.gradient_natural_scale,
+                    lin,
+                )
+            })
             .or_else(|| {
                 options.coefficient_lower_bounds.as_ref().and_then(|lb| {
                     linear_constraints_from_lower_bounds(lb).map(|lin| {
-                        compute_constraint_kkt_diagnostics(beta.as_ref(), &state.gradient, &lin)
+                        compute_constraint_kkt_diagnostics(
+                            beta.as_ref(),
+                            &state.gradient,
+                            state.gradient_natural_scale,
+                            &lin,
+                        )
                     })
                 })
             }),

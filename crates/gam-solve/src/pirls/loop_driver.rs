@@ -1216,7 +1216,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             last_step_halving: 0,
             max_abs_eta,
             constraint_kkt: linear_constraints.as_ref().map(|lin| {
-                compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
+                compute_constraint_kkt_diagnostics(
+                    beta_transformed.as_ref(),
+                    &gradient,
+                    score_norm + s_beta_norm,
+                    lin,
+                )
             }),
             min_penalized_deviance: if zero_iter_penalized.is_finite() {
                 zero_iter_penalized

@@ -940,7 +940,7 @@ mod tests {
         };
         let beta = array![1.0, 2.0];
         let grad = array![0.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert!(diag.primal_feasibility <= 1e-12);
         assert!(diag.dual_feasibility <= 1e-12);
         assert!(diag.complementarity <= 1e-12);
@@ -955,7 +955,7 @@ mod tests {
         };
         let beta = array![0.0, 1.5];
         let grad = array![2.0, 0.0];
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
         assert_eq!(diag.n_constraints, 2);
         assert_eq!(diag.n_active, 1);
         assert!(diag.primal_feasibility <= 1e-12);
@@ -1004,7 +1004,7 @@ mod tests {
         let lambda_true = array![1.0, 0.5, 2.0];
         let grad = constraints.a.t().dot(&lambda_true);
 
-        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, &constraints);
+        let diag = compute_constraint_kkt_diagnostics(&beta, &grad, grad.dot(&grad).sqrt(), &constraints);
 
         assert_eq!(diag.n_constraints, 3);
         assert_eq!(
