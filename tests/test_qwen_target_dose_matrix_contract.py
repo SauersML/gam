@@ -58,6 +58,36 @@ def test_the_relative_landing_error_is_symmetric_about_the_target() -> None:
     assert PRODUCER.relative_landing_error(0.5, 0.5) == 0.0
 
 
+def test_a_landing_is_certified_only_at_the_closer_endpoint_of_its_final_bracket() -> None:
+    # Expansion reads 0.3 and 0.6 under the target 1.0 and crosses at 1.4; the
+    # resolution then reads 0.9, 1.2, 0.95 and 1.1. The final bracket is the last
+    # reading on each side, [0.95, 1.1], and 0.95 is the closer endpoint.
+    readings = [0.3, 0.6, 1.4, 0.9, 1.2, 0.95, 1.1]
+    landing = PRODUCER.landing_certificate(1.0, readings, 0.95)
+    assert landing["final_bracket_nats"] == [0.95, 1.1]
+    assert landing["certified"]
+    assert landing["landing_error_nats"] <= landing["landing_bound_nats"]
+    # The farther endpoint, or an earlier reading outside the final bracket, is
+    # not what the solve returns.
+    assert not PRODUCER.landing_certificate(1.0, readings, 1.1)["certified"]
+    assert not PRODUCER.landing_certificate(1.0, readings, 0.9)["certified"]
+    # A tie goes to the upper endpoint, as in the solve.
+    tie = [0.5, 1.5]
+    assert PRODUCER.landing_certificate(1.0, tie, 1.5)["certified"]
+    assert not PRODUCER.landing_certificate(1.0, tie, 0.5)["certified"]
+    # With no reading under the target the lower endpoint is the unprobed zero
+    # move: [0, 1.5], and 1.5 is closer to 1.0 than 0 is.
+    overshoot = PRODUCER.landing_certificate(1.0, [3.0, 1.5], 1.5)
+    assert overshoot["final_bracket_nats"] == [0.0, 1.5]
+    assert overshoot["certified"]
+    # An exact landing must be one of the readings, and its bound is 0.
+    exact = PRODUCER.landing_certificate(1.0, [0.5, 1.0], 1.0)
+    assert exact["certified"] and exact["landing_bound_nats"] == 0.0
+    assert not PRODUCER.landing_certificate(1.0, [0.5, 1.2], 1.0)["certified"]
+    # Every reading under the target never brackets it, so nothing is certified.
+    assert not PRODUCER.landing_certificate(1.0, [0.2, 0.4], 0.4)["certified"]
+
+
 def test_nearest_fitted_row_wraps_on_a_circle() -> None:
     coords = np.asarray([0.02, 0.5, 0.97])
     assert PRODUCER.nearest_fitted_row(coords, 0.99, 1.0) == 2

@@ -143,6 +143,44 @@ fn estimator_metadata_is_required_and_expectile_tau_is_validated() {
     assert!(error.to_string().contains("strictly in (0, 1)"));
 }
 
+/// An expectile fit persists a Gaussian-identity working likelihood, but the
+/// family name every surface reports (summary, CLI, Python `family_name`) is
+/// the estimator it fitted, read from the saved tag.
+#[test]
+fn expectile_fit_reports_its_estimator_not_the_gaussian_working_family() {
+    let gaussian_standard = || FittedFamily::Standard {
+        likelihood: LikelihoodSpec::gaussian_identity(),
+        link: Some(StandardLink::Identity),
+        latent_cloglog_state: None,
+        mixture_state: None,
+        sas_state: None,
+    };
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ 1".to_string(),
+        ModelKind::Standard,
+        gaussian_standard(),
+        "expectile".to_string(),
+    );
+    payload.estimator = FittedEstimator::Expectile { tau: 0.9 };
+    assert_eq!(
+        FittedModel::from_payload(payload).display_family_name(),
+        "Expectile(tau=0.9)"
+    );
+
+    let gaussian = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ 1".to_string(),
+        ModelKind::Standard,
+        gaussian_standard(),
+        "gaussian".to_string(),
+    );
+    assert_eq!(
+        FittedModel::from_payload(gaussian).display_family_name(),
+        LikelihoodSpec::gaussian_identity().pretty_name()
+    );
+}
+
 #[test]
 fn from_payload_model_kind_maps_to_expected_fitted_model_variant() {
     let cases = vec![

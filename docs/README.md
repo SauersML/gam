@@ -25,7 +25,7 @@ Starting out
 - [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy,
   dict of columns, list of records.
 - [CLI reference](cli.md) — `gam fit`, `predict`, `diagnose`, `sample`,
-  `generate`, and `report`.
+  `generate`, `compare`, and `report`.
 
 Building a model
 

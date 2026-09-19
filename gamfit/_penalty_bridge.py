@@ -79,7 +79,9 @@ def torch_value_grad_from_rust(
     """
     from ._frame_torch import from_numpy_like, to_numpy_f64
 
-    torch = _torch()
+    _torch()  # clean ImportError when torch is missing
+    import torch
+
     value_np, grad_np = value_grad_np(to_numpy_f64(t))
 
     class _Grad(torch.autograd.Function):
