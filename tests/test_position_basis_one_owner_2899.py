@@ -21,10 +21,10 @@ def _positions(n: int = 40) -> tuple[np.ndarray, np.ndarray]:
 
 def test_the_reported_basis_replays_the_fit() -> None:
     t, y = _positions()
-    out = gamfit.gaussian_reml_fit_positions(t, y)
+    out = gamfit.reml.gaussian_reml_fit_positions(t, y)
     assert out["basis_kind"] == "bspline"
     assert out["periodic"] is False and out["period"] is None
-    design = gamfit.bspline_basis(t, out["knots_or_centers"], degree=out["basis_order"])
+    design = gamfit.basis.bspline_basis(t, out["knots_or_centers"], degree=out["basis_order"])
     fitted = np.asarray(out["fitted"], dtype=float)
     np.testing.assert_allclose(
         design @ np.asarray(out["coefficients"], dtype=float),
@@ -39,7 +39,7 @@ def test_a_periodic_duchon_fit_reports_the_wrap_it_used() -> None:
     spacing. The payload used to report ``period=None`` although the fit had
     derived a wrap, so a replay could not reconstruct the basis."""
     t, y = _positions()
-    out = gamfit.gaussian_reml_fit_positions(t, y, "duchon", 8, periodic=True)
+    out = gamfit.reml.gaussian_reml_fit_positions(t, y, "duchon", 8, periodic=True)
     centers = np.asarray(out["knots_or_centers"], dtype=float)
     span = float(centers.max() - centers.min())
     assert out["periodic"] is True
@@ -51,8 +51,8 @@ def test_a_periodic_thin_plate_fit_is_the_periodic_duchon_fit() -> None:
     to be built at no period at all (the center span) while its basis used the
     derived wrap, so the two disagreed."""
     t, y = _positions()
-    duchon = gamfit.gaussian_reml_fit_positions(t, y, "duchon", 8, periodic=True)
-    thin_plate = gamfit.gaussian_reml_fit_positions(t, y, "thinplate", 8, periodic=True)
+    duchon = gamfit.reml.gaussian_reml_fit_positions(t, y, "duchon", 8, periodic=True)
+    thin_plate = gamfit.reml.gaussian_reml_fit_positions(t, y, "thinplate", 8, periodic=True)
     assert thin_plate["basis_kind"] == "thinplate"
     assert thin_plate["basis_order"] == duchon["basis_order"] == 2
     assert thin_plate["period"] == duchon["period"]
@@ -64,8 +64,8 @@ def test_a_periodic_thin_plate_fit_is_the_periodic_duchon_fit() -> None:
 def test_the_batched_fit_reports_the_same_basis() -> None:
     t, y = _positions()
     offsets = np.array([0, 20, 40], dtype=np.uintp)
-    single = gamfit.gaussian_reml_fit_positions(t, y, "duchon", 7)
-    batched = gamfit.gaussian_reml_fit_positions_batched(t, y, offsets, "duchon", 7)
+    single = gamfit.reml.gaussian_reml_fit_positions(t, y, "duchon", 7)
+    batched = gamfit.reml.gaussian_reml_fit_positions_batched(t, y, offsets, "duchon", 7)
     np.testing.assert_array_equal(batched["knots_or_centers"], single["knots_or_centers"])
     np.testing.assert_array_equal(batched["penalty"], single["penalty"])
     assert batched["basis_order"] == single["basis_order"]

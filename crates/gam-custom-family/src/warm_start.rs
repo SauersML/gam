@@ -26,6 +26,7 @@ pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> Ca
         active_constraints: result.active_constraints.clone(),
         terminal_working_sets: result.terminal_working_sets.clone(),
         terminal_likelihood_score: result.terminal_likelihood_score.clone(),
+        rho_mode_responses: None,
         objective_state: result.objective_state.clone(),
     }
 }
@@ -535,7 +536,7 @@ pub(crate) fn reduced_blockwise_edf(
     ) {
         Ok(triple) => Some(triple),
         Err(err) => {
-            log::warn!(
+            log::debug!(
                 "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
             );
             None

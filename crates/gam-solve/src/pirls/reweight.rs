@@ -536,7 +536,7 @@ where
             self.consecutive_accepts = self.consecutive_accepts.saturating_add(1);
             self.consecutive_rejects = 0;
             if !self.engaged_logged {
-                log::info!("[PIRLS-AA1] engaged at iter={}", iter);
+                log::debug!("[PIRLS-AA1] engaged at iter={}", iter);
                 self.engaged_logged = true;
             }
         }
@@ -549,7 +549,7 @@ where
                 && self.consecutive_accepts < 1
             {
                 self.disabled = true;
-                log::info!(
+                log::debug!(
                     "[PIRLS-AA1] disabled at iter={} reason=consecutive_rejects",
                     iter
                 );
@@ -720,7 +720,7 @@ where
     // The active set is a property of the ITERATE, so it is asked per use rather
     // than once up front.
     if let Some(adaptive) = options.adaptive_kkt_tolerance {
-        log::info!(
+        log::debug!(
             "[ADAPTIVE-KKT] outer_g_norm={:.3e} effective_tol={:.3e} floor={:.3e} ceiling={:.3e}",
             adaptive.outer_grad_norm,
             kkt_tolerance,
@@ -804,7 +804,7 @@ where
         // Start-of-iteration beacon: emits one line BEFORE the curvature-sensitive
         // inner work begins, so CI logs show *which* PIRLS iteration is in flight
         // if the process is killed during `update_with_curvature` or the LM solve.
-        log::debug!(
+        log::trace!(
             "[PIRLS] start iter {:>3} | lm_lambda {:.2e} | last_halving {} | last_dev_change {:.3e}",
             iter,
             lambda,
@@ -860,7 +860,7 @@ where
                     used_fisher_fallback_this_iter = true;
                     consecutive_fisher_fallbacks += 1;
                     if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                        log::info!(
+                        log::debug!(
                             "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
                             iter,
                             consecutive_fisher_fallbacks,
@@ -881,7 +881,7 @@ where
         // Fisher fallbacks for the bench runner's `pirls_fisher_frac`
         // diagnostic (commit 971e67ad), masking observed-Hessian PD
         // failures at large scale.
-        log::info!(
+        log::debug!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s source={}",
             iter,
             state.hessian_curvature,
@@ -1405,7 +1405,7 @@ where
                             -1.0
                         };
                         if rho > 100.0 && actual_reduction > noise_floor {
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS gain-ratio audit] rho={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e} current_deviance={:.6e} candidate_deviance={:.6e} current_penalty={:.6e} candidate_penalty={:.6e}",
                                 rho,
                                 actual_reduction,
@@ -1461,7 +1461,7 @@ where
                                 kkt_tolerance,
                             );
                             if lm_rejection_soft {
-                                log::debug!(
+                                log::trace!(
                                     "[PIRLS] gain-rejection soft acceptance: near-stationary \
                                      plateau (‖g‖={projected_grad:.3e}, \
                                      predicted_reduction={predicted_reduction:.3e})"
@@ -1638,7 +1638,7 @@ where
                         let exact_nd_pass = exact_decrement_sq
                             .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 exact_decrement_sq.unwrap_or(f64::NAN),
                                 exact_nd_threshold,
@@ -1716,7 +1716,7 @@ where
                         if numerical_plateau
                             && exact_decrement_sq.is_some()
                         {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] objective resolution exhausted at iter {iter}; \
                                  handing exact-decrement state to undamped refinement \
                                  (decrement_sq={:.3e}, threshold={exact_nd_threshold:.3e})",
@@ -1801,7 +1801,7 @@ where
                                 kkt_tolerance,
                             );
                         if plateau_streak.note(near_stationary_plateau) == LoopVerdict::Plateaued {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] iter {iter} early-exit on soft acceptance: \
                                  near-stationary plateau (‖g‖={convergence_grad_norm:.3e}, \
                                  Δdev={deviance_change:.3e})"
@@ -1822,7 +1822,7 @@ where
                             used_fisher_fallback_this_iter = true;
                             consecutive_fisher_fallbacks += 1;
                             if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                                log::info!(
+                                log::debug!(
                                     "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=gain_rejection",
                                     iter,
                                     consecutive_fisher_fallbacks,
@@ -1839,7 +1839,7 @@ where
                             // (Observed assembly itself failed). Tagged
                             // with `gain_rejection` so the runner
                             // aggregator can count both reasons.
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
                                 iter,
                             );
@@ -1888,7 +1888,7 @@ where
                             state.near_stationary_kkt(projected_grad, kkt_tolerance);
 
                         if lm_rejection_soft {
-                            log::debug!(
+                            log::trace!(
                                 "[PIRLS] LM-rejection soft acceptance: near-stationary plateau \
                                  (‖g‖={projected_grad:.3e}, \
                                  predicted_reduction={predicted_reduction:.3e})"
@@ -1925,7 +1925,7 @@ where
                                     .map(f64::abs)
                                     .fold(0.0_f64, f64::max);
                                 let relative_grad = state.relative_gradient_norm(projected_grad);
-                                log::debug!(
+                                log::trace!(
                                     "[PIRLS] LM step search exhausted at iter={}: \
                                      attempts={}/{} lambda={:.3e} (ceiling={}) \
                                      projected_grad={:.3e} (relative={:.3e}) \
@@ -1962,7 +1962,7 @@ where
                         used_fisher_fallback_this_iter = true;
                         consecutive_fisher_fallbacks += 1;
                         if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                            log::info!(
+                            log::debug!(
                                 "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=candidate_err",
                                 iter,
                                 consecutive_fisher_fallbacks,
@@ -1977,7 +1977,7 @@ where
                         // mid-iter Observed-curvature unreliability,
                         // but candidate_err is a stronger signal
                         // (numerical breakdown, not just bad gain).
-                        log::info!(
+                        log::debug!(
                             "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
                             iter,
                         );
@@ -2027,7 +2027,7 @@ where
         // exit early when the iteration is cheap (small change) AND
         // the residual is small.
         let iter_elapsed = iter_start.elapsed();
-        log::info!(
+        log::debug!(
             "[PIRLS iter-end] iter={:>3} elapsed={:.4}s lm_lambda={:.2e} g_norm={:.3e} last_dev_change={:.3e} last_halving={}",
             iter,
             iter_elapsed.as_secs_f64(),
@@ -2047,11 +2047,11 @@ where
         // dominates because of the O(p³) Cholesky in the LM solve.
         // Knowing which path is hot tells us where the next principled
         // optimization should land.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let timed_total =
                 curvature_total + lm_solve_total + lm_predred_total + lm_candidate_total;
             let other_total = iter_elapsed.saturating_sub(timed_total);
-            log::info!(
+            log::debug!(
                 "[PIRLS iter-breakdown] iter={:>3} attempts={} curvature={:.3}s solve={:.3}s predred={:.3}s candidate={:.3}s other={:.3}s",
                 iter,
                 lm_attempts_done,
@@ -2080,13 +2080,13 @@ where
         //                   the quadratic model was faithful; <0.5
         //                   means it overstated the predicted
         //                   reduction. NaN on rejection-exhausted.
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
                 (lambda / lm_start_lambda).log10()
             } else {
                 f64::NAN
             };
-            log::info!(
+            log::debug!(
                 "[PIRLS lm-trajectory] iter={:>3} start_lambda={:.3e} final_lambda={:.3e} \
                  log10_ratio={:.3} accept_rho={:.3} attempts={}",
                 iter,
@@ -2118,7 +2118,7 @@ where
     // Newton convergence health: rate < 0.5 = healthy Newton; rate ≥ 0.7
     // = struggling (likely stuck near singular geometry or a
     // flat-warm-start that the predictor failed to refine).
-    if log::log_enabled!(log::Level::Info) {
+    if log::log_enabled!(log::Level::Debug) {
         let total_iters = iterations.max(1) as f64;
         let convergence_rate = match initial_gradient_norm {
             Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
@@ -2127,7 +2127,7 @@ where
             }
             _ => f64::NAN,
         };
-        log::info!(
+        log::debug!(
             "[PIRLS solve-end] iters={} elapsed={:.4}s g_norm_initial={:.3e} g_norm_final={:.3e} convergence_rate={:.3e} status={:?}",
             iterations,
             inner_solve_start.elapsed().as_secs_f64(),
@@ -2213,7 +2213,7 @@ where
         const MAX_UNDAMPED_POLISH_STEPS: usize = 8;
         for polish_iter in 0..MAX_UNDAMPED_POLISH_STEPS {
             let Some(bare_h) = state.hessian.as_dense() else {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, the Hessian is not dense",
                     polish_iter + 1
                 );
@@ -2226,7 +2226,7 @@ where
                 options.linear_constraints.as_ref(),
             );
             if state.certifies_kkt(g_norm_before, kkt_tolerance) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, strict KKT certified (‖g‖={g_norm_before:.3e})",
                     polish_iter + 1
                 );
@@ -2237,7 +2237,7 @@ where
             let bare_finite = state.gradient.iter().all(|v| v.is_finite())
                 && bare_h.iter().all(|v| v.is_finite());
             if !(g_norm_before > 0.0 && bare_finite) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, residual {g_norm_before:.3e} is zero or \
                      the gradient/Hessian is not finite",
                     polish_iter + 1
@@ -2276,7 +2276,7 @@ where
                 Some(rows) => active_face_newton_direction(&curvature, &state.gradient, rows),
                 None => unconstrained_newton_direction(&curvature, &state.gradient),
             }) else {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, no Newton direction on a face with \
                      {active_row_count} binding row(s) (reduced curvature did not factorize)",
                     polish_iter + 1
@@ -2291,7 +2291,7 @@ where
             let step_norm_sq = direction.dot(&direction);
             let step_reasonable = step_finite && (step_norm_sq <= 0.25 * beta_norm_sq.max(1.0));
             if !step_reasonable {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, step not reasonable \
                      (‖step‖²={step_norm_sq:.3e}, bound {:.3e}, finite={step_finite})",
                     polish_iter + 1,
@@ -2301,7 +2301,7 @@ where
             }
             let polished: Array1<f64> = beta.as_ref() + &direction;
             if !polished.iter().all(|v| v.is_finite()) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, polished iterate is not finite",
                     polish_iter + 1
                 );
@@ -2312,7 +2312,7 @@ where
                 match model.update_with_curvature(&polished_beta, state.hessian_curvature) {
                     Ok(polished_state) => polished_state,
                     Err(error) => {
-                        log::debug!(
+                        log::trace!(
                             "[PIRLS] undamped polish step {}: stop, re-evaluation failed: {error}",
                             polish_iter + 1
                         );
@@ -2333,7 +2333,7 @@ where
                 polished_beta.as_ref(),
                 &polished_state.gradient,
             ) {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped Newton polish step {} would leave the feasible \
                      set; stopping the refinement at the last feasible iterate",
                     polish_iter + 1,
@@ -2380,7 +2380,7 @@ where
                 && objective_ok
                 && (residual_improved || resolvable_decrease))
             {
-                log::debug!(
+                log::trace!(
                     "[PIRLS] undamped polish step {}: stop, no measured progress \
                      (‖g‖ {g_norm_before:.6e} -> {g_norm_after:.6e}, objective {obj_before:.15e} -> \
                      {obj_after:.15e}, Δ={:.3e}, ‖step‖={:.3e}, binding rows {active_row_count})",
@@ -2390,7 +2390,7 @@ where
                 );
                 break;
             }
-            log::debug!(
+            log::trace!(
                 "[PIRLS] undamped Newton polish (#1122) step {}: \
                  ‖g‖ {g_norm_before:.3e} → {g_norm_after:.3e}, ΔF={:.3e} \
                  (‖step‖={:.3e}, committed on {})",
@@ -2458,7 +2458,7 @@ where
     let final_exact_decrement_pass = final_exact_decrement_sq
         .is_some_and(|decrement_sq| decrement_sq <= final_decrement_threshold);
     if final_exact_decrement_sq.is_some() {
-        log::info!(
+        log::debug!(
             "[PIRLS final exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} status_before={:?}",
             final_exact_decrement_sq.unwrap_or(f64::NAN),
             final_decrement_threshold,
@@ -2483,13 +2483,13 @@ where
             polish_inequalities.as_deref(),
         );
         if geometry_certified && state.certifies_kkt(final_projected_grad, kkt_tolerance) {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] final-state certification: strict KKT \
                  (‖g‖={final_projected_grad:.3e})",
             );
             status = PirlsStatus::Converged;
         } else if geometry_certified && final_exact_decrement_pass {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] final-state certification: exact decrement \
                  (‖g‖={final_projected_grad:.3e}, decrement_sq={:.3e})",
                 final_exact_decrement_sq.unwrap_or(f64::NAN),
@@ -2518,7 +2518,7 @@ where
                     kkt_tolerance,
                 ))
         {
-            log::debug!(
+            log::trace!(
                 "[PIRLS] post-loop rescue on soft acceptance \
                  (‖g‖={final_projected_grad:.3e}, \
                  Δdev={last_deviance_change:.3e})"
@@ -2565,7 +2565,7 @@ where
                     });
             match projected {
                 Some(feasible_beta) => {
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS] constrained fit converged to an INFEASIBLE β \
                          (primal={primal_feasibility:.3e} > \
                          {tol:.3e}); projecting onto the feasible cone so the \
@@ -2643,7 +2643,7 @@ where
                                     options.coefficient_lower_bounds.as_ref(),
                                     options.linear_constraints.as_ref(),
                                 );
-                                log::warn!(
+                                log::debug!(
                                     "[PIRLS] post-convergence observed Hessian indefinite: \
                                  λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
                                 );
@@ -2690,7 +2690,7 @@ where
                         options.coefficient_lower_bounds.as_ref(),
                         options.linear_constraints.as_ref(),
                     );
-                    log::warn!(
+                    log::debug!(
                         "[PIRLS] post-convergence observed Hessian assembly failed: {err}; \
                      exporting InvalidObservedCurvature with ‖g‖={g_norm:.3e}"
                     );

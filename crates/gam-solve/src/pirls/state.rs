@@ -632,6 +632,7 @@ impl PirlsResult {
             computeworkingweight_derivatives_from_eta(
                 &self.likelihood,
                 inverse_link,
+                y,
                 &final_eta_owned,
                 priorweights,
             )?;

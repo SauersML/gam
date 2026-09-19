@@ -2837,7 +2837,7 @@ impl Core {
         // the per-call string build stays out of this preconditioner hot path,
         // and routed through `log` (an `eprintln!` here trips the src banned-macro
         // gate and broke the build).
-        if log::log_enabled!(log::Level::Debug) {
+        if log::log_enabled!(log::Level::Trace) {
             let mut s = String::new();
             for (li, level) in self.levels.iter().enumerate() {
                 let a = level.col_offset;
@@ -2859,7 +2859,7 @@ impl Core {
                     if coarse { "C" } else { "F" }
                 ));
             }
-            log::debug!(
+            log::trace!(
                 "[1032-COARSE] λ={lambda:.3e} m={} ncoarse={ncoarse} cap={COARSE_SPACE_MAX}{s}",
                 self.m
             );
@@ -3139,7 +3139,7 @@ impl Core {
         let nnz_l = sparse_spd_factor_nnz(&a).map_err(|error| {
             format!("residual cascade: sparse normal-equation symbolic analysis failed: {error}")
         })?;
-        log::info!(
+        log::debug!(
             "[2546-FILL] m={} nnz(A)={nnz_a} nnz(L)={nnz_l} dense_upper={} \
              fill_vs_A={:.2} fraction_of_dense={:.4}",
             self.m,
@@ -5464,7 +5464,7 @@ impl CascadeRequest<'_> {
             // a failure — it is the absence of a comparison, which is exactly
             // what `None` says, and it can only ever keep the cascade refining
             // or make a capacity refusal honest.
-            log::debug!(
+            log::trace!(
                 "[cascade] candidate level at exponent={exponent} has no exact comparison: the \
                  log-determinant fell back to the stochastic estimate at {} columns",
                 refined_design.core.m
@@ -5654,7 +5654,7 @@ pub fn fit_residual_cascade(
             // The comparison the decision below is taken on, plus the bracket
             // that screened it: a run record that shows only one of them cannot
             // say whether the exact route ran or the screen carried it.
-            log::debug!(
+            log::trace!(
                 "[cascade] exponent={exponent} gain_bracket={} evidence={} complete={complete} \
                  extends_last={extends_last} room={room}",
                 planned.gain.as_ref().map_or_else(

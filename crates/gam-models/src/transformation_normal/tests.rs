@@ -2656,7 +2656,7 @@ fn spec5_penalty_response() -> Array1<f64> {
 /// I-spline roughness Gram embedded with an unpenalized location row/column —
 /// never a coefficient-difference operator. This is the concrete #2306
 /// cutover: `build_response_basis` must emit `ispline_function_penalties`, not
-/// `create_difference_penalty_matrix`.
+/// a coefficient-difference Gram `DᵀD`.
 #[test]
 pub(crate) fn ctn_response_penalty_is_exact_ispline_function_roughness() {
     let config = TransformationNormalConfig::default();
@@ -2702,7 +2702,7 @@ pub(crate) fn ctn_response_penalty_is_exact_ispline_function_roughness() {
     // Discriminator: the retired coefficient-difference operator is a DIFFERENT
     // matrix, so the cutover genuinely changed the penalized metric.
     let difference =
-        gam_terms::basis::create_difference_penalty_matrix(p_shape, order, None).unwrap();
+        gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
     let mut max_rel = 0.0_f64;
     for r in 0..p_shape {
         for c in 0..p_shape {
@@ -2770,7 +2770,7 @@ pub(crate) fn ctn_response_penalty_matches_direct_function_roughness_quadrature(
     // The scale-free difference operator does NOT reproduce the function-space
     // roughness — this is exactly why the difference operator was wrong.
     let difference =
-        gam_terms::basis::create_difference_penalty_matrix(p_shape, order, None).unwrap();
+        gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
     let difference_form = beta_shape.dot(&difference.dot(&beta_shape));
     let diff_rel = (difference_form - integral).abs() / integral.abs();
     assert!(

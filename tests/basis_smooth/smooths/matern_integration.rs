@@ -70,9 +70,10 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let weights = Array1::ones(n);
@@ -194,9 +195,10 @@ fn matern_3d_aniso_fits_successfully() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let weights = Array1::ones(n);

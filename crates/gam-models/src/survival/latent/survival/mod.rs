@@ -1089,13 +1089,13 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             {
                 Ok(warm_start) => {
                     if !exact_mode_branch.borrow_mut().install_seed(warm_start) {
-                        log::debug!(
+                        log::trace!(
                             "[latent] ignored a late outer ρ-cache β seed: an accepted outer iterate already owns the coefficient-mode anchor"
                         );
                     }
                 }
                 Err(error) => {
-                    log::warn!(
+                    log::debug!(
                         "[latent] outer ρ-cache β warm start rejected: {error}; the next solve starts cold"
                     );
                 }
@@ -1171,7 +1171,7 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
                     .borrow_mut()
                     .candidates(eval_mode, theta, &rho);
             if first_iterate {
-                log::info!(
+                log::debug!(
                     "[latent] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                 );
             }
@@ -5092,7 +5092,7 @@ fn logk_q_derivatives(
     let second_cumulant = match bundle.second_cumulant_ratio(k, sigma) {
         Some(value) => value,
         None => {
-            log::warn!(
+            log::debug!(
                 "[#2610] cancellation-free second cumulant unavailable at k={k} \
                  (sigma={sigma:.6e}, mass={mass:.6e}); falling back to the \
                  differencing form, whose relative error grows without bound past \

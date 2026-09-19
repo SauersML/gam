@@ -170,7 +170,7 @@ pub(crate) fn pullback_labeled_outer_eval(
         let raw_len = result.gradient.len();
         let raw_head: Vec<f64> = result.gradient.iter().take(6).copied().collect();
         result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
-        log::debug!(
+        log::trace!(
             "[LABELED-EVAL] mode={eval_mode:?} rho0={:.4} |g_physical|={raw:.6e} len={raw_len} \
              head={raw_head:?} |g_outer|={:.6e}",
             rho[0],
@@ -196,7 +196,7 @@ pub(crate) fn pullback_labeled_outer_eval(
 /// problem. Per-block penalties already travel through `physical_rho`; joint
 /// penalties need this full-width bundle so coefficient correction and endpoint
 /// criterion assembly see exactly the same objective.
-fn labeled_options_for_rho<'a>(
+pub(crate) fn labeled_options_for_rho<'a>(
     options: &'a BlockwiseFitOptions,
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,

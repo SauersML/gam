@@ -17,7 +17,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gamfit import SparseDictStream, sparse_dictionary_fit, sparse_dictionary_fit_begin
+from gamfit.sae import (
+    SparseDictStream,
+    sparse_dictionary_fit,
+    sparse_dictionary_fit_begin,
+)
 from gamfit._binding import rust_module
 
 

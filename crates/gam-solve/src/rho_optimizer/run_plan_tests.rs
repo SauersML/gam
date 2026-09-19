@@ -3054,6 +3054,82 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     );
 }
 
+/// F4 (pyGAM audit, SAS link): ARC rejecting trials from a strict-saddle
+/// incumbent is not a replay while the trials move.
+///
+/// Each rejection leaves the incumbent bit-identical and raises ARC's
+/// regularization weight, so the next trial is a shorter step to a new point.
+/// The SAS-link probe (seed 1) did exactly this from `V = 935.29` with
+/// `λ_min(H) = −1.5e-3`: six rejected trials whose steps shrank from 3.77 to
+/// 0.58. The replay cut keyed on the incumbent alone and stopped the run after
+/// the second window, so the certificate judged a saddle at `|g| = 0.297` and
+/// the fit failed with `RemlDidNotConverge`. A window proves a replay only when
+/// it revisits the previous window's trials from the same incumbent.
+#[test]
+fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let incumbent = array![-2.6, 4.8];
+    guard.observe_second_order_seed(&incumbent, 935.29, 0.297, Some(false));
+
+    // Shrinking trials toward the incumbent, each one above it (rejected).
+    let mut step = 3.77;
+    let mut shrinking_window = |guard: &mut CostStallGuard| {
+        let mut verdicts = Vec::new();
+        for _ in 0..3 {
+            let trial = array![-2.6 - step, 4.8];
+            verdicts.push(guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)));
+            step *= 0.7;
+        }
+        verdicts
+    };
+    for window in 0..4 {
+        let verdicts = shrinking_window(&mut guard);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
+            "window {window}: rejected trials that move are not a replay, so the strict-saddle \
+             escape must be granted again"
+        );
+        assert!(
+            guard.license_continuation(),
+            "window {window}: an unreplayed window at a strict saddle is licensed"
+        );
+    }
+    assert_eq!(guard.stuck_escapes, 4, "each moving window earns its escape");
+
+    // A window that revisits the previous window's trials from the same
+    // incumbent is a proven replay and is cut.
+    let revisited = [0.3, 0.2, 0.1];
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        assert!(
+            matches!(
+                guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)),
+                CostStallVerdict::Continue
+            ),
+            "the first pass over a fresh window is not yet a replay"
+        );
+    }
+    let mut last = CostStallVerdict::Continue;
+    for trial_step in revisited {
+        let trial = array![-2.6 - trial_step, 4.8];
+        last = guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false));
+    }
+    assert!(
+        matches!(last, CostStallVerdict::FlatValleyStall { .. }),
+        "a window that revisits the same trials from the same incumbent replays it and must halt"
+    );
+    assert!(
+        !guard.license_continuation(),
+        "no licence reopens a proven replay"
+    );
+    let published = exit.lock().unwrap().take().expect("halt publishes the incumbent");
+    assert!(!published.converged, "a strict saddle is never converged");
+    assert_eq!(published.rho, incumbent);
+}
+
 /// #1237 — On a near-separable multinomial fit the outer REML criterion
 /// decreases monotonically as λ→0, so several log-λ directions slam to the
 /// lower box bound and the ARC outer loop cycles to `max_iter` without ever
@@ -6119,19 +6195,13 @@ fn run_nonconverged_arc_returns_typed_checkpoint_without_a_budget_retry() {
     // We use a quartic `cost = SCALE·(x − OFFSET)^4` from `initial_rho = [5.0]`
     // with `max_iter = 1`, which no seed can finish.
     //
-    // OFFSET is what makes the subject reachable, and it is not cosmetic. The
-    // seed budget bounds how many seeds are STARTED SPECULATIVELY, not how many
-    // may be tried: `should_start_next_seed` keeps going while no candidate has
-    // certified, because a fit whose budgeted seeds all fail should try the rest
-    // rather than refuse. So with a plain `x^4` the cascade walks past the
-    // exhausted `[5.0]` ladder to the always-injected neutral baseline `[0.0]`,
-    // which is the EXACT global minimum of `x^4` — it certifies at iteration 0,
-    // the run returns `Ok`, and the refusal this test exists to observe never
-    // happens. Putting the optimum at ½ leaves it stationary at NO
-    // generated candidate (they are integers), so every seed exhausts its budget
-    // and the runner must produce the typed checkpoint. SCALE keeps the residual
-    // gradient far above the stationarity band after the cascade, so the verdict
-    // cannot turn on how close a seed happened to land.
+    // The search runs from its one start `[5.0]`; there is no further seed to
+    // fall back on. OFFSET puts the optimum at ½ so no integer start (including
+    // the neutral baseline `[0.0]` a derived start would pick) is the exact
+    // minimum and certifies at iteration 0; the single budgeted iteration must
+    // exhaust and the runner must produce the typed checkpoint. SCALE keeps the
+    // residual gradient far above the stationarity band after that iteration,
+    // so the verdict cannot turn on how close the step happened to land.
     const OFFSET: f64 = 0.5;
     const SCALE: f64 = 1.0e6;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");

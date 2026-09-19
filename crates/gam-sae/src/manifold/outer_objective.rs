@@ -125,7 +125,7 @@ impl OuterTerminationLedger {
             None => "na".to_string(),
         };
         if !cost.is_finite() {
-            log::info!(
+            log::debug!(
                 "[SAE/outer] eval={} criterion={:.9e} grad={} best={:.9e} improved=false",
                 self.evals,
                 cost,
@@ -147,7 +147,7 @@ impl OuterTerminationLedger {
             });
             self.last_improvement_eval = self.evals;
         }
-        log::info!(
+        log::debug!(
             "[SAE/outer] eval={} criterion={:.9e} grad={} best={:.9e} improved={improved}",
             self.evals,
             cost,
@@ -533,6 +533,11 @@ pub struct OuterProbeTelemetry {
     pub root_unfactorable_no_steps: usize,
     /// Refined roots that did not certify, so the accepted state was priced instead.
     pub root_uncertified_refinements: usize,
+    /// #2822 — root phases that ended with the gate inside its formation band.
+    pub root_rounding_floor_stops: usize,
+    /// #2822 — root steps the strict contraction would have committed, refused because the
+    /// two gates' formation bands overlap.
+    pub root_band_refused_commits: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -1670,6 +1675,8 @@ impl SaeManifoldOuterObjective {
             root_negative_curvature_no_steps: root.negative_curvature_no_steps,
             root_unfactorable_no_steps: root.unfactorable_no_steps,
             root_uncertified_refinements: root.uncertified_refinements,
+            root_rounding_floor_stops: root.rounding_floor_stops,
+            root_band_refused_commits: root.band_refused_commits,
             ..self.probe_telemetry
         }
     }
@@ -1860,7 +1867,7 @@ impl SaeManifoldOuterObjective {
         if let Err(err) =
             fitted.canonicalize_charts_post_fit(target.view(), &fitted_rho, registry.as_ref())
         {
-            log::debug!("into_fitted: chart canonicalization refused: {err}");
+            log::trace!("into_fitted: chart canonicalization refused: {err}");
         }
         let charts_canonicalized = fitted
             .atoms
@@ -1874,7 +1881,7 @@ impl SaeManifoldOuterObjective {
         // `alpha`/`learnable_alpha` (#2933 F06).
         let fitted_loss = fitted.loss(target.view(), &fitted_rho)?;
         let termination = termination_report;
-        log::warn!(
+        log::debug!(
             "[#2235] outer search concluded: {} evals ({} since last improvement, wall {:.1?})",
             termination.evals,
             termination.evals_since_improvement,
@@ -2141,7 +2148,7 @@ impl SaeManifoldOuterObjective {
         let (penalized_quasi_laplace_cost, loss, priced) = match criterion {
             Ok(evaluated) => evaluated,
             Err(SaeCriterionError::VanishedAtoms(atoms)) => {
-                log::debug!(
+                log::trace!(
                     "SAE criterion reached fixed-K structural boundary at rho={:?}: {atoms}",
                     rho.flat_coordinates()
                 );
@@ -2167,7 +2174,7 @@ impl SaeManifoldOuterObjective {
             // descend by more than the material floor, so this probe stays infeasible.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                 self.probe_telemetry.record_refusal_kind(&err.to_string());
-                log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                log::trace!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
                 let loss = self.term.loss(self.target.view(), &rho)?;
                 let beta_hat = self.term.flatten_beta();
                 self.current_rho = rho;
@@ -2210,7 +2217,7 @@ impl SaeManifoldOuterObjective {
             // cache), distinct from the typed-refusal class the mapping
             // sites name. A silent ∞ here made every downstream
             // 'infeasible at the requested rho' failure untraceable.
-            log::debug!(
+            log::trace!(
                 "SAE criterion assembled a NON-FINITE value {penalized_quasi_laplace_cost:.6e} \
                  (loss total {:.6e}) at the converged inner state — mapping to +inf",
                 loss.total()
@@ -2621,7 +2628,7 @@ impl SaeManifoldOuterObjective {
                 FixedPointCoordinateCertificate::Covered { .. } => None,
             })
         {
-            log::warn!("SAE EFS evaluation refused (cost = +inf): {reason}");
+            log::debug!("SAE EFS evaluation refused (cost = +inf): {reason}");
         }
         Ok(evaluation)
     }
@@ -2735,7 +2742,7 @@ impl SaeManifoldOuterObjective {
         let evaluation = match criterion {
             Ok(evaluated) => evaluated,
             Err(SaeCriterionError::VanishedAtoms(atoms)) => {
-                log::debug!("SAE EFS probe reached fixed-K structural boundary: {atoms}");
+                log::trace!("SAE EFS probe reached fixed-K structural boundary: {atoms}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
                 return Ok(infeasible_evaluation("vanished-atom structural boundary"));
@@ -2757,7 +2764,7 @@ impl SaeManifoldOuterObjective {
                 if Self::is_recoverable_value_probe_refusal(&err) =>
             {
                 self.probe_telemetry.record_refusal_kind(&err);
-                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
                 return Ok(infeasible_evaluation(
@@ -2779,7 +2786,7 @@ impl SaeManifoldOuterObjective {
             // descend by more than the material floor, so this probe stays infeasible.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                 self.probe_telemetry.record_refusal_kind(&err.to_string());
-                log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                log::trace!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
                 return Ok(infeasible_evaluation(
@@ -3648,7 +3655,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // infeasible result; no finite pseudo-objective is introduced.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
-                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 Ok(f64::INFINITY)
             }
@@ -3686,7 +3693,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             Ok(InstalledEnvelopeBasin::Infeasible) => return Ok(OuterEval::infeasible(rho.len())),
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
-                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 return Ok(OuterEval::infeasible(rho.len()));
             }
@@ -3724,7 +3731,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             match criterion {
                 Ok(evaluated) => evaluated,
                 Err(SaeCriterionError::VanishedAtoms(atoms)) => {
-                    log::debug!(
+                    log::trace!(
                         "SAE analytic evaluation reached fixed-K structural boundary: {atoms}"
                     );
                     self.probe_telemetry.infeasible_criterion_evals += 1;
@@ -3739,7 +3746,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     if Self::is_recoverable_value_probe_refusal(&err) =>
                 {
                     self.probe_telemetry.record_refusal_kind(&err);
-                    log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                    log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
@@ -3758,7 +3765,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // descend by more than the material floor, so this probe stays infeasible.
                 Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                     self.probe_telemetry.record_refusal_kind(&err.to_string());
-                    log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                    log::trace!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
@@ -3867,7 +3874,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     // no derivative.
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         self.probe_telemetry.record_refusal_kind(&err);
-                        log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
+                        log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
                         self.probe_telemetry.infeasible_criterion_evals += 1;
                         // A reactive waypoint is a typed domain transaction,
                         // not an opaque line-search comparison. Preserve the

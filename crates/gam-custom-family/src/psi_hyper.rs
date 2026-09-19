@@ -640,7 +640,7 @@ fn materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes<
     // family without a batched route, and a capped run never reaches a
     // completion line.
     let sweep_started = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[STAGE] psi Hessian all-beta-axes sweep start psi_index={psi_index} axes={total} \
          route={}",
         if psi_workspace.is_some() {
@@ -665,7 +665,7 @@ fn materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes<
                     .collect::<Vec<_>>()
             })
     };
-    log::info!(
+    log::debug!(
         "[STAGE] psi Hessian all-beta-axes sweep done psi_index={psi_index} axes={total} \
          elapsed={:.2}s declined={}",
         sweep_started.elapsed().as_secs_f64(),
@@ -747,7 +747,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // #2714 — announce the build before it runs: a ψ-hyper build that takes
     // the wall clock of an outer gradient evaluation was invisible until its
     // completion line, which a capped run never reaches.
-    log::info!(
+    log::debug!(
         "[STAGE] build_psi_hyper_coords start axis_count={total_axes} beta_dim={total} \
          workspace_present={}",
         psi_workspace.is_some(),
@@ -1355,7 +1355,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         });
     }
 
-    log::info!(
+    log::debug!(
         "[STAGE] build_psi_hyper_coords axis_count={} workspace_present={} elapsed={:.3}s",
         total_axes,
         psi_workspace.is_some(),
@@ -1571,7 +1571,7 @@ pub fn build_contracted_psi_hook(
         let mut basis = vec![0.0; psi_dim];
         basis[axis_idx] = 1.0;
         let Some(terms) = workspace.second_order_terms_contracted(&basis)? else {
-            log::info!(
+            log::debug!(
                 "[outer-hvp contracted-psi] declined: workspace does not cover psi basis axis {}",
                 axis_idx
             );
@@ -2806,7 +2806,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // build_joint_hessian_closures handles both exact Newton and surrogate.
     let cthf_internal_psi_branch_start = std::time::Instant::now();
     if psi_dim > 0 {
-        log::info!(
+        log::debug!(
             "[STAGE] cthf_internal psi_dim={} eval_mode={:?} pre_unified elapsed={:.3}s",
             psi_dim,
             eval_mode,
@@ -3387,7 +3387,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
         // with ρ coordinates first and ψ coordinates appended — matching the expected
         // output order of CustomFamilyJointHyperResult.
-        log::info!(
+        log::debug!(
             "[STAGE] cthf_internal psi_dim={} eval_mode={:?} post_unified elapsed={:.3}s",
             psi_dim,
             eval_mode,
@@ -4605,7 +4605,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     )?;
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
-        log::warn!(
+        log::debug!(
             "[OUTER] custom-family joint-hyper EFS inner solve did not converge after {} cycle(s); \
              skipping joint-hyper EFS derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
             inner.cycles,

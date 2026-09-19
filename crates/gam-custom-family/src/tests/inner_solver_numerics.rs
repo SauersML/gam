@@ -864,7 +864,7 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_score_subsample: None,
         auto_outer_subsample: false,
         cache_session: None,
-        required_warm_start: None,
+        warm_start: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,

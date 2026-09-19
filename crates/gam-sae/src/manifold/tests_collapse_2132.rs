@@ -302,7 +302,7 @@ fn zz_collapse_2132_heldout_ev_nondecreasing_and_beats_pca() {
 /// blocks the whole #2132/#2228 SAE acceptance lane.
 #[test]
 fn manifold_circle_mixture_seed_eval_terminates_2132() {
-    // The engine's `log::debug!` arbiter lines in `terminal_exact_newton_polish`
+    // The engine's `log::trace!` arbiter lines in `terminal_exact_newton_polish`
     // (bail / step-committed / quotient-solver-refused) are SILENTLY DROPPED by the
     // test harness unless a logger is installed — so a bare `--nocapture` run would
     // show the refusal but not WHY. Forward every record to stderr so the discriminator
@@ -310,7 +310,7 @@ fn manifold_circle_mixture_seed_eval_terminates_2132() {
     struct ForwardingTestLogger;
     impl log::Log for ForwardingTestLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            // The point of this logger is the engine's `log::debug!` arbiter
+            // The point of this logger is the engine's `log::trace!` arbiter
             // lines, so enable exactly what the installed max level admits
             // rather than claiming every record regardless of its level.
             metadata.level() <= log::max_level()
@@ -323,7 +323,7 @@ fn manifold_circle_mixture_seed_eval_terminates_2132() {
     static FORWARDING_TEST_LOGGER: ForwardingTestLogger = ForwardingTestLogger;
     // Ignore the error when another test already installed a global logger.
     if log::set_logger(&FORWARDING_TEST_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Trace);
     }
 
     // (C, P, K, tag): matched-K planted circle mixtures FIRST (fast, known — K=C,

@@ -48,8 +48,8 @@ def test_sae_fit_is_deterministic_for_fixed_seed():
         random_state=123,
     )
 
-    fit_a = gamfit.sae_manifold_fit(**kwargs)
-    fit_b = gamfit.sae_manifold_fit(**kwargs)
+    fit_a = gamfit.sae.sae_manifold_fit(**kwargs)
+    fit_b = gamfit.sae.sae_manifold_fit(**kwargs)
 
     r2_a = _r2(z, fit_a.fitted)
     r2_b = _r2(z, fit_b.fitted)
@@ -90,9 +90,9 @@ def test_sae_fit_random_state_changes_output():
         n_iter=30,
         learning_rate=0.2,
     )
-    fit_0 = gamfit.sae_manifold_fit(**common, random_state=0)
-    fit_1 = gamfit.sae_manifold_fit(**common, random_state=1)
-    fit_2 = gamfit.sae_manifold_fit(**common, random_state=42)
+    fit_0 = gamfit.sae.sae_manifold_fit(**common, random_state=0)
+    fit_1 = gamfit.sae.sae_manifold_fit(**common, random_state=1)
+    fit_2 = gamfit.sae.sae_manifold_fit(**common, random_state=42)
 
     fitted_diff_01 = float(np.max(np.abs(fit_0.fitted - fit_1.fitted)))
     fitted_diff_02 = float(np.max(np.abs(fit_0.fitted - fit_2.fitted)))
@@ -143,9 +143,9 @@ def test_sae_fit_random_state_changes_output_topk_path():
         n_iter=10,
         learning_rate=0.2,
     )
-    fit_0 = gamfit.sae_manifold_fit(**common, random_state=0)
-    fit_1 = gamfit.sae_manifold_fit(**common, random_state=1)
-    fit_0b = gamfit.sae_manifold_fit(**common, random_state=0)
+    fit_0 = gamfit.sae.sae_manifold_fit(**common, random_state=0)
+    fit_1 = gamfit.sae.sae_manifold_fit(**common, random_state=1)
+    fit_0b = gamfit.sae.sae_manifold_fit(**common, random_state=0)
 
     # Distinct seeds diverge.
     diff_01 = float(np.max(np.abs(fit_0.fitted - fit_1.fitted)))

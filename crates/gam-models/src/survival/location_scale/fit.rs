@@ -932,7 +932,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                         exact_warm_start.replace(Some(ws));
                     }
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             "[survival-LS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
                         );
                     }
@@ -1028,7 +1028,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                         exact_warm_start.replace(Some(ws));
                     }
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             "[survival-LS] outer ρ-cache β-warm-start rejected (efs): {e}; falling back to cold β"
                         );
                     }

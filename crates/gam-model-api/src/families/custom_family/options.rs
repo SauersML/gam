@@ -391,16 +391,82 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// magnitude while still bounding pathological probes.
 pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
-/// A caller's required warm start: the widths of the certified point its cache
-/// session carries, and the flag the consuming route sets when it attaches it.
+/// A prior fit's certified outer point, handed to a new fit as its start
+/// (gam#3002). It is the one warm-start mechanism: every source (a saved model's
+/// `warm_start_from`) becomes this, and every outer search takes it through
+/// `OuterProblem::with_warm_start`.
+///
+/// A certificate is a property of a point AND a criterion, so a warm start never
+/// changes which point a search reports for its own criterion V:
+/// - With [`same_inputs`](Self::same_inputs), every outer search of the fit is
+///   offered `theta` as a prior certificate. A search accepts it, with no outer
+///   iteration, only where it is certified for that search's own V: V(theta)
+///   agrees with [`value`](Self::value) within the rounding envelope and the
+///   projected gradient is inside the band. Any other search of the fit (a
+///   pilot, an unarmed evidence fit, an earlier alternation round, whose V is
+///   not the one `theta` was certified for) declines it and runs exactly as it
+///   runs cold. The fit's inputs are the parent's, so it replays the parent's
+///   searches, and the one that accepts is the parent's published search.
+/// - On other inputs, `theta` only joins a search whose result is the argmin over
+///   its seed set (the independent multistart), as one more seed, so that
+///   search's published V is at most its cold one. A search that stops at its
+///   first certified seed does not use it, because a new first seed would change
+///   which point it certifies. The search records that as
+///   [`WarmStartOutcome::NotUsed`].
 #[derive(Clone, Debug)]
-pub struct RequiredWarmStart {
-    /// Outer coordinates of the point.
-    pub rho_dim: usize,
-    /// Flat inner coefficients of the point.
-    pub beta_dim: usize,
-    /// Set by the route that attached the point to its outer problem.
-    pub consumed: Arc<std::sync::atomic::AtomicBool>,
+pub struct WarmStart {
+    /// The certified outer coordinates, in the order the fit's outer problem
+    /// holds them: ρ, then the log length scales, then the auxiliary coordinates.
+    pub theta: Array1<f64>,
+    /// The inner coefficient mode at `theta`, flattened across blocks.
+    pub beta: Array1<f64>,
+    /// The outer criterion the parent certified at `theta`.
+    pub value: f64,
+    /// This fit's inputs (data, weights, offsets and model request) are the
+    /// parent fit's, by their input fingerprint.
+    pub same_inputs: bool,
+    /// What the fit's outer searches did with the point: the most any of them
+    /// did ([`WarmStart::record`]). `None` after the fit means no search received
+    /// it.
+    pub outcome: Arc<std::sync::Mutex<Option<WarmStartOutcome>>>,
+}
+
+/// What an outer search did with a [`WarmStart`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarmStartOutcome {
+    /// The point was accepted where it stands, as a prior certificate for this
+    /// search's criterion.
+    Resumed,
+    /// The point was one more seed of an argmin-over-seeds multistart.
+    JoinedMultistart,
+    /// The point was not used; the reason says why.
+    NotUsed(&'static str),
+}
+
+impl WarmStart {
+    /// Record what one outer search did with the point. A fit can run several
+    /// searches (a pilot, an evidence fit, alternation rounds) and each records,
+    /// so the slot keeps the most any of them did: a search that resumed or
+    /// joined is not hidden by a later one that declined.
+    pub fn record(&self, outcome: WarmStartOutcome) {
+        let rank = |outcome: &WarmStartOutcome| match outcome {
+            WarmStartOutcome::NotUsed(_) => 0,
+            WarmStartOutcome::JoinedMultistart => 1,
+            WarmStartOutcome::Resumed => 2,
+        };
+        if let Ok(mut slot) = self.outcome.lock()
+            && slot
+                .as_ref()
+                .is_none_or(|held| rank(&outcome) >= rank(held))
+        {
+            *slot = Some(outcome);
+        }
+    }
+
+    /// What the fit's outer searches did with the point, if any received it.
+    pub fn recorded(&self) -> Option<WarmStartOutcome> {
+        self.outcome.lock().ok().and_then(|slot| slot.clone())
+    }
 }
 
 /// Stable public API for installing outer-score subsampling.
@@ -499,12 +565,10 @@ pub struct BlockwiseFitOptions {
     /// explicitly; ordinary workflow fits leave this empty so refit-heavy
     /// loops do not touch the shared on-disk store.
     pub cache_session: Option<Arc<gam_runtime::warm_start::Session>>,
-    /// Set when `cache_session` carries a caller's required warm start
-    /// (`warm_start_from`) rather than an opportunistic cache. The route that
-    /// attaches the session checks the point fits its outer problem and marks it
-    /// consumed, so a mismatched point, or a route that cannot take one, is
-    /// refused by name instead of fitting cold.
-    pub required_warm_start: Option<RequiredWarmStart>,
+    /// A prior fit's certified outer point to start from (`warm_start_from`,
+    /// gam#3002). Every outer driver that reads options takes it through
+    /// `OuterProblem::with_warm_start`; see [`WarmStart`].
+    pub warm_start: Option<WarmStart>,
     /// Explicit fit-owned cross-process store. Unlike `cache_session`, which is
     /// one caller-keyed outer-iterate stream, this capability owns the shared
     /// response-keyed record and descriptor-keyed artifact namespaces too.
@@ -569,7 +633,7 @@ impl Default for BlockwiseFitOptions {
             outer_score_subsample: None,
             auto_outer_subsample: true,
             cache_session: None,
-            required_warm_start: None,
+            warm_start: None,
             persistent_warm_start_store: None,
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,

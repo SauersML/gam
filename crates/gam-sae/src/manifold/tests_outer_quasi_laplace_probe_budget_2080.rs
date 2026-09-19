@@ -3169,7 +3169,7 @@ fn zz_measure_wide_p_cost_exponent_2080() {
 /// the Value lane goes red here instead of silently shipping the desync.
 #[test]
 fn value_lane_prices_at_shared_fixed_point_2228() {
-    // #2228 — the acceptance and criterion lines this pin needs are `log::info!`.
+    // #2228 — the acceptance and criterion lines this pin needs are `log::debug!`.
     gam_runtime::test_support::install_diagnostic_logger();
     let n = 96usize;
     let p = 48usize;

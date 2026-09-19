@@ -1417,6 +1417,7 @@ mod runaway_tests {
             linear_terms: Vec::new(),
             random_effect_terms: Vec::new(),
             smooth_terms: Vec::new(),
+            level: Default::default(),
         }
     }
 
@@ -2032,7 +2033,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     let mjs_frozen_slope =
         gam_terms::smooth::freeze_measure_jet_length_scale_learning(&mut spec.slopespec);
     if mjs_frozen_marginal + mjs_frozen_slope > 0 {
-        log::info!(
+        log::debug!(
             "[BMS spatial] froze measure-jet length-scale learning on {} marginal + {} slope \
              term(s): the coupled surface keeps ℓ at its conditioned auto value (#1116)",
             mjs_frozen_marginal,
@@ -2054,7 +2055,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     let kappa_locked_slope =
         gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.slopespec);
     if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_slope {
-        log::info!(
+        log::debug!(
             "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
              explicit length_scale and no anisotropy; user-supplied kernel scale is fixed"
         );
@@ -2064,7 +2065,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         // gam#2924: the residual row kernel differentiates the smoothing
         // coordinates only; a spatial length scale stays at its data-seeded
         // value, as an explicit `length_scale=` would pin it.
-        log::info!(
+        log::debug!(
             "[BMS spatial] residual_columns present: spatial length scales are held at their \
              seeded values (pass length_scale= to choose them)"
         );
@@ -2136,7 +2137,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             None => 0,
         };
         if marginal_seeded + slope_seeded > 0 {
-            log::info!(
+            log::debug!(
                 "[BMS spatial] #2750 screened the representer range of {marginal_seeded} marginal \
                  + {slope_seeded} slope auto measure-jet term(s) against the response \
                  before the BMS design build"
@@ -2346,7 +2347,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 spec.weights.view(),
                 a_block.view(),
             )?;
-            log::info!(
+            log::debug!(
                 "[BMS residual repair] {} centred column(s) admitted; joint (z, r) covariance is {}",
                 runtime.width(),
                 if runtime.field.is_conditional() {
@@ -2926,6 +2927,15 @@ fn fit_bernoulli_marginal_slope_terms_under(
         ));
     }
     let initial_family = make_family(&marginal_design, &slope_design, initial_sigma);
+    // The row-kernel decision every cache build reads, made once before the
+    // search: `gpu=required` for a model the device row kernel does not compute
+    // is refused here, naming the missing capability, instead of at every trial
+    // point as a seed refusal (gam#3000).
+    if initial_family.flex_active() {
+        initial_family
+            .flex_row_kernel_decision()
+            .map_err(FitFailure::input)?;
+    }
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
@@ -3038,7 +3048,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
     // the driver's fast path; a fit that also searches length-scale or auxiliary
     // coordinates runs the driver's own search, which the point does not describe.
-    if options.required_warm_start.is_some()
+    if options.warm_start.is_some()
         && !(setup.auxiliary_dim() == 0
             && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
     {
@@ -3144,7 +3154,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             // marker per eval; this one records the row-measure exactly once.
             static BMS_OUTER_EVAL_ROWSET_LOGGED: std::sync::Once = std::sync::Once::new();
             BMS_OUTER_EVAL_ROWSET_LOGGED.call_once(|| {
-                log::debug!(
+                log::trace!(
                     "[BMS exact outer eval] mode={eval_mode:?} rows={}",
                     spec.y.len()
                 );
@@ -3159,13 +3169,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
                     Ok(ws) => {
                         if !exact_mode_branch.borrow_mut().install_seed(ws) {
-                            log::debug!(
+                            log::trace!(
                                 "[BMS] ignored a late outer-cache coefficient seed: an accepted outer iterate already owns the coefficient-mode anchor"
                             );
                         }
                     }
                     Err(e) => {
-                        log::warn!(
+                        log::debug!(
                             "[BMS] outer ρ-cache β-warm-start rejected: {e}; falling back to cold β"
                         );
                     }
@@ -3193,7 +3203,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             // repeated the identical coefficient solve and ValueOnly pass
             // inside every ValueAndGradient evaluation (#979).
             let selection = if let Some(value_selection) = owned_value_mode {
-                log::info!(
+                log::debug!(
                     "[BMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
                 );
                 upgrade_custom_family_joint_hyper_mode_shared(
@@ -3211,7 +3221,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     .borrow_mut()
                     .candidates(effective_mode, theta, &rho);
                 if first_iterate {
-                    log::info!(
+                    log::debug!(
                         "[BMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
                     );
                 }
@@ -3273,7 +3283,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     let mut designs = solved.designs;
     let mut solved_fit = solved.fit;
     if let Some(law) = intercept_warm_starts.anchor_law.as_ref() {
-        log::info!(
+        log::debug!(
             "[bernoulli marginal-slope anchor] root slots over the fit: {} (gam#2943 part 3(iii))",
             law.counts()
         );
@@ -3373,7 +3383,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             ..
         } = &mut latent_law_consumed
         {
-            log::warn!(
+            log::debug!(
                 "[{gate_context} latent-z] the declared Gaussian law is fitted although the score \
                  fails the standard-normal adequacy screen (adequacy ledger, x = statistic / \
                  bound, x<=1 passed: {}); the declaration's estimated excess anchoring loss at \
@@ -3389,7 +3399,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         } = &mut latent_law_consumed
         {
             if certificate.closed_form_chosen {
-                log::info!(
+                log::debug!(
                     "[{gate_context} latent-z] the closed form is certified at the converged fit: {} \
                      (gam#2926)",
                     certificate.summary()
@@ -3402,7 +3412,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                      differentiated only under the closed form, so nothing can re-solve on it",
                     certificate.summary()
                 );
-                log::warn!(
+                log::debug!(
                     "[{gate_context} latent-z] the closed form stays uncertified: {missing} (gam#2926)"
                 );
                 uncertified = Some(LatentLawConsumed::GaussianUncertified {
@@ -3412,7 +3422,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     missing,
                 });
             } else {
-                log::info!(
+                log::debug!(
                     "[{gate_context} latent-z] at the converged closed-form fit the estimated law is \
                      expected to be the more accurate anchor ({}); re-solving on it from the \
                      closed-form coefficients (gam#2926)",
@@ -3528,7 +3538,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .collect::<Result<Vec<_>, _>>()?;
         let certificate = candidates.certify(weights.as_ref(), &losses)?;
         if certificate.chosen == certificate.fitted {
-            log::info!(
+            log::debug!(
                 "[{gate_context} latent-z] the {} law is certified at the converged fit: {} \
                  (gam#2926)",
                 certificate.fitted.label(),
@@ -3541,7 +3551,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 *slot = Some(certificate);
             }
         } else {
-            log::info!(
+            log::debug!(
                 "[{gate_context} latent-z] at the converged {} fit the moving-law certificate \
                  chooses the {} law ({}); re-solving on it from these coefficients (gam#2926)",
                 certificate.fitted.label(),
@@ -3684,14 +3694,14 @@ fn fit_bernoulli_marginal_slope_terms_under(
     } else {
         match &empirical_channel {
             EmpiricalGeneratedRegressorChannel::ClosedForm => {
-                log::info!(
+                log::debug!(
                     "[BMS latent-z] Murphy–Topel generated-regressor covariance: corrected \
                      through the closed-form standard-normal channel"
                 );
                 None
             }
             EmpiricalGeneratedRegressorChannel::Empirical(build) => {
-                log::info!(
+                log::debug!(
                     "[BMS latent-z] Murphy–Topel generated-regressor covariance: corrected \
                      through the global-empirical measure's direct and cross-row channels ({} \
                      nodes)",
@@ -3717,7 +3727,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         if let Some(inference) = solved_fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
         }
-        log::warn!("[BMS latent-z] {}", declined.explain());
+        log::debug!("[BMS latent-z] {}", declined.explain());
         solved_fit.artifacts.covariance_declined = Some(declined);
     }
     if let Some(cal) = latent_z_conditional_calibration.as_ref()
@@ -3817,7 +3827,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                             ),
                         ));
                     }
-                    log::info!(
+                    log::debug!(
                         "[BMS latent-z] empirical generated-regressor channels: nodes={} \
                          |S_direct|_max={:.6e} |D^T U_Q^T|_max={:.6e}",
                         grid.nodes.len(),
@@ -3875,7 +3885,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         solved_fit
             .add_coefficient_covariance_correction(&correction)
             .map_err(|err| FitFailure::from(err).context("bms generated-regressor"))?;
-        log::info!(
+        log::debug!(
             "[BMS latent-z] Murphy–Topel generated-regressor SE correction applied: \
              p_beta={p_beta} flex_active={flex_active} theta1_dim={} max_diag_inflation={:.3e}",
             cal.theta1_dim(),

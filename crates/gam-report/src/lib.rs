@@ -1337,6 +1337,71 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// `value` to six significant digits in C's `%g` form: fixed notation for
+/// decimal exponents in `[-4, 6)`, scientific otherwise, trailing zeros trimmed.
+/// The number format of every printed model summary.
+pub fn format_significant(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value == f64::INFINITY {
+        return "inf".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-inf".to_string();
+    }
+    if value == 0.0 {
+        return "0".to_string();
+    }
+
+    let exponent = value.abs().log10().floor() as i32;
+    let mut out = if !(-4..6).contains(&exponent) {
+        let raw = format!("{:.5e}", value);
+        normalize_exponent(&raw)
+    } else {
+        let places = (6 - exponent - 1).max(0) as usize;
+        trim_float(format!("{:.*}", places, value))
+    };
+    if out == "-0" {
+        out = "0".to_string();
+    }
+    out
+}
+
+fn normalize_exponent(raw: &str) -> String {
+    let Some((mantissa, exponent)) = raw.split_once('e') else {
+        return raw.to_string();
+    };
+    let mantissa = trim_float(mantissa.to_string());
+    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exponent.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exponent)
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let padded = if digits.len() == 1 {
+        format!("0{digits}")
+    } else {
+        digits.to_string()
+    };
+    format!("{mantissa}e{sign}{padded}")
+}
+
+fn trim_float(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
+}
+
 /// The words for a fit with no REML/LAML criterion at all: an exactly
 /// interpolating Gaussian fit, whose profiled restricted likelihood is unbounded.
 const NO_CRITERION_WORDS: &str = "none (exact fit: criterion unbounded)";

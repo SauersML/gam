@@ -186,7 +186,7 @@ pub(crate) fn fit_transformation_normal(
         &mut covariate_spec,
     );
     if seeded > 0 {
-        log::info!(
+        log::debug!(
             "[#2750] screened the representer range of {seeded} auto measure-jet term(s) against \
              the response before the transformation-normal design build"
         );
@@ -365,7 +365,7 @@ pub(crate) fn fit_transformation_normal(
         .block_spec(&rho0)
         .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
     let n_penalties = probe_block.initial_log_lambdas.len();
-    log::info!(
+    log::debug!(
         "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
         n_penalties,
         kappa0.len(),
@@ -381,7 +381,7 @@ pub(crate) fn fit_transformation_normal(
     let analytic_hessian_supported = analytic_gradient && cap_hessian.is_analytic();
     let analytic_hessian = analytic_hessian_supported;
     if analytic_hessian {
-        log::info!(
+        log::debug!(
             "[transformation-normal] CTN exact joint analytic outer Hessian is available for spatial kappa optimization; using exact second-order outer geometry"
         );
     }
@@ -394,7 +394,7 @@ pub(crate) fn fit_transformation_normal(
             rho0.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         )
     };
-    log::info!(
+    log::debug!(
         "[transformation-normal] skipping baseline custom-family prefit before exact joint optimization \
          (rho_dim={}, log_kappa_dim={}, rho0_range=[{:.3}, {:.3}]); using CTN warm start and penalty-scale rho seed",
         n_penalties,
@@ -519,7 +519,7 @@ pub(crate) fn fit_transformation_normal(
             &make_family,
         )?;
 
-        log::debug!(
+        log::trace!(
             "[transformation-normal] rebuilt exact geometry cache for {} spatial terms in {:.3}s",
             spatial_terms_for_cache.len(),
             geom_start.elapsed().as_secs_f64(),
@@ -536,14 +536,14 @@ pub(crate) fn fit_transformation_normal(
         let (first_iterate, candidates) =
             exact_mode_branch.borrow_mut().candidates(eval_mode, theta, rho);
         if first_iterate {
-            log::info!(
+            log::debug!(
                 "[transformation-normal] first derivative-bearing outer seed evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
             );
         }
         candidates
     };
 
-    log::info!(
+    log::debug!(
         "[transformation-normal] entering exact joint outer optimization \
          (analytic_gradient={}, analytic_hessian={})",
         analytic_gradient,
@@ -602,7 +602,7 @@ pub(crate) fn fit_transformation_normal(
                         gam_problem::EvalMode::ValueOnly,
                     )
                     .map_err(|e| FitFailure::from(e).context("transformation fixed mode profile"))?;
-                    log::info!(
+                    log::debug!(
                         "[transformation-normal] user-fixed coefficient mode selected candidate={} objective={:.16e}",
                         selection.selected_candidate,
                         selection.result.objective,
@@ -615,7 +615,7 @@ pub(crate) fn fit_transformation_normal(
                     )
                 }
                 SpatialFitProvenance::Certified { outer, mode: selection } => {
-                    log::info!(
+                    log::debug!(
                         "[transformation-normal] consuming certified terminal coefficient mode candidate={} objective={:.16e} without profile replay",
                         selection.selected_candidate,
                         selection.result.objective,
@@ -660,7 +660,7 @@ pub(crate) fn fit_transformation_normal(
                         )
                     })?;
                 let max_abs_cov = cov_chunk.iter().copied().map(f64::abs).fold(0.0, f64::max);
-                log::info!(
+                log::debug!(
                     "[transformation-normal] final fixed-rho CTN validation: max_abs_h={:.6e} max_abs_covariate_basis={:.6e}",
                     max_abs_h,
                     max_abs_cov
@@ -698,7 +698,7 @@ pub(crate) fn fit_transformation_normal(
             // inner solve: at n = 320 000 eval calls 89 and 90 of large_scale
             // run 34666040783 each spent 414 s on the same 22-cycle solve.
             let selection = if let Some(value_selection) = owned_value_mode {
-                log::info!(
+                log::debug!(
                     "[transformation-normal] upgrading the owned value-only coefficient mode at identical theta; skipping the coefficient re-solve"
                 );
                 upgrade_custom_family_joint_hyper_mode_shared(
@@ -741,7 +741,7 @@ pub(crate) fn fit_transformation_normal(
                         if error.is_trial_point_infeasible()
                             && warm_starts.iter().any(Option::is_some) =>
                     {
-                        log::info!(
+                        log::debug!(
                             "[transformation-normal] carried coefficient mode is infeasible at this trial point; re-profiling from the family's monotone construction: {error}"
                         );
                         evaluate_custom_family_joint_hyper_best_mode_shared(
@@ -759,7 +759,7 @@ pub(crate) fn fit_transformation_normal(
                 .map_err(|e| format!("transformation exact joint mode profile: {e}"))?;
                 for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
                     if let Some(rejection) = rejection {
-                        log::warn!(
+                        log::debug!(
                             "[transformation-normal] rejected exact coefficient-mode candidate mode_candidate={candidate_idx}: {rejection}"
                         );
                     }

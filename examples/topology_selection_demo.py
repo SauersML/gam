@@ -17,7 +17,7 @@ def main() -> None:
     df = pd.DataFrame({"u": u, "v": v, "y": y + rng.normal(scale=0.12, size=n)})
     # select_topology takes the response column and races candidate topologies
     # for one smooth over every other column: here `y ~ s(u, v, type=AUTO)`.
-    result = gamfit.select_topology(df, "y", return_fits=False)
+    result = gamfit.topology.select_topology(df, "y", return_fits=False)
 
     print(f"selected topology: {result.winner_name}")
 

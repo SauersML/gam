@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
-    log::info!(
+    log::debug!(
         "[GPU] CUDA acceleration enabled\n  device: {} '{}' | memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx>={}flop gemm>={}flop spmv_nnz>={} chol_p>={} syevd_p>={}",
         device.ordinal,
         device.name,
@@ -40,7 +40,7 @@ pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
         })
         .collect::<Vec<_>>()
         .join("; ");
-    log::info!(
+    log::debug!(
         "[GPU] multi-device pool enabled | devices={} | policy_device={} | {}",
         devices.len(),
         devices[0].ordinal,
@@ -52,7 +52,7 @@ pub(crate) fn log_cuda_disabled(reason: &str) {
     static CUDA_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
     let reason = GpuRuntime::cpu_reason().unwrap_or(reason);
     CUDA_DISABLED_LOGGED.get_or_init(|| {
-        log::info!("[GPU] CUDA acceleration disabled: {reason}");
+        log::debug!("[GPU] CUDA acceleration disabled: {reason}");
     });
 }
 

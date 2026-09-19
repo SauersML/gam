@@ -252,20 +252,6 @@ pub(crate) struct RhoSensitivitySpectrum {
 }
 
 impl RhoSensitivitySpectrum {
-    /// First-order variance direction `index` contributes to the correction:
-    /// `‖Qs·J·u_j‖² / σ_j`, the squared norm of the column
-    /// [`smoothing_correction_gram`] builds for it, i.e. its share of
-    /// `tr(J·V_ρ·Jᵀ)`.
-    ///
-    /// Ranking directions by THIS ranks them by their share of the estimand.
-    /// Ranking them by `1/σ_j` — the spread of `ρ` — ranks them by a quantity
-    /// the correction does not depend on alone, and puts a saturated direction
-    /// (where `1/σ_j` is huge precisely because `∂β̂/∂ρ → 0`) first (#2728).
-    pub fn first_order_variance(&self, index: usize) -> f64 {
-        let column = self.sensitivity_orig.dot(&self.eigenvectors.column(index));
-        column.dot(&column) / self.eigenvalues[index]
-    }
-
     /// Indices of the directions the certified inversion admitted, i.e. those
     /// with strictly positive resolved curvature.
     pub(crate) fn active_directions(&self) -> Vec<usize> {
@@ -321,6 +307,18 @@ pub(crate) enum SmoothingCorrectionStatus {
 pub(crate) const FIRTH_OUTER_HESSIAN_NOT_ANALYTIC: &str =
     "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only";
 
+/// The structural refusal of the outer ρ-Hessian once the #784 block-local
+/// correction is latched into the criterion: `Δ_b` is spliced with its exact
+/// ρ-gradient but no ρ-Hessian, so the corrected search ran on BFGS and no
+/// analytic ρ-Hessian exists at its end. `compute_lamlhessian_consistent`
+/// refuses with exactly this text and the smoothing correction maps it to
+/// [`SmoothingCorrectionUnavailable::OuterHessianNotAnalytic`], as for
+/// [`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`]. Inverting the Laplace Hessian without
+/// `∂²Δ_b` instead reads the missing curvature as a contradiction of the
+/// criterion and refuses the fit.
+pub(crate) const BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC: &str =
+    "the latched #784 block-local correction has no analytic outer rho-Hessian";
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SmoothingCorrectionUnavailable {
     ObjectiveInnerHessian {
@@ -337,8 +335,9 @@ pub(crate) enum SmoothingCorrectionUnavailable {
         error: String,
     },
     /// The outer ρ-Hessian has no analytic form for this fit — a
-    /// non-canonical Firth link whose outer search ran on BFGS
-    /// (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`). Structural and expected, not a
+    /// non-canonical Firth link, or a latched #784 block correction, whose
+    /// outer search ran on BFGS (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`,
+    /// `BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC`). Structural and expected, not a
     /// numerical failure: the caller ships the conditional covariance and
     /// labels the correction absent.
     OuterHessianNotAnalytic {
@@ -1118,13 +1117,13 @@ fn dump_indefinite_rho_hessian_diagnostic(
                 (&eigenvalues_owned, &eigenvectors_owned)
             }
             Err(err) => {
-                log::warn!("[INDEF-HESS] eigendecomposition failed: {err}");
+                log::debug!("[INDEF-HESS] eigendecomposition failed: {err}");
                 return;
             }
         },
     };
 
-    log::warn!("[INDEF-HESS] rho={:?}", final_rho.as_slice().unwrap_or(&[]),);
+    log::debug!("[INDEF-HESS] rho={:?}", final_rho.as_slice().unwrap_or(&[]),);
     if let Some(inv) = inverted {
         let deflated = inv
             .classifications
@@ -1132,7 +1131,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
             .take_while(|class| matches!(class, EigenClassification::StructuralZero))
             .count();
         if deflated > 0 {
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] the leading {deflated} direction(s) below may be the penalty map's \
                  certified invariance, DEFLATED before any test (#2676): for those, the reported \
                  value is the Rayleigh quotient `t' H t = sum_k g_k t_k^2` -- a chain-rule term, \
@@ -1140,12 +1139,12 @@ fn dump_indefinite_rho_hessian_diagnostic(
             );
         }
     }
-    log::warn!(
+    log::debug!(
         "[INDEF-HESS] eigenvalues={:?}",
         eigenvalues_ref.as_slice().unwrap_or(&[]),
     );
     if let Some(inv) = inverted {
-        log::warn!(
+        log::debug!(
             "[INDEF-HESS] active_rank={}/{} structural_zero={} unresolvable_curvature={} below_gradient_floor={} curvature_resolution={:.3e}",
             inv.active_rank,
             k,
@@ -1165,7 +1164,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
                     EigenClassification::BelowGradientFloor => "G",
                 })
                 .collect();
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] classifications={:?} (A=active; Z=certified null of the penalty \
                  map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, \
                  excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a \
@@ -1190,7 +1189,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
     // for exactly that reason. And the field is the MINIMUM eigenvalue, which
     // is routinely positive (measured `+9.56e-2` on `geo_disease_matern`);
     // naming it `negative_eigenvalue` asserted a sign it does not carry.
-    log::warn!(
+    log::debug!(
         "[INDEF-HESS] min_eigenvalue={:.4e} min_eigenvector={:?}",
         min_eig,
         v_neg.to_vec(),
@@ -1218,18 +1217,18 @@ fn dump_indefinite_rho_hessian_diagnostic(
             intrinsic.push(eigenvalues_ref[i] - signed);
             floor.push(absolute);
         }
-        log::warn!(
+        log::debug!(
             "[INDEF-HESS] outer_gradient={:?}",
             outer_gradient.to_vec(),
         );
-        log::warn!(
+        log::debug!(
             "[INDEF-HESS] reparam_split sigma={sigma:?} reparam=sum_k g_k v_k^2={reparam:?} \
              intrinsic=sigma-reparam={intrinsic:?} gradient_floor=sum_k |g_k| v_k^2={floor:?} \
              (a certified-null direction has intrinsic == 0 EXACTLY, so |sigma| == floor and \
              the gate's boundary runs through it; see #2676)"
         );
     } else {
-        log::warn!(
+        log::debug!(
             "[INDEF-HESS] outer_gradient unavailable ({} of {k} coordinate(s)); the \
              reparameterisation split sigma = intrinsic + sum_k g_k v_k^2 cannot be formed, \
              and every per-direction floor collapsed to the eigensolver backward error (#2676)",
@@ -1249,7 +1248,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
         }
         tr_aa[i] = s;
     }
-    log::warn!(
+    log::debug!(
         "[INDEF-HESS] penalty_count={} ranges={:?} ranks={:?}",
         n_pen,
         (0..n_pen)
@@ -1353,7 +1352,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
             if a * b >= 0.0 {
                 continue;
             }
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] structural_redundancy_detected pair=({},{}) relative_defect={:.6e} \
                  best_scale={:.6e} antisym_proj={:.4e} (proportional to the arithmetic that \
                  formed them, so the criterion IS exactly constant along this direction)",
@@ -1386,7 +1385,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
             {
                 continue;
             }
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] near_degenerate_not_an_invariance pair=({},{}) \
                  relative_defect={:.6e} arithmetic_floor={arithmetic_floor:.6e} \
                  antisym_proj={:.4e} — this pair is MEASURABLY distinct ({:.3e}x the floor), so \
@@ -1407,7 +1406,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
     // defects — the near-proportional end is the informative one.
     if n_pen <= INDEF_HESS_PAIR_DUMP_GRID_MAX_K {
         for p in &pairs {
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] pair=({},{}) relative_defect={:.6e} best_scale={:.6e} tr_ii={:.4e} tr_jj={:.4e} v_neg[i]-v_neg[j]/sqrt2={:.4e}",
                 p.i,
                 p.j,
@@ -1428,7 +1427,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         for p in top.iter().take(INDEF_HESS_PAIR_DUMP_TOP_N) {
-            log::warn!(
+            log::debug!(
                 "[INDEF-HESS] top_pair=({},{}) relative_defect={:.6e} best_scale={:.6e} tr_ii={:.4e} tr_jj={:.4e} v_neg[i]-v_neg[j]/sqrt2={:.4e}",
                 p.i,
                 p.j,
@@ -1573,7 +1572,7 @@ pub(crate) fn compute_smoothing_correction(
     // 0×0 placeholder from a geometry backend that failed to materialize a real
     // dense inner Hessian) would otherwise abort the whole fit inside the solve.
     if h_trans.nrows() != n_coeffs_trans || h_trans.ncols() != n_coeffs_trans {
-        log::warn!(
+        log::debug!(
             "smoothing-correction inner Hessian shape {}x{} does not match coefficient dimension {}; skipping.",
             h_trans.nrows(),
             h_trans.ncols(),
@@ -1615,7 +1614,7 @@ pub(crate) fn compute_smoothing_correction(
                     identified_inverse.sensitivity()
                 }
                 Err(identified_error) => {
-                    log::warn!(
+                    log::debug!(
                         "smoothing-correction inner Hessian refused its strict Cholesky \
                          ({cholesky_error:?}) and its identified subspace ({identified_error}); \
                          skipping."
@@ -1674,7 +1673,7 @@ pub(crate) fn compute_smoothing_correction(
         match sensitivity.mode_response_coned(h_trans.view(), dg_drho_trans.view(), &col_supports) {
             Some(jacobian) => jacobian,
             None => {
-                log::warn!(
+                log::debug!(
                     "IFT beta-rho sensitivity solve failed for smoothing correction; skipping."
                 );
                 return SmoothingCorrectionComputation {
@@ -1697,8 +1696,11 @@ pub(crate) fn compute_smoothing_correction(
     let mut hessian_rho = match reml_state.compute_lamlhessian_consistent(final_rho) {
         Ok(h) => h,
         Err(err) => {
-            let reason = if err.to_string().contains(FIRTH_OUTER_HESSIAN_NOT_ANALYTIC) {
-                log::info!(
+            let message = err.to_string();
+            let reason = if message.contains(FIRTH_OUTER_HESSIAN_NOT_ANALYTIC)
+                || message.contains(BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC)
+            {
+                log::debug!(
                     "LAML Hessian is not analytic for this fit ({}); the smoothing correction \
                      is typed-unavailable.",
                     err
@@ -1707,7 +1709,7 @@ pub(crate) fn compute_smoothing_correction(
                     error: err.to_string(),
                 }
             } else {
-                log::warn!(
+                log::debug!(
                     "LAML Hessian unavailable ({}); skipping smoothing correction.",
                     err
                 );
@@ -1804,7 +1806,7 @@ pub(crate) fn compute_smoothing_correction(
         })
         .filter(|value| value.is_finite());
     if let Some(defect) = assembly_reevaluation_defect {
-        log::info!(
+        log::debug!(
             "[RHO-HESSIAN] outer-vs-correction re-assembly defect ‖H_correction − H_outer‖₂ = {defect:.6e} \
              (n_rho={n_rho}); this is a measured component of the curvature resolution the \
              definiteness gate below judges against (#2748)"
@@ -1861,7 +1863,7 @@ pub(crate) fn compute_smoothing_correction(
     ) {
         Ok(inverse) => inverse,
         Err(error) => {
-            log::warn!("Exact LAML rho-Hessian inversion failed: {error}");
+            log::debug!("Exact LAML rho-Hessian inversion failed: {error}");
             dump_indefinite_rho_hessian_diagnostic(
                 &hessian_rho,
                 final_rho,
@@ -1885,7 +1887,7 @@ pub(crate) fn compute_smoothing_correction(
     if inverted.active_rank == 0 {
         // Every direction is independently certified as a structural zero of
         // the penalty map, so J·V_ρ·Jᵀ is mathematically zero.
-        log::info!(
+        log::debug!(
             "LAML rho Hessian has no identified directions (active_rank=0/{}, structural_zero={}, curvature_resolution={:.3e}); smoothing correction is exactly zero.",
             n_rho_total,
             inverted.structural_zero,
@@ -1911,7 +1913,7 @@ pub(crate) fn compute_smoothing_correction(
     }
 
     if inverted.active_rank < n_rho_total {
-        log::info!(
+        log::debug!(
             "LAML rho Hessian is not fully identified (active_rank={}/{}, structural_zero={}, below_gradient_floor={}, unresolvable_curvature={}, curvature_resolution={:.3e}); using its certified structural pseudoinverse. `below_gradient_floor` counts saturation nulls: directions whose curvature is under the outer loop\'s own residual gradient, so they carry no resolvable rho-variance (#2428).",
             inverted.active_rank,
             n_rho_total,
@@ -1932,7 +1934,7 @@ pub(crate) fn compute_smoothing_correction(
     let used_structural_pseudoinverse = inverted.used_structural_pseudoinverse;
     let active_rank_used = inverted.active_rank;
     if used_structural_pseudoinverse {
-        log::debug!(
+        log::trace!(
             "Applied rank-deficient pseudo-inverse on identified rho-Hessian subspace before smoothing correction."
         );
     }
@@ -1966,7 +1968,7 @@ pub(crate) fn compute_smoothing_correction(
 
     // Validate the result
     if !v_corr_orig.iter().all(|v| v.is_finite()) {
-        log::warn!("Non-finite values in smoothing correction matrix; skipping.");
+        log::debug!("Non-finite values in smoothing correction matrix; skipping.");
         return SmoothingCorrectionComputation {
             correction: None,
             rho_covariance: Some(rho_covariance),

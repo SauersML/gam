@@ -32,7 +32,7 @@ impl CustomFamily for TransformationNormalFamily {
         let beta = &block_states[0].beta;
         let row_q_start = std::time::Instant::now();
         let row_quantities = self.row_quantities(beta)?;
-        log::info!(
+        log::debug!(
             "[STAGE] CTN row_quantities (h, h', 1/h', powers) n={} elapsed={:.3}s",
             row_quantities.h.len(),
             row_q_start.elapsed().as_secs_f64(),
@@ -46,7 +46,7 @@ impl CustomFamily for TransformationNormalFamily {
         // non-negative alpha shape fields.
         let grad_start = std::time::Instant::now();
         let (grad, hessian) = self.scop_gradient_and_negative_hessian(beta, &row_quantities)?;
-        log::info!(
+        log::debug!(
             "[STAGE] CTN gradient terms n={} p={} elapsed={:.3}s",
             n,
             grad.len(),
@@ -56,14 +56,14 @@ impl CustomFamily for TransformationNormalFamily {
         let hess_start = std::time::Instant::now();
         let p_dim = hessian.nrows() as u64;
         let n_u64 = n as u64;
-        log::info!(
+        log::debug!(
             "[STAGE] CTN hessian terms (SCOP exact dense) n={} p={} flops~{} elapsed={:.3}s",
             n,
             p_dim,
             n_u64.saturating_mul(p_dim).saturating_mul(p_dim),
             hess_start.elapsed().as_secs_f64(),
         );
-        log::info!(
+        log::debug!(
             "[STAGE] CTN evaluate end n={} p={} elapsed={:.3}s",
             n,
             p_dim,
@@ -362,7 +362,7 @@ impl CustomFamily for TransformationNormalFamily {
         );
         let terms = self.scop_psi_terms(beta, &row, op, op_arc, axis)?;
 
-        log::info!(
+        log::debug!(
             "[STAGE] CTN psi first-order terms axis={} psi_index={} elapsed={:.3}s",
             deriv.implicit_axis,
             psi_index,
@@ -472,7 +472,7 @@ impl CustomFamily for TransformationNormalFamily {
             .into());
         }
 
-        log::info!(
+        log::debug!(
             "[STAGE] CTN psi-psi pair (psi_i={}, psi_j={}, axes={},{}) elapsed={:.3}s",
             psi_i,
             psi_j,

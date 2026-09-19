@@ -112,9 +112,14 @@ pub(crate) fn validate_survival_location_scale_spec(
     let n = spec.event_target.len();
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     match &spec.inverse_link {
-        InverseLink::Standard(StandardLink::Log) => {
+        InverseLink::Standard(
+            link @ (StandardLink::Log | StandardLink::Inverse | StandardLink::InverseSquared),
+        ) => {
             return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "fit_survival_location_scale does not support Standard(Log)".to_string(),
+                reason: format!(
+                    "fit_survival_location_scale does not support the {} link",
+                    link.name()
+                ),
             });
         }
         InverseLink::Standard(StandardLink::Logit)

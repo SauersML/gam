@@ -62,7 +62,7 @@ fn run_fixture_seed(
 #[test]
 fn multistart_publishes_the_basin_only_a_stiff_seed_reaches_2359() {
     let (problem, levels) = problem_with_starts(0.0, &[4.0]);
-    let seeds = problem.multistart_seeds(&levels).expect("seeds");
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
     assert!(
         seeds.iter().any(|seed| seed[0] == 0.0) && seeds.iter().any(|seed| seed[0] == 4.0),
         "fixture precondition: both the neutral and the stiff seed are generated, got {seeds:?}"
@@ -115,11 +115,11 @@ fn multistart_publishes_the_basin_only_a_flexible_seed_reaches_2359() {
 fn each_multistart_run_searches_its_own_seed_alone_2359() {
     let (problem, levels) = problem_with_starts(0.0, &[4.0, 0.0, f64::INFINITY]);
     assert_eq!(
-        problem.multistart_seeds(&[]).expect("seeds"),
+        problem.multistart_seeds(None, &[]).expect("seeds"),
         vec![array![0.0]],
         "with no declared level the fit's own start is the only search"
     );
-    let every = problem.multistart_seeds(&levels).expect("seeds");
+    let every = problem.multistart_seeds(None, &levels).expect("seeds");
     assert_eq!(
         every,
         vec![array![0.0], array![4.0], array![8.0]],
@@ -127,18 +127,27 @@ fn each_multistart_run_searches_its_own_seed_alone_2359() {
     );
     let outcome = problem
         .run_certified_multistart(&levels, "sole seeds", 0, 1, |_, seed_problem, _| {
-            let seeds = seed_problem.multistart_seeds(&[]).expect("seeds");
+            let seeds = seed_problem.multistart_seeds(None, &[]).expect("seeds");
             (
-                Err(EstimationError::RemlOptimizationFailed("not run".to_string())),
+                Err(EstimationError::RemlOptimizationFailed(
+                    "not run".to_string(),
+                )),
                 seeds,
             )
         })
         .expect("multistart runs");
     assert_eq!(outcome.seeds, every);
     for (index, (_, seeds)) in outcome.runs.iter().enumerate() {
-        assert_eq!(seeds, &vec![every[index].clone()], "run {index} searches its own seed alone");
+        assert_eq!(
+            seeds,
+            &vec![every[index].clone()],
+            "run {index} searches its own seed alone"
+        );
     }
-    assert_eq!(outcome.winner, None, "no run certified, so there is no winner");
+    assert_eq!(
+        outcome.winner, None,
+        "no run certified, so there is no winner"
+    );
 }
 
 /// The winner is a function of the seed runs' results alone, not of the order
@@ -147,7 +156,7 @@ fn each_multistart_run_searches_its_own_seed_alone_2359() {
 #[test]
 fn a_multistart_winner_does_not_depend_on_which_run_finishes_first_2359() {
     let (problem, levels) = problem_with_starts(0.0, &[3.5, 4.0]);
-    let seeds = problem.multistart_seeds(&levels).expect("seeds");
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
     let mut published = Vec::new();
     for reverse in [false, true] {
         let outcome = problem
@@ -218,7 +227,7 @@ fn run_flat_well_seed(
 #[test]
 fn a_multistart_tie_goes_to_the_lower_seed_index_2359() {
     let (problem, levels) = problem_with_starts(5.75, &[6.25]);
-    let seeds = problem.multistart_seeds(&levels).expect("seeds");
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
     let first_on_floor = seeds
         .iter()
         .position(|seed| (seed[0] - 6.0).abs() < 0.5)
@@ -252,7 +261,7 @@ fn a_multistart_tie_goes_to_the_lower_seed_index_2359() {
 #[test]
 fn only_certified_runs_compete_and_none_certified_is_a_refusal_2359() {
     let (problem, levels) = problem_with_starts(0.0, &[4.0]);
-    let seeds = problem.multistart_seeds(&levels).expect("seeds");
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
     let stiff = seeds
         .iter()
         .position(|seed| seed[0] == 4.0)
@@ -417,4 +426,203 @@ fn the_winner_is_the_same_on_every_pool_width_and_lane_kind_2359() {
         assert!(lanes <= width, "{lanes} lanes on a pool of {width}");
         assert_eq!(inside, outside, "pool width {width}: same winner and bits as OS-thread lanes");
     }
+}
+
+fn warm_start(theta: f64, value: f64, same_inputs: bool) -> gam_model_api::WarmStart {
+    gam_model_api::WarmStart {
+        theta: array![theta],
+        beta: array![0.0],
+        value,
+        same_inputs,
+        outcome: Default::default(),
+    }
+}
+
+/// The published (seeds, ρ, V, iterations) of a multistart on the two-basin
+/// fixture, searching `levels` beside the problem's own start.
+fn published_two_basin(
+    problem: &OuterProblem,
+    levels: &[f64],
+) -> (Vec<Array1<f64>>, f64, f64, usize) {
+    let outcome = problem
+        .run_certified_multistart(levels, "two basins", 0, 1, |_, seed_problem, _| {
+            run_fixture_seed(&seed_problem, 1.0, 6.0, std::time::Duration::ZERO)
+        })
+        .expect("multistart runs");
+    let winner = outcome.winner.expect("a seed certifies");
+    let result = outcome.runs[winner]
+        .0
+        .as_ref()
+        .expect("the winner certified");
+    (
+        outcome.seeds.clone(),
+        result.rho()[0],
+        result.final_value(),
+        result.iterations(),
+    )
+}
+
+/// The certified well of the two-basin fixture, searched from ρ = 4 alone: a
+/// parent fit's published point and value.
+fn two_basin_parent() -> CertifiedOuterResult {
+    let (problem, _) = problem_with_starts(4.0, &[]);
+    run_fixture_seed(&problem, 1.0, 6.0, std::time::Duration::ZERO)
+        .0
+        .expect("the parent certifies")
+}
+
+/// A warm start from another fit's inputs joins the multistart as one more seed
+/// and never replaces its seeds (gam#3002). The parent's point lies in this
+/// fit's railed basin (V ≈ 1); the cold seeds reach the well (V ≈ 0). The
+/// argmin over the superset publishes the well: V_warm ≤ V_cold within the
+/// multistart's tie envelope, which is all a joined seed can cost. Taken as
+/// the sole seed, the point publishes the rail, and this test is what catches
+/// that mutant.
+#[test]
+fn a_warm_start_from_other_inputs_joins_the_multistart_and_never_raises_v_3002() {
+    let (problem, levels) = problem_with_starts(0.0, &[4.0]);
+    let (_, _, cold, _) = published_two_basin(&problem, &levels);
+    let (_, alone_rho, alone, _) =
+        published_two_basin(&problem.clone().with_initial_rho(array![-6.0]), &[]);
+    assert!(
+        alone > cold + 0.5,
+        "fixture precondition: the parent's point alone publishes the rail \
+         (rho={alone_rho} V={alone}), the cold seeds the well (V={cold})"
+    );
+    let parent = warm_start(-6.0, alone, false);
+    let (seeds, warm_rho, warm, _) =
+        published_two_basin(&problem.clone().with_warm_start(&parent), &levels);
+    assert!(
+        seeds.contains(&array![-6.0]) && seeds.contains(&array![4.0]),
+        "the parent's point joins the cold seeds, got {seeds:?}"
+    );
+    assert!(
+        warm <= cold + outer_value_agreement_bound(cold, warm),
+        "the warm start raised the published V: rho={warm_rho} V={warm} against cold V={cold}"
+    );
+    assert_eq!(
+        parent.recorded(),
+        Some(gam_model_api::WarmStartOutcome::JoinedMultistart)
+    );
+}
+
+/// On the parent's own inputs the parent's certified point, offered to the
+/// search that certified it, is accepted where it stands: no outer iteration,
+/// the parent's bits. Through a single search and through the multistart alike.
+#[test]
+fn a_warm_start_on_the_parents_inputs_resumes_with_no_outer_iteration_3002() {
+    let parent = two_basin_parent();
+    let resume = warm_start(parent.rho()[0], parent.final_value(), true);
+    let (problem, levels) = problem_with_starts(0.0, &[4.0]);
+    let problem = problem.with_warm_start(&resume);
+    let (single, _) = run_fixture_seed(&problem, 1.0, 6.0, std::time::Duration::ZERO);
+    let single = single.expect("the resume certifies");
+    assert_eq!(
+        single.iterations(),
+        0,
+        "a still-certified point costs no outer iteration"
+    );
+    assert_eq!(single.rho()[0].to_bits(), parent.rho()[0].to_bits());
+    assert_eq!(
+        resume.recorded(),
+        Some(gam_model_api::WarmStartOutcome::Resumed)
+    );
+
+    let (seeds, rho, _, iterations) = published_two_basin(&problem, &levels);
+    assert_eq!(
+        seeds,
+        vec![parent.rho().clone()],
+        "the multistart is the one resumed run"
+    );
+    assert_eq!((rho.to_bits(), iterations), (parent.rho()[0].to_bits(), 0));
+}
+
+/// A point certified for another criterion (a pilot's, an unarmed evidence
+/// fit's, an earlier alternation round's) is declined on the parent's own
+/// inputs, and the search runs bit for bit as it runs cold. The point here is
+/// stationary for this criterion but records another value, so only the value
+/// test declines it. The cold search publishes the rail and a search from the
+/// point would publish the well, so the test catches both a resume that skips
+/// the value test and a decline that searches from the point.
+#[test]
+fn a_prior_certificate_for_another_criterion_is_declined_and_the_search_runs_cold_3002() {
+    let parent = two_basin_parent();
+    let (problem, levels) = problem_with_starts(0.0, &[4.0]);
+    let (cold, _) = run_fixture_seed(&problem, 1.0, 6.0, std::time::Duration::ZERO);
+    let cold = cold.expect("the cold search certifies");
+    assert!(
+        cold.final_value() > parent.final_value() + 0.5,
+        "fixture precondition: the cold search publishes the rail (V={}), the point is the \
+         well (V={})",
+        cold.final_value(),
+        parent.final_value()
+    );
+    let other = warm_start(parent.rho()[0], parent.final_value() + 0.25, true);
+    let warm_problem = problem.clone().with_warm_start(&other);
+    let (warm, _) = run_fixture_seed(&warm_problem, 1.0, 6.0, std::time::Duration::ZERO);
+    let warm = warm.expect("the cold search certifies");
+    assert_eq!(
+        (
+            warm.rho()[0].to_bits(),
+            warm.final_value().to_bits(),
+            warm.iterations()
+        ),
+        (
+            cold.rho()[0].to_bits(),
+            cold.final_value().to_bits(),
+            cold.iterations()
+        ),
+        "the declined search ran cold"
+    );
+    assert!(matches!(
+        other.recorded(),
+        Some(gam_model_api::WarmStartOutcome::NotUsed(_))
+    ));
+
+    let (_, cold_rho, cold_v, _) = published_two_basin(&problem, &levels);
+    let (seeds, rho, v, _) = published_two_basin(&warm_problem, &levels);
+    assert!(
+        !seeds.contains(parent.rho()),
+        "a declined resume adds no seed to the multistart, got {seeds:?}"
+    );
+    assert_eq!(
+        (rho.to_bits(), v.to_bits()),
+        (cold_rho.to_bits(), cold_v.to_bits())
+    );
+}
+
+/// A single search, which certifies from its one derived start, does not take a
+/// point from other inputs: a new start would change which point it certifies.
+/// It runs exactly as the cold search and records that it did not use the point.
+#[test]
+fn a_single_search_does_not_use_a_warm_start_from_other_inputs_3002() {
+    let (problem, _) = problem_with_starts(0.0, &[4.0]);
+    let (cold, _) = run_fixture_seed(&problem, 1.0, 6.0, std::time::Duration::ZERO);
+    let cold = cold.expect("the cold search certifies");
+    let parent = two_basin_parent();
+    let other = warm_start(parent.rho()[0], parent.final_value(), false);
+    let (warm, _) = run_fixture_seed(
+        &problem.clone().with_warm_start(&other),
+        1.0,
+        6.0,
+        std::time::Duration::ZERO,
+    );
+    let warm = warm.expect("the single search certifies");
+    assert_eq!(
+        (
+            warm.rho()[0].to_bits(),
+            warm.final_value().to_bits(),
+            warm.iterations()
+        ),
+        (
+            cold.rho()[0].to_bits(),
+            cold.final_value().to_bits(),
+            cold.iterations()
+        ),
+        "the single search ran cold"
+    );
+    assert!(matches!(
+        other.recorded(),
+        Some(gam_model_api::WarmStartOutcome::NotUsed(_))
+    ));
 }

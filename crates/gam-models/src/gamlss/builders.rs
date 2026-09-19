@@ -2781,7 +2781,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             .fold(f64::NEG_INFINITY, f64::max);
         let mean_slope =
             warp_slope.iter().map(|value| value - 1.0).sum::<f64>() / warp_slope.len() as f64;
-        log::info!(
+        log::debug!(
             "[WIGGLE-OUTER] #2748 pass {_outer}: delta={last_delta:.6e} scale={last_scale:.6e} \
              tol={:.6e} |step|={step_norm:.6e} |step_k|/|step_k-1|={step_ratio:.6e} \
              cos(step_k, step_k-1)={step_cosine:+.6} mu_hat={dominant_multiplier:+.6e} \
@@ -2819,7 +2819,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
             .chain(step.iter().copied())
             .collect();
         let (advance, advance_kind, history_reset) = mixer.advance(&residual, relaxation)?;
-        log::info!(
+        log::debug!(
             "[WIGGLE-OUTER] #2748 pass {_outer}: advance={advance_kind} |residual|={:.6e} \
              history_reset={history_reset}",
             mixer.last_residual_norm().unwrap_or(f64::NAN),
@@ -3111,7 +3111,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
         && gam_terms::smooth::all_spatial_terms_kappa_fixed(&mean_bootspec)
         && gam_terms::smooth::all_spatial_terms_kappa_fixed(&noise_bootspec)
     {
-        log::info!(
+        log::debug!(
             "[GAMLSS spatial] disabling κ/ψ optimization: every spatial term in \
              both blocks has an explicit length_scale and no anisotropy; \
              user-supplied kernel scale is fixed"
@@ -4578,7 +4578,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         &baseline_design.penalties,
         rho_dim,
     );
-    log::info!(
+    log::debug!(
         "[binomial-mean-wiggle] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
         rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
         rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),

@@ -13,7 +13,7 @@ permutation null, steering-validated):
      calendar phase, tested against a FULL-PIPELINE permutation null (the
      label-aware chart is rebuilt for every shuffled labeling, so chart
      construction cannot inflate the statistic); (b) the
-     ``gamfit.adjudicate_atom_shape`` race on the 2-D coords, paired with the
+     ``gamfit.sae.adjudicate_atom_shape`` race on the 2-D coords, paired with the
      centroid circular-ordering diagnostic (``centroid_ordering.py`` next to
      this file). The race owns discrete cyclic structure through its
      ``ring_clusters`` class; ``ring_clusters_reporting_k`` names its all-data
@@ -315,7 +315,7 @@ def circle_fit(Z: np.ndarray, *, steps: int, seed: int, lr: float = 1e-2,
     period 1.0; angles are converted to radians."""
     import gamfit
 
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X=np.ascontiguousarray(Z, dtype=np.float64),
         K=1,
         d_atom=1,
@@ -597,7 +597,7 @@ def main() -> int:
                          "or run on a GPU host.")
 
     import gamfit
-    assert hasattr(gamfit, "adjudicate_atom_shape"), "gamfit missing adjudicator"
+    assert hasattr(gamfit.sae, "adjudicate_atom_shape"), "gamfit missing adjudicator"
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

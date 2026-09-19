@@ -37,7 +37,7 @@ def _ev(x: np.ndarray, recon: np.ndarray) -> float:
 
 def _joint_fit(X, K, d_atom, n_iter, seed, isometry):
     t0 = time.time()
-    fit = gamfit.sae_manifold_fit(
+    fit = gamfit.sae.sae_manifold_fit(
         X, K=K, d_atom=d_atom, atom_topology="circle", assignment="ordered_beta_bernoulli",
         isometry_weight=isometry, n_iter=n_iter, random_state=seed,
     )
