@@ -31,10 +31,13 @@ fn resolvable_trial_count_is_zero_without_a_resolvable_gain_3185() {
 
 /// Without the stall acceptance every fit must converge on the decrement test
 /// itself. Across sample sizes the reduced lognormal AFT still reaches its
-/// closed-form MLE.
+/// closed-form MLE: the exact log-likelihood gap to the closed form,
+/// `n[log(σ/σ̂) + (σ̂² + (μ − μ̂)²)/(2σ²) − ½]`, is within the default inner
+/// tolerance on `½λ²`, which is what a certified fit promises at any `n`.
 #[test]
 fn reduced_parametric_aft_converges_without_stall_acceptance_3185() {
-    for (n, seed) in [(50usize, 31u64), (800, 3170), (20_000, 70)] {
+    let inner_tol = BlockwiseFitOptions::default().inner_tol;
+    for (n, seed) in [(50usize, 31u64), (800, 3185), (20_000, 70)] {
         let (age_exit, event, log_t) = reduced_aft_lognormal_sample(n, -0.3, 0.8, seed);
         let (mu_hat, sigma_hat) = lognormal_closed_form_mle(&log_t);
         let spec = reduced_aft_lognormal_spec(&age_exit, &event, 1.0);
@@ -42,15 +45,17 @@ fn reduced_parametric_aft_converges_without_stall_acceptance_3185() {
         assert!(prepared.is_reduced_parametric_aft());
         let (fit, _) = fit_survival_location_scale_with_geometry(spec)
             .unwrap_or_else(|e| panic!("n={n}: reduced parametric-AFT MLE: {e}"));
-        let loc = fit.beta_threshold()[0];
-        let sigma = fit.beta_log_sigma()[0].exp();
+        let mu = fit.beta_threshold()[0];
+        let log_sigma = fit.beta_log_sigma()[0];
+        let sigma = log_sigma.exp();
+        let d = mu - mu_hat;
+        let gap = n as f64
+            * ((log_sigma - sigma_hat.ln())
+                + ((sigma_hat - sigma) * (sigma_hat + sigma) + d * d) / (2.0 * sigma * sigma));
         assert!(
-            (loc - mu_hat).abs() < 1e-6,
-            "n={n}: location {loc:.9} != closed-form mu {mu_hat:.9}"
-        );
-        assert!(
-            (sigma - sigma_hat).abs() < 1e-6,
-            "n={n}: sigma {sigma:.9} != closed-form sigma {sigma_hat:.9}"
+            gap >= -inner_tol && gap <= inner_tol,
+            "n={n}: log-likelihood gap {gap:.3e} to the closed-form MLE exceeds {inner_tol:.1e} \
+             (mu {mu:.9} vs {mu_hat:.9}, sigma {sigma:.9} vs {sigma_hat:.9})"
         );
     }
 }
