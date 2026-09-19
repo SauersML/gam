@@ -121,7 +121,7 @@ def shape_predict_response(
     # (`_shape_point_payload`) owns the identical "return the vector, or restore
     # a one-column table" tail that the three forked shapers used to duplicate.
     point, table_columns = _point_payload_spec(
-        point_shape, point_column, columns, parsed.get("point_columns")
+        point_shape, point_column, columns, payload.get("point_columns")
     )
     shaped = _shape_point_payload(
         point,
