@@ -557,9 +557,14 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // Row quantities float64 cannot represent at the current coefficients:
         // numerical failures of the solve, not properties of the input.
         EstimationError::InverseLinkDomainViolation { .. }
-        | EstimationError::LinkFeasibilityBoundaryOptimum { .. }
         | EstimationError::PirlsRowGeometryUnrepresentable { .. }
         | EstimationError::LogStrengthDomainViolation { .. } => FitNumericalError::new_err(message),
+        // The data put the likelihood maximum on the edge of the link's
+        // feasible set (an all-zero group under identity-Poisson, say), like a
+        // separation: a property of the input, raised as its category's class.
+        EstimationError::LinkFeasibilityBoundaryOptimum { .. } => {
+            category_error(err.error_category(), message)
+        }
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
         EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
         EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),

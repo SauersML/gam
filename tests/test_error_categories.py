@@ -111,6 +111,20 @@ def test_non_finite_data_is_a_data_error():
         gamfit.fit(frame, "y ~ s(x)")
 
 
+def test_a_likelihood_maximum_on_the_link_feasibility_boundary_is_a_data_error():
+    # An all-zero group puts the identity-Poisson maximum on eta = 0.
+    group = np.repeat([0.0, 1.0], 200)
+    y = np.where(group == 0.0, 0.0, np.random.default_rng(5).poisson(5.0, 400)).astype(float)
+    with pytest.raises(gamfit.errors.DataError, match="feasib") as caught:
+        gamfit.fit(
+            {"g": group, "y": y},
+            "y ~ linear(g, double_penalty=false)",
+            family="poisson",
+            link="identity",
+        )
+    assert not isinstance(caught.value, gamfit.errors.ConvergenceError)
+
+
 def test_an_unpredictable_cell_is_a_data_error():
     model = gamfit.fit(_categorical_frame(), "y ~ s(x) + factor(grp)")
     new = _categorical_frame(6)
