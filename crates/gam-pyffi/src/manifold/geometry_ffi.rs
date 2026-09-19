@@ -8028,8 +8028,11 @@ fn model_partial_dependence_impl(
         term,
         grid,
     )?;
-    let x = standard_mean_design_dense(&model, table.table.clone())?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let spec = standard_mean_termspec(model, &table.table)?;
+    if gam::terms::smooth::term_collection_has_nonzero_anchor(&spec) {
+        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
+    }
+    let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let beta = &fit.beta;
     // The partial-effect band prices its SEs off the covariance the fit
     // publishes — the same choice `summary()` makes — and names it in the
@@ -8045,20 +8048,50 @@ fn model_partial_dependence_impl(
          partial-dependence standard errors"
             .to_string()
     })?;
-    let blocks = term_blocks_for_model_impl(model)?;
-    let (start, end) = blocks
-        .iter()
-        .find(|(name, _, _, _)| name.as_str() == term)
-        .map(|(_, _, s, e)| (*s, *e))
+    // The term's coefficient range is a property of the layout, not of the
+    // rows, so one grid row places it; the grid itself then realizes only the
+    // term's own columns and the blocks they read.
+    let rows = table.table.values.view();
+    let layout = gam::terms::smooth::build_term_collection_prediction_design(
+        rows.slice(ndarray::s![..rows.nrows().min(1), ..]),
+        &spec,
+    )
+    .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let mut terms = layout.linear_ranges.iter().chain(&layout.smooth_ranges);
+    let range = terms
+        .find(|(name, _)| name.as_str() == term)
+        .map(|(_, range)| range.clone())
         .ok_or_else(|| {
-            let available: Vec<&str> = blocks.iter().map(|(n, _, _, _)| n.as_str()).collect();
+            let available: Vec<&str> = layout
+                .linear_ranges
+                .iter()
+                .chain(&layout.smooth_ranges)
+                .map(|(name, _)| name.as_str())
+                .collect();
             format!("partial_dependence: term {term:?} not found; available: {available:?}")
         })?;
+    if range.end > beta.len() || range.end > cov.nrows() || range.end > cov.ncols() {
+        return Err(format!(
+            "partial_dependence: term {term:?} columns {range:?} lie outside the {} saved \
+             coefficients or the {:?} covariance",
+            beta.len(),
+            cov.dim()
+        ));
+    }
+    let term_design = gam::terms::smooth::build_term_prediction_columns(rows, &spec, term)
+        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    if term_design.ncols() != range.len() {
+        return Err(format!(
+            "partial_dependence: term {term:?} realizes {} columns on the grid but spans \
+             {range:?} in the model layout",
+            term_design.ncols()
+        ));
+    }
     let (predicted, standard_error) = gam_predict::term_diagnostics::term_partial_dependence(
-        x.view(),
-        beta.view(),
-        cov.view(),
-        start..end,
+        term_design.view(),
+        beta.slice(ndarray::s![range.clone()]),
+        cov.slice(ndarray::s![range.clone(), range]),
+        0..term_design.ncols(),
     )?;
     Ok(PartialDependenceOutput {
         table,
@@ -8078,8 +8111,8 @@ fn model_variance_share_encoded_impl(
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    let x = standard_mean_design_dense(&model, dataset)?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let x = standard_mean_design(&model, dataset)?;
+    let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
         .filter(|(name, kind, _, _)| {
@@ -8153,10 +8186,30 @@ fn model_variance_share(
 /// link-wiggle's final fitted predictor uses the mean block as its row offset
 /// and a LinkWiggle-frame matrix, so returning this internal matrix from the
 /// public API was the architectural root cause of #2299.
-fn standard_mean_design_dense(
+fn standard_mean_design(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<Array2<f64>, String> {
+    let design = standard_mean_prediction_design(model, &dataset)?;
+    let dense = design
+        .design
+        .try_to_dense_by_chunks("design_matrix prediction design")?;
+    append_deployment_extension_columns(
+        model.payload(),
+        dataset.values.view(),
+        &dataset.column_map(),
+        model.training_headers.as_ref(),
+        dense,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// The frozen mean-block term specification a term-design diagnostic
+/// evaluates, resolved against the dataset's columns.
+fn standard_mean_termspec(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<gam::terms::smooth::TermCollectionSpec, String> {
     // A scan-routed model never materializes a dense B-spline design — the
     // exact O(n) state-space smoother is the whole point — so there is no model
     // matrix to export. Replace the cryptic "missing resolved_termspec" error
@@ -8185,34 +8238,33 @@ fn standard_mean_design_dense(
                 .to_string(),
         );
     }
-    let col_map = dataset.column_map();
-    let training_headers = model.training_headers.as_ref();
     let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
         &model.resolved_termspec,
-        training_headers,
-        &col_map,
+        model.training_headers.as_ref(),
+        &dataset.column_map(),
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    Ok(spec)
+}
+
+const NONZERO_ANCHOR_DESIGN_ERROR: &str = "design_matrix cannot represent a model with non-zero \
+     smooth anchors as a single coefficient matrix; use Model.predict for the complete affine \
+     predictor";
+
+/// The undensified mean-block design behind [`standard_mean_design`], so a
+/// caller that reads one term's columns never materializes the rest.
+fn standard_mean_prediction_design(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<gam::terms::smooth::TermCollectionPredictionDesign, String> {
+    let spec = standard_mean_termspec(model, dataset)?;
+    let design =
+        gam::terms::smooth::build_term_collection_prediction_design(dataset.values.view(), &spec)
+            .map_err(|err| format!("failed to build design matrix: {err}"))?;
     if design.affine_offset.iter().any(|value| *value != 0.0) {
-        return Err(
-            "design_matrix cannot represent a model with non-zero smooth anchors as a single \
-             coefficient matrix; use Model.predict for the complete affine predictor"
-                .to_string(),
-        );
+        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
     }
-    let dense = design
-        .design
-        .try_to_dense_by_chunks("design_matrix prediction design")?;
-    append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &col_map,
-        training_headers,
-        dense,
-    )
-    .map_err(|err| err.to_string())
+    Ok(design)
 }
 
 fn posterior_credible_interval_impl(
