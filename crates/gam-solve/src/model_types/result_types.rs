@@ -1283,21 +1283,26 @@ pub struct OuterCriterionCertificate {
 /// The mint's Newton-decrement verdict is stricter than any search stop, so the
 /// point a search hands over can still buy a decrease the arithmetic resolves.
 /// The mint takes Newton steps on the free coordinates while each lowers the
-/// criterion by more than its band, within the step budget quadratic
-/// convergence allows, and judges the point they reach. A coordinate whose
-/// Newton steps stop short of the box bound they head to is railed there when
-/// that lowers the criterion by more than its band (projected Newton), and the
-/// coordinates left free are polished on a budget of their own.
+/// criterion by more than its band and the decrement contracts, and judges the
+/// point they reach. Where only the decrease left is resolvable, not a step's,
+/// the last step is a settling step whose point must certify. A coordinate
+/// whose Newton steps contract slower than Newton's quadratic rate toward the
+/// box bound they head to is railed there when that lowers the criterion by
+/// more than its band (projected Newton), and the coordinates left free are
+/// polished on their own face.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewtonPolishRecord {
     /// `λ̂²` at the point the search handed over.
     pub lambda_sq_before: f64,
     /// `λ̂²` at the point this certificate judged.
     pub lambda_sq_after: f64,
-    /// The criterion decrease each accepted step bought, in order.
+    /// The criterion decrease each accepted step bought, in order. A settling
+    /// step's is within the band and may be negative.
     pub decreases: Vec<f64>,
-    /// The step budget quadratic convergence allowed on the current face.
-    pub step_budget: usize,
+    /// Whether the last step was a settling step (#3012): the decrease left to
+    /// the minimum was resolvable, the full step's own model decrease was not.
+    #[serde(default)]
+    pub settled: bool,
     /// The coordinates the polish railed, in order. `#[serde(default)]` so a
     /// record stored before this field existed still deserializes.
     #[serde(default)]
@@ -4014,7 +4019,7 @@ mod assembly_inner_status_gate_tests {
                 lambda_sq_before: 1.0e-4,
                 lambda_sq_after: 0.0,
                 decreases: vec![6.3e-5],
-                step_budget: 2,
+                settled: false,
                 rails: vec![NewtonPolishRail {
                     index: 0,
                     from: 17.0,
@@ -4090,7 +4095,7 @@ mod assembly_inner_status_gate_tests {
             lambda_sq_before: 1.0e-4,
             lambda_sq_after: 0.0,
             decreases: vec![1.0e-6],
-            step_budget: 1,
+            settled: false,
             rails: Vec::new(),
             entry: vec![-17.05, 2.49],
         });
