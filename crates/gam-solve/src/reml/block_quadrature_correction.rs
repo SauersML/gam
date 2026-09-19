@@ -96,51 +96,55 @@ impl<'a> RemlState<'a> {
     /// Per-bundle-cached wrapper around [`Self::block_local_quadrature_correction_compute`].
     ///
     /// The block-local correction is a deterministic function of this bundle's
-    /// converged inner state and ρ alone (mode-invariant, Hessian-free), but the
-    /// outer loop evaluates the objective at one ρ up to three times (value,
-    /// value+gradient, value+gradient+Hessian) sharing the SAME `bundle`. The
-    /// expensive engaged path (dense O(p³) eigendecomposition plus the
-    /// fixed-seed O(draws·n·m) importance sampler) therefore reran 2–3× per
-    /// outer iteration. Hoist it onto `bundle.block_local_correction` so it is
-    /// computed exactly once per inner solution and every consumer at that ρ
-    /// reads the identical value+gradient (exact hoist — #784, #1082). Keyed on
-    /// `n_ext`, which is fixed for a fit, so one cell suffices.
+    /// converged inner state and ρ alone, but the outer loop evaluates the
+    /// objective at one ρ up to three times (value, value+gradient,
+    /// value+gradient+Hessian) sharing the SAME `bundle`. Hoist it onto
+    /// `bundle.block_local_correction` so the eigendecomposition and the
+    /// quadrature run once per inner solution and every consumer at that ρ
+    /// reads the identical value+gradient (exact hoist — #784, #1082).
+    ///
+    /// `want_hessian` says whether the evaluation asks for the ρ-Hessian. Its
+    /// second-order pass over the nodes is paid only then: a value or
+    /// value+gradient evaluation (a line search, the ρ-posterior sampler's
+    /// leapfrog steps) never reads it.
     pub(crate) fn block_local_quadrature_correction(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
+        want_hessian: bool,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         // A deferred search prices the Laplace criterion, which is not this
         // bundle's correction once the admission is decided, so it is not cached.
         if self.block_correction_admission_deferred() {
-            return self.block_local_quadrature_correction_compute(rho, bundle, n_ext);
+            return self.block_local_quadrature_correction_compute(
+                rho,
+                bundle,
+                n_ext,
+                want_hessian,
+            );
         }
-        if let Some((cached_ext, terms, audit)) = bundle.block_local_correction.get()
-            && *cached_ext == n_ext
-        {
+        if let Some(entry) = bundle.block_local_correction.get(n_ext, want_hessian) {
             // Re-publish the audit record the computing call wrote: the window
             // was cleared at the start of THIS assemble call, so without this a
             // ρ whose splice engaged reads back as declined on every assemble
             // after the first (#2623).
-            if let Some(record) = audit.as_ref() {
-                crate::estimate::outer_eval_capture::record_quadrature_marginal(record.clone());
+            if let Some(record) = entry.audit {
+                crate::estimate::outer_eval_capture::record_quadrature_marginal(record);
             }
-            return Ok((**terms).clone());
+            return Ok((*entry.terms).clone());
         }
-        let terms = self.block_local_quadrature_correction_compute(rho, bundle, n_ext)?;
-        let audit = crate::estimate::outer_eval_capture::last_quadrature_marginal_record();
-        // First writer wins; a racing writer built from identical inputs, so
-        // either stored object is correct. A `set` that loses the race (cell
-        // already filled) is fine — both terms are equal — so the `Err` is
-        // discarded by returning the freshly computed `terms` either way.
-        match bundle
+        let terms =
+            self.block_local_quadrature_correction_compute(rho, bundle, n_ext, want_hessian)?;
+        bundle
             .block_local_correction
-            .set((n_ext, std::sync::Arc::new(terms.clone()), audit))
-        {
-            Ok(()) => Ok(terms),
-            Err(_) => Ok(terms),
-        }
+            .store(super::BlockLocalCorrectionCache {
+                n_ext,
+                terms: std::sync::Arc::new(terms.clone()),
+                carries_hessian: want_hessian,
+                audit: crate::estimate::outer_eval_capture::last_quadrature_marginal_record(),
+            });
+        Ok(terms)
     }
 
     fn block_correction_decision_guard(
@@ -215,6 +219,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         n_ext: usize,
+        want_hessian: bool,
     ) -> Result<TkCorrectionTerms, EstimationError> {
         // #1521 trait-inversion: the #784 importance-sampling correction and its
         // eigen-diagnostic live UP in the gam-inference `hmc_io` tier; gam-solve
@@ -760,7 +765,7 @@ impl<'a> RemlState<'a> {
         let x = x_dense.as_ref();
         // Φ and its derivatives in the whitened block coordinates
         // a_i = Λ^{-1/2} V_bᵀ x_i.
-        let curvature_derivatives = if axis_split || hessian_support.is_ok() {
+        let curvature_derivatives = if axis_split || (want_hessian && hessian_support.is_ok()) {
             Some(self.hessian_cde_arrays(pirls_result)?)
         } else {
             None
@@ -1065,16 +1070,19 @@ impl<'a> RemlState<'a> {
         // mode: every pair is resolved above, so the eigenframe is twice
         // differentiable here. A fit whose `Δ_b` has no closed-form Hessian
         // declares none (`BlockQuadratureLatch::hessian_refusal`), and its
-        // smoothing-corrected covariance refuses with that reason.
+        // smoothing-corrected covariance refuses with that reason. An
+        // evaluation that does not ask for the Hessian does not pay for it.
         let cost_hessian = match (&hessian_support, curvature_derivatives.as_ref()) {
-            (Ok(curvature), Some((c_obs, d_obs, e_obs))) => {
+            (Ok(curvature), Some((c_obs, d_obs, e_obs))) if want_hessian => {
                 let fourth = if axis_split {
-                    Some(super::block_correction_hessian::curvature_fourth_derivative(
-                        pirls_result,
-                        &target.inverse_link,
-                        &target.prior_weights,
-                        e_obs,
-                    )?)
+                    Some(
+                        super::block_correction_hessian::curvature_fourth_derivative(
+                            pirls_result,
+                            &target.inverse_link,
+                            &target.prior_weights,
+                            e_obs,
+                        )?,
+                    )
                 } else {
                     None
                 };

@@ -6302,7 +6302,7 @@ impl<'a> RemlState<'a> {
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -6465,7 +6465,7 @@ impl<'a> RemlState<'a> {
                 cell
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 

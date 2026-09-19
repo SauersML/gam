@@ -223,7 +223,10 @@ fn standard_options(family: LikelihoodSpec) -> ExternalOptimOptions {
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
-        skip_rho_posterior_inference: false,
+        // The formula/CLI policy (`canonical_standard_fit_options`): the
+        // smoothing-corrected covariance comes from the outer Hessian, not
+        // from the Tier-1/Tier-2 rho-posterior escalation this flag gates.
+        skip_rho_posterior_inference: true,
         max_iter: 300,
         tol: 1.0e-10,
         nullspace_dims: Vec::new(),
