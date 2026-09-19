@@ -200,6 +200,9 @@ impl From<DataError> for TermBuilderError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
