@@ -411,8 +411,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         use_remlobjective: true,
         compute_covariance: false,
         use_outer_hessian: false,
-        screening_max_inner_iterations: None,
-        seed_screening: false,
         early_exit_threshold: None,
         outer_score_subsample: None,
         auto_outer_subsample: false,
@@ -421,7 +419,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        screen_initial_rho: false,
     }
 }
 

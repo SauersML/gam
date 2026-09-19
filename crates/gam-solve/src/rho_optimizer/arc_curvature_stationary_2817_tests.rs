@@ -1416,13 +1416,9 @@ fn a_fixed_point_walk_that_bought_resolved_improvement_keeps_walking_2817() {
 fn an_exhausted_arc_budget_refuses_instead_of_retrying_2817() {
     const OFFSET: f64 = 0.5;
     const SCALE: f64 = 1.0e6;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![5.0])
         .with_max_iter(1)
         .with_fallback_policy(FallbackPolicy::Disabled);

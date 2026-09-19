@@ -3710,7 +3710,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // infeasible eval so the outer optimizer steers back into the PD region.
         // This gradient lane previously `?`-propagated the SAME refusal as a fatal
         // `RemlOptimizationFailed`, which — because the SAE fit runs a single
-        // seed (`max_seeds = 1`, no fallback) — aborted the WHOLE fit at "no
+        // start (no fallback) — aborted the WHOLE fit at "no
         // candidate seeds passed outer startup validation" for the assignment /
         // topology combinations whose seed or a walk probe lands on such a ρ,
         // while ordered_beta_bernoulli (whose seed happens to stay PD) survived. Treat it the

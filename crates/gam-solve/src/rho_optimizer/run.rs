@@ -58,10 +58,6 @@ pub(crate) fn resume_config(
 ) -> OuterConfig {
     let mut resume = config.clone();
     resume.initial_rho = Some(warm_start.theta.clone());
-    resume.initial_rho_candidates.clear();
-    resume.sole_seed = true;
-    resume.screen_initial_rho = false;
-    resume.screening_cap = None;
     resume.initial_inner_seed = Some(BoundInnerSeed {
         theta: warm_start.theta.clone(),
         beta: warm_start.beta.clone(),
@@ -185,35 +181,22 @@ pub(crate) struct OuterConfig {
     /// It may narrow the model domain but never changes the feasible cone that
     /// screening or mint is allowed to certify.
     pub(crate) search_bounds_override: Option<(Array1<f64>, Array1<f64>)>,
-    pub(crate) seed_config: gam_problem::SeedConfig,
+    /// Model-derived log-smoothing-parameter start (one entry per outer
+    /// coordinate). Used as the single outer start when `initial_rho` is
+    /// absent; see [`crate::rho_optimizer::run_plan::outer_start_point`].
     pub(crate) heuristic_log_lambdas: Option<Vec<f64>>,
     pub(crate) initial_rho: Option<Array1<f64>>,
-    /// Additional explicit, model-derived starts. Unlike the generic seed
-    /// lattice these are supplied by the objective owner and survive the
-    /// `max_seeds` truncation; the certified keep-best loop optimizes each one.
-    pub(crate) initial_rho_candidates: Vec<Array1<f64>>,
-    /// Seed points an EARLIER round of this same [`run_outer`] call already
-    /// started and either refused at certification (#2569) or ran to exhaustion
-    /// (#2817).
+    /// The lowest state an earlier search of this criterion evaluated: its resume checkpoint
+    /// (#2953).
     ///
-    /// Set by the certify-resume loop, from [`OuterResult::refused_seed_points`].
-    /// The plan runner drops these from
-    /// its cascade (never the caller's own `initial_rho`, which is the reseed
-    /// point the resume exists to explore), because re-running them from the
-    /// reset state they were refused in reproduces the recorded verdict digit
-    /// for digit — the same argument #2080 makes for replaying a recorded
-    /// cold-entry-leg refusal. Empty on every non-resume path, so the ordinary
-    /// cascade is unchanged.
-    pub(crate) previously_refused_seed_points: Vec<Array1<f64>>,
-    /// The lowest state an earlier plan attempt of this search evaluated: that attempt's
-    /// resume checkpoint (#2953).
-    ///
-    /// Set only by the plan loop, which hands its best checkpoint to the next attempt with its
-    /// iteration count zeroed (the loop has already counted that work). The plan runner starts
-    /// from it as its own lowest evaluated state, so a candidate the next attempt certifies is
-    /// judged against it before it publishes (#2596, #2627), exactly as a state of its own search
-    /// would be. It is in the runner's own coordinate order, since the plan loop runs inside
-    /// the canonical frame. `None` on the first attempt and on every path outside the plan loop.
+    /// The plan loop hands its best checkpoint to the next attempt with its iteration count
+    /// zeroed (the loop has already counted that work), and starts its own best checkpoint from
+    /// the one its caller carries. The plan runner starts from it as its own lowest evaluated
+    /// state, so a candidate the search certifies is judged against it before it publishes
+    /// (#2596, #2627), exactly as a state of its own search would be. With a single start per
+    /// search, a carried state is the only other state a certified candidate can be judged
+    /// against. It is in native order on entry to [`run_outer`], which permutes it with the rest
+    /// of the configuration into the canonical frame the plan loop runs in.
     pub(crate) carried_checkpoint: Option<OuterResult>,
     pub(crate) initial_inner_seed: Option<BoundInnerSeed>,
     /// The exact analytic Hessian of the criterion a continuation search
@@ -227,8 +210,6 @@ pub(crate) struct OuterConfig {
     /// under any SPD initial metric.
     pub(crate) initial_curvature: Option<BoundOuterCurvature>,
     pub(crate) fallback_policy: FallbackPolicy,
-    pub(crate) screening_cap: Option<Arc<AtomicUsize>>,
-    pub(crate) screen_initial_rho: bool,
     /// `initial_rho` came from a PRIOR FIT'S TERMINAL CERTIFICATE, not from a
     /// heuristic, a mid-run checkpoint, or a caller's guess.
     ///
@@ -243,13 +224,12 @@ pub(crate) struct OuterConfig {
     /// otherwise declines with an error. It never searches
     /// (`resume_prior_certificate`).
     pub(crate) resume_value: Option<f64>,
-    /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
+    /// Outer-aware inner-PIRLS iteration cap.
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
     /// (when ρ is far from converged) and lift it back to full as
-    /// convergence approaches. Distinct from `screening_cap` in that it
-    /// does NOT suppress cache writes / warm-start updates / KKT
-    /// enforcement; it is purely a budget. See
+    /// convergence approaches. It does NOT suppress cache writes /
+    /// warm-start updates / KKT enforcement; it is purely a budget. See
     /// `RemlObjectiveState::outer_inner_cap` for dual-cap semantics.
     pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
@@ -387,11 +367,6 @@ pub(crate) struct OuterConfig {
     /// solve, so the search route does not flip back to BFGS once a saddle is on
     /// record.
     pub(crate) curvature_search_latched: bool,
-    /// The search starts from `initial_rho` and from nothing else: no generated
-    /// seed, no candidate, and no fall-through to another seed whatever this
-    /// one's outcome. Each run of a parallel multistart
-    /// ([`OuterProblem::run_certified_multistart`]) searches one seed this way.
-    pub(crate) sole_seed: bool,
 }
 
 /// The outer search's iteration count when a caller declares none: no count.
@@ -422,16 +397,11 @@ impl Default for OuterConfig {
             model_domain_bounds: None,
             model_domain_limit_faces: None,
             search_bounds_override: None,
-            seed_config: gam_problem::SeedConfig::default(),
             heuristic_log_lambdas: None,
             initial_rho: None,
-            initial_rho_candidates: Vec::new(),
-            previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
             initial_inner_seed: None,
             fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: None,
-            screen_initial_rho: false,
             initial_rho_is_prior_terminal_certificate: false,
             resume_value: None,
             outer_inner_cap: None,
@@ -447,7 +417,6 @@ impl Default for OuterConfig {
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
-            sole_seed: false,
         }
     }
 }
@@ -480,14 +449,10 @@ pub struct OuterProblem {
     max_iter: usize,
     bounds: Option<(Array1<f64>, Array1<f64>)>,
     limit_faces: Option<(Vec<bool>, Vec<bool>)>,
-    seed_config: gam_problem::SeedConfig,
     heuristic_log_lambdas: Option<Vec<f64>>,
     initial_rho: Option<Array1<f64>>,
-    initial_rho_candidates: Vec<Array1<f64>>,
     initial_curvature: Option<BoundOuterCurvature>,
     fallback_policy: FallbackPolicy,
-    screening_cap: Option<Arc<AtomicUsize>>,
-    screen_initial_rho: bool,
     outer_inner_cap: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
@@ -497,7 +462,6 @@ pub struct OuterProblem {
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     problem_size: OuterProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
-    sole_seed: bool,
     /// The inner mode at one joined multistart seed: installed only at that
     /// exact point (`install_matching_initial_inner_seed`).
     warm_start: Option<BoundInnerSeed>,
@@ -530,14 +494,10 @@ impl OuterProblem {
             max_iter: UNBOUNDED_OUTER_ITERATIONS,
             bounds: None,
             limit_faces: None,
-            seed_config: gam_problem::SeedConfig::default(),
             heuristic_log_lambdas: None,
             initial_rho: None,
-            initial_rho_candidates: Vec::new(),
             initial_curvature: None,
             fallback_policy: FallbackPolicy::Automatic,
-            screening_cap: None,
-            screen_initial_rho: false,
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
@@ -547,7 +507,6 @@ impl OuterProblem {
             cache_mirror_sessions: Vec::new(),
             problem_size: OuterProblemSize::default(),
             rho_canonical_keys: None,
-            sole_seed: false,
             warm_start: None,
             warm_start_source: None,
             resume_only: false,
@@ -636,10 +595,6 @@ impl OuterProblem {
         self.limit_faces = Some((lower, upper));
         self
     }
-    pub fn with_seed_config(mut self, sc: gam_problem::SeedConfig) -> Self {
-        self.seed_config = sc;
-        self
-    }
     pub fn with_heuristic_log_lambdas(mut self, h: Vec<f64>) -> Self {
         self.heuristic_log_lambdas = Some(h);
         self
@@ -654,36 +609,6 @@ impl OuterProblem {
         self.initial_curvature = Some(BoundOuterCurvature { theta, hessian });
         self
     }
-    pub(crate) fn with_initial_rho_candidates(mut self, candidates: Vec<Array1<f64>>) -> Self {
-        self.initial_rho_candidates = candidates;
-        self
-    }
-    pub fn with_screening_cap(mut self, screening_cap: Arc<AtomicUsize>) -> Self {
-        self.screening_cap = Some(screening_cap);
-        self
-    }
-    /// Allow seed screening to rank the explicit initial rho against generated
-    /// candidates even when the effective seed budget is one. The default keeps
-    /// a user-provided initial point authoritative and avoids a separate
-    /// screening pass.
-    ///
-    /// "Authoritative" governs where the cascade starts, not whose refusal is
-    /// reported: a refused seed falls through to the generated seeds
-    /// (`should_start_next_seed`), and the cascade reports its lowest-value
-    /// refused checkpoint (`retain_best_outer_checkpoint`).
-    pub fn with_screen_initial_rho(mut self, screen_initial_rho: bool) -> Self {
-        self.screen_initial_rho = screen_initial_rho;
-        self
-    }
-    /// Search from `rho` and from nothing else: no generated seed, no candidate,
-    /// and no fall-through to another seed whatever this one's outcome
-    /// (`OuterConfig::sole_seed`).
-    pub fn with_sole_seed(mut self, rho: Array1<f64>) -> Self {
-        self.initial_rho = Some(rho);
-        self.initial_rho_candidates.clear();
-        self.sole_seed = true;
-        self
-    }
     /// Offer this search a prior fit's certified outer point (gam#3002). Every
     /// warm-start source reaches every outer search through this one rule, and
     /// [`Self::run`] and [`Self::run_certified_multistart`] derive from it what
@@ -694,8 +619,8 @@ impl OuterProblem {
     ///   certified for this search's criterion (`resume_prior_certificate`), and
     ///   otherwise runs exactly as it runs cold, from a reset objective;
     /// - on other inputs the independent multistart adds it as one more seed, so
-    ///   its argmin is taken over a superset of the cold seeds; the cascade,
-    ///   which certifies its first certifiable seed, runs cold and records why.
+    ///   its argmin is taken over a superset of the cold seeds; a single search,
+    ///   which certifies from its one derived start, runs cold and records why.
     /// A point of another outer dimension belongs to another search: this one
     /// runs cold.
     pub fn with_warm_start(mut self, warm_start: &gam_model_api::WarmStart) -> Self {
@@ -727,7 +652,7 @@ impl OuterProblem {
     /// The outer bridge writes a coarsened iteration cap into
     /// `feedback.cap` on every accepted gradient/Hessian eval; the inner
     /// solver writes back into `feedback.last_iters` /
-    /// `feedback.last_converged` after each non-screening solve so the
+    /// `feedback.last_converged` after each inner solve so the
     /// next outer iter's schedule can adapt to the inner solver's
     /// actual convergence behavior. Typical caller passes
     /// `InnerProgressFeedback {
@@ -928,16 +853,11 @@ impl OuterProblem {
             model_domain_bounds: self.bounds.clone(),
             model_domain_limit_faces: self.limit_faces.clone(),
             search_bounds_override: None,
-            seed_config: self.seed_config,
             heuristic_log_lambdas: self.heuristic_log_lambdas.clone(),
             initial_rho: self.initial_rho.clone(),
-            initial_rho_candidates: self.initial_rho_candidates.clone(),
-            previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
             initial_inner_seed: self.warm_start.clone(),
             fallback_policy: self.fallback_policy,
-            screening_cap: self.screening_cap.clone(),
-            screen_initial_rho: self.screen_initial_rho,
             // Only a prior fit's certified point can establish these: the resume
             // attempt `Self::run` derives from a warm start, and the cache's final
             // hit, which says so where it sets `initial_rho`.
@@ -960,7 +880,6 @@ impl OuterProblem {
             native_coordinate_order: None,
             // Latched only by the certify-last reseed loop (#2939).
             curvature_search_latched: false,
-            sole_seed: self.sole_seed,
         }
     }
 
@@ -1002,7 +921,6 @@ impl OuterProblem {
             rail_face_limit_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
-            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }
@@ -1043,50 +961,6 @@ impl OuterProblem {
             rail_face_limit_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
-            screening_proxy_fn: None::<fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>>,
-            seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
-            terminal_eval_order: None,
-        }
-    }
-
-    /// Construct a [`ClosureObjective`] with both an order-aware evaluation
-    /// hook and a custom seed-screening ranking proxy. The proxy fires only
-    /// when the cascade in `rank_seeds_with_screening` calls it; outside
-    /// screening the regular cost path is unaffected.
-    pub fn build_objective_with_screening_proxy<S, Fc, Fe, Feo, Fr, Fefs, Fsp>(
-        &self,
-        state: S,
-        cost_fn: Fc,
-        eval_fn: Fe,
-        eval_order_fn: Feo,
-        reset_fn: Option<Fr>,
-        efs_fn: Option<Fefs>,
-        screening_proxy_fn: Fsp,
-    ) -> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
-    where
-        Fc: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-        Fe: FnMut(&mut S, &Array1<f64>) -> Result<OuterEval, EstimationError>,
-        Feo: FnMut(&mut S, &Array1<f64>, OuterEvalOrder) -> Result<OuterEval, EstimationError>,
-        Fr: FnMut(&mut S),
-        Fefs: FnMut(&mut S, &Array1<f64>) -> Result<EfsEval, EstimationError>,
-        Fsp: FnMut(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
-    {
-        let mut cap = self.capability();
-        cap.fixed_point_available = efs_fn.is_some();
-        ClosureObjective {
-            state,
-            cap,
-            cost_fn,
-            eval_fn,
-            eval_order_fn: Some(eval_order_fn),
-            reset_fn,
-            efs_fn,
-            fixed_point_certificate_fn: None,
-            exact_polish_fn: None,
-            rail_face_limit_fn: None,
-            criterion_invariance_fn: None,
-            criterion_rank_fn: None,
-            screening_proxy_fn: Some(screening_proxy_fn),
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
             terminal_eval_order: None,
         }
@@ -1106,8 +980,8 @@ impl OuterProblem {
         }
         // A warm start (`with_warm_start`): on the parent's inputs the point is
         // offered as a prior certificate, and a decline leaves this search to run
-        // exactly as it runs cold; on other inputs this cascade, which certifies
-        // its first certifiable seed, runs cold. One warm-start source per
+        // exactly as it runs cold; on other inputs this search, which certifies
+        // from its one derived start, runs cold. One warm-start source per
         // search, so the cold run takes no cache session either.
         if self.warm_start_source.is_some() {
             if let Some(warm_start) = self.warm_start_for_this_search() {
@@ -1130,9 +1004,8 @@ impl OuterProblem {
                     }
                 } else {
                     warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
-                        "the fit's inputs differ from the parent's, and this search certifies its \
-                         first certifiable seed, so a new first seed would change the point it \
-                         reports",
+                        "the fit's inputs differ from the parent's, and this search certifies from \
+                         its one derived start, so a new start would change the point it reports",
                     ));
                 }
             }
@@ -1162,7 +1035,6 @@ impl OuterProblem {
                         iterations,
                     );
                     config.initial_rho = Some(rho.clone());
-                    config.screen_initial_rho = false;
                     config.initial_rho_is_prior_terminal_certificate = true;
                     if !beta.is_empty() {
                         cached_inner_seed = Some(BoundInnerSeed {
@@ -1215,7 +1087,6 @@ impl OuterProblem {
                             iteration,
                         );
                         config.initial_rho = Some(rho.clone());
-                        config.screen_initial_rho = false;
                         had_hit = true;
                     } else {
                         log::debug!(
@@ -1368,9 +1239,11 @@ impl OuterProblem {
 pub(crate) enum PlanRunOutcome {
     Converged(OuterResult),
     Exhausted(OuterResult),
-    DominatedPlateau(DominatedPlateau),
     FirstOrderFallbackRequested(FirstOrderFallbackRequest),
     FixedPointContinuationRequested(FixedPointContinuationRequest),
+    /// A certified candidate an evaluated state beat (#2596, #2627); see
+    /// [`DominatedPlateau`].
+    DominatedPlateau(DominatedPlateau),
 }
 
 /// A certified candidate that an evaluated but uncertified state of the same
@@ -1820,26 +1693,6 @@ pub struct OuterResult {
     pub rank_boundary_stall: Option<RankBoundaryStall>,
     /// Which lane produced this result. See [`OuterResultOrigin`].
     pub origin: OuterResultOrigin,
-    /// Seed start points this plan run STARTED and whose mandatory analytic
-    /// certificate then REFUSED (#2569).
-    ///
-    /// The certify-resume loop in `run_outer` re-runs the outer search seeded
-    /// at the refused checkpoint, and the seed cascade it re-enters is allowed
-    /// to fall through its `seed_budget` while nothing has certified
-    /// (`should_start_next_seed`). The fall-through lands on the SAME generated
-    /// lattice seed every round — a point that does not depend on the
-    /// checkpoint, reached from a state `obj.reset()` has restored — so the
-    /// cascade re-derives a verdict it already recorded. Measured on the #2569
-    /// grouped-binomial design: one cold seed re-run 17 times per fit, each
-    /// repetition terminating at the identical `|g|` after the identical outer
-    /// iteration count, for 18-48% of the fit's wall clock.
-    ///
-    /// Carrying the points forward lets the next resume skip exactly those
-    /// seeds, on the same grounds #2080's `cold_entry_leg_refusal` replays a
-    /// recorded cold-entry verdict: re-running them would reproduce the
-    /// recorded refusal digit for digit. A seed that has NOT been started and
-    /// refused is never suppressed, so no rescue path is closed.
-    pub refused_seed_points: Vec<Array1<f64>>,
     /// The lowest certified optimum a plan attempt of this search declined because an
     /// evaluated state beat it (#2596, #2627), or `None`. When the terminal certificate
     /// refuses this result and nothing continues it to a certified point, the refusal is
@@ -1904,7 +1757,6 @@ impl OuterResult {
             cost_stall_probe_scale: None,
             rank_boundary_stall: None,
             origin: OuterResultOrigin::Solver,
-            refused_seed_points: Vec::new(),
             dominated_plateau: None,
         }
     }
@@ -3895,15 +3747,15 @@ fn certify_fixed_point_optimality(
 ///
 /// #2359: the generic REML/LAML Hessian consumes the row-family derivative
 /// ladder through order FOUR while its analytic gradient stops at order three,
-/// so order four is a mint-time cost, not a per-candidate one. A multi-start
-/// screens every seed it starts — that screening is a first-order gate
+/// so order four is a mint-time cost, not a per-candidate one. The outer search
+/// screens every candidate stop it reaches — that screening is a first-order gate
 /// (stationarity, KKT projection, rail facts), and `curvature_admissible()`
 /// reads `hessian_psd != Some(false)`, so a `None` curvature verdict certifies
 /// on stationarity alone. The one order-four evaluation belongs to the winner,
 /// once, and its verdict is the one that mints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CertificationFidelity {
-    /// Per-candidate multi-start gate. Never spends order four.
+    /// Per-candidate stop gate. Never spends order four.
     Screening,
     /// The single terminal mint audit. Spends order four when the objective
     /// declares an analytic Hessian.
@@ -6019,20 +5871,25 @@ fn try_certify_asymptote_rail(
     // information exactly where its logdet pair cancels; and even when it
     // succeeds it speaks for ONE coordinate along ONE ray. The analytic route
     // forms the λ=∞ limit itself — the null-space-restricted fit, and the
-    // exact first-order form of the logdet and trace terms there — and its
-    // positive definiteness proves the whole face against every way of coming
-    // off it. When the objective cannot form that limit, or the proof does not
-    // hold, the measured-tail path below is unchanged.
+    // exact first-order form of the logdet and trace terms there — and proves
+    // the whole face against every way of coming off it: by that form's
+    // positive definiteness, or, when the released penalty ranges are
+    // independent (Σ rank A_j = q, every single-penalty face), by the exact
+    // KKT test c_j > τ_j on the linear first-order law, or, when they overlap,
+    // by a sound lower bound on that law over the whole release simplex. When
+    // the objective cannot form that limit, or the proof does not hold, the
+    // measured-tail path below is unchanged.
     match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
         Ok((rails, proof)) => {
             log::debug!(
-                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s): λ_min(C)={:.6e} \
-                 > margin {:.3e}, joint pencil ĉ={:.6e}, remaining value gap {:.3e}, estimand \
-                 travel {:.3e}",
+                "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
+                 statistic {:.6e} > band {:.3e}, joint pencil ĉ={:.6e}, remaining value gap \
+                 {:.3e}, estimand travel {:.3e}",
                 inputs.context,
                 rails.len(),
-                proof.min_curvature,
-                proof.curvature_margin,
+                proof.route,
+                proof.statistic,
+                proof.band,
                 proof.joint_tail_constant,
                 proof.value_gap,
                 proof.estimand_travel,
@@ -6215,12 +6072,13 @@ fn try_certify_face_analytically(
             // move the criterion at all.
             value_gap: tail_constant * (-rho_k).exp(),
             estimand_travel_bound: proof.estimand_travel,
-            // The face was PROVEN, so the standard it cleared is the form's own
-            // eigen-backward-error margin — not a finite-difference floor, and
-            // not a quantity comparable with one.
+            // The face was PROVEN, so the standard it cleared is the route's
+            // own rounding band on the assembled form — not a finite-difference
+            // floor, and not a quantity comparable with one.
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: proof.min_curvature,
-                curvature_margin: proof.curvature_margin,
+                route: proof.route,
+                statistic: proof.statistic,
+                band: proof.band,
             },
         })
         .collect();
@@ -7655,9 +7513,9 @@ pub(crate) fn run_outer(
         let mut exact_config = config.clone();
         exact_config.initial_rho = Some(result.rho.clone());
         exact_config.heuristic_log_lambdas = None;
-        exact_config.seed_config.max_seeds = 1;
-        exact_config.seed_config.seed_budget = 1;
-        exact_config.screen_initial_rho = false;
+        // The pilot's checkpoint is the lowest state evaluated so far, and the polish starts
+        // at it.
+        exact_config.carried_checkpoint = None;
         exact_config.operator_initial_trust_radius = result.operator_trust_radius;
         exact_config.warm_start_outer_hessian = result.final_hessian.clone();
         log::debug!(
@@ -7781,15 +7639,6 @@ pub(crate) fn run_outer(
     // refusal. A re-run whose warm solver value improved but whose certified value
     // did not (#2155/#2363) returns the refusal instead of taking another reseed.
     let mut last_refused_certified_value: Option<f64> = None;
-    // #2569 — seed points this loop has already started and already had refused.
-    // A resume changes `initial_rho` and nothing else the cascade reads, and it
-    // runs from a reset objective, so a NON-initial seed re-entered on a later
-    // round terminates exactly where it terminated before. Measured on the
-    // grouped-binomial design of #2569: 17 rounds re-ran one cold lattice seed
-    // to the identical `|g|` after the identical 42 outer iterations, 1628 s of
-    // a 9016 s fit. Accumulated across rounds and handed to the retry so the
-    // cascade replays the recorded verdict instead of re-deriving it.
-    let mut refused_seed_points: Vec<Array1<f64>> = Vec::new();
     // #2939 — once a mint has certified a strict saddle, every later run in this
     // solve searches on the declared curvature (`OuterConfig::curvature_search_latched`).
     let mut curvature_search_latched = config.curvature_search_latched;
@@ -7860,23 +7709,12 @@ pub(crate) fn run_outer(
                     retry_cfg.search_bounds_override = Some(frozen_bounds);
                 }
                 retry_cfg.heuristic_log_lambdas = None;
-                retry_cfg.seed_config.max_seeds = 1;
-                retry_cfg.seed_config.seed_budget = 1;
-                retry_cfg.screen_initial_rho = false;
-                // `seed_budget = 1` above is NOT binding: `should_start_next_seed`
-                // lets the cascade continue past it while nothing has certified,
-                // and on a resume the reseeded slot-0 candidate is exactly what
-                // failed certification, so `best` is `None` and the fall-through
-                // fires every round on the same regenerated lattice seed (#2569).
-                // Suppress only seeds this loop has ALREADY started and had
-                // refused; a seed that has never run is still reachable, so the
-                // fall-through keeps its rescue role.
-                for point in result.refused_seed_points.iter() {
-                    if !refused_seed_points.contains(point) {
-                        refused_seed_points.push(point.clone());
-                    }
-                }
-                retry_cfg.previously_refused_seed_points = refused_seed_points.clone();
+                // The reseed starts strictly below the refused checkpoint, which is already
+                // below every state an earlier search carried in, so nothing the re-run
+                // certifies can be dominated by a carried state. Carrying one would only let a
+                // re-run whose start is refused hand that older state back as its own stop
+                // (#2953).
+                retry_cfg.carried_checkpoint = None;
                 // Every reseed lands at a genuinely different point, so the refused
                 // checkpoint's metric (trust radius, outer Hessian) must not be
                 // transferred into the restart.
@@ -7968,16 +7806,6 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
     if let Some(initial) = config.initial_rho.as_ref() {
         canonical.initial_rho = Some(permute_arr(initial));
     }
-    canonical.previously_refused_seed_points = config
-        .previously_refused_seed_points
-        .iter()
-        .map(permute_arr)
-        .collect();
-    canonical.initial_rho_candidates = config
-        .initial_rho_candidates
-        .iter()
-        .map(permute_arr)
-        .collect();
     if let Some(bound) = config.initial_inner_seed.as_ref() {
         canonical.initial_inner_seed = Some(BoundInnerSeed {
             theta: permute_arr(&bound.theta),
@@ -8017,6 +7845,15 @@ fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfi
             }
         }
         canonical.warm_start_outer_hessian = Some(hc);
+    }
+    // A carried checkpoint is in native order. Mapping a result to native order under the
+    // inverse permutation maps it to canonical order.
+    if let Some(checkpoint) = config.carried_checkpoint.as_ref() {
+        let mut inverse = vec![0usize; perm.len()];
+        for (c, &i) in perm.iter().enumerate() {
+            inverse[i] = c;
+        }
+        canonical.carried_checkpoint = Some(outer_result_to_native(checkpoint.clone(), &inverse));
     }
     if let Some(bound) = config.initial_curvature.as_ref()
         && bound.hessian.nrows() == perm.len()
@@ -8173,7 +8010,12 @@ pub(crate) fn run_outer_uncertified(
     }
 
     let mut last_error: Option<EstimationError> = None;
-    let mut best_checkpoint: Option<OuterResult> = None;
+    // A state an earlier search evaluated is this ladder's first checkpoint, so its first
+    // attempt judges what it certifies against it as every later attempt does (#2953).
+    let mut best_checkpoint: Option<OuterResult> = config
+        .carried_checkpoint
+        .as_ref()
+        .map(carried_checkpoint_of);
     // #2953 — the lowest certified optimum an attempt declined because an evaluated
     // state beat it. It rides on the result this loop returns, so a terminal refusal
     // reports it instead of losing it.
@@ -8220,7 +8062,6 @@ pub(crate) fn run_outer_uncertified(
             }
             attempt_config.initial_rho = Some(checkpoint.point.clone());
             attempt_config.initial_inner_seed = checkpoint.inner_seed.clone();
-            attempt_config.screen_initial_rho = false;
             // This is a mid-run finite incumbent, not a terminal certificate
             // imported from a prior fit.  Leaving the original config's cache
             // provenance set could let the zero-iteration resume path accept
@@ -8231,16 +8072,7 @@ pub(crate) fn run_outer_uncertified(
             // from gradients at the continued point instead of combining two
             // different checkpoints.
             attempt_config.warm_start_outer_hessian = None;
-            // The finite incumbent owns the nominal slot: try it first, without
-            // screening or neutral-seed promotion. Preserve the caller's
-            // absolute lattice, though. If this continuation certifies, the
-            // ordinary seed loop stops immediately and no other start runs; if
-            // it is refused or remains nonstationary, `should_start_next_seed`
-            // may advance through the remaining bounded lattice until a fit
-            // certifies. Setting `max_seeds = 1` here used to erase that recovery
-            // authority exactly when the incumbent lay outside the criterion's
-            // finite observed-information domain (#2653).
-            attempt_config.seed_config.seed_budget = 1;
+            // The finite incumbent is the continuation's single start.
             log::debug!(
                 "[OUTER] {context}: resuming {the_plan} first from the last finite {:?} \
                  incumbent after {} iteration(s) of its plan attempt: cost={:.6e}, \
@@ -8264,14 +8096,9 @@ pub(crate) fn run_outer_uncertified(
             }
             attempt_config.initial_rho = Some(checkpoint.rho.clone());
             attempt_config.initial_inner_seed = None;
-            attempt_config.screen_initial_rho = false;
             attempt_config.initial_rho_is_prior_terminal_certificate = false;
             attempt_config.warm_start_outer_hessian = None;
-            // The checkpoint owns the first nominal slot.  Preserve the
-            // caller's absolute recovery lattice: if this continuation still
-            // refuses, `should_start_next_seed` may advance until a candidate
-            // certifies, exactly as for a rho-local EFS trial refusal.
-            attempt_config.seed_config.seed_budget = 1;
+            // The checkpoint is the continuation's single start.
             log::debug!(
                 "[OUTER] {context}: analytic screening refuted the {:?} fixed point; \
                  resuming {the_plan} first from its best finite checkpoint after {} \
@@ -8492,10 +8319,9 @@ pub(crate) fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// / standard-EFS path via [`OuterProblem::run`] / [`run_outer`].
 ///
 /// Builds the same bounded seed and tolerance/budget the standard plan path
-/// uses, picks the seed (initial-ρ if supplied, else the first generated
-/// candidate — the per-atom fixed point is a contraction near the optimum and
-/// does not need the multi-seed cascade the dense path runs for its non-convex
-/// quasi-Newton surface), then drives the per-atom EFS loop. The shared-border
+/// uses, takes the same single derived start (initial-ρ if supplied, else the
+/// commensurate-curvature start — the per-atom fixed point is a contraction
+/// near the optimum), then drives the per-atom EFS loop. The shared-border
 /// topology defaults to disjoint (every atom owns a private penalty block — the
 /// common ARD-per-atom case); callers with a known arrow-border overlap can run
 /// the module's `run_per_atom_efs` directly with a populated
@@ -8523,28 +8349,13 @@ pub(crate) fn run_per_atom_efs_if_frontier(
     );
     let (lower, upper) = outer_search_bounds_template(config, cap.n_params);
 
-    // Seed: cache/explicit initial ρ if present, otherwise the first generated
-    // candidate. The per-atom multiplicative fixed point is locally
-    // contractive, so a single seed suffices; the heavy multi-seed cascade
-    // exists for the dense quasi-Newton's non-convex surface, not for EFS.
-    let seed = match config.initial_rho.as_ref() {
-        Some(initial) if initial.len() == cap.n_params => initial.clone(),
-        _ => {
-            let generated = crate::seeding::generate_rho_candidates(
-                cap.n_params,
-                config.heuristic_log_lambdas.as_deref(),
-                &config.seed_config,
-                gam_problem::OrderedRhoBounds::envelope(
-                    model_domain_bounds.0.iter().copied(),
-                    model_domain_bounds.1.iter().copied(),
-                )?,
-            );
-            match generated.into_iter().next() {
-                Some(first) => first,
-                None => Array1::<f64>::zeros(cap.n_params),
-            }
-        }
-    };
+    // The per-atom multiplicative fixed point is locally contractive, so it
+    // enters from the same single derived start as every other plan.
+    let seed = crate::rho_optimizer::run_plan::outer_start_point(
+        config,
+        cap.n_params,
+        &model_domain_bounds,
+    )?;
 
     log::debug!(
         "[OUTER] {context}: frontier ρ-scaling (rho_dim={rho_dim}) → per-atom decoupled EFS primary"

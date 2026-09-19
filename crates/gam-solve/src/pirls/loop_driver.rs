@@ -1447,8 +1447,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
-        // together collapsed step halving to 3 under seed screening (where
-        // max_iterations is intentionally capped low), turning recoverable
+        // together collapsed step halving to 3 under a low outer-imposed
+        // iteration cap, turning recoverable
         // damping into spurious failures.
         max_step_halving: base_max_step_halving,
         firth_bias_reduction: firth_active,
@@ -1505,7 +1505,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // so the gain ratio compares one objective. That lock is correct *within* a
     // solve, but it pins ν to whatever η the solve started from. When the fit
     // cold-starts (the final dedicated fit at the converged ρ passes
-    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // `warm_start_beta = None`, and the first outer eval starts from a default guess),
     // that warm-start η has not yet captured the mean structure; the leftover
     // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
     // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
