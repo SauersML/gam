@@ -1,35 +1,33 @@
-//! Standing type-I size gate for the single-response Wood (2013) smooth-term
-//! Wald p-value, one test per response family (pyGAM audit, lane
+//! Standing null-calibration gate for the single-response smooth-term Wald
+//! p-value, one test per response family (pyGAM audit, lane
 //! `pv-wald-families`).
 //!
-//! The registry's `wood_smooth_test_pvalue` target was audited on Gaussian
-//! data only. The same `wood_smooth_test` primitive is reached by every
-//! standard family, and the family changes three of its inputs: the IRLS
-//! weights inside the whitening Gram `X'WX`, the covariance `Vb` (whose scale
-//! is profiled, Pearson-refreshed, or fixed), and the reference distribution
-//! (`F(ref_df, n − edf)` when the scale is estimated, `χ²(ref_df)` when it is
-//! not). A wrong weight, a wrong scale predicate, or a residual df read off the
-//! wrong fit is invisible to a Gaussian-only gate.
+//! The same smooth-term Wald primitive is reached by every standard family,
+//! and the family changes three of its inputs: the IRLS weights inside the
+//! penalized Hessian, the covariance `Vb` (whose scale is profiled,
+//! Pearson-refreshed, or fixed), and the reference law. A wrong weight, a
+//! wrong scale predicate, or a residual df read off the wrong fit is invisible
+//! to a Gaussian-only gate.
 //!
 //! Audit: `y ~ s(x1) + s(x2)` with a real `s(x1)` and a TRUE-NULL `s(x2)`
 //! (`x2` is drawn independently of `y`), `n = 200`, 200 seeded replications
-//! per family (the 500-replication acceptance run, at n = 60, 200 and 2000, is
-//! the bench; this is its standing CI-sized gate). The p-value read is the
-//! production summary row — the shared
-//! `smooth_term_summary_rows` walk with the fit's exact weighted Gram, the same
-//! call `saved_model_summary` makes for CLI and Python. At
-//! `α ∈ {0.10, 0.05, 0.01}` the empirical size must not exceed
-//! `α + 2·MCSE(α)`, `MCSE(α) = √(α(1 − α)/m)`, over the `m` fits that
-//! converged. An undersized (conservative) test passes. The measured sizes and
-//! the Monte-Carlo study behind them are in
-//! `bench/pvalue_calibration/pv-wald-families/`.
+//! per family. The p-value read is the production summary row — the shared
+//! `smooth_term_summary_rows` walk, the same call `saved_model_summary` makes
+//! for CLI and Python.
 //!
-//! What this gate does NOT assert is uniformity of the p-value below 0.5. On
-//! a null term REML shrinks the fit to the boundary, and conditional on that
-//! λ̂ the statistic is not a χ²: in the one-direction case `T = max(z² − 1, 0)`
-//! against a `χ²₁` reference, which is conservative at every level and
-//! front-loaded below 0.5 (the README derives it). mgcv's `testStat` refers a
-//! sub-unit-edf term to the same `χ²₁`, so it shares the shape.
+//! Under the null the p-value must be U(0, 1) over the whole range, so the
+//! gate is two-sided. A conservative p-value (a pile near one, a size below
+//! nominal) fails exactly as an anti-conservative one does:
+//!
+//! * at `α ∈ {0.10, 0.05, 0.01}` the empirical size over the `m` fits that
+//!   converged is within `3·MCSE(α)` of `α`, `MCSE(α) = √(α(1 − α)/m)`;
+//! * the Kolmogorov distance of the p-values from U(0, 1) is below the
+//!   Dvoretzky–Kiefer–Wolfowitz radius `√(ln(2/δ)/(2m))` at the same
+//!   three-sigma level `δ = 2Φ(−3)`.
+//!
+//! A null term REML shrinks onto its penalty null space is in every family's
+//! sample; its p-value is held to the same uniform law, with no exemption.
+//! The measured laws are in `bench/pvalue_calibration/pv-wald-families/`.
 
 use csv::StringRecord;
 use gam::{
@@ -45,6 +43,8 @@ use std::f64::consts::PI;
 const N_OBS: usize = 200;
 const N_REPLICATIONS: u64 = 200;
 const ALPHAS: [f64; 3] = [0.10, 0.05, 0.01];
+/// Width of every acceptance band, in standard errors.
+const BAND_SIGMAS: f64 = 3.0;
 const SEED: u64 = 0x5A17_3051_0000;
 /// A fit the outer optimizer refuses to certify returns an error, not a
 /// p-value. Those replications are reported, never counted as rejections or
@@ -176,12 +176,7 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
-    let rows = smooth_term_summary_rows(
-        &fit.design,
-        &fit.resolvedspec,
-        &fit.fit,
-        fit.fit.weighted_gram(),
-    );
+    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))
@@ -199,7 +194,7 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     })
 }
 
-fn assert_null_size_within_monte_carlo_error(family: Family) {
+fn assert_null_p_value_is_uniform(family: Family) {
     // The fits run on rayon workers, which need the wide worker stack.
     init_parallelism();
     let outcomes: Vec<(u64, Result<NullRow, String>)> = (0..N_REPLICATIONS)
@@ -228,41 +223,47 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
             "{family:?} rep {rep}: p-value out of range: {}",
             row.p_value
         );
-        // The reference df is defined, and at least one, for every edf —
-        // including a term shrunk below one effective degree of freedom.
+        // `ref_df` is the null mean `Σ_k 1/(1 + e_k)` of the whitened
+        // statistic at `λ̂`, so a term REML shrank onto its null space
+        // honestly reports about its edf, below one. The p-value does not
+        // read it: its law is the λ̂-selection replay, checked below.
         assert!(
-            row.ref_df.is_finite() && row.ref_df >= 1.0,
-            "{family:?} rep {rep}: ref_df {} undefined or below one at edf {}",
+            row.ref_df.is_finite() && row.ref_df >= 0.0,
+            "{family:?} rep {rep}: ref_df {} undefined or negative at edf {}",
             row.ref_df,
             row.edf
         );
-        // A term REML switched off carries no evidence against the null: the
-        // statistic vanishes with the shrunk coefficients, so the p-value
-        // must sit in the upper half, never near a rejection.
-        if row.edf < 0.01 {
-            assert!(
-                row.p_value > 0.5,
-                "{family:?} rep {rep}: edf {} term reported p = {}",
-                row.edf,
-                row.p_value
-            );
-        }
     }
 
     let m = rows.len() as f64;
-    let mut oversized = Vec::new();
+    let mut miscalibrated = Vec::new();
     let mut report = Vec::new();
     for &alpha in &ALPHAS {
         let rejections = rows.iter().filter(|(_, r)| r.p_value <= alpha).count();
         let size = rejections as f64 / m;
-        let bound = alpha + 2.0 * (alpha * (1.0 - alpha) / m).sqrt();
-        report.push(format!("α={alpha}: size {size:.4} (bound {bound:.4})"));
-        if size > bound {
-            oversized.push(format!(
-                "α={alpha}: {rejections}/{} rejections, size {size:.4} > α + 2·MCSE = {bound:.4}",
-                rows.len()
+        let band = BAND_SIGMAS * (alpha * (1.0 - alpha) / m).sqrt();
+        report.push(format!("α={alpha}: size {size:.4} (α ± {band:.4})"));
+        if (size - alpha).abs() > band {
+            miscalibrated.push(format!(
+                "α={alpha}: {rejections}/{} rejections, size {size:.4} outside α ± 3·MCSE = \
+                 [{:.4}, {:.4}]",
+                rows.len(),
+                alpha - band,
+                alpha + band
             ));
         }
+    }
+    let mut p_values: Vec<f64> = rows.iter().map(|(_, r)| r.p_value).collect();
+    let distance = kolmogorov_distance_from_uniform(&mut p_values);
+    let radius = dkw_radius(rows.len());
+    report.push(format!("KS D {distance:.4} (DKW radius {radius:.4})"));
+    if distance > radius {
+        let above = p_values.iter().filter(|&&p| p > 0.99).count();
+        miscalibrated.push(format!(
+            "Kolmogorov distance {distance:.4} from U(0,1) exceeds the DKW radius {radius:.4}; \
+             {above}/{} p-values are above 0.99",
+            rows.len()
+        ));
     }
     eprintln!(
         "{family:?}: {} usable fits, {} failed; {}",
@@ -271,44 +272,62 @@ fn assert_null_size_within_monte_carlo_error(family: Family) {
         report.join("; ")
     );
     assert!(
-        oversized.is_empty(),
-        "{family:?}: the Wood smooth-term Wald test rejects a true-null s({NULL_TERM}) too \
-         often (anti-conservative):\n{}",
-        oversized.join("\n")
+        miscalibrated.is_empty(),
+        "{family:?}: the smooth-term Wald p-value of a true-null s({NULL_TERM}) is not \
+         U(0,1):\n{}",
+        miscalibrated.join("\n")
     );
 }
 
-#[test]
-fn gaussian_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Gaussian);
+/// `sup_u |F̂(u) − u|` of the sample against U(0, 1).
+fn kolmogorov_distance_from_uniform(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let m = values.len() as f64;
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, &u)| ((i + 1) as f64 / m - u).max(u - i as f64 / m))
+        .fold(0.0, f64::max)
+}
+
+/// The Dvoretzky–Kiefer–Wolfowitz radius (Massart's constant) exceeded with
+/// probability at most `δ = 2Φ(−BAND_SIGMAS)`, the level of the size bands.
+fn dkw_radius(m: usize) -> f64 {
+    let delta = libm::erfc(BAND_SIGMAS / std::f64::consts::SQRT_2);
+    ((2.0 / delta).ln() / (2.0 * m as f64)).sqrt()
 }
 
 #[test]
-fn poisson_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Poisson);
+fn gaussian_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Gaussian);
 }
 
 #[test]
-fn binomial_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Binomial);
+fn poisson_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Poisson);
 }
 
 #[test]
-fn gamma_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Gamma);
+fn binomial_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Binomial);
 }
 
 #[test]
-fn negative_binomial_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::NegativeBinomial);
+fn gamma_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Gamma);
 }
 
 #[test]
-fn tweedie_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Tweedie);
+fn negative_binomial_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::NegativeBinomial);
 }
 
 #[test]
-fn beta_null_smooth_wald_size_is_within_monte_carlo_error() {
-    assert_null_size_within_monte_carlo_error(Family::Beta);
+fn tweedie_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Tweedie);
+}
+
+#[test]
+fn beta_null_smooth_wald_p_value_is_uniform() {
+    assert_null_p_value_is_uniform(Family::Beta);
 }

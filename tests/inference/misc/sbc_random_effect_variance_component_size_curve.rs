@@ -127,12 +127,7 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
-    let rows = smooth_term_summary_rows(
-        &fit.design,
-        &fit.resolvedspec,
-        &fit.fit,
-        fit.fit.weighted_gram(),
-    );
+    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
     let row = rows
         .iter()
         .find(|row| row.name == GROUP_TERM)

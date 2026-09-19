@@ -1,5 +1,40 @@
 ## Unreleased
 
+- **The summary smooth-term Wald p-value is uniform under the null.**
+  `summary().smooth_terms[*].p_value` was Wood's (2013) fixed-`λ` test read at the REML
+  `λ̂`. REML shrinks a null term onto its penalty null space in most fits, where that
+  statistic vanishes, so on `y ~ s(x1) + s(x2)` with a null `x2` (n = 200, 200 fits per
+  family) 44% of Gaussian p-values were above 0.99 and the size at 0.05 was 0.019–0.050
+  across the seven standard families; the Kolmogorov distance from U(0, 1) exceeded its
+  three-sigma radius in every family. The row now carries the whitened Wald statistic
+  `W = uᵀ(I + T(t̂))⁻¹u` of the term's profiled score `u ~ N(0, I)`, with `t̂` chosen for
+  the observation by the same certified REML selection the λ̂-selection replay applies to
+  each null draw, and the p-value is read against that replayed law (studentized through
+  the exact Beta radius map at estimated scale). A term with no identified direction
+  publishes `p = 1`, the one genuine atom of the law. A term whose replay refuses
+  publishes no p-value, with `pvalue_unavailable = "selection_refused"`, rather than the
+  anti-conservative fixed-`λ` tail. The design Gram the old test needed is no longer
+  built: `smooth_term_summary_rows(design, spec, fit)` lost its whitening argument.
+- **`smooth_significance` publishes no p-value when the λ̂-selection replay refuses.**
+  When `λ̂` was chosen but the replay could not be computed (`selection` is
+  `geometry_refused`, `grid_refused`, `selection_unresolved` or
+  `observed_score_unusable`), the row silently published the conditional (fixed-`λ`)
+  tail, which treats `λ̂` as given and gave a null binomial term `p = 0.0005`. Such a
+  row now has `outcome = Err(SmoothLrUnavailable::SelectionRefused(reason))`
+  (`p_value_unavailable = "selection_refused"`). A `rho_covariance` whose shape does not
+  match the fit's penalty components is now an error; before, the estimated-`λ`
+  Bartlett factor was dropped without notice.
+- **The λ̂-selection replay no longer refuses Bernoulli draws whose penalty shares
+  saturate.** The certified search enclosed the criterion's slope and curvature through
+  the shares `s = x/(1+x)` and their complements, and computed the complement as `1 − s`.
+  Near `s = 1` that difference keeps only an absolute `ε`, so across a narrow cell the
+  endpoint curvatures differed by `~ε` while the enclosure's rounding band assumed
+  relatively exact summands and was `~1e-18`. The two enclosures did not intersect and the
+  replay stopped with `selection_unresolved`: 5 of 48 null binomial draws at n = 100, each
+  publishing a NaN p-value. The complement is now `1/(1+x)`, exact to one rounding, and the
+  share polynomials are written in `(s, 1 − s)`. Of the same 48 draws, 47 replayed without
+  a refusal and one was still searching when stopped after 17 min: the replay's cost is
+  heavy-tailed on Bernoulli fits, a separate defect this does not fix.
 - **The default `s(x)` sizes its basis from the data** (slop.md G1). The formula-default
   open B-spline was capped at `clamp(unique/4, 4..8)` internal knots (12 cubic
   coefficients), so `y ~ s(x)` stopped improving with `n`: on `sin(8πx) + N(0, 0.3²)`
