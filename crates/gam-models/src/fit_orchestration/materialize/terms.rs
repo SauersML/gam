@@ -13,7 +13,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     terms: &[ParsedTerm],
     data: &Dataset,
     col_map: &HashMap<String, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut FitNotes,
     scale_dimensions: bool,
     smooth_overrides: Option<&JsonValue>,
     spatial_center_counts: Option<&[Option<usize>]>,
@@ -276,7 +276,7 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
     label: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut FitNotes,
 ) -> Result<Vec<UnidentifiedScalarTerm>, WorkflowError> {
     if spec.linear_terms.is_empty() {
         return Ok(Vec::new());
@@ -347,7 +347,7 @@ pub(crate) fn prune_unidentified_linear_terms_for_marginal_slope(
     }
 
     if !dropped.is_empty() {
-        inference_notes.push(format!(
+        inference_notes.advise(format!(
             "{label}: removed {} scalar term(s) that add no identifiable \
              direction beyond the implicit intercept and earlier scalar terms: {}",
             dropped.len(),

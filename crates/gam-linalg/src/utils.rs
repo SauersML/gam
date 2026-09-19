@@ -1161,7 +1161,7 @@ where
         Some((x, pcg_solve_info(&result)))
     } else {
         if result.stop == PcgStop::BadPreconditioner {
-            log::warn!(
+            log::debug!(
                 "SPD PCG rejected: preconditioner diagonal contained a non-positive or \
                  non-finite entry; caller should route to a direct factorization \
                  or indefinite Krylov path."

@@ -107,7 +107,7 @@ fn fit_default(n: usize, seed: u64, truth: fn(f64) -> f64) -> DefaultFit {
         basis_dim: row.basis_dim,
         edf: row.edf.expect("a converged smooth reports its EDF"),
         p_value: row.p_value,
-        notes: outcome.inference_notes.clone(),
+        notes: outcome.inference_notes.iter().cloned().collect(),
     }
 }
 

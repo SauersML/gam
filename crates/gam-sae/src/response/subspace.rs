@@ -839,7 +839,7 @@ impl BlockUnits {
         let total = unit_sums.iter().fold(RowSum::default(), |total, row| total.plus(*row));
         let pairs = width * (width + 1) / 2;
         if total.orthant_fallbacks > 0 {
-            log::info!(
+            log::debug!(
                 "retained-response pair pass (#2946): {} of {pairs} pair kernels took the certified orthant route ({:.3e} of the pass)",
                 total.orthant_fallbacks,
                 total.orthant_fallbacks as f64 / pairs as f64,

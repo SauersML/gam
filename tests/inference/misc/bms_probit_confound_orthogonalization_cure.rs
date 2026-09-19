@@ -129,7 +129,7 @@ fn build_confounded_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTerm
                 boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 

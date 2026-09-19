@@ -43,7 +43,7 @@ def _fit(n: int, seed: int, truth):
     fitted = np.asarray(model.predict(data)).ravel()
     rmse = float(np.sqrt(np.mean((fitted - mean) ** 2)))
     (row,) = model.basis_check(data)
-    return rmse, row, [str(w.message) for w in caught]
+    return rmse, row, [str(w.message) for w in caught] + list(model.notes)
 
 
 def _sin_8_pi(x):

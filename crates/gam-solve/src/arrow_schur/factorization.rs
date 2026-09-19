@@ -377,7 +377,7 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
     if qualified.is_empty() {
         // Costs nothing when deflation succeeds; emitted only on the branch that
         // is currently indistinguishable from "no gauge was supplied".
-        log::debug!(
+        log::trace!(
             "[GAUGE-DEFLATION] no direction qualified: closest |g'Hg| was {:.6e}x the bar \
              (curvature={:.6e}, bar=eps*max_diag*|g|^2, eps={:.1e}, max_diag={:.6e}, \
              gauges={})",

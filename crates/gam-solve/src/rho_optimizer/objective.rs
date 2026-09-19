@@ -525,7 +525,7 @@ pub trait OuterObjective {
         rho: &Array1<f64>,
         plan: &OuterPlan,
     ) -> Result<(), EstimationError> {
-        log::debug!(
+        log::trace!(
             "[OUTER] finalize: re-installing best rho into the objective (solver {:?})",
             plan.solver
         );
@@ -839,11 +839,11 @@ impl<'a> CheckpointingObjective<'a> {
     /// `ρ` is printed in full: the whole point is to be able to difference two
     /// consecutive trial points by hand, and a norm cannot be differenced.
     fn trace_eval(&self, rho: &Array1<f64>, cost: f64, gradient: Option<&Array1<f64>>, what: &str) {
-        if !log::log_enabled!(log::Level::Debug) {
+        if !log::log_enabled!(log::Level::Trace) {
             return;
         }
         let gradient_norm = gradient.map_or(f64::NAN, |g| g.dot(g).sqrt());
-        log::debug!(
+        log::trace!(
             "[OUTER eval] #{} {what} cost={cost:.15e} |g|={gradient_norm:.6e} rho={:?}",
             self.eval_counter.load(Ordering::Relaxed),
             rho.to_vec(),
