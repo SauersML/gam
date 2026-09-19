@@ -4824,14 +4824,64 @@ mod tests {
     }
 
     #[test]
-    fn compare_models_rejects_mismatched_family_or_observation_count() {
+    fn compare_models_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
+        // #1465: every ranking row's delta and evidence ratio are measured on
+        // the scale that orders the table, even where it and the REML score
+        // disagree (`m2` has the lowest REML, `m1` the lowest corrected AIC).
+        let candidates = vec![
+            cand("m1", 53.748, 99.0, 100.0),
+            cand("m2", 41.605, 100.0, 102.0),
+            cand("m3", 120.011, 128.0, 130.0),
+        ];
+        let cmp = compare_models(candidates).expect("comparison");
+        assert_eq!(cmp.winner, "m1");
+        for row in &cmp.ranking {
+            assert!(row.delta_aic >= 0.0, "row {} delta {}", row.name, row.delta_aic);
+            assert!(row.evidence_ratio >= 1.0, "row {} ratio {}", row.name, row.evidence_ratio);
+        }
+        let names: Vec<_> = cmp.ranking.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn compare_models_rejects_pure_noise_smooth_despite_lower_evidence() {
+        // Seed-3000 numbers from the #1362 reproduction. The noise-augmented
+        // `big` has the lower raw REML score but spends ~7.5 extra EDF without
+        // improving the likelihood; on the Gaussian scale-counted AICs
+        // (`−2ℓ + 2(edf + 1)`) the small model wins.
+        let small = cand("small", 180.526, 79.669, 81.2);
+        let big = cand("big", 177.404, 94.742, 97.9);
+        assert!(big.reml_score < small.reml_score);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "small");
+        let big_row = cmp.score_table.iter().find(|r| r.name == "big").unwrap();
+        assert!(big_row
+            .reml_score
+            .is_some_and(|score| (score - 177.404).abs() < 1e-9));
+    }
+
+    #[test]
+    fn compare_models_keeps_power_for_a_relevant_smooth() {
+        // Seed-3000 relevant-z numbers: a genuinely relevant smooth lowers the
+        // REML score and the AICs, so the bigger model must still win.
+        let small = cand("small", 1025.067, 753.47, 755.0);
+        let big = cand("big", 199.509, 96.83, 99.9);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "big");
+    }
+
+    #[test]
+    fn compare_models_rejects_mismatched_observation_counts() {
         let mut other_n = cand("big_n", 100.0, 50.0, 51.0);
         other_n.n_obs = 500;
         let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_n.clone()])
             .expect_err("cross-n comparison must be rejected");
         assert!(err.contains("number of observations") && err.contains("500"));
         assert!(log_evidence_ratio(&cand("a", 1.0, 1.0, 1.0), &other_n).is_err());
+    }
 
+    #[test]
+    fn compare_models_rejects_mismatched_family() {
         let mut other_family = cand("pois", 100.0, 50.0, 51.0);
         other_family.family = "Poisson Log".to_string();
         let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_family])
