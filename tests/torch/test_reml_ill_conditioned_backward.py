@@ -2,7 +2,7 @@
 
 When ``λ`` saturates very large (e.g. ``1e10+``), the penalized Hessian
 ``K = XᵀWX + λS`` becomes effectively rank-deficient (``λS`` dominates).
-The analytic VJP previously raised ``GamError: Model is ill-conditioned``
+The analytic VJP previously raised ``GamfitError: Model is ill-conditioned``
 in that regime, which would crash production training at large ``F`` where
 individual atoms can saturate ``λ_k`` in early batches.
 

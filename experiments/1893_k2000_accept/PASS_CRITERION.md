@@ -7,7 +7,7 @@ SAE, at usable throughput? PASS iff ALL THREE legs hold (the driver prints
 
 1. **Completion — no co-collapse / no silent-linear reroute.**
    `gamfit.sae.sae_manifold_fit(X_train, K=2000, assignment='topk', top_k=32)` returns a
-   `ManifoldSAE` without raising. A `GamError` / infeasible-sentinel refusal (or any
+   `ManifoldSAE` without raising. A `GamfitError` / infeasible-sentinel refusal (or any
    exception) is a FAIL (`completed=false`). This is the leg the acceptance-deflation
    fixes (dbdb20d27 / 37e4d2eae / 36bec0e29) had to land for.
 

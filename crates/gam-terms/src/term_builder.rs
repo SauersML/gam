@@ -33,6 +33,7 @@ use crate::smooth::{
     TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
+use gam_problem::ErrorCategory;
 use gam_problem::types::ColIdx;
 
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
@@ -117,6 +118,35 @@ pub enum TermBuilderError {
     /// Term-collection-stage formula error — a node that the caller was
     /// supposed to resolve upstream reached the builder.
     MalformedFormula { reason: String },
+    /// A term that needs a numeric coordinate (`s(...)`, `te(...)`, the
+    /// continuous operand of `fs`/`sz`, an explicit `linear(...)`) names a
+    /// categorical column. Fitting it would smooth over the arbitrary level
+    /// codes, so the term is refused at formula resolution and the categorical
+    /// alternatives are named instead.
+    CategoricalCoordinate {
+        /// The term as written in the formula.
+        term: String,
+        /// The categorical column the term names.
+        column: String,
+        /// The number of levels the column carries.
+        level_count: usize,
+        /// The first cell whose text is not a number, when the column is
+        /// categorical because of one: a stray string in an otherwise numeric
+        /// column is the common way this happens by accident.
+        first_non_numeric: Option<NonNumericCell>,
+    },
+    /// A data-layer failure met while resolving the terms' columns, carried
+    /// whole so its category and text reach the front end unchanged.
+    Data(DataError),
+}
+
+/// A categorical cell whose text does not parse as a number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonNumericCell {
+    /// The cell's text.
+    pub value: String,
+    /// The 1-based data row holding it.
+    pub row: usize,
 }
 
 impl std::fmt::Display for TermBuilderError {
@@ -128,6 +158,40 @@ impl std::fmt::Display for TermBuilderError {
             | TermBuilderError::UnsupportedFeature { reason }
             | TermBuilderError::DegenerateData { reason }
             | TermBuilderError::MalformedFormula { reason } => f.write_str(reason),
+            TermBuilderError::Data(source) => std::fmt::Display::fmt(source, f),
+            TermBuilderError::CategoricalCoordinate {
+                term,
+                column,
+                level_count,
+                first_non_numeric,
+            } => {
+                write!(
+                    f,
+                    "term `{term}` uses column '{column}' as a numeric coordinate, but '{column}' \
+                     is categorical ({level_count} levels"
+                )?;
+                if let Some(cell) = first_non_numeric {
+                    write!(
+                        f,
+                        "; first non-numeric value '{}' at row {}",
+                        cell.value, cell.row
+                    )?;
+                }
+                write!(
+                    f,
+                    "), so the term would be fit over arbitrary level codes. For a per-level \
+                     effect use factor({column}) (fixed) or group({column}) (random); for a smooth \
+                     that varies by level use s(x, by={column}), fs(x, {column}) or sz(x, {column}); \
+                     for a random-effect smooth use s({column}, bs=\"re\")"
+                )?;
+                if first_non_numeric.is_some() {
+                    write!(
+                        f,
+                        ". If '{column}' is meant to be numeric, fix or remove its non-numeric values"
+                    )?;
+                }
+                Ok(())
+            }
             // Delegate to the canonical `DataError::ColumnNotFound` formatter
             // so a single source of truth defines the human text. The
             // intermediate `DataError` constructed here owns its strings only
@@ -153,8 +217,6 @@ impl std::fmt::Display for TermBuilderError {
     }
 }
 
-impl std::error::Error for TermBuilderError {}
-
 impl From<TermBuilderError> for String {
     fn from(err: TermBuilderError) -> String {
         err.to_string()
@@ -176,9 +238,8 @@ impl From<String> for TermBuilderError {
 /// Typed lift from data-layer errors. `DataError::ColumnNotFound` becomes
 /// `TermBuilderError::ColumnNotFound` field-for-field — no stringification,
 /// no information loss — so the FFI boundary downstream can dispatch on
-/// the typed variant. Other `DataError` variants degrade into
-/// `MissingColumn` since they describe column-resolution-time failures
-/// without a dedicated structured destination.
+/// the typed variant. Other `DataError` variants are carried whole in
+/// `Data`, so their category survives.
 impl From<DataError> for TermBuilderError {
     fn from(err: DataError) -> Self {
         match err {
@@ -195,17 +256,61 @@ impl From<DataError> for TermBuilderError {
                 similar,
                 tsv_hint,
             },
-            DataError::SchemaMismatch { reason }
-            | DataError::ParseError { reason }
-            | DataError::EncodingFailure { reason }
-            | DataError::EmptyInput { reason }
-            | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
-            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
-                reason: cell.to_string(),
-            },
+            other @ (DataError::SchemaMismatch { .. }
+            | DataError::ParseError { .. }
+            | DataError::EncodingFailure { .. }
+            | DataError::EmptyInput { .. }
+            | DataError::InvalidValue { .. }
+            | DataError::InvalidCell { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
+        }
+    }
+}
+
+impl TermBuilderError {
+    /// The user-facing category every front end classifies this failure by.
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::ColumnNotFound { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidOption { .. }
+            | Self::UnsupportedFeature { .. }
+            | Self::MalformedFormula { .. }
+            | Self::CategoricalCoordinate { .. } => ErrorCategory::Formula,
+            Self::DegenerateData { .. } => ErrorCategory::Data,
+            // The column-kind table disagreeing with the column map it was
+            // built alongside.
+            Self::MissingColumn { .. } => ErrorCategory::Internal,
+            Self::Data(source) => source.error_category(),
+        }
+    }
+
+    /// The `Enum::Variant` name a front end prints beside the message.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::MissingColumn { .. } => "TermBuilderError::MissingColumn",
+            Self::ColumnNotFound { .. } => "TermBuilderError::ColumnNotFound",
+            Self::IncompatibleConfig { .. } => "TermBuilderError::IncompatibleConfig",
+            Self::InvalidOption { .. } => "TermBuilderError::InvalidOption",
+            Self::UnsupportedFeature { .. } => "TermBuilderError::UnsupportedFeature",
+            Self::DegenerateData { .. } => "TermBuilderError::DegenerateData",
+            Self::MalformedFormula { .. } => "TermBuilderError::MalformedFormula",
+            Self::CategoricalCoordinate { .. } => "TermBuilderError::CategoricalCoordinate",
+            Self::Data(source) => source.variant_name(),
+        }
+    }
+}
+
+impl std::error::Error for TermBuilderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Renders exactly its source, so it is transparent to the chain.
+            Self::Data(source) => std::error::Error::source(source),
+            _ => None,
         }
     }
 }
@@ -386,19 +491,6 @@ pub(crate) fn marginal_slope_z_alias_is_live(
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
 
-/// A categorical column cannot be the argument of a term that treats its
-/// input as a numeric axis: the category codes would be read as positions on
-/// a line, silently fitting an arbitrary order. Point the user at the
-/// categorical spellings instead.
-fn categorical_in_numeric_term_error(term: &str, column: &str) -> TermBuilderError {
-    TermBuilderError::incompatible_config(format!(
-        "{term} treats its arguments as numeric axes, but column '{column}' is \
-         categorical; use factor({column}) for a categorical level effect, \
-         group({column}) for a random effect, or s(x, {column}, bs=\"fs\") for a \
-         per-level smooth of a numeric x"
-    ))
-}
-
 pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
@@ -492,11 +584,15 @@ pub fn build_termspec(
                     TermBuilderError::missing_column(format!(
                         "internal column-kind lookup failed for '{name}'"
                     ))
-                    .to_string()
                 })?;
                 if *explicit {
-                    if matches!(auto_kind, ColumnKindTag::Categorical) {
-                        return Err(categorical_in_numeric_term_error("linear()", name));
+                    if auto_kind == ColumnKindTag::Categorical {
+                        return Err(categorical_coordinate_error(
+                            format!("linear({name})"),
+                            name,
+                            col,
+                            ds,
+                        ));
                     }
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
@@ -562,7 +658,6 @@ pub fn build_termspec(
                     TermBuilderError::missing_column(format!(
                         "internal column-kind lookup failed for '{name}'"
                     ))
-                    .to_string()
                 })?;
                 if !matches!(auto_kind, ColumnKindTag::Continuous | ColumnKindTag::Binary) {
                     return Err(TermBuilderError::incompatible_config(format!(
@@ -654,6 +749,14 @@ pub fn build_termspec(
                     let by_col = resolve_col(col_map, by_name)?;
                     inject_by_level_sizing_rows(&mut inner_options, ds, by_col);
                 }
+                reject_categorical_smooth_coordinates(
+                    label,
+                    *kind,
+                    &smooth_vars,
+                    &cols,
+                    &inner_options,
+                    ds,
+                )?;
                 let inner_basis = build_smooth_basis(
                     *kind,
                     &smooth_vars,
@@ -897,7 +1000,6 @@ pub fn build_termspec(
                         TermBuilderError::missing_column(format!(
                             "internal column-kind lookup failed for '{var}'"
                         ))
-                        .to_string()
                     })?;
                     match kind {
                         ColumnKindTag::Continuous | ColumnKindTag::Binary => numeric_cols.push(col),
@@ -2452,6 +2554,98 @@ pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
     bracketed && !parse_option_list(trimmed).is_empty()
 }
 
+/// The `(continuous, factor)` operand indices of a two-variable `fs`/`sz`/`re`
+/// factor smooth. `fs`/`sz` need a categorical operand and prefer the second
+/// (`fs(x, g)`); `re` prefers the first, following mgcv's random-slope
+/// spelling `s(g, x, bs="re")`, and treats the first operand as the grouping
+/// variable when neither is categorical. `None` when `fs`/`sz` has no
+/// categorical operand.
+fn factor_smooth_operands(type_name: &str, cols: [usize; 2], ds: &Dataset) -> Option<(usize, usize)> {
+    let categorical =
+        cols.map(|col| matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical)));
+    if type_name == "re" {
+        Some(if !categorical[0] && categorical[1] { (0, 1) } else { (1, 0) })
+    } else if categorical[1] {
+        Some((0, 1))
+    } else if categorical[0] {
+        Some((1, 0))
+    } else {
+        None
+    }
+}
+
+/// Refuse a smooth that would use a categorical column as a numeric
+/// coordinate.
+///
+/// A categorical column holds level codes whose order and spacing are
+/// arbitrary, so a smooth over it is meaningless. The only smooths that take
+/// a categorical operand are the factor smooths (`fs`, `sz`, `re`), and only
+/// in their factor slot; a categorical `by=` is removed from `vars` before
+/// this runs and stays valid.
+fn reject_categorical_smooth_coordinates(
+    term: &str,
+    kind: SmoothKind,
+    vars: &[String],
+    cols: &[usize],
+    options: &BTreeMap<String, String>,
+    ds: &Dataset,
+) -> Result<(), TermBuilderError> {
+    let type_name = resolve_smooth_type_name(kind, cols.len(), options);
+    let factor_slot = match cols {
+        [first, second] if matches!(type_name.as_str(), "fs" | "sz" | "re") => {
+            factor_smooth_operands(&type_name, [*first, *second], ds).map(|(_, factor)| factor)
+        }
+        _ => None,
+    };
+    for (idx, (var, &col)) in vars.iter().zip(cols).enumerate() {
+        if Some(idx) != factor_slot
+            && matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical))
+        {
+            return Err(categorical_coordinate_error(term.to_string(), var, col, ds));
+        }
+    }
+    Ok(())
+}
+
+/// The [`TermBuilderError::CategoricalCoordinate`] refusal for `column`,
+/// naming the first cell whose text is not a number when there is one.
+fn categorical_coordinate_error(
+    term: String,
+    column: &str,
+    col: usize,
+    ds: &Dataset,
+) -> TermBuilderError {
+    let levels = ds
+        .schema
+        .columns
+        .get(col)
+        .map(|schema_column| schema_column.levels.as_slice())
+        .unwrap_or(&[]);
+    let first_non_numeric = ds
+        .values
+        .column(col)
+        .iter()
+        .enumerate()
+        .find_map(|(row, &code)| {
+            let level = levels.get(level_code_index(code)?)?;
+            level.trim().parse::<f64>().is_err().then(|| NonNumericCell {
+                value: level.clone(),
+                row: row + 1,
+            })
+        });
+    TermBuilderError::CategoricalCoordinate {
+        term,
+        column: column.to_string(),
+        level_count: levels.len(),
+        first_non_numeric,
+    }
+}
+
+/// The level index a categorical cell encodes, or `None` for a missing cell.
+fn level_code_index(code: f64) -> Option<usize> {
+    (code.is_finite() && code >= 0.0 && code.fract() == 0.0).then_some(code as usize)
+}
+
 pub fn resolve_smooth_type_name(
     kind: SmoothKind,
     n_cols: usize,
@@ -2677,19 +2871,6 @@ pub(crate) fn build_smooth_basis(
     let smooth_double_penalty = option_bool(options, "double_penalty")?.unwrap_or(true);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
 
-    // Only the factor-smooth family (fs/sz/re) consumes a categorical column
-    // as a grouping factor. Every other smooth places its inputs on numeric
-    // axes, where category codes would silently fit an arbitrary level order.
-    if !matches!(type_opt.as_str(), "fs" | "sz" | "re")
-        && let Some((var, _)) = vars.iter().zip(cols.iter()).find(|(_, col)| {
-            matches!(ds.column_kinds.get(**col), Some(ColumnKindTag::Categorical))
-        })
-    {
-        return Err(
-            categorical_in_numeric_term_error(&format!("a '{type_opt}' smooth"), var).to_string(),
-        );
-    }
-
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         if type_opt == "re" {
             validate_random_effect_smooth_options(options)?;
@@ -2702,29 +2883,13 @@ pub(crate) fn build_smooth_basis(
                 type_opt
             ));
         }
-        let kinds = cols
-            .iter()
-            .map(|&c| ds.column_kinds.get(c).copied())
-            .collect::<Vec<_>>();
-        let (cont_idx, group_idx) = if type_opt == "re" {
-            // mgcv random-slope examples are often s(g, x, bs="re").
-            match (kinds[0], kinds[1]) {
-                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
-                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
-                _ => (1usize, 0usize),
-            }
-        } else {
-            match (kinds[0], kinds[1]) {
-                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
-                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
-                _ => {
-                    return Err(format!(
-                        "{} factor-smooth requires one categorical factor variable",
-                        type_opt
-                    ));
-                }
-            }
-        };
+        let (cont_idx, group_idx) =
+            factor_smooth_operands(&type_opt, [cols[0], cols[1]], ds).ok_or_else(|| {
+                format!(
+                    "{} factor-smooth requires one categorical factor variable",
+                    type_opt
+                )
+            })?;
         let c = cols[cont_idx];
         let (minv, maxv) = col_minmax(ds.values.column(c))?;
         let degree = if type_opt == "re" {

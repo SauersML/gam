@@ -466,7 +466,7 @@ Limitations: every check uses Gaussian REML. The LAML and non-Gaussian cases wer
 | asymptote window 12, MIN_TAIL_SAMPLES 3, EXP4_* | `ro/asymptote_certificate.rs:81, 86, 221, 226, 230` | curve fitting of tails | **heuristic**. Delete; replace with Prop. 5 + Theorem 4 |
 | ASYMPTOTE_* (1e-4, 18, 0.5, 6), TAIL_SNAP_DRIFT_REL | `ro/run.rs:5744, 5757, 5769-5770, 5456, 5896, 6417` | same | **heuristic**. Delete |
 | TAIL_SNAP_CURVATURE_BAND (0.25, 4.0) | `ro/run.rs:6356, 6492` | a guess at the exponential-tail curvature ratio. The exact ratio is Prop. 7 (h₀ = 1, contraction e⁻¹) | **heuristic**. Delete |
-| FACE_LAW_ERROR_SLACK 4.0, ORDER_BAND 0.5, DOMAIN_MARGIN 1e-6 | `ro/run.rs:6037, 6050, 6154` | none | **magic**. Delete |
+| FACE_LAW_ERROR_SLACK 4.0, ORDER_BAND 0.5, DOMAIN_MARGIN 1e-6 | `ro/run.rs:6037, 6050, 6154` | none | **magic**. Deleted with `falsify_face_law`; the analytic face proof spends no criterion evaluation |
 | CERTIFY_RESUME_PROGRESS_REL | `ro/run.rs:7327` | none | **heuristic** |
 | LOG_STRENGTH box as a proxy for ∞; RepresentabilityFace rung | `ro/run.rs:8495, 8507`; `ro/rail.rs:31-230` | violates the SPEC (hand box) | **delete**. Replace with t-coordinates (the domain t ≥ 0) |
 

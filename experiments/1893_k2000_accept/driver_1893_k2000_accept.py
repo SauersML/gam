@@ -227,7 +227,7 @@ def main() -> int:
         )
         recon_te = np.asarray(model.reconstruct(X_te), dtype=np.float64)
         ev_ours = held_out_ev(X_te.astype(np.float64), recon_te, mean_tr.astype(np.float64))
-    except Exception as exc:  # noqa: BLE001 — a GamError / co-collapse refusal is a FAIL, not a crash
+    except Exception as exc:  # noqa: BLE001 — a GamfitError / co-collapse refusal is a FAIL, not a crash
         completed, err, ev_ours = False, f"{type(exc).__name__}: {exc}", float("nan")
     fit_seconds = time.time() - t0
 

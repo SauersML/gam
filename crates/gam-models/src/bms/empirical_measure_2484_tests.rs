@@ -3,7 +3,7 @@
 //!
 //! Every derivative here is checked against a difference quotient of code that
 //! is on the fit path — `build_empirical_z_grid_with_alpha` for the measure and
-//! `empirical_intercept_from_marginal` + `signed_probit_logcdf_and_mills_ratio`
+//! `empirical_intercept` + `signed_probit_logcdf_and_mills_ratio`
 //! for the row. Nothing is checked against a reimplementation of the formula it
 //! is testing, because a probe that reconstructs the object it measures is
 //! measuring its own reconstruction.
@@ -26,7 +26,7 @@
 use super::empirical_measure_sensitivity::{
     build_empirical_z_grid_with_alpha, rigid_empirical_score_zeta_channels,
 };
-use super::gradient_paths::empirical_intercept_from_marginal;
+use super::gradient_paths::empirical_intercept;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use gam_problem::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2};
@@ -306,14 +306,12 @@ impl RowFixture {
         for i in 0..zeta.len() {
             let marginal = super::family::bernoulli_marginal_link_map(&PROBIT, marginal_eta[i])
                 .expect("link map");
-            let a = empirical_intercept_from_marginal(
-                marginal.mu,
+            let a = empirical_intercept(
                 marginal.q,
                 slope_eta[i],
                 self.probit_scale,
                 &grid.nodes,
                 &grid.weights,
-                None,
             )
             .expect("intercept solves");
             let e = a + self.probit_scale * slope_eta[i] * zeta[i];

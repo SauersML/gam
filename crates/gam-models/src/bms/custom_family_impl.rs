@@ -551,22 +551,6 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for BernoulliMargi
     }
 }
 
-impl crate::custom_family::JeffreysArming for BernoulliMarginalSlopeFamily {
-    fn with_jeffreys_armed(
-        &self,
-        evidence: Option<&gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
-    ) -> Self {
-        Self {
-            jeffreys_armed: evidence.is_some(),
-            // Each member runs its own auto-subsample schedule from zero, as a
-            // freshly built family does at the start of a fit.
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            ..self.clone()
-        }
-    }
-}
-
 impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMarginalSlopeFamily>
     for BernoulliMarginalSlopeFamily
 {

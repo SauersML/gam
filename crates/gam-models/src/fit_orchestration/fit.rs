@@ -765,9 +765,11 @@ pub(crate) fn fit_standard_model(
 /// ([`fit_location_scale_with_optional_wiggle`]) consumes these parts; each
 /// family's request type lowers itself into them via
 /// [`LocationScaleWorkflowAdapter::into_parts`].
-struct LocationScaleWorkflowParts<'a, S> {
+struct LocationScaleWorkflowParts<'a, S, C> {
     data: ArrayView2<'a, f64>,
     spec: S,
+    /// Spec-derived quantities the assembled result records alongside the fit.
+    context: C,
     wiggle: Option<LinkWiggleConfig>,
     options: BlockwiseFitOptions,
     kappa_options: SpatialLengthScaleOptimizationOptions,
@@ -790,9 +792,16 @@ trait LocationScaleWorkflowAdapter {
     type Request<'a>;
     /// The family-specific fit result the engine assembles.
     type Result;
+    /// Spec-derived quantities the assembled result records alongside the fit
+    /// (the Gaussian σ floor), computed once in [`Self::into_parts`] before any
+    /// solve.
+    type Context;
 
-    /// Lower the borrowed request into the family-agnostic workflow parts.
-    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec>;
+    /// Lower the borrowed request into the family-agnostic workflow parts,
+    /// deriving the [`Self::Context`] from the spec the fits consume.
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> Result<LocationScaleWorkflowParts<'a, Self::Spec, Self::Context>, FitFailure>;
 
     /// Pilot fit on the bare (non-wiggle) spec, used to seed the wiggle-basis
     /// selector. This is the first work the wiggle path performs, so any
@@ -829,11 +838,12 @@ trait LocationScaleWorkflowAdapter {
 
     /// Assemble the family result from a non-wiggle fit (knots/degree/wiggle
     /// coefficients all absent).
-    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result;
+    fn assemble_plain(context: Self::Context, fit: BlockwiseTermFitResult) -> Self::Result;
 
     /// Assemble the family result from a wiggle refit, carrying the selected
     /// knots/degree and the extracted `beta_link_wiggle` block.
     fn assemble_with_wiggle(
+        context: Self::Context,
         fit: BlockwiseTermFitResult,
         wiggle_knots: Array1<f64>,
         wiggle_degree: usize,
@@ -878,10 +888,11 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     let LocationScaleWorkflowParts {
         data,
         spec,
+        context,
         wiggle,
         options,
         kappa_options,
-    } = A::into_parts(request);
+    } = A::into_parts(request)?;
 
     let Some(wiggle_cfg) = wiggle else {
         // A location-scale model has two coupled predictors. For binomial
@@ -898,7 +909,7 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
             &fit.fit,
             "plain location-scale fit",
         )?;
-        return Ok(A::assemble_plain(fit));
+        return Ok(A::assemble_plain(context, fit));
     };
 
     let pilot = A::fit_pilot(data, &spec, &options, &kappa_options)?;
@@ -934,6 +945,7 @@ fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
     })
     .map_err(crate::gamlss::assembly_failure)?;
     Ok(A::assemble_with_wiggle(
+        context,
         assembled_fit,
         solved.wiggle_knots,
         solved.wiggle_degree,
@@ -948,15 +960,26 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
     type Spec = GaussianLocationScaleTermSpec;
     type Request<'a> = GaussianLocationScaleFitRequest<'a>;
     type Result = GaussianLocationScaleFitResult;
+    type Context = f64;
 
-    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec> {
-        LocationScaleWorkflowParts {
+    /// The context is the σ floor of the response the fits consume
+    /// (`gaussian_resolution_sigma_floor`).
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> Result<LocationScaleWorkflowParts<'a, Self::Spec, f64>, FitFailure> {
+        let sigma_floor = crate::sigma_link::gaussian_resolution_sigma_floor(
+            request.spec.y.view(),
+            request.spec.weights.view(),
+        )
+        .map_err(crate::gamlss::input_failure)?;
+        Ok(LocationScaleWorkflowParts {
             data: request.data,
             spec: request.spec,
+            context: sigma_floor,
             wiggle: request.wiggle,
             options: request.options,
             kappa_options: request.kappa_options,
-        }
+        })
     }
 
     fn fit_pilot(
@@ -1018,7 +1041,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
         fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
     }
 
-    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result {
+    fn assemble_plain(sigma_floor: f64, fit: BlockwiseTermFitResult) -> Self::Result {
         GaussianLocationScaleFitResult {
             fit,
             wiggle_knots: None,
@@ -1029,10 +1052,12 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
             // the coefficients back to raw units and overwrites this with the
             // applied factor. `1.0` here is the identity (no standardization).
             response_scale: 1.0,
+            sigma_floor,
         }
     }
 
     fn assemble_with_wiggle(
+        sigma_floor: f64,
         fit: BlockwiseTermFitResult,
         wiggle_knots: Array1<f64>,
         wiggle_degree: usize,
@@ -1046,6 +1071,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
             // See `assemble_plain`: raw-unit remapping happens in the Gaussian
             // model wrapper, which overwrites this with the applied factor.
             response_scale: 1.0,
+            sigma_floor,
         }
     }
 }
@@ -1057,15 +1083,19 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     type Spec = BinomialLocationScaleTermSpec;
     type Request<'a> = BinomialLocationScaleFitRequest<'a>;
     type Result = BinomialLocationScaleFitResult;
+    type Context = ();
 
-    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec> {
-        LocationScaleWorkflowParts {
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> Result<LocationScaleWorkflowParts<'a, Self::Spec, ()>, FitFailure> {
+        Ok(LocationScaleWorkflowParts {
             data: request.data,
             spec: request.spec,
+            context: (),
             wiggle: request.wiggle,
             options: request.options,
             kappa_options: request.kappa_options,
-        }
+        })
     }
 
     fn fit_pilot(
@@ -1134,7 +1164,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
         fit_binomial_location_scale_terms(data, spec, options, kappa_options)
     }
 
-    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result {
+    fn assemble_plain((): (), fit: BlockwiseTermFitResult) -> Self::Result {
         BinomialLocationScaleFitResult {
             fit,
             wiggle_knots: None,
@@ -1144,6 +1174,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     }
 
     fn assemble_with_wiggle(
+        (): (),
         fit: BlockwiseTermFitResult,
         wiggle_knots: Array1<f64>,
         wiggle_degree: usize,
@@ -1200,8 +1231,10 @@ pub(crate) fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
 ///                                         response-scale-equivariant (#884). The
 ///                                         floor cannot ride the intercept shift
 ///                                         (it sits outside the exp), so consumers
-///                                         reconstruct with floor `s·LOGB_SIGMA_FLOOR`
+///                                         reconstruct with floor `s·sigma_floor`
 ///                                         (see `GaussianLocationScalePredictor`).
+///                                         `sigma_floor` itself is dimensionless
+///                                         and is left unchanged here.
 ///
 /// The link-wiggle lives on the mean (identity) channel, so its knots and
 /// coefficients scale by `s` exactly like the Location block. Doing the remap
@@ -1483,13 +1516,10 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
 pub(crate) fn fit_gaussian_location_scale_model(
     mut request: GaussianLocationScaleFitRequest<'_>,
 ) -> Result<GaussianLocationScaleFitResult, FitFailure> {
-    // Standardize the response so the fixed log-σ soft floor
-    // `LOGB_SIGMA_FLOOR = 0.01` is scale-relative (≈ 1 % of the response
-    // spread) rather than absolute. Without this the link σ = 0.01 + exp(η)
-    // gives κ = dlogσ/dη = exp(η)/(0.01+exp(η)) < 1 whenever the raw σ is small,
-    // and the scale-block Fisher information 2κ²a is strictly below gamlss's
-    // floorless 2a, systematically over-smoothing the log-σ envelope
-    // (#686 #688 #684 #685 #687). Fitting on y/s restores κ ≈ 1.
+    // Standardize the response so the scale block works on a unit-spread
+    // response whatever the recording units. The σ floor is the recording-grid
+    // bound of this standardized response (`gaussian_resolution_sigma_floor`),
+    // so it scales with y and the fit is exactly response-scale-equivariant.
     let response_scale = gaussian_response_sample_std(request.spec.y.view());
     // A response with no spread has no scale to standardise by, and no
     // location-scale model either: refuse it rather than fit `y / 1e-6`
