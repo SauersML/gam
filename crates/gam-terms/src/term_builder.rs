@@ -2657,7 +2657,10 @@ pub(crate) fn build_smooth_basis(
         let penalty_order = resolve_spline_penalty_order(
             parse_penalty_order_alias(options)?,
             effective_degree,
-            Some((degree, n_knots + effective_degree + 1)),
+            Some(DegreeReduction::BasisDimension {
+                requested: degree,
+                k: n_knots + effective_degree + 1,
+            }),
         )?;
         // All factor-smooth flavours (`fs`, `sz`, `re`) place their per-level
         // marginal on the SAME penalized B-spline (P-spline) basis. The flavours
@@ -2907,7 +2910,7 @@ pub(crate) fn build_smooth_basis(
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
-            let (mut n_knots, inferred, effective_degree) =
+            let (mut n_knots, inferred, mut effective_degree) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
             // Every period/origin declaration this arm accepts is read only
@@ -2938,8 +2941,16 @@ pub(crate) fn build_smooth_basis(
             if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 n_knots = n_knots.min(1);
             }
+            let unique = unique_count_column(ds.values.column(c));
+            let knots_before_support_cap = n_knots;
+            let degree_before_support_cap = effective_degree;
+            if inferred && !periodic_axes[0] && unique >= 2 {
+                let (capped_knots, capped_degree) =
+                    support_capped_bspline_dimension(n_knots, effective_degree, unique);
+                n_knots = capped_knots;
+                effective_degree = capped_degree;
+            }
             if inferred {
-                let unique = unique_count_column(ds.values.column(c));
                 // State the rule the engine actually applied
                 // (`heuristic_knots_for_column`: `clamp(unique/4, 4..8)`), and
                 // the small-data reduction when it fired. The note used to
@@ -2955,12 +2966,21 @@ pub(crate) fn build_smooth_basis(
                     MAX_DEFAULT_INTERNAL_KNOTS,
                     heuristic_knots,
                 );
-                if n_knots != heuristic_knots {
+                if knots_before_support_cap != heuristic_knots {
                     note.push_str(&format!(
                         " Reduced to {} because the fit has only {} rows and {} smooth coordinates.",
-                        n_knots,
+                        knots_before_support_cap,
                         ds.values.nrows(),
                         smooth_coordinate_count,
+                    ));
+                }
+                if n_knots != knots_before_support_cap || effective_degree != degree {
+                    note.push_str(&format!(
+                        " Capped to {} internal knots at degree {} (basis dimension {}) because the covariate has only {} unique values.",
+                        n_knots,
+                        effective_degree,
+                        n_knots + effective_degree + 1,
+                        unique,
                     ));
                 }
                 note.push_str(" Override with knots=... or k=....");
@@ -3085,11 +3105,23 @@ pub(crate) fn build_smooth_basis(
             // MLE-style opt-out.
             let double_penalty = smooth_double_penalty;
             // Validated against the degree actually built, which a small
-            // explicit `k` may have reduced (see `parse_ps_internal_knots`).
+            // explicit `k` (`parse_ps_internal_knots`) or the covariate's
+            // support (`support_capped_bspline_dimension`) may have reduced.
+            let reduction = if degree_before_support_cap != degree {
+                DegreeReduction::BasisDimension {
+                    requested: degree,
+                    k: n_knots + effective_degree + 1,
+                }
+            } else {
+                DegreeReduction::DataSupport {
+                    requested: degree,
+                    unique,
+                }
+            };
             let penalty_order = resolve_spline_penalty_order(
                 parse_penalty_order_alias(options)?,
                 effective_degree,
-                Some((degree, n_knots + effective_degree + 1)),
+                Some(reduction),
             )?;
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
@@ -4043,9 +4075,8 @@ pub(crate) fn build_smooth_basis(
                 // shared `degree=` request. We mirror that: if the caller
                 // explicitly asks for `k < degree + 1`, drop the degree on
                 // THAT axis only to the largest feasible spline, and track the
-                // penalty order so the marginal difference penalty stays
-                // well-defined (`order < num_basis_functions` is required by
-                // `create_difference_penalty_matrix`). Apply the same
+                // penalty order so the marginal derivative penalty `∫(f^(m))²`
+                // stays well-defined (`m ≤ degree`). Apply the same
                 // per-margin degree shrinkage to periodic tensor margins too:
                 // a cyclic marginal basis with k=3 cannot be cubic, but it is
                 // still a valid lower-degree cyclic margin with dimension k,
@@ -4061,7 +4092,10 @@ pub(crate) fn build_smooth_basis(
                 let effective_penalty_order = resolve_spline_penalty_order(
                     requested_penalty_orders[axis],
                     effective_degree,
-                    Some((degree, k_axis)),
+                    Some(DegreeReduction::BasisDimension {
+                        requested: degree,
+                        k: k_axis,
+                    }),
                 )
                 .map_err(|e| format!("tensor margin {axis}: {e}"))?;
                 // A `cc`/`cp`/`cyclic` per-margin basis declares periodicity
@@ -4635,6 +4669,32 @@ pub(crate) fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
 }
 
+/// Cap a default open B-spline `(internal_knots, degree)` so its basis
+/// dimension `internal_knots + degree + 1` does not exceed the covariate's
+/// `unique` distinct values (`unique >= 2`).
+///
+/// [`heuristic_knots_for_column`] floors at four internal knots, so a covariate
+/// with two or three distinct values was given eight basis functions. Only
+/// `unique` combinations of them are seen by the data; the rest are identified
+/// by the penalty alone, and the smooth's null space and effective degrees of
+/// freedom are then decided by the knot heuristic instead of the data. A basis
+/// of exactly `unique` functions already interpolates any value per distinct
+/// covariate level, so the cap never costs representable signal. When `unique`
+/// is at most the degree, the degree is lowered to `unique − 1` (a linear basis
+/// on a binary covariate) with no internal knots, the same reduction an
+/// explicit `k = unique` makes in [`parse_ps_internal_knots`].
+pub(crate) fn support_capped_bspline_dimension(
+    internal_knots: usize,
+    degree: usize,
+    unique: usize,
+) -> (usize, usize) {
+    if internal_knots + degree + 1 <= unique {
+        return (internal_knots, degree);
+    }
+    let degree = degree.min(unique.saturating_sub(1)).max(1);
+    (unique.saturating_sub(degree + 1), degree)
+}
+
 /// #1867: the basis dimension the default open cubic `s(x)` gets on `col`, the
 /// floor under a 1-D radial smooth's default so it is not dimensioned coarser
 /// than the spline it competes with on the same data.
@@ -4672,7 +4732,7 @@ pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -
 fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
     let d = cols.len().max(1);
     let degree = DEFAULT_BSPLINE_DEGREE;
-    let min_k = degree + 2; // smallest margin that carries a difference penalty
+    let min_k = degree + 2; // smallest margin that carries a roughness penalty
     let n = ds.values.nrows();
 
     // Per-margin 1-D ceiling: never request more basis functions than the
@@ -5749,6 +5809,16 @@ pub(crate) fn validate_spline_degree(option: &str, degree: usize) -> Result<(), 
     Ok(())
 }
 
+/// Why a B-spline basis was built at a lower degree than requested; see
+/// [`resolve_spline_penalty_order`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DegreeReduction {
+    /// An explicit basis dimension `k` holds at most degree `k - 1`.
+    BasisDimension { requested: usize, k: usize },
+    /// The inferred basis was capped to the covariate's `unique` support.
+    DataSupport { requested: usize, unique: usize },
+}
+
 /// Resolve and validate the roughness-penalty order of a B-spline-family
 /// smooth against the degree of the basis actually built.
 ///
@@ -5762,13 +5832,12 @@ pub(crate) fn validate_spline_degree(option: &str, degree: usize) -> Result<(), 
 /// The default is [`DEFAULT_PENALTY_ORDER`] capped at the degree, so a linear
 /// spline gets the first-derivative penalty.
 ///
-/// `reduced` carries `(requested_degree, k)` when a small basis dimension
-/// lowered the degree (`degree <= k - 1`), so the error can name the option
-/// that actually caused the conflict.
+/// `reduced` says why the built degree sits below the requested one, so the
+/// error can name what actually caused the conflict.
 pub(crate) fn resolve_spline_penalty_order(
     requested_order: Option<usize>,
     degree: usize,
-    reduced: Option<(usize, usize)>,
+    reduced: Option<DegreeReduction>,
 ) -> Result<usize, String> {
     let Some(order) = requested_order else {
         return Ok(DEFAULT_PENALTY_ORDER.min(degree));
@@ -5782,10 +5851,18 @@ pub(crate) fn resolve_spline_penalty_order(
     }
     if order > degree {
         let cause = match reduced {
-            Some((requested_degree, k)) if requested_degree != degree => format!(
-                "degree={requested_degree} was reduced to {degree} because a basis of k={k} \
-                 functions holds at most degree k-1; raise k or lower penalty_order"
-            ),
+            Some(DegreeReduction::BasisDimension { requested, k }) if requested != degree => {
+                format!(
+                    "degree={requested} was reduced to {degree} because a basis of k={k} \
+                     functions holds at most degree k-1; raise k or lower penalty_order"
+                )
+            }
+            Some(DegreeReduction::DataSupport { requested, unique }) if requested != degree => {
+                format!(
+                    "degree={requested} was reduced to {degree} because the covariate has \
+                     only {unique} unique values; set k explicitly or lower penalty_order"
+                )
+            }
             _ => format!("use penalty_order <= {degree} or raise degree"),
         };
         return Err(TermBuilderError::invalid_option(format!(

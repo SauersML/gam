@@ -808,7 +808,40 @@ pub enum LocalLawMixture {
     VanishingAtTruncation { floor: f64 },
 }
 
+/// How the flexible row algebra integrates a row over its latent law — the one
+/// property of a law that a row kernel has to implement (gam#3000). The CPU
+/// row lowering takes one branch per form, and a device kernel declares the
+/// forms it transcribes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LatentIntegral {
+    /// Closed-form moments of the standard normal density on each denested
+    /// cubic cell.
+    GaussianCellMoments,
+    /// A finite weighted sum over the law's grid nodes.
+    DiscreteGrid,
+}
+
+impl LatentIntegral {
+    /// The capability a kernel needs to compute a model of this form.
+    pub(crate) const fn capability(self) -> &'static str {
+        match self {
+            Self::GaussianCellMoments => "the Gaussian cell-moment latent integral",
+            Self::DiscreteGrid => "the discrete-grid latent integral of an empirical latent law",
+        }
+    }
+}
+
 impl LatentMeasureKind {
+    /// The form in which the row algebra integrates over this law.
+    pub(crate) fn integral(&self) -> LatentIntegral {
+        match self {
+            Self::StandardNormal => LatentIntegral::GaussianCellMoments,
+            Self::GlobalEmpirical { .. } | Self::LocalEmpirical { .. } => {
+                LatentIntegral::DiscreteGrid
+            }
+        }
+    }
+
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
             Self::StandardNormal => Ok(()),

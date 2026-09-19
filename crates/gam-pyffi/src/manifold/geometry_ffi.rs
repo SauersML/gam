@@ -4810,6 +4810,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
@@ -4924,7 +4925,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
-    module.add_function(wrap_pyfunction!(compare_reml_fits, module)?)?;
+    module.add_function(wrap_pyfunction!(compare_models, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
@@ -5114,7 +5115,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
-    module.add_function(wrap_pyfunction!(model_conditional_aic, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;

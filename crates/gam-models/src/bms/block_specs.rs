@@ -2927,6 +2927,15 @@ fn fit_bernoulli_marginal_slope_terms_under(
         ));
     }
     let initial_family = make_family(&marginal_design, &slope_design, initial_sigma);
+    // The row-kernel decision every cache build reads, made once before the
+    // search: `gpu=required` for a model the device row kernel does not compute
+    // is refused here, naming the missing capability, instead of at every trial
+    // point as a seed refusal (gam#3000).
+    if initial_family.flex_active() {
+        initial_family
+            .flex_row_kernel_decision()
+            .map_err(FitFailure::input)?;
+    }
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available

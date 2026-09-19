@@ -293,9 +293,9 @@ class GAM(nn.Module):
         frozen_coefficients = self._frozen_coefficients()
         if frozen_coefficients is None:
             raise RuntimeError("frozen_coefs is None")
-        points_list = (
-            list(points) if isinstance(points, (list, tuple))
-            else [points] * len(self.smooths)
+        points_list: list[torch.Tensor] = (
+            [points] * len(self.smooths) if isinstance(points, torch.Tensor)
+            else list(points)
         )
         if len(points_list) != len(self.smooths):
             raise ValueError(

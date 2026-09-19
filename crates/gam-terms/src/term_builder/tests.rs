@@ -4208,6 +4208,53 @@ fn heuristic_knots_for_column_uses_uniquevalue_rule() {
     assert_eq!(heuristic_knots_for_column(boundary.view()), 8);
 }
 
+/// The default `s(x)` basis on a low-cardinality covariate is capped to the
+/// covariate's distinct values: the 4-knot heuristic floor handed a binary
+/// covariate eight cubic functions, six of them identified by the penalty
+/// alone. The heuristic knot count itself (the default policy) is unchanged;
+/// only the basis built from it is capped by the data's support, and an
+/// explicit `k=` is honoured as written.
+#[test]
+fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
+    let dimension_of = |formula: &str, unique: usize| -> (usize, usize, usize) {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..60)
+                .map(|i| {
+                    let x = (i % unique) as f64;
+                    vec![x.sin(), x]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula(formula).expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms =
+            build_termspec(&parsed.terms, &ds, &col_map, &mut notes).expect("default smooth builds");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected 1D B-spline");
+        };
+        let internal = match &spec.knotspec {
+            BSplineKnotSpec::Generate { num_internal_knots, .. } => *num_internal_knots,
+            BSplineKnotSpec::Automatic { num_internal_knots: Some(knots), .. } => *knots,
+            other => panic!("unexpected default knot spec {other:?}"),
+        };
+        assert!(spec.penalty_order <= spec.degree);
+        (internal + spec.degree + 1, spec.degree, spec.penalty_order)
+    };
+    // (unique, expected basis dimension, expected degree)
+    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 8, 3)] {
+        let (got_dimension, got_degree, _) = dimension_of("y ~ s(x)", unique);
+        assert_eq!(
+            (got_dimension, got_degree),
+            (dimension, degree),
+            "default s(x) on {unique} unique values"
+        );
+    }
+    // An explicit basis dimension is the caller's contract, not a default.
+    assert_eq!(dimension_of("y ~ s(x, k=8)", 3).0, 8);
+}
+
 #[test]
 fn bug_term_builder_knots_floor_on_constant_column() {
     let c = array![4.0, 4.0, 4.0, 4.0];
@@ -4618,6 +4665,26 @@ fn penalty_order_outside_one_to_degree_is_an_error_not_a_clamp() {
         err.contains("degree=3 was reduced to 2") && err.contains("k=3"),
         "the k-driven degree reduction must be named, got: {err}"
     );
+    // An inferred basis on a three-valued covariate is capped to quadratic by
+    // the data support, not by any `k`; the error must say so.
+    let three_valued = continuous_dataset(
+        &["y", "x"],
+        (0..30)
+            .map(|i| {
+                let x = (i % 3) as f64;
+                vec![x * x + 0.01 * i as f64, x]
+            })
+            .collect(),
+    );
+    let err = formula_error("y ~ s(x, penalty_order=3)", &three_valued);
+    assert!(
+        err.contains("penalty_order=3 exceeds the spline degree 2")
+            && err.contains("only 3 unique values")
+            && !err.contains("k="),
+        "the support-driven degree reduction must be named, got: {err}"
+    );
+    let spec = build_formula("y ~ s(x)", &three_valued);
+    assert_eq!(bspline_spec(&spec, 0).penalty_order, 2);
     let err = formula_error("y ~ te(x, z, penalty_order=[2, 4])", &ds);
     assert!(
         err.contains("tensor margin 1") && err.contains("penalty_order=4"),

@@ -118,7 +118,8 @@ impl PyEventHistoryModel {
         self.fit.rank()
     }
 
-    /// Summed time and latent-order reference discrepancies in nats; empty for
+    /// Per reference grid the fit ran on, the move the next grid makes at the
+    /// fitted coefficients, in posterior standard deviations; empty for
     /// stationary-prior centring.
     fn reference_refinements(&self) -> Vec<f64> {
         self.fit.reference_refinements.clone()
@@ -128,8 +129,9 @@ impl PyEventHistoryModel {
         self.fit.centring.as_ref().map_or(0, |c| c.masks)
     }
 
-    /// Sum of time-refinement and latent-order discrepancies at fixed
-    /// coefficients, in nats.
+    /// The reference grid's certificate: the geometric-tail estimate of the
+    /// moves finer grids make the fitted coefficients take, in posterior
+    /// standard deviations.
     fn reference_certificate(&self) -> Option<f64> {
         self.fit.reference_certificate
     }
