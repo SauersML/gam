@@ -29,10 +29,17 @@ on:
       # without waiting on the multi-hour Rust suite in test.yml.
       - "tests/**"
       - "gamfit/**"
+      # The gamfit-vs-pyGAM harness: its smoke test runs in the bench step.
+      - "bench/pygam_compare/**"
       - "src/inference/model.rs"
       - "src/inference/predict/mod.rs"
       - "src/inference/predict/standard.rs"
       - "src/terms/smooth/spatial_optimization.rs"
+      # The generated gamfit/_rust.pyi mirrors these declarations; the stub
+      # drift check and the static-typing lane must see every change to them.
+      - "crates/gam-pyffi/**"
+      - "scripts/gen_rust_stub.py"
+      - "pyproject.toml"
       - ".github/workflows/python-contracts.yml"
 
 concurrency:
@@ -148,7 +155,8 @@ jobs:
         run: |
           python -m pip install \
             'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
-            'matplotlib>=3.8' 'scikit-learn>=1.4' 'lifelines>=0.28'
+            'matplotlib>=3.8' 'scikit-learn>=1.4' 'lifelines>=0.28' \
+            'mypy>=2.3'
 
       - name: Run numeric by-variable predict-clip contract (#1513)
         if: ${{ !cancelled() && steps.extension.outcome == 'success' && steps.test-extras.outcome == 'success' }}
@@ -207,11 +215,28 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py" -v --tb=short
 
-      - name: Run bench-package Python tests (#1512 orphans)
+      - name: Install bench-only requirements into an isolated venv (pyGAM)
+        id: bench-venv
         if: ${{ !cancelled() && steps.extension.outcome == 'success' && steps.test-extras.outcome == 'success' }}
+        # bench/pygam_compare's smoke test runs real pyGAM fits, so pyGAM must be
+        # installed; it is a bench-only dependency (never a gamfit runtime dep).
+        # A --system-site-packages venv sees the gamfit wheel and the test extras
+        # but keeps pyGAM's `scipy<1.17` pin out of the interpreter the full
+        # tests/ triage below runs on, so installing it cannot change that
+        # inventory's numbers.
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          python -m venv --system-site-packages bench-venv
+          bench-venv/bin/python -m pip install -r "$GITHUB_WORKSPACE/bench/pygam_compare/requirements.txt"
+
+      - name: Run bench-package Python tests (#1512 orphans)
+        if: ${{ !cancelled() && steps.extension.outcome == 'success' && steps.test-extras.outcome == 'success' && steps.bench-venv.outcome == 'success' }}
         # `bench/` holds five pytest files — 26 test functions covering the
         # manifold-zoo geometry contracts, the exact analytic handoff, the zoo
-        # figure records and the synthetic-SAE metrics — and they ran in NO CI
+        # figure records and the synthetic-SAE metrics (plus, since, the
+        # gamfit-vs-pyGAM harness smoke test in bench/pygam_compare, which is
+        # why this step runs on the bench venv above) — and they ran in NO CI
         # job. `pyproject.toml` sets `testpaths = ["tests"]`, and BOTH
         # directory-level steps pass an explicit `tests/` target, which
         # overrides testpaths entirely; no step ever named `bench`. This is the
@@ -233,7 +258,7 @@ jobs:
           set -euo pipefail
           mkdir -p benchpath
           ln -sfn "$GITHUB_WORKSPACE/bench" benchpath/bench
-          PYTHONPATH="$PWD/benchpath" python -m pytest "$GITHUB_WORKSPACE/bench" \
+          PYTHONPATH="$PWD/benchpath" bench-venv/bin/python -m pytest "$GITHUB_WORKSPACE/bench" \
             -p no:cacheprovider -v --tb=short
 
       - name: Install full-suite test runners (xdist + timeout)
@@ -374,7 +399,7 @@ jobs:
         run: |
           set -uo pipefail
           python -m pytest "$GITHUB_WORKSPACE/tests/" \
-            -m "not slow" \
+            -m "not slow and not static_typing" \
             -p no:cacheprovider \
             -n auto --timeout=300 --timeout-method=thread \
             --max-worker-restart=200 \
@@ -442,3 +467,42 @@ jobs:
           files: |
             ${{ runner.temp }}/py1512_junit.xml
             ${{ runner.temp }}/py1512_summary.txt
+
+  # mypy --strict over gamfit and a user of it (audit PKG-05). It needs no
+  # compiled extension, since mypy reads the generated gamfit/_rust.pyi, so it
+  # runs in minutes beside the wheel build rather than after it. What it does
+  # need is every framework gamfit integrates with, which is why these tests
+  # carry the `static_typing` marker and the full-suite steps deselect it.
+  static-typing:
+    name: Static typing (mypy --strict)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the type-checking toolchain
+        # torch comes from the CPU index first so the `type` group resolves
+        # against it instead of pulling the CUDA build. The rest is read from
+        # pyproject.toml's `type` dependency group, the one list contributors
+        # install.
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python - <<'PY' > "$RUNNER_TEMP/type-requirements.txt"
+          import tomllib
+          with open("pyproject.toml", "rb") as handle:
+              groups = tomllib.load(handle)["dependency-groups"]
+          print("\n".join(groups["type"]))
+          PY
+          python -m pip install -r "$RUNNER_TEMP/type-requirements.txt"
+
+      - name: Run the static-typing contract
+        run: python -m pytest tests/test_static_typing.py -m static_typing -v --tb=short

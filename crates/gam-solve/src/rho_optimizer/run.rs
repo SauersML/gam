@@ -33,6 +33,34 @@ pub(crate) fn outer_theta_bitwise_eq(left: &Array1<f64>, right: &Array1<f64>) ->
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
+/// Why a search on the parent's own inputs did not take the parent's point.
+pub(crate) const RESUME_DECLINED: &str = "the parent's certified point is not certified for this search's criterion (a pilot, an \
+     evidence fit or an alternation round, or a criterion this version computes differently), \
+     so this search ran as it runs cold";
+
+/// `config` as the resume attempt for a warm start on the parent's own inputs
+/// (gam#3002): the parent's point as the one seed, its inner mode installed
+/// there, and its recorded criterion value, so the search accepts the point
+/// where it stands or declines (`resume_prior_certificate`).
+pub(crate) fn resume_config(
+    config: &OuterConfig,
+    warm_start: &gam_model_api::WarmStart,
+) -> OuterConfig {
+    let mut resume = config.clone();
+    resume.initial_rho = Some(warm_start.theta.clone());
+    resume.initial_rho_candidates.clear();
+    resume.sole_seed = true;
+    resume.screen_initial_rho = false;
+    resume.screening_cap = None;
+    resume.initial_inner_seed = Some(BoundInnerSeed {
+        theta: warm_start.theta.clone(),
+        beta: warm_start.beta.clone(),
+    });
+    resume.initial_rho_is_prior_terminal_certificate = true;
+    resume.resume_value = Some(warm_start.value);
+    resume
+}
+
 /// Install cached inner state only at the exact outer coordinate that owns it.
 ///
 /// This function is called after a seed-attempt reset and immediately before
@@ -179,6 +207,13 @@ pub(crate) struct OuterConfig {
     /// about it: a terminal certificate is a rho a previous outer run already
     /// certified as stationary, so re-deriving it can only move it.
     pub(crate) initial_rho_is_prior_terminal_certificate: bool,
+    /// A resume attempt (gam#3002): the criterion value a prior fit certified at
+    /// `initial_rho`. The search then accepts `initial_rho` where it stands when
+    /// it is certified for THIS search's criterion (its value agrees within the
+    /// rounding envelope and its projected gradient is inside the band), and
+    /// otherwise declines with an error. It never searches
+    /// (`resume_prior_certificate`).
+    pub(crate) resume_value: Option<f64>,
     /// Outer-aware inner-PIRLS iteration cap (sibling of `screening_cap`).
     /// When set, the BFGS bridge drives this atomic on every accepted
     /// gradient eval to coarsen the inner Newton solve at early outer iters
@@ -375,6 +410,7 @@ impl Default for OuterConfig {
             screening_cap: None,
             screen_initial_rho: false,
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
@@ -440,6 +476,15 @@ pub struct OuterProblem {
     rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
     sole_seed: bool,
+    /// The inner mode at one joined multistart seed: installed only at that
+    /// exact point (`install_matching_initial_inner_seed`).
+    warm_start: Option<BoundInnerSeed>,
+    /// A prior fit's certified point (`with_warm_start`, gam#3002).
+    warm_start_source: Option<gam_model_api::WarmStart>,
+    /// This problem is a multistart's resume attempt: a declined prior
+    /// certificate is returned as the error, and the multistart runs the cold
+    /// seeds itself.
+    resume_only: bool,
 }
 
 impl OuterProblem {
@@ -482,6 +527,9 @@ impl OuterProblem {
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             rho_canonical_keys: None,
             sole_seed: false,
+            warm_start: None,
+            warm_start_source: None,
+            resume_only: false,
         }
     }
 
@@ -608,6 +656,44 @@ impl OuterProblem {
         self.initial_rho_candidates.clear();
         self.sole_seed = true;
         self
+    }
+    /// Offer this search a prior fit's certified outer point (gam#3002). Every
+    /// warm-start source reaches every outer search through this one rule, and
+    /// [`Self::run`] and [`Self::run_certified_multistart`] derive from it what
+    /// the point may do without changing the point the search reports for its
+    /// own criterion (see [`gam_model_api::WarmStart`]):
+    /// - on the parent's own inputs the point is offered as a prior certificate
+    ///   first. The search accepts it with no outer iteration where it is
+    ///   certified for this search's criterion (`resume_prior_certificate`), and
+    ///   otherwise runs exactly as it runs cold, from a reset objective;
+    /// - on other inputs the independent multistart adds it as one more seed, so
+    ///   its argmin is taken over a superset of the cold seeds; the cascade,
+    ///   which certifies its first certifiable seed, runs cold and records why.
+    /// A point of another outer dimension belongs to another search: this one
+    /// runs cold.
+    pub fn with_warm_start(mut self, warm_start: &gam_model_api::WarmStart) -> Self {
+        self.warm_start_source = Some(warm_start.clone());
+        self
+    }
+    /// This problem with no warm start: the search a cold fit runs.
+    fn without_warm_start(&self) -> Self {
+        let mut cold = self.clone();
+        cold.warm_start = None;
+        cold.warm_start_source = None;
+        cold.resume_only = false;
+        cold
+    }
+    /// The warm start this search can take, if its point has this search's outer
+    /// dimension. A point of another dimension is recorded as not used here.
+    fn warm_start_for_this_search(&self) -> Option<&gam_model_api::WarmStart> {
+        let warm_start = self.warm_start_source.as_ref()?;
+        if warm_start.theta.len() != self.n_params {
+            warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                "the parent's certified point has another outer dimension than this search",
+            ));
+            return None;
+        }
+        Some(warm_start)
     }
     /// Wire the bidirectional inner-PIRLS feedback channel.
     ///
@@ -838,13 +924,15 @@ impl OuterProblem {
             initial_rho_candidates: self.initial_rho_candidates.clone(),
             previously_refused_seed_points: Vec::new(),
             carried_checkpoint: None,
-            initial_inner_seed: None,
+            initial_inner_seed: self.warm_start.clone(),
             fallback_policy: self.fallback_policy,
             screening_cap: self.screening_cap.clone(),
             screen_initial_rho: self.screen_initial_rho,
-            // Only the cache's final-hit path can establish this, and it says
-            // so where it sets `initial_rho`.
+            // Only a prior fit's certified point can establish these: the resume
+            // attempt `Self::run` derives from a warm start, and the cache's final
+            // hit, which says so where it sets `initial_rho`.
             initial_rho_is_prior_terminal_certificate: false,
+            resume_value: None,
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
@@ -1005,6 +1093,40 @@ impl OuterProblem {
         let objective_upper = obj.outer_domain_upper_bound()?;
         if objective_lower.is_some() || objective_upper.is_some() {
             install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
+        }
+        // A warm start (`with_warm_start`): on the parent's inputs the point is
+        // offered as a prior certificate, and a decline leaves this search to run
+        // exactly as it runs cold; on other inputs this cascade, which certifies
+        // its first certifiable seed, runs cold. One warm-start source per
+        // search, so the cold run takes no cache session either.
+        if self.warm_start_source.is_some() {
+            if let Some(warm_start) = self.warm_start_for_this_search() {
+                if warm_start.same_inputs {
+                    match run_outer(obj, &resume_config(&config, warm_start), context) {
+                        Ok(result) => {
+                            warm_start.record(gam_model_api::WarmStartOutcome::Resumed);
+                            return Ok(result);
+                        }
+                        Err(decline) if self.resume_only => return Err(decline),
+                        Err(decline) => {
+                            log::info!(
+                                "[OUTER] {context}: the parent's certified point is not certified \
+                                 for this search's criterion ({decline}); running the cold search"
+                            );
+                            warm_start
+                                .record(gam_model_api::WarmStartOutcome::NotUsed(RESUME_DECLINED));
+                            obj.reset();
+                        }
+                    }
+                } else {
+                    warm_start.record(gam_model_api::WarmStartOutcome::NotUsed(
+                        "the fit's inputs differ from the parent's, and this search certifies its \
+                         first certifiable seed, so a new first seed would change the point it \
+                         reports",
+                    ));
+                }
+            }
+            return run_outer(obj, &config, context);
         }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
@@ -2005,90 +2127,19 @@ pub(crate) fn audit_stationary_point_in(
 // warn-and-continue diagnostic — so a nonstationary point can never be
 // minted into a fit (SPEC rule 20).
 
-/// Cholesky positive-SEMIdefiniteness probe for the (small, outer-dim) final
-/// Hessian, with a roundoff-scale diagonal shift. Returns `None` when the
-/// matrix is empty, non-square, or non-finite; `Some(false)` when the shifted
-/// matrix has a non-positive pivot — i.e. the curvature is genuinely
-/// indefinite, not merely semidefinite-within-noise.
-///
-/// The shift is `√ε · max(1, max|H_ii|)`: eigenvalues assembled through
-/// O(‖H‖)-scaled arithmetic carry O(ε·‖H‖) roundoff, so a `√ε`-relative
-/// margin cleanly separates a true negative direction from accumulated
-/// floating-point noise on a flat (near-semidefinite) valley.
-
-/// The same probe with an explicit **measured** curvature
-/// resolution, which the shift is raised to when it is the larger (#2748).
-///
-/// The `√ε·max(1, max|H_ii|)` shift above is a statement about the *arithmetic*
-/// that assembled `H` — accumulated round-off at the matrix's own scale. It is
-/// not, and does not claim to be, a statement about the *assembly*: an outer
-/// criterion Hessian is a derivative of a quantity computed through an inner
-/// solve, a log-determinant and a trace contraction, and its error is not
-/// bounded by `√ε·‖H‖`. `gam_linalg::curvature_resolution` calls the second
-/// quantity `‖δH‖₂` and requires it to be MEASURED, per site, from an identity
-/// that is exactly zero in exact arithmetic.
-///
-/// `measured_resolution` is that measurement. `0.0` reproduces the historical
-/// shift bit for bit, and since the two are combined by `max` this can only
-/// ever admit a point the previous rule refused — never refuse one it admitted.
-/// The shift the certificate's definiteness verdict is ACTUALLY taken at, and
-/// the single owner of that number (#2748).
-///
-/// It is the larger of the measured `‖δH‖₂` and the arithmetic shift
-/// `√ε·max(max|H_ii|, 1)`. The second is what decides whenever no identity
-/// could be measured, and it is not small: on a ρ-Hessian whose largest
-/// diagonal is under 1 it is a flat `√ε = 1.49e-8`.
-///
-/// It is `pub(crate)` and separate because the verdict travels. The
-/// smoothing-correction re-judges the same direction at the same point against
-/// a resolution built from its own eigensolver's backward error — `2.19e-16` on
-/// the measured #2748 `geo_disease` k=12 cell — and refused a direction the
-/// certificate had cleared at `1.49e-8`, eight orders wider. A verdict and the
-/// standard it was taken at have to travel together, or the second layer
-/// applies a strictly stronger test than the first and the fit dies between
-/// them.
-pub(crate) fn certificate_curvature_shift(hessian: &Array2<f64>, measured_resolution: f64) -> f64 {
-    let n = hessian.nrows();
-    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
-    let arithmetic_shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
-    if measured_resolution.is_finite() && measured_resolution > arithmetic_shift {
-        measured_resolution
-    } else {
-        arithmetic_shift
-    }
-}
-
-pub(crate) fn certificate_hessian_is_psd_at_resolution(
-    hessian: &Array2<f64>,
-    measured_resolution: f64,
-) -> Option<bool> {
-    let n = hessian.nrows();
-    if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let shift = certificate_curvature_shift(hessian, measured_resolution);
-    let mut chol = hessian.clone();
-    for j in 0..n {
-        chol[[j, j]] += shift;
-    }
-    for j in 0..n {
-        for k in 0..j {
-            let l_jk = chol[[j, k]];
-            for i in j..n {
-                chol[[i, j]] -= chol[[i, k]] * l_jk;
-            }
-        }
-        let pivot = chol[[j, j]];
-        if !(pivot > 0.0) || !pivot.is_finite() {
-            return Some(false);
-        }
-        let inv_sqrt = 1.0 / pivot.sqrt();
-        for i in j..n {
-            chol[[i, j]] *= inv_sqrt;
-        }
-    }
-    Some(true)
-}
+// The certificate's definiteness verdict, the one owner of the shift it is taken at, and the
+// Newton decrement that travels with it are opt's bound-constrained second-order helpers (SPEC
+// rule 24, #2900 row 24.2). The shift is the larger of a MEASURED curvature resolution (#2748:
+// an outer Hessian is a derivative through an inner solve, a log-determinant and a trace
+// contraction, so its error is not bounded by `√ε·‖H‖`) and the arithmetic
+// `√ε·max(max|H_ii|, 1)`; `0.0` is the arithmetic shift. A verdict and the shift it was taken at
+// travel together, so the smoothing correction re-judges a direction at the certificate's shift
+// rather than at its own eigensolver's backward error.
+pub(crate) use opt::{
+    certificate_curvature_shift,
+    hessian_is_psd_at_resolution as certificate_hessian_is_psd_at_resolution,
+    newton_predicted_decrease, newton_predicted_decrease_at_resolution,
+};
 
 /// PSD verdict of the outer Hessian restricted to its UN-RAILED coordinates
 /// (#2299 box-KKT reduced-Hessian / critical-cone gate).
@@ -2905,34 +2956,6 @@ struct ConfirmedDescent {
     on_box_face: bool,
 }
 
-/// The largest `α ≥ 0` for which `ρ + α·d` stays inside the box, exactly.
-///
-/// `f64::INFINITY` when no coordinate the ray moves is bounded in the direction
-/// it moves. Coordinates with `d_i == 0` never bind — the ray does not move
-/// them — which is what lets the railed block (where `direction` is exactly
-/// zero by construction) sit at its bounds without capping the step at `0`.
-fn max_feasible_step_along(
-    rho: &Array1<f64>,
-    ray: &Array1<f64>,
-    bounds: &(Array1<f64>, Array1<f64>),
-) -> f64 {
-    let (lower, upper) = bounds;
-    let mut alpha = f64::INFINITY;
-    for i in 0..rho.len() {
-        let step = ray[i];
-        if step > 0.0 {
-            if let Some(&limit) = upper.get(i) {
-                alpha = alpha.min((limit - rho[i]) / step);
-            }
-        } else if step < 0.0 {
-            if let Some(&limit) = lower.get(i) {
-                alpha = alpha.min((limit - rho[i]) / step);
-            }
-        }
-    }
-    alpha.max(0.0)
-}
-
 /// Extend a confirmed negative-curvature descent to the step the criterion
 /// actually supports, instead of the step the falsifiability ladder happened to
 /// stop at (#2612).
@@ -3031,7 +3054,7 @@ fn expand_confirmed_descent(
         }
         project_to_bounds(&point, Some(bounds))
     };
-    let alpha_box = max_feasible_step_along(rho, &ray, bounds);
+    let alpha_box = opt::max_feasible_step_along(rho, &ray, &bounds.0, &bounds.1);
     let mut best = ConfirmedDescent {
         point: point_at(alpha),
         alpha,
@@ -3118,150 +3141,6 @@ fn expand_confirmed_descent(
     best
 }
 
-/// Second-order predicted objective decrease of a safeguarded Newton step at a
-/// flat-valley cost-stall exit (#2253/#2249/#2015).
-///
-/// On a flat-valley cost-stall exit the outer criterion has provably stopped
-/// improving (the cost-stall window fired), yet the re-measured projected
-/// gradient can sit modestly above the score-relative flat band on a
-/// weakly-identified small-n fit (measured: |Pg| ≈ 0.072 vs a score-relative
-/// band ≈ 0.053 on an n=84/p=64 K=1 circle). Whether that residual is genuine
-/// available descent is a SECOND-ORDER question. The improvement a safeguarded
-/// Newton step buys is the Newton decrement over two:
-///
-/// ```text
-/// Δpred = ½ · gᵀ H⁻¹ g,
-/// ```
-///
-/// the textbook Newton stopping quantity (Boyd–Vandenberghe §9.5). When `Δpred`
-/// is below the outer objective tolerance, no step can reduce the criterion by
-/// more than that tolerance and the point is stationary at the resolution the
-/// criterion can be optimized — the mathematically correct "no further descent
-/// possible" criterion.
-///
-/// This is curvature-scaled, not a constant: because `H⁻¹` weights each gradient
-/// component by the inverse eigenvalue, a residual aligned with a NEAR-FLAT
-/// Hessian eigenvector (a linear ramp that DOES carry real descent) inflates
-/// `gᵀ H⁻¹ g` toward the roundoff-regularized `|g_flat|² / shift` and is
-/// REJECTED; only a residual that is small along the well-curved directions and
-/// nearly orthogonal to the flat ones certifies. An indefinite Hessian never
-/// reaches here — the certificate's curvature gate (`certificate_hessian_is_psd_at_resolution`)
-/// rejects a genuinely indefinite point independently, and this factorization
-/// returns `None` on a non-PSD shifted factor so the caller falls back to the
-/// gradient-only bound.
-///
-/// `hessian` and `grad` are the analytic outer Hessian and the KKT-PROJECTED
-/// gradient at the certified point. The shift `√ε · max|H_jj|` matches
-/// [`certificate_hessian_is_psd_at_resolution`] so the definiteness verdict and this decrement
-/// agree on the same regularized operator. Returns `None` when the shapes are
-/// malformed, an entry is non-finite, the shifted factor is not PD, or the
-/// resulting quadratic form is negative (which a PD factor rules out; retained
-/// as a roundoff guard).
-pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
-    newton_predicted_decrease_at_resolution(hessian, grad, 0.0)
-}
-
-/// [`newton_predicted_decrease`] for a caller whose definiteness verdict was
-/// taken at a MEASURED curvature resolution (#2817, #1082).
-///
-/// The decrement is taken at the arithmetic shift wherever
-/// `H + √ε·max(max|H_jj|, 1)·I` factors, exactly as before. Only when it does not
-/// — a negative eigenvalue below that shift — is it taken at
-/// [`certificate_curvature_shift`]`(H, measured_resolution)`, the shift at which
-/// [`certificate_hessian_is_psd_at_resolution`] judged the matrix. The verdict and
-/// the operator its decrement is computed on have to be the same one. A caller
-/// that has declared the point PSD at the criterion's resolution, and then asks
-/// for the decrement on a matrix that cannot be factored at the far smaller
-/// arithmetic shift, gets `None` and can never stop at a point its own verdict
-/// accepts.
-///
-/// The arithmetic shift is tried first, not the resolution, because a larger
-/// shift shrinks every positive direction's share `g_i²/(λ_i + shift)`: a residual
-/// along a near-flat POSITIVE direction is real descent, and taking it at the
-/// resolution shift would read it as none. The larger shift can only overstate
-/// descent along a negative direction close to `−shift`, which errs toward
-/// continuing the search. A zero resolution is [`newton_predicted_decrease`] bit
-/// for bit.
-pub(crate) fn newton_predicted_decrease_at_resolution(
-    hessian: &Array2<f64>,
-    grad: &Array1<f64>,
-    measured_resolution: f64,
-) -> Option<f64> {
-    let n = hessian.nrows();
-    if n == 0 || hessian.ncols() != n || grad.len() != n {
-        return None;
-    }
-    if hessian.iter().any(|v| !v.is_finite()) || grad.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let arithmetic_shift = certificate_curvature_shift(hessian, 0.0);
-    if let Some(decrease) = shifted_newton_predicted_decrease(hessian, grad, arithmetic_shift) {
-        return Some(decrease);
-    }
-    let resolution_shift = certificate_curvature_shift(hessian, measured_resolution);
-    if resolution_shift > arithmetic_shift {
-        shifted_newton_predicted_decrease(hessian, grad, resolution_shift)
-    } else {
-        None
-    }
-}
-
-/// `½·gᵀ(H + shift·I)⁻¹g` through a lower Cholesky factor, or `None` when the
-/// shifted matrix is not positive definite. Shapes and finiteness are checked by
-/// [`newton_predicted_decrease_at_resolution`].
-fn shifted_newton_predicted_decrease(
-    hessian: &Array2<f64>,
-    grad: &Array1<f64>,
-    shift: f64,
-) -> Option<f64> {
-    let n = hessian.nrows();
-    // Lower Cholesky factor L of H + shift·I (same regularization the PSD probe
-    // uses), computed in place.
-    let mut l = hessian.clone();
-    for j in 0..n {
-        l[[j, j]] += shift;
-    }
-    for j in 0..n {
-        for k in 0..j {
-            let l_jk = l[[j, k]];
-            for i in j..n {
-                l[[i, j]] -= l[[i, k]] * l_jk;
-            }
-        }
-        let pivot = l[[j, j]];
-        if !(pivot > 0.0) || !pivot.is_finite() {
-            return None;
-        }
-        let inv_sqrt = 1.0 / pivot.sqrt();
-        for i in j..n {
-            l[[i, j]] *= inv_sqrt;
-        }
-    }
-    // Solve (L Lᵀ) d = g for d = H_s⁻¹ g: forward-substitute L y = g, then
-    // back-substitute Lᵀ d = y.
-    let mut y = grad.clone();
-    for j in 0..n {
-        let mut s = y[j];
-        for k in 0..j {
-            s -= l[[j, k]] * y[k];
-        }
-        y[j] = s / l[[j, j]];
-    }
-    let mut d = y;
-    for j in (0..n).rev() {
-        let mut s = d[j];
-        for k in (j + 1)..n {
-            s -= l[[k, j]] * d[k];
-        }
-        d[j] = s / l[[j, j]];
-    }
-    let quad = grad.dot(&d); // gᵀ H_s⁻¹ g ≥ 0 for a PD factor.
-    if !quad.is_finite() || quad < 0.0 {
-        return None;
-    }
-    Some(0.5 * quad)
-}
-
 /// Which term of the stationarity bound's `max` chain actually set it.
 ///
 /// `certify_outer_optimality` does not compute *a* bound; it takes the maximum of
@@ -3337,6 +3216,13 @@ pub(crate) enum StationarityBoundSource {
     /// there, so the point is refused by this type instead of railed. The bound
     /// is the decrement verdict's.
     RepresentabilityFace,
+    /// A mint whose polish backtracked along its Newton step, down to where the
+    /// quadratic model's own decrease reaches `band_f`, and found no step that
+    /// lowers the criterion by more than `band_f`, with no limit face lowering it
+    /// either (#3012). The decrement promises a decrease the criterion does not
+    /// deliver along the Newton direction, so the point is refused by this type.
+    /// The bound is the decrement verdict's.
+    NewtonBacktrackUnresolved,
 }
 
 impl StationarityBoundSource {
@@ -3351,6 +3237,7 @@ impl StationarityBoundSource {
             Self::NewtonDecrement => "newton-decrement",
             Self::NewtonDecrementUndecided => "newton-decrement-undecided",
             Self::RepresentabilityFace => "representability-face",
+            Self::NewtonBacktrackUnresolved => "newton-backtrack-unresolved",
         }
     }
 
@@ -8248,6 +8135,11 @@ pub(crate) fn run_outer_uncertified(
                     err,
                 )
             })?;
+    }
+    // A resume attempt (gam#3002) accepts the prior certificate where it stands
+    // or declines; it runs no plan, so no fallback can search from the point.
+    if config.resume_value.is_some() {
+        return resume_prior_certificate(obj, config, &cap, context);
     }
     // Frontier ρ-scaling auto-switch (#986): at per-atom-EFS-eligible frontier
     // rho dimension the decoupled per-atom fixed point is the primary outer

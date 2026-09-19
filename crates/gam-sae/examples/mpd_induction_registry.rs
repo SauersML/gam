@@ -15,10 +15,8 @@
 //! The example:
 //! * refuses a settings file other than the one `execute.json` declares, and exports with different
 //!   checkpoints or token rows;
-//! * widens every tensor to binary64 (exact for every `f32`) and registers it in a
-//!   [`TensorRegistry`], with its aliases and every discovered use site.
-//!   `torch.nn.functional.linear` applies `x Wᵀ`, the identity orientation; an index or an addition
-//!   reads the stored values; any other op is refused;
+//! * widens every tensor to binary64 and registers it, with its aliases and every discovered use
+//!   site, through `support/induction_export.rs`;
 //! * checks that the export's edit factors are a layer-0 head's output block of the registered
 //!   `W_O.0` (negated) and its unit columns, and builds each setting's [`ParameterEditRecord`] at
 //!   `W_O.0#0`;
@@ -68,67 +66,25 @@ use gam_sae::parameter_decomposition::block::{
 };
 use gam_sae::parameter_decomposition::lift::{
     ExecutedExperiment, ForwardRoundoff, LiftError, ParameterExperiment, ParameterReadout, TensorId,
-    TensorRegistry, TieOrientation, UseMap, UseSiteId,
+    UseSiteId,
 };
 use gam_sae::parameter_decomposition::occurrence::{EditScope, ParameterEditRecord, PositionScope};
 use gam_sae::parameter_decomposition::receipts::{
     ExternalExecution, ReceiptRefusal, StageAgreement, affine_stage_band, compare_stage,
     factored_edit_stage_band,
 };
-use ndarray::{Array1, Array2, Array3, ArrayD, ArrayView1, ArrayView2, ArrayView3, Axis, IxDyn, s};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[path = "support/npy_header.rs"]
 mod npy_header;
-use npy_header::{NpyFloat, parse_npy_float_header, parse_npy_header};
+#[path = "support/induction_export.rs"]
+mod induction_export;
+use induction_export::{ExportFile, float64_array, load_export};
 
 const USAGE: &str = "usage: mpd_induction_registry --run EXECUTE_DIR --settings SETTINGS_JSON --out REPORT_JSON";
-
-/// The fields of `registry.json` this example reads; the others are ignored.
-#[derive(Deserialize)]
-struct Export {
-    stage: String,
-    checkpoint: u64,
-    trained_dtype: String,
-    sequences: usize,
-    tokens: Vec<Vec<i64>>,
-    config: Config,
-    tensors: Vec<Tensor>,
-    use_sites: Vec<Use>,
-    files: BTreeMap<String, ExportFile>,
-}
-
-#[derive(Deserialize)]
-struct Config {
-    vocab: usize,
-    seq_len: usize,
-    d_model: usize,
-    n_layers: usize,
-    n_heads: usize,
-    d_head: usize,
-}
-
-#[derive(Deserialize)]
-struct Tensor {
-    tensor_id: String,
-    aliases: Vec<String>,
-    shape: Vec<usize>,
-}
-
-#[derive(Deserialize)]
-struct Use {
-    tensor_id: String,
-    ordinal: usize,
-    transposed: bool,
-    op: String,
-}
-
-#[derive(Deserialize)]
-struct ExportFile {
-    path: String,
-}
 
 /// The fields of `execute.json` this example reads.
 #[derive(Deserialize)]
@@ -235,119 +191,6 @@ fn flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].as_str())
         .ok_or_else(|| format!("missing {name}; {USAGE}"))
-}
-
-/// The bytes of one exported array, found by its file name inside `dir`, so an export can move.
-fn read_array(
-    files: &BTreeMap<String, ExportFile>,
-    dir: &Path,
-    array_id: &str,
-) -> Result<(PathBuf, Vec<u8>), String> {
-    let file = files
-        .get(array_id)
-        .ok_or_else(|| format!("the manifest names no file for {array_id}"))?;
-    let name = Path::new(&file.path)
-        .file_name()
-        .ok_or_else(|| format!("{}: no file name", file.path))?;
-    let path = dir.join(name);
-    let bytes = std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    Ok((path, bytes))
-}
-
-/// The data bytes of `count` elements of `width` bytes, refusing a truncated or padded file.
-fn payload<'a>(
-    bytes: &'a [u8],
-    data_off: usize,
-    count: usize,
-    width: usize,
-    path: &Path,
-) -> Result<&'a [u8], String> {
-    let end = count
-        .checked_mul(width)
-        .and_then(|size| size.checked_add(data_off))
-        .ok_or_else(|| format!("{}: size overflow", path.display()))?;
-    if end != bytes.len() {
-        return Err(format!(
-            "{}: {} bytes, expected {end}",
-            path.display(),
-            bytes.len()
-        ));
-    }
-    Ok(&bytes[data_off..end])
-}
-
-/// One stored tensor: a two-axis `<f4` array, widened to binary64.
-fn stored_tensor(export: &Export, dir: &Path, tensor: &Tensor) -> Result<ArrayD<f64>, String> {
-    let (path, bytes) = read_array(&export.files, dir, &tensor.tensor_id)?;
-    let (rows, cols, width, is_f4, data_off) = parse_npy_header(&bytes, &path)?;
-    if !is_f4 {
-        return Err(format!("{}: expected the trained <f4 values", path.display()));
-    }
-    if [rows, cols][..] != tensor.shape[..] {
-        return Err(format!(
-            "{}: shape ({rows}, {cols}), but registry.json records {:?}",
-            path.display(),
-            tensor.shape
-        ));
-    }
-    let values = payload(&bytes, data_off, rows * cols, width, &path)?
-        .chunks_exact(width)
-        .map(|chunk| f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])))
-        .collect();
-    ArrayD::from_shape_vec(IxDyn(&[rows, cols]), values)
-        .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// One executed array: a two-axis `<f8` array of the declared shape.
-fn float64_array(
-    files: &BTreeMap<String, ExportFile>,
-    dir: &Path,
-    array_id: &str,
-    expected: (usize, usize),
-) -> Result<Array2<f64>, String> {
-    let (path, bytes) = read_array(files, dir, array_id)?;
-    let header = parse_npy_float_header(&bytes, &path)?;
-    if header.float != NpyFloat::F8 {
-        return Err(format!(
-            "{}: expected <f8 values from the binary64 executor",
-            path.display()
-        ));
-    }
-    let [rows, cols] = header.shape[..] else {
-        return Err(format!(
-            "{}: expected two axes, got {:?}",
-            path.display(),
-            header.shape
-        ));
-    };
-    if (rows, cols) != expected {
-        return Err(format!(
-            "{}: shape ({rows}, {cols}), expected {expected:?}",
-            path.display()
-        ));
-    }
-    let values = payload(&bytes, header.data_off, rows * cols, header.float.bytes(), &path)?
-        .chunks_exact(8)
-        .map(|chunk| {
-            f64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ])
-        })
-        .collect();
-    Array2::from_shape_vec((rows, cols), values)
-        .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// What a discovered use site does with its tensor, for the ops this export produces.
-fn use_map(site: &Use) -> Result<UseMap, String> {
-    match (site.op.as_str(), site.transposed) {
-        ("torch.nn.functional.linear", false) => Ok(UseMap::Linear(TieOrientation::Identity)),
-        ("torch.Tensor.__getitem__" | "torch.Tensor.add", false) => Ok(UseMap::Stored),
-        (op, transposed) => Err(format!(
-            "use site {}#{}: no use map is declared for op {op} (transposed: {transposed})",
-            site.tensor_id, site.ordinal
-        )),
-    }
 }
 
 /// The native stage of one linear use on the external input rows, and its receipt.
@@ -526,54 +369,18 @@ fn main() -> Result<(), String> {
             settings_path.display()
         ));
     }
+    if execute.stage != "execute" {
+        return Err(format!("stage {:?}; expected execute", execute.stage));
+    }
     let registry_dir = PathBuf::from(&execute.harvest);
-    let text = std::fs::read_to_string(registry_dir.join("registry.json"))
-        .map_err(|error| format!("read registry.json in {}: {error}", registry_dir.display()))?;
-    let export: Export =
-        serde_json::from_str(&text).map_err(|error| format!("registry.json: {error}"))?;
-    if export.stage != "registry" || execute.stage != "execute" {
-        return Err(format!(
-            "stages {:?} and {:?}; expected registry and execute",
-            export.stage, execute.stage
-        ));
-    }
-    if export.trained_dtype != "float32" {
-        return Err(format!(
-            "trained dtype {:?}; the tensors are read as <f4",
-            export.trained_dtype
-        ));
-    }
+    let loaded = load_export(&registry_dir)?;
+    let (export, registry) = (&loaded.export, &loaded.registry);
     let config = &export.config;
     if export.checkpoint != execute.checkpoint
         || export.sequences != execute.sequences
         || export.tokens != execute.tokens
-        || export.tokens.len() != export.sequences
-        || export.tokens.iter().any(|row| row.len() != config.seq_len)
     {
         return Err("the registry and execute exports hold different checkpoints or token rows".to_string());
-    }
-
-    let mut registry = TensorRegistry::default();
-    let mut values = BTreeMap::new();
-    for tensor in &export.tensors {
-        let stored = stored_tensor(&export, &registry_dir, tensor)?;
-        registry
-            .register_storage(TensorId(tensor.tensor_id.clone()), stored.view())
-            .map_err(|error| error.to_string())?;
-        values.insert(tensor.tensor_id.clone(), stored);
-    }
-    for tensor in &export.tensors {
-        for alias in &tensor.aliases {
-            registry
-                .register_alias(TensorId(alias.clone()), TensorId(tensor.tensor_id.clone()))
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    for site in &export.use_sites {
-        let storage = TensorId(site.tensor_id.clone());
-        registry
-            .register_use_site(UseSiteId::read(&storage, site.ordinal), storage, use_map(site)?)
-            .map_err(|error| error.to_string())?;
     }
     let fingerprint = registry.teacher_fingerprint();
     let native_logits = float64_array(
@@ -592,15 +399,7 @@ fn main() -> Result<(), String> {
         native_logits.ncols()
     );
 
-    let weight = |id: &str| -> Result<Array2<f64>, String> {
-        values
-            .get(id)
-            .ok_or_else(|| format!("the registry export holds no {id}"))?
-            .view()
-            .into_dimensionality::<ndarray::Ix2>()
-            .map(|view| view.to_owned())
-            .map_err(|error| format!("{id}: {error}"))
-    };
+    let weight = |id: &str| loaded.weight(id);
     let output = weight("W_O.0")?;
     let later_output = weight("W_O.1")?;
     let unembedding = weight("W_U")?;
@@ -736,7 +535,7 @@ fn main() -> Result<(), String> {
                 let delta = FactoredEdit::new(left.clone(), right.clone())
                     .map_err(|error| LiftError::from(error).to_string())?;
                 Some(
-                    ParameterEditRecord::new(&registry, EditScope::UseSite(site.clone()), scope.clone(), delta)
+                    ParameterEditRecord::new(registry, EditScope::UseSite(site.clone()), scope.clone(), delta)
                         .map_err(|error| error.to_string())?,
                 )
             }
@@ -769,7 +568,7 @@ fn main() -> Result<(), String> {
                 ],
             };
             let shapes = experiment
-                .readout_shapes(&registry, config.vocab)
+                .readout_shapes(registry, config.vocab)
                 .map_err(|error| error.to_string())?;
             let executed = ExecutedExperiment {
                 readouts: stage_ids
@@ -855,15 +654,15 @@ fn main() -> Result<(), String> {
                 );
                 // The softmax and the value read at torch's own inputs, taken as exact.
                 let exact = Array3::<f64>::zeros(external_scores.dim());
-                let (weights, weight_radius) = core
+                let pattern = core
                     .weights_at_scores(external_scores.view(), exact.view())
                     .map_err(|error| error.to_string())?;
                 let external_pattern = heads_of(&format!("pattern.{layer}"), index, sequence);
                 tally.pattern.add(
                     sequence,
                     causal_rows(external_pattern.view()).view(),
-                    causal_rows(weights.view()).view(),
-                    Some(causal_rows(weight_radius.view()).view()),
+                    causal_rows(pattern.weights.view()).view(),
+                    Some(causal_rows(pattern.weight_radius.view()).view()),
                 )?;
                 let (mixed, mixed_radius) = core
                     .mix_at_weights(external_pattern.view(), exact.view(), value_rows)
@@ -914,14 +713,14 @@ fn main() -> Result<(), String> {
                     _ => AttentionLayerReads::native(),
                 };
                 let executed = native_layer
-                    .execute(reads, residual.view(), &positions)
+                    .execute(reads, ProjectedRows::exact(residual.view()), &positions)
                     .map_err(|error| error.to_string())?;
                 tally
                     .layer_output
                     .add(sequence, residual_out.view(), executed.output.view(), None)?;
                 if scope.is_some() && layer == 0 {
                     let unedited = native_layer
-                        .execute(AttentionLayerReads::native(), residual.view(), &positions)
+                        .execute(AttentionLayerReads::native(), ProjectedRows::exact(residual.view()), &positions)
                         .map_err(|error| error.to_string())?;
                     tally.unedited_output.get_or_insert_with(Measured::default).add(
                         sequence,

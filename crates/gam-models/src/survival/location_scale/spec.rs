@@ -352,6 +352,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// (#2901). A block's EDF is clamped to its coefficient count only when every
     /// penalty on it is certified. Empty when the inner solver recorded none.
     pub edf_rank_bound: Vec<gam_solve::estimate::EdfRankBound>,
+    /// Which rule selected the inner custom-family fit's coefficient mode (#2661),
+    /// carried through rather than defaulted so finalization cannot drop the record the
+    /// inner fit made.
+    pub coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +473,7 @@ pub fn survival_fit_from_parts(
         penalty_block_trace,
         edf_by_block,
         edf_rank_bound,
+        coefficient_mode_selection,
     } = parts;
 
     // Validation (preserved from the old impl).
@@ -900,6 +905,7 @@ pub fn survival_fit_from_parts(
             // Assembled outside the custom-family outer search, so it records no
             // point `warm_start_from` could resume.
             outer_warm_start: None,
+            coefficient_mode_selection,
         },
         inner_cycles: 0,
     })

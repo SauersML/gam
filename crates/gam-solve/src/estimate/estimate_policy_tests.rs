@@ -27,7 +27,7 @@ use crate::mixture_link::{
 };
 use gam_linalg::utils::StableSolver;
 use gam_problem::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
+    InverseLink, LikelihoodSpec, ResponseFamily, SeedRiskProfile, StandardLink,
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -39,7 +39,7 @@ fn gaussian_external_reml_uses_one_analytic_seed() {
     // The profiled-Gaussian path scores its data-derived `initial.sp` and
     // summed-penalty diagonal candidates before constructing the outer
     // problem.  The generic lattice must not repeat that basin decision.
-    let cfg = external_reml_seed_config(2, LinkFunction::Identity);
+    let cfg = external_reml_seed_config(2, true);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
     assert_eq!(cfg.max_seeds, 1);
     assert_eq!(cfg.seed_budget, 3);
@@ -50,7 +50,7 @@ fn gaussian_external_reml_uses_one_analytic_seed() {
 fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
     // Coordinate count must not silently re-enable heuristic global shifts:
     // the coupled analytic candidates own the same decision at every k.
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Identity);
+    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, true);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
     assert_eq!(cfg.max_seeds, 1);
     assert_eq!(cfg.seed_budget, 3);
@@ -59,7 +59,7 @@ fn high_dimensional_gaussian_external_reml_does_not_restore_a_lattice() {
 
 #[test]
 fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
-    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, LinkFunction::Logit);
+    let cfg = external_reml_seed_config(REML_SEED_SCREENING_RHO_CAP, false);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
     assert_eq!(
         cfg.max_seeds, 2,
@@ -73,7 +73,7 @@ fn high_dimensional_glm_external_reml_requests_arc_seed_pair() {
 
 #[test]
 fn generalized_external_reml_keeps_multistart_policy() {
-    let cfg = external_reml_seed_config(2, LinkFunction::Logit);
+    let cfg = external_reml_seed_config(2, false);
     assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
     assert!(cfg.max_seeds > 1);
     assert_eq!(
@@ -85,23 +85,18 @@ fn generalized_external_reml_keeps_multistart_policy() {
 #[test]
 fn profiled_gaussian_search_consumes_exact_outer_curvature() {
     assert!(
-        !standard_reml_search_prefers_gradient_only(LinkFunction::Identity),
+        !standard_reml_search_prefers_gradient_only(true),
         "quadratic Gaussian identity REML must route its available exact Hessian into search"
     );
 }
 
 #[test]
 fn non_gaussian_search_reserves_order_four_for_mint() {
-    for link in [
-        LinkFunction::Logit,
-        LinkFunction::Probit,
-        LinkFunction::Log,
-    ] {
-        assert!(
-            standard_reml_search_prefers_gradient_only(link),
-            "{link:?} must retain the optimize-3 / certify-4 derivative ceiling"
-        );
-    }
+    assert!(
+        standard_reml_search_prefers_gradient_only(false),
+        "non-Gaussian families (including identity-link Student-t) must retain the \
+         optimize-3 / certify-4 derivative ceiling"
+    );
 }
 
 #[test]
@@ -2093,7 +2088,7 @@ fn lambda_search_nuisance_freeze_is_a_function_of_data_and_spec_alone_2363() {
         ),
         "fixture precondition: the freeze under test only exists for an ESTIMATED Beta precision"
     );
-    let seed_config = external_reml_seed_config(1, LinkFunction::Logit);
+    let seed_config = external_reml_seed_config(1, false);
 
     let pristine = beta_precision_anchor_state(&y, &w, &x, &cfg);
     freeze_lambda_search_nuisance_at_canonical_anchor(&pristine, &resolved, 1, None, &seed_config)

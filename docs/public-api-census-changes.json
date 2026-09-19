@@ -4464,5 +4464,55 @@
     },
     "reason": "#2469: cloglog_posterior_meanwith_deriv_gamma_reference was a pub(crate) test-module reference built on cloglog_survival_gamma_reference, the Gamma/Mellin-Barnes route this commit deletes (see docs/source-removal-changes.json). The integrated cloglog pin now grades the router against 50-digit mpmath references instead.",
     "evidence": "At 651eabad3f, git grep -w finds cloglog_posterior_meanwith_deriv_gamma_reference only inside quadrature.rs's test module: its declaration and one call in test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case, which this commit deletes. public_api_census.py in gate dy6 run spec-lead-q1-g1 refused exactly this one removal."
+  },
+  {
+    "base": "52389090ca99fe8caf15b4c92b6e0e2406d37779",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/run.rs::certificate_curvature_shift": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::certificate_hessian_is_psd_at_resolution": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::newton_predicted_decrease": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::newton_predicted_decrease_at_resolution": 1
+    },
+    "reason": "#2900 row 24.2 (SPEC rule 24): the four pub(crate) second-order helpers are opt::second_order at opt 53ce029, re-exported by run.rs under the same names, so no call site changes.",
+    "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
+  },
+  {
+    "base": "ae20ed3b52b554c6379b92ae588611a08d2376a3",
+    "removed": {
+      "crates/gam-inference/src/model_comparison.rs::corrected_edf": 1,
+      "crates/gam-inference/src/model_comparison.rs::rho_uncertainty_df": 1,
+      "crates/gam-solve/src/evidence.rs::compare_reml_fits": 1,
+      "crates/gam-solve/src/evidence.rs::criterion_gap": 1,
+      "crates/gam-solve/src/evidence.rs::ranking_score": 1
+    },
+    "reason": "slop.md G2 / pyGAM audit d11: model comparison ranks on the smoothing-corrected AIC through one Rust function. corrected_edf and CorrectedEdf::rho_uncertainty_df move from gam-inference::model_comparison to gam_solve::inference::information_criteria under the same names, so the fitted summary can form aic_corrected. compare_reml_fits (which ranked on ranking_score, the uncorrected -2*loglik + 2*edf) is replaced by evidence::compare_models ranking on aic_corrected, and criterion_gap by log_evidence_ratio, half the corrected-AIC gap.",
+    "evidence": "At the base, git grep -w finds compare_reml_fits, ranking_score and criterion_gap only in crates/gam-solve/src/evidence.rs and the gam-pyffi FFI (ffi_prelude.rs imports, model_ffi.rs), and corrected_edf / rho_uncertainty_df only in gam-inference; every caller is rewritten in this change. See the matching docs/source-removal-changes.json entry."
+  },
+  {
+    "base": "da5b1ad4bd7ecf8081e094aaf5e8573a7d9792af",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs::resolve_marginal_slope_base_link": 1
+    },
+    "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
+    "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
+  },
+  {
+    "base": "c981848bcb2ddbde8a46383c9c065105a19e4525",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::consumed": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::from_model": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::required": 1,
+      "crates/gam-models/src/fit_orchestration/warm_start_from.rs::session": 1
+    },
+    "reason": "gam#3002: OuterWarmStart's four methods staged a saved model's point as a one-entry outer cache session. They are replaced by resolve_warm_start, which builds a gam_model_api::WarmStart (the point, its certified value, and whether the inputs are the parent's), and every outer search takes it through OuterProblem::with_warm_start. See docs/source-removal-changes.json at the same base.",
+    "evidence": "At the landing tree git grep finds no call of OuterWarmStart::from_model, .session(), .required() or .consumed() on a warm start; gam-pyffi's geometry_ffi.rs, the only production caller of from_model, calls resolve_warm_start. public_api_census.py at 5bd6913b9b on 55212405d7 refused exactly these four identities without this entry, and verified 13342 -> 13345 public function declarations with it."
+  },
+  {
+    "base": "a5a71e516b0a0f1afd3b29b7e1e080926e4bb206",
+    "removed": {
+      "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
+    },
+    "reason": "pyGAM audit G8: create_difference_penalty_matrix was a coefficient-difference penalty DᵀD. SPEC puts penalties on the function; production B-spline penalties are bspline_derivative_penalty_matrix, and the function's one production caller discarded its result. Deleted together with the dead penalty output of compute_geometric_constraint_transform (see docs/source-removal-changes.json).",
+    "evidence": "At the base, git grep -w create_difference_penalty_matrix finds one production call, in duchon_thinplate.rs compute_geometric_constraint_transform, whose output both bspline_build.rs callers bind to `_`; all other uses are tests, now served by the test-only gam_linalg_test_support::coefficient_difference_penalty. cargo check --workspace --all-targets RC 0."
   }
 ]

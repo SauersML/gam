@@ -2350,6 +2350,19 @@ pub enum CovarianceDeclined {
         /// serde tag.
         unavailable_channel: String,
     },
+    /// Expectile (LAWS) fit whose inner solve published no dense covariance —
+    /// the memory governor refused it and only a factorized diagonal of the
+    /// Gaussian working-model `Vb` exists, or inference was not computed.
+    ///
+    /// The expectile's covariance is the penalized Newey–Powell sandwich
+    /// `H⁻¹(c·Xᵀdiag(w²r²)X + φ̂S_λ)H⁻¹`, a correction of the FULL `Vb`; a
+    /// diagonal alone cannot carry it, and publishing the working-model
+    /// diagonal under the expectile's name is the under-coverage the sandwich
+    /// exists to remove. Point estimation is unaffected and IS published.
+    ExpectileSandwichRequiresDenseCovariance {
+        /// Coefficient count whose dense covariance was not admitted.
+        coefficients: usize,
+    },
 }
 
 impl CovarianceDeclined {
@@ -2410,6 +2423,19 @@ impl CovarianceDeclined {
                      correction exists to add, so the intervals would be too narrow and, on the \
                      wire, indistinguishable from corrected ones. The point estimates are \
                      unaffected and are published. See gam#2985."
+                )
+            }
+            Self::ExpectileSandwichRequiresDenseCovariance { coefficients } => {
+                format!(
+                    "no coefficient covariance was published for this expectile fit: its inner \
+                     solve published no dense {coefficients}-coefficient covariance (the memory \
+                     governor did not admit it, or inference was not computed), and the \
+                     expectile's Newey-Powell sandwich covariance is a correction of that full \
+                     matrix which a factorized diagonal or a bare Hessian cannot carry. \
+                     Publishing the Gaussian working-model standard errors instead is not \
+                     admissible: the asymmetric weights are not inverse variances, so those \
+                     intervals under-cover wherever the noise is large. The point estimates are \
+                     unaffected and are published."
                 )
             }
         }
@@ -2591,30 +2617,140 @@ pub struct FitArtifacts {
     /// git grep -n 'covariance_declined' -- crates/ src/ | grep -E 'covariance_declined\s*='
     /// ```
     ///
-    /// **Today that returns exactly 1** — `bms/block_specs.rs`, the BMS
-    /// Murphy-Topel seam. **If a second producer ever appears, check whether it
+    /// **Outside tests, today that returns** `bms/block_specs.rs` (the BMS
+    /// Murphy-Topel seam), `survival/marginal_slope/generated_regressor.rs`,
+    /// and `fit_orchestration/entry.rs` (the expectile sandwich on a fit whose
+    /// dense covariance was not admitted, persisted whole-fit through
+    /// `assemble_standard_payload`). **If a second producer ever appears, check whether it
     /// persists through a compact constructor; if it does, the parameter must be
     /// threaded and `tests/bms_covariance_declined_2718.rs` extended to cover
     /// that route.** The round-trip test there pins the wire, not the routing,
     /// so it will not catch a new producer on its own.
     #[serde(default)]
     pub covariance_declined: Option<CovarianceDeclined>,
-    /// The certified outer point in the outer optimizer's own coordinates, when
-    /// the route that fitted the model records one: `gamfit.fit(...,
-    /// warm_start_from=model)` resumes a new fit from it through the outer cache
-    /// seam, which recertifies it rather than trusting it. `None` on a route that
+    /// The certified outer point of the published search, in the outer
+    /// optimizer's own coordinates, when the route that fitted the model records
+    /// one: `gamfit.fit(..., warm_start_from=model)` offers it to a new fit
+    /// (gam#3002, `OuterProblem::with_warm_start`), whose searches accept it only
+    /// where it is certified for their own criterion. `None` on a route that
     /// records none and on a model saved before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_warm_start: Option<OuterWarmStartRecord>,
+    /// Which rule selected the coefficient mode this fit reports (#2366,
+    /// #2661). A payload written before the record existed carries
+    /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
+    #[serde(default)]
+    pub coefficient_mode_selection: CoefficientModeSelection,
 }
 
-/// A certified outer point: `rho` in the outer optimizer's coordinates and
-/// `beta`, the inner coefficient mode flattened across blocks in the order the
-/// outer objective's coefficient seed reads it.
+/// A certified outer point (gam#3002): `theta`, the outer coordinates in the order
+/// the fit's outer problem holds them (ρ, then the log length scales, then the
+/// auxiliary coordinates), `beta`, the inner coefficient mode there flattened
+/// across blocks, `value`, the criterion the search certified there, and the
+/// fingerprint of the inputs the point is certified for.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OuterWarmStartRecord {
-    pub rho: Vec<f64>,
+    /// v25 wrote the ρ-only point as `rho`.
+    #[serde(alias = "rho")]
+    pub theta: Vec<f64>,
     pub beta: Vec<f64>,
+    /// `value` and `input_fingerprint` are `None` in a v25 record, which predates
+    /// them; such a point can only join a search, never resume as a certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_fingerprint: Option<String>,
+}
+
+/// Which rule selected a fit's coefficient mode (#2366, #2661).
+///
+/// A custom family whose inner coefficient objective is nonconvex can hold
+/// several modes at one ρ, and the profiled criterion `V(ρ)` is a function of
+/// ρ only once a rule names which mode the fit reports. The #2661 anchored
+/// continuation from maximal smoothing is that rule, and a family-owned
+/// objective homotopy is the stronger one where a family declares it. When
+/// the continuation declines, the fit proceeds from the caller's seed and its
+/// mode is a functional of that seed. This records which of these happened, so
+/// a consumer reads it from the fit and can refuse a seed-selected mode
+/// ([`Self::require_rule_selected`]) instead of finding it in a log.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "kebab-case")]
+pub enum CoefficientModeSelection {
+    /// No rule was recorded: a payload written before this record existed, or
+    /// a route that selects its mode elsewhere and records nothing here.
+    #[default]
+    NotRecorded,
+    /// The inner objective has one mode: the family's Hessian does not depend
+    /// on β, or the family certifies global convexity.
+    UniqueMode,
+    /// The endpoint of the family's certified coefficient-objective homotopy.
+    ObjectiveHomotopy { steps: usize },
+    /// The endpoint of the #2661 anchored continuation, certified.
+    AnchoredContinuation {
+        steps: usize,
+        endpoint_discrepancy: f64,
+    },
+    /// No rule selected the mode, so it is the one the caller's seed reached.
+    /// `reason` says why no rule applied: the continuation's refusal, or the
+    /// route having no smoothing parameter to anchor a continuation at.
+    SeedSelected { reason: String },
+}
+
+impl CoefficientModeSelection {
+    /// Refuse a mode no rule selected: a seed-selected mode, naming the
+    /// continuation's refusal, and an unrecorded one.
+    pub fn require_rule_selected(&self, context: &str) -> Result<(), String> {
+        match self {
+            Self::UniqueMode
+            | Self::ObjectiveHomotopy { .. }
+            | Self::AnchoredContinuation { .. } => Ok(()),
+            Self::SeedSelected { reason } => Err(format!(
+                "{context}: the coefficient mode is the one the caller's seed reached, because the \
+                 selection rule did not apply: {reason}"
+            )),
+            Self::NotRecorded => Err(format!(
+                "{context}: no rule selecting the coefficient mode was recorded"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod coefficient_mode_selection_wire_2661_tests {
+    use super::{CoefficientModeSelection, FitArtifacts};
+
+    /// Every variant survives the payload wire, and an artifacts record saved
+    /// before the field existed reads as `NotRecorded`, which claims nothing.
+    #[test]
+    fn the_mode_selection_record_round_trips_and_defaults_to_not_recorded() {
+        for selection in [
+            CoefficientModeSelection::NotRecorded,
+            CoefficientModeSelection::UniqueMode,
+            CoefficientModeSelection::ObjectiveHomotopy { steps: 3 },
+            CoefficientModeSelection::AnchoredContinuation {
+                steps: 4,
+                endpoint_discrepancy: 2.5e-7,
+            },
+            CoefficientModeSelection::SeedSelected {
+                reason: "the continuation declined".to_string(),
+            },
+        ] {
+            let wire = serde_json::to_string(&selection).expect("serialize");
+            let read: CoefficientModeSelection = serde_json::from_str(&wire).expect("deserialize");
+            assert_eq!(read, selection, "{wire}");
+        }
+        let mut saved = serde_json::to_value(FitArtifacts::default()).expect("serialize artifacts");
+        saved
+            .as_object_mut()
+            .expect("artifacts serialize as an object")
+            .remove("coefficient_mode_selection")
+            .expect("the record is on the wire");
+        let read: FitArtifacts = serde_json::from_value(saved).expect("an older record reads");
+        assert_eq!(
+            read.coefficient_mode_selection,
+            CoefficientModeSelection::NotRecorded
+        );
+    }
 }
 
 impl std::fmt::Debug for FitArtifacts {
@@ -2646,13 +2782,17 @@ impl std::fmt::Debug for FitArtifacts {
                 &self.joint_log_lambdas.as_ref().map(|v| v.len()),
             )
             .field("covariance_declined", &self.covariance_declined)
+            .field(
+                "coefficient_mode_selection",
+                &self.coefficient_mode_selection,
+            )
             .field("jeffreys_arming_evidence", &self.jeffreys_arming_evidence)
             .field(
                 "outer_warm_start",
                 &self
                     .outer_warm_start
                     .as_ref()
-                    .map(|seed| (seed.rho.len(), seed.beta.len())),
+                    .map(|seed| (seed.theta.len(), seed.beta.len())),
             )
             .finish()
     }
@@ -5951,7 +6091,9 @@ impl UnifiedFitResult {
         family: &gam_problem::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
-            (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => {
+                Ok(FittedLinkState::Standard(None))
+            }
             // Every state-less binomial probability link decodes to the bare
             // `Standard(None)` payload — the concrete `StandardLink` lives on the
             // family/spec, not in the fitted-link record. LogLog and Cauchit

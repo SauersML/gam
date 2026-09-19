@@ -1505,24 +1505,70 @@ pub fn apply_request_metadata(
     payload.inference_notes = inference_notes;
 }
 
+/// Record, on every certified outer point the payload carries, the fingerprint of
+/// the inputs it is certified for, so a later warm start can tell a resume from a
+/// new fit (gam#3002). `None` leaves the point able only to join a later search.
+fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint: Option<String>) {
+    for fit in [payload.fit_result.as_mut(), payload.unified.as_mut()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(record) = fit.artifacts.outer_warm_start.as_mut() {
+            record.input_fingerprint = input_fingerprint.clone();
+        }
+    }
+}
+
 /// One authoritative "formula fit → saved payload" service: materialize once,
 /// dispatch on the request variant, fit, and assemble the persistence payload.
 /// Both front ends (CLI, Python FFI) must route through this function so a fit
 /// requested through any surface produces an identical saved model. (#2470)
+///
+/// An automatic `.` term is expanded against `dataset` first, so the payload
+/// stores (and `model.formula` shows) the formula that was actually fitted, and
+/// the expansion's notes lead the payload's inference notes.
 pub fn fit_formula_to_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
-    if fit_config.outer_warm_start.is_some()
-        && (fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some())
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "warm_start_from resumes one fit; a CTN chain fits several".to_string(),
-        });
+    let automatic = crate::fit_orchestration::expand_automatic_fit_formula(
+        &formula, dataset, fit_config,
+    )?;
+    let mut payload = fit_expanded_formula_to_payload(automatic.formula, dataset, fit_config)?;
+    if !automatic.notes.is_empty() {
+        let mut notes = automatic.notes;
+        notes.append(&mut payload.inference_notes);
+        payload.inference_notes = notes;
     }
+    Ok(payload)
+}
+
+fn fit_expanded_formula_to_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+) -> Result<FittedModelPayload, WorkflowError> {
+    let warm_start_route_refused = |route: &'static str| WorkflowError::WarmStartRefused {
+        refusal: crate::fit_orchestration::WarmStartRefusal::NoSearchTakesIt { route },
+    };
+    if fit_config.warm_start.is_some()
+        && crate::fit_orchestration::expectile_tau_for_config(fit_config)?.is_some()
+    {
+        return Err(warm_start_route_refused("an expectile fit"));
+    }
+    // A CTN chain's certified point is its outcome fit's, and that fit is a
+    // function of the chain's own inputs (the stage-1 transform is fitted or
+    // frozen from them), so the point is recorded against the chain's inputs.
+    // The outcome fit takes the warm start through its configuration and says
+    // what its searches did with it; the stage-1 fits never receive it.
     if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
-        return crate::inference::ctn::fit_chain(formula, dataset, fit_config);
+        let mut payload = crate::inference::ctn::fit_chain(formula.clone(), dataset, fit_config)?;
+        record_input_fingerprint(
+            &mut payload,
+            crate::fit_orchestration::fit_input_fingerprint(&formula, dataset, fit_config),
+        );
+        return Ok(payload);
     }
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
@@ -1534,13 +1580,6 @@ pub fn fit_formula_to_payload(
     // `StandardFitResult`, so the persistence payload is built by the same
     // `assemble_standard_payload` used for every other standard fit.
     if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        if fit_config.outer_warm_start.is_some() {
-            return Err(WorkflowError::InvalidConfig {
-                reason: "warm_start_from resumes custom-family fits; the expectile driver does \
-                         not read it"
-                    .to_string(),
-            });
-        }
         let mut payload = assemble_standard_payload(StandardPayloadInputs {
             formula,
             dataset,
@@ -1557,6 +1596,7 @@ pub fn fit_formula_to_payload(
     // materializers do not consume this standard-only orchestration field.
     let mut dispatch_config = fit_config.clone();
     dispatch_config.spatial_center_counts = Some(Vec::new());
+    let formula_for_fingerprint = formula.clone();
     let materialized = materialize(&formula, dataset, &dispatch_config)?;
     let request = materialized.request;
     // The time basis THIS materialization built, carried to the save path so a
@@ -1889,19 +1929,38 @@ pub fn fit_formula_to_payload(
             payload_for_dispersion_location_scale(formula, dataset, fit_config, kind, ls_result)?
         }
     };
-    // A route that never attached the model's point fitted cold; that is not the
-    // warm start the caller asked for.
-    if fit_config
-        .outer_warm_start
-        .as_ref()
-        .is_some_and(|warm_start| !warm_start.consumed())
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "warm_start_from: this fit's route runs no outer search that the model's \
-                     certified point describes, so it could not resume from it"
-                .to_string(),
-        });
+    // A route whose outer driver never received the model's point fitted cold;
+    // that is not the warm start the caller asked for. One that received it says
+    // what it did in the model's notes, so a point it did not use is never silent.
+    if let Some(warm_start) = fit_config.warm_start.as_ref() {
+        match warm_start.recorded() {
+            None => return Err(warm_start_route_refused("this fit's route")),
+            Some(outcome) => inference_notes.push(format!(
+                "warm_start_from: {}",
+                match outcome {
+                    gam_model_api::WarmStartOutcome::Resumed => {
+                        "resumed from the model's certified point (same inputs)".to_string()
+                    }
+                    gam_model_api::WarmStartOutcome::JoinedMultistart => {
+                        "the model's certified point joined the multistart as one more seed \
+                         (other inputs)"
+                            .to_string()
+                    }
+                    gam_model_api::WarmStartOutcome::NotUsed(reason) => {
+                        format!("the model's certified point was not used: {reason}")
+                    }
+                }
+            )),
+        }
     }
+    record_input_fingerprint(
+        &mut payload,
+        crate::fit_orchestration::fit_input_fingerprint(
+            &formula_for_fingerprint,
+            dataset,
+            fit_config,
+        ),
+    );
     payload.unidentified_scalar_terms = unidentified_scalar_terms;
     apply_request_metadata(&mut payload, fit_config, inference_notes);
     Ok(payload)

@@ -626,12 +626,18 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )));
     }
     let z_primary = spec.z.column(0).to_owned();
+    // The pilot reads score 0, so its variance is that score's conditional
+    // variance `Σ(a_i)₀₀` from the field the fitted likelihood reads (gam#2952).
+    let z_primary_variance = Array1::from_shape_fn(z_primary.len(), |row| {
+        score_covariance.at_row(row).to_dense()[[0, 0]]
+    });
     let baseline_started = std::time::Instant::now();
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
         &entry_at_origin,
         &z_primary,
+        &z_primary_variance,
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
@@ -1954,7 +1960,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // the driver's fast path. A fit that also searches length-scale or auxiliary
     // coordinates runs the driver's own search, which a saved model's certified
     // point does not describe, so it is refused before any fitting.
-    if options.required_warm_start.is_some()
+    if options.warm_start.is_some()
         && !(setup.auxiliary_dim() == 0
             && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
     {
