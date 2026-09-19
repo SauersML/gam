@@ -1405,5 +1405,18 @@
     ],
     "reason": "#2951 A12: a Qwen3 decoder block had no mechanism program because GatedBlockProgram::new refused any per-head query/key norm (GatedBlockProgramError::QueryKeyNorm). The refusal was a missing capability, so the program gains a HeadRmsNorm primitive and the refusal is deleted. attention.rs's private normalize_heads(rows with radius, heads, head_dim, epsilon, gain) is replaced by the pub head_rms_norm (values) and head_rms_norm_with_radius (values and l8's mean-value radius, unchanged), which derive the head count from the width, so NativeAttention and the program node run one owner; its two callers (normalize_queries, normalize_keys) and the norm-radius test call the new owner. The test a_gated_block_program_refuses_what_it_cannot_express_or_bind is renamed a_gated_block_program_refuses_what_it_cannot_bind: the per-head-norm refusal it asserted no longer exists, and it now asserts the normed block's two gain parameters instead.",
     "evidence": "Direct gate dx1 run mpd-lead-qk-g2 (direct-dx1-mpd-lead-qk-g2.log) at d10950d360 (this unit stacked on l8 and the attention governor): RC_CHECK 0, RC_PYFFI 0, 365/365 parameter_decomposition:: tests, DONE_SENTINEL_0. Mutant arms dx1 run mpd-lead-qk-m2 (direct-dx1-mpd-lead-qk-m2.log): control 3/3 PASS, eps and swap arms FIRED. Stack check-only dx1 run mpd-lead-stack-c1 (direct-dx1-mpd-lead-stack-c1.log) at 3fbbf95bc0: RC_CHECK 0, RC_PYFFI 0."
+  },
+  {
+    "base": "52389090ca99fe8caf15b4c92b6e0e2406d37779",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:certificate_curvature_shift",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:certificate_hessian_is_psd_at_resolution",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:max_feasible_step_along",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:newton_predicted_decrease",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:newton_predicted_decrease_at_resolution",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:shifted_newton_predicted_decrease"
+    ],
+    "reason": "#2900 row 24.2 (SPEC rule 24: general outer-optimizer machinery lives in opt). The outer certificate's curvature shift, its PSD-at-resolution verdict, the Newton decrement taken at that shift (with its private Cholesky helper) and the exact box intersection along a ray were generic bound-constrained second-order helpers in gam-solve's rho_optimizer. They are opt::second_order at opt 53ce029 (from 6f2d85f), ported with the same bodies, and run.rs re-exports them (certificate_hessian_is_psd_at_resolution as an alias of opt::hessian_is_psd_at_resolution), so every call site keeps its name. max_feasible_step_along's one caller passes the box's two bounds to opt's version.",
+    "evidence": "git grep -c -w at d10950d360 finds certificate_hessian_is_psd_at_resolution in run.rs (10), bridges.rs (3) and run_plan_tests.rs (4); certificate_curvature_shift in run.rs (6); newton_predicted_decrease in run.rs (7), run_plan_tests.rs (5), rail_projection_tests.rs (6) and arc_curvature_stationary_2817_tests.rs (6); newton_predicted_decrease_at_resolution in run.rs (4), bridges.rs (2) and arc_curvature_stationary_2817_tests.rs (4); max_feasible_step_along and shifted_newton_predicted_decrease only in run.rs. All of them resolve to the pub(crate) re-export of opt's functions in run.rs. None is named in gam-pyffi, Python or benches; docs/issue-1082-validation.md:243 names certificate_curvature_shift in prose, which still describes the same function (now opt::certificate_curvature_shift through the re-export). opt's bodies diff equal to the removed ones except two clippy rewrites of the same predicates (opt 6f2d85f message)."
   }
 ]
