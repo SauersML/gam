@@ -90,7 +90,7 @@ use gam_solve::gaussian_reml_multi_penalty::{GaussianRemlMultiPenaltyProblem, Ga
 use gam_terms::basis::{
     BasisBuildResult, BasisMetadata, CenterStrategy, DuchonBasisSpec, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, PenaltySource, SpatialIdentifiability, build_duchon_basis, default_num_centers,
-    duchon_cubic_default, expanded_num_centers, starting_num_centers,
+    duchon_cubic_default, refined_num_centers, starting_num_centers,
 };
 use ndarray::{Array1, Array2, ArrayView2, Axis, s};
 use std::fmt;
@@ -169,23 +169,24 @@ pub struct CompileDesign {
 }
 
 impl CompileDesign {
-    /// The pilot resolution: gam-terms' starting center count for `training_draws` rows in `retained_dim` coordinates.
+    /// The pilot resolution: gam-terms' starting center count for `training_draws` rows in `retained_dim` coordinates,
+    /// over the cubic Duchon default's affine null space (`retained_dim + 1` columns).
     pub fn pilot(training_draws: usize, holdout_draws: usize, retained_dim: usize) -> Self {
         Self {
             training_draws,
             holdout_draws,
-            centers: starting_num_centers(training_draws, retained_dim),
+            centers: starting_num_centers(training_draws, retained_dim, retained_dim.saturating_add(1)),
         }
     }
 
     /// The same experiment at gam-terms' next evidence-backed resolution, or `None` once the production ceiling
     /// `default_num_centers` is reached.
     pub fn enriched(&self, retained_dim: usize) -> Option<Self> {
-        expanded_num_centers(self.centers, default_num_centers(self.training_draws, retained_dim)).map(|centers| {
-            Self {
-                centers,
-                ..*self
-            }
+        let ceiling = default_num_centers(self.training_draws, retained_dim);
+        let centers = refined_num_centers(self.centers).min(ceiling);
+        (centers > self.centers).then_some(Self {
+            centers,
+            ..*self
         })
     }
 }

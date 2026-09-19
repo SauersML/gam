@@ -72,6 +72,12 @@ pub use term_design::{
 // single canonical model-save freezer; its helper `freeze_smooth_basis_from_metadata`
 // stays private. A legal gam-terms resident (pure gam-terms/gam-problem types) and
 // a shared home the future family sub-crates can call without depending on gam-models.
+mod adaptive_resolution;
+pub use adaptive_resolution::{
+    AdaptiveResolution, adaptive_resolution_of, adaptive_resolution_support,
+    adaptive_resolution_width, apply_adaptive_resolution, refined_adaptive_resolution,
+};
+
 mod design_freezing;
 pub use design_freezing::freeze_term_collection_from_design;
 

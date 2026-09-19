@@ -149,6 +149,12 @@ pub struct SphericalSplineBasisSpec {
     /// the orthogonalization.
     #[serde(default)]
     pub identifiability: SphericalSplineIdentifiability,
+    /// `true` when nobody chose the harmonic `max_degree`: it is the formula
+    /// default's starting resolution, which the standard formula workflow
+    /// refines from the converged fit's own evidence. An explicit degree or
+    /// `k=` is `false` and honoured verbatim.
+    #[serde(default)]
+    pub adaptive_degree: bool,
 }
 
 /// Realized-design identifiability policy for the Wahba spherical spline (#532).
@@ -178,6 +184,7 @@ impl Default for SphericalSplineBasisSpec {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         }
     }
 }

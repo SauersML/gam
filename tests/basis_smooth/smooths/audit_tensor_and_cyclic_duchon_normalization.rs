@@ -97,6 +97,7 @@ fn harmonic_sphere_penalty_is_intentionally_not_frobenius_normalized() {
         radians: false,
         method: SphereMethod::Harmonic,
         max_degree: Some(3),
+        adaptive_degree: false,
         wahba_kernel: Default::default(),
         identifiability: Default::default(),
     };

@@ -1921,7 +1921,15 @@
     "evidence": "At base bdd00e20fd46860b917ff233fc268f9a8f293f9d, source_removal_guard.py and public_api_census.py (run against this base) report exactly these identities, and git grep -w finds both names only in the opt re-export and their callers at the head tree. At the head tree: cargo check --workspace --all-targets RC 0 with 0 warnings, cargo build --workspace --lib RC 0, and gam-solve rho_optimizer:: plus the _3036 pins all pass (acn112, toolchain 1.97.1)."
   },
   {
-    "base": "c8f927327ae4b3fa476d8ceb9242798c2d3d7578",
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/time_block.rs:fn:append_linear_constraints"
+    ],
+    "reason": "gam#3037: the flexible survival location-scale time block declared its coordinate cone and, appended to it by append_linear_constraints, one derivative-guard row per training row. The cone implies every one of those rows (the I-spline derivative design is non-negative entrywise, every column carrying it is bounded at zero, and the offsets encode the guard), so the block now declares the cone alone. The flexible path was its only caller, so the concatenation helper is deleted with it.",
+    "evidence": "At the base, git grep finds append_linear_constraints only in crates/gam-models/src/survival/location_scale/time_block.rs: its declaration and its one call in prepare_identified_time_block's flexible path, which this commit replaces with the cone. No bench, script, example or Python file names it. source_removal_guard.py, run without this acknowledgement, refused exactly this one identity (public, 0 production occurrences)."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
     "items": [
       "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:disable_duchon_operator_penalties_in_basis",
       "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:gate_duchon_operator_penalties_for_family",
