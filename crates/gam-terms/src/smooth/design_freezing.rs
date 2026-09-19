@@ -65,6 +65,7 @@ fn freeze_smooth_basis_from_metadata(
                     |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
                         data_range: (domain_start, domain_start + period),
                         num_basis,
+                        adaptive: false,
                     },
                 )
                 .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
@@ -473,6 +474,7 @@ fn freeze_smooth_basis_from_metadata(
                         BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_start + period),
                             num_basis,
+                            adaptive: false,
                         }
                     }
                     _ if margin_is_cr => BSplineKnotSpec::NaturalCubicRegression {
@@ -524,6 +526,7 @@ fn freeze_smooth_basis_from_metadata(
                         |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_start + period),
                             num_basis,
+                            adaptive: false,
                         },
                     )
                     .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()))
@@ -592,6 +595,7 @@ fn freeze_smooth_basis_from_metadata(
                         |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_start + period),
                             num_basis,
+                            adaptive: false,
                         },
                     )
                     .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));

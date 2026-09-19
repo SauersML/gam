@@ -4604,5 +4604,36 @@
     },
     "reason": "gh#2263 F3: kl_measurement_floor is now the one owner of a KL measurement's floor, max(B, control), and returns the band B beside it. kl_measurement_band_nats stays as its private component, so a caller cannot rebuild the floor as band.max(control) beside the owner. The function and its formula are unchanged; only its visibility narrows.",
     "evidence": "public_api_census.py, run with this base and the landing commit, reports exactly this identity. git grep -w kl_measurement_band_nats finds it only in crates/gam-sae/src/inference/intervention_shard.rs at the head tree: its definition, kl_measurement_floor, and the module's tests. cargo nextest run -p gam-sae --lib on the intervention_shard tests passes, including a_measurement_floor_is_its_band_raised_only_by_stochastic_control_evidence_2263."
+  },
+  {
+    "base": "c14c88d3ab59a78e5741d37a295c4132826cab29",
+    "removed": {
+      "crates/gam-models/src/survival/location_scale/time_block.rs::append_linear_constraints": 1
+    },
+    "reason": "gam#3037: append_linear_constraints concatenated the flexible survival location-scale time block's coordinate cone with its per-row derivative-guard rows. The cone implies every guard row, so the block now declares the cone alone and nothing concatenates two time constraint systems. It was pub(crate), with one caller.",
+    "evidence": "public_api_census.py, run without this acknowledgement against a candidate with this change, reported exactly this identity as removed (13546 public function declarations before, 13545 after). git grep finds append_linear_constraints only at its declaration and its one call in prepare_identified_time_block, both in time_block.rs, which this commit replaces."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
+    "removed": {
+      "crates/gam-models/src/bms/estimated_latent_law.rs::closed_form_survival_anchor_log_probabilities": 1
+    },
+    "reason": "gam#2926 (moving-law certificate at the fitted law's anchor): the certificate scores a rigid survival row at the intercept the fit solved on its own law. closed_form_survival_anchor_log_probabilities(q, b, law) computed the closed-form intercept q·sqrt(1 + b²) itself, which is the fit's anchor only when the fitted law is Gaussian. It becomes survival_anchor_log_probabilities(alpha, b, law), which takes the intercept: calibration.rs's rigid arm passes solve_anchor(q, s·b, fitted law), the root the fit solved (#2983), or the closed form on the Gaussian law, where the two coincide.",
+    "evidence": "source_removal_guard.py and public_api_census.py each reported exactly this one identity at base de9b43848b (gateDr4 on acl42), and both passed with this entry at base 136b8383a5 (gateD5). git grep -w closed_form_survival_anchor_log_probabilities finds no occurrence under crates, src or tests at the head tree; survival_anchor_log_probabilities is declared at crates/gam-models/src/bms/estimated_latent_law.rs:253 and called at moving_law_rule.rs:1580, survival/marginal_slope/calibration.rs:197 and timepoint_exact/law_node_tests.rs:490, whose the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926 pins the intercept it takes."
+  },
+  {
+    "base": "94e6a59c5b31edf06a4d4b4b52885099ff721b22",
+    "removed": {
+      "crates/gam-custom-family/src/blockwise_solve.rs::block_quadratic_penalty": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::block_quadratic_penalty_with_accumulation": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty_parallel_worthwhile": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::total_quadratic_penalty_with_accumulation": 1,
+      "crates/gam-problem/src/joint_penalty.rs::quadratic_form_with_accumulation": 1,
+      "crates/gam-problem/src/joint_penalty.rs::quadratic_with_accumulation": 1,
+      "crates/gam-solve/src/reml/assembly.rs::penalty_coords_from_blocks": 1
+    },
+    "reason": "#2954 stage 1b, ruling (C): the custom-family penalty is evaluated on its structural roots by one function, gam_custom_family::BlockPenaltyRoots (value, penalty_increment, s_lambdas, block_value, terms). It replaces the dense block_quadratic_penalty, block_quadratic_penalty_with_accumulation, total_quadratic_penalty, total_quadratic_penalty_with_accumulation and total_quadratic_penalty_parallel_worthwhile in place, because the dense 1/2 b'S_lambda b carried lambda times the stored matrix's null eigenvalue (measured lambda*2.14e-16 on 2923's time block). The joint bundle's quadratic_with_accumulation and JointPenaltySpec::quadratic_form_with_accumulation go the same way: the bundle's quadratic reads its validated roots, and BlockPenaltyRoots carries the accumulation for per-block and joint terms alike. gam-solve's penalty_coords_from_blocks built the criterion's coordinates from the dense matrices with its own rank threshold; its one caller, the custom-family assembly, now builds them from the same roots.",
+    "evidence": "public_api_census.py and source_removal_guard.py, run against this base, report exactly these eight public functions, and git grep -w finds none of them under crates, src or tests at the head tree. Every former caller reads gam_custom_family::BlockPenaltyRoots or the joint bundle's validated roots; the landing gate at this base ran every lib and integration test target of gam-problem, gam-custom-family, gam-solve and gam-models, and every test that fails at the head fails at the base."
   }
 ]
