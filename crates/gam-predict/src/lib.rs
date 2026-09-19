@@ -2269,6 +2269,10 @@ where
         // the Bernoulli indicator 1{T > t} with conditional variance S(1−S) —
         // the Binomial law of total variance below with μ = S: E[S(1−S)] =
         // m(1−m) − v, and total predictive variance exactly m(1−m).
+        // Location-scale t: Var(Y|μ) = σ²ν/(ν−2), finite only for ν > 2.
+        ResponseFamily::StudentT { sigma, nu } => {
+            (*nu > 2.0).then(|| Array1::from_elem(mean.len(), sigma * sigma * nu / (nu - 2.0)))
+        }
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => Some(Array1::from_iter(
             mean.iter().enumerate().map(|(i, &mu)| {
                 let p = mu.clamp(0.0, 1.0);
@@ -2498,6 +2502,11 @@ where
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
+        // The predictive law of a fresh Student-t observation is a Gaussian
+        // (posterior of η) convolved with a scaled t, which has no closed-form
+        // quantile; no observation band is reported rather than a Gaussian
+        // surrogate that would under-cover the heavy tails.
+        ResponseFamily::StudentT { .. } => (None, None),
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             // Royston–Parmar reports the survival probability S(t) at the
             // requested horizon, so its fresh observation is the Bernoulli
