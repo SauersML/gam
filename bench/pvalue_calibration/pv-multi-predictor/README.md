@@ -39,6 +39,38 @@ Every surface below feeds the same Wood (2013) rank-truncated Wald kernel,
   shrinkage enters through `F`'s joint solve.
 - the design-whitening Gram `XᵀWX` in the same stacked layout.
 
+### Fits that publish no influence matrix
+
+The standard single-predictor lane publishes `F` and `XᵀWX`. The
+custom-family and survival lanes do not: Gaussian and survival
+location-scale, Royston-Parmar and Weibull survival. Their smooth table used to
+fall back to the truncation rank `r` for the reference df and to the caller's
+unweighted `XᵀX` for the whitening. In a location-scale fit the mean block's
+curvature is `Xᵀ diag(1/σᵢ²) X`, so the unweighted metric kept the wrong
+rank-`r` subspace. The mean-smooth test of a covariate that moves only the
+scale then rejected above its level at n = 300 (0.078 at 0.05 before the fix).
+
+Both blocks belong to the term alone, because no other term's penalty touches
+its coefficients `J`:
+
+- `F_JJ = I − (V_JJ/c)·S_JJ`, with `S_JJ = Σ_k λ_k S_k`, and
+- `G_JJ = H_JJ − S_JJ`.
+
+The summary now derives them when the fit leaves them out. A fit may report
+`β` in other units than the design's penalties. A Gaussian location-scale fit
+solves on a standardized response and reports the mean block rescaled. That
+factor `d²` is identified from the fit's own unit-free per-penalty traces
+`τ_k`: `tr(V_JJ λ_k S_k)/c = d²·τ_k` must give one `d²` for every penalty. The
+resulting `tr(F_JJ)` must also equal the reported EDF. If either check fails,
+the test keeps the old rank-only reference df rather than guessing. The
+regression `tests/regressions/smooths/summary_smooth_test_without_published_influence.rs`
+checks two things:
+
+- a standard fit stripped of `F` and `XᵀWX` reports the same test as with
+  them;
+- a location-scale fit's reference df is Wood's, and does not depend on the
+  response's units.
+
 `V_b` is the smoothing-parameter-conditional covariance. The kernel
 deliberately does not use the smoothing-corrected `V_c` (#2296), because Wood's
 reference distribution is derived for `V_b`. No surface here substitutes
@@ -66,6 +98,22 @@ a covariate penalty with a non-zero prior mean that the survival fit leaves out,
 a block narrower than its design, or a competing-risks fit (whose layout is
 per cause). The table then reports that reason in `smooth_terms_unavailable`
 instead of a p-value for the wrong coefficients.
+
+### Multinomial: which test to use
+
+The per-class test asks whether the term moves the log-odds of one class
+against the reference class. Its answer depends on which class is the
+reference. A class block `F_jj` of the joint influence matrix is not an
+influence matrix of its own. Its trace can come out zero or negative when the
+fit shrinks the term toward the other classes. The rank-`round(edf)`
+truncation then has no direction to test, and the row reports
+`NoEffectiveDegreesOfFreedom` instead of a p-value. The joint test,
+`joint_smooth_significance()`, tests every class block of the term at once.
+Its null, that the term moves no class probability, does not depend on the
+reference class, and its EDF is the sum of the per-class EDFs. It is the test
+to use for "does this covariate matter". Rejecting when any per-class test
+rejects is not a valid substitute: it multiplies the size, as the legacy table
+below shows.
 
 ## Results
 
