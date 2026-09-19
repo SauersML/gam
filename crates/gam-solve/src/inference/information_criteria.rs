@@ -66,8 +66,9 @@ impl CorrectedEdfUnavailable {
                  correction C = J·V_rho·J'"
             }
             Self::MissingCovarianceScale => {
-                "the fit has no engine-level likelihood family, so the \
-                 coefficient-covariance scale of the correction is undefined"
+                "the fit's likelihood has no scalar coefficient-covariance scale \
+                 (a custom family or Royston-Parmar survival), so the scale of the \
+                 correction is undefined"
             }
             Self::MissingMethodProvenance => {
                 "the retained smoothing correction is not the first-order \
@@ -325,26 +326,32 @@ pub fn information_criteria(
             "information criteria require a retained conditional EDF".into(),
         )
     })?;
-    let covariance_scale = fit
-        .likelihood_family
-        .as_ref()
-        .map(|spec| {
-            // A custom-family fit has no engine-level family and no scalar
-            // response dispersion; its coefficient covariance is `H⁻¹`
-            // already, so only an engine family needs φ here.
-            let phi = fit.dispersion_phi()?;
-            GlmLikelihoodSpec {
+    // The corrected EDF divides by the coefficient-covariance scale. A fit
+    // without an engine-level family (a custom-family fit) or whose family has
+    // no scalar scale (Royston-Parmar) has none; the corrected EDF then
+    // reports `MissingCovarianceScale` and the conditional AIC stands. Only
+    // such a scale needs the response dispersion.
+    let covariance_scale = match fit.likelihood_family.as_ref() {
+        None => None,
+        Some(spec) => {
+            let glm = GlmLikelihoodSpec {
                 spec: spec.clone(),
                 scale: fit.likelihood_scale,
-            }
-            .coefficient_covariance_scale(phi)
-            .map_err(|error| {
+            };
+            let scale_error = |error: gam_problem::InvalidLikelihoodScale| {
                 EstimationError::InvalidInput(format!(
                     "information-criteria coefficient covariance scale: {error}"
                 ))
-            })
-        })
-        .transpose()?;
+            };
+            match glm.resolved_scale().map_err(scale_error)? {
+                gam_problem::ResolvedLikelihoodScale::Unspecified => None,
+                _ => Some(
+                    glm.coefficient_covariance_scale(fit.dispersion_phi()?)
+                        .map_err(scale_error)?,
+                ),
+            }
+        }
+    };
     let method_certified_exact = matches!(
         fit.smoothing_correction_method_first_order(),
         Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
