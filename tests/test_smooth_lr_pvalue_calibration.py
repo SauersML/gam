@@ -8,14 +8,15 @@ Truth ``eta = b0 + a1 sin(2 pi x1) + a3 cos(2 pi x3)`` with ``x ~ U(0,1)^3``,
 model ``y ~ s(x1) + s(x2) + s(x3)``. ``s(x2)`` is null (size) and ``s(x3)``
 is weak (power).
 
-Size. At ``a`` = 0.05 and 0.01 the rejection rate must lie within two binomial
-Monte-Carlo standard errors of ``a``, on both sides: an anti-conservative
-reference fails the upper bound and a conservative one the lower.
+Size. At ``a`` = 0.10, 0.05 and 0.01 the rejection rate must lie within two
+binomial Monte-Carlo standard errors of ``a``, on both sides: an
+anti-conservative reference fails the upper bound and a conservative one the
+lower.
 
-Shape. A double-penalty smooth is shrunk to nothing on about half the null
-datasets, so a calibrated p-value has an atom at ``1 - m`` (``m`` the mass of
-``W = 0``) and is uniform below it. Given ``p < 1/2`` it is ``U(0, 1/2)``, and
-the Kolmogorov-Smirnov test of ``2p`` on that event must not reject at 0.05.
+Shape. The null p-value must be ``U(0, 1)`` over its whole range: the
+two-sided Kolmogorov-Smirnov test of every null p-value against ``U(0, 1)``
+must not reject at 0.05. A mass of p-values piled near 1 fails it exactly as
+an excess near 0 does.
 
 Power. The weak-term power at 0.05 must not fall below that of the
 reference this lane replaced, measured on the same datasets, by more than the
@@ -77,14 +78,13 @@ def _p_values(cell: str):
 def test_smooth_lr_is_sized_and_keeps_its_power(cell):
     null, weak = _p_values(cell)
     assert np.all(np.isfinite(null)), "a null replicate published no p-value"
-    for level in (0.05, 0.01):
+    for level in (0.10, 0.05, 0.01):
         rate = float(np.mean(null <= level))
         mcse = np.sqrt(level * (1.0 - level) / null.size)
         assert abs(rate - level) <= 2.0 * mcse, (
             f"{cell}: size {rate:.4f} at {level} is {(rate - level) / mcse:+.2f} MCSE"
         )
-    below = null[null < 0.5]
-    assert stats.kstest(2.0 * below, "uniform").pvalue > 0.05, cell
+    assert stats.kstest(null, "uniform").pvalue > 0.05, cell
     power = float(np.mean(weak <= 0.05))
     before = CELLS[cell][-1]
     mcse = np.sqrt(before * (1.0 - before) / weak.size)
