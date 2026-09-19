@@ -721,7 +721,7 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design(&model, dataset).map(|design| design.dense)
+            standard_mean_design(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)

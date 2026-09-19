@@ -561,7 +561,7 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
             BSplineKnotSpec::NaturalCubicRegression { knots } => {
                 // Unreachable in practice (the early dispatch returns the cr
@@ -575,7 +575,7 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
                 crate::bail_invalid_basis!(
@@ -607,7 +607,7 @@ pub(crate) fn build_bspline_basis_1d_realizing(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
         }
     };

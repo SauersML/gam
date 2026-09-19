@@ -8028,7 +8028,7 @@ fn model_partial_dependence_impl(
         term,
         grid,
     )?;
-    let design = standard_mean_design(&model, table.table.clone())?;
+    let design = standard_mean_prediction_design(model, &table.table)?;
     let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let beta = &fit.beta;
     // The partial-effect band prices its SEs off the covariance the fit
@@ -8060,11 +8060,23 @@ fn model_partial_dependence_impl(
                 .collect();
             format!("partial_dependence: term {term:?} not found; available: {available:?}")
         })?;
+    // Only the term's own columns enter its contribution and band, so the rest
+    // of the grid design is never densified.
+    if range.end > beta.len() || range.end > cov.nrows() || range.end > cov.ncols() {
+        return Err(format!(
+            "partial_dependence: term {term:?} columns {range:?} lie outside the {} saved \
+             coefficients or the {:?} covariance",
+            beta.len(),
+            cov.dim()
+        ));
+    }
+    let columns: Vec<usize> = range.clone().collect();
+    let term_design = design.design.extract_columns(&columns);
     let (predicted, standard_error) = gam_predict::term_diagnostics::term_partial_dependence(
-        design.dense.view(),
-        beta.view(),
-        cov.view(),
-        range,
+        term_design.view(),
+        beta.slice(ndarray::s![range.clone()]),
+        cov.slice(ndarray::s![range.clone(), range]),
+        0..columns.len(),
     )?;
     Ok(PartialDependenceOutput {
         table,
@@ -8084,7 +8096,7 @@ fn model_variance_share_encoded_impl(
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    let x = standard_mean_design(&model, dataset)?.dense;
+    let x = standard_mean_design(&model, dataset)?;
     let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
@@ -8153,14 +8165,6 @@ fn model_variance_share(
     })
 }
 
-/// A standard model's dense mean-block design on caller rows, with the global
-/// coefficient range of each linear and smooth term.
-struct StandardMeanDesign {
-    dense: Array2<f64>,
-    linear_ranges: Vec<(String, std::ops::Range<usize>)>,
-    smooth_ranges: Vec<(String, std::ops::Range<usize>)>,
-}
-
 /// Internal full mean-block design used by term diagnostics.
 ///
 /// This is deliberately distinct from the public affine predictor design.  A
@@ -8170,7 +8174,27 @@ struct StandardMeanDesign {
 fn standard_mean_design(
     model: &FittedModel,
     dataset: EncodedDataset,
-) -> Result<StandardMeanDesign, String> {
+) -> Result<Array2<f64>, String> {
+    let design = standard_mean_prediction_design(model, &dataset)?;
+    let dense = design
+        .design
+        .try_to_dense_by_chunks("design_matrix prediction design")?;
+    append_deployment_extension_columns(
+        model.payload(),
+        dataset.values.view(),
+        &dataset.column_map(),
+        model.training_headers.as_ref(),
+        dense,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// The undensified mean-block design behind [`standard_mean_design`], so a
+/// caller that reads one term's columns never materializes the rest.
+fn standard_mean_prediction_design(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+) -> Result<gam::terms::smooth::TermCollectionPredictionDesign, String> {
     // A scan-routed model never materializes a dense B-spline design — the
     // exact O(n) state-space smoother is the whole point — so there is no model
     // matrix to export. Replace the cryptic "missing resolved_termspec" error
@@ -8217,22 +8241,7 @@ fn standard_mean_design(
                 .to_string(),
         );
     }
-    let dense = design
-        .design
-        .try_to_dense_by_chunks("design_matrix prediction design")?;
-    let dense = append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &col_map,
-        training_headers,
-        dense,
-    )
-    .map_err(|err| err.to_string())?;
-    Ok(StandardMeanDesign {
-        dense,
-        linear_ranges: design.linear_ranges,
-        smooth_ranges: design.smooth_ranges,
-    })
+    Ok(design)
 }
 
 fn posterior_credible_interval_impl(
