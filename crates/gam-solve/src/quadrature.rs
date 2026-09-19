@@ -2173,6 +2173,60 @@ fn reciprocal_link_posterior_jet(
     })
 }
 
+/// Posterior mean and variance of a reciprocal-power inverse link under
+/// `η ~ N(mu, sigma²)`, on the same analytic continuation `η + i0` that
+/// defines the posterior mean (`reciprocal_link_posterior_jet`).
+///
+/// The second moment is `Re E[g⁻¹(η + i0)²]`:
+///
+/// - inverse link: `(η + i0)^{-2}`, whose real expectation is the Hadamard
+///   finite part `−d/dm PV E[1/η]`, i.e. minus the first derivative of the
+///   principal-value jet;
+/// - inverse-squared link: `((η + i0)^{-1/2})² = (η + i0)^{-1}`, whose real
+///   expectation is the principal value `PV E[1/η]`.
+///
+/// Both match the moment expansion of `g⁻¹(η)²` about `mu` to every order, so
+/// the variance agrees with the exact moments of any posterior that keeps its
+/// mass away from the pole. A negative difference means the posterior reaches
+/// the pole so closely that no response-scale variance exists; that is
+/// reported as an error rather than clamped.
+pub fn reciprocal_link_posterior_meanvariance(
+    link: LinkFunction,
+    mu: f64,
+    sigma: f64,
+) -> Result<(f64, f64), EstimationError> {
+    let mean = reciprocal_link_posterior_jet(link, mu, sigma)?.mean;
+    let second_moment = match link {
+        LinkFunction::Inverse => {
+            -gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma)[1]
+        }
+        LinkFunction::InverseSquared => {
+            gam_math::gaussian_reciprocal::principal_value_inverse_normal_jet(mu, sigma)[0]
+        }
+        other => {
+            return Err(EstimationError::InvalidInput(format!(
+                "reciprocal-link posterior variance reached non-reciprocal link {other:?}"
+            )));
+        }
+    };
+    if sigma == 0.0 {
+        return Ok((mean, 0.0));
+    }
+    // `second_moment − mean²` cancels when `sigma ≪ mu`; a difference below
+    // the rounding of its two operands is a zero variance, not a missing one.
+    let rounding = 4.0 * f64::EPSILON * second_moment.abs().max(mean * mean);
+    let variance = second_moment - mean * mean;
+    let variance = if variance < 0.0 && -variance <= rounding { 0.0 } else { variance };
+    if !(variance.is_finite() && variance >= 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "{} link posterior variance does not exist at eta = {mu}, se = {sigma}: the \
+             linear-predictor posterior reaches the link's pole at eta = 0",
+            link.name()
+        )));
+    }
+    Ok((mean, variance))
+}
+
 #[inline]
 pub(crate) fn integrated_inverse_link_jet(
     quadctx: &QuadratureContext,

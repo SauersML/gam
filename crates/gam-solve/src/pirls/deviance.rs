@@ -610,7 +610,6 @@ pub(crate) fn beta_fitted_loglikelihood_unit_from_eta(
 /// reports [`EstimationError::InverseLinkDomainViolation`], which the inner
 /// solver treats as an infeasible trial step and damps (step-halving to
 /// feasibility) instead of projecting `η`.
-#[allow(clippy::too_many_arguments)]
 fn reciprocal_link_edm_row(
     row: usize,
     family: PowerVarianceEdm,

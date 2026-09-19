@@ -5485,6 +5485,9 @@ pub fn run_nuts_sampling_flattened_family(
         (ResponseFamily::Gaussian, _, FamilyNutsInputs::Glm(_)) => Err(
             "NUTS sampling is only implemented for Gaussian with identity link".to_string(),
         ),
+        (ResponseFamily::InverseGaussian, _, FamilyNutsInputs::Glm(_)) => {
+            Err("NUTS sampling is not implemented for the inverse-Gaussian family".to_string())
+        }
     }
 }
 

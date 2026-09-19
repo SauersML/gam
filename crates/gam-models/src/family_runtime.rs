@@ -5,7 +5,7 @@ use crate::quadrature::{
     integrated_family_moments_jet, integrated_inverse_link_jetwith_state,
     integrated_inverse_link_mean_and_derivative, logit_posterior_meanvariance,
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
-    probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
+    probit_posterior_meanvariance, reciprocal_link_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use gam_problem::{
@@ -237,7 +237,24 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<f64, EstimationError> {
         match (&self.spec.response, &self.spec.link) {
-            (ResponseFamily::Gaussian, _) => Ok(eta),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::Log),
+            ) => Ok((eta + 0.5 * se_eta * se_eta).exp()),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                _,
+            ) => {
+                // Identity is the plug-in; the reciprocal links are the
+                // principal-value / positive-part means of the shared dispatcher.
+                integrated_inverse_link_mean_and_derivative(
+                    quadctx,
+                    self.link_function(),
+                    eta,
+                    se_eta,
+                )
+                .map(|v| v.mean)
+            }
             (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
                 integrated_inverse_link_mean_and_derivative(
                     quadctx,
@@ -279,8 +296,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
-            | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => {
+            | (ResponseFamily::NegativeBinomial { .. }, _) => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
                 // (log-normal MGF). When the exponent exceeds the f64 range the
                 // posterior mean genuinely overflows; `exp` then returns +inf,
@@ -307,7 +323,26 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError> {
         match (&self.spec.response, &self.spec.link) {
-            (ResponseFamily::Gaussian, _) => Ok((eta, (se_eta * se_eta).max(0.0))),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ) => Ok((eta, se_eta * se_eta)),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::Log),
+            ) => Ok(lognormal_meanvariance(eta, se_eta)),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                InverseLink::Standard(link @ (StandardLink::Inverse | StandardLink::InverseSquared)),
+            ) => reciprocal_link_posterior_meanvariance(link.as_link_function(), eta, se_eta),
+            (
+                ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                other,
+            ) => Err(EstimationError::InvalidInput(format!(
+                "{} likelihood has no posterior variance for link {:?}",
+                self.spec.response.name(),
+                other
+            ))),
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
@@ -384,17 +419,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             (ResponseFamily::Poisson, _)
             | (ResponseFamily::Tweedie { .. }, _)
-            | (ResponseFamily::NegativeBinomial { .. }, _)
-            | (ResponseFamily::Gamma, _) => {
-                // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
-                // Var[exp(η)] = exp(2μ + σ²)·expm1(σ²). `expm1` keeps the
-                // variance factor exact for tiny σ² (σ² = 1e-20: exp(σ²) - 1
-                // rounds to 0, expm1 returns 1e-20), so small but nonzero
-                // posterior uncertainty is never reported as exactly zero.
-                let s2 = se_eta * se_eta;
-                let m1 = (eta + 0.5 * s2).exp();
-                let m2 = (2.0 * eta + s2).exp() * s2.exp_m1();
-                Ok((m1, m2.max(0.0)))
+            | (ResponseFamily::NegativeBinomial { .. }, _) => {
+                Ok(lognormal_meanvariance(eta, se_eta))
             }
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
@@ -473,4 +499,16 @@ mod log_link_public_jet_tests {
         assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
     }
 
+}
+
+/// Log-normal moments: `E[exp(η)] = exp(μ + σ²/2)`,
+/// `Var[exp(η)] = exp(2μ + σ²)·expm1(σ²)`. `expm1` keeps the variance factor
+/// exact for tiny `σ²` (`σ² = 1e-20`: `exp(σ²) − 1` rounds to 0, `expm1`
+/// returns 1e-20), so small but nonzero posterior uncertainty is never
+/// reported as exactly zero.
+fn lognormal_meanvariance(eta: f64, se_eta: f64) -> (f64, f64) {
+    let s2 = se_eta * se_eta;
+    let m1 = (eta + 0.5 * s2).exp();
+    let variance = (2.0 * eta + s2).exp() * s2.exp_m1();
+    (m1, variance)
 }

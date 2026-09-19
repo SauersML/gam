@@ -483,7 +483,7 @@ impl PowerVarianceEdm {
 /// in `μ = η^(−a)` (the inverse link `a = 1`, the inverse-squared link
 /// `a = ½`), or `None` for every other link.
 #[inline]
-pub(crate) fn reciprocal_power_link(inverse_link: &InverseLink) -> Option<(StandardLink, f64)> {
+pub fn reciprocal_power_link(inverse_link: &InverseLink) -> Option<(StandardLink, f64)> {
     match inverse_link {
         InverseLink::Standard(StandardLink::Inverse) => Some((StandardLink::Inverse, 1.0)),
         InverseLink::Standard(StandardLink::InverseSquared) => {
@@ -501,7 +501,7 @@ pub(crate) fn reciprocal_power_link(inverse_link: &InverseLink) -> Option<(Stand
 /// to feasibility — instead of projecting `η` or flooring `μ`, so every
 /// accepted iterate evaluates the exact likelihood.
 #[inline]
-pub(crate) fn require_reciprocal_link_domain(
+pub fn require_reciprocal_link_domain(
     link: StandardLink,
     eta: f64,
 ) -> Result<(), EstimationError> {
@@ -609,7 +609,6 @@ fn reciprocal_link_row(
 /// weight (including `1/φ`), working response `z = η + (y − μ)/μ′`, and the
 /// optional curvature/link-jet carriers. Every row is certified before any
 /// output buffer is written.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_reciprocal_link_working_state(
     family: PowerVarianceEdm,
     link: StandardLink,

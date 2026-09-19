@@ -378,6 +378,25 @@ pub fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
+/// CDF of the inverse Gaussian `IG(μ, λ)` (mean `μ`, variance `μ³/λ`) at `x`:
+///
+/// ```text
+/// F(x) = Φ(√(λ/x)(x/μ − 1)) + exp(2λ/μ) Φ(−√(λ/x)(x/μ + 1)),   x > 0,
+/// ```
+///
+/// and `0` on `x ≤ 0`. The second term is formed as `exp(2λ/μ + ln Φ(·))`, so a
+/// large shape `λ/μ` never overflows the exponential against the vanishing
+/// normal tail.
+pub fn inverse_gaussian_cdf(x: f64, mu: f64, lambda: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let root = (lambda / x).sqrt();
+    let body = normal_cdf(root * (x / mu - 1.0));
+    let reflected = (2.0 * lambda / mu + normal_logcdf(-root * (x / mu + 1.0))).exp();
+    (body + reflected).min(1.0)
+}
+
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`.
 ///
 /// The exact symmetric identity is `erfc(|z|/√2)`. Evaluating that identity

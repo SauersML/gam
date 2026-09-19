@@ -10,6 +10,9 @@ pub use gam_math::probability::normal_pdf;
 /// `crate::probability::normal_cdf` resolving for all existing callers.
 pub use gam_math::probability::normal_cdf;
 
+/// Inverse-Gaussian CDF `IG(μ, λ)`. Implementation lives in `gam-math`.
+pub use gam_math::probability::inverse_gaussian_cdf;
+
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`, evaluated directly
 /// without subtracting a CDF from one.
 pub use gam_math::probability::normal_two_sided_probability;
@@ -176,6 +179,70 @@ pub fn beta_moment_matched_interval(
     let b = (1.0 - mu) * precision;
     let q_lo = beta_quantile(p_lo, a, b);
     let q_hi = beta_quantile(p_hi, a, b);
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
+/// Quantile of `IG(μ, λ)` at `p ∈ (0, 1)`: the CDF is continuous and strictly
+/// increasing on `(0, ∞)`, so a geometric bracket around the mean followed by
+/// geometric bisection converges to the adjacent-float pair that straddles `p`.
+fn inverse_gaussian_quantile(p: f64, mu: f64, lambda: f64) -> f64 {
+    if !(p > 0.0 && p < 1.0 && mu.is_finite() && mu > 0.0 && lambda.is_finite() && lambda > 0.0) {
+        return f64::NAN;
+    }
+    let mut lo = mu;
+    while inverse_gaussian_cdf(lo, mu, lambda) >= p {
+        lo *= 0.5;
+        if lo == 0.0 {
+            return 0.0;
+        }
+    }
+    let mut hi = mu;
+    while inverse_gaussian_cdf(hi, mu, lambda) < p {
+        hi *= 2.0;
+        if !hi.is_finite() {
+            return f64::INFINITY;
+        }
+    }
+    loop {
+        let mid = (lo * hi).sqrt();
+        if mid <= lo || mid >= hi {
+            return hi;
+        }
+        if inverse_gaussian_cdf(mid, mu, lambda) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+}
+
+/// Equal-tailed predictive interval for a strictly-positive response modelled
+/// as an inverse Gaussian whose first two moments match a point prediction:
+/// mean `mu` and total predictive variance `total_var` (estimation +
+/// observation noise). Moment matching fixes `λ = μ³/V`; when estimation
+/// uncertainty vanishes (`total_var → φμ³`) this is the exact conditional
+/// `IG(μ, 1/φ)`, and with nonzero estimation variance it widens inside the
+/// inverse-Gaussian family, keeping its right skew.
+///
+/// Returns `None` for degenerate inputs (non-positive or non-finite mean or
+/// variance) or a mis-ordered pair, in which case the caller keeps the
+/// symmetric edges.
+pub fn inverse_gaussian_moment_matched_interval(
+    mu: f64,
+    total_var: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+        return None;
+    }
+    let lambda = mu.powi(3) / total_var;
+    let q_lo = inverse_gaussian_quantile(p_lo, mu, lambda);
+    let q_hi = inverse_gaussian_quantile(p_hi, mu, lambda);
     if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
         Some((q_lo, q_hi))
     } else {

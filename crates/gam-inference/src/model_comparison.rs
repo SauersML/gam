@@ -553,8 +553,8 @@ fn reporting_scale(
 /// Number of estimated dispersion / scale parameters a family contributes to the
 /// conditional-AIC degrees of freedom (`2·(edf + scale_dof)`, #1583).
 ///
-/// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / Beta /
-/// Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
+/// Gaussian profiles σ̂² (one extra dof) unless φ was user-fixed; Gamma / inverse
+/// Gaussian / Beta / Tweedie / Negative-Binomial add one only when their dispersion is *estimated*
 /// from data; Poisson and Binomial carry φ ≡ 1 and add none.
 fn scale_parameter_count(
     spec: &LikelihoodSpec,
@@ -567,6 +567,9 @@ fn scale_parameter_count(
         }
         ResponseFamily::Gamma => {
             matches!(scale, LikelihoodScaleMetadata::EstimatedGammaShape { .. })
+        }
+        ResponseFamily::InverseGaussian => {
+            matches!(scale, LikelihoodScaleMetadata::EstimatedDispersion { .. })
         }
         ResponseFamily::Beta { .. } => {
             matches!(scale, LikelihoodScaleMetadata::EstimatedBetaPhi { .. })

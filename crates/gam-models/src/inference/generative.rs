@@ -71,9 +71,18 @@ pub fn family_noise_parameter(
                 )))
             }
         }
-        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::FixedDispersion { phi }) => {
-            positive("fixed Gaussian dispersion", phi).map(|_| Some(phi.sqrt()))
-        }
+        (
+            ResponseFamily::Gaussian,
+            LikelihoodScaleMetadata::FixedDispersion { phi }
+            | LikelihoodScaleMetadata::EstimatedDispersion { phi },
+        ) => positive("Gaussian dispersion", phi).map(|_| Some(phi.sqrt())),
+        // Inverse-Gaussian: `gaussian_scale` carries the dispersion φ of
+        // `Var(Y) = φ μ³`, estimated at the converged mean.
+        (
+            ResponseFamily::InverseGaussian,
+            LikelihoodScaleMetadata::FixedDispersion { phi }
+            | LikelihoodScaleMetadata::EstimatedDispersion { phi },
+        ) => positive("inverse-Gaussian dispersion phi", phi),
         // Tweedie: `gaussian_scale` carries the *dispersion* phi; the variance
         // power `p` is read straight off the family spec by `from_likelihood`.
         // phi is estimated jointly with the mean (#771), so consult the fit's
@@ -157,6 +166,11 @@ pub enum NoiseModel {
         /// Per-observation Gamma shape k (> 0), with mean-driven scale; see
         /// `Tweedie::phi`.
         shape: Array1<f64>,
+    },
+    InverseGaussian {
+        /// Per-observation dispersion φ (> 0) of `Var(Y) = φ μ³`; see
+        /// `Tweedie::phi`.
+        phi: Array1<f64>,
     },
     Bernoulli,
     /// Row-specific categorical response law.
@@ -379,6 +393,16 @@ impl NoiseModel {
                 )?;
                 Ok(NoiseModel::Gamma {
                     shape: Array1::from_elem(nobs, shape),
+                })
+            }
+            ResponseFamily::InverseGaussian => {
+                let phi = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "inverse-Gaussian dispersion phi",
+                    gaussian_scale,
+                )?;
+                Ok(NoiseModel::InverseGaussian {
+                    phi: Array1::from_elem(nobs, phi),
                 })
             }
             ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
@@ -763,6 +787,31 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 let dist = rand_distr::Gamma::new(shape_i, scale).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Gamma params shape={shape_i} scale={scale}: {e}"
+                    ))
+                })?;
+                y[i] = rand_distr::Distribution::sample(&dist, rng);
+            }
+            Ok(y)
+        }
+        NoiseModel::InverseGaussian { phi } => {
+            check_dispersion_len(phi, spec.mean.len(), "inverse-Gaussian phi")?;
+            let mut y = Array1::<f64>::zeros(spec.mean.len());
+            for i in 0..y.len() {
+                let phi_i = phi[i];
+                if !(phi_i.is_finite() && phi_i > 0.0) {
+                    crate::bail_invalid_estim!("invalid inverse-Gaussian phi at row {i}: {phi_i}");
+                }
+                let mu = spec.mean[i];
+                if !(mu.is_finite() && mu > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "inverse-Gaussian mean at row {i} must be finite and strictly positive, got {mu}"
+                    );
+                }
+                // IG(μ, λ) with shape λ = 1/φ.
+                let dist = rand_distr::InverseGaussian::new(mu, 1.0 / phi_i).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid inverse-Gaussian params mean={mu} shape={}: {e}",
+                        1.0 / phi_i
                     ))
                 })?;
                 y[i] = rand_distr::Distribution::sample(&dist, rng);

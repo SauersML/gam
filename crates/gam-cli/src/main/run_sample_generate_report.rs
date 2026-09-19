@@ -968,6 +968,32 @@ fn report_family_residuals(
                 label: "Quantile Residual",
             })
         }
+        ResponseFamily::InverseGaussian => {
+            // Pearson dispersion under V(μ) = μ³: φ̂ = Σ(y−μ)²/μ³/(n − edf).
+            let phi = (0..n)
+                .map(|i| (y[i] - mu[i]).powi(2) / mu[i].powi(3))
+                .sum::<f64>()
+                / residual_dof;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err("inverse-Gaussian dispersion estimate is not positive".to_string());
+            }
+            let values = (0..n)
+                .map(|i| {
+                    if !(y[i] > 0.0 && mu[i] > 0.0) {
+                        return Err(format!(
+                            "inverse-Gaussian response and mean must be positive, got y={} μ={}",
+                            y[i], mu[i]
+                        ));
+                    }
+                    // IG(μ, λ = 1/φ): Var = φμ³.
+                    to_normal(inverse_gaussian_cdf(y[i], mu[i], 1.0 / phi))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
+            })
+        }
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
             if !(phi.is_finite() && phi > 0.0) {

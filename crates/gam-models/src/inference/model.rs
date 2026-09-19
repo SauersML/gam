@@ -4103,13 +4103,14 @@ impl FittedModel {
     /// `E[g⁻¹(η)] ≠ g⁻¹(E[η])` by Jensen. The curvature-based classification is:
     ///   * all log-link families (Poisson / Gamma / Tweedie / NegativeBinomial):
     ///     `E[exp η] = exp(η + se²/2) ≠ exp(η)` (log-normal MGF);
+    ///   * the reciprocal links (`1/η` for Gaussian / Gamma, `η^{-1/2}` for
+    ///     Inverse-Gaussian) and Inverse-Gaussian's log link;
     ///   * all Binomial links (logit / probit / cloglog / SAS / BetaLogistic /
     ///     Mixture / LatentCLogLog): bounded sigmoidal inverse links;
     ///   * Beta (logit link): `E[σ(η)] ≠ σ(E[η])`;
     ///   * Royston–Parmar (curved survival-probability inverse link).
     /// The integral collapses to the plug-in (so the cheaper plug-in path is
-    /// exact and taken instead) only for the effectively-linear identity-link
-    /// Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
+    /// exact and taken instead) only for the linear identity-link Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
     /// curved regardless of family. This curvature partition mirrors
     /// `families::family_runtime::posterior_mean`, the compute path that produces the
     /// corrected mean for each of these families.
@@ -4122,11 +4123,17 @@ impl FittedModel {
         let family = self.likelihood();
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
-            // mean equals the plug-in and the cheaper exact path is taken.
-            ResponseFamily::Gaussian => false,
-            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
+            // mean equals the plug-in and the cheaper exact path is taken. The
+            // inverse link `1/η` is curved.
+            ResponseFamily::Gaussian => {
+                !matches!(&family.link, InverseLink::Standard(StandardLink::Identity))
+            }
+            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η). Gamma's
+            // inverse link and both Inverse-Gaussian links (`η^{-1/2}`, `exp`)
+            // are curved as well.
             ResponseFamily::Poisson
             | ResponseFamily::Gamma
+            | ResponseFamily::InverseGaussian
             | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => true,
             // Beta (logit link): E[σ(η)] ≠ σ(E[η]).

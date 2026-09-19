@@ -1088,7 +1088,7 @@ fn validate_bounded_observation_inputs(
                 yi.is_finite() && yi >= 0.0 && yi == yi.round()
             }
             ResponseFamily::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
-            ResponseFamily::Gamma => yi.is_finite() && yi > 0.0,
+            ResponseFamily::Gamma | ResponseFamily::InverseGaussian => yi.is_finite() && yi > 0.0,
             ResponseFamily::Beta { .. } | ResponseFamily::RoystonParmar => false,
         };
         if !valid {
@@ -1096,6 +1096,152 @@ fn validate_bounded_observation_inputs(
         }
     }
     Ok(resolved_scale)
+}
+
+/// The dispersion `φ` of a power-variance family (`V = μ^p`: Gaussian `p = 0`,
+/// Gamma `p = 2`, inverse Gaussian `p = 3`) under a non-identity link, with the
+/// variance power.
+fn power_variance_dispersion(
+    response: &ResponseFamily,
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+) -> Result<(f64, f64), EstimationError> {
+    let to_estimation = |error: gam_spec::InvalidLikelihoodScale| {
+        EstimationError::InvalidInput(error.reason().to_string())
+    };
+    let (power, phi) = match response {
+        ResponseFamily::Gaussian => (0.0, resolved_scale.gaussian_phi().map_err(to_estimation)?),
+        ResponseFamily::Gamma => (2.0, resolved_scale.gamma_phi().map_err(to_estimation)?),
+        ResponseFamily::InverseGaussian => {
+            (3.0, resolved_scale.dispersion_phi().map_err(to_estimation)?)
+        }
+        other => crate::bail_invalid_estim!(
+            "family {} has no power-variance row under a reciprocal link",
+            other.name()
+        ),
+    };
+    if !(phi.is_finite() && phi > 0.0) {
+        crate::bail_invalid_estim!("bounded-family dispersion phi must be finite and > 0; got {phi}");
+    }
+    Ok((power, phi))
+}
+
+/// Exact observed row of a power-variance family (`V = μ^p`) under the
+/// reciprocal-power link `μ = η^(−a)` (inverse `a = 1`, inverse-squared
+/// `a = ½`).
+///
+/// With `α = a(p − 1) − 1` and `β = a(p − 2) − 1` every quantity is a sum of two
+/// powers of `η`, so each `η`-derivative follows from the power rule:
+///
+/// ```text
+/// ℓ  = (w/φ)[y η^(α+1)/(1 − p) − η^(β+1)/(2 − p)]   (p ≠ 2)
+/// ℓ  = (w/φ)[−y η^a + a ln η]                          (p = 2)
+/// s  = (w a/φ)[−y η^α + η^β]
+/// H  = (w a/φ)[y α η^(α−1) − β η^(β−1)]
+/// W  = E[H] = (w a²/φ) η^(β−1)
+/// ```
+///
+/// `η ≤ 0` leaves the link's domain and reports the retriable
+/// `InverseLinkDomainViolation`, so the bounded Newton step halves back to
+/// feasibility exactly as the unconstrained PIRLS does.
+fn exact_reciprocal_power_observation_row(
+    response: &ResponseFamily,
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+    (reciprocal, a): (StandardLink, f64),
+    row: usize,
+    y: f64,
+    weight: f64,
+    eta: f64,
+) -> Result<ExactStandardObservationRow, EstimationError> {
+    gam_solve::pirls::require_reciprocal_link_domain(reciprocal, eta)?;
+    let (p, phi) = power_variance_dispersion(response, resolved_scale)?;
+    let alpha = a * (p - 1.0) - 1.0;
+    let beta = a * (p - 2.0) - 1.0;
+    let c = weight * a / phi;
+    // Falling-factorial power-rule term `k (k−1)…(k−n+1) η^(k−n)` scaled by `c`.
+    let falling = |k: f64, n: i32| -> f64 {
+        let mut coefficient = 1.0;
+        for j in 0..n {
+            coefficient *= k - f64::from(j);
+        }
+        coefficient * eta.powf(k - f64::from(n))
+    };
+    // H^(n) = −s^(n+1) with s = c[−y η^α + η^β].
+    let neghessian = |n: i32| c * (y * falling(alpha, n + 1) - falling(beta, n + 1));
+    let log_likelihood = if p == 2.0 {
+        (weight / phi) * (-y * eta.powf(a) + a * eta.ln())
+    } else {
+        (weight / phi)
+            * (y * eta.powf(alpha + 1.0) / (1.0 - p) - eta.powf(beta + 1.0) / (2.0 - p))
+    };
+    let fisherweight = c * a * eta.powf(beta - 1.0);
+    if !(fisherweight.is_finite() && fisherweight > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "bounded reciprocal-link Fisher weight",
+            eta,
+            fisherweight,
+        ));
+    }
+    certify_bounded_row(
+        row,
+        eta,
+        ExactStandardObservationRow {
+            mu: eta.powf(-a),
+            score: c * (-y * eta.powf(alpha) + eta.powf(beta)),
+            fisherweight,
+            neghessian_eta: neghessian(0),
+            neghessian_eta_derivative: neghessian(1),
+            neghessian_eta_second_derivative: neghessian(2),
+            neghessian_eta_third_derivative: neghessian(3),
+            log_likelihood,
+        },
+    )
+}
+
+/// Exact observed row of the inverse Gaussian under the log link `μ = e^η`:
+///
+/// ```text
+/// ℓ = (w/φ)(−y e^(−2η)/2 + e^(−η)),   s = (w/φ)(y e^(−2η) − e^(−η)),
+/// H^(n) = (w/φ)((−1)^n 2^(n+1) y e^(−2η) − (−1)^n e^(−η)),   W = (w/φ) e^(−η).
+/// ```
+fn exact_inverse_gaussian_log_observation_row(
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+    row: usize,
+    y: f64,
+    weight: f64,
+    eta: f64,
+) -> Result<ExactStandardObservationRow, EstimationError> {
+    let (_, phi) = power_variance_dispersion(&ResponseFamily::InverseGaussian, resolved_scale)?;
+    let c = weight / phi;
+    let quadratic = (-2.0 * eta).exp();
+    let linear = (-eta).exp();
+    let neghessian = |n: i32| {
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        c * sign * (2.0_f64.powi(n + 1) * y * quadratic - linear)
+    };
+    let fisherweight = c * linear;
+    if !(fisherweight.is_finite() && fisherweight > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "bounded inverse-Gaussian Fisher weight",
+            eta,
+            fisherweight,
+        ));
+    }
+    certify_bounded_row(
+        row,
+        eta,
+        ExactStandardObservationRow {
+            mu: eta.exp(),
+            score: c * (y * quadratic - linear),
+            fisherweight,
+            neghessian_eta: neghessian(0),
+            neghessian_eta_derivative: neghessian(1),
+            neghessian_eta_second_derivative: neghessian(2),
+            neghessian_eta_third_derivative: neghessian(3),
+            log_likelihood: c * (linear - 0.5 * y * quadratic),
+        },
+    )
 }
 
 fn exact_standard_observation_row(
@@ -1111,7 +1257,32 @@ fn exact_standard_observation_row(
         return Ok(ExactStandardObservationRow::zero_weight(0.0));
     }
     let family = &likelihood.spec;
+    if let Some(reciprocal) = gam_solve::pirls::reciprocal_power_link(&family.link) {
+        return exact_reciprocal_power_observation_row(
+            &family.response,
+            resolved_scale,
+            reciprocal,
+            row,
+            y,
+            weight,
+            eta,
+        );
+    }
     match &family.response {
+        ResponseFamily::Gaussian
+            if !matches!(family.link, InverseLink::Standard(StandardLink::Identity)) =>
+        {
+            crate::bail_invalid_estim!(
+                "bounded Gaussian rows are defined for the identity and inverse links, got {}",
+                family.link.link_function().name()
+            );
+        }
+        ResponseFamily::Gamma if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) => {
+            crate::bail_invalid_estim!(
+                "bounded Gamma rows are defined for the log and inverse links, got {}",
+                family.link.link_function().name()
+            );
+        }
         ResponseFamily::Gaussian => {
             let scaled_weight = match resolved_scale {
                 gam_spec::ResolvedLikelihoodScale::ProfiledGaussian => weight,
@@ -1237,6 +1408,15 @@ fn exact_standard_observation_row(
                     log_likelihood: -weighted_ratio - weighted_shape * eta,
                 },
             )
+        }
+        ResponseFamily::InverseGaussian => {
+            if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) {
+                crate::bail_invalid_estim!(
+                    "bounded inverse-Gaussian rows are defined for the inverse-squared and log links, got {}",
+                    family.link.link_function().name()
+                );
+            }
+            exact_inverse_gaussian_log_observation_row(resolved_scale, row, y, weight, eta)
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
@@ -3610,28 +3790,13 @@ fn exact_joint_spatial_outer_hessian_available(
     family: &LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> bool {
-    // Every `LikelihoodSpec` variant (Gaussian, Binomial-*, Poisson, Gamma,
-    // Royston-Parmar) routes through the unified evaluator's outer-Hessian
-    // path: Gaussian Identity uses the no-correction dense form, all GLM
-    // variants supply scalar-GLM derivative ingredients consumed by
-    // `compute_outer_hessian` / `build_outer_hessian_operator`, and
-    // `outer_hessian_route_plan` chooses the matrix-free
-    // `HessianValue::Operator` representation when the dense assembly exceeds
-    // the materialization cap.  The previous `Identity || sparse_design`
-    // gate predates that operator routing and forced binomial+logit+Matern
-    // (and any other non-Gaussian dense-lazy spatial design) onto the
-    // gradient-only BFGS path even though analytic Hessian is fully
-    // available — capability check, not cost.  Match every variant
-    // explicitly so any future family addition (which may not yet provide
-    // outer-Hessian ingredients) forces an authoring decision here rather
-    // than silently inheriting `true`.
     // Every supported response (Gaussian, Binomial-*, Poisson, Tweedie,
-    // NegativeBinomial, Beta, Gamma, Royston-Parmar) routes through the
-    // unified evaluator's outer-Hessian path; the spec-level capability
-    // check therefore always succeeds. Match every response explicitly so
-    // any future family addition (which may not yet provide outer-Hessian
-    // ingredients) forces an authoring decision here rather than silently
-    // inheriting `true`.
+    // NegativeBinomial, Beta, Gamma, inverse Gaussian, Royston-Parmar) routes
+    // through the unified evaluator's outer-Hessian path, which chooses the
+    // matrix-free operator representation when dense assembly is too large.
+    // Match every response explicitly so any future family addition (which
+    // may not yet provide outer-Hessian ingredients) forces an authoring
+    // decision here rather than silently inheriting `true`.
     let family_supported = match &family.response {
         ResponseFamily::Gaussian
         | ResponseFamily::Binomial
@@ -3640,6 +3805,7 @@ fn exact_joint_spatial_outer_hessian_available(
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
         | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
         | ResponseFamily::RoystonParmar => true,
     };
     // A design with zero columns has no joint outer-Hessian to compute;
