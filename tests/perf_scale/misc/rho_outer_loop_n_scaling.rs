@@ -112,7 +112,7 @@ fn bspline_smooth(name: &str, col: usize) -> SmoothTermSpec {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }

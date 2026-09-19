@@ -44,7 +44,7 @@ fn matern_smooth(name: &str, centers: usize, kappa_auto: bool) -> SmoothTermSpec
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }

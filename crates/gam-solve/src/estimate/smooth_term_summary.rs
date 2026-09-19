@@ -51,7 +51,7 @@ use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
-use gam_terms::smooth::{ShapeConstraint, TermCollectionDesign, TermCollectionSpec};
+use gam_terms::smooth::{ShapeSpec, TermCollectionDesign, TermCollectionSpec};
 use ndarray::Array2;
 
 /// Build the smooth/random-effect rows of a model summary.
@@ -187,7 +187,7 @@ pub fn smooth_term_summary_rows(
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
         penalty_cursor += k;
-        let pvalue_unavailable = smooth_pvalue_unavailable(term.shape);
+        let pvalue_unavailable = smooth_pvalue_unavailable(&term.shape);
         let smooth_test = if pvalue_unavailable.is_none() {
             cov_forwald.and_then(|cov| {
                 wood_smooth_test(SmoothTestInput {
@@ -237,13 +237,14 @@ pub fn smooth_term_summary_rows(
 /// any. One predicate for every p-value surface (the Wald summary table and the
 /// likelihood-ratio `smooth_significance`), so they cannot disagree about which
 /// terms are testable.
-pub fn smooth_pvalue_unavailable(shape: ShapeConstraint) -> Option<SmoothPValueUnavailable> {
-    match shape {
-        ShapeConstraint::None => None,
-        ShapeConstraint::MonotoneIncreasing
-        | ShapeConstraint::MonotoneDecreasing
-        | ShapeConstraint::Convex
-        | ShapeConstraint::Concave => Some(SmoothPValueUnavailable::ShapeConstrained),
+pub fn smooth_pvalue_unavailable(shape: &ShapeSpec) -> Option<SmoothPValueUnavailable> {
+    // Any held shape (an atom, a conjunction, or a per-margin tensor request)
+    // restricts the coefficients to a cone, so the unconstrained reference
+    // distribution does not apply.
+    if shape.is_none() {
+        None
+    } else {
+        Some(SmoothPValueUnavailable::ShapeConstrained)
     }
 }
 
