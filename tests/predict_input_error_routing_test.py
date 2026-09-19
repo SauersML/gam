@@ -96,4 +96,4 @@ def test_check_reports_the_unseen_numeric_factor_level_with_its_column(frame):
 
 def test_seen_levels_still_predict(label_model):
     predictions = label_model.predict(_predict_frame([0.25, 0.75], ["L0", "L2"]))
-    assert np.all(np.isfinite(np.asarray(predictions["mean"], dtype=float)))
+    assert np.all(np.isfinite(np.asarray(predictions, dtype=float)))
