@@ -8340,7 +8340,8 @@ fn fit_save_predict_survival_location_scale_linkwiggle_3006(location: &str) {
         let x = 2.0 * normal_cdf(StandardNormal.sample(&mut rng)) - 1.0;
         let eps: f64 = StandardNormal.sample(&mut rng);
         let event_time = (1.0 + 0.5 * x + 0.6 * eps).exp();
-        let censor_time = (1.6 + 0.8 * StandardNormal.sample::<f64>(&mut rng)).exp();
+        let censor_draw: f64 = StandardNormal.sample(&mut rng);
+        let censor_time = (1.6 + 0.8 * censor_draw).exp();
         let (exit, event) = if event_time <= censor_time {
             (event_time, 1)
         } else {
@@ -8477,10 +8478,11 @@ fn write_delayed_entry_pc_survival_frame_3037(path: &std::path::Path, n: usize, 
     std::fs::write(path, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "write frame", e));
 }
 
-#[test]
-fn survival_location_scale_linear_pc_log_scale_fits_and_predicts_3037() {
+/// gam#3037 / gam#3038: a linear-PC log-scale location-scale fit on a
+/// delayed-entry age-scale frame must fit certified and then predict the band
+/// rows whose entry sits at a band's lower edge (exit = entry + 3).
+fn fit_predict_linear_pc_log_scale_3037(n: usize) {
     gam_runtime::test_support::install_diagnostic_logger();
-    let n: usize = std::env::var("GAM_3037_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3828);
     let dir = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let csv_path = dir.path().join("pc_frame.csv");
     write_delayed_entry_pc_survival_frame_3037(&csv_path, n, 3037);
@@ -8526,6 +8528,16 @@ fn survival_location_scale_linear_pc_log_scale_fits_and_predicts_3037() {
         training_data: None,
     })
     .unwrap_or_else(|e| panic!("linear-PC log-scale model failed to predict band rows: {e}"));
+}
+
+#[test]
+fn survival_location_scale_linear_pc_log_scale_fits_and_predicts_3037() {
+    fit_predict_linear_pc_log_scale_3037(3828);
+}
+
+#[test]
+fn survival_location_scale_linear_pc_log_scale_large_frame_predicts_bands_3038() {
+    fit_predict_linear_pc_log_scale_3037(19400);
 }
 
 /// gam#2904: a SAS survival location-scale fit selects the link shape together
