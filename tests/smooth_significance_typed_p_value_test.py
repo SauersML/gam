@@ -15,7 +15,9 @@ The contract pinned here:
 * a tail the reference cannot resolve is published as `p < p_value_upper_bound`
   — a finite, positive number no larger than the evaluation accuracy — never
   as a point value;
-* a null term's tail is resolved, and equals the evaluated corrected tail.
+* a null term's tail is resolved, and equals the evaluated corrected tail;
+* an estimated-scale statistic is scored on its own support, which starts
+  below zero, rather than clamped to zero.
 
 Replicates are seeded `default_rng(1000 + rep)` over the pyGAM audit's
 inference cells (bench/pygam_audit; bench/pvalue_calibration/pv-lr-refit).
@@ -70,6 +72,16 @@ def test_poisson_tail_below_the_imhof_accuracy_is_a_bound_not_zero() -> None:
     null = rows["s(x2)"]
     assert null["p_value"] is not None and 0.0 < null["p_value"] <= 1.0
     assert null["p_value"] == null["p_value_corrected"]
+
+
+def test_gaussian_profiled_statistic_below_zero_is_scored_where_it_is() -> None:
+    # With an estimated scale `W = n·ln(1 + Q/V) + B` and `B < 0`: a null term
+    # REML shrinks away lands in `(B, 0)`. It used to be clamped to `W = 0`,
+    # which scored every such replicate as `P(W > 0)` instead of its own tail.
+    row = _rows("gaussian", 0)["s(x2)"]
+    assert row["statistic_lr"] < 0.0, row["statistic_lr"]
+    assert row["p_value"] is not None and 0.0 < row["p_value"] <= 1.0
+    assert row["p_value"] == row["p_value_corrected"]
 
 
 def test_gaussian_tail_below_the_imhof_accuracy_is_a_bound_not_rounding() -> None:

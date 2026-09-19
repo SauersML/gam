@@ -2590,8 +2590,11 @@ impl SmoothLrReferenceDf {
             SmoothLrConditionalLaw::Closed(value) => return (value, 0.0),
             SmoothLrConditionalLaw::Combination(terms, x) => (terms, x),
         };
-        let summary =
-            |w: f64| gam_math::probability::chi_square_sf(w / self.scale, self.chi_square_df);
+        // A profiled statistic can sit below zero (its support starts at the
+        // offset `B < 0`); the known-scale summary's tail is 1 there.
+        let summary = |w: f64| {
+            gam_math::probability::chi_square_sf(w.max(0.0) / self.scale, self.chi_square_df)
+        };
         let derived = if self.statistic_resolution.is_finite() && self.statistic_resolution > 0.0 {
             let delta = self.statistic_resolution * (statistic.abs() + self.mean.abs());
             (summary(statistic) - summary(statistic + delta)).abs()
@@ -3289,7 +3292,7 @@ pub fn smooth_term_lr_inference_forspec(
             out.push(report(Err(SmoothLrUnavailable::NullLogLikelihoodNotFinite)));
             continue;
         }
-        let statistic_lr = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
+        let log_likelihood_ratio = 2.0 * (ll_full - null.fit.log_likelihood);
         // η at the null fit: X_null β_null + affine_offset + offset (per-row
         // linear predictor; design-layout independent — Lawley reads it on the
         // full design rows). `compose_offset` folds the design's fixed affine
@@ -3322,6 +3325,20 @@ pub fn smooth_term_lr_inference_forspec(
                 residual_unit_dimension: *residual_unit_dimension,
             });
         }
+        // The statistic's support is the reference's. A known-scale `W` is a
+        // non-negative combination of chi-squares, so a negative value is the
+        // two fits' optimizer noise and zero is the same event. A profiled `W`
+        // is `n·ln(1 + Q/V) + B`, whose support starts at `B`, and `B < 0`
+        // whenever the full fit spends any residual degree of freedom the null
+        // does not (`n·ln x < n(x − 1) ≤ ν_0(x − 1)` for `x = ν_f/ν_0 < 1`,
+        // since `ν_0 ≤ n`): a `W` in `(B, 0)` is an ordinary null draw, and moving
+        // it to zero scored it as `P(W > 0)` — an atom near 0.6 carrying the
+        // half of the null replicates whose term REML shrinks away.
+        let statistic_lr = if reference.profiled_scale.is_some() {
+            log_likelihood_ratio
+        } else {
+            log_likelihood_ratio.max(0.0)
+        };
         let ref_df_provenance = reference.clone();
 
         let (p_uncorrected, mut p_bound) = reference.tail_probability_with_bound(statistic_lr);
@@ -4173,6 +4190,39 @@ mod profiled_scale_reference_tests {
         // essentially one, but it is no longer the exact branch.
         let (just_above, _) = subject.tail_probability_with_bound(-0.6099);
         assert!(just_above < 1.0 && just_above > 0.999, "{just_above}");
+    }
+
+    /// A profiled `W` between the offset and zero is an ordinary draw from the
+    /// reference: its tail is resolved, strictly between the tail at zero and
+    /// one, and falls as `W` rises. Scoring it as `W = 0` put an atom at the
+    /// tail at zero under half of the null replicates.
+    #[test]
+    fn a_statistic_between_the_offset_and_zero_is_scored_where_it_is() {
+        use super::SmoothLrPValue;
+        let mut subject = reference(
+            vec![1.0_f64, 0.5],
+            Some(SmoothLrProfiledScale {
+                observations: 30.0,
+                deterministic_offset: -0.61,
+                residual_weights: vec![0.25],
+                residual_unit_dimension: 24.0,
+            }),
+        );
+        // A fit behind the reference, so the resolution request is derived
+        // from the summary at the (negative) statistic.
+        subject.statistic_resolution = 1e-10;
+        let (at_zero, _) = subject.tail_probability_with_bound(0.0);
+        let mut previous = 1.0;
+        for &statistic in &[-0.5_f64, -0.3, -0.1, -1e-3] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            assert!(value.is_finite() && accuracy.is_finite(), "W={statistic}: {value} ± {accuracy}");
+            assert!(value > at_zero && value < previous, "W={statistic}: {value} vs [{at_zero}, {previous}]");
+            assert_eq!(
+                subject.typed_p_value(statistic, value, accuracy),
+                Some(SmoothLrPValue::Resolved(value))
+            );
+            previous = value;
+        }
     }
 
     /// A huge effect is reported as a finite p-value or an explicit ceiling,

@@ -103,10 +103,10 @@ def rejects(row: dict, alpha: float) -> bool:
     return bound is not None and bound < alpha
 
 
-def ks_uniform(p: np.ndarray) -> tuple[float, float]:
+def ks_uniform(p: np.ndarray, alternative: str = "two-sided") -> tuple[float, float]:
     from scipy import stats
 
-    res = stats.kstest(p, "uniform")
+    res = stats.kstest(p, "uniform", alternative=alternative)
     return float(res.statistic), float(res.pvalue)
 
 
@@ -150,7 +150,14 @@ def summarize(paths: list[str]) -> None:
             if role.startswith("size"):
                 p = np.array([row["p_value"] for row in term if row.get("p_value") is not None])
                 d, pk = ks_uniform(p)
-                line += f"; KS D={d:.4f} p={pk:.3f} (n={p.size})"
+                # `greater`: the empirical CDF above the uniform's somewhere,
+                # i.e. the p-values anti-conservative at some level. A penalized
+                # null term shrunk to W = 0 publishes p = 1, a conservative atom
+                # the two-sided test also counts against the reference.
+                dg, pg = ks_uniform(p, "greater")
+                line += (f"; KS two-sided D={d:.4f} p={pk:.3f}, "
+                         f"anti-conservative D+={dg:.4f} p={pg:.3f} (n={p.size}); "
+                         f"P(p=1)={np.mean(p == 1.0):.3f}")
             print(line)
         secs = [r["seconds"] for r in recs]
         print(f"seconds per rep: median {np.median(secs):.1f}, max {max(secs):.1f}\n")
