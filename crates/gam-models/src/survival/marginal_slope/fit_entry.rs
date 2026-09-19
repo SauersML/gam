@@ -985,17 +985,30 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         out
     };
+    // The time penalties act on the base columns and, with a time wiggle, on the
+    // warp's Jacobian at the baseline predictor, not on the design's zero
+    // placeholder tail. Seeds and the ρ domain are both read against that acting
+    // design (#3061).
+    let time_acting_exit = time_block_acting_exit_design(
+        &spec.time_block.design_exit,
+        spec.time_block.offset_exit.view(),
+        spec.timewiggle_block.as_ref(),
+    )
+    .map_err(FitFailure::input)?;
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
         );
         // A seed refuses a design or penalty with no usable Gram scale, a
         // degenerate block the caller's data produced (#2937).
-        seeds.extend(block_log_lambda_seeds(
-            &spec.time_block.design_exit,
-            spec.time_block.penalties.iter(),
-        )
-        .map_err(FitFailure::input)?);
+        seeds.extend(
+            time_block_log_lambda_seeds(
+                &time_acting_exit,
+                &spec.time_block.penalties,
+                spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
+            )
+            .map_err(FitFailure::input)?,
+        );
         seeds.extend(block_log_lambda_seeds(
             &marginal_design.design,
             marginal_design.penalties.iter().map(|bp| &bp.local),
@@ -1009,7 +1022,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         seeds
     };
     // The ρ domain per coordinate, in the layout the seeds above use: the time
-    // block's penalties against its exit design, the marginal and slope blocks
+    // block's penalties against its acting exit design, the marginal and slope blocks
     // against their own designs, the prepared extra blocks against theirs, and
     // the absorber's identity ridge against the residualized influence columns
     // it penalizes (#2812, #2902 item 15).
@@ -1017,7 +1030,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let mut lower = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let mut upper = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
-            &spec.time_block.design_exit,
+            &time_acting_exit,
             spec.time_block.penalties.iter(),
         );
         lower.extend(lo);
@@ -1811,8 +1824,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // baseline-chart and learned log-σ axes, and between a chart and a design axis only through
     // the FLEX family program. The third derivatives have closed forms on the rigid frame for
     // design and chart axes but not for a learned log σ (gam#2765), and through the ζ
-    // composition of `timewiggle_third` for every time-wiggle frame it serves
-    // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
+    // composition of `timewiggle_third` for every time-wiggle frame it serves, on design axes
+    // (gam#2893) and baseline-chart axes (gam#3061). Any other θ keeps the analytic
     // gradient without declared curvature: declaring it would refuse every trial point that
     // asks for curvature.
     //
@@ -1849,8 +1862,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
             && (!initial_family.joint_jeffreys_term_required()
                 || initial_family.rigid_psi_jeffreys_third_served()
-                || (setup.auxiliary_dim() == 0
-                    && initial_family.timewiggle_zeta_available())));
+                || initial_family.timewiggle_psi_jeffreys_third_served()));
     let analytic_joint_hessian_available = analytic_joint_derivatives_available
         && joint_hessian.is_analytic()
         && psi_curvature_exact;
