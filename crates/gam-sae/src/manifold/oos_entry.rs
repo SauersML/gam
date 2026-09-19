@@ -1085,7 +1085,10 @@ mod tests {
             regularization: SaeOosRegularization {
                 log_lambda_sparse: 0.01_f64.ln(),
                 log_lambda_smooth: vec![0.01_f64.ln()],
-                log_ard: vec![vec![0.01_f64.ln()]],
+                // The frozen dictionary reproduces this target exactly, so the ARD prior
+                // is set weak enough that its pull on the coordinate mode, linear in the
+                // strength, sits below the roundoff the assertions below allow.
+                log_ard: vec![vec![1.0e-14_f64.ln()]],
             },
             max_iter: 1,
             learning_rate: 1.0,
