@@ -100,6 +100,21 @@ def railed() -> tuple[Any, dict[str, Any]]:
     return model, data
 
 
+def test_railed_coordinate_adds_no_smoothing_variance(railed: tuple[Any, dict[str, Any]]) -> None:
+    model, _ = railed
+    corrected = model.predict(_levels(), interval=0.95, return_type="dict")
+    conditional = model.predict(
+        _levels(), interval=0.95, covariance_mode="conditional", return_type="dict"
+    )
+    assert corrected.covariance_source == "smoothing-corrected"
+    np.testing.assert_allclose(
+        np.asarray(corrected.posterior_mean_standard_error, dtype=float),
+        np.asarray(conditional.posterior_mean_standard_error, dtype=float),
+        rtol=1e-12,
+        atol=0.0,
+    )
+
+
 def _levels() -> dict[str, Any]:
     return {"g": np.array([f"g{k}" for k in range(_GROUPS)])}
 

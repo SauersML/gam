@@ -658,9 +658,14 @@ fn a_double_well_fit_publishes_its_uncertified_trace_2901() {
     let exact = lambda / hessian;
     let trace = result.penalty_block_trace()[0];
     assert!(trace > 1.0, "the trace {trace} lies above the block's rank of 1");
+    // The trace is `λ·(r·x̂)` with `x̂` a dense Cholesky solve of the 1×1 `H` and
+    // `r = 1` the exact root of `S = [1]`. To first order in the unit roundoff
+    // `u = ε/2`: `l = fl(√H)` enters squared (2u), the forward and back divisions
+    // (2u), the product with λ (u), and the reference quotient `λ/H` itself (u),
+    // so the two agree to `6u = 3ε` relative.
     assert!(
-        (trace - exact).abs() <= 2.0 * f64::EPSILON * exact,
-        "the published trace {trace} is λ/H = {exact} to one solve and one product"
+        (trace - exact).abs() <= 3.0 * f64::EPSILON * exact,
+        "the published trace {trace} is λ/H = {exact} to one Cholesky solve and one product"
     );
     assert_eq!(
         result.edf_by_block()[0],

@@ -441,11 +441,13 @@ pub(crate) fn materialize_survival<'a>(
     }
 
     // `survmodel(distribution=...)` in the formula names the residual law, as
-    // `survival_distribution` does in the configuration, and the formula's
-    // `link(...)` with its initialization options names the inverse link, as
-    // `link` does; the formula wins in both. A fit without a link takes its
-    // inverse link from the residual law.
+    // `survival_distribution` does in the configuration, and the formula wins.
+    // The formula's `link(...)` with its initialization options names the
+    // inverse link, as `link` does; both are read, and a `link` argument that
+    // names a different link from the formula's is refused by name. A fit
+    // without a link takes its inverse link from the residual law.
     let formula_link = parsed.linkspec.as_ref();
+    resolve_link_spellings(formula_link, config.link.as_deref(), false)?;
     let link_name = formula_link
         .map(|spec| spec.link.as_str())
         .or(config.link.as_deref());

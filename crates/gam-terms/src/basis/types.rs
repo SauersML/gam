@@ -29,7 +29,7 @@ impl SendPtr {
 /// Re-export of the neutral basis-error contract. #1521: `BasisError` lives
 /// in `gam-problem` so `EstimationError` can wrap it (`#[from]`) without a
 /// back-edge; gam-terms re-exports it to preserve `gam_terms::basis::BasisError`.
-pub use gam_problem::BasisError;
+pub use gam_problem::{BasisError, CovariateSpan};
 
 // ============================================================================
 // Unified Basis Generation API
