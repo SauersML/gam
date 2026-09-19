@@ -4467,13 +4467,21 @@ impl<'a> RemlState<'a> {
         // constrained optimum (issue #989). `bounded()`, which solves via the
         // exact-interval path rather than this active-set gate, was unaffected —
         // hence the two documented ways to bound a coefficient disagreed.
-        let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
-        let stationarity_ok =
-            kkt.stationarity <= stationarity_tol || stationarity_rel <= stationarity_tol;
+        //
+        // The dual-feasibility and complementarity channels carry the same
+        // gradient units (`λ` solves `g = Aᵀλ` on unit rows) and are judged in
+        // the same frame. Held to a bare absolute bar they made convergence
+        // depend on the response's units: `y → 1e6·y` on a monotone smooth
+        // scales `g` and `λ` by 1e6 and was refused at `comp = 9.65e-5` under
+        // `‖g‖∞ = 1.5e6` — a relative complementarity of 6e-11.
+        let gradient_scale = kkt.gradient_scale;
+        let exceeds = |residual: f64, tolerance: f64| {
+            crate::active_set::exceeds_at_gradient_scale(residual, tolerance, gradient_scale)
+        };
         if kkt.primal_feasibility > KKT_TOL_PRIMAL
-            || kkt.dual_feasibility > KKT_TOL_DUAL
-            || kkt.complementarity > KKT_TOL_COMP
-            || !stationarity_ok
+            || exceeds(kkt.dual_feasibility, KKT_TOL_DUAL)
+            || exceeds(kkt.complementarity, KKT_TOL_COMP)
+            || exceeds(kkt.stationarity, stationarity_tol)
         {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
@@ -4525,7 +4533,7 @@ impl<'a> RemlState<'a> {
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
-                stationarity_rel,
+                kkt.stationarity / gradient_scale.max(1.0),
                 stationarity_tol,
                 if kkt.working_set_rank_deficient {
                     ", degenerate face"
