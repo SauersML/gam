@@ -386,8 +386,8 @@ pub struct PreactivationPair {
 /// are absolute. `Φ₂` comes from the owner's plain entry, whose absolute contract
 /// is cheap. Where that route's bounds certify no digit of `K` or `∂_r K` (the
 /// anticorrelated lower tails, #2946), the kernel is evaluated again with the
-/// owner's certified entry. Its rounding scales with `Φ₂` inside the owner's
-/// relative regime, and [`PairKernel::orthant_fallback`] records that it ran.
+/// owner's certified entry. Its rounding scales with `Φ₂`, and
+/// [`PairKernel::orthant_fallback`] records that it ran.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PairKernel {
     /// `K = E[σ(X) σ(Y)]`.
@@ -1480,8 +1480,7 @@ fn limiting_step(x: f64) -> f64 {
 enum OrthantEntry {
     /// `bivariate_normal_cdf_with_complement` under its absolute contract.
     Plain,
-    /// `bivariate_normal_cdf_with_complement_bounded`: value-scaled rounding inside its relative regime, the
-    /// absolute contract elsewhere.
+    /// `bivariate_normal_cdf_with_complement_bounded`: rounding that scales with the value.
     Certified,
 }
 
@@ -1511,8 +1510,7 @@ fn capped_complement(ratio: Bounded) -> Bounded {
 /// rounding bounds plus the standardized arguments' rounding propagated through
 /// the partials of `Φ₂`. `Φ₂`'s own rounding is the chosen entry's: the plain
 /// entry's absolute contract, or the certified entry's per-evaluation bound, which
-/// scales with the value inside its relative regime (ρ ≤ 0 with both apex
-/// coordinates resolved nonnegative).
+/// scales with the value.
 /// - A rounded `1 − ρ²` moves the owner's `1 ∓ |ρ|`, and so the effective
 ///   correlation, by at most its bound over `1 + |ρ|`.
 /// - With `c = 1 − ρ²`, `r_h = (h − ρk)/c` and `r_k = (k − ρh)/c`, the partials
@@ -1758,7 +1756,6 @@ fn exact_gelu_biased_pair_kernel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bivariate_normal::RoundingContract;
     use crate::probability::normal_pdf;
     use crate::quadrature::{
         GaussHermiteRule, gauss_hermite_rule, symmetric_tridiagonal_eigen_first_components,
@@ -4098,7 +4095,7 @@ mod tests {
 
     #[test]
     fn biased_pair_kernels_keep_relative_accuracy_in_anticorrelated_lower_tails() {
-        // (b, c, v, w, r) inside the bivariate normal owner's relative regime for both activations: ρ ≤ 0, with both
+        // (b, c, v, w, r) in the anticorrelated lower tails for both activations: ρ ≤ 0, with both
         // reduced apex coordinates −(h − ρk)/(1 − ρ²) and −(k − ρh)/(1 − ρ²) nonnegative. Here the absolute contract
         // alone left K and ∂_r K with no certified digit (#2946).
         let laws: [(f64, f64, f64, f64, f64); 7] = [
@@ -4128,7 +4125,7 @@ mod tests {
                 covariance_rounding: 0.0,
             };
             // The owner certifies relative accuracy at both standardized cells: the ReLU's (b/√v, c/√w, r/√(vw)) and
-            // the exact GELU's (b/√A, c/√B, r/√(AB)). An Absolute contract would leave these pins with no digit.
+            // the exact GELU's (b/√A, c/√B, r/√(AB)). An absolute bound would leave these pins with no digit.
             let (total_x, total_y) = (1.0 + variance_x, 1.0 + variance_y);
             for (h, k, correlation, complement) in [
                 (
@@ -4147,9 +4144,10 @@ mod tests {
                 let orthant = bivariate_normal_cdf_with_complement_bounded(h, k, correlation, complement)
                     .expect("bounded standardized orthant");
                 assert!(
-                    matches!(orthant.contract, RoundingContract::Relative),
-                    "Φ₂ at (h, k, ρ) = ({h}, {k}, {correlation}) from b = {mean_x}, c = {mean_y}, r = {covariance} is not certified relative: {:?}",
-                    orthant.contract
+                    orthant.rounding <= 1.0e-12 * orthant.value,
+                    "Φ₂ at (h, k, ρ) = ({h}, {k}, {correlation}) from b = {mean_x}, c = {mean_y}, r = {covariance} is not certified relative: {:e} ± {:e}",
+                    orthant.value,
+                    orthant.rounding
                 );
             }
             let (relu_kernel, relu_derivative) =
@@ -4228,14 +4226,15 @@ mod tests {
                 "{activation:?} at a central law took the certified entry: {plain:?}"
             );
         }
-        // Positive control for the contract query: the positively correlated standardized cell (−3, −3, 0.5) lies
-        // outside the owner's certified region and must answer Absolute.
-        let outside = bivariate_normal_cdf_with_complement_bounded(-3.0, -3.0, 0.5, 0.75)
-            .expect("bounded orthant outside the certified region");
+        // The positively correlated standardized cell (−3, −3, 0.5) splits into two leaves, and its bound still scales
+        // with the value.
+        let positive = bivariate_normal_cdf_with_complement_bounded(-3.0, -3.0, 0.5, 0.75)
+            .expect("bounded orthant at a positive correlation");
         assert!(
-            matches!(outside.contract, RoundingContract::Absolute),
-            "Φ₂ at (−3, −3, 0.5) claims {:?} outside the certified region",
-            outside.contract
+            positive.rounding <= 1.0e-12 * positive.value,
+            "Φ₂ at (−3, −3, 0.5) = {:e} ± {:e}",
+            positive.value,
+            positive.rounding
         );
     }
 
