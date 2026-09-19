@@ -955,6 +955,7 @@ mod factor_smooth_null_component_tests {
             flavour,
             group_frozen_levels: None,
             frozen_global_orthogonality: None,
+            adaptive: false,
         };
         build_factor_smooth(
             grouped_data(n_levels).view(),
@@ -1216,6 +1217,7 @@ mod factor_smooth_heldout_group_tests {
                     flavour,
                     group_frozen_levels: frozen,
                     frozen_global_orthogonality: None,
+                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),
@@ -1410,6 +1412,7 @@ mod frozen_factor_level_collection_tests {
                             flavour: FactorSmoothFlavour::Fs {},
                             group_frozen_levels: Some(vec![9.0_f64.to_bits(), 8.0_f64.to_bits()]),
                             frozen_global_orthogonality: None,
+                            adaptive: false,
                         },
                     }),
                 }),

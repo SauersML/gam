@@ -591,6 +591,12 @@ pub struct FactorSmoothSpec {
     /// persisted; replayed verbatim by `apply_global_smooth_identifiability`.
     #[serde(default)]
     pub frozen_global_orthogonality: Option<Array2<f64>>,
+    /// `true` when nobody chose the shared marginal's size: it is the formula
+    /// default's starting resolution, which the standard formula workflow
+    /// refines from the converged fit's own evidence. An explicit `k=` is
+    /// `false` and honoured verbatim.
+    #[serde(default)]
+    pub adaptive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5920,7 +5926,7 @@ pub(crate) fn build_tensor_bspline_basis(
             (
                 BSplineKnotSpec::PeriodicUniform {
                     data_range,
-                    num_basis,
+                    num_basis, ..
                 },
                 _,
             ) => Array1::linspace(data_range.0, data_range.1, *num_basis),

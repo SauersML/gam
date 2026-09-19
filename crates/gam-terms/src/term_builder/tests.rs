@@ -51,80 +51,62 @@ fn unique_count_column_uses_canonical_level_bits() {
     assert_eq!(unique_count_column(finite.view()), 3);
 }
 
-/// #1867 regression: on sparse 1-D data the generic conditioning cap in
-/// [`default_num_centers`] (`n / COND_N_DIVISOR`) starves a radial
-/// (matérn/duchon) basis BELOW the resolution the univariate B-spline
-/// `s(x)` is handed on the SAME data — 7 vs 11 basis functions at n=30 —
-/// so `matern(x)`/`duchon(x)` over-smooth oscillations that `s(x)`
-/// recovers. The spline-equivalent floor threaded into the radial default
-/// count must restore that resolution. Without the floor (the `0` argument,
-/// i.e. the pre-fix behaviour) the radial default stays starved.
+/// #1867: a 1-D radial smooth must not be dimensioned coarser than the
+/// univariate `s(x)` on the same data. The spline-equivalent floor is the
+/// rate-derived pilot `s(x)` starts from: the order-2 null space plus the
+/// penalized resolution rank `⌈n^{1/5}⌉`, held to the distinct values.
 #[test]
 fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
-    let n = 30usize;
-    let d = 1usize;
-    // Raw radial default, starved by the n/COND_N_DIVISOR conditioning cap.
-    let planned = default_num_centers(n, d);
-    assert!(
-        planned < 11,
-        "precondition: conditioning cap starves the raw radial default (got {planned})"
-    );
-    // A well-resolved 1-D column of `n` distinct values asks for the
-    // univariate spline basis dimension the competing `s(x)` gets.
-    let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-    let univariate_floor =
-        heuristic_knots_for_column(col.view()).saturating_add(DEFAULT_BSPLINE_DEGREE + 1);
-    assert_eq!(univariate_floor, 11, "univariate spline resolution at n=30");
-
-    // BEFORE (no floor): radial defaults inherit the starved count.
-    assert_eq!(default_matern_center_count(n, d, planned, 0), planned);
-    assert!(default_duchon_center_count(n, d, planned, 2, 0) <= planned);
-
-    // AFTER (spline-equivalent floor): radial defaults are lifted to at
-    // least the univariate spline resolution, so they are not dimensioned
-    // coarser than `s(x)` on identical data.
-    assert!(
-        default_matern_center_count(n, d, planned, univariate_floor) >= univariate_floor,
-        "matern 1-D default must not be starved below the spline resolution"
-    );
-    assert!(
-        default_duchon_center_count(n, d, planned, 2, univariate_floor) >= univariate_floor,
-        "duchon 1-D default must not be starved below the spline resolution"
-    );
-
+    for n in [30usize, 1_000, 100_000] {
+        let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let univariate_floor = univariate_spline_basis_dim(col.view());
+        assert_eq!(
+            univariate_floor,
+            DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, DEFAULT_PENALTY_ORDER),
+            "univariate spline pilot at n={n}"
+        );
+        // A radial plan starved below the floor is lifted to it.
+        let starved = 1usize;
+        assert!(default_matern_center_count(n, 1, starved, univariate_floor) >= univariate_floor);
+        assert!(default_duchon_center_count(n, 1, 2, univariate_floor) >= univariate_floor);
+        // Without the floor the Duchon default is the rate pilot itself
+        // (bounded below only by the null-space identifiability floor).
+        assert_eq!(
+            default_duchon_center_count(n, 1, 2, 0),
+            starting_num_centers(n, 1, 2).max(3)
+        );
+    }
     // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
     // the generic n-scaling plan unchanged.
     assert_eq!(default_matern_center_count(200, 2, 40, 0), 40);
 }
 
 /// #1757 regression: an omitted `k=`/`centers=` on a 2-D Duchon smooth must
-/// remain a low-rank representer basis. The generic spatial planner grows
-/// with `n` (125 centers at n=500), which makes the Duchon center-Gram
-/// rotation and REML linear algebra scale as dense `O(k^3)` setup work
-/// before the data-fit iterations even start. The Duchon-specific default
-/// caps the implicit basis at the thin-plate/Duchon spline rank
-/// `10 * 3^(d - 1)` (30 in 2-D) while explicit `k=`/`centers=` still bypass
-/// this helper upstream.
+/// stay a low-rank representer basis rather than the generic spatial width,
+/// and that rank is the data-derived pilot — the affine null space plus the
+/// penalized resolution rank at `n` rows — not a fixed `10 * 3^(d - 1)`: it
+/// grows with `n` instead of saturating at 30 in 2-D.
 #[test]
 fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
-    let n = 500usize;
     let d = 2usize;
     let polynomial_cols = d + 1;
-    let generic_plan = default_num_centers(n, d);
-    let duchon_default = default_duchon_center_count(n, d, generic_plan, polynomial_cols, 0);
-    let spline_rank = 10usize.saturating_mul(3usize.saturating_pow((d - 1) as u32));
-
+    let mut previous = 0usize;
+    for n in [500usize, 5_000, 50_000, 500_000] {
+        let generic_plan = default_num_centers(n, d);
+        let duchon_default = default_duchon_center_count(n, d, polynomial_cols, 0);
+        assert_eq!(
+            duchon_default,
+            starting_num_centers(n, d, polynomial_cols),
+            "2-D Duchon default at n={n} must be the rate-derived pilot"
+        );
+        assert!(duchon_default < generic_plan, "low rank vs the generic width at n={n}");
+        assert!(duchon_default > polynomial_cols, "affine null space plus a penalized span");
+        assert!(duchon_default >= previous, "the pilot never shrinks as n grows");
+        previous = duchon_default;
+    }
     assert!(
-        generic_plan > spline_rank,
-        "precondition: generic spatial plan should be wider than the Duchon low-rank spline rank"
-    );
-    assert_eq!(
-        duchon_default, spline_rank,
-        "2-D Duchon default must use the low-rank spline representer size, not the generic spatial width"
-    );
-    assert!(
-        duchon_default > polynomial_cols,
-        "the capped default must still contain the affine polynomial null space"
+        previous > 30,
+        "at n=5e5 the pilot exceeds the old fixed mgcv rank of 30 (got {previous})"
     );
 }
 
@@ -325,7 +307,6 @@ fn build_two_dimensional_spatial_basis(
         &options,
         ds,
         &mut notes,
-        1,
     )
     .unwrap_or_else(|error| {
         panic!("failed to build {selector} with count option {count_option:?}: {error}")
@@ -354,7 +335,6 @@ fn build_sphere_over_lat_lon(ds: &Dataset) -> Result<SmoothBasisSpec, String> {
         &options,
         ds,
         &mut notes,
-        1,
     )
 }
 
@@ -494,7 +474,6 @@ fn default_univariate_thinplate_basis_dim_is_modest() {
         &options,
         &ds,
         &mut notes,
-        1,
     )
     .expect("build default univariate tp smooth");
 
@@ -559,7 +538,6 @@ fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
         &options,
         &ds,
         &mut notes,
-        1,
     )
     .expect("build default 2-D matern smooth");
 
@@ -654,7 +632,6 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             &options,
             &ds,
             &mut notes,
-            1,
         )
         .expect("build Matérn provenance fixture")
     };
@@ -753,7 +730,6 @@ fn matern_and_thinplate_accept_periodic_option() {
         &matern_opts,
         &ds,
         &mut notes,
-        1,
     )
     .expect("matern(x, periodic=true) must be accepted");
     match &matern_basis {
@@ -776,7 +752,6 @@ fn matern_and_thinplate_accept_periodic_option() {
         &tps_opts,
         &ds,
         &mut notes,
-        1,
     )
     .expect("thinplate(x, periodic=true) must be accepted");
     match &tps_basis {
@@ -819,7 +794,6 @@ fn scalar_periodic_false_builds_non_periodic_radial_smooth() {
             &opts,
             &ds,
             &mut notes,
-            1,
         )
         .unwrap_or_else(|e| panic!("s(x, bs={bs}, periodic=false) must be accepted: {e}"))
     };
@@ -1253,7 +1227,7 @@ fn one_dimensional_bspline_accepts_boundary_periodic() {
         &spec.knotspec,
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis: 8
+            num_basis: 8, ..
         } if *data_range == (0.0, std::f64::consts::TAU)
     ));
 }
@@ -1567,10 +1541,12 @@ fn default_sphere_smooth_uses_spherical_farthest_point_centers() {
     let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("expected sphere term");
     };
-    assert!(matches!(
-        spec.center_strategy,
-        CenterStrategy::FarthestPoint { .. }
-    ));
+    // Nobody chose the count, so the farthest-point centers are an `Auto`
+    // pilot the formula workflow refines on the fit's REML evidence.
+    let CenterStrategy::Auto(inner) = &spec.center_strategy else {
+        panic!("default sphere centers must be an adaptive pilot: {:?}", spec.center_strategy);
+    };
+    assert!(matches!(**inner, CenterStrategy::FarthestPoint { .. }));
 }
 
 #[test]
@@ -1675,7 +1651,7 @@ fn one_dimensional_duchon_length_scale_opts_into_hybrid_mode() {
 }
 
 #[test]
-fn multidimensional_duchon_default_uses_low_rank_mgcv_sized_basis() {
+fn multidimensional_duchon_default_uses_rate_derived_pilot_basis() {
     let ds = continuous_dataset(
         &["y", "x1", "x2"],
         (0..500)
@@ -1702,10 +1678,17 @@ fn multidimensional_duchon_default_uses_low_rank_mgcv_sized_basis() {
     let CenterStrategy::Auto(inner) = &spec.center_strategy else {
         panic!("expected auto center strategy");
     };
-    assert!(matches!(
-        inner.as_ref(),
-        CenterStrategy::FarthestPoint { num_centers: 30 }
-    ));
+    let CenterStrategy::FarthestPoint { num_centers } = inner.as_ref() else {
+        panic!("expected farthest-point pilot centers, got {inner:?}");
+    };
+    // The pilot is the polynomial null space plus the penalized resolution
+    // rank at n=500 in 2-D — not a fixed per-dimension constant.
+    let polynomial_cols = match spec.nullspace_order {
+        DuchonNullspaceOrder::Zero => 1,
+        DuchonNullspaceOrder::Linear => 3,
+        DuchonNullspaceOrder::Degree(degree) => crate::basis::duchon_nullspace_dimension(2, degree),
+    };
+    assert_eq!(*num_centers, starting_num_centers(500, 2, polynomial_cols));
 }
 
 #[test]
@@ -2692,13 +2675,16 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
     // `zbig` spans a very different range from `x` on purpose, so an
     // anisotropy option such as `scale_dims=` has something to change on the
     // radial arms; on two identically-scaled axes it is a true no-op and the
-    // probe would prove nothing.
+    // probe would prove nothing. `x` is spread non-uniformly over [0, 1] so
+    // quantile and uniform knot placement differ at every knot count; on an
+    // equispaced covariate the rate-sized pilot's knots coincide under both
+    // placements and a `knot_placement=` probe would prove nothing either.
     let ds = continuous_dataset(
         &["y", "x", "z", "zbig", "lat", "lon", "g"],
         (0..240)
             .map(|i| {
                 let t = i as f64;
-                let x = (i % 24) as f64 / 23.0;
+                let x = ((i % 24) as f64 / 23.0).powi(2);
                 let z = (i / 24) as f64 / 9.0;
                 vec![
                     (t * 0.13).sin() + x + z,
@@ -4171,7 +4157,6 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
             &options,
             &ds,
             &mut notes,
-            1,
         )
         .expect("thin-plate basis builds")
     };
@@ -4217,7 +4202,6 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
         &small_options,
         &ds_small,
         &mut notes,
-        1,
     )
     .expect("small-level thin-plate basis builds");
     assert_eq!(
@@ -4320,23 +4304,20 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
 }
 
 #[test]
-fn heuristic_knots_for_column_uses_uniquevalue_rule() {
-    // Few unique values → `unique/4` clamped up to the 4-knot floor.
-    let col = array![0.0, 0.0, 1.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-    assert_eq!(unique_count_column(col.view()), 6);
-    assert_eq!(heuristic_knots_for_column(col.view()), 4);
-    // Many unique values → clamped to the flat mgcv-like default cap of 8
-    // internal knots (cubic basis ≈ 12 functions), NOT grown with n. A larger
-    // column used to return 20 internal knots (a 24-function basis); that
-    // over-rich default over-parameterized weak-signal additive fits and the
-    // penalty could not shrink it away cleanly (gam#1680). The cap is flat in n:
-    // users opt *in* to a wigglier fit by raising `k` explicitly.
-    let bigger = Array1::from_iter((0..200).map(|v| v as f64));
-    assert_eq!(heuristic_knots_for_column(bigger.view()), 8);
-    // The 32-unique boundary is exactly where `unique/4` meets the cap, so
-    // columns at or below it keep their previous knot count unchanged.
-    let boundary = Array1::from_iter((0..32).map(|v| v as f64));
-    assert_eq!(heuristic_knots_for_column(boundary.view()), 8);
+fn pilot_internal_knots_follow_the_resolution_rate_not_a_fixed_cap() {
+    // The pilot open cubic basis is the order-2 null space plus the penalized
+    // resolution rank `⌈n^{1/5}⌉`: dims 5/6/9/12 at n = 1e2..1e5, with no
+    // fixed ceiling (the old rule clamped every column to 8 internal knots).
+    for (n, dim) in [(100usize, 5usize), (1_000, 6), (10_000, 9), (100_000, 12)] {
+        let col = Array1::from_iter((0..n).map(|v| v as f64));
+        assert_eq!(
+            pilot_internal_knots_for_column(col.view()) + DEFAULT_BSPLINE_DEGREE + 1,
+            dim,
+            "pilot s(x) dimension at n={n}"
+        );
+    }
+    let huge = 10usize.pow(9);
+    assert!(pilot_internal_knots(huge, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) > 8);
 }
 
 /// The default `s(x)` basis on a low-cardinality covariate is capped to the
@@ -4374,7 +4355,7 @@ fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
         (internal + spec.degree + 1, spec.degree, spec.penalty_order)
     };
     // (unique, expected basis dimension, expected degree)
-    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 8, 3)] {
+    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 5, 3)] {
         let (got_dimension, got_degree, _) = dimension_of("y ~ s(x)", unique);
         assert_eq!(
             (got_dimension, got_degree),
@@ -4384,16 +4365,6 @@ fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
     }
     // An explicit basis dimension is the caller's contract, not a default.
     assert_eq!(dimension_of("y ~ s(x, k=8)", 3).0, 8);
-}
-
-#[test]
-fn bug_term_builder_knots_floor_on_constant_column() {
-    let c = array![4.0, 4.0, 4.0, 4.0];
-    let k = heuristic_knots_for_column(c.view());
-    assert!(
-        k >= 4,
-        "Heuristic knot count should keep the documented minimum floor even on constant columns."
-    );
 }
 
 /// #1425 / #2469: the partition a fit prices and the partition identifiability
