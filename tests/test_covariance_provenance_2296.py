@@ -112,9 +112,9 @@ def test_default_uncertainty_publishes_conditional_when_no_correction_exists() -
     # label. The producing seam is
     # `crates/gam-pyffi/src/manifold/geometry_ffi.rs`,
     # `.map_err(|err| format!("prediction failed: {err}"))`.
-    with pytest.raises(gamfit.GamError) as raised:
+    with pytest.raises(gamfit.errors.GamError) as raised:
         model.predict(grid, interval=0.9, covariance_mode="smoothing", return_type="dict")
-    assert type(raised.value) is gamfit.GamError
+    assert type(raised.value) is gamfit.errors.GamError
     assert str(raised.value) == (
         "prediction failed: Invalid input: fit result does not "
         "contain smoothing-corrected covariance"
@@ -223,7 +223,7 @@ def test_spline_scan_interval_refuses_corrected_and_labels_conditional() -> None
     # An EXPLICIT smoothing-corrected request refuses: no corrected object
     # exists for the profiled-lambda scan, and substituting the conditional
     # band under a corrected requirement would under-report uncertainty.
-    with pytest.raises(gamfit.GamError) as refusal:
+    with pytest.raises(gamfit.errors.GamError) as refusal:
         model.predict(
             grid, interval=0.9, covariance_mode="smoothing", return_type="dict"
         )

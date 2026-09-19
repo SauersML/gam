@@ -1,6 +1,6 @@
 """Bug hunt: the Matérn kernel basis primitive is unreachable from the public
 ``gamfit`` namespace, even though it is a documented, working peer of the
-exported ``gamfit.duchon_basis``.
+exported ``gamfit.basis.duchon_basis``.
 
 `gamfit/_api.py` defines ``matern_basis(points, centers, *, length_scale, nu,
 aniso_log_scales)`` with a full public-style docstring that explicitly states it
@@ -15,10 +15,10 @@ jet-peer ``sphere_basis_jet``). Because ``__all__`` is auto-derived from what is
 importable, the omission also drops it from star-imports and from the
 ``docs/api-reference.md`` mkdocstrings surface (which documents
 ``bspline_basis`` / ``duchon_basis`` / ``sphere_basis`` but has no
-``::: gamfit.matern_basis`` entry).
+``::: gamfit.basis.matern_basis`` entry).
 
 Net effect: a user following the docstring's "peer of ``duchon_basis``" framing
-finds ``gamfit.duchon_basis`` but ``gamfit.matern_basis`` raises
+finds ``gamfit.basis.duchon_basis`` but ``gamfit.basis.matern_basis`` raises
 ``AttributeError`` — the Matérn radial primitive advertised in the README
 ("radial smooths ... ``matern``") has no direct Python entry point, unlike every
 other exposed basis primitive.
@@ -34,7 +34,7 @@ Root cause: a one-line omission in the ``from ._api import (...)`` block of
 ``duchon_basis`` (and, for full parity, ``sphere_basis_jet`` next to
 ``sphere_basis``).
 
-The assertions below check both that ``gamfit.matern_basis`` is reachable AND
+The assertions below check both that ``gamfit.basis.matern_basis`` is reachable AND
 that the public entry point computes the correct closed-form Matérn kernel, so
 the test pins a real primitive, not merely the presence of a name.
 """
@@ -48,18 +48,18 @@ import gamfit
 def test_matern_basis_is_reachable_from_public_namespace():
     # Its exported siblings are all reachable; the Matérn primitive must be too.
     for sibling in ("duchon_basis", "bspline_basis", "sphere_basis"):
-        assert hasattr(gamfit, sibling), f"expected sibling {sibling} to be public"
-    assert hasattr(gamfit, "matern_basis"), (
-        "gamfit.matern_basis is not reachable from the public namespace, even "
+        assert hasattr(gamfit.basis, sibling), f"expected sibling {sibling} to be public"
+    assert hasattr(gamfit.basis, "matern_basis"), (
+        "gamfit.basis.matern_basis is not reachable from the public namespace, even "
         "though its docstring frames it as a peer of the exported "
-        "gamfit.duchon_basis and the underlying FFI works"
+        "gamfit.basis.duchon_basis and the underlying FFI works"
     )
 
 
 def test_public_matern_basis_computes_correct_kernel():
-    matern_basis = getattr(gamfit, "matern_basis", None)
+    matern_basis = getattr(gamfit.basis, "matern_basis", None)
     if matern_basis is None:
-        pytest.fail("gamfit.matern_basis is unreachable (public export missing)")
+        pytest.fail("gamfit.basis.matern_basis is unreachable (public export missing)")
 
     # 1-D Matérn kernel value vs distance, against the standard closed forms
     # (with the sqrt(2*nu) scaling used by the engine, verified numerically).

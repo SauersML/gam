@@ -1913,13 +1913,15 @@ impl BernoulliMarginalSlopeFamily {
     /// 32 ψ-axes pays the heavy empirical jet at most once per row.
     ///
     /// Readers are row passes that already run in parallel over rows, so a row
-    /// is built serially by the reader that owns it: no reader starts a nested
-    /// full-`n` build. That was the old contract, and `RayonSafeOnce` lets
-    /// every concurrent first caller run its own initializer, so each worker
-    /// that entered a row fold before the first publish rebuilt the whole
-    /// table: up to one full-`n` jet pass per pool thread, the extra work
-    /// growing with the thread count. A failed row's `Err` is stored in that
-    /// row's slot and propagates identically to every reader of the row.
+    /// is built serially by its first reader, and concurrent readers of the
+    /// same row wait for it ([`RigidRowTensors`]): no reader starts a nested
+    /// full-`n` build and no row is built twice. A whole-table lazy build was
+    /// the old contract, and `RayonSafeOnce` lets every concurrent first caller
+    /// run its own initializer, so each worker that entered a row fold before
+    /// the first publish rebuilt the whole table: up to one full-`n` jet pass
+    /// per pool thread, the extra work growing with the thread count. A failed
+    /// row's `Err` is stored in that row's slot and propagates identically to
+    /// every reader of the row.
     pub(super) fn rigid_third_full_cached<'a>(
         &self,
         block_states: &[ParameterBlockState],
@@ -1935,8 +1937,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// One row of a per-row rigid full-derivative tensor table: allocate the
-    /// table's row slots on first touch, then build and store this row's
-    /// tensor on the row's first read.
+    /// table on first touch, then build and store this row's tensor on the
+    /// row's first read. The table holder is a `RayonSafeOnce`, so a racing
+    /// allocation only discards an unbuilt table.
     ///
     /// The standard-normal arm of `row_fn` is a compile-time row-program
     /// lowering that emits exactly the requested tensor order; empirical-grid
@@ -1946,7 +1949,7 @@ impl BernoulliMarginalSlopeFamily {
     /// the third-order cache.
     fn rigid_full_tensor_for_row<'a, T, R>(
         &self,
-        table: &'a gam_runtime::resource::RayonSafeOnce<Vec<RigidRowTensorSlot<T>>>,
+        table: &'a gam_runtime::resource::RayonSafeOnce<RigidRowTensors<T>>,
         block_states: &[ParameterBlockState],
         row: usize,
         row_fn: R,
@@ -1954,18 +1957,12 @@ impl BernoulliMarginalSlopeFamily {
     where
         R: FnOnce(BernoulliMarginalLinkMap, f64) -> Result<T, String>,
     {
-        let slots = table.get_or_compute(|| {
-            (0..self.y.len())
-                .map(|_| RigidRowTensorSlot::new())
-                .collect::<Vec<_>>()
-        });
-        slots[row]
-            .get_or_compute(|| {
+        table
+            .get_or_compute(|| RigidRowTensors::new(self.y.len()))
+            .row(row, || {
                 let marginal = self.marginal_link_map(block_states[0].eta[row])?;
                 row_fn(marginal, block_states[1].eta[row])
             })
-            .as_ref()
-            .map_err(|err| err.clone())
     }
 
     /// Look up the per-row rigid uncontracted fourth-derivative tensor.
@@ -3399,7 +3396,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             preseeded,
             kept_warm,
@@ -3511,7 +3508,7 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
         }
-        log::info!(
+        log::debug!(
             "[bernoulli intercept warm-start rows={}] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
             rows.len(),
             preseeded,

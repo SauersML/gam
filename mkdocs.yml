@@ -8,6 +8,16 @@ edit_uri: edit/main/docs/
 
 docs_dir: docs
 
+# Engineering ledgers (issue progress notes, test censuses, removal evidence)
+# live beside the user docs in the repository but are not part of the
+# published site.
+exclude_docs: |
+  issue-*.md
+  test-census-*
+  test-integrity.md
+  public-api-*
+  source-removal-changes.json
+
 extra_css:
   - stylesheets/extra.css
 
@@ -118,6 +128,8 @@ nav:
   - Home: README.md
   - Getting started:
     - Install and first model: getting-started.md
+    - A tour on real data: tour.md
+    - Migrating from pyGAM: migrating-from-pygam.md
     - Data input formats: data-input.md
     - CLI reference: cli.md
   - Building a model:
@@ -142,6 +154,8 @@ nav:
     - API reference: api-reference.md
     - Exceptions: exceptions.md
     - Cookbook: cookbook.md
+    - Benchmarks against pyGAM: benchmarks.md
     - GPU acceleration: gpu_acceleration.md
+    - Threads: threads.md
     - REML scaling: reml_scaling.md
   - Changelog: changelog.md

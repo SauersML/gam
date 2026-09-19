@@ -176,7 +176,7 @@ struct PosteriorPredictResult {
 }
 
 fn posterior_predict_bands_encoded_table_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     samples: Array2<f64>,
     level: f64,
@@ -184,7 +184,7 @@ fn posterior_predict_bands_encoded_table_impl(
     // Reuse the polymorphic core prediction pipeline, then collapse both its
     // canonical-predictor and response-mean matrices inside Rust so predict()
     // never materializes either draw matrix on the Python side.
-    let result = posterior_predict_encoded_table_impl(model_bytes, source, samples)?;
+    let result = posterior_predict_encoded_table_impl(model, source, samples)?;
     let (n_draws, n_rows) = result.eta.dim();
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
         posterior_bands::draw_bands_from_matrices(result.eta.view(), result.mean.view(), level)?;
@@ -203,11 +203,10 @@ fn posterior_predict_bands_encoded_table_impl(
 }
 
 fn posterior_predict_encoded_table_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     samples: Array2<f64>,
 ) -> Result<PosteriorPredictResult, String> {
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let col_map = dataset.column_map();
     let prediction = gam_predict::predict_posterior_draws(
@@ -229,11 +228,10 @@ fn posterior_predict_encoded_table_impl(
 }
 
 fn sample_encoded_table_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     source: EncodedDataset,
     options_json: Option<&str>,
 ) -> Result<SamplePayload, String> {
-    let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let options = parse_sample_options(options_json)?;
     let cfg = resolve_nuts_config(&model, options);
@@ -330,6 +328,7 @@ fn build_sample_payload(
         // produced them (gam#2778); nothing here re-derives it from the
         // model class.
         method: nuts.sampler.label().to_string(),
+        acceptance_rate: nuts.sampler.acceptance_rate(),
         exact: nuts.sampler.targets_exact_posterior(),
         covariance_source: nuts.covariance.as_str().to_string(),
     })
@@ -574,8 +573,7 @@ fn coefficient_provenance_for_state(
     (provenance, blocks)
 }
 
-fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
+fn coefficient_state_json_impl(model: &FittedModel) -> Result<String, String> {
     // A scan-routed model has no dense coefficient covariance to export: the
     // exact O(n) smoother keeps only the per-knot posterior, and its natural
     // parameter count is ~n, so the dense Gram this payload carries is both
@@ -635,7 +633,7 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
 }
 
 fn term_blocks_for_model_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
 ) -> Result<Vec<(String, String, usize, usize)>, String> {
     // A scan-routed model has a single smooth term occupying the smoother's
     // entire coefficient space (its per-knot function values). Report that one
@@ -644,7 +642,6 @@ fn term_blocks_for_model_impl(
     // no dense coefficient covariance) and which would be O(n²) even if it
     // could (#1046).
     {
-        let model = load_model_impl(model_bytes)?;
         if let Some(scan) = scan_introspection(&model)? {
             return Ok(vec![(
                 scan_smooth_label(&scan),
@@ -654,7 +651,7 @@ fn term_blocks_for_model_impl(
             )]);
         }
     }
-    let state_json = coefficient_state_json_impl(model_bytes)?;
+    let state_json = coefficient_state_json_impl(model)?;
     let payload: TermBlocksPayload = serde_json::from_str(&state_json)
         .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
     let mut blocks = Vec::with_capacity(payload.term_blocks.len());
@@ -704,11 +701,10 @@ fn build_difference_smooth_request_json(
     })
 }
 
-fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {
+fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Result<String, String> {
     let request: gam::inference::difference_smooth::DifferenceSmoothRequest =
         serde_json::from_str(request_json)
             .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
-    let model = load_model_impl(model_bytes)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     // The band prices its SEs off the covariance the fit publishes, as
     // `summary()` and `partial_dependence` do (#2779); a fit whose correction
@@ -960,12 +956,6 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
         .map_err(|err| format!("failed to serialize shared precision result: {err}"))
 }
 
-fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
-    let summary = saved_model_summary(&model)?;
-    serde_json::to_string(&summary).map_err(|err| format!("failed to serialize summary: {err}"))
-}
-
 /// One `curv(...)` term's #944 report, JSON-serialized for the Python surface.
 #[derive(Serialize)]
 struct CurvatureInferenceRow {
@@ -1102,9 +1092,21 @@ struct SmoothTermLrRow {
     correction_provenance: &'static str,
 }
 
+/// A smooth term the per-term LR test does not report, with its typed reason.
+#[derive(Serialize)]
+struct SmoothTermLrUnavailableRow {
+    name: String,
+    term_idx: usize,
+    /// Machine-readable reason, e.g. `"shape_constrained"`.
+    p_value_unavailable: &'static str,
+    /// One-sentence explanation of why no p-value exists.
+    explanation: &'static str,
+}
+
 #[derive(Serialize)]
 struct SmoothTermLrPayload {
     smooth_terms: Vec<SmoothTermLrRow>,
+    unavailable: Vec<SmoothTermLrUnavailableRow>,
 }
 
 fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
@@ -1122,7 +1124,7 @@ fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
 /// then swap in the model's fitted spec and family so the profile oracle refits
 /// at the EXACT estimand the model was fitted under — only κ moves.
 fn curvature_inference_dataset_json_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     dataset: EncodedDataset,
     level: f64,
 ) -> Result<String, String> {
@@ -1132,7 +1134,6 @@ fn curvature_inference_dataset_json_impl(
             "curvature_inference: confidence level must be in (0, 1), got {level}"
         ));
     }
-    let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
     let spec = model
         .payload()
@@ -1230,10 +1231,9 @@ fn curvature_inference_dataset_json_impl(
 /// core LR + Bartlett driver. The fitted spec carries the exact estimand the
 /// model was fitted under.
 fn smooth_term_lr_inference_dataset_json_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
     let spec = model
         .payload()
@@ -1247,6 +1247,7 @@ fn smooth_term_lr_inference_dataset_json_impl(
     if spec.smooth_terms.is_empty() {
         let payload = SmoothTermLrPayload {
             smooth_terms: Vec::new(),
+            unavailable: Vec::new(),
         };
         return serde_json::to_string(&payload)
             .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"));
@@ -1316,7 +1317,21 @@ fn smooth_term_lr_inference_dataset_json_impl(
         })
         .collect::<Vec<_>>();
 
-    let payload = SmoothTermLrPayload { smooth_terms };
+    let unavailable =
+        gam::families::fit_orchestration::drivers::smooth_term_lr_unavailable_forspec(&spec)
+            .into_iter()
+            .map(|r| SmoothTermLrUnavailableRow {
+                name: r.name,
+                term_idx: r.term_idx,
+                p_value_unavailable: r.reason.label(),
+                explanation: r.reason.explanation(),
+            })
+            .collect::<Vec<_>>();
+
+    let payload = SmoothTermLrPayload {
+        smooth_terms,
+        unavailable,
+    };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"))
 }
@@ -1360,10 +1375,9 @@ struct BasisAdequacyPayload {
 /// entry exists for models saved before the check existed, and for a caller who
 /// wants the check against rows other than the ones a summary happens to carry.
 fn basis_adequacy_dataset_json_impl(
-    model_bytes: &[u8],
+    model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
     let spec = model
         .payload()
@@ -1437,14 +1451,12 @@ fn postfit_standard_materialization_config(model: &FittedModel) -> Result<FitCon
     Ok(fit_config)
 }
 
-fn check_dataset_json_impl(model_bytes: &[u8], dataset: EncodedDataset) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
+fn check_dataset_json_impl(model: &FittedModel, dataset: EncodedDataset) -> Result<String, String> {
     let check = schema_check_encoded(&model, &dataset)?;
     serde_json::to_string(&check).map_err(|err| format!("failed to serialize schema check: {err}"))
 }
 
-fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
-    let model = load_model_impl(model_bytes)?;
+fn report_html_impl(model: &FittedModel) -> Result<String, String> {
     let mut report_input = saved_model_report_input(&model, "<in-memory>".to_string())?;
     report_input.notes.push(
         "Python report currently omits data-dependent diagnostics and smooth plots.".to_string(),
@@ -2612,9 +2624,8 @@ fn response_column_name(formula: &str) -> Option<String> {
 /// binary response (which selects the classification diagnostics panel), and
 /// the response-scale point column of the class's prediction payload.
 #[pyfunction]
-fn saved_model_class_traits(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Py<PyDict>> {
-    let model: FittedModel = serde_json::from_slice(&model_bytes)
-        .map_err(|err| py_value_error(format!("saved model payload must be JSON: {err}")))?;
+fn saved_model_class_traits(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<Py<PyDict>> {
+    let model = &*model.model;
     let label = prediction_model_class_label(&model);
     let family_state = &model.payload().family_state;
     let binary_response = match family_state {

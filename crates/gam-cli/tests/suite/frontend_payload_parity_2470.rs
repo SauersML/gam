@@ -4,8 +4,9 @@
 //! The two front ends already share the payload *assemblers*
 //! (`assemble_standard_payload` and friends), but they did not share the copy
 //! of the request metadata that no assembler can derive from a fitted result:
-//! `group_metadata`, `training_table_kind` and `inference_notes`. The Python
-//! binding reaches that copy through `fit_formula_to_payload`; every CLI save
+//! `group_metadata`, `training_table_kind`, `inference_notes` and
+//! `informational_notes`. The Python binding reaches that copy through
+//! `fit_formula_to_payload`; every CLI save
 //! route open-coded it, and every one of them omitted `training_table_kind`, so
 //! the same request document persisted `"polars"` from Python and the
 //! `"unknown"` default from `gam fit`.
@@ -109,5 +110,9 @@ fn frontend_request_metadata_parity_2470() {
     assert_eq!(
         cli.inference_notes, shared.inference_notes,
         "inference_notes diverged between the CLI and the shared save service"
+    );
+    assert_eq!(
+        cli.informational_notes, shared.informational_notes,
+        "informational_notes diverged between the CLI and the shared save service"
     );
 }

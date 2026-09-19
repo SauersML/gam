@@ -174,7 +174,7 @@ an abandoned public type.
 `(source path, function name)` identities, as `scripts/public_api_census.py`
 counts them. The rule above was applied to each identity once, and its
 disposition is recorded in
-[`public-api-2829-disposition.tsv`](public-api-2829-disposition.tsv). The ledger
+[`public-api-2829-disposition.tsv`](https://github.com/SauersML/gam/blob/main/docs/public-api-2829-disposition.tsv). The ledger
 once also listed 15 declarations that `d484a091a` only moved within their own
 file, with the same count before and after; the census does not count a move
 as a removal, so those rows are gone.
@@ -303,4 +303,4 @@ bit-identical coefficients across ownership forms. The measured-span shear
 control demonstrates that supplying the wrong metric changes the selected
 dimension. These are compiled external consumers, not symbol-table probes.
 Execution receipts and remaining historical acceptance gaps are recorded in
-[`test-census-2818-recovery.md`](test-census-2818-recovery.md).
+[`test-census-2818-recovery.md`](https://github.com/SauersML/gam/blob/main/docs/test-census-2818-recovery.md).

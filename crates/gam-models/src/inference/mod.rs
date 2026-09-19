@@ -7,7 +7,9 @@ pub mod model_extension;
 pub mod model_payload_builders;
 pub mod predict_io;
 pub mod predict_input;
+pub mod saved_residuals;
 pub mod saved_summary;
+pub mod summary_text;
 pub mod ctn;
 
 #[cfg(test)]

@@ -8,10 +8,10 @@ import gamfit
 
 def spline_block(t, centered=False):
     degree, knots_inside = 3, 4
-    design = np.asarray(gamfit.bspline_basis(t, knots_inside, degree=degree))
+    design = np.asarray(gamfit.basis.bspline_basis(t, knots_inside, degree=degree))
     interior = np.quantile(t, np.linspace(0, 1, knots_inside + 2)[1:-1])
     knots = np.r_[np.repeat(t.min(), degree + 1), interior, np.repeat(t.max(), degree + 1)]
-    penalty = np.asarray(gamfit.smoothness_penalty(knots, degree=degree, order=2)[0])
+    penalty = np.asarray(gamfit.basis.smoothness_penalty(knots, degree=degree, order=2)[0])
     if centered:
         q, _ = np.linalg.qr(design.sum(axis=0).reshape(-1, 1), mode="complete")
         tangent = q[:, 1:]
@@ -29,7 +29,7 @@ def block_problem():
     y = np.sin(4 * x) + 0.5 * z**2 + 0.15 * rng.normal(size=60)
     weights = rng.uniform(0.5, 2.0, size=60)
     args = ([first, second], [s_first, s_second], y)
-    base = gamfit.gaussian_reml_fit_blocks_forward(*args, weights=weights)
+    base = gamfit.reml.gaussian_reml_fit_blocks_forward(*args, weights=weights)
     return args, weights, base
 
 
@@ -40,14 +40,14 @@ def test_block_reml_response_perturbation_is_continuous(block_problem, row, sign
     (designs, penalties, y), weights, base = block_problem
     shifted = y.copy()
     shifted[row] += sign * 1e-6
-    fit = gamfit.gaussian_reml_fit_blocks_forward(designs, penalties, shifted, weights=weights)
+    fit = gamfit.reml.gaussian_reml_fit_blocks_forward(designs, penalties, shifted, weights=weights)
     assert np.max(np.abs(np.asarray(fit["fitted"]) - np.asarray(base["fitted"]))) < 1e-4
 
 
 @pytest.mark.parametrize("initial_rho", [5.0, 10.0, 15.0, 20.0, 25.0, 28.0, 30.0, 32.0, 35.0, 40.0])
 def test_block_reml_initial_strength_does_not_change_the_fit(block_problem, initial_rho):
     args, weights, base = block_problem
-    fit = gamfit.gaussian_reml_fit_blocks_forward(
+    fit = gamfit.reml.gaussian_reml_fit_blocks_forward(
         *args, weights=weights, init_rhos=np.array([-7.37, initial_rho])
     )
     assert np.max(np.abs(np.asarray(fit["fitted"]) - np.asarray(base["fitted"]))) < 1e-4
@@ -60,7 +60,7 @@ def constrained_problem():
     design, penalty = spline_block(t)
     y = np.sin(5 * t) + 0.2 * rng.normal(size=50)
     weights = rng.uniform(0.5, 2.0, size=50)
-    free = gamfit.gaussian_reml_fit_with_constraints_forward(design, y, penalty, weights=weights)
+    free = gamfit.reml.gaussian_reml_fit_with_constraints_forward(design, y, penalty, weights=weights)
     return design, penalty, y, weights, np.asarray(free["coefficients"]).ravel()
 
 
@@ -73,13 +73,13 @@ def test_binding_constraint_with_derivative_penalty(constrained_problem, column,
     a[0, column] = sign
     b = np.array([sign * free[column] + 0.3])
     kwargs = dict(weights=weights, a_inequality=a, b_inequality=b)
-    fit = gamfit.gaussian_reml_fit_with_constraints_forward(design, y, penalty, **kwargs)
+    fit = gamfit.reml.gaussian_reml_fit_with_constraints_forward(design, y, penalty, **kwargs)
     beta = np.asarray(fit["coefficients"]).ravel()
     assert np.isfinite(beta).all()
     assert np.all(a @ beta >= b - 1e-8)
     np.testing.assert_array_equal(fit["active_indices"], [0])
     np.testing.assert_allclose(a @ beta, b, atol=1e-8, rtol=0)
-    perturbed = gamfit.gaussian_reml_fit_with_constraints_forward(
+    perturbed = gamfit.reml.gaussian_reml_fit_with_constraints_forward(
         design, y, penalty + 1e-10 * np.eye(penalty.shape[0]), **kwargs
     )
     np.testing.assert_allclose(fit["fitted"], perturbed["fitted"], atol=1e-3, rtol=0)

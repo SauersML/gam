@@ -112,7 +112,6 @@ fn constant_slope_config() -> FitConfig {
         frozen_score: true,
         baseline_target: "weibull".to_string(),
         time_num_internal_knots: 3,
-        precompute_conformal: Some(false),
         ..FitConfig::default()
     }
 }

@@ -24,8 +24,8 @@ def test_nonconvergence_is_typed_evidence_with_resumable_checkpoint_879():
 
     # Zero trust-region iterations deterministically leaves this non-stationary
     # caller start untouched. It must produce an error, never a fit dictionary.
-    with pytest.raises(gamfit.RemlConvergenceError) as caught:
-        gamfit.gaussian_reml_optimize_latent(
+    with pytest.raises(gamfit.errors.RemlConvergenceError) as caught:
+        gamfit.reml.gaussian_reml_optimize_latent(
             y=y,
             n_obs=n,
             latent_dim=1,
@@ -66,7 +66,7 @@ def test_nonconvergence_is_typed_evidence_with_resumable_checkpoint_879():
     # a tolerance derived from the recorded evidence to exercise the resume
     # plumbing without relying on a workload-specific iteration count.
     resume_tol = np.nextafter(scaled, np.inf)
-    resumed = gamfit.gaussian_reml_optimize_latent(
+    resumed = gamfit.reml.gaussian_reml_optimize_latent(
         y=y,
         n_obs=n,
         latent_dim=1,
@@ -86,8 +86,8 @@ def test_nonconvergence_is_typed_evidence_with_resumable_checkpoint_879():
 @pytest.mark.parametrize("grad_tol", [np.inf, -np.inf, np.nan, 0.0, -1.0])
 def test_invalid_stationarity_tolerance_cannot_certify_a_fit_954(grad_tol):
     n, t, y, centers, penalty = _problem()
-    with pytest.raises(gamfit.GamError, match="grad_tol must be finite and positive"):
-        gamfit.gaussian_reml_optimize_latent(
+    with pytest.raises(gamfit.errors.GamError, match="grad_tol must be finite and positive"):
+        gamfit.reml.gaussian_reml_optimize_latent(
             y=y,
             n_obs=n,
             latent_dim=1,
