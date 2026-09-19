@@ -7453,6 +7453,17 @@ fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
                 served_hat_cost = true;
                 return Some(cost_hat);
             }
+            // The criterion's support is the model's canonical outer domain: a
+            // draw outside it is not a model, so its importance weight is zero
+            // and there is nothing to evaluate. A railed coordinate carries a
+            // near-flat Laplace proposal whose draws land far outside the box,
+            // where the inner solve has no valid minimum to report.
+            if let Some((lower, upper)) = config.model_domain_bounds.as_ref() {
+                let outside = (0..rho_dim).any(|idx| !(rho[idx] >= lower[idx] && rho[idx] <= upper[idx]));
+                if outside {
+                    return None;
+                }
+            }
             let mut theta = theta_hat.clone();
             for idx in 0..rho_dim {
                 theta[idx] = rho[idx];
