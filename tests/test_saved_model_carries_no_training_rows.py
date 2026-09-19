@@ -11,20 +11,20 @@ payload compiled once when the model is built.
 
 from __future__ import annotations
 
+import copy
 import importlib
-from typing import Any
+import pickle
 
-pytest: Any = importlib.import_module("pytest")
-np = pytest.importorskip("numpy")
-pd = pytest.importorskip("pandas")
-pytest.importorskip("gamfit._rust")
+import numpy as np
+import pandas as pd
+import pytest
 
 import gamfit
 
 FORMULA = "y ~ s(x1, k=8) + s(x2, k=8)"
 
 
-def _frame(n: int, seed: int) -> "pd.DataFrame":
+def _frame(n: int, seed: int) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(0.0, 1.0, n)
     x2 = rng.uniform(0.0, 1.0, n)
@@ -97,3 +97,29 @@ def test_accessors_read_the_compiled_model() -> None:
         "saved_model_predict_class_name",
     ):
         assert not hasattr(rust, removed), removed
+
+
+def test_compiled_model_is_a_value_that_pickles_as_its_saved_bytes() -> None:
+    train = _frame(300, 6)
+    model = gamfit.fit(train, FORMULA)
+    compiled = model._prediction_model
+    recompiled = gamfit.loads(model.dumps())._prediction_model
+    assert recompiled is not compiled
+    assert recompiled == compiled and hash(recompiled) == hash(compiled)
+    assert gamfit.fit(_frame(300, 7), FORMULA)._prediction_model != compiled
+    for protocol in range(pickle.DEFAULT_PROTOCOL, pickle.HIGHEST_PROTOCOL + 1):
+        assert pickle.loads(pickle.dumps(compiled, protocol=protocol)) == compiled
+    assert copy.copy(compiled) == compiled
+    assert copy.deepcopy(compiled) == compiled
+
+    # Posterior samples keep the compiled model that drew them, and still pickle
+    # and predict from it after a round trip.
+    draws = model.sample(train.head(20), samples=16, seed=7)
+    restored = pickle.loads(pickle.dumps(draws))
+    assert restored._model == compiled
+    new_rows = _frame(10, 8)[["x1", "x2"]]
+    expected = draws.predict(new_rows)
+    got = restored.predict(new_rows)
+    assert list(got) == list(expected)
+    for key in expected:
+        assert np.array_equal(np.asarray(got[key]), np.asarray(expected[key])), key

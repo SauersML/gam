@@ -77,18 +77,28 @@ struct PyPredictOptions {
 /// makes detaching work from the GIL a constant-time ownership transfer without
 /// cloning the fitted payload. The summary is derived from the typed model on
 /// first use and retained, so summary-backed accessors never rebuild it.
+///
+/// The saved-model bytes it was compiled from are kept beside it (O(p²), no
+/// per-row data), so the handle is a value: two handles are equal when they
+/// were compiled from the same saved model, and it pickles and copies as those
+/// bytes, recompiled on load.
 #[pyclass(module = "gamfit._rust", name = "_FittedModel", frozen)]
 struct PyFittedModel {
     model: Arc<FittedModel>,
+    source: Arc<[u8]>,
     summary: std::sync::OnceLock<serde_json::Value>,
 }
 
 impl PyFittedModel {
-    fn new(model: FittedModel) -> Self {
-        Self {
+    fn compile(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
+        let (model, source) = detach_py_result(py, "compile_model", move || {
+            load_model_impl(&model_bytes).map(|model| (model, model_bytes))
+        })?;
+        Ok(Self {
             model: Arc::new(model),
+            source: source.into(),
             summary: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     fn summary_value(&self) -> PyResult<&serde_json::Value> {
@@ -102,6 +112,31 @@ impl PyFittedModel {
 
 #[pymethods]
 impl PyFittedModel {
+    #[new]
+    fn py_new(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
+        Self::compile(py, model_bytes)
+    }
+
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> (Bound<'py, pyo3::types::PyType>, (Bound<'py, PyBytes>,)) {
+        let source = PyBytes::new(slf.py(), &slf.get().source);
+        (slf.get_type(), (source,))
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other
+            .cast::<Self>()
+            .is_ok_and(|other| *other.get().source == *self.source)
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.source.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[getter]
     fn formula(&self) -> &str {
         &self.model.payload().formula
@@ -1471,10 +1506,7 @@ fn fit_array(
 
 #[pyfunction]
 fn compile_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyFittedModel> {
-    let model = detach_py_result(py, "compile_model", move || {
-        load_model_impl(&model_bytes)
-    })?;
-    Ok(PyFittedModel::new(model))
+    PyFittedModel::compile(py, model_bytes)
 }
 
 /// Log Akaike evidence ratio of model A over model B: `−(AIC_A − AIC_B)/2`.
