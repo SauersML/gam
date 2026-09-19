@@ -790,7 +790,7 @@ impl PsiGramTensor {
         // A weakly penalized solve can amplify an otherwise acceptable 1e-9
         // interpolation residual. Refine until the unresolved tail is at the
         // transform's own accumulation floor, rather than mandating a degree.
-        let accumulation_floor = (m as f64 * f64::EPSILON) / (1.0 - m as f64 * f64::EPSILON);
+        let accumulation_floor = gam_linalg::roundoff::accumulation_growth(m);
         let tail_rtol = PSI_GRAM_CERT_RTOL.min(accumulation_floor);
         let gram_bound = tail_rtol * gram_scale;
         let rhs_bound = tail_rtol * rhs_scale;

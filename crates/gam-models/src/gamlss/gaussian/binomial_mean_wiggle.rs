@@ -44,21 +44,6 @@ pub struct BinomialMeanWiggleFamily {
     /// still simply `β_w ≥ 0`; prediction reconstructs `B(η_new)·β_w` and
     /// compensates the saved mean coefficient by `-Aβ_w`.
     pub frozen_warp_design: Option<Arc<Array2<f64>>>,
-    /// A pass of the frozen-index fixed point after the first (#2748).
-    ///
-    /// The fixed-point map has to be single-valued for any iteration on it to
-    /// converge. With the generic seed policy every pass re-ran the outer
-    /// multi-start, and on `geo_disease_matern` (n=1000) two inner optima
-    /// `2.3e-3` apart in cost (`671.2021` vs `671.2044`) took turns winning as
-    /// the frozen index moved by `1e-3`: every residual jump in the mixed
-    /// iteration coincided with the winner flipping, so the residual floored at
-    /// `3e-3` and no accelerator could cross it. A continuation pass therefore
-    /// runs exactly one seed — the previous pass's own `ρ`, which the blocks
-    /// carry as their warm-start log-lambdas — and the loop also switches
-    /// `screen_initial_rho` off so the screening cascade never re-ranks it.
-    /// The first pass keeps the full multi-start: that is where the basin is
-    /// chosen.
-    pub continuation: bool,
 }
 
 impl MonotoneWiggleFamily for BinomialMeanWiggleFamily {
@@ -630,24 +615,6 @@ impl BinomialMeanWiggleFamily {
 }
 
 impl CustomFamily for BinomialMeanWiggleFamily {
-    fn outer_seed_config(&self, n_params: usize) -> gam_problem::SeedConfig {
-        let mut config = gam_problem::SeedConfig::default();
-        if n_params == 0 {
-            return config;
-        }
-        if self.continuation {
-            // One seed, the pinned warm ρ: see the `continuation` field.
-            config.max_seeds = 1;
-            config.seed_budget = 1;
-            config.screen_max_inner_iterations = 0;
-            return config;
-        }
-        config.max_seeds = if n_params <= 4 { 6 } else { 4 };
-        config.seed_budget = 1;
-        config.screen_max_inner_iterations = 2;
-        config
-    }
-
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
@@ -1792,7 +1759,6 @@ mod exact_frozen_monotonicity_tests {
             wiggle_degree: 3,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             frozen_warp_design: Some(Arc::new(frozen.clone())),
-            continuation: false,
         };
         let spec = ParameterBlockSpec {
             name: "wiggle".to_string(),
@@ -1964,7 +1930,6 @@ mod exact_frozen_monotonicity_tests {
             wiggle_degree: degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             frozen_warp_design: None,
-            continuation: false,
         };
         // An index that spans the knot range, and a SUPERCRITICAL warp: every
         // coefficient positive and large enough that `max_i B'(q0)_i . beta_w`
@@ -2011,7 +1976,6 @@ mod exact_frozen_monotonicity_tests {
             .expect("frozen basis is the value basis at the frozen index");
         let frozen = BinomialMeanWiggleFamily {
             frozen_warp_design: Some(Arc::new(frozen_basis.clone())),
-            continuation: false,
             ..dynamic.clone()
         };
         let frozen_geom = frozen
