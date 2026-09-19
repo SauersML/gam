@@ -31,7 +31,7 @@ Where gamfit is behind:
 - **Many smooths.** Fits with 20 smooths (binomial n=1e3 p20, gaussian n=1e3 p20) did not finish within 400 s.
 - **Binomial predict.** 11-41x pyGAM's CPU time.
 - **Memory.** Peak RSS is 1.1-8.7x pyGAM's.
-- **Very wiggly 1-D truths.** gamfit loses on the g1d_doppler, g1d_sin3, g1d_sin6 cases. The default basis (at most 8 interior knots) is too small for these functions. REML chooses the wiggliness only within the basis it is given, so raise `k` (see [Choosing k](formulas.md#choosing-k)).
+- **Very wiggly 1-D truths.** gamfit loses on the g1d_doppler, g1d_sin3, g1d_sin6 cases. The measured wheel capped the default `s(x)` basis at 8 interior knots, too few for these functions. The default basis now grows with the data until its own adequacy test passes (#3078; see [Choosing k](formulas.md#choosing-k)), so these rows describe the old cap until the audit is re-run.
 - **Other accuracy losses:** bump2d_n1000, bump2d_n4000, gamma_add2_n2000, outlier_n300, pois_lowcount_n500. Against the tuned grid search, gamfit wins 7, ties 24 and loses 18 of 49 held-out comparisons.
 - **Fit failures.** gamfit refused 9 of the cross-validation fits (binom_add4_n300, cake, nearsep_n200, pois_add2_n2000, pois_add2_n300, wage). It raised an error rather than return an unconverged fit.
 - **Latency on some paths.** The 300-row monotone example took 55.36 s (pyGAM 0.04 s). The 10,000-row `Default` credit logistic fit did not finish. In CI, `quality_vs_pygam_poisson_2d_shape` timed out.

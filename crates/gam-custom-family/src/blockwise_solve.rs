@@ -266,11 +266,61 @@ pub(crate) fn correct_labeled_coefficient_mode<
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
+    correct_labeled_mode(
+        family,
+        specs,
+        options,
+        layout,
+        rho,
+        warm_start,
+        inner_blockwise_coefficient_mode::<F>,
+    )
+}
+
+/// Correct a labeled-rho continuation endpoint to its certified mode with the
+/// determinant artifacts an ordinary inner solve carries, so the published mode
+/// is the same reusable seed a direct evaluation files (gam#2973).
+pub(crate) fn correct_labeled_laplace_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
+    correct_labeled_mode(
+        family,
+        specs,
+        options,
+        layout,
+        rho,
+        warm_start,
+        inner_blockwise_fit::<F>,
+    )
+}
+
+type InnerModeSolve<F> = fn(
+    &F,
+    &[ParameterBlockSpec],
+    &[Array1<f64>],
+    &BlockwiseFitOptions,
+    Option<&ConstrainedWarmStart>,
+) -> Result<BlockwiseInnerResult, CustomFamilyError>;
+
+fn correct_labeled_mode<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    solve: InnerModeSolve<F>,
+) -> Result<(BlockwiseInnerResult, ConstrainedWarmStart), CustomFamilyError> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
     let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
     let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
-    let inner = inner_blockwise_coefficient_mode(
+    let inner = solve(
         family,
         specs,
         &per_block,
@@ -296,7 +346,7 @@ pub(crate) fn correct_labeled_coefficient_mode<
     Ok((inner, warm_start))
 }
 
-/// Complete the value-only endpoint criterion from a continuation-owned mode.
+/// Complete the endpoint criterion in `eval_mode` from a continuation-owned mode.
 /// The mode is consumed, so it cannot accidentally be paired with a different
 /// endpoint after the call.
 pub(crate) fn outerobjective_from_coefficient_mode_labeled<
@@ -309,6 +359,7 @@ pub(crate) fn outerobjective_from_coefficient_mode_labeled<
     rho: &Array1<f64>,
     rho_prior: &gam_problem::RhoPrior,
     inner: BlockwiseInnerResult,
+    eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let labeled_options = labeled_options_for_rho(options, specs, layout, rho)?;
@@ -320,8 +371,9 @@ pub(crate) fn outerobjective_from_coefficient_mode_labeled<
         &physical_rho,
         gam_problem::RhoPrior::Flat,
         inner,
+        eval_mode,
     )?;
-    pullback_labeled_outer_eval(base, rho, layout, rho_prior, EvalMode::ValueOnly)
+    pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
         .map_err(CustomFamilyError::from)
 }
 
@@ -1459,15 +1511,35 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 ),
             });
         }
-        if self.hessian.nrows() != p || self.hessian.ncols() != p {
+        // Solve in delta-space for both constrained and unconstrained blocks.
+        // That keeps the linear system consistent even when we add a
+        // numerical ridge to stabilize an indefinite exact-Newton Hessian.
+        let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
+        self.step_for_rhs(ctx, rhs_step)
+    }
+}
+
+impl ExactNewtonBlockUpdater<'_> {
+    /// The block step `δ` for the right-hand side `rhs_step`: `(H + S_λ) δ = rhs_step` on the
+    /// stabilized penalized curvature and under the block's linear constraints, returned as
+    /// `β + δ`. The Newton update takes it with `rhs_step = gradient − S_λβ`; a branch
+    /// continuation's IFT predictor takes it with `−Σ_k Δρ_k λ_k S_k β̂` (gam#2973), so both
+    /// steps are solved by one solver on one curvature.
+    pub(crate) fn step_for_rhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_step: Array1<f64>,
+    ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        let p = ctx.spec.design.ncols();
+        if self.hessian.nrows() != p || self.hessian.ncols() != p || rhs_step.len() != p {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
-                    "block {} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    "block {} exact-newton step shape mismatch: Hessian {}x{} and right-hand \
+                     side {}, expected {p}",
                     ctx.block_idx,
                     self.hessian.nrows(),
                     self.hessian.ncols(),
-                    p,
-                    p
+                    rhs_step.len(),
                 ),
             });
         }
@@ -1483,10 +1555,6 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         // direction (gam#1088).
         exact_newton_hessian_finite_check(self.hessian, ctx.block_idx)?;
         let lhs = self.hessian.add_dense(ctx.s_lambda)?;
-        // Solve in delta-space for both constrained and unconstrained blocks.
-        // That keeps the linear system consistent even when we add a
-        // numerical ridge to stabilize an indefinite exact-Newton Hessian.
-        let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
         let mut lhs_dense = lhs.to_dense();
         // `lhs_dense = H_data + S` is penalized by the PSD block penalty `S`.
         // Bound the stabilizing ridge by the DATA Hessian's curvature, not the
