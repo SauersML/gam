@@ -1042,6 +1042,15 @@ pub enum EstimationError {
         cap_bytes: usize,
     },
 
+    /// The sigma-point cubature that forms the smoothing-corrected covariance
+    /// `V_p = E_ρ[φ̂·H(ρ)⁻¹] + Cov_ρ[β̂(ρ)]` could not be formed at the certified
+    /// `ρ̂`: a node could not be calibrated, contained in the `ρ` domain, or
+    /// integrated. It is raised after the outer search certified the fit, so it
+    /// is never a trial-point verdict, and it is never answered by publishing a
+    /// first-order covariance in the cubature's place.
+    #[error("the smoothing-corrected covariance's sigma-point cubature failed at the certified rho: {reason}")]
+    SmoothingCubatureRefused { reason: String },
+
     #[error(
         "Log-strength domain violation at coordinate {coordinate}: value={value:?} is outside \
          the supported interval [{lower}, {upper}]"
@@ -1217,6 +1226,7 @@ impl EstimationError {
             | Self::PirlsRowGeometryUnrepresentable { .. }
             | Self::ExactTweedieSeriesWorkLimit { .. }
             | Self::DenseMaterializationRefused { .. }
+            | Self::SmoothingCubatureRefused { .. }
             | Self::LogStrengthDomainViolation { .. }
             | Self::MonotoneRoot { .. }
             | Self::CalibratorTrainingFailed { .. }
@@ -1411,6 +1421,7 @@ impl EstimationError {
             | Self::MonotoneRoot(_) => FailureCategory::Numerical,
             // Prose from the calibrator's own trainer; no producer names a kind.
             Self::CalibratorTrainingFailed(_) => FailureCategory::Unclassified,
+            Self::SmoothingCubatureRefused { .. } => FailureCategory::Integration,
         }
     }
 
@@ -1501,6 +1512,7 @@ impl EstimationError {
             Self::DenseMaterializationRefused { .. } => {
                 "EstimationError::DenseMaterializationRefused"
             }
+            Self::SmoothingCubatureRefused { .. } => "EstimationError::SmoothingCubatureRefused",
             Self::LogStrengthDomainViolation { .. } => "EstimationError::LogStrengthDomainViolation",
             Self::MonotoneRoot(_) => "EstimationError::MonotoneRoot",
             Self::CalibratorTrainingFailed(_) => "EstimationError::CalibratorTrainingFailed",

@@ -618,7 +618,6 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         smoothing_correction_fallback: fit.smoothing_correction_fallback().map(|fallback| {
             SummarySmoothingCorrectionFallback {
                 reason: fallback.reason.clone(),
-                severity: fallback.severity.as_str(),
             }
         }),
         rho_posterior_status,
@@ -1236,8 +1235,6 @@ pub struct SummaryConvergence {
 #[derive(Serialize)]
 pub struct SummarySmoothingCorrectionFallback {
     pub reason: String,
-    /// `"routine"` (a by-design eligibility gate) or `"numerical_failure"`.
-    pub severity: &'static str,
 }
 
 /// The objective a fit optimized, named once in Rust so every surface — the

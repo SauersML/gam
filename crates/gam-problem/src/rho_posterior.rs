@@ -116,6 +116,11 @@ pub enum RhoPosteriorRefusal {
     TailShapeNotFinite,
     /// The smoothed importance weights do not sum to a positive finite total.
     SmoothedWeightsNotNormalizable,
+    /// The plug-in Gaussian truncated to the `ρ` domain has no usable mass:
+    /// `requested²` draws produced only `accepted < requested` inside the
+    /// domain, so the domain holds under `1/requested` of the proposal — below
+    /// what a `requested`-draw diagnostic resolves.
+    ProposalOutsideSupport { accepted: usize, drawn: usize, requested: usize },
 }
 
 impl fmt::Display for RhoPosteriorRefusal {
@@ -137,6 +142,11 @@ impl fmt::Display for RhoPosteriorRefusal {
             Self::SmoothedWeightsNotNormalizable => {
                 f.write_str("smoothed importance weights do not sum to a positive finite total")
             }
+            Self::ProposalOutsideSupport { accepted, drawn, requested } => write!(
+                f,
+                "the plug-in Gaussian puts under 1/{requested} of its mass inside the rho \
+                 domain: {accepted} of {drawn} draws landed in it"
+            ),
         }
     }
 }
@@ -392,14 +402,17 @@ impl From<&RhoPosteriorEscalation> for RhoPosteriorEscalationRecord {
 /// leaving the plug-in + first-order intervals.
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-adequacy diagnostic. `criterion` evaluates the outer criterion
-    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns
-    /// `Ok(None)` when there is nothing to grade (`K = 0`) and the typed
-    /// [`RhoPosteriorRefusal`] when the diagnostic cannot be formed.
+    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`); `support` is
+    /// the `ρ` domain the proposal is truncated to — draws outside it are
+    /// rejected before `criterion` is evaluated. Returns `Ok(None)` when there
+    /// is nothing to grade (`K = 0`) and the typed [`RhoPosteriorRefusal`] when
+    /// the diagnostic cannot be formed.
     fn rho_posterior_adequacy(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        support: &dyn Fn(&Array1<f64>) -> bool,
         n_samples: Option<usize>,
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 

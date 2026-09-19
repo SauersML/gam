@@ -2930,48 +2930,17 @@ pub enum SmoothingCorrectionAbsence {
     DenseCovarianceNotReserved { detail: String },
 }
 
-/// Severity classifier for first-order fallbacks taken by
-/// `RemlState::compute_smoothing_correction_auto`.
-///
-/// `Routine` covers by-design eligibility gates (dimension limits, the
-/// near-boundary/highgrad linearization gate, rank-deficient `V_ρ` where
-/// cubature would inject spurious variance, `n_rho == 0`, etc.). These
-/// log at `info` and do not count as failures.
-///
-/// `NumericalFailure` covers situations where cubature was requested by
-/// the eligibility logic but a downstream numerical step refused to
-/// produce a usable second-order correction: Hessian compute / inversion
-/// failed, the inverse Hessian's spectrum is non-positive, a sigma-point
-/// inner PIRLS diverged, or the assembled total covariance is
-/// non-finite. These log at `warn` and increment
-/// `SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT` so they are visible
-/// in long-running fits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SmoothingCorrectionFallbackSeverity {
-    Routine,
-    NumericalFailure,
-}
-
-impl SmoothingCorrectionFallbackSeverity {
-    /// The token every surface prints for this severity.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Routine => "routine",
-            Self::NumericalFailure => "numerical_failure",
-        }
-    }
-}
-
 /// Why a fit's published smoothing correction is the first-order
 /// linearization rather than the sigma-point cubature upgrade.
 ///
-/// Minted where the cubature was declined, at fit time, so the reason a
-/// correction fell back — a by-design eligibility gate or a numerical step
-/// that refused — travels with the fit instead of reaching only a log.
+/// Minted where the first-order form was chosen, at fit time, so the
+/// mathematical reason (no ρ to integrate, or a certified `V_ρ` whose
+/// identified subspace makes the linearization exact) travels with the fit
+/// instead of reaching only a log. A cubature that fails is not a fallback:
+/// it is the typed `EstimationError::SmoothingCubatureRefused` (SPEC R21).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SmoothingCorrectionFallback {
     pub reason: String,
-    pub severity: SmoothingCorrectionFallbackSeverity,
 }
 
 /// Why a custom-family outer search declares no analytic ρ-Hessian.

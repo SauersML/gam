@@ -325,11 +325,12 @@ class Summary:
         ``covariance_source`` is ``"smoothing-corrected"`` or
         ``"conditional"`` (the same token as :attr:`coefficient_se_source`);
         ``covariance_source_reason`` says why, and is always set when the source
-        is ``"conditional"`` or the correction fell back from the sigma-point
-        cubature to the first-order one. ``smoothing_correction_method`` names
-        the retained correction and ``smoothing_correction_fallback`` carries the
-        ``reason`` and ``severity`` (``"routine"`` or ``"numerical_failure"``)
-        of a declined cubature upgrade.
+        is ``"conditional"`` or the correction is the first-order one.
+        ``smoothing_correction_method`` names the retained correction and
+        ``smoothing_correction_fallback`` carries the ``reason`` the first-order
+        form is exact (no identified rho direction to integrate). A sigma-point
+        cubature that fails raises ``IntegrationError`` instead of publishing a
+        downgraded covariance.
 
         The rho-posterior adequacy diagnostic is reported as
         ``rho_posterior_status`` (``"assessed"``, ``"refused"``,

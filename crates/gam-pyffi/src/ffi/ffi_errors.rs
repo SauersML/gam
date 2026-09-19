@@ -760,6 +760,9 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         // A dense copy the process cannot hold is a statement about the size of
         // the data the caller supplied, so it carries invalid-input identity.
         EstimationError::DenseMaterializationRefused { .. } => InvalidInputError::new_err(message),
+        // The smoothing-corrected covariance's cubature could not integrate its
+        // nodes at the certified rho: an integration failure of the fit.
+        EstimationError::SmoothingCubatureRefused { .. } => IntegrationError::new_err(message),
     }
 }
 
