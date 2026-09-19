@@ -2,7 +2,7 @@
 
     python -m bench.pygam_compare.run PLAN --out DIR [--reps R] [--timeout S]
                                               [--memcap-mb M] [--only-libs a,b]
-                                              [--shard I/K]
+                                              [--shard I/K] [--lib-path DIR]
 
 Writes ``DIR/records.jsonl`` (one JSON object per rep, including reps that
 timed out, blew the memory cap, errored or were not run), ``DIR/meta.json``
@@ -20,6 +20,12 @@ trips either is recorded with that status, the remaining reps of the cell and
 every larger ``n`` of the same (lib, family, design) are recorded as
 ``not_run_after_<status>``, and the report counts all of it against the
 library.
+
+Workers never inherit the caller's ``PYTHONPATH``; ``--lib-path DIR`` is the
+one way to put a pinned build first on their import path (for example a copy
+of an editable ``gamfit`` taken before a rebuild overwrites it), so a
+before/after comparison measures the build it names. Every gamfit record
+carries ``lib_file``, the imported package's path, so a run can be audited.
 """
 
 from __future__ import annotations
@@ -81,12 +87,20 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
 
 
 def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+    lib: str,
+    cell: Cell,
+    seed: int,
+    timeout_s: float,
+    memcap_mb: float,
+    cwd: str,
+    lib_path: str | None = None,
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
     env = dict(os.environ)
     env.update(THREAD_ENV)
     env.pop("PYTHONPATH", None)
+    if lib_path is not None:
+        env["PYTHONPATH"] = lib_path
     cmd = [
         sys.executable,
         str(WORKER),
@@ -163,7 +177,11 @@ def git_sha() -> str | None:
 
 
 def run_plan(
-    plan: Plan, out_dir: Path, memcap_mb: float, progress: bool = True
+    plan: Plan,
+    out_dir: Path,
+    memcap_mb: float,
+    progress: bool = True,
+    lib_path: str | None = None,
 ) -> list[dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     records_path = out_dir / "records.jsonl"
@@ -173,6 +191,7 @@ def run_plan(
         "memcap_mb": memcap_mb,
         "safety_net": "timeout_s and memcap_mb are a harness safety net, not a solver budget",
         "thread_env": THREAD_ENV,
+        "lib_path": lib_path,
         "host": platform.node(),
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -202,7 +221,9 @@ def run_plan(
                             status=f"not_run_after_{stopped[key]}",
                         )
                     else:
-                        rec = run_rep(lib, cell, rep, plan.timeout_s, memcap_mb, cwd)
+                        rec = run_rep(
+                            lib, cell, rep, plan.timeout_s, memcap_mb, cwd, lib_path
+                        )
                         if rec["status"] in ("timeout", "memcap"):
                             stopped[key] = rec["status"]
                     records.append(rec)
@@ -248,6 +269,12 @@ def main(argv: list[str] | None = None) -> int:
         help="I/K: run only the designs whose index in the plan is I mod K, so "
         "K drivers can split a plan across cores (merge with report.py)",
     )
+    ap.add_argument(
+        "--lib-path",
+        type=Path,
+        help="directory put first on every worker's PYTHONPATH (a pinned "
+        "library build); the caller's own PYTHONPATH is never inherited",
+    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     plan = PLANS[args.plan]
@@ -272,7 +299,14 @@ def main(argv: list[str] | None = None) -> int:
         plan = dataclasses.replace(
             plan, cells=tuple(c for c in plan.cells if c.design in mine)
         )
-    records = run_plan(plan, args.out, args.memcap_mb, progress=not args.quiet)
+    lib_path = None
+    if args.lib_path is not None:
+        if not args.lib_path.is_dir():
+            ap.error(f"--lib-path {args.lib_path}: not a directory")
+        lib_path = str(args.lib_path.resolve())
+    records = run_plan(
+        plan, args.out, args.memcap_mb, progress=not args.quiet, lib_path=lib_path
+    )
     print(f"wrote {len(records)} records to {args.out}", file=sys.stderr)
     return 0
 

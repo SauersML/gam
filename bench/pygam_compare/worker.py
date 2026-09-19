@@ -308,6 +308,7 @@ def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
     model: Any = None
     if gamfit is not None:
         out["lib_version"] = str(gamfit.__version__)
+        out["lib_file"] = str(gamfit.__file__)
         train = fuzz_terms.as_frame(data.train, data.categorical)
         model = phase("fit", lambda: gamfit.fit(train, data.formula, family=family))
     if model is not None:
