@@ -484,7 +484,6 @@ pub(crate) fn xt_diag_x_symmetric(
             // Genuinely-sparse fallback: row-parallel accumulator that
             // shares the symbolic pattern via Arc, so the BTreeSet build
             // happens once and the values buffers are zero-init per chunk.
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let csr = xs
                 .to_csr_arc()
                 .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
@@ -503,43 +502,60 @@ pub(crate) fn xt_diag_x_symmetric(
             let acc_template = xs
                 .hessian_accumulator_template()
                 .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
-            let n_threads = rayon::current_num_threads().max(1);
-            let target_chunks = (n_threads * 16).max(n_threads);
-            let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
-            let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
-            let mut local_accs: Vec<SparseHessianAccumulator> = chunk_starts
-                .into_par_iter()
-                .map(|start| {
-                    let end = (start + chunk_rows).min(n);
-                    let mut local = acc_template.empty_clone();
-                    for i in start..end {
-                        let wi = diag[i];
-                        if wi == 0.0 {
-                            continue;
-                        }
-                        let r_start = row_ptr[i];
-                        let r_end = row_ptr[i + 1];
-                        for a_ptr in r_start..r_end {
-                            let a = col_idx[a_ptr];
-                            let wxa = wi * vals[a_ptr];
-                            local.add_upper(a, a, wxa * vals[a_ptr]);
-                            for b_ptr in (a_ptr + 1)..r_end {
-                                let b = col_idx[b_ptr];
-                                local.add_upper(a, b, wxa * vals[b_ptr]);
-                            }
+            let accumulate_rows = |local: &mut SparseHessianAccumulator, rows: Range<usize>| {
+                for i in rows {
+                    let wi = diag[i];
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    let r_start = row_ptr[i];
+                    let r_end = row_ptr[i + 1];
+                    for a_ptr in r_start..r_end {
+                        let a = col_idx[a_ptr];
+                        let wxa = wi * vals[a_ptr];
+                        local.add_upper(a, a, wxa * vals[a_ptr]);
+                        for b_ptr in (a_ptr + 1)..r_end {
+                            let b = col_idx[b_ptr];
+                            local.add_upper(a, b, wxa * vals[b_ptr]);
                         }
                     }
-                    local
-                })
-                .collect();
-            let mut acc = if let Some(first) = local_accs.pop() {
-                first
-            } else {
-                acc_template.empty_clone()
+                }
             };
-            for other in local_accs.into_iter() {
-                acc.add_values(&other.values);
-            }
+            // The row chunks are sized from the shape alone and their partials
+            // combine over a fixed pairwise tree, so the Hessian's bits are the
+            // same at every pool width. (Chunks sized from the pool width made
+            // them follow `RAYON_NUM_THREADS`.)
+            let avg_row_nnz = vals.len().checked_div(n).unwrap_or(0);
+            let min_parallel_work = super::SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+            let acc = match crate::parallel::row_reduction_chunk_rows(
+                n,
+                avg_row_nnz.saturating_mul(avg_row_nnz),
+                acc_template.values.len(),
+                min_parallel_work,
+            ) {
+                None => {
+                    let mut acc = acc_template.empty_clone();
+                    accumulate_rows(&mut acc, 0..n);
+                    acc
+                }
+                Some(chunk_rows) => crate::pairwise_reduce::par_deterministic_block_fold_by_work(
+                    crate::parallel::row_reduction_chunk_count(n, chunk_rows),
+                    chunk_rows,
+                    |chunks| {
+                        let mut local = acc_template.empty_clone();
+                        accumulate_rows(
+                            &mut local,
+                            chunks.start * chunk_rows..(chunks.end * chunk_rows).min(n),
+                        );
+                        local
+                    },
+                    |mut acc, other| {
+                        acc.add_values(&other.values);
+                        acc
+                    },
+                )
+                .unwrap_or_else(|| acc_template.empty_clone()),
+            };
             Ok(SymmetricMatrix::Sparse(acc.into_sparse_col_mat()))
         }
     }

@@ -33,7 +33,11 @@ from gamfit._binding import rust_module
 
 
 def _formula_default_open_dim(t: typing.Any) -> int:
-    """``s(x)``'s default cubic basis dimension: ``clamp(unique/4, 4, 8) + 4``."""
+    """``s(x)``'s pilot cubic basis dimension: ``clamp(unique/4, 4, 8) + 4``.
+
+    The formula fit may grow this pilot through its adaptive resolution loop;
+    a bare basis constructor has no fit to refine from and keeps it.
+    """
     unique = len(np.unique(np.asarray(t, dtype=float)))
     return min(max(unique // 4, 4), 8) + 4
 
@@ -156,7 +160,7 @@ def test_predict_proba_returns_the_posterior_mean_as_fitted() -> None:
     clf = GAMClassifier(formula="y ~ s(x1)", family="binomial").fit(X, y)
     proba = clf.predict_proba(X)
     posterior = np.asarray(
-        clf.model_.predict(clf._strip_response_column(X), return_type="dict")["posterior_mean"],
+        clf.model_.predict(X, return_type="dict")["posterior_mean"],
         dtype=float,
     )
     np.testing.assert_array_equal(proba[:, 1], posterior)

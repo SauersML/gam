@@ -1,0 +1,10 @@
+..                                                                       [100%]
+==================================== PASSES ====================================
+________________ test_multi_term_additive_identity_with_factor _________________
+----------------------------- Captured stderr call -----------------------------
+[8s] [thin-plate] requested 96 distinct knots but the data contain only 7 geometrically distinct selectable points; reducing the basis to 7 knots
+[10s] [thin-plate] requested 132 distinct knots but the data contain only 61 geometrically distinct selectable points; reducing the basis to 61 knots
+=========================== short test summary info ============================
+PASSED test_pg_methods.py::test_posterior_sample_shapes
+PASSED test_pg_partial_dependence.py::test_multi_term_additive_identity_with_factor
+2 passed, 32 deselected in 13.33s
