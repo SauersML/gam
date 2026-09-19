@@ -4475,5 +4475,13 @@
     },
     "reason": "#2900 row 24.2 (SPEC rule 24): the four pub(crate) second-order helpers are opt::second_order at opt 53ce029, re-exported by run.rs under the same names, so no call site changes.",
     "evidence": "git grep -w at d10950d360: every caller is in gam-solve's rho_optimizer (run.rs, bridges.rs, run_plan_tests.rs, rail_projection_tests.rs, arc_curvature_stationary_2817_tests.rs) and resolves through the re-export; gam-pyffi names none of them."
+  },
+  {
+    "base": "da5b1ad4bd7ecf8081e094aaf5e8573a7d9792af",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs::resolve_marginal_slope_base_link": 1
+    },
+    "reason": "gam#2999: the pub(super) marginal-slope base-link resolver read only the formula's link(...). It is replaced, in the same file, by resolve_marginal_slope_link, which also reads the request's link and flexible_link arguments, so no link spelling goes unread. Its two callers, the bernoulli marginal-slope and the survival marginal-slope materializers, call the replacement.",
+    "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
   }
 ]
