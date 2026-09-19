@@ -1,0 +1,14 @@
+family	n	design	gamfit	pygam_default	pygam_gridsearch
+gaussian	1e3	p1	127	112	114
+gaussian	1e3	p5	149	122	124
+gaussian	1e3	te	148	121	124
+gaussian	1e3	p20	1390	160	187
+gaussian	1e4	p1	156	126	129
+gaussian	1e4	p5	280	181	191
+gaussian	1e4	te	260	179	189
+gaussian	1e5	p1	465	275	278
+gaussian	1e5	p5	1398	800	821
+gaussian	1e6	p1	2708	1587	-
+binomial	1e3	p5	176	122	125
+binomial	1e4	p1	171	126	130
+binomial	1e4	p5	247	188	199

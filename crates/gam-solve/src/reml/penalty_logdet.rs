@@ -1483,7 +1483,7 @@ impl PenaltyPseudologdet {
         let y_k: Vec<Array2<f64>> = match y_k {
             Ok(y) => y,
             Err(reason) => {
-                log::warn!(
+                log::debug!(
                     "penalty ρ-derivative root factorization failed ({reason}); falling back to \
                      the direct WᵀS_kW contraction, whose error grows like ε·κ(S_λ)"
                 );

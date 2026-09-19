@@ -784,7 +784,7 @@ pub fn prepare_sae_resident_frame(
         match frame.refresh(sys) {
             Ok(()) => return Ok(Some(frame)),
             Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {
-                log::debug!("resident SAE frame refresh: device unavailable; rebuilding on CPU");
+                log::trace!("resident SAE frame refresh: device unavailable; rebuilding on CPU");
             }
             Err(failure) => {
                 return Err(device_failure_as_arrow_error(
@@ -2230,7 +2230,7 @@ fn direct_answer_to_pcg_miss(
     let budget = options
         .pcg_budget
         .filter(|budget| budget.direct_answers_miss())?;
-    log::info!(
+    log::debug!(
         "arrow-Schur InexactPCG missed within the dense route's price ({} products): {miss}; \
          Direct answers the step",
         budget.products()
@@ -2364,7 +2364,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
-                        log::info!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        log::debug!("arrow-Schur mixed precision fallback to f64: {reason}");
                         mixed_precision_status = MixedPrecisionStatus::F64Fallback;
                     }
                 }
@@ -2421,7 +2421,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
-                        log::info!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        log::debug!("arrow-Schur mixed precision fallback to f64: {reason}");
                         mixed_precision_status = MixedPrecisionStatus::F64Fallback;
                     }
                 }
@@ -2452,7 +2452,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             // `solve_sae_matrix_free_pcg` kernel does NOT yet apply the pin, so a
             // set quotient forces the CPU path (gated below).
             if options.solve_precision.is_enabled() {
-                log::info!(
+                log::debug!(
                     "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
                 );
                 mixed_precision_status = MixedPrecisionStatus::F64Fallback;
@@ -2590,7 +2590,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                             // Unavailable / framed-mismatch / transient ⇒ the device
                             // genuinely declined; fall through to the CPU PCG path
                             // transparently (`used_device_arrow` stays false — honest).
-                            log::debug!(
+                            log::trace!(
                                 "arrow-Schur device declined the framed solve ({declined:?}); \
                                  falling through to CPU PCG"
                             );

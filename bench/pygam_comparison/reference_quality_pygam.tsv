@@ -1,0 +1,9 @@
+idx	outcome	cause	test	rc	dur_s	sub_passed	sub_failed	metric	reason
+34	PASS	ok	families::quality_vs_interpret_ml_pygam_binomial_logit_comparative::gam_binomial_logit_holdout_predictive_quality	0	12	1	0		
+35	PASS	ok	families::quality_vs_interpret_ml_pygam_binomial_logit_comparative::gam_binomial_logit_holdout_predictive_quality_on_real_data	0	5	1	0	nll=0.6215 auc=0.6989 nll=0.6211 nll=0.6213 nll=0.6211 nll gam=6.21530699904156991e-1 nll gam=6.21530699904156991e-1 	
+317	PASS	ok	misc::quality_vs_pygam_logistic_1d_shape::gam_logistic_1d_shape_matches_pygam_on_logit_scale	0	10	1	0	edf gam=4.716 pearson=0.99769 rel_l2=0.0704 	
+318	PASS	ok	misc::quality_vs_pygam_logistic_1d_shape::gam_logistic_1d_shape_matches_pygam_on_logit_scale_on_real_data	0	149	1	0	edf=3.808 edf=3.537 auc=0.6372 auc=0.6365 logloss=0.6579 logloss=0.6572 	
+410	TIMEOUT	per_test_bound	families::quality_vs_pygam_poisson_2d_shape::gam_poisson_2d_recovers_true_log_mean_surface	124	360	0	0		exceeded the 360s per-case bound from .config/nextest.toml
+411	TIMEOUT	per_test_bound	families::quality_vs_pygam_poisson_2d_shape::gam_poisson_2d_recovers_true_log_mean_surface_on_real_data	124	360	0	0		exceeded the 360s per-case bound from .config/nextest.toml
+428	PASS	ok	smooths::quality_vs_pygam_pspline::gam_pspline_held_out_accuracy_beats_pygam_on_lidar	0	1	1	0	r2=0.9325 rmse=0.0706 rmse=0.0709 rel_l2_vs_pygam=0.0056 rmse gam=7.05992888338952823e-2 	
+429	PASS	ok	smooths::quality_vs_pygam_pspline::gam_pspline_held_out_accuracy_beats_pygam_on_lidar_on_real_data	0	1	1	0	r2=-0.4722 rmse=0.1113 rmse=0.1173 rel_l2_vs_pygam=0.0330 	

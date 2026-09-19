@@ -227,7 +227,7 @@ pub fn factorize_sparse_spd(
     let logdet = simplicial.logdet;
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     if elapsed_ms > 100.0 {
-        log::info!(
+        log::debug!(
             "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
             n_input,
             elapsed_ms

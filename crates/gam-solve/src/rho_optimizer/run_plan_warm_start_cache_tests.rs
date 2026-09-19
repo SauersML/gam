@@ -48,6 +48,28 @@ fn transferred_hessian_requires_current_analytic_capability_2253() {
 }
 
 #[test]
+fn continuation_curvature_binds_only_at_its_own_start() {
+    // The #784 corrected continuation declares no outer Hessian, so the
+    // transferred-metric gate refuses; the Laplace optimum's exact Hessian
+    // still seeds its BFGS metric, but only at the optimum it was measured at.
+    let theta = array![30.82, -1.25];
+    let bound = BoundOuterCurvature {
+        theta: theta.clone(),
+        hessian: array![[2.0_f64, 0.5], [0.5, 3.0]],
+    };
+    assert!(bound_initial_curvature(Some(&bound), &theta, 2).is_some());
+    let moved = array![30.82, -1.25 + f64::EPSILON];
+    assert!(bound_initial_curvature(Some(&bound), &moved, 2).is_none());
+    assert!(bound_initial_curvature(Some(&bound), &theta, 3).is_none());
+    assert!(bound_initial_curvature(None, &theta, 2).is_none());
+    let non_finite = BoundOuterCurvature {
+        theta: theta.clone(),
+        hessian: array![[f64::NAN, 0.0], [0.0, 1.0]],
+    };
+    assert!(bound_initial_curvature(Some(&non_finite), &theta, 2).is_none());
+}
+
+#[test]
 fn iterate_payload_round_trips_beta() {
     // Every persisted entry that comes with an inner-β hint round-trips
     // (ρ, β) together — that pair lets a resume open inner PIRLS in the

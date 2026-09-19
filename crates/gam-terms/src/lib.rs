@@ -43,6 +43,7 @@ pub mod chunked_kernel_design;
 pub mod construction;
 pub mod decoders;
 pub mod dictionary;
+pub mod fit_notes;
 pub mod grid_spline_2d;
 pub mod inference;
 mod isotropic_scale;
@@ -63,6 +64,7 @@ pub mod terms {
 /// Re-export of the neutral estimation error so crate-local macros
 /// (`bail_invalid_estim!`) and call sites can reference `crate::EstimationError`.
 pub use gam_problem::EstimationError;
+pub use fit_notes::{FitNoteSink, FitNotes};
 pub use isotropic_scale::{IsotropicScale, IsotropicScaleError, OriginalUnits, StandardizedUnits};
 pub use penalty_spec::{PenaltySpec, validate_penalty_spec_shape};
 

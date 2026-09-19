@@ -958,7 +958,8 @@ fn deterministic_gaussian_standard_fit(
             // the data pin every direction the face leaves free. When they do
             // not -- `free_dim > n` makes `A` singular by construction, since
             // `rank(X Z) <= n`, and a double-penalized smooth deliberately
-            // admits `p > n` (`bspline_basis_min_rows`) -- the unpenalized
+            // admits `p > n` (only `n > M_p` is required, see
+            // `reject_prefit_unidentifiable_unpenalized_space`) -- the unpenalized
             // interpolant the boundary was built from is not the optimum at
             // all: with a penalty on those directions the criterion's
             // `log|X'WX + S_λ| - log|S_λ|₊` terms move the optimum off the
@@ -1709,7 +1710,7 @@ pub fn fit_from_formula(
 /// authoritative materialization pass.
 pub struct FormulaFitResult {
     pub result: FitResult,
-    pub inference_notes: Vec<String>,
+    pub inference_notes: FitNotes,
     /// Scalar terms the training rows could not identify, removed before the fit.
     pub unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 }
@@ -1730,9 +1731,10 @@ pub fn fit_from_formula_with_notes(
         return fit_expanded_formula_with_notes(formula, data, config);
     }
     let mut outcome = fit_expanded_formula_with_notes(&automatic.formula, data, config)?;
-    let mut notes = automatic.notes;
-    notes.append(&mut outcome.inference_notes);
-    outcome.inference_notes = notes;
+    // The expansion is an advisory: the fitted formula is not the literal one.
+    let mut advisories = automatic.notes;
+    advisories.append(&mut outcome.inference_notes.advisories);
+    outcome.inference_notes.advisories = advisories;
     Ok(outcome)
 }
 
@@ -1744,7 +1746,10 @@ fn fit_expanded_formula_with_notes(
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
         let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
             formula.to_string(), data, config)?;
-        return Ok(FormulaFitResult { inference_notes: payload.inference_notes.clone(),
+        return Ok(FormulaFitResult { inference_notes: FitNotes {
+                                        advisories: payload.inference_notes.clone(),
+                                        informational: payload.informational_notes.clone(),
+                                    },
                                     unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
                                     result: FitResult::Ctn(Box::new(payload)) });
     }
@@ -1775,7 +1780,7 @@ pub(crate) fn fit_materialized_standard_with_notes(
     data: &Dataset,
     config: &FitConfig,
     request: StandardFitRequest<'_>,
-    inference_notes: Vec<String>,
+    inference_notes: FitNotes,
 ) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
@@ -1808,8 +1813,7 @@ fn finish_adaptive_spatial_fit(
         let standard_options =
             canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
         let resolution_tol = standard_options.tol;
-        let candidates =
-            adaptive_spatial_candidates(current_standard, data.values.nrows(), resolution_tol)?;
+        let candidates = adaptive_spatial_candidates(current_standard, data, resolution_tol)?;
         if candidates.is_empty() {
             return Ok(current);
         }
@@ -1932,11 +1936,45 @@ fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
     }
 }
 
+/// The largest internal-knot count the adaptive loop may give a formula-default
+/// open B-spline `s(x)` of `degree` on `column`, starting from `current_knots`
+/// in a model that already realizes `model_coefficients` columns on `n_rows`
+/// rows. Two identifiability bounds, no tuning constant:
+///
+/// * **Data support.** A degree-`d` spline with `K` internal knots has
+///   `K + d + 1` coefficients, and a function observed at `u` distinct
+///   covariate values has at most `u` identifiable values; the interpolating
+///   (smoothing-spline) limit is `K + d + 1 = u`. This also keeps every quantile
+///   knot on its own distinct interior value (`u - d - 1 <= u - 2`).
+/// * **Design rank.** Growing the term must leave the whole model with fewer
+///   coefficients than rows (at least one residual degree of freedom): a
+///   `p >= n` design is not identified by the data at all, and in that regime
+///   the double-penalty REML surface is flat along directions the data never
+///   see.
+///
+/// Never below `current_knots`, so an already-resolved basis is never shrunk.
+fn adaptive_bspline_knot_ceiling(
+    column: ndarray::ArrayView1<'_, f64>,
+    degree: usize,
+    current_knots: usize,
+    model_coefficients: usize,
+    n_rows: usize,
+) -> usize {
+    let mut distinct: Vec<f64> = column.iter().copied().filter(|v| v.is_finite()).collect();
+    distinct.sort_by(f64::total_cmp);
+    distinct.dedup();
+    let support_knots = distinct.len().saturating_sub(degree + 1);
+    let spare_rank = n_rows.saturating_sub(1).saturating_sub(model_coefficients);
+    let rank_knots = current_knots.saturating_add(spare_rank);
+    support_knots.min(rank_knots).max(current_knots)
+}
+
 fn adaptive_spatial_candidates(
     result: &StandardFitResult,
-    n_rows: usize,
+    data: &Dataset,
     resolution_tol: f64,
 ) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
+    let n_rows = data.values.nrows();
     let term_count = result.resolvedspec.smooth_terms.len();
     if result.adaptive_spatial_terms.len() != term_count
         || result.adaptive_spatial_center_counts.len() != term_count
@@ -1997,13 +2035,32 @@ fn adaptive_spatial_candidates(
                     ),
                 ));
             }
+            // The formula-default `s(x)` B-spline is bounded by its covariate's
+            // distinct values and the design rank, not by a center-count rule.
+            let bspline = match &result.resolvedspec.smooth_terms[term_index].basis {
+                gam_terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec }
+                    if *feature_col < data.values.ncols() =>
+                {
+                    Some((*feature_col, spec.degree))
+                }
+                _ => None,
+            };
             // Tiny samples can force the materializer's exact polynomial floor
             // above the generic `n / 4` conditioning ceiling. The realized
             // request is already the smallest admissible basis in that case, so
             // it is also the ceiling; never report a nonsensical attempted
             // center count below the basis that just converged.
-            let ceiling_centers = gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
-                .max(current_centers);
+            let ceiling_centers = match bspline {
+                Some((feature_col, degree)) => adaptive_bspline_knot_ceiling(
+                    data.values.column(feature_col),
+                    degree,
+                    current_centers,
+                    result.design.design.ncols(),
+                    n_rows,
+                ),
+                None => gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
+                    .max(current_centers),
+            };
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
             let edf =
@@ -2021,6 +2078,11 @@ fn adaptive_spatial_candidates(
                 lacking_fit.contains(&term_index),
             ) {
                 AdaptiveCenterDecision::Certified => {}
+                // A B-spline at its ceiling already spans every identifiable
+                // direction its covariate and the design rank allow; there is no
+                // larger default basis to certify against, so the converged fit
+                // stands with its fit-time adequacy advisory.
+                AdaptiveCenterDecision::Exhausted if bspline.is_some() => {}
                 AdaptiveCenterDecision::Expand(proposed_centers) => {
                     candidates.push(AdaptiveSpatialCandidate {
                         term_index,
@@ -2099,6 +2161,41 @@ mod adaptive_spatial_resolution_tests {
             AdaptiveCenterDecision::Certified
         );
     }
+
+    #[test]
+    fn bspline_knot_ceiling_is_the_covariate_support_when_rank_is_ample() {
+        // 50 distinct values, cubic: the interpolating limit is 50 - 4 = 46
+        // internal knots. Duplicates and non-finite rows add no support.
+        let mut values: Vec<f64> = (0..50).map(|i| i as f64 / 49.0).collect();
+        values.extend_from_slice(&[0.0, 1.0, f64::NAN, f64::INFINITY]);
+        let column = ndarray::Array1::from(values);
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 13, 10_000),
+            46
+        );
+    }
+
+    #[test]
+    fn bspline_knot_ceiling_keeps_a_residual_degree_of_freedom() {
+        // 120 rows, 4 smooths of 12 coefficients plus an intercept: 49
+        // coefficients, so one term may add at most 120 - 1 - 49 = 70 knots.
+        let column = ndarray::Array1::from_iter((0..120).map(|i| i as f64));
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 49, 120),
+            78
+        );
+    }
+
+    #[test]
+    fn bspline_knot_ceiling_never_shrinks_the_current_basis() {
+        // Five distinct values support one internal knot, and the design is
+        // already square; the ceiling stays at the basis that just converged.
+        let column = ndarray::Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 4, 6, 6),
+            4
+        );
+    }
 }
 
 fn fit_from_formula_once_with_notes(
@@ -2120,7 +2217,7 @@ fn fit_from_formula_once_with_notes(
     if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
             result: result.into_fit_result(),
-            inference_notes: Vec::new(),
+            inference_notes: FitNotes::default(),
             unidentified_scalar_terms: Vec::new(),
         });
     }
@@ -2231,7 +2328,7 @@ fn fit_materialized_once_with_notes(
 fn attach_basis_adequacy(
     result: FitResult,
     covariate_frame: Option<StandardFitData<'_>>,
-    mut inference_notes: Vec<String>,
+    mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
     let FitResult::Standard(mut standard) = result else {
@@ -2248,7 +2345,7 @@ fn attach_basis_adequacy(
             &standard.resolvedspec,
             &standard.fit,
         );
-        inference_notes.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
+        inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,
         ));
     }
@@ -2822,7 +2919,7 @@ fn publish_expectile_sandwich_covariance(
             ExpectileSandwichRequiresDenseCovariance {
                 coefficients: fit.beta.len(),
             };
-        log::warn!("[expectile] {}", declined.explain());
+        log::debug!("[expectile] {}", declined.explain());
         fit.covariance_corrected = None;
         if let Some(inference) = fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
@@ -2960,7 +3057,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -3135,7 +3232,7 @@ pub fn residual_cascade_fast_path(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;

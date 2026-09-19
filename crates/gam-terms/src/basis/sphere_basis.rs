@@ -918,7 +918,7 @@ pub(crate) fn build_matern_basis_seeded(
     let use_lazy = !use_streaming
         && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
     let (design, candidates) = if let Some(chunk) = matern_auto_chunk {
-        log::info!(
+        log::debug!(
             "Matérn basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.nrows(),
             design_cols,
@@ -964,8 +964,8 @@ pub(crate) fn build_matern_basis_seeded(
         };
         (design, candidates)
     } else if use_lazy {
-        // log::info! — deliberate memory-saving choice, not an anomaly.
-        log::info!(
+        // log::debug! — deliberate memory-saving choice, not an anomaly.
+        log::debug!(
             "Matérn basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             design_cols,

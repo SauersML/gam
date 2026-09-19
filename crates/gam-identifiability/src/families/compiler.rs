@@ -958,7 +958,7 @@ fn keep_positive_eigenspace(
                 tol,
                 gap,
             } => {
-                log::warn!(
+                log::debug!(
                     "keep_positive_eigenspace: ambiguous equilibrated rank (observe-only, \
                      #2337 stage 1): rank_floor={rank_floor}, rank_ceil={rank_ceil}, \
                      sigma_in_band={sigma_in_band:.3e}, tol={tol:.3e}, gap={gap}, \

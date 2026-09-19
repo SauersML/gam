@@ -15,9 +15,6 @@ from typing import Any, Mapping, TYPE_CHECKING
 if TYPE_CHECKING:
     from ._sampling import PosteriorSamples
 
-# Sentinel for unbound posteriors loaded from disk without a model context.
-_NO_MODEL: bytes = b""
-
 
 @dataclass(frozen=True, eq=False, slots=True)
 class CumulativeIncidenceDraws:
@@ -89,16 +86,16 @@ class PairedPosteriorSamples:
         cls,
         payload: Mapping[str, Any],
         *,
-        target_model_bytes: bytes = _NO_MODEL,
-        competing_model_bytes: bytes = _NO_MODEL,
+        target_model: Any = None,
+        competing_model: Any = None,
     ) -> "PairedPosteriorSamples":
         from ._sampling import PosteriorSamples
 
         target = PosteriorSamples.from_ffi_payload(
-            payload["target"], model_bytes=target_model_bytes
+            payload["target"], model=target_model
         )
         competing = PosteriorSamples.from_ffi_payload(
-            payload["competing"], model_bytes=competing_model_bytes
+            payload["competing"], model=competing_model
         )
         if target.n_draws != competing.n_draws:
             raise ValueError(
@@ -112,13 +109,13 @@ class PairedPosteriorSamples:
         cls,
         raw: str,
         *,
-        target_model_bytes: bytes = _NO_MODEL,
-        competing_model_bytes: bytes = _NO_MODEL,
+        target_model: Any = None,
+        competing_model: Any = None,
     ) -> "PairedPosteriorSamples":
         return cls.from_ffi_payload(
             json.loads(raw),
-            target_model_bytes=target_model_bytes,
-            competing_model_bytes=competing_model_bytes,
+            target_model=target_model,
+            competing_model=competing_model,
         )
 
     @property

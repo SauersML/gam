@@ -96,7 +96,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
                 boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let marginalspec = TermCollectionSpec {

@@ -530,13 +530,10 @@ fn initial_rho_with_single_seed_budget_skips_expensive_screening() {
         .with_seed_config(seed_config)
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(initial_seed.clone())
-        // Declare a problem size whose estimated PSIS work trips the terminal
-        // rho-uncertainty diagnostic cost gate, so its 32 `eval_cost` samples do
-        // NOT run here. This test isolates the SEED-SCREENING accounting (screening
-        // is skipped: `screening_cap == 0` and `screening_calls == 0`); the
-        // mandatory terminal value audit and post-certification uncertainty
-        // diagnostic are separate phases and must not be counted as screening.
-        .with_problem_size(1_000_000, 1)
+        // This test isolates the SEED-SCREENING accounting (screening is
+        // skipped: `screening_cap == 0` and `screening_calls == 0`); the
+        // mandatory terminal value audit is a separate phase and must not be
+        // counted as screening.
         .with_max_iter(1);
     let mut obj = problem.build_objective(
         (),

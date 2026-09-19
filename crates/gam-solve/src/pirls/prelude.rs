@@ -57,8 +57,8 @@ pub(crate) use faer::{Accum, Par, Side};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip};
 
 pub(crate) use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+    ParallelIterator,
 };
 
 pub(crate) use statrs::function::gamma::{digamma, ln_gamma};
@@ -80,7 +80,7 @@ pub use gam_problem::{ConstraintSet, KhatriRaoConeConstraints, PlacedConstraintB
 
 pub(crate) use gam_linalg::utils::{array_is_finite, inf_norm, row_chunk_for_byte_budget};
 
-// `log` is used as a path (`log::debug!`), so re-export the crate itself.
+// `log` is used as a path (`log::trace!`), so re-export the crate itself.
 pub(crate) use log;
 
 #[cfg(test)]

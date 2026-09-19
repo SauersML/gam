@@ -1,9 +1,8 @@
 #!/bin/bash
 # A100 variant of the #1893 K=2000 acceptance harness, doubling as the #1017/#2230
 # increment-1 residency MEASUREMENT. Same real creditscope Qwen3.5-35B L30 fit as
-# run_1893_k2000_accept.sbatch, but on the GPU partition, and it opts the wheel's
-# logger into Info (via the exposed set_log_level pyfunction) so the per-solve
-# operand-upload lines (DeviceSaePcgData::operand_byte_report, landed 9b98a5413)
+# run_1893_k2000_accept.sbatch, but on the GPU partition, and it opts the
+# "gamfit" Python logger into DEBUG so the per-solve operand-upload lines (DeviceSaePcgData::operand_byte_report, landed 9b98a5413)
 # print, and a final SUMMARY block sums them:
 #   count(lines) = matrix-free PCG solves = LM-ladder trials across the fit
 #   Σ total MiB  = the host→device operand transfer a base-resident frame removes
@@ -11,17 +10,15 @@
 # legacy-sparse at this wide-p shape; framed dense would be ~31 GiB, impossible).
 #
 # TWO REQUIREMENTS:
-#   1. GAMFIT_VERSION must pin a wheel built from >= 9b98a5413 (contains
-#      operand_byte_report + the log::info! emission at both flatten sites).
-#   2. The wheel's log level is raised to Info BEFORE the fit. gam-pyffi DOES
-#      install a `log` backend (gam::solver::progress_log::init_logging in the
-#      #[pymodule], all sites -> stderr), but the level defaults to Warn (a
-#      deliberate #1689 fit-overhead choice) and RUST_LOG is intentionally IGNORED
-#      (explicit-API-not-env-var design). This script raises it in-process via the
-#      exposed `gamfit._rust.set_log_level("info")` pyfunction (a tiny wrapper runs
-#      the unmodified driver right after the call), so NO RUST_LOG and no pyffi
-#      change is needed. A "0 operand lines" SUMMARY then means the device
-#      matrix-free PCG lane did NOT offload at K (not a logging problem).
+#   1. GAMFIT_VERSION must pin a wheel that forwards engine `log` records to the
+#      "gamfit" Python logger (and contains operand_byte_report, >= 9b98a5413).
+#   2. The "gamfit" logger is lowered to DEBUG BEFORE the fit. The engine's
+#      records go to that logger and are silent by default; RUST_LOG is
+#      intentionally IGNORED (explicit-API-not-env-var design). A tiny wrapper
+#      attaches a stderr handler to the logger and runs the unmodified driver, so
+#      NO RUST_LOG and no pyffi change is needed. A "0 operand lines" SUMMARY then
+#      means the device matrix-free PCG lane did NOT offload at K (not a logging
+#      problem).
 #
 # Submit (coordinator): GAMFIT_VERSION=0.1.NNN /Users/user/msi-node/msi sub \
 #   experiments/1893_k2000_accept/run_1893_k2000_a100_measure.sbatch
@@ -61,10 +58,10 @@ nvidia-smi -L || { echo "FATAL: no GPU visible to the job"; exit 98; }
 
 export OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 MKL_NUM_THREADS=16 NUMEXPR_NUM_THREADS=16
 export LD_LIBRARY_PATH="/common/software/install/manual/openblas/0.3.27_gcc11.3.0/lib:${LD_LIBRARY_PATH:-}"
-# RUST_LOG is intentionally IGNORED by the wheel (requirement 2); the level is
-# raised in-process via set_log_level below, and we grep the emitted lines rather
-# than rely on an env-var filter. The #1017/#2230 lines are prefix-tagged so the
-# grep is exact even amid the other Info-level fit-progress chatter.
+# RUST_LOG is intentionally IGNORED by the wheel (requirement 2); the "gamfit"
+# logger is lowered in-process below, and we grep the emitted lines rather than
+# rely on an env-var filter. The #1017/#2230 lines are prefix-tagged so the grep
+# is exact even amid the other debug-level fit-progress chatter.
 
 VENV=${VENV:-$R/venv_1893_a100_${SLURM_JOB_ID:-manual}}
 python3 -m venv "$VENV"
@@ -76,17 +73,15 @@ python -c "import gamfit; print('gamfit', getattr(gamfit,'__version__','?'))"
 RUNLOG="$R/sae_1893_a100_measure_${SLURM_JOB_ID:-manual}.runlog"
 echo "=== #1893 a100 measure K=$K  $(date)  node=$(hostname)  gamfit==$GAMFIT_VERSION ==="
 
-# Raise the wheel log level to Info in-process (RUST_LOG is ignored), then run the
-# UNMODIFIED #1893 driver in the same interpreter so the level persists through the
-# fit. The wrapper drops its own name from argv so the driver's argparse is intact.
-WRAP="$R/measure_setloglevel_${SLURM_JOB_ID:-manual}.py"
+# Lower the "gamfit" logger to DEBUG in-process (RUST_LOG is ignored), then run
+# the UNMODIFIED #1893 driver in the same interpreter so the level persists through
+# the fit. The wrapper drops its own name from argv so the driver's argparse is intact.
+WRAP="$R/measure_debuglog_${SLURM_JOB_ID:-manual}.py"
 cat > "$WRAP" <<'PYEOF'
-import sys, runpy, gamfit
-_set = getattr(getattr(gamfit, "_rust", gamfit), "set_log_level", None) \
-    or getattr(gamfit, "set_log_level", None)
-if _set is None:
-    sys.exit("FATAL: gamfit set_log_level not found — wheel predates the export (need >= 9b98a5413)")
-_set("info")
+import logging, sys, runpy
+_log = logging.getLogger("gamfit")
+_log.addHandler(logging.StreamHandler(sys.stderr))
+_log.setLevel(logging.DEBUG)
 sys.argv = sys.argv[1:]            # argv[0] becomes the driver path
 runpy.run_path(sys.argv[0], run_name="__main__")
 PYEOF
@@ -102,11 +97,11 @@ echo "================= #1017/#2230 RESIDENCY MEASUREMENT SUMMARY ==============
 LINES="$(grep -F '#1017/#2230' "$RUNLOG" || true)"
 COUNT="$(printf '%s\n' "$LINES" | grep -c 'operand upload' || true)"
 if [ "${COUNT:-0}" -eq 0 ]; then
-  echo "0 operand lines captured. With set_log_level('info') applied, this means the"
+  echo "0 operand lines captured. With the gamfit logger at DEBUG, this means the"
   echo "matrix-free device PCG lane did NOT engage at K=$K (border k below the offload"
   echo "floor) — rerun with a larger K / wider-p shape, or use the host-pure"
   echo "residency_operand_measure harness which assembles the wide border directly."
-  echo "(If it also fails to raise the level, confirm the wheel is >= 9b98a5413.)"
+  echo "(If no gamfit records appear at all, confirm the wheel forwards engine logs.)"
 else
   # Sum the per-solve total=X.YMiB across all captured solves/ladder-trials.
   printf '%s\n' "$LINES" | awk '
