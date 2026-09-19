@@ -32,7 +32,8 @@
 //! finite family executes through it on held-out inputs against the teacher's own native edit.
 //! Each entry's verdict is an [`EvidenceStatus`]: a [`EvidenceStatus::UniformBound`] from a
 //! Lipschitz certificate, or a held-out [`EvidenceStatus::Counterexample`]. The same body runs at
-//! `d = 8` and `d = 512`; `planted_rotation_fidelity` states each derivation.
+//! `d = 8` and `d = 512`, for a ReLU and an exact-GELU teacher; `planted_rotation_fidelity` states
+//! each derivation.
 
 use super::codec::{BitString, code_saving_at_proven_fidelity};
 use super::moments::{GeneratorPart, MaskDomain, MaskMomentSystem, MomentBlock, MomentVector};
@@ -1177,7 +1178,8 @@ struct FidelityGap {
 /// So the bound is a [`EvidenceStatus::UniformBound`] on the exact block distortion over every
 /// input of norm at most `r`, the held-out rows among them. Execution rounding is not part of it.
 /// For ReLU `L_σ = 1`, since `|max(a, 0) − max(b, 0)| ≤ |a − b|`: its `slope_bound_squared` is 1,
-/// whose root is exactly 1.
+/// whose root is exactly 1. For the exact GELU `L_σ = sup|σ'| = σ'(√2) = 1.1289…`, the root of
+/// the owner's upper bound on `σ'(√2)²`, rounded up.
 ///
 /// # The held-out measurement
 ///
@@ -1214,9 +1216,10 @@ struct FidelityGap {
 /// The body is activation-generic. `L_σ` is the owner's `slope_bound_squared`, and each executed
 /// activation's value bound is the owner's `gaussian_hermite_coefficients` at scale zero, whose
 /// value is `activate`'s bit for bit. ReLU's value bound is exactly zero, because `max` is exact
-/// in IEEE-754, so every status here is rigorous. The exact GELU's value bound is first order and
-/// rests on a measured `erfc` ulp, so its arm runs through this body when that owner's bound is
-/// proven (#2946).
+/// in IEEE-754. The exact GELU's value `t Φ(t)` (or `φ(t) t/λ` in the left tail) carries the
+/// owner's bound with nothing truncated: `Φ` from the probability owner's proven table route,
+/// `φ` from its certified density, `λ` from its derived tail ratios, and every product's
+/// second-order term (#2946). So every status here is rigorous for both activations.
 fn planted_rotation_fidelity(width: usize, activation: GaussianActivation) -> FidelityGap {
     let teacher = plant_teacher(width, activation);
     let count = PLANTED_ANGLES.len();
@@ -1380,6 +1383,40 @@ fn a_planted_rotation_relu_teacher_is_recovered_and_certified_on_held_out_interv
     );
     println!(
         "width 512: largest certified {:e} < tolerance {FIDELITY_TOLERANCE:e} < weakest refutation {:e}",
+        gap.largest_certified, gap.weakest_refutation
+    );
+}
+
+#[test]
+fn a_planted_rotation_gelu_teacher_is_recovered_and_certified_on_held_out_interventions_at_width_8()
+{
+    let gap = planted_rotation_fidelity(8, GaussianActivation::ExactGelu);
+    assert!(
+        gap.largest_certified < FIDELITY_TOLERANCE && FIDELITY_TOLERANCE < gap.weakest_refutation,
+        "the declared tolerance {FIDELITY_TOLERANCE:e} must sit between the largest certified \
+         bound {:e} and the weakest refutation {:e}",
+        gap.largest_certified,
+        gap.weakest_refutation
+    );
+    println!(
+        "GELU width 8: largest certified {:e} < tolerance {FIDELITY_TOLERANCE:e} < weakest refutation {:e}",
+        gap.largest_certified, gap.weakest_refutation
+    );
+}
+
+#[test]
+fn a_planted_rotation_gelu_teacher_is_recovered_and_certified_on_held_out_interventions_at_width_512()
+{
+    let gap = planted_rotation_fidelity(512, GaussianActivation::ExactGelu);
+    assert!(
+        gap.largest_certified < FIDELITY_TOLERANCE && FIDELITY_TOLERANCE < gap.weakest_refutation,
+        "the declared tolerance {FIDELITY_TOLERANCE:e} must sit between the largest certified \
+         bound {:e} and the weakest refutation {:e}",
+        gap.largest_certified,
+        gap.weakest_refutation
+    );
+    println!(
+        "GELU width 512: largest certified {:e} < tolerance {FIDELITY_TOLERANCE:e} < weakest refutation {:e}",
         gap.largest_certified, gap.weakest_refutation
     );
 }

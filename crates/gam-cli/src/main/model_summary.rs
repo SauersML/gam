@@ -323,13 +323,17 @@ mod per_term_edf_tests {
         };
 
         // Build the summary rows exactly as the CLI/report path does.
-        let smooth_terms =
-            smooth_term_summary_rows(&std_fit.design, &std_fit.fit, std_fit.fit.weighted_gram());
+        let smooth_terms = smooth_term_summary_rows(
+            &std_fit.design,
+            &std_fit.fit,
+            std_fit.fit.weighted_gram(),
+            SummaryBlockOffset::default(),
+        );
         let parametric_terms = parametric_term_summary_rows(
             &std_fit.design,
             &std_fit.resolvedspec,
             &std_fit.fit,
-            &|_, bits| f64::from_bits(bits).to_string(),
+            SummaryBlockOffset::default(),
         )
         .coefficients;
 

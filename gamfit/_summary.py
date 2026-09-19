@@ -316,7 +316,10 @@ class Summary:
         ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
         instead, because its null ``f = 0`` is the apex of the constraint cone
         and no calibrated reference exists for the truncated posterior mean.
-        Empty when the model has no smooth or random-effect terms; every
+        A model with more than one linear predictor (the Bernoulli
+        marginal-slope family) tags each record with ``predictor`` —
+        ``"marginal"`` or ``"slope"`` — naming the formula the smooth belongs
+        to; each row is tested against its own predictor's block. Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
         Why :attr:`smooth_terms` could not be built (a model saved without its
@@ -580,7 +583,9 @@ class Summary:
         ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
         Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason.
+        adds a ``p_value_unavailable`` column naming the reason, and a
+        multi-predictor model adds a ``predictor`` column (``"marginal"`` /
+        ``"slope"``).
         """
         import pandas as pd
 

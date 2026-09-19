@@ -19,7 +19,7 @@ use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
 use gam_linalg::utils::splitmix64;
 use gam_math::probability::{normal_cdf, standard_normal_quantile};
-use gam_models::fit_orchestration::FitConfig;
+use gam_models::fit_orchestration::{FitConfig, FitResult, fit_model, materialize};
 use gam_models::inference::model::FittedModel;
 use gam_models::inference::model_payload_builders::fit_formula_to_payload;
 use ndarray::{Array1, Axis};
@@ -88,17 +88,43 @@ fn draw(n: usize, seed: u64) -> Sample {
     }
 }
 
-fn fit(sample: &Sample, latent_measure: &str) -> FittedModel {
-    let config = FitConfig {
+fn bernoulli_config(latent_measure: &str) -> FitConfig {
+    FitConfig {
         family: Some("bernoulli-marginal-slope".to_string()),
         z_column: Some("z".to_string()),
         slope_formula: Some("1".to_string()),
         latent_measure: Some(latent_measure.to_string()),
         ..FitConfig::default()
-    };
-    let payload = fit_formula_to_payload("y ~ x".to_string(), &sample.dataset, &config)
-        .unwrap_or_else(|e| panic!("bernoulli marginal-slope fit, law {latent_measure}: {e}"));
+    }
+}
+
+fn fit_formula(sample: &Sample, formula: &str, latent_measure: &str) -> FittedModel {
+    let payload = fit_formula_to_payload(
+        formula.to_string(),
+        &sample.dataset,
+        &bernoulli_config(latent_measure),
+    )
+    .unwrap_or_else(|e| panic!("bernoulli fit {formula}, law {latent_measure}: {e}"));
     FittedModel::from_payload(payload)
+}
+
+fn fit(sample: &Sample, latent_measure: &str) -> FittedModel {
+    fit_formula(sample, "y ~ x", latent_measure)
+}
+
+/// The score the fit itself trained on, read from the fit result before any
+/// payload is built. The request is materialized as the payload builder
+/// materializes it, so the two fits see the same design and the same rows.
+fn fit_time_training_score(sample: &Sample, latent_measure: &str) -> Array1<f64> {
+    let mut config = bernoulli_config(latent_measure);
+    config.spatial_center_counts = Some(Vec::new());
+    let materialized = materialize("y ~ x", &sample.dataset, &config)
+        .unwrap_or_else(|e| panic!("materialize the bernoulli marginal-slope request: {e}"));
+    match fit_model(materialized.request) {
+        Ok(FitResult::BernoulliMarginalSlope(result)) => result.latent_score,
+        Ok(_) => panic!("a bernoulli marginal-slope request returns a marginal-slope fit"),
+        Err(e) => panic!("bernoulli marginal-slope fit: {e}"),
+    }
 }
 
 fn residual(model: &FittedModel, sample: &Sample) -> Option<Array1<f64>> {
@@ -127,10 +153,12 @@ fn slope_and_standard_error(values: &[f64], x: &[f64]) -> (f64, f64) {
     (slope, (rss / (n - 2.0) / sxx).sqrt())
 }
 
-/// At the training rows the saved map reproduces the fit's own ζ: the fit
-/// recorded the mean and sd of the sample it calibrated (unit weights). Each is a
-/// sum over the same n values, so the two agree to the rounding of two recursive
-/// sums, `(n−1)·ε·Σ|·|/n`.
+/// At the training rows the saved map reproduces the fit's own ζ moments: the
+/// fit recorded the mean and sd of the sample it calibrated (unit weights). Each
+/// is a sum over the same n values, so the two agree to the rounding of two
+/// recursive sums, `(n−1)·ε·Σ|·|/n`. The survival fit result does not carry its
+/// training score, so the survival arm pins the moments; the Bernoulli arm pins
+/// the score itself.
 fn assert_reproduces_the_fit_moments(model: &FittedModel, zeta_train: &Array1<f64>, label: &str) {
     let calibration = model
         .latent_z_conditional_calibration
@@ -198,15 +226,57 @@ fn a_saved_model_returns_the_conditional_residual_its_fit_applied_3016() {
     let held_out = draw(N_HELD_OUT, 0x3016_0000_5EED_0002);
     let model = fit(&train, "conditional-location-scale");
 
-    // 1. At the training rows ζ is the fit's own.
+    // 1. At the training rows ζ is the score the fit trained on, bit for bit:
+    // the fit and the saved model run the one fitted score map.
     let zeta_train = residual(&model, &train).expect("a conditional law was consumed");
-    assert_reproduces_the_fit_moments(&model, &zeta_train, "bernoulli");
+    let fit_time = fit_time_training_score(&train, "conditional-location-scale");
+    let first_difference = zeta_train
+        .iter()
+        .zip(&fit_time)
+        .position(|(saved, fitted)| saved.to_bits() != fitted.to_bits());
+    assert_eq!(
+        first_difference,
+        None,
+        "bernoulli: the saved model's training-row ζ must be the fit's own score bit for bit \
+         (saved {:?}, fit {:?})",
+        first_difference.map(|row| zeta_train[row]),
+        first_difference.map(|row| fit_time[row])
+    );
+    assert_eq!(zeta_train.len(), fit_time.len());
 
-    // 2. On new rows ζ is conditionally centred.
+    // 2. A save and load round trip returns the same ζ.
+    let bytes = serde_json::to_vec(&model).expect("serialize the model");
+    let loaded: FittedModel = serde_json::from_slice(&bytes).expect("parse the saved model");
+    let zeta_loaded = residual(&loaded, &held_out).expect("a conditional law was consumed");
+
+    // 3. On new rows ζ is conditionally centred.
     let zeta_held_out = residual(&model, &held_out).expect("a conditional law was consumed");
     assert_conditionally_centred(&zeta_held_out, &held_out.dataset, &held_out.x, "bernoulli");
+    assert!(
+        zeta_loaded
+            .iter()
+            .zip(&zeta_held_out)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "bernoulli: the reloaded model must return the saved model's ζ bit for bit"
+    );
 
-    // 3. A fit that consumed no conditional law returns none.
+    // 4. A conditioning design of another width than the one m(a) and v(a) were
+    // fitted on is refused rather than read against the wrong columns.
+    let mut mismatched = loaded;
+    let wider = fit_formula(&train, "y ~ smooth(x)", "conditional-location-scale");
+    mismatched.resolved_termspec = wider.resolved_termspec.clone();
+    let refusal = mismatched
+        .latent_conditional_residual(
+            held_out.dataset.values.view(),
+            &held_out.dataset.column_map(),
+        )
+        .expect_err("a conditioning design of the wrong width must be refused");
+    assert!(
+        refusal.to_string().contains("basis columns"),
+        "the refusal names the width mismatch: {refusal}"
+    );
+
+    // 5. A fit that consumed no conditional law returns none.
     let global = fit(&train, "global-empirical");
     assert!(
         global.latent_z_conditional_calibration.is_none(),

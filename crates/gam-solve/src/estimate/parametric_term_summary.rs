@@ -19,14 +19,13 @@
 //! `λ_J`, `λ_J`'s uncertainty is not charged to it: the covariance is the
 //! conditional `φ[H⁻¹AH⁻¹]_JJ = (V_c)_JJ − φ(H⁻¹S_JH⁻¹)_JJ`, not the
 //! smoothing-corrected one, whose first-order `λ_J` term made the test
-//! conservative again. An unpenalized term (the factor that carries the level
-//! of a model without an intercept) has `S_J = 0` and keeps the display
+//! conservative again. An unpenalized term has `S_J = 0` and keeps the display
 //! covariance.
 //!
-//! A fixed factor (`+ g`, `factor(g)`, `C(g)`) is a full one-hot block of its
-//! `L` levels under its own REML ridge `λI`, beside a level carrier (the
-//! intercept, or the factor carrying the level of a no-intercept model). The
-//! block's constant direction `1` is aliased with that carrier: with `M` the
+//! A fixed factor (`+ g`, `factor(g)`) is a full one-hot block of its `L`
+//! levels under its own REML ridge `λI`, beside the intercept, which a model
+//! keeps whenever a fixed factor spans the constant. The block's constant
+//! direction `1` is aliased with the intercept: with `M` the
 //! Schur complement of `A` on the block, `M1 = 0`, so the data say nothing about
 //! the mean of the level effects and the ridge sets it to zero. The factor's
 //! null — all levels equal — is a hypothesis on the `L − 1` contrasts `Q'β_J`,
@@ -37,6 +36,7 @@
 //! themselves are a variance-component block, reported with the smooth terms;
 //! only the factor's joint test is parametric.
 
+use crate::estimate::smooth_term_summary::SummaryBlockOffset;
 use crate::estimate::summary::{
     ParametricPValueUnavailable, ParametricTermSummary, ParametricTermTest,
 };
@@ -59,8 +59,7 @@ use std::ops::Range;
 /// joint test per term.
 #[derive(Clone, Debug)]
 pub struct ParametricTermTables {
-    /// Intercept and linear-term coefficients, and the level coefficients of a
-    /// factor left unpenalized to carry the level of a no-intercept model.
+    /// Intercept and linear-term coefficients.
     pub coefficients: Vec<ParametricTermSummary>,
     /// One Wald test per parametric term: a factor with `L` levels is tested
     /// once on `L − 1` degrees of freedom, any other term on its own columns.
@@ -70,6 +69,7 @@ pub struct ParametricTermTables {
 /// One parametric term: its coefficient block and the label of each column.
 struct ParametricTerm {
     name: String,
+    /// The term's columns in the fit's coefficient layout.
     range: Range<usize>,
     column_labels: Vec<String>,
     /// A coefficient on a bound or inside a bounded geometry has no Wald
@@ -118,17 +118,18 @@ impl WaldReference {
 /// that prior's variance removed (module doc); its rows report the resulting
 /// null sampling SD with `penalized` set. A multi-column linear term yields one
 /// row per column, suffixed `[i]`; a constrained or bounded coefficient names
-/// its geometry in the row label. A ridged fixed factor contributes one joint
-/// test on its `L − 1` contrasts and no coefficient rows; a factor left
-/// unpenalized to carry the level contributes one row per level, labelled
-/// `name[level]` by `level_label(feature_col, code)`, and one joint test.
+/// its geometry in the row label. A fixed factor contributes one joint test on
+/// its `L − 1` contrasts and no coefficient rows. `offset` places `design`
+/// inside the fit's coefficient and penalty layout, as for
+/// [`super::smooth_term_summary_rows`]: every index into `fit` is global, every
+/// index into `design` block-local.
 pub fn parametric_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
-    level_label: &dyn Fn(usize, u64) -> String,
+    offset: SummaryBlockOffset,
 ) -> ParametricTermTables {
-    let terms = parametric_terms(design, spec, level_label);
+    let terms = parametric_terms(design, spec, offset.coefficients);
     let uncertainty = fit.display_coefficient_uncertainty();
     let se = uncertainty.as_ref().map(|view| &view.standard_errors);
     let covariance = uncertainty.as_ref().and_then(|view| view.covariance);
@@ -137,7 +138,7 @@ pub fn parametric_term_summary_rows(
     let mut coefficients = Vec::new();
     let mut term_tests = Vec::new();
     for term in &terms {
-        let own_penalty = own_penalty(design, fit, &term.range);
+        let own_penalty = own_penalty(design, fit, offset, &term.range);
         let penalized = own_penalty.is_some();
         let null_covariance = null_sampling_covariance(fit, covariance, &term.range, own_penalty);
         let first = coefficients.len();
@@ -182,18 +183,19 @@ pub fn parametric_term_summary_rows(
     }
 }
 
-/// The intercept, the linear terms, and the unpenalized factor blocks, in
-/// coefficient order.
+/// The intercept, the linear terms, and the fixed factors, in coefficient
+/// order, each placed at `first_coefficient` in the fit's layout.
 fn parametric_terms(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
-    level_label: &dyn Fn(usize, u64) -> String,
+    first_coefficient: usize,
 ) -> Vec<ParametricTerm> {
+    let global = |range: &Range<usize>| first_coefficient + range.start..first_coefficient + range.end;
     let mut terms = Vec::new();
     if !design.intercept_range.is_empty() {
         terms.push(ParametricTerm {
             name: "Intercept".to_string(),
-            range: design.intercept_range.clone(),
+            range: global(&design.intercept_range),
             column_labels: vec!["Intercept".to_string(); design.intercept_range.len()],
             bounded: false,
             tested: TestedDirections::Coefficients,
@@ -221,70 +223,57 @@ fn parametric_terms(
         });
         terms.push(ParametricTerm {
             name: name.clone(),
-            range: range.clone(),
+            range: global(range),
             column_labels,
             bounded,
             tested: TestedDirections::Coefficients,
         });
     }
     // A genuine random effect (`group(g)`, `re(g)`) is a variance component,
-    // tested (or not) with the smooth terms. A fixed factor is parametric: tested
-    // on its contrasts when it carries its own ridge, and on its levels when it
-    // is left unpenalized to carry the level of a no-intercept model.
+    // tested (or not) with the smooth terms. A fixed factor is parametric:
+    // tested on its contrasts, since the intercept carries its level.
     for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
-        let Some(meta) = spec.random_effect_terms.get(re_idx) else {
-            continue;
-        };
-        let fixed_factor = !meta.lenient_unseen;
-        if !(fixed_factor || !meta.penalized) || range.is_empty() {
+        let fixed_factor = spec
+            .random_effect_terms
+            .get(re_idx)
+            .is_some_and(|meta| !meta.lenient_unseen);
+        if !fixed_factor || range.is_empty() {
             continue;
         }
-        let codes = design
-            .random_effect_levels
-            .get(re_idx)
-            .map(|(_, codes)| codes.as_slice())
-            .or(meta.frozen_levels.as_deref())
-            .unwrap_or(&[]);
-        let column_labels = (0..range.len())
-            .map(|i| match codes.get(i) {
-                Some(&code) => format!("{name}[{}]", level_label(meta.feature_col, code)),
-                None => format!("{name}[{i}]"),
-            })
-            .collect();
         terms.push(ParametricTerm {
             name: name.clone(),
-            range: range.clone(),
-            column_labels,
+            range: global(range),
+            column_labels: Vec::new(),
             bounded: false,
-            tested: if meta.penalized {
-                TestedDirections::Contrasts
-            } else {
-                TestedDirections::Coefficients
-            },
+            tested: TestedDirections::Contrasts,
         });
     }
     terms
 }
 
 /// The term's own penalty `Σ_k λ_k S_k` over the blocks that lie inside its
-/// coefficient range, or `None` when it owns no penalty. `fit.lambdas` is laid
-/// out one entry per `design.penalties` block, in order.
+/// coefficient range, or `None` when it owns no penalty. From
+/// `offset.penalties` on, `fit.lambdas` is laid out one entry per
+/// `design.penalties` block, in order.
 fn own_penalty(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
+    offset: SummaryBlockOffset,
     range: &Range<usize>,
 ) -> Option<Array2<f64>> {
     let q = range.len();
     let mut penalty = Array2::<f64>::zeros((q, q));
     let mut owned = false;
-    for (block, lambda) in design.penalties.iter().zip(fit.lambdas.iter()) {
-        let cols = &block.col_range;
+    let lambdas = fit.lambdas.iter().skip(offset.penalties);
+    for (block, lambda) in design.penalties.iter().zip(lambdas) {
+        let cols = offset.coefficients + block.col_range.start
+            ..offset.coefficients + block.col_range.end;
         if cols.is_empty() || cols.start < range.start || cols.end > range.end {
             continue;
         }
-        let offset = cols.start - range.start;
+        let at = cols.start - range.start;
         penalty
-            .slice_mut(s![offset..offset + cols.len(), offset..offset + cols.len()])
+            .slice_mut(s![at..at + cols.len(), at..at + cols.len()])
             .scaled_add(*lambda, &block.local);
         owned = true;
     }
