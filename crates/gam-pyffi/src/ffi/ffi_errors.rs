@@ -857,6 +857,9 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
         WorkflowError::TransformationNormalConflict { .. } => {
             InvalidConfigurationError::new_err(err.to_string())
         }
+        WorkflowError::WarmStartRefused { .. } => {
+            InvalidConfigurationError::new_err(err.to_string())
+        }
     }
 }
 

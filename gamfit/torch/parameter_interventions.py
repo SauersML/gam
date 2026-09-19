@@ -578,6 +578,10 @@ class _ParameterUseMode(TorchFunctionMode):
     edited tensors at the planned reads, orients each read by the map that
     multiplies it, and records what the tracked uses multiplied and wrote."""
 
+    # ``torch.backends.cuda.matmul.allow_tf32`` as read right before the forward
+    # this mode runs; set by :func:`_run_under_mode`.
+    tf32_matmul: bool
+
     def __init__(
         self,
         parameters: dict[int, tuple[torch.nn.Parameter, str]],
@@ -985,7 +989,7 @@ def execute_parameter_cotangents(
             f"use sites {unreached} were never multiplied in this forward "
             f"(transpose views never consumed: {unconsumed})"
         )
-    blocks = []
+    blocks: list[torch.Tensor] = []
     for readout in readouts:
         if isinstance(readout, OutputReadout):
             if output.dim() < 2 or readout.positions[-1] >= output.shape[1]:
@@ -1007,7 +1011,7 @@ def execute_parameter_cotangents(
             else:
                 block = record[1]
         blocks.append(block)
-    objective = None
+    terms: list[torch.Tensor] = []
     for block, values in zip(blocks, blocks_in):
         array = np.asarray(values, dtype=np.float64)
         if array.shape != tuple(block.shape):
@@ -1017,19 +1021,25 @@ def execute_parameter_cotangents(
             )
         if not np.all(np.isfinite(array)):
             raise ValueError("readout cotangents must be finite")
-        term = (
-            block.to(torch.float64)
-            * torch.from_numpy(np.ascontiguousarray(array)).to(device=block.device)
-        ).sum()
-        objective = term if objective is None else objective + term
+        terms.append(
+            (
+                block.to(torch.float64)
+                * torch.from_numpy(np.ascontiguousarray(array)).to(device=block.device)
+            ).sum()
+        )
+    # ``readouts`` is non-empty (checked above): left-to-right float64 sum.
+    objective = sum(terms[1:], terms[0])
     captured = [mode.captured[key] for key in keys]
     written = [record[3] for record in captured]
+    gradients: tuple[torch.Tensor | None, ...]
     if objective.requires_grad:
         gradients = torch.autograd.grad(objective, written, allow_unused=True)
     else:
         gradients = (None,) * len(written)
     uses = []
     for (site, read, carried, wrote, positions), gradient in zip(captured, gradients):
+        if read is None:
+            raise ValueError(f"use site {site.use_site_id} has no input tensor to factor")
         rows_written = torch.zeros_like(wrote) if gradient is None else gradient
         rows_read = read
         if positions is not None:

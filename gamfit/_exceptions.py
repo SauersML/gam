@@ -29,54 +29,54 @@ from ._binding import RustExtensionUnavailableError, rust_module
 _rust = rust_module()
 
 # The five category bases.
-GamfitError: type = _rust.GamfitError
-FormulaError: type = _rust.FormulaError
-DataError: type = _rust.DataError
-ConvergenceError: type = _rust.ConvergenceError
-NotFittedError: type = _rust.NotFittedError
-InternalError: type = _rust.InternalError
+GamfitError = _rust.GamfitError
+FormulaError = _rust.FormulaError
+DataError = _rust.DataError
+ConvergenceError = _rust.ConvergenceError
+NotFittedError = _rust.NotFittedError
+InternalError = _rust.InternalError
 
 # FormulaError subclasses. `ColumnNotFoundError` instances carry `column`,
 # `role`, `available`, `similar` and `tsv_hint` attributes set at raise time.
-ColumnNotFoundError: type = _rust.ColumnNotFoundError
-InvalidSpecificationError: type = _rust.InvalidSpecificationError
-InvalidConfigurationError: type = _rust.InvalidConfigurationError
-BasisError: type = _rust.BasisError
-MissingDependencyError: type = _rust.MissingDependencyError
+ColumnNotFoundError = _rust.ColumnNotFoundError
+InvalidSpecificationError = _rust.InvalidSpecificationError
+InvalidConfigurationError = _rust.InvalidConfigurationError
+BasisError = _rust.BasisError
+MissingDependencyError = _rust.MissingDependencyError
 
 # DataError subclasses.
-SchemaMismatchError: type = _rust.SchemaMismatchError
-PredictionError: type = _rust.PredictionError
-PerfectSeparationError: type = _rust.PerfectSeparationError
-ModelOverparameterizedError: type = _rust.ModelOverparameterizedError
-IllConditionedError: type = _rust.IllConditionedError
-InvalidInputError: type = _rust.InvalidInputError
-GeometryError: type = _rust.GeometryError
-FitInputError: type = _rust.FitInputError
+SchemaMismatchError = _rust.SchemaMismatchError
+PredictionError = _rust.PredictionError
+PerfectSeparationError = _rust.PerfectSeparationError
+ModelOverparameterizedError = _rust.ModelOverparameterizedError
+IllConditionedError = _rust.IllConditionedError
+InvalidInputError = _rust.InvalidInputError
+GeometryError = _rust.GeometryError
+FitInputError = _rust.FitInputError
 
 # ConvergenceError subclasses. A fit's solve failure raises the class of its
 # fit category (#2937); instances carry `variant`, `category`, `error_category`,
 # `causes` and `fields`.
-FitConvergenceError: type = _rust.FitConvergenceError
-PirlsConvergenceError: type = _rust.PirlsConvergenceError
-RemlConvergenceError: type = _rust.RemlConvergenceError
-InnerModeConvergenceError: type = _rust.InnerModeConvergenceError
-FitSeedError: type = _rust.FitSeedError
-FitNumericalError: type = _rust.FitNumericalError
-LinearSystemSolveError: type = _rust.LinearSystemSolveError
-EigendecompositionError: type = _rust.EigendecompositionError
-PenaltySpectrumError: type = _rust.PenaltySpectrumError
-ParameterConstraintError: type = _rust.ParameterConstraintError
-HessianNotPositiveDefiniteError: type = _rust.HessianNotPositiveDefiniteError
-MonotoneRootError: type = _rust.MonotoneRootError
-IntegrationError: type = _rust.IntegrationError
-CalibratorError: type = _rust.CalibratorError
-DictionaryConvergenceError: type = _rust.DictionaryConvergenceError
+FitConvergenceError = _rust.FitConvergenceError
+PirlsConvergenceError = _rust.PirlsConvergenceError
+RemlConvergenceError = _rust.RemlConvergenceError
+InnerModeConvergenceError = _rust.InnerModeConvergenceError
+FitSeedError = _rust.FitSeedError
+FitNumericalError = _rust.FitNumericalError
+LinearSystemSolveError = _rust.LinearSystemSolveError
+EigendecompositionError = _rust.EigendecompositionError
+PenaltySpectrumError = _rust.PenaltySpectrumError
+ParameterConstraintError = _rust.ParameterConstraintError
+HessianNotPositiveDefiniteError = _rust.HessianNotPositiveDefiniteError
+MonotoneRootError = _rust.MonotoneRootError
+IntegrationError = _rust.IntegrationError
+CalibratorError = _rust.CalibratorError
+DictionaryConvergenceError = _rust.DictionaryConvergenceError
 
 # InternalError subclasses.
-FitInvariantError: type = _rust.FitInvariantError
-GradientUnavailableError: type = _rust.GradientUnavailableError
-LayoutError: type = _rust.LayoutError
+FitInvariantError = _rust.FitInvariantError
+GradientUnavailableError = _rust.GradientUnavailableError
+LayoutError = _rust.LayoutError
 
 
 def map_exception(exc: BaseException) -> BaseException:

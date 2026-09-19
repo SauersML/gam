@@ -4509,26 +4509,43 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // identity caught by `pytest.raises(gamfit.RemlConvergenceError)` and
     // constructed by `RemlConvergenceError::new_err(...)` on the Rust side is
     // exactly the same object.
-    macro_rules! register_exceptions {
-        ($($class:ident),+ $(,)?) => {
-            $(module.add(stringify!($class), module.py().get_type::<$class>())?;)+
-        };
-    }
-    register_exceptions!(
-        GamfitError, FormulaError, DataError,
-        ConvergenceError, NotFittedError, InternalError,
-        ColumnNotFoundError, InvalidSpecificationError, InvalidConfigurationError,
-        BasisError, MissingDependencyError, SchemaMismatchError,
-        PredictionError, PerfectSeparationError, ModelOverparameterizedError,
-        IllConditionedError, InvalidInputError, GeometryError,
-        FitInputError, FitConvergenceError, PirlsConvergenceError,
-        RemlConvergenceError, InnerModeConvergenceError, FitSeedError,
-        FitNumericalError, LinearSystemSolveError, EigendecompositionError,
-        PenaltySpectrumError, ParameterConstraintError, HessianNotPositiveDefiniteError,
-        MonotoneRootError, IntegrationError, CalibratorError,
-        DictionaryConvergenceError, FitInvariantError, GradientUnavailableError,
-        LayoutError,
-    );
+    module.add("GamfitError", module.py().get_type::<GamfitError>())?;
+    module.add("FormulaError", module.py().get_type::<FormulaError>())?;
+    module.add("DataError", module.py().get_type::<DataError>())?;
+    module.add("ConvergenceError", module.py().get_type::<ConvergenceError>())?;
+    module.add("NotFittedError", module.py().get_type::<NotFittedError>())?;
+    module.add("InternalError", module.py().get_type::<InternalError>())?;
+    module.add("ColumnNotFoundError", module.py().get_type::<ColumnNotFoundError>())?;
+    module.add("InvalidSpecificationError", module.py().get_type::<InvalidSpecificationError>())?;
+    module.add("InvalidConfigurationError", module.py().get_type::<InvalidConfigurationError>())?;
+    module.add("BasisError", module.py().get_type::<BasisError>())?;
+    module.add("MissingDependencyError", module.py().get_type::<MissingDependencyError>())?;
+    module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
+    module.add("PredictionError", module.py().get_type::<PredictionError>())?;
+    module.add("PerfectSeparationError", module.py().get_type::<PerfectSeparationError>())?;
+    module.add("ModelOverparameterizedError", module.py().get_type::<ModelOverparameterizedError>())?;
+    module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
+    module.add("InvalidInputError", module.py().get_type::<InvalidInputError>())?;
+    module.add("GeometryError", module.py().get_type::<GeometryError>())?;
+    module.add("FitInputError", module.py().get_type::<FitInputError>())?;
+    module.add("FitConvergenceError", module.py().get_type::<FitConvergenceError>())?;
+    module.add("PirlsConvergenceError", module.py().get_type::<PirlsConvergenceError>())?;
+    module.add("RemlConvergenceError", module.py().get_type::<RemlConvergenceError>())?;
+    module.add("InnerModeConvergenceError", module.py().get_type::<InnerModeConvergenceError>())?;
+    module.add("FitSeedError", module.py().get_type::<FitSeedError>())?;
+    module.add("FitNumericalError", module.py().get_type::<FitNumericalError>())?;
+    module.add("LinearSystemSolveError", module.py().get_type::<LinearSystemSolveError>())?;
+    module.add("EigendecompositionError", module.py().get_type::<EigendecompositionError>())?;
+    module.add("PenaltySpectrumError", module.py().get_type::<PenaltySpectrumError>())?;
+    module.add("ParameterConstraintError", module.py().get_type::<ParameterConstraintError>())?;
+    module.add("HessianNotPositiveDefiniteError", module.py().get_type::<HessianNotPositiveDefiniteError>())?;
+    module.add("MonotoneRootError", module.py().get_type::<MonotoneRootError>())?;
+    module.add("IntegrationError", module.py().get_type::<IntegrationError>())?;
+    module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
+    module.add("DictionaryConvergenceError", module.py().get_type::<DictionaryConvergenceError>())?;
+    module.add("FitInvariantError", module.py().get_type::<FitInvariantError>())?;
+    module.add("GradientUnavailableError", module.py().get_type::<GradientUnavailableError>())?;
+    module.add("LayoutError", module.py().get_type::<LayoutError>())?;
 
     // #773: `create_exception!` stamps every gamfit exception with
     // `__module__ = "_rust"`, but the compiled extension is importable only as
@@ -4624,6 +4641,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
     module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
+    module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
@@ -4738,7 +4756,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
-    module.add_function(wrap_pyfunction!(compare_reml_fits, module)?)?;
+    module.add_function(wrap_pyfunction!(compare_models, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
@@ -4928,7 +4946,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothing_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(model_group_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(model_deployment_extensions, module)?)?;
-    module.add_function(wrap_pyfunction!(model_conditional_aic, module)?)?;
     module.add_function(wrap_pyfunction!(summary_repr, module)?)?;
     module.add_function(wrap_pyfunction!(summary_criterion_row, module)?)?;
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
@@ -6729,26 +6746,25 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-    warm_start: Option<(&[u8], &str)>,
+    warm_start_model: Option<&[u8]>,
 ) -> Result<Vec<u8>, WorkflowError> {
     // The stderr `[OUTER step]` log stream (installed by `progress_log::
     // init_logging` at module import) carries solver progress for the Python
     // bindings; the former always-on TUI session lane has been removed.
     let mut fit_config = parse_fit_config(config_json)?;
-    // `warm_start_from`: the saved model's certified outer point, staged under the
-    // caller's scratch directory for this one fit.
-    if let Some((model_bytes, scratch_dir)) = warm_start {
-        let prior = load_model_impl(model_bytes)?;
-        fit_config.outer_warm_start = Some(
-            gam::families::fit_orchestration::OuterWarmStart::from_model(
-                prior.payload(),
-                &formula,
-                std::path::PathBuf::from(scratch_dir),
-            )?,
-        );
-    }
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
+    }
+    // `warm_start_from` (gam#3002): the saved model's certified outer point,
+    // resolved against exactly the data and request this fit runs on.
+    if let Some(model_bytes) = warm_start_model {
+        let prior = load_model_impl(model_bytes)?;
+        fit_config.warm_start = Some(gam::families::fit_orchestration::resolve_warm_start(
+            prior.payload(),
+            &formula,
+            &dataset,
+            &fit_config,
+        )?);
     }
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,

@@ -222,7 +222,7 @@ impl<'a> RemlState<'a> {
         if reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(zero());
         }
-        // The penalty-score channel needs one λ per canonical penalty.
+        // The mode and trace channels need one λ per canonical penalty.
         if rho.len() != n_rho || n_rho == 0 {
             return Ok(zero());
         }
@@ -644,6 +644,9 @@ impl<'a> RemlState<'a> {
         //                + (b)+(c) tr(Ḣ_j · (Q_b + Q_c))
         //                + (d) g_dᵀ · dβ̂/dρ_j,
         //
+        // where (a) is identically zero for the row-remainder `ΔF` the target
+        // integrates (ρ reaches it only through β̂), so its content lives in (d).
+        //
         // with the TOTAL drift `Ḣ_j = λ_j S_j − C[v_j]`,
         // `C[v] = Xᵀ diag(c ⊙ Xv) X`, the IFT mode response
         // `dβ̂/dρ_j = −v_j = −H⁻¹ λ_j S_j β̂`, and
@@ -680,39 +683,40 @@ impl<'a> RemlState<'a> {
             w_xv_ett.row_mut(i).mapv_inplace(|v| v * w_i);
         }
 
-        // Channel (d) moment: g_d = E_p[∂ΔF/∂β̂]
-        //   = Xᵀ(E_p[ngs_disp] − ngs_base) + Σ_k λ_k S_k (V_b E_p[t])
-        //     − ½ Xᵀ(c ⊙ E_p[s²]).
-        let delta_mean = target.block_vecs.dot(&moments.e_t); // p
+        // Channel (d) moment: g_d = E_p[∂ΔF/∂β̂] with δ held fixed. `ΔF` is the
+        // row Taylor remainder `Σ_i [ψ_i(η̂_i+s_i) − ψ_i(η̂_i) − ψ_i'(η̂_i)s_i − ½W_i s_i²]`
+        // (see `Gam784BlockTarget`), and `∂ψ'/∂η = W`, `∂W/∂η = c`, so
+        //   g_d = Xᵀ(E_p[ngs_disp] − ngs_base) − Xᵀ W X (V_b E_p[t])
+        //         − ½ Xᵀ(c ⊙ E_p[s²]).
+        // On the exact mode this is the penalty-score form's `g_d` minus
+        // `H δ̄`, and `v_j·H δ̄ = λ_j (S_j β̂)·δ̄` is exactly the explicit channel
+        // that form carried, so the total is unchanged there.
+        let s_mean = xv.dot(&moments.e_t); // n
         let mut g_d = x.t().dot(&(&moments.e_neg_score - &ngs_base));
-        for (pen, &lam) in target.penalties.iter().zip(target.lambdas.iter()) {
-            g_d.scaled_add(lam, &transformed_penalty_matvec(pen, &delta_mean));
-        }
+        g_d.scaled_add(-1.0, &x.t().dot(&(&target.weights_obs * &s_mean)));
         g_d.scaled_add(-0.5, &x.t().dot(&(c_weights * &sigma2)));
 
         // Channel (c) moment: R[:,r] = E_p[t_r · ∂ΔF/∂δ]
-        //   = Xᵀ E_p[t_r ngs_disp] + (Σ_k λ_k S_k β̂) E_p[t_r] − Xᵀ W X V_b E_p[t tᵀ][:,r].
-        let mut pen_score_total = Array1::<f64>::zeros(p);
-        for (score, &lam) in target.penalty_scores.iter().zip(target.lambdas.iter()) {
-            pen_score_total.scaled_add(lam, score);
-        }
+        //   = Xᵀ E_p[t_r ngs_disp] − (Xᵀ ngs_base) E_p[t_r] − Xᵀ W X V_b E_p[t tᵀ][:,r].
+        let base_score_coef = x.t().dot(&ngs_base); // p
         let mut r_mat = x.t().dot(&moments.e_t_neg_score); // p × m
         for r in 0..m {
             r_mat
                 .column_mut(r)
-                .scaled_add(moments.e_t[r], &pen_score_total);
+                .scaled_add(-moments.e_t[r], &base_score_coef);
         }
         r_mat -= &x.t().dot(&w_xv_ett);
 
         // Channel (b) moment: M_r = E_p[(∂ΔF/∂t)_r (−½ t_r)] via
-        // ∂ΔF/∂t = (XV)ᵀ ngs_disp + V_bᵀ(Σλ_k S_k β̂) − (XV)ᵀ(W ⊙ s).
+        // ∂ΔF/∂t = (XV)ᵀ (ngs_disp − ngs_base − W ⊙ s).
         let xvt_etngs = xv.t().dot(&moments.e_t_neg_score); // m × m
-        let pterm = target.block_vecs.t().dot(&pen_score_total); // m
+        let base_score_block = xv.t().dot(&ngs_base); // m
         let xvt_w_xv_ett = xv.t().dot(&w_xv_ett); // m × m
         let mut m_vec = Array1::<f64>::zeros(m);
         for r in 0..m {
             m_vec[r] =
-                -0.5 * (xvt_etngs[(r, r)] + pterm[r] * moments.e_t[r] - xvt_w_xv_ett[(r, r)]);
+                -0.5 * (xvt_etngs[(r, r)] - base_score_block[r] * moments.e_t[r]
+                    - xvt_w_xv_ett[(r, r)]);
         }
 
         // Eigenframe assembly. `block_vecs` are the `block_cols` columns of

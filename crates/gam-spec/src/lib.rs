@@ -631,6 +631,17 @@ pub enum ResponseFamily {
     },
     Gamma,
     RoystonParmar,
+    /// Scaled Student-t response on the identity link:
+    /// `y = η + σ·T_ν`, density
+    /// `Γ((ν+1)/2) / (Γ(ν/2)·√(νπ)·σ) · (1 + r²/(νσ²))^{-(ν+1)/2}`, `r = y − η`.
+    /// The scale `σ` and the degrees of freedom `ν` are hyperparameters of the
+    /// marginal likelihood, estimated jointly with the smoothing parameters by
+    /// LAML; the values carried here are the current point on that search (the
+    /// seed at construction, the estimate on a fitted model).
+    StudentT {
+        sigma: f64,
+        nu: f64,
+    },
 }
 
 impl ResponseFamily {
@@ -645,6 +656,7 @@ impl ResponseFamily {
             Self::Beta { .. } => "beta",
             Self::Gamma => "gamma",
             Self::RoystonParmar => "royston-parmar",
+            Self::StudentT { .. } => "student-t",
         }
     }
 
@@ -661,6 +673,7 @@ impl ResponseFamily {
         match self {
             Self::Binomial | Self::RoystonParmar | Self::Beta { .. } => Some((0.0, 1.0)),
             Self::Gaussian
+            | Self::StudentT { .. }
             | Self::Poisson
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
@@ -701,7 +714,7 @@ impl ResponseFamily {
                 Some((0.0, f64::INFINITY))
             }
             Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
-            Self::Gaussian | Self::RoystonParmar => None,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -729,7 +742,7 @@ impl ResponseFamily {
                  (a binary {0, 1} response is a Binomial GLM, not Beta; route it through the Binomial family instead)",
             ),
             Self::Binomial => Some("response values in the closed interval [0, 1]"),
-            Self::Gaussian | Self::RoystonParmar => None,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -754,7 +767,7 @@ impl ResponseFamily {
             }
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
             Self::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
-            Self::Gaussian | Self::RoystonParmar => true,
+            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => true,
         }
     }
 
@@ -772,6 +785,7 @@ impl ResponseFamily {
             Self::Beta { .. } => "Beta",
             Self::Gamma => "Gamma",
             Self::RoystonParmar => "Royston-Parmar",
+            Self::StudentT { .. } => "Student-t",
         }
     }
 
@@ -937,7 +951,11 @@ impl ResponseFamily {
                     Ok(())
                 }
             }
-            Self::Tweedie { .. } | Self::Beta { .. } | Self::Gamma | Self::RoystonParmar => Ok(()),
+            Self::Tweedie { .. }
+            | Self::Beta { .. }
+            | Self::Gamma
+            | Self::RoystonParmar
+            | Self::StudentT { .. } => Ok(()),
         }
     }
 
@@ -1331,6 +1349,7 @@ pub enum FamilySpecKind {
     TweedieLog { p: f64 },
     NegativeBinomialLog { theta: f64 },
     BetaLogit { phi: f64 },
+    StudentTIdentity { sigma: f64, nu: f64 },
     RoystonParmar,
     BinomialLogit,
     BinomialProbit,
@@ -1353,6 +1372,7 @@ impl FamilySpecKind {
             Self::TweedieLog { .. } => "tweedie-log",
             Self::NegativeBinomialLog { .. } => "negative-binomial-log",
             Self::BetaLogit { .. } => "beta-regression-logit",
+            Self::StudentTIdentity { .. } => "student-t",
             Self::GammaLog => "gamma-log",
             Self::RoystonParmar => "royston-parmar",
             Self::BinomialLogit => "binomial-logit",
@@ -1376,6 +1396,7 @@ impl FamilySpecKind {
             Self::TweedieLog { .. } => "Tweedie Log",
             Self::NegativeBinomialLog { .. } => "Negative-Binomial Log",
             Self::BetaLogit { .. } => "Beta Regression Logit",
+            Self::StudentTIdentity { .. } => "Student-t Identity",
             Self::GammaLog => "Gamma Log",
             Self::RoystonParmar => "Royston Parmar",
             Self::BinomialLogit => "Binomial Logit",
@@ -1460,7 +1481,9 @@ impl LikelihoodSpec {
     pub fn is_legal_cell(response: &ResponseFamily, link: &InverseLink) -> bool {
         match response {
             // Pure-identity families.
-            ResponseFamily::Gaussian | ResponseFamily::RoystonParmar => {
+            ResponseFamily::Gaussian
+            | ResponseFamily::StudentT { .. }
+            | ResponseFamily::RoystonParmar => {
                 matches!(link, InverseLink::Standard(StandardLink::Identity))
             }
             // Log-link families.
@@ -1600,6 +1623,13 @@ impl LikelihoodSpec {
             (ResponseFamily::RoystonParmar, InverseLink::Standard(StandardLink::Identity)) => {
                 FamilySpecKind::RoystonParmar
             }
+            (
+                ResponseFamily::StudentT { sigma, nu },
+                InverseLink::Standard(StandardLink::Identity),
+            ) => FamilySpecKind::StudentTIdentity {
+                sigma: *sigma,
+                nu: *nu,
+            },
             (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
                 FamilySpecKind::PoissonLog
             }
@@ -1735,6 +1765,10 @@ impl LikelihoodSpec {
             // (magic-by-default, issue #567): the family-variant `phi` is the
             // seed, refined from the working residuals during fitting.
             ResponseFamily::Beta { phi } => LikelihoodScaleMetadata::EstimatedBetaPhi { phi: *phi },
+            // The Student-t scale σ and degrees of freedom ν live on the family
+            // variant and are outer LAML hyperparameters; the likelihood carries
+            // no separate exponential-dispersion multiplier.
+            ResponseFamily::StudentT { .. } => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
@@ -1779,9 +1813,10 @@ impl LikelihoodSpec {
     #[inline]
     pub const fn fixed_dispersion(&self) -> Option<f64> {
         match self.response {
-            ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::RoystonParmar => {
-                None
-            }
+            ResponseFamily::Gaussian
+            | ResponseFamily::Gamma
+            | ResponseFamily::RoystonParmar
+            | ResponseFamily::StudentT { .. } => None,
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
             | ResponseFamily::Tweedie { .. }
@@ -2379,6 +2414,19 @@ impl GlmLikelihoodSpec {
                 Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
             }
 
+            // Student-t: σ and ν are validated on the family variant; the
+            // likelihood carries no further dispersion multiplier.
+            (ResponseFamily::StudentT { sigma, nu }, Metadata::FixedDispersion { phi })
+                if phi.to_bits() == 1.0_f64.to_bits() =>
+            {
+                positive(*sigma, "Student-t scale sigma")?;
+                positive(*nu, "Student-t degrees of freedom nu")?;
+                Ok(Resolved::Unit)
+            }
+            (ResponseFamily::StudentT { .. }, _) => {
+                Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
+            }
+
             (ResponseFamily::Gamma, Metadata::FixedGammaShape { shape }) => Ok(Resolved::Gamma {
                 scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
                 estimated: false,
@@ -2636,6 +2684,41 @@ impl GlmLikelihoodSpec {
             self.scale = LikelihoodScaleMetadata::EstimatedBetaPhi { phi };
         }
         self
+    }
+
+    /// Set the Student-t scale `σ` and degrees of freedom `ν` on the family
+    /// variant, where every PIRLS weight / deviance / log-likelihood expression
+    /// reads them. The outer LAML search moves `(log σ, log ν)` and installs
+    /// each trial point through this mutator. No-op for non-Student-t families.
+    #[inline]
+    #[must_use]
+    pub fn with_student_t(mut self, sigma: f64, nu: f64) -> Self {
+        if let ResponseFamily::StudentT {
+            sigma: family_sigma,
+            nu: family_nu,
+        } = &mut self.spec.response
+        {
+            *family_sigma = sigma;
+            *family_nu = nu;
+        }
+        self
+    }
+
+    /// The Student-t `(σ, ν)` carried on the family variant, validated finite
+    /// and positive; `None` for every other family.
+    #[inline]
+    pub fn student_t_parameters(&self) -> Option<Result<(f64, f64), InvalidLikelihoodScale>> {
+        match self.spec.response {
+            ResponseFamily::StudentT { sigma, nu } => Some(
+                PositiveLikelihoodScale::try_new(sigma, "Student-t scale sigma").and_then(
+                    |sigma| {
+                        PositiveLikelihoodScale::try_new(nu, "Student-t degrees of freedom nu")
+                            .map(|nu| (sigma.value(), nu.value()))
+                    },
+                ),
+            ),
+            _ => None,
+        }
     }
 
     /// Mutate the Tweedie dispersion `phi` in place. Unlike Beta, the Tweedie
