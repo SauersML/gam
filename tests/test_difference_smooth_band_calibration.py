@@ -1,4 +1,4 @@
-"""Calibration of simultaneous difference-smooth bands and the no-difference test.
+"""Calibration of simultaneous difference-smooth bands.
 
 The full seeded study lives in ``bench/pvalue_calibration/pv-bands``; these
 are its fast regression slices.
@@ -88,26 +88,11 @@ def test_band_is_priced_from_the_published_covariance(
     np.testing.assert_allclose(_column(rows, "diff"), contrast @ np.asarray(design_b.coefficients), atol=1e-10)
 
 
-def test_no_difference_p_value_is_the_simultaneous_band_test() -> None:
-    model = gamfit.fit(_two_groups("gaussian", 300, 11, True), FORMULA)
-    rows = _rows(model)
-    p_values = {row["p_value"] for row in rows}
-    assert len(p_values) == 1
-    (p_value,) = p_values
-    assert 0.0 < p_value <= 1.0
-    for level in (0.90, 0.95, 0.99):
-        band = _rows(model, level=level)
-        excludes_zero = bool(np.any((_column(band, "lower") > 0.0) | (_column(band, "upper") < 0.0)))
-        assert excludes_zero == (p_value <= 1.0 - level), (level, p_value)
-    assert all(row["p_value"] is None for row in _rows(model, simultaneous=False))
-
-
-def test_gaussian_simultaneous_band_covers_the_whole_curve_and_holds_its_size() -> None:
+def test_gaussian_simultaneous_band_covers_the_whole_curve() -> None:
     replicates = 60
     level = 0.95
     covered = []
     pointwise_covered = []
-    rejected = []
     for replicate in range(replicates):
         alternative = gamfit.fit(_two_groups("gaussian", 200, 40_000 + replicate, True), FORMULA)
         band = _rows(alternative, level=level)
@@ -117,13 +102,9 @@ def test_gaussian_simultaneous_band_covers_the_whole_curve_and_holds_its_size() 
         pointwise_covered.append(
             np.all((_column(pointwise, "lower") <= truth) & (truth <= _column(pointwise, "upper")))
         )
-        null = gamfit.fit(_two_groups("gaussian", 200, 50_000 + replicate, False), FORMULA)
-        rejected.append(_rows(null, level=level)[0]["p_value"] <= 1.0 - level)
     mcse = math.sqrt(level * (1.0 - level) / replicates)
     coverage = float(np.mean(covered))
-    size = float(np.mean(rejected))
     assert abs(coverage - level) <= 2.0 * mcse, (coverage, mcse)
-    assert abs(size - (1.0 - level)) <= 2.0 * mcse, (size, mcse)
     # The pointwise band is what G2 measured: it misses somewhere on the curve
     # far more often than 5% of the time.
     assert float(np.mean(pointwise_covered)) < level - 2.0 * mcse

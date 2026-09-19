@@ -150,14 +150,6 @@ pub(crate) struct EffectReport {
     pub lower: Array1<f64>,
     pub upper: Array1<f64>,
     pub critical: f64,
-    /// Whole-curve p-value of `H0: C beta = 0` at every contrast row, from the
-    /// same simulated law of `max_i |Z_i|` that calibrates the simultaneous
-    /// critical value: `(1 + #{M_s >= T}) / (S + 1)` with
-    /// `T = max_i |center_i| / se_i`. It rejects at `alpha` exactly when the
-    /// `1 - alpha` simultaneous band excludes zero somewhere, up to the
-    /// simulation's resolution. `None` for pointwise bands, which carry no
-    /// whole-curve null law.
-    pub zero_curve_p_value: Option<f64>,
 }
 
 /// Typed failures from covariance selection or effect-band construction.
@@ -293,25 +285,24 @@ pub(crate) fn effect_report(
 
     let covariance = validated_symmetric_matrix(covariance)?;
     let center = contrast_design.dot(&beta);
-    let (se, critical, zero_curve_p_value) = match options {
+    let (se, critical) = match options {
         BandOptions::Pointwise(pointwise) => {
             let se = pointwise_standard_errors(contrast_design, covariance.view())?;
             let critical = standard_normal_quantile(0.5 * (1.0 + pointwise.level))
                 .map_err(|detail| EffectError::NormalQuantile { detail })?;
-            (se, critical, None)
+            (se, critical)
         }
         BandOptions::Simultaneous(simultaneous) => {
             let curve_factor = simultaneous_curve_factor(contrast_design, covariance.view())?;
             let se = factor_standard_errors(&curve_factor);
-            let maxima = simulated_supremum_law(
+            let critical = simultaneous_critical(
                 &curve_factor,
                 se.view(),
+                simultaneous.level,
                 simultaneous.simulations,
                 simultaneous.seed,
             );
-            let critical = quantile_from_sorted(&maxima, simultaneous.level);
-            let p_value = supremum_tail_p_value(&maxima, max_standardized_magnitude(&center, &se));
-            (se, critical, Some(p_value))
+            (se, critical)
         }
     };
 
@@ -324,7 +315,6 @@ pub(crate) fn effect_report(
         lower,
         upper,
         critical,
-        zero_curve_p_value,
     })
 }
 
@@ -542,17 +532,15 @@ fn factor_standard_errors(curve_factor: &Array2<f64>) -> Array1<f64> {
     )
 }
 
-/// Sorted draws of `max_i |Z_i|` for the standardized Gaussian curve whose
-/// covariance factor is `curve_factor`. A curve with no random direction has
-/// the point mass at zero as its supremum law.
-fn simulated_supremum_law(
+fn simultaneous_critical(
     curve_factor: &Array2<f64>,
     se: ArrayView1<'_, f64>,
+    level: f64,
     simulations: usize,
     seed: u64,
-) -> Vec<f64> {
+) -> f64 {
     if curve_factor.ncols() == 0 {
-        return vec![0.0; simulations];
+        return 0.0;
     }
 
     let mut standardized_factor = curve_factor.clone();
@@ -585,33 +573,7 @@ fn simulated_supremum_law(
         maxima.push(maximum);
     }
     maxima.sort_by(f64::total_cmp);
-    maxima
-}
-
-/// `max_i |center_i| / se_i`. A row with zero variance contributes nothing
-/// when its center is zero and an unbounded deviation otherwise.
-fn max_standardized_magnitude(center: &Array1<f64>, se: &Array1<f64>) -> f64 {
-    center
-        .iter()
-        .zip(se)
-        .map(|(&value, &scale)| {
-            if scale > 0.0 {
-                value.abs() / scale
-            } else if value == 0.0 {
-                0.0
-            } else {
-                f64::INFINITY
-            }
-        })
-        .fold(0.0_f64, f64::max)
-}
-
-/// Monte Carlo tail probability `(1 + #{M_s >= statistic}) / (S + 1)` of the
-/// sorted supremum draws; counting the observed statistic among the draws
-/// keeps the test valid at every simulation count.
-fn supremum_tail_p_value(sorted_maxima: &[f64], statistic: f64) -> f64 {
-    let exceed = sorted_maxima.len() - sorted_maxima.partition_point(|&draw| draw < statistic);
-    (1 + exceed) as f64 / (sorted_maxima.len() + 1) as f64
+    quantile_from_sorted(&maxima, level)
 }
 
 fn fill_standard_normals(rng: &mut StdRng, output: &mut [f64]) {
@@ -807,7 +769,11 @@ mod tests {
             .map(|_| {
                 fill_standard_normals(&mut rng, &mut coordinates);
                 let deviation = curve_factor.dot(&Array1::from_vec(coordinates.clone()));
-                max_standardized_magnitude(&deviation, se)
+                deviation
+                    .iter()
+                    .zip(se)
+                    .map(|(&value, &scale)| value.abs() / scale)
+                    .fold(0.0_f64, f64::max)
             })
             .collect()
     }
@@ -869,104 +835,6 @@ mod tests {
             "pointwise whole-curve coverage {pointwise_curve} should fall well short of {level}"
         );
         assert!(simultaneous.critical > pointwise.critical);
-    }
-
-    #[test]
-    fn zero_curve_p_value_is_uniform_under_the_null_and_matches_the_band() {
-        let (contrast, covariance) = correlated_curve_fixture();
-        let beta = Array1::zeros(covariance.nrows());
-        let options = SimultaneousBandOptions::default();
-        let report = effect_report(
-            beta.view(),
-            covariance.view(),
-            contrast.view(),
-            BandOptions::Simultaneous(options),
-        )
-        .unwrap();
-        // An exactly-zero estimated curve carries no evidence against zero.
-        assert_eq!(report.zero_curve_p_value, Some(1.0));
-
-        let curve_factor = simultaneous_curve_factor(contrast.view(), covariance.view()).unwrap();
-        let law = simulated_supremum_law(
-            &curve_factor,
-            report.se.view(),
-            options.simulations,
-            options.seed,
-        );
-        let replicates = 20_000;
-        let mut p_values: Vec<f64> = independent_standardized_maxima(
-            &contrast,
-            &covariance,
-            &report.se,
-            replicates,
-            7_031_966,
-        )
-        .into_iter()
-        .map(|statistic| supremum_tail_p_value(&law, statistic))
-        .collect();
-        for alpha in [0.10, 0.05, 0.01] {
-            let size = p_values.iter().filter(|&&p| p <= alpha).count() as f64 / replicates as f64;
-            let mcse = (alpha * (1.0 - alpha) / replicates as f64
-                + alpha * (1.0 - alpha) / options.simulations as f64)
-                .sqrt();
-            assert!(
-                (size - alpha).abs() <= 2.0 * mcse,
-                "size at {alpha}: {size} (2 MCSE = {})",
-                2.0 * mcse
-            );
-        }
-        p_values.sort_by(f64::total_cmp);
-        let ks = p_values
-            .iter()
-            .enumerate()
-            .map(|(index, &p)| {
-                let upper = (index + 1) as f64 / replicates as f64 - p;
-                let lower = p - index as f64 / replicates as f64;
-                upper.max(lower)
-            })
-            .fold(0.0_f64, f64::max);
-        // Kolmogorov 1% critical value 1.628 / sqrt(R), widened by the
-        // calibration law's own sup-norm error at S draws.
-        let bound = 1.628 * (1.0 / replicates as f64).sqrt()
-            + 1.628 * (1.0 / options.simulations as f64).sqrt();
-        assert!(ks <= bound, "KS distance {ks} exceeds {bound}");
-
-        // Duality with the band: a curve the 95% band excludes zero from has
-        // p <= 0.05, and one it does not has p > 0.05.
-        // The intercept column is constant one, so shifting it moves every row
-        // by the same amount and the statistic is `shift / min_i se_i`.
-        let minimum_se = report.se.iter().copied().fold(f64::INFINITY, f64::min);
-        for (multiple, rejects) in [(1.2, true), (0.8, false)] {
-            let mut shifted = beta.clone();
-            shifted[0] = multiple * report.critical * minimum_se;
-            let shifted_report = effect_report(
-                shifted.view(),
-                covariance.view(),
-                contrast.view(),
-                BandOptions::Simultaneous(options),
-            )
-            .unwrap();
-            let excludes_zero = shifted_report
-                .lower
-                .iter()
-                .zip(&shifted_report.upper)
-                .any(|(&lower, &upper)| lower > 0.0 || upper < 0.0);
-            let p_value = shifted_report.zero_curve_p_value.unwrap();
-            assert_eq!(excludes_zero, p_value <= 0.05, "multiple {multiple}: p = {p_value}");
-            assert_eq!(excludes_zero, rejects);
-        }
-    }
-
-    #[test]
-    fn pointwise_bands_carry_no_zero_curve_p_value() {
-        let report = effect_report(
-            array![1.0].view(),
-            array![[1.0]].view(),
-            array![[1.0]].view(),
-            BandOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(report.zero_curve_p_value, None);
     }
 
     #[test]

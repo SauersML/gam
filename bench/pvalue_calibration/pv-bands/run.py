@@ -2,19 +2,14 @@
 
 For each family (gaussian, poisson, binomial) and sample size n, simulate a
 two-group by-factor GAM with unequal group sizes (group A is the 30% minority)
-and fit ``y ~ g + s(x, by=g, k=10)``. On the difference-smooth grid:
+and fit ``y ~ g + s(x, by=g, k=10)``. The truth has a group difference
+``d(x) = 0.6 cos(pi x)`` on the linear-predictor scale. On the
+difference-smooth grid, record whether the simultaneous band covers d on the
+whole grid (target = level) and whether the pointwise band does.
 
-* **coverage** -- the truth has a group difference ``d(x) = 0.6 cos(pi x)`` on
-  the linear-predictor scale. Record whether the simultaneous band covers d on
-  the whole grid (target = level) and whether the pointwise band does.
-* **size / KS** -- both groups share one curve. The "no difference" test is
-  the row ``p_value`` (the whole-curve p-value from the band's own max|Z|
-  law); size at alpha is ``P(p <= alpha)``, and the null p-values are tested
-  for uniformity with a one-sample Kolmogorov-Smirnov test.
-* **power** -- ``P(p <= alpha)`` under the coverage scenario's truth.
-
-Every replicate has its own seed ``100_000 * (1 + family index) + 10 n + r``
-(the null arm adds ``5_000_000``), so any cell reruns alone. Refused fits are recorded with their message, never dropped silently.
+Every replicate has its own seed ``100_000 * (1 + family index) + 10 n + r``,
+so any cell reruns alone. Refused fits are recorded with their message, never
+dropped silently.
 
 Usage::
 
@@ -40,7 +35,6 @@ LEVELS = (0.90, 0.95, 0.99)
 GRID = 50
 FORMULA = "y ~ g + s(x, by=g, k=10)"
 SHARE_A = 0.3
-NULL_SEED_OFFSET = 5_000_000
 
 
 def _expit(eta):
@@ -55,16 +49,15 @@ def _difference(x):
     return 0.6 * np.cos(np.pi * x)
 
 
-def replicate_seed(family: str, n: int, replicate: int, null: bool) -> int:
-    seed = 100_000 * (1 + FAMILIES.index(family)) + 10 * n + replicate
-    return seed + (NULL_SEED_OFFSET if null else 0)
+def replicate_seed(family: str, n: int, replicate: int) -> int:
+    return 100_000 * (1 + FAMILIES.index(family)) + 10 * n + replicate
 
 
-def simulate(family: str, n: int, seed: int, null: bool):
+def simulate(family: str, n: int, seed: int):
     rng = np.random.default_rng(seed)
     x = rng.uniform(0.0, 1.0, n)
     g = np.where(rng.uniform(size=n) < SHARE_A, "A", "B")
-    eta = _base(x) + (0.0 if null else 1.0) * np.where(g == "B", _difference(x), 0.0)
+    eta = _base(x) + np.where(g == "B", _difference(x), 0.0)
     if family == "gaussian":
         y = eta + 0.5 * rng.standard_normal(n)
     elif family == "poisson":
@@ -75,19 +68,19 @@ def simulate(family: str, n: int, seed: int, null: bool):
 
 
 def one(task):
-    family, n, replicate, null = task
+    family, n, replicate = task
     import gamfit
 
-    seed = replicate_seed(family, n, replicate, null)
-    result = {"family": family, "n": n, "seed": seed, "null": null}
-    data = simulate(family, n, seed, null)
+    seed = replicate_seed(family, n, replicate)
+    result = {"family": family, "n": n, "seed": seed}
+    data = simulate(family, n, seed)
     try:
         model = gamfit.fit(data, FORMULA, family=family)
     except Exception as exc:
         result["error"] = "fit: " + str(exc)[:300]
         return result
     try:
-        return _bands(model, result, null)
+        return _bands(model, result)
     except Exception as exc:
         result["error"] = "difference_smooth: " + str(exc)[:300]
         return result
@@ -105,42 +98,31 @@ def _rows(model, level, simultaneous):
     )
 
 
-def _covers(rows, null):
+def _covers(rows):
     x = np.array([row["x"] for row in rows])
     lower = np.array([row["lower"] for row in rows])
     upper = np.array([row["upper"] for row in rows])
-    truth = np.zeros_like(x) if null else _difference(x)
+    truth = _difference(x)
     return bool(np.all((lower <= truth) & (truth <= upper)))
 
 
-def _bands(model, result, null):
+def _bands(model, result):
     for level in LEVELS:
         rows = _rows(model, level, True)
-        result[f"sim_{level}"] = _covers(rows, null)
+        result[f"sim_{level}"] = _covers(rows)
         if level == 0.95:
-            result["p_value"] = float(rows[0]["p_value"])
             result["critical_95"] = float(rows[0]["critical"])
             result["covariance_kind"] = rows[0]["covariance_kind"]
-    result["pw_0.95"] = _covers(_rows(model, 0.95, False), null)
+    result["pw_0.95"] = _covers(_rows(model, 0.95, False))
     return result
 
 
 def _cells(results):
     for family in FAMILIES:
         for n in SIZES:
-            for null in (False, True):
-                rows = [
-                    r for r in results
-                    if r["family"] == family and r["n"] == n and r["null"] == null
-                ]
-                if rows:
-                    yield family, n, null, rows
-
-
-def _ks_uniform(p_values):
-    from scipy import stats
-
-    return stats.kstest(p_values, "uniform")
+            rows = [r for r in results if r["family"] == family and r["n"] == n]
+            if rows:
+                yield family, n, rows
 
 
 def summarize(results, out=sys.stdout):
@@ -151,9 +133,7 @@ def summarize(results, out=sys.stdout):
     emit(f"{'family':9s} {'n':>5s} {'R':>4s} {'err':>3s}  "
          + "  ".join(f"sim@{level:.2f}" for level in LEVELS)
          + "  pw@0.95  MCSE@.95  conditional")
-    for family, n, null, rows in _cells(results):
-        if null:
-            continue
+    for family, n, rows in _cells(results):
         ok = [r for r in rows if "error" not in r]
         if not ok:
             emit(f"{family:9s} {n:5d} {len(rows):4d} {len(rows):3d}")
@@ -164,32 +144,6 @@ def summarize(results, out=sys.stdout):
         conditional = sum(r["covariance_kind"] == "conditional" for r in ok)
         emit(f"{family:9s} {n:5d} {len(ok):4d} {len(rows) - len(ok):3d}  "
              + "  ".join(cells) + f"  {pointwise:7.3f}  {mcse:7.4f}  {conditional:11d}")
-
-    emit()
-    emit("No-difference test under a shared curve (size) and under d(x) (power)")
-    emit(f"{'family':9s} {'n':>5s} {'R':>4s} {'err':>3s}  size@.10  size@.05  size@.01"
-         "  MCSE@.05  KS D     KS p    power@.05")
-    power = {}
-    for family, n, null, rows in _cells(results):
-        if not null:
-            ok = [r for r in rows if "error" not in r]
-            if ok:
-                power[(family, n)] = np.mean([r["p_value"] <= 0.05 for r in ok])
-    for family, n, null, rows in _cells(results):
-        if not null:
-            continue
-        ok = [r for r in rows if "error" not in r]
-        if not ok:
-            emit(f"{family:9s} {n:5d} {len(rows):4d} {len(rows):3d}")
-            continue
-        p_values = np.array([r["p_value"] for r in ok])
-        sizes = [f"{np.mean(p_values <= alpha):8.3f}" for alpha in (0.10, 0.05, 0.01)]
-        ks = _ks_uniform(p_values)
-        mcse = math.sqrt(0.05 * 0.95 / len(ok))
-        emit(f"{family:9s} {n:5d} {len(ok):4d} {len(rows) - len(ok):3d}  "
-             + "  ".join(sizes)
-             + f"  {mcse:8.4f}  {ks.statistic:.4f}  {ks.pvalue:.4f}  "
-             + f"{power.get((family, n), float('nan')):8.3f}")
 
     kinds = {}
     for r in results:
@@ -221,10 +175,9 @@ def main():
     families = args.families.split(",")
     sizes = [int(v) for v in args.sizes.split(",")]
     tasks = [
-        (family, n, replicate, null)
+        (family, n, replicate)
         for family in families
         for n in sizes
-        for null in (False, True)
         for replicate in range(args.reps)
     ]
     start = time.time()

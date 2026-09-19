@@ -1,7 +1,9 @@
-# pv-bands: simultaneous difference-smooth bands and the no-difference test
+# pv-bands: simultaneous difference-smooth bands
 
 Seeded Monte Carlo calibration of `difference_smooth(..., simultaneous=True)`
-bands and of the whole-curve "no difference" p-value (the row `p_value`).
+bands. The whole-curve "no difference" p-value measured alongside them is not
+published, because it failed calibration (see
+[Why there is no no-difference p-value](#why-there-is-no-no-difference-p-value)).
 
 ## Design
 
@@ -11,19 +13,14 @@ bands and of the whole-curve "no difference" p-value (the row `p_value`).
   group B adds `d(x) = 0.6 cos(pi x)` on the eta scale.
 - Families: Gaussian (sd 0.5), Poisson (log link) and binomial (logit link),
   each at n = 100, 400 and 2000.
-- Each cell runs 500 replicates of each arm, so the MCSE at 0.95 is at most
-  about 0.0104.
+- Each cell runs 500 replicates, so the MCSE at 0.95 is at most about
+  0.0104.
 - Grid: 50 points spanning the training x range.
 - **Coverage:** whether the band contains `d` at every grid point. It is
   checked for the simultaneous band at 0.90/0.95/0.99 and for the pointwise
   band at 0.95, which is the G2 comparison.
-- **Size and KS:** both groups share one curve. Size at alpha is
-  `P(p_value <= alpha)`. A one-sample Kolmogorov-Smirnov test checks the null
-  p-values for uniformity.
-- **Power:** `P(p_value <= 0.05)` under `d`.
 - Seeds:
-  - Replicate r uses `100_000 * (1 + family index) + 10 n + r`, and the null
-    arm adds `5_000_000`.
+  - Replicate r uses `100_000 * (1 + family index) + 10 n + r`.
   - The band's max|Z| law uses 10 000 draws with seed 12 345. Both are fixed
     in Rust and reported on every row as `n_sim` and `seed`.
 - Refused fits are counted with their message, never dropped silently.
@@ -48,10 +45,6 @@ The summary below is copied from it verbatim.
     the band refused such fits.
 - The critical value is the `level` quantile of `max_i |Z_i|`, where
   `Z ~ N(0, R)` and `R` is the correlation of `C V C^T`.
-- The whole-curve p-value is `(1 + #{M_s >= T}) / (S + 1)`, where
-  `T = max_i |diff_i| / se_i` and `M_s` are the same simulated maxima. The
-  p-value and the band are therefore dual: the band at `level` excludes 0
-  somewhere exactly when `p_value <= 1 - level`.
 - There is no Bonferroni fallback. The dead `multi_point_joint` Bonferroni
   field is deleted.
 
@@ -76,7 +69,14 @@ binomial    400  497   3     0.803     0.891     0.954    0.565   0.0098        
 binomial   2000  486  14     0.930     0.969     0.994    0.722   0.0099          156
 ```
 
-### No-difference test: size under a shared curve, power under d(x)
+### Why there is no no-difference p-value
+
+An earlier revision of this change published a whole-curve p-value on every
+simultaneous row: `(1 + #{M_s >= T}) / (S + 1)`, where
+`T = max_i |diff_i| / se_i` and `M_s` are the band's own simulated maxima. It
+was measured with a null arm (both groups share one curve, seed offset
+`5_000_000`), and it failed the calibration bar in 8 of the 9 cells. The KS
+uniformity test rejects in all 9, and the size is off in both directions:
 
 ```
 family        n    R err  size@.10  size@.05  size@.01  MCSE@.05  KS D     KS p    power@.05
@@ -91,6 +91,12 @@ binomial    400  497   3     0.171     0.121     0.056    0.0098  0.0796  0.0035
 binomial   2000  486  14     0.062     0.031     0.006    0.0099  0.2871  0.0000     0.733
 ```
 
+A conservative p-value is as wrong as an anti-conservative one, so the
+p-value is withheld rather than published with these errors. It belongs back
+once the covariance and REML lanes bring every cell within 2 MCSE at each
+alpha and the KS test stops rejecting. The null arm that measured it is in
+`run.py` at commit `b8da3eb0`, and re-running it is the acceptance check.
+
 Almost all refused fits are REML outer-optimizer refusals ("did not certify a
 stationary optimum"). They occur mostly at n = 100 for binomial (87) and
 Poisson (63), with 28 at binomial n = 2000. `--summarize` lists every refusal.
@@ -101,10 +107,7 @@ Poisson (63), with 28 at binomial n = 2000. `--summarize` lists every refusal.
 
 - The seeded Rust tests in `crates/gam-inference/src/effects.rs` draw the
   estimate exactly from `N(truth, C V C^T)`, with S = 10 000 max|Z| draws.
-- In those tests:
-  - whole-curve coverage is within 2 MCSE of the level;
-  - the no-difference p-value is KS-uniform;
-  - the p-value agrees with the band's zero-exclusion at every level.
+- In those tests, whole-curve coverage is within 2 MCSE of the level.
 - The max|Z| machinery is therefore exact for the covariance it is given.
   The simulation count, seeding, correlation and eta-scale construction are
   not the source of any miscalibration.
@@ -116,27 +119,21 @@ Poisson (63), with 28 at binomial n = 2000. `--summarize` lists every refusal.
 - The simultaneous band is the one to use for whole-curve statements.
 
 **The fitted-model numbers only partly meet the acceptance target**, which is
-within 2 MCSE of 0.95 coverage and 0.05 size.
+within 2 MCSE of 0.95 coverage.
 
-- Poisson n = 400 hits both targets (coverage 0.944, size 0.050), though its
-  KS still rejects.
-- Gaussian n = 100 hits the coverage target at 0.950. Its size of 0.074 is
-  2.4 MCSE high.
-- Gaussian is conservative at larger n: coverage is 0.982 and 0.994, and size
-  is 0.038 and 0.026. Its KS rejects.
+- Poisson n = 400 (0.944) and Gaussian n = 100 (0.950) hit it.
+- Gaussian is conservative at larger n: coverage is 0.982 and 0.994.
   - The published smoothing-corrected covariance is wider than the sampling
     spread of the contrast under this truth.
   - That is a property of the covariance and the REML estimator (the
     rho-uncertainty lane), not of the band.
 - Small-n Poisson and binomial are anti-conservative. Coverage at n = 100 is
-  0.84 and 0.80, and size is 0.13 and 0.09.
+  0.84 and 0.80.
   - Many of those fits publish the conditional covariance, because their
     correction is typed unavailable.
   - At n = 100 there is also smoothing bias from heavy penalization.
-  - Both effects shrink with n. At n = 2000, coverage is 0.964 and 0.969 and
-    size is 0.026 and 0.031.
-- Binomial n = 400 stays anti-conservative, with coverage 0.891 and size
-  0.121.
+  - Both effects shrink with n. At n = 2000, coverage is 0.964 and 0.969.
+- Binomial n = 400 stays anti-conservative, with coverage 0.891.
 
 **No correction was added.** There are no fudge factors, inflation constants
 or Bonferroni fallback. The remaining gap belongs to the covariance and to the
