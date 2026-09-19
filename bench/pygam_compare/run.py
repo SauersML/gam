@@ -39,6 +39,7 @@ import psutil
 
 from . import report
 from .plans import PLANS, Cell, Plan
+from .worker import supports
 
 HERE = Path(__file__).resolve().parent
 WORKER = HERE / "worker.py"
@@ -188,8 +189,9 @@ def run_plan(
         records_path.open("w") as fh,
     ):
         for cell in plan.cells:
+            libs = [lib for lib in plan.libs if supports(lib, cell.family)]
             for rep in range(plan.reps):
-                for lib in plan.libs:
+                for lib in libs:
                     key = (lib, cell.family, cell.design)
                     if key in stopped:
                         rec: dict[str, Any] = dict(

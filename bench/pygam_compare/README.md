@@ -50,6 +50,20 @@ These are the plans (see `plans.py`):
 | `n1e4_core` | n=1e4, all families × {`p1`, `p5`, `te`} | 3 |
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `count_small` | n ∈ {1e2, 1e3}, count families × all designs | 3 |
+| `count_1e4` | n=1e4, count families × all designs | 2 |
+| `count_1e5` | n=1e5, count families × {`p1`, `p5`, `te`} | 1 |
+
+The count plans are the count-family sweep. They use their own families:
+`poisson_lo`, `poisson_mid` and `poisson_hi` (Poisson with mean level 0.3, 5
+and 500), `poisson_exposure` (Poisson with a log-exposure offset), `negbin`
+(negative binomial, theta estimated) and `tweedie` (power fixed at 1.5, phi
+estimated). pyGAM has no negative binomial or Tweedie family, so those cells
+run gamfit alone and report absolute time and the certification rate (the
+`k/n ok` count in the Status table; a fit that returns has certified). For
+`poisson_exposure`, pyGAM is fitted on the rate `y/E` with weights `E`, which
+is the exposure likelihood; `PoissonGAM.gridsearch` in pyGAM 0.12.0 passes the
+weights on as the exposure a second time.
 
 Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
 
