@@ -451,13 +451,13 @@ pub fn build_termspec(
     };
     let genuine_random_effect = |name: &str| {
         terms.iter().any(|t| {
-            matches!(t, ParsedTerm::RandomEffect { name: n } if n == name)
+            matches!(t, ParsedTerm::RandomEffect { name: n, lenient_unseen: true } if n == name)
         })
     };
-    // Every term matched here lowers to a fixed factor (a `RandomEffectTermSpec`
-    // with `lenient_unseen: false`); see the resolution after the loop.
+    // Every term matched here lowers to a `RandomEffectTermSpec` with
+    // `lenient_unseen: false` (a fixed factor); see the resolution after the loop.
     let factor_block_present = terms.iter().any(|t| match t {
-        ParsedTerm::Factor { .. } => true,
+        ParsedTerm::RandomEffect { lenient_unseen, .. } => !*lenient_unseen,
         ParsedTerm::Linear {
             name,
             explicit: false,
