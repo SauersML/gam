@@ -2863,7 +2863,7 @@ impl SpatialLogKappaCoords {
     /// upper]; projecting is the unique closest feasible seed. The user's
     /// length_scale was always a hint for the outer optimizer (the optimizer
     /// is authoritative for κ), not a hard constraint — so clipping preserves
-    /// their intent as far as the geometry allows. Emits `log::info!` when
+    /// their intent as far as the geometry allows. Emits `log::debug!` when
     /// any coordinate moves, so the outside-window case is diagnostically
     /// visible (not silent).
     pub fn clamp_to_bounds(
@@ -2893,7 +2893,7 @@ impl SpatialLogKappaCoords {
             }
         }
         if n_projected > 0 {
-            log::info!(
+            log::debug!(
                 "[spatial-kappa] projected {n_projected}/{} ψ seed coords into data-derived bounds \
                  (worst excess={worst_delta:.3} log units); user length_scale falls outside \
                  the resolvable [sqrt(eps)/r_max, 1/(sqrt(eps)*r_min)] kernel-range window",
@@ -3874,7 +3874,7 @@ pub fn apply_response_aware_anisotropy_seed(
         // `set_spatial_aniso_log_scales` re-centers to Σ η = 0. A term that does
         // not support aniso scales is silently skipped (the seed is optional).
         if let Err(err) = set_spatial_aniso_log_scales(spec, term_idx, nudged) {
-            log::debug!(
+            log::trace!(
                 "[spatial-kappa] response-aware anisotropy seed skipped for term {term_idx}: {err}"
             );
         }
@@ -3936,7 +3936,7 @@ pub fn log_spatial_aniso_scales(spec: &TermCollectionSpec) {
                 lines.push_str(&format!("\n  axis {}: eta={:+.4}", a, eta_a));
             }
         }
-        log::info!("{}", lines);
+        log::debug!("{}", lines);
     }
 }
 
@@ -3998,7 +3998,7 @@ pub fn sync_aniso_contrasts_from_metadata(spec: &mut TermCollectionSpec, design:
             && eta.len() > 1
         {
             if let Err(err) = set_spatial_aniso_log_scales(spec, term_idx, eta) {
-                log::debug!(
+                log::trace!(
                     "term {term_idx}: anisotropic log-scale sync skipped, keeping the existing scales: {err}"
                 );
             }
@@ -4462,7 +4462,7 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
             group_key.feature_cols.len(),
         )?;
         let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
-        log::info!(
+        log::debug!(
             "sharing {} spatial centers across {} smooth terms over columns {:?} (requested {} centers)",
             shared_centers.nrows(),
             members.len(),

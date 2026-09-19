@@ -134,7 +134,7 @@ fn build(
 struct StderrInfoLogger;
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -158,7 +158,7 @@ fn arg_usize(idx: usize, default: usize) -> usize {
 fn main() {
     gam::init_parallelism();
     match log::set_logger(&LOGGER) {
-        Ok(()) => log::set_max_level(log::LevelFilter::Info),
+        Ok(()) => log::set_max_level(log::LevelFilter::Debug),
         Err(err) => eprintln!("keeping the already-installed logger: {err}"),
     }
     let n: usize = arg_usize(1, 1500);

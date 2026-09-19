@@ -4,6 +4,7 @@ pub mod constrained_partition;
 pub mod fast_channel;
 pub mod fractional_rank;
 pub mod gaussian_activation;
+pub mod gaussian_reciprocal;
 mod jet_algebra;
 pub mod jet_partitions;
 pub mod jet_scalar;

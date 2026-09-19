@@ -243,7 +243,7 @@ pub(crate) fn sigma_cubature_dispatch(
             Ok(Some(results)) => return Ok(results),
             Ok(None) => {
                 // Device declined (shape / family / policy gate); fall through.
-                log::debug!(
+                log::trace!(
                     "[sigma-cubature] GPU stream pool declined (Ok(None)) — \
                      falling through to CPU Rayon oracle"
                 );
@@ -990,6 +990,12 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
+        if self.block_correction_latched() {
+            crate::bail_invalid_estim!(
+                "{}",
+                crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
+            );
+        }
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(&bundle);
         match decision.strategy {
@@ -1107,7 +1113,7 @@ impl<'a> RemlState<'a> {
             // optimizer already certified, so a refusal publishes the fit and
             // carries its typed reason with it.
             Err(refusal) => {
-                log::warn!("rho-posterior adequacy diagnostic refused at the converged rho: {refusal}");
+                log::debug!("rho-posterior adequacy diagnostic refused at the converged rho: {refusal}");
                 RhoPosteriorOutcome::Refused(refusal)
             }
         };
@@ -1199,8 +1205,8 @@ impl<'a> RemlState<'a> {
         outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
         // The ρ coordinates the outer certificate judged railed on a face of
-        // `rho_domain`. The cubature conditions on them (see
-        // [`sigma_cubature_axes`]).
+        // `rho_domain`. The first-order inverse gives them zero variance and
+        // the cubature conditions on them (see [`sigma_cubature_axes`]).
         railed_coordinates: &[usize],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
@@ -1212,6 +1218,7 @@ impl<'a> RemlState<'a> {
             final_lambdas,
             final_fit,
             outer_gradient,
+            railed_coordinates,
             outer_hessian,
             caller_measured_hessian_error,
         );
@@ -1389,7 +1396,7 @@ impl<'a> RemlState<'a> {
             ));
         }
         if railed.iter().any(|&on_face| on_face) {
-            log::info!(
+            log::debug!(
                 "[sigma-cubature] conditioning on {} railed rho coordinate(s); integrating {} \
                  free-coordinate axis/axes",
                 railed.iter().filter(|&&on_face| on_face).count(),
@@ -1439,7 +1446,7 @@ impl<'a> RemlState<'a> {
         }
         let upgraded: Vec<usize> = ranked[..rank].iter().map(|(index, _)| *index).collect();
         if rank < ranked.len() {
-            log::info!(
+            log::debug!(
                 "[sigma-cubature] upgrading {rank} of {} active rho direction(s), capturing \
                  {:.4} of the first-order correction variance; the remainder keeps its \
                  first-order column",
@@ -1610,11 +1617,11 @@ impl<'a> RemlState<'a> {
         // diverges as a penalty switches off. Recording both — together with
         // where the node was ASKED to sit and where the criterion actually put
         // it — is what makes a wide `Vp` attributable after the fact (#2728).
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let mass: f64 = node_weights.iter().sum();
             for (index, (cov_point, _)) in scaled_points.iter().enumerate() {
                 let node = &nodes[index];
-                log::info!(
+                log::debug!(
                     "[sigma-cubature] node={index} step={:.4e} wald_step={:.4e} ΔV={:.6e} \
                      posterior_weight={:.6e} evals={} box_limited={} \
                      tr(φ̂·H(ρ)⁻¹)={:.6e} tr(φ̂·H(ρ̂)⁻¹)={:.6e}",
@@ -1662,7 +1669,7 @@ impl<'a> RemlState<'a> {
         // which scales by exactly c², consistent with Vb (#582).
         let mut corr = total_cov - base_cov.mapv(|v| dispersion_phi * v);
         symmetrize_in_place(&mut corr);
-        log::info!(
+        log::debug!(
             "[sigma-cubature] tr(correction)={:.6e} tr(φ̂·H(ρ̂)⁻¹)={:.6e}",
             corr.diag().iter().sum::<f64>(),
             dispersion_phi * base_cov.diag().iter().sum::<f64>(),
@@ -1709,7 +1716,7 @@ impl<'a> RemlState<'a> {
                 ..
             } => {
                 SMOOTHING_CORRECTION_CUBATURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch={} rank={} points={} near_boundary={} \
                      grad_norm={:.3e} max_rho_var={:.3e} max_node_criterion_rise={:.3e} \
                      (proposal calibration rise {PROFILE_SIGMA_RISE})",
@@ -1731,7 +1738,7 @@ impl<'a> RemlState<'a> {
                 let has_matrix = correction.is_some();
                 match severity {
                     SmoothingCorrectionFallbackSeverity::Routine => {
-                        log::info!(
+                        log::debug!(
                             "[smoothing-correction] branch=first-order severity=routine \
                              has_matrix={} reason=\"{}\"",
                             has_matrix,
@@ -1741,7 +1748,7 @@ impl<'a> RemlState<'a> {
                     SmoothingCorrectionFallbackSeverity::NumericalFailure => {
                         SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT
                             .fetch_add(1, Ordering::Relaxed);
-                        log::warn!(
+                        log::debug!(
                             "[smoothing-correction] branch=first-order severity=numerical-failure \
                              has_matrix={} reason=\"{}\" failure_count={}",
                             has_matrix,
@@ -1758,14 +1765,14 @@ impl<'a> RemlState<'a> {
                 // Structural, not numerical: no analytic outer Hessian exists
                 // for this fit, so the counter of numerical failures does not
                 // move.
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason=outer-hessian-not-analytic \
                      ({error})"
                 );
             }
             SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
                 SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
-                log::warn!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason={reason:?} failure_count={}",
                     SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed),
                 );
@@ -2373,7 +2380,7 @@ mod smoothing_correction_outcome_tests {
             // Do NOT swallow a failed outer gradient into a zero-LENGTH array.
             //
             // This previously fell back to `Array1::zeros(0)` behind a
-            // `log::debug!`, which no test harness in this crate has a backend
+            // `log::trace!`, which no test harness in this crate has a backend
             // for. A zero-length outer gradient is not a small gradient: it is
             // an EMPTY identified subspace, so `first_order.active_rank` is 0,
             // `V_ρ` comes back as `[[0.0]]`, and

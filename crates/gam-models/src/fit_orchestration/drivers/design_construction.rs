@@ -1088,7 +1088,7 @@ fn validate_bounded_observation_inputs(
                 yi.is_finite() && yi >= 0.0 && yi == yi.round()
             }
             ResponseFamily::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
-            ResponseFamily::Gamma => yi.is_finite() && yi > 0.0,
+            ResponseFamily::Gamma | ResponseFamily::InverseGaussian => yi.is_finite() && yi > 0.0,
             ResponseFamily::Beta { .. }
             | ResponseFamily::StudentT { .. }
             | ResponseFamily::RoystonParmar => false,
@@ -1098,6 +1098,152 @@ fn validate_bounded_observation_inputs(
         }
     }
     Ok(resolved_scale)
+}
+
+/// The dispersion `φ` of a power-variance family (`V = μ^p`: Gaussian `p = 0`,
+/// Gamma `p = 2`, inverse Gaussian `p = 3`) under a non-identity link, with the
+/// variance power.
+fn power_variance_dispersion(
+    response: &ResponseFamily,
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+) -> Result<(f64, f64), EstimationError> {
+    let to_estimation = |error: gam_spec::InvalidLikelihoodScale| {
+        EstimationError::InvalidInput(error.reason().to_string())
+    };
+    let (power, phi) = match response {
+        ResponseFamily::Gaussian => (0.0, resolved_scale.gaussian_phi().map_err(to_estimation)?),
+        ResponseFamily::Gamma => (2.0, resolved_scale.gamma_phi().map_err(to_estimation)?),
+        ResponseFamily::InverseGaussian => {
+            (3.0, resolved_scale.dispersion_phi().map_err(to_estimation)?)
+        }
+        other => crate::bail_invalid_estim!(
+            "family {} has no power-variance row under a reciprocal link",
+            other.name()
+        ),
+    };
+    if !(phi.is_finite() && phi > 0.0) {
+        crate::bail_invalid_estim!("bounded-family dispersion phi must be finite and > 0; got {phi}");
+    }
+    Ok((power, phi))
+}
+
+/// Exact observed row of a power-variance family (`V = μ^p`) under the
+/// reciprocal-power link `μ = η^(−a)` (inverse `a = 1`, inverse-squared
+/// `a = ½`).
+///
+/// With `α = a(p − 1) − 1` and `β = a(p − 2) − 1` every quantity is a sum of two
+/// powers of `η`, so each `η`-derivative follows from the power rule:
+///
+/// ```text
+/// ℓ  = (w/φ)[y η^(α+1)/(1 − p) − η^(β+1)/(2 − p)]   (p ≠ 2)
+/// ℓ  = (w/φ)[−y η^a + a ln η]                          (p = 2)
+/// s  = (w a/φ)[−y η^α + η^β]
+/// H  = (w a/φ)[y α η^(α−1) − β η^(β−1)]
+/// W  = E[H] = (w a²/φ) η^(β−1)
+/// ```
+///
+/// `η ≤ 0` leaves the link's domain and reports the retriable
+/// `InverseLinkDomainViolation`, so the bounded Newton step halves back to
+/// feasibility exactly as the unconstrained PIRLS does.
+fn exact_reciprocal_power_observation_row(
+    response: &ResponseFamily,
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+    (reciprocal, a): (StandardLink, f64),
+    row: usize,
+    y: f64,
+    weight: f64,
+    eta: f64,
+) -> Result<ExactStandardObservationRow, EstimationError> {
+    gam_solve::pirls::require_reciprocal_link_domain(reciprocal, eta)?;
+    let (p, phi) = power_variance_dispersion(response, resolved_scale)?;
+    let alpha = a * (p - 1.0) - 1.0;
+    let beta = a * (p - 2.0) - 1.0;
+    let c = weight * a / phi;
+    // Falling-factorial power-rule term `k (k−1)…(k−n+1) η^(k−n)` scaled by `c`.
+    let falling = |k: f64, n: i32| -> f64 {
+        let mut coefficient = 1.0;
+        for j in 0..n {
+            coefficient *= k - f64::from(j);
+        }
+        coefficient * eta.powf(k - f64::from(n))
+    };
+    // H^(n) = −s^(n+1) with s = c[−y η^α + η^β].
+    let neghessian = |n: i32| c * (y * falling(alpha, n + 1) - falling(beta, n + 1));
+    let log_likelihood = if p == 2.0 {
+        (weight / phi) * (-y * eta.powf(a) + a * eta.ln())
+    } else {
+        (weight / phi)
+            * (y * eta.powf(alpha + 1.0) / (1.0 - p) - eta.powf(beta + 1.0) / (2.0 - p))
+    };
+    let fisherweight = c * a * eta.powf(beta - 1.0);
+    if !(fisherweight.is_finite() && fisherweight > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "bounded reciprocal-link Fisher weight",
+            eta,
+            fisherweight,
+        ));
+    }
+    certify_bounded_row(
+        row,
+        eta,
+        ExactStandardObservationRow {
+            mu: eta.powf(-a),
+            score: c * (-y * eta.powf(alpha) + eta.powf(beta)),
+            fisherweight,
+            neghessian_eta: neghessian(0),
+            neghessian_eta_derivative: neghessian(1),
+            neghessian_eta_second_derivative: neghessian(2),
+            neghessian_eta_third_derivative: neghessian(3),
+            log_likelihood,
+        },
+    )
+}
+
+/// Exact observed row of the inverse Gaussian under the log link `μ = e^η`:
+///
+/// ```text
+/// ℓ = (w/φ)(−y e^(−2η)/2 + e^(−η)),   s = (w/φ)(y e^(−2η) − e^(−η)),
+/// H^(n) = (w/φ)((−1)^n 2^(n+1) y e^(−2η) − (−1)^n e^(−η)),   W = (w/φ) e^(−η).
+/// ```
+fn exact_inverse_gaussian_log_observation_row(
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
+    row: usize,
+    y: f64,
+    weight: f64,
+    eta: f64,
+) -> Result<ExactStandardObservationRow, EstimationError> {
+    let (_, phi) = power_variance_dispersion(&ResponseFamily::InverseGaussian, resolved_scale)?;
+    let c = weight / phi;
+    let quadratic = (-2.0 * eta).exp();
+    let linear = (-eta).exp();
+    let neghessian = |n: i32| {
+        let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+        c * sign * (2.0_f64.powi(n + 1) * y * quadratic - linear)
+    };
+    let fisherweight = c * linear;
+    if !(fisherweight.is_finite() && fisherweight > 0.0) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "bounded inverse-Gaussian Fisher weight",
+            eta,
+            fisherweight,
+        ));
+    }
+    certify_bounded_row(
+        row,
+        eta,
+        ExactStandardObservationRow {
+            mu: eta.exp(),
+            score: c * (y * quadratic - linear),
+            fisherweight,
+            neghessian_eta: neghessian(0),
+            neghessian_eta_derivative: neghessian(1),
+            neghessian_eta_second_derivative: neghessian(2),
+            neghessian_eta_third_derivative: neghessian(3),
+            log_likelihood: c * (linear - 0.5 * y * quadratic),
+        },
+    )
 }
 
 fn exact_standard_observation_row(
@@ -1113,7 +1259,32 @@ fn exact_standard_observation_row(
         return Ok(ExactStandardObservationRow::zero_weight(0.0));
     }
     let family = &likelihood.spec;
+    if let Some(reciprocal) = gam_solve::pirls::reciprocal_power_link(&family.link) {
+        return exact_reciprocal_power_observation_row(
+            &family.response,
+            resolved_scale,
+            reciprocal,
+            row,
+            y,
+            weight,
+            eta,
+        );
+    }
     match &family.response {
+        ResponseFamily::Gaussian
+            if !matches!(family.link, InverseLink::Standard(StandardLink::Identity)) =>
+        {
+            crate::bail_invalid_estim!(
+                "bounded Gaussian rows are defined for the identity and inverse links, got {}",
+                family.link.link_function().name()
+            );
+        }
+        ResponseFamily::Gamma if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) => {
+            crate::bail_invalid_estim!(
+                "bounded Gamma rows are defined for the log and inverse links, got {}",
+                family.link.link_function().name()
+            );
+        }
         ResponseFamily::Gaussian => {
             let scaled_weight = match resolved_scale {
                 gam_spec::ResolvedLikelihoodScale::ProfiledGaussian => weight,
@@ -1239,6 +1410,15 @@ fn exact_standard_observation_row(
                     log_likelihood: -weighted_ratio - weighted_shape * eta,
                 },
             )
+        }
+        ResponseFamily::InverseGaussian => {
+            if !matches!(family.link, InverseLink::Standard(StandardLink::Log)) {
+                crate::bail_invalid_estim!(
+                    "bounded inverse-Gaussian rows are defined for the inverse-squared and log links, got {}",
+                    family.link.link_function().name()
+                );
+            }
+            exact_inverse_gaussian_log_observation_row(resolved_scale, row, y, weight, eta)
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
@@ -2201,7 +2381,7 @@ impl CustomFamily for BoundedLinearFamily {
         // width IS the desynchronisation this declaration exists to prevent, and
         // `Structural` is the safe answer to it too.
         if block_index != 0 || block_spec.design.ncols() != self.designzeroed.ncols() {
-            log::debug!(
+            log::trace!(
                 "bounded linear family: coefficient coordinate asked for block {block_index} \
                  at spec width {} ({} block state(s) supplied) while this family carries one \
                  block of width {}; the coordinate is structural either way",
@@ -3617,28 +3797,13 @@ fn exact_joint_spatial_outer_hessian_available(
     family: &LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> bool {
-    // Every `LikelihoodSpec` variant (Gaussian, Binomial-*, Poisson, Gamma,
-    // Royston-Parmar) routes through the unified evaluator's outer-Hessian
-    // path: Gaussian Identity uses the no-correction dense form, all GLM
-    // variants supply scalar-GLM derivative ingredients consumed by
-    // `compute_outer_hessian` / `build_outer_hessian_operator`, and
-    // `outer_hessian_route_plan` chooses the matrix-free
-    // `HessianValue::Operator` representation when the dense assembly exceeds
-    // the materialization cap.  The previous `Identity || sparse_design`
-    // gate predates that operator routing and forced binomial+logit+Matern
-    // (and any other non-Gaussian dense-lazy spatial design) onto the
-    // gradient-only BFGS path even though analytic Hessian is fully
-    // available — capability check, not cost.  Match every variant
-    // explicitly so any future family addition (which may not yet provide
-    // outer-Hessian ingredients) forces an authoring decision here rather
-    // than silently inheriting `true`.
     // Every supported response (Gaussian, Binomial-*, Poisson, Tweedie,
-    // NegativeBinomial, Beta, Gamma, Royston-Parmar) routes through the
-    // unified evaluator's outer-Hessian path; the spec-level capability
-    // check therefore always succeeds. Match every response explicitly so
-    // any future family addition (which may not yet provide outer-Hessian
-    // ingredients) forces an authoring decision here rather than silently
-    // inheriting `true`.
+    // NegativeBinomial, Beta, Gamma, inverse Gaussian, Royston-Parmar) routes
+    // through the unified evaluator's outer-Hessian path, which chooses the
+    // matrix-free operator representation when dense assembly is too large.
+    // Match every response explicitly so any future family addition (which
+    // may not yet provide outer-Hessian ingredients) forces an authoring
+    // decision here rather than silently inheriting `true`.
     let family_supported = match &family.response {
         ResponseFamily::Gaussian
         | ResponseFamily::Binomial
@@ -3647,6 +3812,7 @@ fn exact_joint_spatial_outer_hessian_available(
         | ResponseFamily::NegativeBinomial { .. }
         | ResponseFamily::Beta { .. }
         | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
         | ResponseFamily::StudentT { .. }
         | ResponseFamily::RoystonParmar => true,
     };
@@ -3740,7 +3906,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
                 // because the caller turns this into "spatial kappa
                 // optimization is unavailable for one or more eligible spatial
                 // terms", which names none of them.
-                log::warn!(
+                log::debug!(
                     "[spatial-kappa] term {term_idx}: enrolled for per-axis ψ but its per-axis \
                      derivative producer declined; the joint κ route is unavailable for this fit"
                 );
@@ -3750,7 +3916,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
         else {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: isotropic ψ derivative producer declined; the \
                  joint κ route is unavailable for this fit"
             );
@@ -3909,7 +4075,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 ..
             } = &smooth_term.metadata
             else {
-                log::warn!(
+                log::debug!(
                     "[spatial-kappa] term {term_idx}: per-axis ψ declined -- a Duchon spec whose \
                      realized design does not carry Duchon metadata"
                 );
@@ -3949,7 +4115,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         0
     };
     if d == 0 {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the producer reported zero \
              axes (no implicit operator and no dense design list)"
         );
@@ -3959,7 +4125,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         .smooth_term_penalty_range(term_idx)
         .map_err(EstimationError::InvalidInput)?
     else {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the realized design exposes \
              no penalty range for this term"
         );
@@ -3993,7 +4159,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     let producer_emits_active_list = matches!(&termspec.basis, SmoothBasisSpec::Duchon { .. });
     let keep: Vec<usize> = if producer_emits_active_list {
         if emitted != smooth_term.active_penalties.len() {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the Duchon producer \
                  emitted {emitted} active penalty block(s) but the realized design carries {} \
                  ({:?}); the term falls back to its isotropic axis",
@@ -4015,7 +4181,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             .collect()
     };
     if keep.is_empty() || keep.iter().any(|&index| index >= emitted) {
-        log::warn!(
+        log::debug!(
             "[spatial-kappa] term {term_idx}: per-axis ψ declined -- candidate→fitted map \
              {keep:?} does not index the {emitted} emitted block(s)"
         );
@@ -4047,7 +4213,7 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             .rotated_by_joint_null(rotation)
             .map_err(EstimationError::from)?
         else {
-            log::warn!(
+            log::debug!(
                 "[spatial-kappa] term {term_idx}: per-axis ψ declined -- the realized design \
                  carries a joint-null rotation of {} coefficients that the per-axis derivative \
                  blocks do not admit",
@@ -4403,6 +4569,135 @@ mod glm_eta_observation_fd_tests {
         assert_eq!(excluded.fisherweight[0], 0.0);
         assert_eq!(excluded.neghessian_eta[0], 0.0);
         assert_eq!(excluded.log_likelihood, 0.0);
+    }
+
+    fn resolved_row(
+        likelihood: &gam_spec::GlmLikelihoodSpec,
+        y: f64,
+        eta: f64,
+    ) -> Result<StandardFamilyObservationState, EstimationError> {
+        evaluate_resolved_standard_family_observations(
+            likelihood,
+            None,
+            None,
+            None,
+            &array![y],
+            &array![1.0],
+            &array![eta],
+        )
+    }
+
+    /// Log-density of one observation, written independently of the row code
+    /// from each family's textbook density at mean `μ` and dispersion `φ`.
+    fn log_density(response: &ResponseFamily, phi: f64, y: f64, mu: f64) -> f64 {
+        match response {
+            ResponseFamily::Gaussian => {
+                -0.5 * (2.0 * std::f64::consts::PI * phi).ln() - (y - mu).powi(2) / (2.0 * phi)
+            }
+            ResponseFamily::Gamma => {
+                let shape = 1.0 / phi;
+                shape * (shape * y / mu).ln() - shape * y / mu - y.ln() - libm::lgamma(shape)
+            }
+            ResponseFamily::InverseGaussian => {
+                -0.5 * (2.0 * std::f64::consts::PI * phi * y.powi(3)).ln()
+                    - (y - mu).powi(2) / (2.0 * phi * mu * mu * y)
+            }
+            other => panic!("no reference density for {}", other.name()),
+        }
+    }
+
+    /// Inverse Gaussian (inverse-squared and log links) and Gamma / Gaussian under
+    /// the inverse link: every row of the derivative tower the inner PIRLS and the
+    /// outer REML/LAML consume (`s`, `H`, `H′`, `H″`, `H‴`) is the exact
+    /// `η`-derivative of the one below it, the log-likelihood differs from the
+    /// textbook log-density only by a `η`-free constant carrying the dispersion,
+    /// and the Fisher weight is the expected observed curvature (`H` is affine in
+    /// `y`, so `E[H] = H` at `y = μ`).
+    #[test]
+    fn reciprocal_and_inverse_gaussian_rows_are_the_exact_derivative_tower() {
+        let cases = [
+            (ResponseFamily::InverseGaussian, StandardLink::InverseSquared, 0.7, 1.3, 0.45),
+            (ResponseFamily::InverseGaussian, StandardLink::Log, 0.7, 1.3, 0.2),
+            (ResponseFamily::Gamma, StandardLink::Inverse, 0.4, 2.1, 0.6),
+            (ResponseFamily::Gaussian, StandardLink::Inverse, 0.3, 1.7, 0.8),
+        ];
+        let h = 1e-5;
+        for (response, link, phi, y, eta) in cases {
+            let label = format!("{} / {}", response.name(), link.name());
+            let scale = match response {
+                ResponseFamily::Gamma => gam_spec::LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 / phi },
+                _ => gam_spec::LikelihoodScaleMetadata::EstimatedDispersion { phi },
+            };
+            let likelihood = gam_spec::GlmLikelihoodSpec {
+                spec: LikelihoodSpec::try_new(response.clone(), InverseLink::Standard(link))
+                    .expect("legal cell"),
+                scale,
+            };
+            let at = |e: f64| resolved_row(&likelihood, y, e).expect("row evaluates");
+            let mean = |e: f64| match link {
+                StandardLink::Log => e.exp(),
+                StandardLink::Inverse => 1.0 / e,
+                StandardLink::InverseSquared => e.powf(-0.5),
+                _ => unreachable!(),
+            };
+            let (s0, sp, sm) = (at(eta), at(eta + h), at(eta - h));
+            let fd = |plus: f64, minus: f64| (plus - minus) / (2.0 * h);
+            let close = |analytic: f64, numeric: f64, what: &str| {
+                assert!(
+                    (analytic - numeric).abs() <= 1e-6 * (1.0 + analytic.abs()),
+                    "{label}: {what} {analytic} vs FD {numeric}"
+                );
+            };
+            close(s0.score[0], fd(sp.log_likelihood, sm.log_likelihood), "score");
+            close(s0.neghessian_eta[0], -fd(sp.score[0], sm.score[0]), "H");
+            close(
+                s0.neghessian_eta_derivative[0],
+                fd(sp.neghessian_eta[0], sm.neghessian_eta[0]),
+                "H'",
+            );
+            close(
+                s0.neghessian_eta_second_derivative[0],
+                fd(sp.neghessian_eta_derivative[0], sm.neghessian_eta_derivative[0]),
+                "H''",
+            );
+            close(
+                s0.neghessian_eta_third_derivative[0],
+                fd(
+                    sp.neghessian_eta_second_derivative[0],
+                    sm.neghessian_eta_second_derivative[0],
+                ),
+                "H'''",
+            );
+
+            let other = 1.6 * eta;
+            let kernel_gap = at(eta).log_likelihood - at(other).log_likelihood;
+            let density_gap = log_density(&response, phi, y, mean(eta))
+                - log_density(&response, phi, y, mean(other));
+            assert!(
+                (kernel_gap - density_gap).abs() <= 1e-12 * (1.0 + density_gap.abs()),
+                "{label}: log-likelihood gap {kernel_gap} vs density gap {density_gap}"
+            );
+
+            let at_mean = resolved_row(&likelihood, mean(eta), eta).expect("row evaluates");
+            assert!(
+                (at_mean.fisherweight[0] - at_mean.neghessian_eta[0]).abs()
+                    <= 1e-12 * at_mean.fisherweight[0],
+                "{label}: Fisher weight {} vs H at y = mu {}",
+                at_mean.fisherweight[0],
+                at_mean.neghessian_eta[0]
+            );
+
+            if link != StandardLink::Log {
+                for outside in [0.0, -0.3] {
+                    match resolved_row(&likelihood, y, outside) {
+                        Err(EstimationError::InverseLinkDomainViolation { link: name, .. }) => {
+                            assert_eq!(name, link.name(), "{label}")
+                        }
+                        other => panic!("{label}: eta = {outside} must leave the domain, got {other:?}"),
+                    }
+                }
+            }
+        }
     }
 
     #[test]

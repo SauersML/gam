@@ -36,6 +36,7 @@ use crate::basis::{
     MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
     SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
+use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
     TermCollectionSpec,
@@ -51,7 +52,7 @@ pub fn apply_smooth_overrides(
     spec: &mut TermCollectionSpec,
     overrides: &JsonValue,
     data: &Dataset,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut impl FitNoteSink,
 ) -> Result<(), String> {
     let registry = overrides
         .as_object()
@@ -83,6 +84,7 @@ pub fn apply_smooth_overrides(
             .ok_or_else(|| {
                 format!("smooths[{symbol:?}] descriptor missing required \"kind\" field")
             })?;
+        pin_adaptive_bspline_default(&mut term.basis, data)?;
         apply_one_override(term, kind, descriptor_obj, symbol, inference_notes)?;
         apply_by_variable(
             term,
@@ -94,6 +96,55 @@ pub fn apply_smooth_overrides(
         )?;
     }
     Ok(())
+}
+
+/// A `smooths={...}` descriptor is an explicit specification of the smooth, so
+/// the formula default's adaptive resolution
+/// ([`BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`) is replaced by the
+/// fixed spec the formula DSL builds for the same count and placement: the
+/// descriptor's own tunables (knot count, knot vector, periodicity, degree) then
+/// act on exactly the basis they always did, and the formula workflow never
+/// grows a smooth the caller described by hand. Uniform placement becomes the
+/// `Generate` vector over the covariate's range, which is the knot vector the
+/// adaptive spec builds.
+fn pin_adaptive_bspline_default(
+    basis: &mut SmoothBasisSpec,
+    data: &Dataset,
+) -> Result<(), String> {
+    use crate::basis::BSplineKnotPlacement;
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            pin_adaptive_bspline_default(inner, data)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => pin_adaptive_bspline_default(smooth, data),
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            let BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(num_internal_knots),
+                placement,
+                adaptive: true,
+            } = spec.knotspec
+            else {
+                return Ok(());
+            };
+            spec.knotspec = match placement {
+                BSplineKnotPlacement::Uniform => {
+                    let column = data.values.column(*feature_col);
+                    BSplineKnotSpec::Generate {
+                        data_range: crate::term_builder::col_minmax(column)?,
+                        num_internal_knots,
+                    }
+                }
+                BSplineKnotPlacement::Quantile => BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    placement,
+                    adaptive: false,
+                },
+            };
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Wrap the term's basis in the `ByVariable` row-gating envelope when the
@@ -111,7 +162,7 @@ fn apply_by_variable(
     symbol: &str,
     data: &Dataset,
     column_index: &HashMap<&str, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     let by_name = match descriptor.get("by") {
         None => return Ok(()),
@@ -160,7 +211,7 @@ fn apply_by_variable(
                 kind: BySmoothKind::Numeric,
                 by: ByVariableSpec::Numeric,
             };
-            inference_notes.push(format!(
+            inference_notes.inform(format!(
                 "smooths[{symbol:?}] gated by numeric column {by_name:?} (by·s(x))",
             ));
             Ok(())
@@ -265,7 +316,7 @@ fn apply_one_override(
     kind: &str,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     // Push the descriptor's optional `name` into the term name for downstream
     // diagnostics (purely cosmetic — the term identity is its feature_cols).
@@ -299,7 +350,7 @@ fn apply_one_override(
         .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))?;
     }
 
-    inference_notes.push(format!(
+    inference_notes.inform(format!(
         "smooths[{symbol:?}] descriptor (kind={kind}) merged onto formula-built term",
     ));
     Ok(())
@@ -723,6 +774,7 @@ fn apply_bspline_1d(
             BSplineKnotSpec::Automatic { placement, .. } => BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(n_internal),
                 placement: *placement,
+                adaptive: false,
             },
             BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
                 BSplineKnotSpec::PeriodicUniform {
@@ -1465,6 +1517,7 @@ mod tests {
         automatic.knotspec = BSplineKnotSpec::Automatic {
             num_internal_knots: Some(5),
             placement: crate::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         };
         let err2 = apply_bspline_1d(&mut automatic, &obj(json!({"periodic": true})), "x")
             .expect_err("periodic against automatic knots must error");

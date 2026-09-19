@@ -56,7 +56,7 @@ pub trait HessianFactorization: Send + Sync {
     /// native operator traces (notably sparse Cholesky) should override it.
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_operator: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );
@@ -96,7 +96,7 @@ pub trait HessianFactorization: Send + Sync {
         op: &dyn HyperOperator,
     ) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_matrix_operator_cross: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );
@@ -114,7 +114,7 @@ pub trait HessianFactorization: Send + Sync {
         right: &dyn HyperOperator,
     ) -> f64 {
         if left.is_implicit() || right.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_hinv_operator_cross: materializing implicit HyperOperator(s) — \
                  backend should provide a matrix-free override"
             );
@@ -183,7 +183,7 @@ pub trait HessianFactorization: Send + Sync {
     /// backends this equals `trace_hinv_operator`.
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         if op.is_implicit() {
-            log::warn!(
+            log::debug!(
                 "trace_logdet_operator: materializing implicit HyperOperator — \
                  backend should provide a matrix-free override"
             );

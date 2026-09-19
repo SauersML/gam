@@ -1058,6 +1058,7 @@ pub(crate) fn reml_fixed_glm_dispersion(
         // Hessian. Treating Beta precision as EDM dispersion double-scales EFS.
         Scale::Unit | Scale::NegativeBinomial { .. } | Scale::BetaPrecision { .. } => 1.0,
         Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => phi.value(),
+        Scale::Dispersion { phi, .. } => phi.value(),
         Scale::Gamma { .. } => resolved
             .gamma_phi()
             .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
@@ -1162,6 +1163,9 @@ pub(crate) struct Gam784BlockTarget<'t> {
     /// Response y and prior weights for the deviance.
     pub(crate) y: Array1<f64>,
     pub(crate) prior_weights: Array1<f64>,
+    /// The prior weights on the likelihood scale `-ln φ`, formed once for the
+    /// node sweeps that evaluate every row at every quadrature node.
+    pub(crate) row_measures: Vec<crate::pirls::DevianceRowMeasure>,
     /// Family/link spec for the deviance and the inverse link.
     pub(crate) likelihood: GlmLikelihoodSpec,
     pub(crate) inverse_link: InverseLink,
@@ -1248,6 +1252,117 @@ impl Gam784BlockTarget<'_> {
         self.likelihood_surface_at(eta).map(|(_, score)| score)
     }
 
+    /// The excess at one node of the batched sweeps, from its column `s` of
+    /// `S = X_t·V_b·T`, with the displaced η-score
+    /// written into `score` when one is given. `half` is the calling worker's
+    /// half-deviance scratch.
+    ///
+    /// The same arithmetic as [`Self::excess_with_displaced_neg_score`], on the
+    /// serial row sweep: the batch parallelises over nodes, and a node that
+    /// forked again into its own rows would pay a fork/join round and a row
+    /// allocation per node for a sweep that is itself only arithmetic.
+    fn node_excess(
+        &self,
+        s: ndarray::ArrayView1<'_, f64>,
+        half: &mut [f64],
+        mut score: Option<&mut [f64]>,
+    ) -> Result<f64, EstimationError> {
+        if !(self.phi.is_finite() && self.phi > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 likelihood scale must be finite and positive; got {}",
+                self.phi
+            )));
+        }
+        crate::pirls::deviance_eta_rows_on_measures_into(
+            self.y.view(),
+            self.eta_hat.view(),
+            s,
+            &self.likelihood,
+            &self.inverse_link,
+            &self.row_measures,
+            half,
+            score.as_deref_mut(),
+        )?;
+        let scaled_half_deviance =
+            crate::pirls::stable_finite_signed_sum(half, "#784 scaled half-deviance")?;
+        if let Some(score) = score {
+            if let Some(i) = score.iter().position(|value| !value.is_finite()) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "scaled deviance eta score",
+                    eta: self.eta_hat[i] + s[i],
+                    value: score[i],
+                });
+            }
+        }
+        self.remainder_at(scaled_half_deviance, s)
+    }
+
+    /// [`BlockExcessTarget::excess_with_displaced_neg_score_batch`] and
+    /// [`BlockExcessTarget::excess_batch`], which differ only in whether each
+    /// node's displaced score is kept.
+    fn node_batch(
+        &self,
+        draws: &Array2<f64>,
+        keep_score: bool,
+    ) -> Vec<(f64, Option<Array1<f64>>)> {
+        let m = self.block_lambdas.len();
+        let n = self.eta_hat.len();
+        let n_draws = draws.ncols();
+        assert_eq!(
+            draws.nrows(),
+            m,
+            "posterior displacement draw rows must match smoothing block count"
+        );
+
+        // δ-columns: Δ = V_b · T  (p × n_draws). Cheap (O(p·m·n_draws)) and kept
+        // identical to the serial `block_vecs.dot(t)` per column.
+        let delta_all = gam_linalg::faer_ndarray::fast_ab(&self.block_vecs, draws);
+        // s-columns: S = X_t · Δ  (n × n_draws). THE batched matvec — one GEMM
+        // replacing `n_draws` separate `fast_av(x_transformed, δ_s)` calls.
+        let s_all = gam_linalg::faer_ndarray::fast_ab(self.x_transformed, &delta_all);
+
+        // Parallelise over nodes, which is where the independent work is, and
+        // sweep each node's rows serially (`node_excess`): a row sweep is
+        // arithmetic, and splitting it costs the same order as doing it.
+        //
+        // Measured on the geo_latlon fuzz family (n=960, p=11, binomial-logit),
+        // where this sampler was 45% of the profile, a serial node loop over a
+        // parallel row sweep got SLOWER with cores -- 205.0s at 1 core, 264.3s
+        // at 4, 304.3s at 16, 555.9s at 32 -- every additional worker another
+        // thief splitting a sweep too small to be worth splitting.
+        //
+        // Order is preserved: this is an indexed map into a `Vec`, so node `s`
+        // still lands at position `s` and the result is bit-identical to the
+        // serial loop. Each worker holds one half-deviance scratch of `n` rows.
+        (0..n_draws)
+            .into_par_iter()
+            .map_init(
+                || vec![0.0_f64; n],
+                |half, sidx| {
+                    let mut score = keep_score.then(|| Array1::<f64>::zeros(n));
+                    let excess = match self.node_excess(
+                        s_all.column(sidx),
+                        half,
+                        score.as_mut().map(|score| {
+                            score
+                                .as_slice_mut()
+                                .expect("a freshly allocated score is contiguous")
+                        }),
+                    ) {
+                        Ok(excess) => excess,
+                        Err(_) => return (f64::INFINITY, None),
+                    };
+                    if excess.is_finite() {
+                        (excess, score)
+                    } else {
+                        (excess, None)
+                    }
+                },
+            )
+            .collect()
+    }
+
     /// `ΔF` from the displaced scaled half-deviance at `η̂ + s`: the row
     /// Taylor remainder `ψ(η̂ + s) − ψ(η̂) − ψ'(η̂)·s − ½ Σ_i W_i s_i²`.
     fn remainder_at(
@@ -1260,11 +1375,15 @@ impl Gam784BlockTarget<'_> {
         Ok(value_diff - self.base_neg_score_at_mode.dot(&s) - 0.5 * curv)
     }
 
-    /// `sum_i W_i s_i^2` on an exponent-scaled signed surface.  Squaring `s_i`
-    /// before multiplying by a tiny `W_i` can overflow even when the weighted
-    /// term is finite; scaling every term by the largest log magnitude avoids
-    /// that false refusal.  One deterministic Neumaier pass preserves signed
+    /// `sum_i W_i s_i^2`, one deterministic Neumaier pass that preserves signed
     /// observed-curvature cancellation.
+    ///
+    /// Each term is formed as `(W_i s_i) s_i`, so a tiny `W_i` never meets a
+    /// squared `s_i` that overflows on its own. When a factor or term leaves the
+    /// normal range, or the sum does, the terms are instead summed on an
+    /// exponent-scaled signed surface: scaled by the largest log magnitude, which
+    /// refuses only a sum outside f64. That route costs three transcendentals a
+    /// row, so it is kept for the draws that need it.
     pub(crate) fn observed_quadratic(
         &self,
         s: ndarray::ArrayView1<'_, f64>,
@@ -1276,6 +1395,39 @@ impl Gam784BlockTarget<'_> {
                 self.weights_obs.len()
             )));
         }
+        let mut sum = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        let mut direct = true;
+        for (&weight, &value) in self.weights_obs.iter().zip(s.iter()) {
+            if weight == 0.0 || value == 0.0 {
+                continue;
+            }
+            let weighted = weight * value;
+            let term = weighted * value;
+            if !(term.is_normal() && weighted.is_normal()) {
+                direct = false;
+                break;
+            }
+            let next = sum + term;
+            compensation += if sum.abs() >= term.abs() {
+                (sum - next) + term
+            } else {
+                (term - next) + sum
+            };
+            sum = next;
+        }
+        let value = sum + compensation;
+        if direct && value.is_finite() {
+            return Ok(value);
+        }
+        self.observed_quadratic_scaled(s)
+    }
+
+    /// [`Self::observed_quadratic`] on the exponent-scaled signed surface.
+    fn observed_quadratic_scaled(
+        &self,
+        s: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<f64, EstimationError> {
         let mut max_log = f64::NEG_INFINITY;
         for i in 0..s.len() {
             if !s[i].is_finite() {
@@ -1441,21 +1593,16 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     /// [`Self::excess_batch`], which runs it) holds its columns of `Δ = V_b·T` (p) and
     /// `S = X_t·Δ` (n), each at most twice because `fast_ab`'s small-shape route forms
     /// the product before assigning it; its result entry, displaced score (n) and
-    /// excess-only result; and its draw transients: `η̂ + s` (n), the
-    /// row oracle's `Result` rows and the certified rows (n each) and the half-deviance
-    /// values (n). The transients count for every node, not per worker: the row sweep
-    /// is itself a parallel collect, so a worker blocked in it can start another node's
-    /// draw.
+    /// excess-only result; and a half-deviance scratch of `n` rows. The scratch is one per
+    /// worker, not per node, but a node is charged a whole one so the bound holds for
+    /// any split of the batch.
     fn node_working_bytes(&self) -> Option<usize> {
         let n = self.eta_hat.len();
         let p = self.block_vecs.nrows();
-        let row_bytes = std::mem::size_of::<Result<crate::pirls::DevianceEtaRow, EstimationError>>()
-            + std::mem::size_of::<crate::pirls::DevianceEtaRow>();
         p.checked_mul(2)?
-            .checked_add(n.checked_mul(5)?)?
+            .checked_add(n.checked_mul(4)?)?
             .checked_add(1)?
             .checked_mul(std::mem::size_of::<f64>())?
-            .checked_add(n.checked_mul(row_bytes)?)?
             .checked_add(std::mem::size_of::<(f64, Option<Array1<f64>>)>())
     }
 
@@ -1491,9 +1638,9 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     /// ```
     ///
     /// Column `s` of `S` is exactly `fast_av(X_t, V_b · t_s)` — the same vector
-    /// the serial path forms — and everything downstream (the inverse-link jet
-    /// sweep, deviance, linear Taylor and curvature terms) is then computed
-    /// per-column with byte-for-byte the same arithmetic as the serial
+    /// the serial path forms — and everything downstream (the row oracle,
+    /// deviance, linear Taylor and curvature terms) is then computed per-column
+    /// with byte-for-byte the same arithmetic as the serial
     /// `excess_with_displaced_neg_score`. Only the matvec→GEMM reassociation can
     /// perturb `S` (faer reduces the inner `p`-sum the same way per output
     /// element regardless of the RHS column count, so this is at the level of
@@ -1502,71 +1649,12 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         &self,
         draws: &Array2<f64>,
     ) -> Vec<(f64, Option<Array1<f64>>)> {
-        let m = self.block_lambdas.len();
-        let n = self.eta_hat.len();
-        let n_draws = draws.ncols();
-        assert_eq!(
-            draws.nrows(),
-            m,
-            "posterior displacement draw rows must match smoothing block count"
-        );
-
-        // δ-columns: Δ = V_b · T  (p × n_draws). Cheap (O(p·m·n_draws)) and kept
-        // identical to the serial `block_vecs.dot(t)` per column.
-        let delta_all = gam_linalg::faer_ndarray::fast_ab(&self.block_vecs, draws);
-        // s-columns: S = X_t · Δ  (n × n_draws). THE batched matvec — one GEMM
-        // replacing `n_draws` separate `fast_av(x_transformed, δ_s)` calls.
-        let s_all = gam_linalg::faer_ndarray::fast_ab(self.x_transformed, &delta_all);
-
-        // Parallelise over DRAWS, which is where the independent work is.
-        //
-        // This loop used to be serial, and each iteration called
-        // `likelihood_surface_at` -> `deviance_eta_rows_with_log_measure_scale`,
-        // which fans out over the `n` rows with `into_par_iter()`. So the outer
-        // dimension (many genuinely independent draws) ran on one thread while
-        // the inner one (a single sweep of ~1e3 cheap rows) paid a fork/join
-        // round on every draw. That is the wrong level: the row sweep is tens of
-        // microseconds of arithmetic, and scheduling it costs the same order.
-        //
-        // Measured on the geo_latlon fuzz family (n=960, p=11, binomial-logit),
-        // where this sampler is 45% of the profile: wall clock RISES with core
-        // count -- 205.0s at 1 core, 264.3s at 4, 304.3s at 16, 555.9s at 32.
-        // More cores made it 2.7x slower, because every additional worker is
-        // another thief splitting a sweep too small to be worth splitting.
-        //
-        // Order is preserved: this is an indexed map into a `Vec`, so draw `s`
-        // still lands at position `s` and the result is bit-identical to the
-        // serial loop.
-        let out: Vec<(f64, Option<Array1<f64>>)> = (0..n_draws)
-            .into_par_iter()
-            .map(|sidx| {
-                let s_col = s_all.column(sidx);
-                let mut eta_disp = self.eta_hat.clone();
-                for i in 0..n {
-                    eta_disp[i] += s_col[i];
-                }
-                let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
-                    return (f64::INFINITY, None);
-                };
-                let Ok(excess) = self.remainder_at(scaled_half_deviance, s_col) else {
-                    return (f64::INFINITY, None);
-                };
-                if excess.is_finite() {
-                    (excess, Some(ngs))
-                } else {
-                    (excess, None)
-                }
-            })
-            .collect();
-        out
+        self.node_batch(draws, true)
     }
 
     fn excess_batch(&self, nodes: &Array2<f64>) -> Vec<f64> {
-        // Preserve the BLAS-3 displacement path for the coarse rule. The row
-        // oracle currently produces value and score together atomically; drop
-        // the unused score here without falling back to one BLAS-2 matvec per
-        // node.
-        self.excess_with_displaced_neg_score_batch(nodes)
+        // The same BLAS-3 displacement path, with no score kept per node.
+        self.node_batch(nodes, false)
             .into_iter()
             .map(|(excess, _)| excess)
             .collect()
@@ -1578,41 +1666,149 @@ mod exact_deviance_state_cache_tests {
     use super::*;
     use ndarray::{Array2, array};
 
-    #[test]
-    fn observed_quadratic_scales_before_squaring_and_preserves_sign() {
-        let x = Array2::<f64>::zeros((2, 1));
-        let weights_obs = array![1.0e-320_f64, -1.0e-320_f64];
-        let weights_obs_log_abs = weights_obs.mapv(|weight| weight.abs().ln());
-        let target = Gam784BlockTarget {
-            x_transformed: &x,
-            block_vecs: Array2::zeros((1, 1)),
-            block_lambdas: array![1.0],
-            eta_hat: array![0.0, 0.0],
+    fn target<'t>(
+        x: &'t Array2<f64>,
+        block_vecs: Array2<f64>,
+        eta_hat: Array1<f64>,
+        weights_obs: Array1<f64>,
+        y: Array1<f64>,
+        likelihood: GlmLikelihoodSpec,
+    ) -> Gam784BlockTarget<'t> {
+        let n = eta_hat.len();
+        let prior_weights = Array1::<f64>::ones(n);
+        let inverse_link = likelihood.spec.link.clone();
+        let base_rows = crate::pirls::deviance_eta_rows_with_log_measure_scale(
+            y.view(),
+            &eta_hat,
+            &likelihood,
+            &inverse_link,
+            prior_weights.view(),
+            0.0,
+        )
+        .expect("base rows");
+        let base_half: Vec<f64> = base_rows.iter().map(|row| row.half_deviance).collect();
+        let weights_obs_log_abs = weights_obs.mapv(|weight| {
+            if weight == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                weight.abs().ln()
+            }
+        });
+        Gam784BlockTarget {
+            x_transformed: x,
+            block_lambdas: Array1::ones(block_vecs.ncols()),
+            block_vecs,
             weights_obs,
             weights_obs_log_abs,
-            y: array![0.0, 0.0],
-            prior_weights: array![1.0, 1.0],
-            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-                ResponseFamily::Poisson,
-                InverseLink::Standard(StandardLink::Log),
-            )),
-            inverse_link: InverseLink::Standard(StandardLink::Log),
+            row_measures: crate::pirls::DevianceRowMeasure::rows(prior_weights.view(), 0.0),
+            y,
+            prior_weights,
+            likelihood,
+            inverse_link,
             phi: 1.0,
             penalty_scores: Arc::new(Vec::new()),
             penalties: &[],
             lambdas: Vec::new(),
-            base_scaled_half_deviance: 0.0,
-            base_neg_score_at_mode: array![0.0, 0.0],
-            base_absolute_half_deviance: 0.0,
-        };
+            base_scaled_half_deviance: crate::pirls::stable_finite_signed_sum(&base_half, "base")
+                .expect("base half-deviance"),
+            base_absolute_half_deviance: base_half.iter().map(|value| value.abs()).sum(),
+            base_neg_score_at_mode: Array1::from_iter(base_rows.iter().map(|row| row.eta_score)),
+            eta_hat,
+        }
+    }
+
+    fn poisson_quadratic_target(x: &Array2<f64>, weights_obs: Array1<f64>) -> Gam784BlockTarget<'_> {
+        let n = weights_obs.len();
+        target(
+            x,
+            Array2::zeros((1, 1)),
+            Array1::zeros(n),
+            weights_obs,
+            Array1::zeros(n),
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            )),
+        )
+    }
+
+    #[test]
+    fn observed_quadratic_scales_before_squaring_and_preserves_sign() {
+        // `s_i²` alone overflows; `(W_i s_i) s_i` does not.
+        let x = Array2::<f64>::zeros((2, 1));
+        let target = poisson_quadratic_target(&x, array![1.0e-320_f64, -1.0e-320_f64]);
         let s = array![1.0e200, 5.0e199];
         let observed = target
             .observed_quadratic(s.view())
             .expect("weighted quadratic");
-        let first = (target.weights_obs[0].ln() + 2.0 * s[0].ln()).exp();
-        let second = (target.weights_obs[1].abs().ln() + 2.0 * s[1].ln()).exp();
-        let expected = first - second;
-        approx::assert_relative_eq!(observed, expected, max_relative = 2.0e-14);
+        let first = (target.weights_obs[0] * s[0]) * s[0];
+        let second = (target.weights_obs[1] * s[1]) * s[1];
+        assert!(first > 0.0 && second < 0.0 && (first + second).is_finite());
+        approx::assert_relative_eq!(observed, first + second, max_relative = 4.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn observed_quadratic_sums_terms_outside_the_normal_range_on_the_scaled_surface() {
+        // The first term, 1e-310, is subnormal: the scaled surface sums it.
+        let x = Array2::<f64>::zeros((2, 1));
+        let target = poisson_quadratic_target(&x, array![1.0e-300_f64, -0.5]);
+        let s = array![1.0e-5, 3.0];
+        let observed = target
+            .observed_quadratic(s.view())
+            .expect("weighted quadratic");
+        approx::assert_relative_eq!(observed, -4.5, max_relative = 8.0 * f64::EPSILON);
+        let non_finite = array![f64::INFINITY, 3.0];
+        assert!(target.observed_quadratic(non_finite.view()).is_err());
+    }
+
+    #[test]
+    fn node_batch_matches_the_single_node_excess_and_score() {
+        // Binomial-logit rows at a real mode: the batched node sweep must give
+        // each node the excess and displaced score of the one-node path.
+        let n = 64;
+        let x = Array2::from_shape_fn((n, 3), |(i, j)| {
+            let u = (i as f64 + 0.5) / n as f64;
+            match j {
+                0 => 1.0,
+                1 => 2.0 * u - 1.0,
+                _ => (3.0 * u).sin(),
+            }
+        });
+        let beta = array![-0.3, 1.2, 0.7];
+        let eta_hat = x.dot(&beta);
+        let y = Array1::from_iter((0..n).map(|i| f64::from(u8::from((i * 7) % 5 < 2))));
+        let weights_obs = eta_hat.mapv(|eta: f64| {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            mu * (1.0 - mu)
+        });
+        let block_vecs = array![[0.6, 0.0], [0.8, 0.0], [0.0, 1.0]];
+        let target = target(
+            &x,
+            block_vecs,
+            eta_hat,
+            weights_obs,
+            y,
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+        );
+        let nodes = array![[0.0, 0.4, -1.1, 2.0], [0.0, -0.7, 0.3, 1.5]];
+        let batch = target.excess_with_displaced_neg_score_batch(&nodes);
+        let excess_only = target.excess_batch(&nodes);
+        for (col, ((excess, score), &only)) in batch.iter().zip(excess_only.iter()).enumerate() {
+            let t = nodes.column(col).to_owned();
+            let (serial_excess, serial_score) = target.excess_with_displaced_neg_score(&t);
+            let score = score.as_ref().expect("batched displaced score");
+            let serial_score = serial_score.expect("serial displaced score");
+            assert_eq!(*excess, only);
+            approx::assert_abs_diff_eq!(*excess, serial_excess, epsilon = 1.0e-12);
+            for (batched, single) in score.iter().zip(serial_score.iter()) {
+                approx::assert_abs_diff_eq!(*batched, *single, epsilon = 1.0e-14);
+            }
+        }
+        // At the mode the excess is exactly the base's cancellation.
+        approx::assert_abs_diff_eq!(batch[0].0, 0.0, epsilon = 1.0e-12);
     }
 
     /// `ΔF` is the definition `F(β̂+δ) − F(β̂) − ½ δᵀ H δ` at an exact mode, and
@@ -1694,6 +1890,7 @@ mod exact_deviance_state_cache_tests {
             weights_obs,
             weights_obs_log_abs,
             y: y.clone(),
+            row_measures: crate::pirls::DevianceRowMeasure::rows(prior_weights.view(), 0.0),
             prior_weights,
             likelihood,
             inverse_link,

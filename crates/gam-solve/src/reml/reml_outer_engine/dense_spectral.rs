@@ -801,7 +801,7 @@ impl DenseSpectralOperator {
         factor: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> Array2<f64> {
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let start = std::time::Instant::now();
             let result = op.projected_matrix_cached(factor, &self.projected_factor_cache);
             let signature = format!(
@@ -889,7 +889,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
                 state.max = elapsed_s;
             }
             if state.count >= state.next_heartbeat {
-                log::info!(
+                log::debug!(
                     "[STAGE] {} (×{} so far, total={:.3}s min={:.3}s max={:.3}s avg={:.3}s)",
                     state.signature,
                     state.count,
@@ -906,7 +906,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
         // when it ran more than once (the first occurrence already logged
         // its own line, so a count of 1 needs no follow-up).
         if state.count > 1 {
-            log::info!(
+            log::debug!(
                 "[STAGE] {} final ×{} total={:.3}s min={:.3}s max={:.3}s avg={:.3}s",
                 state.signature,
                 state.count,
@@ -918,7 +918,7 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
         }
     }
 
-    log::info!("[STAGE] {} elapsed={:.3}s", signature, elapsed_s);
+    log::debug!("[STAGE] {} elapsed={:.3}s", signature, elapsed_s);
     *guard = Some(Repeat {
         signature: signature.to_string(),
         count: 1,
@@ -1028,7 +1028,7 @@ impl HessianFactorization for DenseSpectralOperator {
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let start = std::time::Instant::now();
             let result =
                 op.trace_projected_factor_cached(&self.w_factor, &self.projected_factor_cache);
@@ -1060,7 +1060,7 @@ impl HessianFactorization for DenseSpectralOperator {
         left: &dyn HyperOperator,
         right: &dyn HyperOperator,
     ) -> f64 {
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let start = std::time::Instant::now();
             let left_proj = self.projected_operator(&self.w_factor, left);
             let result = if std::ptr::addr_eq(left, right) {
@@ -1183,7 +1183,7 @@ impl HessianFactorization for DenseSpectralOperator {
     }
 
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        if log::log_enabled!(log::Level::Info) {
+        if log::log_enabled!(log::Level::Debug) {
             let start = std::time::Instant::now();
             let result =
                 op.trace_projected_factor_cached(&self.g_factor, &self.projected_factor_cache);

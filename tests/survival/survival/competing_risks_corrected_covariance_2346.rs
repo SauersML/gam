@@ -35,7 +35,7 @@ struct StderrInfoLogger;
 
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -76,7 +76,7 @@ impl SplitMix64 {
 fn competing_risks_fit_carries_smoothing_corrected_covariance_2346() {
     INIT_LOGGER.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
     // Two-cause competing-risks data with asymmetric cause-specific hazards

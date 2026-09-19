@@ -195,7 +195,7 @@ pub(crate) fn apply_survival_generated_regressor_correction(
     // whose standard errors derive from it (#2955).
     fit.add_coefficient_covariance_correction(&correction)
         .map_err(|err| format!("survival marginal-slope generated-regressor: {err}"))?;
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope latent-z] Murphy–Topel generated-regressor SE correction \
          applied: p_beta={p_beta} theta1_dim={} max_diag_inflation={:.3e}",
         calibration.theta1_dim(),
@@ -216,6 +216,6 @@ fn withhold_covariance(fit: &mut UnifiedFitResult, reason: &str) {
         SurvivalMarginalSlopeGeneratedRegressorSensitivityUnavailable {
             unavailable_channel: reason.to_string(),
         };
-    log::warn!("[survival-marginal-slope latent-z] {}", declined.explain());
+    log::debug!("[survival-marginal-slope latent-z] {}", declined.explain());
     fit.artifacts.covariance_declined = Some(declined);
 }

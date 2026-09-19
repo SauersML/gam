@@ -229,7 +229,7 @@ fn main() {
     let n_pcs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(16);
     let level = args.get(4).map(String::as_str).unwrap_or("warn");
     let lane = args.get(5).map(String::as_str).unwrap_or("flexible");
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Warn);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     gam_solve::progress_log::set_log_level(level);
 
     eprintln!("[repro2748] lane={lane} centers={centers} n={n} n_pcs={n_pcs}");

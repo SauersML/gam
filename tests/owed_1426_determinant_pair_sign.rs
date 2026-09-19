@@ -15,7 +15,7 @@
 //! (cost ≈ 524 at EDF≈24 vs ≈ 835 at EDF≈8).
 //!
 //! This test pins the sign directly. It captures the `[#1271-diag]` REML
-//! evaluation trace already emitted (at `log::Level::Info`) by
+//! evaluation trace already emitted (at `log::Level::Debug`) by
 //! `src/solver/reml/objective.rs` on every dense evaluation — each line carries
 //! the GENUINE internal scalars `logS` (= `penalty_logdet.value`), `logH`
 //! (= `hessian_op.logdet()`), `half_diff` (= ½(logH − logS), the pair), and the
@@ -42,7 +42,7 @@ struct CaptureLogger;
 
 impl log::Log for CaptureLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record) {
         let msg = format!("{}", record.args());
@@ -117,7 +117,7 @@ fn gammalog_determinant_pair_has_correct_occam_sign() {
     // `DIAG_LINES`. Ignore Err: a global logger may already be installed by
     // another test sharing this binary.
     if log::set_logger(&LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
     if let Ok(mut g) = DIAG_LINES.lock() {
         g.clear();

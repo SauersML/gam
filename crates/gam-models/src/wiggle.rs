@@ -618,7 +618,7 @@ pub(crate) fn select_wiggle_basis_from_seed_with_knots(
         WarpKnotEnds::Simple => {
             let minimum = composed_warp_minimum_degree();
             if cfg.degree < minimum {
-                log::info!(
+                log::debug!(
                     "[warp-degree] composed monotone warp requested degree {} and is built at \
                      {minimum}: the inner objective reads the basis's derivative of order {} \
                      (H is the order-2 coefficient of the row jet and reaches the basis through \

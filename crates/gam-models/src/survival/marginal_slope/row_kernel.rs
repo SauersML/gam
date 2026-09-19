@@ -1529,7 +1529,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
 
             static HESSIAN_STORAGE_LOGGED: std::sync::Once = std::sync::Once::new();
             HESSIAN_STORAGE_LOGGED.call_once(|| {
-                log::info!(
+                log::debug!(
                     "[STAGE] survival marginal-slope hybrid Hessian assembly: \
                      sparse=({},{},{},{},{}) dims=({},{},{},{},{})",
                     time_designs[0].is_sparse(),
@@ -1904,7 +1904,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         static LAST_FIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let fit = Arc::as_ptr(&self.family.weights) as usize;
         if LAST_FIT.swap(fit, std::sync::atomic::Ordering::Relaxed) != fit {
-            log::warn!(
+            log::debug!(
                 "[survival-marginal-slope] {reason}, so this fit builds J·F one row at a time, which \
                  is slower"
             );
