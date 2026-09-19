@@ -1586,7 +1586,17 @@ where
                 //
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
-                let initial_sp = reml_state.analytic_initial_sp_rho(&base, seed_bounds);
+                //
+                // The pilot P-IRLS solve behind this seed runs at `base`. A typed
+                // per-rho refusal there (`is_trial_point_infeasible`) is the same
+                // verdict the base cost below records for `base`, and the search
+                // steps past it exactly as it steps past an infeasible trial point.
+                // Every other failure is not about `base` and is propagated.
+                let initial_sp = match reml_state.analytic_initial_sp_rho(&base, seed_bounds) {
+                    Ok(seed) => seed,
+                    Err(error) if error.is_trial_point_infeasible() => None,
+                    Err(error) => return Err(error),
+                };
                 //   2. The certified single-λ (diagonal) profiled optimum on the
                 //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
                 //      ρ. This is an honest one-dimensional restriction of the

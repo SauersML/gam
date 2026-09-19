@@ -3713,33 +3713,46 @@ impl<'a> RemlState<'a> {
     /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
-    /// Returns `None` (no candidate) when the pilot fit at `base` or the design
-    /// Gram is unavailable, or the Gram's width does not match `p`. The pilot is
-    /// the cached P-IRLS solve the caller's own `compute_cost(&base)` runs, so a
-    /// pilot that fails also fails the base cost, and the caller's scored-seed
-    /// record reports it there; this candidate adds no second verdict on it.
+    /// Returns `Ok(None)` only when there is no smoothing coordinate to seed.
+    /// Every failure is an `Err` with its own type: the pilot P-IRLS solve at
+    /// `base` (the cached solve the caller's `compute_cost(&base)` also runs),
+    /// the design Gram diagonal, and a pilot or Gram whose length disagrees with
+    /// the problem's. The caller decides which of those a seed search can step
+    /// past; this function does not turn any of them into "no candidate".
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
         bounds: OrderedRhoBounds,
-    ) -> Option<Array1<f64>> {
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
         let n_pen = self.canonical_penalties.len();
         let n_rho = base.len().min(n_pen);
         if n_rho == 0 {
-            return None;
+            return Ok(None);
         }
         let weights = if reml_is_gaussian_identity(&self.config.likelihood) {
             self.weights.to_owned()
         } else {
-            let pilot = self.execute_pirls_if_needed(base).ok()?;
+            let pilot = self.execute_pirls_if_needed(base)?;
             if pilot.solveweights.len() != self.weights.len() {
-                return None;
+                return Err(EstimationError::LayoutError(format!(
+                    "analytic initial-sp seed: pilot fit carries {} working weights for {} rows",
+                    pilot.solveweights.len(),
+                    self.weights.len()
+                )));
             }
             pilot.solveweights.to_owned()
         };
-        let gram_diag = self.x.diag_gram(&weights).ok()?;
+        let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
+            ))
+        })?;
         if gram_diag.len() != self.p {
-            return None;
+            return Err(EstimationError::LayoutError(format!(
+                "analytic initial-sp seed: design Gram diagonal has {} entries, expected {}",
+                gram_diag.len(),
+                self.p
+            )));
         }
         // `bounds` is ordered by construction (`OrderedRhoBounds`); no defensive
         // swap — an inverted box was refused at the seed-prepass boundary (#2379).
@@ -3763,7 +3776,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
-        Some(rho)
+        Ok(Some(rho))
     }
 
     /// Certified finite-window single-λ Gaussian-identity REML optimum, mapped
