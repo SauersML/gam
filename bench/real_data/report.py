@@ -50,6 +50,7 @@ def aggregate(records: list[Record]) -> dict[str, dict[str, dict[str, Any]]]:
                 "folds": len(recs),
                 "ok_folds": len(ok),
                 "ok_fold_ids": sorted(r["fold"] for r in ok),
+                "certified_folds": sum(r.get("certified") is True for r in ok),
                 "failures": {
                     str(r["fold"]): {
                         "status": r["status"],
@@ -104,11 +105,11 @@ def _f(x: float | None, spec: str = ".4g") -> str:
     return "—" if x is None or (isinstance(x, float) and not math.isfinite(x)) else format(x, spec)
 
 
-def _ok(cell: dict[str, Any] | None) -> str:
+def _ok(cell: dict[str, Any] | None, key: str = "ok_folds") -> str:
     if cell is None:
         return "—"
-    s = f"{cell['ok_folds']}/{cell['folds']}"
-    return s if cell["ok_folds"] == cell["folds"] else f"**{s}**"
+    s = f"{cell[key]}/{cell['folds']}"
+    return s if cell[key] == cell["folds"] else f"**{s}**"
 
 
 def render(agg: dict[str, dict[str, dict[str, Any]]], meta: dict[str, Any]) -> str:
@@ -133,7 +134,7 @@ def render(agg: dict[str, dict[str, dict[str, Any]]], meta: dict[str, Any]) -> s
     w("")
     w("## Headline")
     w("")
-    w("| dataset | family | n | gamfit ok | fit s gamfit | fit s pygam_gs | speed-up | "
+    w("| dataset | family | n | gamfit certified | fit s gamfit | fit s pygam_gs | speed-up | "
       "dev gamfit | dev pygam_gs | Δdev | cov gamfit | cov pygam_gs | peak MB gamfit | peak MB pygam_gs |")  # fmt: skip
     w("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     speedups: list[float] = []
@@ -155,7 +156,7 @@ def render(agg: dict[str, dict[str, dict[str, Any]]], meta: dict[str, Any]) -> s
                 if dd is not None:
                     dev_wins += dd < 0
                     dev_losses += dd > 0
-        w(f"| {name} | {any_cell['family']} | {any_cell['n']} | {_ok(g)} | "
+        w(f"| {name} | {any_cell['family']} | {any_cell['n']} | {_ok(g, 'certified_folds')} | "
           f"{_f(g and g['fit_s'], '.3f')} | {_f(gs and gs['fit_s'], '.3f')} | "
           f"{_f(spd, '.1f')}× | {_f(dev_g)} | {_f(dev_gs)} | {_f(dd and 100 * dd, '+.1f')}% | "
           f"{_f(g and g['coverage'], '.3f')} | {_f(gs and gs['coverage'], '.3f')} | "
