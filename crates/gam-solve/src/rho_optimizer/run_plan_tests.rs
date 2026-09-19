@@ -6680,3 +6680,8 @@ mod typed_objective_failure_propagation_1561_tests;
 // evaluated trials (#3017).
 #[path = "arc_rejected_trials_3017_tests.rs"]
 mod arc_rejected_trials_3017_tests;
+
+// The cost-stall guard judges a decrease against the objective bands of the
+// two evaluations it compares, not a relative floor (#3018).
+#[path = "cost_stall_objective_band_3018_tests.rs"]
+mod cost_stall_objective_band_3018_tests;

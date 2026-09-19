@@ -7131,7 +7131,7 @@ fn predict_encoded_table_configured_impl(
         return Err(PredictError::SchemaMismatch(missing.join(" ")));
     }
     let dataset =
-        dataset_with_model_schema_from_encoded(model, &source).map_err(PredictError::Other)?;
+        dataset_with_model_schema_from_encoded(model, &source)?;
     predict_dataset_with_options_impl(model, model_class, dataset, &options)
         .map_err(PredictError::Other)
 }
