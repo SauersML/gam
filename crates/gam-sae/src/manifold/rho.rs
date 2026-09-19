@@ -54,8 +54,8 @@ mod log_strength_domain_tests {
             AssignmentMode::softmax(1.0),
         )
         .expect("one logit column, coordinate block and manifold");
-        let rho = SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)])
-            .for_assignment(&softmax);
+        let rho =
+            SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)]).for_assignment(&softmax);
         assert_eq!(rho.sparse_flat_index(), None);
         let mut irrelevant_placeholder = rho.clone();
         irrelevant_placeholder.log_lambda_sparse = f64::INFINITY;
@@ -302,7 +302,11 @@ impl SaeManifoldRho {
                 self.k_atoms()
             ));
         }
-        if self.kappa_atoms.last().is_some_and(|&previous| previous >= atom) {
+        if self
+            .kappa_atoms
+            .last()
+            .is_some_and(|&previous| previous >= atom)
+        {
             return Err(format!(
                 "cannot append curvature atom {atom} after {:?}",
                 self.kappa_atoms.last()
@@ -483,15 +487,19 @@ impl SaeManifoldRho {
     /// `ard_flat_index` uses.
     pub(crate) fn kappa_flat_index(&self, atom: usize) -> Option<usize> {
         let curvature_index = self.kappa_atoms.binary_search(&atom).ok()?;
-        let k = self.log_lambda_smooth.len();
-        let prefix = self.smooth_flat_start();
+        Some(self.block_flat_start() + self.log_lambda_block.len() + curvature_index)
+    }
+
+    /// Flat index of the first `log_lambda_block` coordinate: after the smoothing
+    /// and ARD blocks, before the curvature tail. Derived forwards from the prefix
+    /// arithmetic so a later tail cannot shift it.
+    pub(crate) fn block_flat_start(&self) -> usize {
         let ard_len = match self.ard_sharing {
             ArdSharing::PerAtom => self.log_ard.iter().map(|a| a.len()).sum::<usize>(),
             ArdSharing::Shared => self.max_ard_axes(),
         };
-        Some(prefix + k + ard_len + self.log_lambda_block.len() + curvature_index)
+        self.smooth_flat_start() + self.log_lambda_smooth.len() + ard_len
     }
-
 
     pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {
         let k = self.log_lambda_smooth.len();
@@ -741,11 +749,8 @@ impl SaeManifoldRho {
             ));
         }
         let mut previous_atom = None;
-        for (coordinate, (&atom, &value)) in self
-            .kappa_atoms
-            .iter()
-            .zip(self.kappa.iter())
-            .enumerate()
+        for (coordinate, (&atom, &value)) in
+            self.kappa_atoms.iter().zip(self.kappa.iter()).enumerate()
         {
             if atom >= self.k_atoms() {
                 return Err(format!(
@@ -936,8 +941,9 @@ impl SaeManifoldRho {
                 }
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
                 let log_lambda_block: Vec<f64> = (0..block_len).map(|b| flat[cursor + b]).collect();
-                let kappa: Vec<f64> =
-                    (0..kappa_len).map(|b| flat[cursor + block_len + b]).collect();
+                let kappa: Vec<f64> = (0..kappa_len)
+                    .map(|b| flat[cursor + block_len + b])
+                    .collect();
                 SaeManifoldRho {
                     log_lambda_sparse: self
                         .sparse_flat_index()
@@ -1025,9 +1031,7 @@ mod curvature_coordinate_tests {
         let base = SaeManifoldRho::new(-1.0, -2.0, vec![Array1::zeros(2), Array1::zeros(2)]);
         let without = base.flat_coordinates();
 
-        let with_kappa = base
-            .clone()
-            .with_curvature(vec![(0, 0.75), (1, -1.25)]);
+        let with_kappa = base.clone().with_curvature(vec![(0, 0.75), (1, -1.25)]);
         let flat = with_kappa.flat_coordinates();
         assert_eq!(
             flat.len(),

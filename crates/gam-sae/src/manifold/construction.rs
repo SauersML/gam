@@ -2,13 +2,13 @@ use super::*;
 // #2598 — `construction_quasi_laplace.rs` interpolates the refusal markers into
 // its ρ-local refusals instead of restating them, so the classifier and the
 // producer cannot disagree about the phrase again.
+use super::fit_drivers::GaugeOrbitDescent;
 use super::outer_objective::ProbeRefusalKind;
 use crate::identifiability::{
     FrameColumnLayout, OutputBlockRootAccumulator, ResidualGaugeCurvature,
     TriangularRootAccumulator,
 };
 use gam_linalg::faer_ndarray::FaerEigh;
-use super::fit_drivers::GaugeOrbitDescent;
 
 /// #2822 — a term's tier-0 fit frame: the shared column mean μ and the per-column scale σ.
 ///
@@ -1941,7 +1941,8 @@ impl SaeManifoldTerm {
                 ref dense_rows,
                 root_rows,
             } => {
-                let operator = super::streamed_frame_curvature::StreamedFrameCurvatureOperator::new(
+                let operator =
+                    super::streamed_frame_curvature::StreamedFrameCurvatureOperator::new(
                     self,
                     &certificate_model.metric,
                     layout,
@@ -1986,8 +1987,7 @@ impl SaeManifoldTerm {
         // defect). Always populated (one entry per atom, `None` for non-`d = 1`
         // charts), never dispersion-gated: coordinate quality does not depend on the
         // reconstruction dispersion the incoherence report needs.
-        let coordinate_fidelity =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let coordinate_fidelity = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_coordinate_fidelity(self, atom_idx)
             })
             .into_iter()
@@ -2000,8 +2000,7 @@ impl SaeManifoldTerm {
         // that sees it. One entry per atom, `None` for atoms outside the `d = 1`
         // periodic family, and — like the fidelity report — a pure read that
         // feeds nothing back into the loss or criterion.
-        let decoder_embeddedness =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let decoder_embeddedness = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_decoder_embeddedness(self, atom_idx)
             })
             .into_iter()
@@ -2011,8 +2010,7 @@ impl SaeManifoldTerm {
         // `None` for caller-supplied or under-sampled atoms). A pure read of the
         // fitted decoder image and shared soft support measure; never gated by a flag and
         // feeds nothing back into the loss/criterion.
-        let topology_persistence =
-            atom_certificates_in_parallel(k_atoms, |atom_idx| {
+        let topology_persistence = atom_certificates_in_parallel(k_atoms, |atom_idx| {
                 atom_topology_persistence(self, atom_idx)
             });
 
@@ -2449,11 +2447,8 @@ impl SaeManifoldTerm {
         // of such a row fills in every block). The reduction counts the sum's
         // eigenvalues above any shift exactly, by inertia, so nothing is
         // approximated by carrying them separately.
-        let curvature_source = self.residual_gauge_curvature_source(
-            &metric,
-            &layout,
-            isometry_penalty_root.clone(),
-        )?;
+        let curvature_source =
+            self.residual_gauge_curvature_source(&metric, &layout, isometry_penalty_root.clone())?;
 
         Ok((
             FittedSaeManifold {
@@ -3401,7 +3396,10 @@ impl SaeManifoldTerm {
                         left
                     })
             } else {
-                chunks.into_iter().map(chunk_block).reduce(|mut left, right| {
+                chunks
+                    .into_iter()
+                    .map(chunk_block)
+                    .reduce(|mut left, right| {
                     left += &right;
                     left
                 })
@@ -5133,6 +5131,98 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Explicit output-scale derivatives of the data term (#2822, #2231).
+    ///
+    /// Scaling the target columns in `col_range` by `s` (`log λ = 2·log s`) moves the data term
+    /// `½ Σ_i w_i ‖U_iᵀ(y_i − f_i)‖²` at FIXED state by
+    /// `∂/∂log λ = ½ Σ_i w_i ⟨U_iᵀ P y_i, U_iᵀ r_i⟩` with `r = y − f` and `P` the column-range
+    /// projector. This is the envelope derivative of the minimized penalized loss, so it is the
+    /// value's explicit channel. It is not `½‖P r‖²`: the two differ by `½⟨P f, r⟩`, which the
+    /// penalty keeps nonzero at the inner optimum. Row weights, the whitening metric and the
+    /// compact active support match [`Self::loss_scaled`] exactly.
+    pub(crate) fn output_scale_data_derivatives(
+        &self,
+        target: ArrayView2<'_, f64>,
+        col_ranges: &[std::ops::Range<usize>],
+    ) -> Result<Vec<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::output_scale_data_derivatives: Z must be ({n}, {p}); got {:?}",
+                target.dim()
+            ));
+        }
+        if let Some(range) = col_ranges
+            .iter()
+            .find(|range| range.end > p || range.start >= range.end)
+        {
+            return Err(format!(
+                "SaeManifoldTerm::output_scale_data_derivatives: columns {range:?} outside output dim {p}"
+            ));
+        }
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let recon_layout = self
+            .last_row_layout
+            .as_ref()
+            .filter(|l| l.active_atoms.len() == n);
+        let k_atoms = self.k_atoms();
+        let mut g_buf = vec![0.0_f64; p];
+        let mut residual = vec![0.0_f64; p];
+        let mut projected = vec![0.0_f64; p];
+        let mut assign_buf = vec![0.0_f64; k_atoms];
+        let mut out = vec![0.0_f64; col_ranges.len()];
+        for row in 0..n {
+            self.assignment
+                .try_assignments_row_into(row, &mut assign_buf)?;
+            residual.iter_mut().for_each(|slot| *slot = 0.0);
+            let mut decode = |atom_idx: usize| {
+                self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                let a_k = assign_buf[atom_idx];
+                for (slot, &g) in residual.iter_mut().zip(g_buf.iter()) {
+                    *slot += a_k * g;
+                }
+            };
+            match recon_layout {
+                Some(layout) => layout.active_atoms[row].iter().for_each(|&k| decode(k)),
+                None => (0..k_atoms).for_each(decode),
+            }
+            for (col, slot) in residual.iter_mut().enumerate() {
+                *slot = target[[row, col]] - *slot;
+            }
+            let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
+            let metric = self.row_metric.as_ref().filter(|_| whitens);
+            let white_residual =
+                metric.map(|m| m.whiten_residual_row(row, ArrayView1::from(&residual)));
+            for (slot, range) in out.iter_mut().zip(col_ranges) {
+                for (col, value) in projected.iter_mut().enumerate() {
+                    *value = if range.contains(&col) {
+                        target[[row, col]]
+                    } else {
+                        0.0
+                    };
+                }
+                let inner = match (metric, white_residual.as_ref()) {
+                    (Some(m), Some(white)) => m
+                        .whiten_residual_row(row, ArrayView1::from(&projected))
+                        .iter()
+                        .zip(white)
+                        .map(|(a, b)| a * b)
+                        .sum::<f64>(),
+                    _ => range
+                        .clone()
+                        .map(|col| projected[col] * residual[col])
+                        .sum::<f64>(),
+                };
+                *slot += 0.5 * w_row * inner;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn analytic_penalty_value_total(
         &self,
         registry: &AnalyticPenaltyRegistry,
@@ -5586,8 +5676,9 @@ impl SaeManifoldTerm {
         );
         let retained: Vec<usize> = (0..m).filter(|&i| evals[i] > threshold).collect();
         let values = retained.iter().map(|&i| evals[i]).collect();
-        let vectors =
-            Array2::from_shape_fn((m, retained.len()), |(row, col)| evecs[[row, retained[col]]]);
+        let vectors = Array2::from_shape_fn((m, retained.len()), |(row, col)| {
+            evecs[[row, retained[col]]]
+        });
         Ok((values, vectors))
     }
 
@@ -5600,7 +5691,9 @@ impl SaeManifoldTerm {
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
     pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
-        Ok(Self::symmetric_positive_eigenspace(s, "symmetric_rank")?.0.len())
+        Ok(Self::symmetric_positive_eigenspace(s, "symmetric_rank")?
+            .0
+            .len())
     }
 
     /// Rank and log pseudo-determinant `log|S|_+ = Σ_{σ_i > threshold} ln σ_i` of a
@@ -5626,10 +5719,8 @@ impl SaeManifoldTerm {
                 s.dim()
             ));
         }
-        let (values, vectors) = Self::symmetric_positive_eigenspace(
-            s,
-            "symmetric_log_pseudodeterminant_differential",
-        )?;
+        let (values, vectors) =
+            Self::symmetric_positive_eigenspace(s, "symmetric_log_pseudodeterminant_differential")?;
         let mut acc = 0.0_f64;
         for (col, &value) in values.iter().enumerate() {
             let u = vectors.column(col);

@@ -4333,6 +4333,18 @@ impl SaeManifoldTerm {
         // the route alone decides. Before, a dense ThresholdGate fit ranked ½log|A|
         // and returned `½tr(B⁻¹∂B)` channels from cached `B` geometry.
         let exact_a_logdet_route = logdet_derivative_bundle.is_none();
+        // #2822 — an output-scale coordinate moves `A` through the target
+        // (`output_scale_logdet_traces`). The streaming route's probes are β-space `S⁻¹`
+        // solves, which hold no joint weight to contract that operator against.
+        if !exact_a_logdet_route && !rho.log_lambda_block.is_empty() {
+            return Err(OuterGradientError::internal(
+                "analytic_outer_rho_gradient_components_with_bundle: output-scale coordinates \
+                 (crosscoder blocks or the global dispersion) need ½tr(A⁻¹ ∂A/∂log λ), whose \
+                 ∂A moves with the target; the streaming route's β-space probes do not price \
+                 it, so these coordinates are fitted on the dense exact-A route only"
+                    .to_string(),
+            ));
+        }
 
         // #2087/#2330 ROUTE-COHERENCE GUARD. The VALUE's log-determinant route and
         // THIS gradient's are selected by two unrelated predicates:
@@ -4763,9 +4775,9 @@ impl SaeManifoldTerm {
                 },
             )
         })?;
-        let block_tail_start = n_params - rho.log_lambda_block.len();
+        let block_span = rho.block_flat_start()..rho.block_flat_start() + rho.log_lambda_block.len();
         for coord in 0..n_params {
-            let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
+            let rhs = if block_span.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4774,7 +4786,7 @@ impl SaeManifoldTerm {
                                 .to_string(),
                         )
                     })?;
-                let block = coord - block_tail_start;
+                let block = coord - block_span.start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
                     .map_err(OuterGradientError::internal)?
@@ -5952,6 +5964,10 @@ impl SaeManifoldTerm {
         }
         // One per-coordinate map at a time: the metric channel below builds its own.
         drop(da_by_flat);
+        // #2822 — the output-scale coordinates move `A` through the target.
+        for (flat, trace) in self.output_scale_logdet_traces(rho, target, cache, a_pinv)? {
+            logdet_trace[flat] = trace;
+        }
         // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
         // integrated-marginal logit Hessian (cross-row), absent from the operator
         // map above (softmax-only). Add its ½log|A| trace directly.
@@ -6009,6 +6025,74 @@ impl SaeManifoldTerm {
             theta_adjoint: gamma,
             stationarity_adjoint,
         })
+    }
+
+    /// #2822 — `½⟨W, ∂A/∂log λ_ℓ⟩` for each output-scale coordinate (a crosscoder block's or
+    /// the global dispersion's log precision), as `(flat index, trace)`.
+    ///
+    /// The criterion is priced on the rescaled target `y' = √λ·y`, so `∂y'/∂log λ_ℓ = ½P_ℓy'`
+    /// with `P_ℓ` the block's column selector. At fixed θ, `A = B_raw + ΔC` is affine in the
+    /// target: `B_raw` is the Gauss--Newton majorizer the cache holds, and `ΔC` is linear in the
+    /// residual. So `∂A/∂log λ_ℓ = A(y' + ½P_ℓy') − A(y')` exactly, and both operators come from
+    /// the same probes against the same cache, contracted as they are written.
+    ///
+    /// An embedded-sphere row's `B` carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which reads
+    /// the residual, so its `B` and `Φ` move with the target too; that leg is not priced here
+    /// and the coordinate is refused.
+    pub(crate) fn output_scale_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+    ) -> Result<Vec<(usize, f64)>, String> {
+        if rho.log_lambda_block.is_empty() {
+            return Ok(Vec::new());
+        }
+        let &(p_x, ref block_dims) = self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
+            "output_scale_logdet_traces: the state carries output-scale coordinates but no \
+             pricing spans"
+                .to_string()
+        })?;
+        if block_dims.len() != rho.log_lambda_block.len() {
+            return Err(format!(
+                "output_scale_logdet_traces: {} output-scale coordinates for {} pricing spans",
+                rho.log_lambda_block.len(),
+                block_dims.len()
+            ));
+        }
+        if !self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
+            return Err(
+                "output_scale_logdet_traces: an embedded-sphere row's B carries -c_g P_g with \
+                 c_g = <g_raw, x_g>, which moves with the target; that leg of \
+                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are refused \
+                 on sphere rows"
+                    .to_string(),
+            );
+        }
+        let mut traces = Vec::with_capacity(block_dims.len());
+        let mut start = p_x;
+        for (block, &width) in block_dims.iter().enumerate() {
+            let columns = start..start + width;
+            start += width;
+            if columns.end > target.ncols() {
+                return Err(format!(
+                    "output_scale_logdet_traces: pricing span {columns:?} exceeds the target's {} \
+                     columns",
+                    target.ncols()
+                ));
+            }
+            let mut shifted = target.to_owned();
+            shifted
+                .slice_mut(s![.., columns.clone()])
+                .mapv_inplace(|value| 1.5 * value);
+            let mut sink = ContractingExactHessianProbe::new(weight);
+            self.probe_exact_hessian_arrow(rho, shifted.view(), cache, &mut sink)?;
+            sink.scale = -1.0;
+            self.probe_exact_hessian_arrow(rho, target, cache, &mut sink)?;
+            traces.push((rho.block_flat_start() + block, 0.5 * sink.sum));
+        }
+        Ok(traces)
     }
 
     /// #2933 F07 — `(½⟨X, ∂Φ/∂ρ⟩, ⟨X, ∂Φ/∂θ⟩)` for a dense symmetric weight `X` on the

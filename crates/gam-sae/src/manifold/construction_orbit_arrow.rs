@@ -248,6 +248,70 @@ impl ExactHessianProbeSink for Array2<f64> {
     }
 }
 
+/// `scale·⟨W, A⟩` for a symmetric weight `W`, accumulated as the exact-Hessian probes write `A`,
+/// so the operator is never held. Every arrow position is written exactly once and `W` is
+/// symmetric, so the symmetrization is the identity on the contraction.
+pub(crate) struct ContractingExactHessianProbe<'w, W: JointWeight + ?Sized> {
+    weight: &'w W,
+    pub(crate) scale: f64,
+    pub(crate) sum: f64,
+}
+
+impl<'w, W: JointWeight + ?Sized> ContractingExactHessianProbe<'w, W> {
+    pub(crate) fn new(weight: &'w W) -> Self {
+        Self {
+            weight,
+            scale: 1.0,
+            sum: 0.0,
+        }
+    }
+}
+
+impl<W: JointWeight + ?Sized> ExactHessianProbeSink for ContractingExactHessianProbe<'_, W> {
+    fn row_slot_column(&mut self, start: usize, end: usize, slot: usize, t: &Array1<f64>) {
+        let col = start + slot;
+        let column = (start..end)
+            .map(|i| self.weight.entry(i, col) * t[i])
+            .sum::<f64>();
+        self.sum += self.scale * column;
+    }
+
+    fn add_mass_carriers(&mut self, carriers: &[(f64, Vec<(usize, f64)>)]) -> Result<(), String> {
+        if carriers.is_empty() {
+            return Ok(());
+        }
+        let dense = self.weight.dense().ok_or_else(|| {
+            "ContractingExactHessianProbe: the ordered Beta--Bernoulli mass carriers span rows, \
+             and the weight is not held dense"
+                .to_string()
+        })?;
+        for (coefficient, carrier) in carriers {
+            let mut quadratic = 0.0;
+            for &(row, left) in carrier {
+                for &(col, right) in carrier {
+                    quadratic += dense[[row, col]] * left * right;
+                }
+            }
+            self.sum += self.scale * coefficient * quadratic;
+        }
+        Ok(())
+    }
+
+    fn border_column(&mut self, total_t: usize, j: usize, column: &SaeArrowVector) {
+        let col = total_t + j;
+        let mut value = 0.0;
+        for i in 0..total_t {
+            value += 2.0 * self.weight.entry(i, col) * column.t[i];
+        }
+        for i in 0..column.beta.len() {
+            value += self.weight.entry(total_t + i, col) * column.beta[i];
+        }
+        self.sum += self.scale * value;
+    }
+
+    fn symmetrize(&mut self) {}
+}
+
 /// A symmetric joint `(t, β)` operator held on the arrow's positions only: each row's coordinate
 /// block, the coordinate–border block and the border block. Written by the exact-Hessian probes, it
 /// holds the entries of the dense materialization bit for bit.
@@ -1562,6 +1626,12 @@ impl SaeManifoldTerm {
         self.exact_stationarity_penalty_derivative_delta_into(rho, cache, &mut operator_traces)?;
         for (flat, contraction) in operator_traces.contractions {
             logdet_trace[flat] = 0.5 * contraction;
+        }
+        // #2822 — the output-scale coordinates move `A` through the target.
+        for (flat, trace) in
+            self.output_scale_logdet_traces(rho, target, cache, &differential.operator_weight)?
+        {
+            logdet_trace[flat] = trace;
         }
         let mut gamma = self.logdet_theta_adjoint_dense(
             rho,
