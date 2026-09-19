@@ -5125,7 +5125,8 @@ impl FittedModel {
     /// `UnseenCategoryPolicy::encode_unknown_for_columns`. It intentionally
     /// covers ONLY genuine random effects (`group(g)`/`re(g)`/`s(g, bs="re")`).
     /// A FIXED categorical factor — a bare `+ g` OR an explicit `factor(g)` —
-    /// is a fixed parametric factor: an unseen level of it must reach the strict
+    /// is auto-promoted to a penalized random block internally but is still a
+    /// fixed parametric factor: an unseen level of it must reach the strict
     /// schema encode and raise a `SchemaMismatchError` rather than be silently
     /// averaged to the factor's centering point (#2102/#2137). Such terms carry
     /// `lenient_unseen == false` and are excluded here so they hit the strict
@@ -5175,10 +5176,9 @@ impl FittedModel {
     /// the `check`/`predict` schema layer can enforce the same fixed-factor
     /// contract the design operator (`build_random_effect_block`) enforces.
     ///
-    /// Only terms with concrete `frozen_levels` (captured at fit) are returned,
-    /// matching the operator's strict gate. The frozen set is the complete
-    /// training vocabulary for either coding — a treatment-coded factor keeps
-    /// its reference level in it.
+    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
+    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
+    /// training vocabulary) are returned, matching the operator's strict gate.
     pub fn numeric_fixed_factor_vocabularies(&self) -> Vec<(String, HashSet<u64>)> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return Vec::new();
@@ -5189,7 +5189,7 @@ impl FittedModel {
         let mut out = Vec::<(String, HashSet<u64>)>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
-                if term.lenient_unseen {
+                if term.lenient_unseen || term.drop_first_level {
                     continue;
                 }
                 let Some(levels) = term.frozen_levels.as_ref() else {

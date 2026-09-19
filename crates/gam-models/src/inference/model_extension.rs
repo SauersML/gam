@@ -107,9 +107,8 @@ impl FittedModel {
                 let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
                     "extend_with_group requires saved resolved_termspec; refit".to_string()
                 })?;
-                let mut group_terms = spec.random_effect_terms.iter().filter(|t| t.penalized);
-                if let (Some(only), None) = (group_terms.next(), group_terms.next()) {
-                    only.name.clone()
+                if spec.random_effect_terms.len() == 1 {
+                    spec.random_effect_terms[0].name.clone()
                 } else {
                     return Err(
                         "extend_with_group requires term when the model has zero or multiple group terms"
@@ -153,15 +152,6 @@ fn extend_model_with_random_effect_level(
             .iter()
             .position(|term| term.name == term_name)
             .ok_or_else(|| format!("extend_with_group unknown random-effect term '{term_name}'"))?;
-        if !spec.random_effect_terms[term_idx].penalized {
-            // A fixed factor (`factor(g)` / bare `+ g`) has no variance
-            // component, so there is no prior to draw a new level's
-            // coefficient from; its vocabulary is closed at fit time.
-            return Err(format!(
-                "extend_with_group term '{term_name}' is a fixed factor with no random-effect \
-                 variance to extend from; fit it as group({term_name}) to add levels at deployment"
-            ));
-        }
         (
             term_idx,
             spec.random_effect_terms[term_idx].feature_col,
@@ -348,16 +338,8 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| format!("<unserializable: {error}>"))
 }
 
-/// Global penalty index of random-effect term `term_idx`'s ridge, mirroring the
-/// assembly order in `build_term_collection_design`: one null-recovery ridge
-/// per `double_penalty` linear term, then one ridge per *penalized*
-/// random-effect term (a fixed factor contributes none).
 fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
-    spec.linear_terms.iter().filter(|term| term.double_penalty).count()
-        + spec.random_effect_terms[..term_idx]
-            .iter()
-            .filter(|term| term.penalized)
-            .count()
+    usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
 }
 
 fn extension_prior_parameters(

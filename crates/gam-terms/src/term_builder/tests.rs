@@ -3076,12 +3076,12 @@ fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
 }
 
 /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
-/// two `g` design blocks. The bare `+ g` lowers to a single fixed
-/// treatment-coded factor block owning the factor's level offsets; the
+/// two `g` design blocks. The bare `+ g` is auto-promoted to a single
+/// penalized random-effect block owning the factor's full level offsets; the
 /// `by=` branch must then recognize that owner and skip adding its own
 /// main effect. Before the fix the dedup guard
 /// recognized only explicit `group(g)` (a `ParsedTerm::RandomEffect`), so the
-/// bare-`+ g` block slipped past and a spurious second `g`
+/// auto-promoted bare-`+ g` block slipped past and a spurious second `g`
 /// block (plus an extra smoothing parameter) was added. Assert exactly ONE
 /// `g` random/categorical block, and that adding the bare `+ g` introduces no
 /// extra `g` blocks beyond `y ~ s(x, by=g)` alone.
@@ -3234,8 +3234,8 @@ fn factor_by_smooth_plus_bare_categorical_does_not_duplicate_factor_block() {
         "`y ~ s(x, by=g)` must produce exactly one `g` design block"
     );
 
-    // The bug: adding a bare `+ g` (the fixed factor block owning the same
-    // level offsets) must NOT introduce a second `g`
+    // The bug: adding a bare `+ g` (auto-promoted to a penalized random
+    // block owning the same level offsets) must NOT introduce a second `g`
     // block. Before the fix this was 2.
     let by_plus_bare = g_blocks("y ~ s(x, by=g, k=10) + g");
     assert_eq!(
@@ -3250,83 +3250,6 @@ fn factor_by_smooth_plus_bare_categorical_does_not_duplicate_factor_block() {
         by_plus_bare, by_only,
         "the bare `+ g` collision must add zero extra `g` blocks (#1457)"
     );
-}
-
-/// pyGAM audit F1: `factor(g)` and a bare categorical `+ g` are FIXED
-/// effects — treatment-coded, unpenalized (so no smoothing parameter) and
-/// strict on unseen levels — while `group(g)`/`re(g)` stay penalized random
-/// effects with a full one-hot block. The two used to lower to the same
-/// penalized ridge, so a "fixed" factor was silently shrunk toward zero.
-#[test]
-fn factor_and_bare_categorical_lower_to_a_fixed_treatment_coded_factor() {
-    let ds = factor_dataset_l3();
-    let col_map = ds.column_map();
-    let g_term = |formula: &str| -> RandomEffectTermSpec {
-        let parsed = parse_formula(formula).expect("parse categorical formula");
-        let mut notes = Vec::new();
-        let terms = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
-            .unwrap_or_else(|err| panic!("`{formula}` must build, got: {err:?}"));
-        assert!(
-            terms.linear_terms.iter().all(|lt| lt.name != "g"),
-            "`{formula}` must not emit a numeric linear term for `g`"
-        );
-        let mut g_terms = terms.random_effect_terms.into_iter().filter(|rt| rt.name == "g");
-        let term = g_terms.next().expect("one `g` block");
-        assert!(g_terms.next().is_none(), "exactly one `g` block for `{formula}`");
-        term
-    };
-
-    for formula in ["y ~ factor(g)", "y ~ g", "y ~ x + g"] {
-        let term = g_term(formula);
-        assert!(!term.penalized, "`{formula}` must be an unpenalized fixed factor");
-        assert!(term.drop_first_level, "`{formula}` must be treatment-coded");
-        assert!(!term.lenient_unseen, "`{formula}` must reject unseen levels");
-    }
-    for formula in ["y ~ group(g)", "y ~ re(g)"] {
-        let term = g_term(formula);
-        assert!(term.penalized, "`{formula}` must stay a penalized random effect");
-        assert!(!term.drop_first_level, "`{formula}` keeps every level's column");
-        assert!(term.lenient_unseen, "`{formula}` tolerates held-out groups");
-    }
-}
-
-/// pyGAM audit F2: a categorical column in a term that reads its inputs as
-/// numeric axes must be a typed error pointing at `factor()`/`group()`,
-/// instead of fitting the level codes as positions on a line.
-#[test]
-fn categorical_column_in_a_numeric_axis_term_is_rejected() {
-    let ds = factor_dataset_l3();
-    let col_map = ds.column_map();
-    for formula in [
-        "y ~ s(g)",
-        "y ~ linear(g)",
-        "y ~ te(x, g)",
-        "y ~ s(g, bs=\"cc\")",
-        "y ~ thinplate(x, g)",
-        "y ~ matern(g)",
-    ] {
-        let parsed = parse_formula(formula).expect("parse numeric-axis formula");
-        let mut notes = Vec::new();
-        let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
-            .expect_err(&format!("`{formula}` must reject the categorical column"));
-        assert!(
-            matches!(err, TermBuilderError::IncompatibleConfig { .. }),
-            "`{formula}` must raise a typed IncompatibleConfig, got {err:?}"
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("'g' is categorical") && msg.contains("factor(g)") && msg.contains("group(g)"),
-            "`{formula}` must name the column and point at factor()/group(): {msg}"
-        );
-    }
-    // The factor-smooth family consumes the categorical as its grouping
-    // factor, so it is not a numeric axis there.
-    for formula in ["y ~ s(x, g, bs=\"fs\", k=5)", "y ~ s(x, by=g, k=5)"] {
-        let parsed = parse_formula(formula).expect("parse factor-smooth formula");
-        let mut notes = Vec::new();
-        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
-            .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
-    }
 }
 
 #[test]
@@ -5231,5 +5154,51 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
         assert!(err.contains("in term"), "`{term}`: {err}");
         assert!(err.contains("domain"), "`{term}`: {err}");
         assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
+    }
+}
+
+/// pyGAM audit F2: a categorical column in a term that reads its inputs as
+/// numeric axes must be a typed error pointing at `factor()`/`group()`,
+/// instead of fitting the level codes as positions on a line.
+#[test]
+fn categorical_column_in_a_numeric_axis_term_is_rejected() {
+    let ds = factor_dataset_l3();
+    let col_map = ds.column_map();
+    for formula in [
+        "y ~ s(g)",
+        "y ~ linear(g)",
+        "y ~ te(x, g)",
+        "y ~ s(g, bs=\"cc\")",
+        "y ~ thinplate(x, g)",
+        "y ~ matern(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse numeric-axis formula");
+        let mut notes = Vec::new();
+        let err = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .expect_err(&format!("`{formula}` must reject the categorical column"));
+        assert!(
+            matches!(err, TermBuilderError::IncompatibleConfig { .. }),
+            "`{formula}` must raise a typed IncompatibleConfig, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g' is categorical") && msg.contains("factor(g)") && msg.contains("group(g)"),
+            "`{formula}` must name the column and point at factor()/group(): {msg}"
+        );
+    }
+    // The factor-smooth family consumes the categorical as its grouping
+    // factor, and the categorical wrappers are its level effects, so none of
+    // these is a numeric axis.
+    for formula in [
+        "y ~ s(x, g, bs=\"fs\", k=5)",
+        "y ~ s(x, by=g, k=5)",
+        "y ~ x + g",
+        "y ~ x + factor(g)",
+        "y ~ x + group(g)",
+    ] {
+        let parsed = parse_formula(formula).expect("parse categorical formula");
+        let mut notes = Vec::new();
+        build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+            .unwrap_or_else(|err| panic!("`{formula}` must still build, got: {err:?}"));
     }
 }
