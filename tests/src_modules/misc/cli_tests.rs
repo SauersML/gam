@@ -1617,7 +1617,7 @@ fn cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631() {
     // ── CLI arm: the same request through `run_fit`, which fits `Surv(...)` through that service.
     run_fit(FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         request: None,
         formula_positional: Some(formula.to_string()),
         predict_noise: None,
@@ -1703,7 +1703,7 @@ fn cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631() {
     let model_path = td.path().join("weibull_default.model.json");
     run_fit(FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         request: None,
         formula_positional: Some("Surv(entry, exit, event) ~ x".to_string()),
         predict_noise: None,
@@ -2212,7 +2212,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
 
     run_fit(FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         request: None,
         formula_positional: Some("Surv(entry, exit, event) ~ 1".to_string()),
         predict_noise: Some("1".to_string()),
@@ -2448,7 +2448,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
 
     run_fit(FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         request: None,
         formula_positional: Some("y ~ x".to_string()),
         predict_noise: None,
@@ -3071,7 +3071,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
 
     let fit_args = FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         request: None,
         formula_positional: Some("y ~ x1 + x2".to_string()),
         predict_noise: None,
@@ -3354,7 +3354,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
 
     let fit_args = FitArgs {
         expectile_tau: None,
-        data: train_path,
+        data: train_path.clone(),
         // Firth bias-reduction is only implemented for the binomial logit
         // likelihood. The auto-detect default for binary responses is
         // probit (96df9f5/b0590db), so the formula must request logit
