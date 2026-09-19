@@ -156,5 +156,6 @@ nav:
     - Cookbook: cookbook.md
     - Benchmarks against pyGAM: benchmarks.md
     - GPU acceleration: gpu_acceleration.md
+    - Threads: threads.md
     - REML scaling: reml_scaling.md
   - Changelog: changelog.md

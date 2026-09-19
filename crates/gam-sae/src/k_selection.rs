@@ -11,8 +11,7 @@
 //! [`gam_solve::structure_search`] picks between manifold topologies, not a
 //! continuous smoothing parameter. The REML-always / no-GCV-BIC policy governs
 //! *fitting* (the continuous `ρ`/`λ` smoothing tier); discrete structure
-//! selection legitimately uses a knee/penalized-fit criterion (the topology
-//! search already uses `score='bic'` for the same reason). So the dictionary
+//! selection legitimately uses a knee/penalized-fit criterion. So the dictionary
 //! size is selected by either:
 //!
 //! * an **elbow / kneedle** criterion — pick the `K` at the saturation knee of
