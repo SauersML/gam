@@ -1,0 +1,4 @@
+convex fit wall 1.3s cpu 0.2s True
+convex predict wall 191.1s cpu 16.3s
+convex pdep 0.1s plugin 6.22e-06 post_mean 6.22e-06 lower -1.34e-06 upper 1.21e-05 pdep 8.01e-06 cov_src smoothing-corrected
+convex sample 0.1s draws (80, 60) frac_violating 0.0

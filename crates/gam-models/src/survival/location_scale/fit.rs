@@ -399,16 +399,30 @@ pub(crate) fn fit_survival_location_scale_terms(
             .as_ref()
             .is_some_and(|derivs| survival_psi_derivatives_support_exact_joint_hessian(derivs));
 
-    // The wiggle seed is sized by its penalties, the rule every other block's
-    // seed follows (`initial_log_lambdas`); a selected wiggle basis carries no
-    // caller seed, and a zero-length seed would give the outer layout no wiggle
-    // ρ beside a realized block that carries its penalties (#3006).
+    // One outer ρ per link-wiggle penalty, as the prepared `linkwiggle` block
+    // carries one free penalty per entry of `penalties`. The count is the
+    // block's penalty list, never the presence of a seed: a selected wiggle
+    // basis carries no seed, and counting the seed left the wiggle strength
+    // off the outer search (its penalty sat at the block's default seed).
+    // The seed default is the block's own (`initial_log_lambdas` in
+    // `prepare`), so the outer seed and the realized block agree.
     let wiggle_rho0 = match spec.linkwiggle_block.as_ref() {
-        Some(wiggle) => {
-            initial_log_lambdas(&wiggle.penalties, wiggle.initial_log_lambdas.clone())
-                .map_err(SurvivalLocationScaleError::from)?
-        }
         None => Array1::zeros(0),
+        Some(wiggle) => match wiggle.initial_log_lambdas.clone() {
+            None => Array1::zeros(wiggle.penalties.len()),
+            Some(seed) if seed.len() == wiggle.penalties.len() => seed,
+            Some(seed) => {
+                return Err(SurvivalLocationScaleError::DimensionMismatch {
+                    reason: format!(
+                        "survival link-wiggle initial_log_lambdas length mismatch: got {}, \
+                         expected {}",
+                        seed.len(),
+                        wiggle.penalties.len()
+                    ),
+                }
+                .into());
+            }
+        },
     };
     // Outer time-warp ρ count. In the reduced constant-scale-AFT regime the
     // time block collapses to its unpenalized affine null space (see
