@@ -4591,7 +4591,7 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         !centred.reference_refinements.is_empty(),
         "a risk-set centred fit must have refreshed its normaliser at least once"
     );
-    assert!(centred.reference_certificate.is_some_and(|gap| gap <= 1e-4));
+    assert!(centred.reference_certificate.is_some_and(|certificate| certificate <= spec.quadrature_tolerance));
     let reevaluated = centred.family.refresh_normaliser(&centred.fit.block_states).unwrap();
     assert_eq!(centred.centring.as_ref().unwrap().log_normaliser, reevaluated.log_normaliser);
     assert_eq!(centred.centring.as_ref().unwrap().log_risk_mass, reevaluated.log_risk_mass);
@@ -5015,6 +5015,101 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
         solved_elsewhere != offered_order,
         "a ladder starting at order {finer_order} must not read the order-{} candidate as its fit",
         reprior_setting.0
+    );
+}
+
+/// A reference grid is certified by the geometric tail of its fixed-coefficient
+/// refinement steps (#2986): `d₁ + d₂/(1 − q)`, `q = d₂/d₁`, with each step at
+/// the edge of its rounding band. The steps are dyadic, so every certificate
+/// is exact. Steps that do not contract have no tail, two exact zeros are a
+/// grid the objective does not read, and a first step inside its band leaves
+/// the ratio unresolved, which is refused.
+#[test]
+fn a_reference_grid_is_certified_by_the_geometric_tail_of_its_steps_2986() {
+    use super::family::{Shift, reference_tail};
+    let exact = |value: f64| Shift { value, band: 0.0 };
+    let tail = |first: Shift, second: Shift| {
+        let certificate = reference_tail(first, second);
+        emit(&format!("[2986 tail] {first:?}, {second:?}: {certificate:?}"));
+        certificate
+    };
+    let halving = tail(exact(1.0), exact(0.5)).expect("a contracting pair");
+    let banded = tail(Shift { value: 1.25, band: 0.25 }, Shift { value: 0.25, band: 0.25 }).expect("a banded pair");
+    let flat = tail(exact(0.5), exact(0.5)).expect("a pair that does not contract");
+    let unread = tail(exact(0.0), exact(0.0)).expect("an unread grid");
+    let inside = tail(Shift { value: 1e-3, band: 1e-3 }, exact(1e-4));
+    let vanished = tail(exact(0.0), exact(1e-4));
+    // 1 + (1/2)/(1/2).
+    assert_eq!(halving, Some(2.0), "the tail of steps 1 and 1/2 is 2");
+    // (5/4 + 1/4) + (1/4 + 1/4)/(1 − (1/2)/(5/4 − 1/4)): the bands are charged.
+    assert_eq!(banded, Some(2.5), "the tail of banded steps reads each at its band's edge");
+    assert_eq!(flat, None, "steps that do not contract have no tail");
+    assert_eq!(unread, Some(0.0), "a grid the objective does not read is certified at zero");
+    for (label, refusal) in [("inside its band", inside), ("vanished", vanished)] {
+        assert!(
+            matches!(refusal, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+            "a first step {label} leaves the ratio unresolved and must be refused: {refusal:?}"
+        );
+    }
+}
+
+/// The reference grid is chosen from fixed-coefficient steps, not by refitting
+/// rung by rung (#2986): the first grid whose tail certifies, with every step
+/// asked once, in order, and none past the one after the chosen grid. Grid 3's
+/// first step alone is within the tolerance, but its steps contract too slowly
+/// for their tail to be (`0.04 + 0.03/0.25 = 0.16`); grid 4's tail is
+/// `0.03 + 0.001/(1 − 1/30)`.
+#[test]
+fn the_reference_grid_is_the_first_whose_tail_certifies_2986() {
+    use super::family::{Shift, reference_tail, select_reference_grid};
+    let tolerance = 0.05;
+    let steps = [0.5, 0.04, 0.03, 0.001];
+    let mut asked = Vec::new();
+    let (chosen, certificate, read) = select_reference_grid(2, tolerance, |level| {
+        asked.push(level);
+        steps
+            .get(level - 2)
+            .map(|&value| Shift { value, band: 0.0 })
+            .ok_or_else(|| super::cohort::EventHistoryError::NumericalFailure {
+                reason: format!("grid {level} was asked past the fixture's steps"),
+            })
+    })
+    .expect("a grid certifies within the fixture's steps");
+    let expected = reference_tail(Shift { value: steps[2], band: 0.0 }, Shift { value: steps[3], band: 0.0 })
+        .expect("grid 4's tail")
+        .expect("grid 4's steps contract");
+    emit(&format!("[2986 select] chose grid {chosen} at {certificate:e} (expected {expected:e}); asked {asked:?}; read {read:?}"));
+    assert_eq!(chosen, 4, "the chosen grid must be the first whose tail certifies, grid 4");
+    assert_eq!(certificate, expected, "the chosen grid's certificate must be its tail");
+    assert_eq!(asked, vec![2, 3, 4, 5], "each step is asked once, in order, and none past the chosen grid's second");
+    assert_eq!(read.iter().map(|step| step.value).collect::<Vec<_>>(), steps.to_vec());
+}
+
+/// A refinement's coefficient move is `max_q |(V (g′ − g))_q| / sd_q` with its
+/// rounding band `γ_{p+3} max_q Σ_r |V_qr| |g′_r − g_r| / sd_q`, on a 2×2
+/// posterior whose arithmetic is exact (#2986). A gradient that is not finite
+/// is a typed failure, never a move a maximum skips, and a gradient of the
+/// wrong length is refused.
+#[test]
+fn a_refinement_shift_is_the_posterior_move_with_its_rounding_band_2986() {
+    use super::family::refinement_shift;
+    let covariance = array![[4.0, 2.0], [2.0, 9.0]];
+    let sd = [2.0, 3.0];
+    let shift = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5, -0.25]).expect("a finite move");
+    let poisoned = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[f64::NAN, -0.25]);
+    let short = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5]);
+    emit(&format!("[2986 shift] {shift:?}; poisoned {poisoned:?}; short {short:?}"));
+    // V δ = (3/2, −5/4): 3/4 and 5/12 posterior sd.
+    assert_eq!(shift.value, 0.75, "the move is the largest |V δ| / sd");
+    // Σ |V δ| / sd = (5/2)/2 and (13/4)/3.
+    assert_eq!(shift.band, 1.25 * gam_math::roundoff::accumulation_growth(5), "the band is γ_(p+3) max Σ|V δ| / sd");
+    assert!(
+        matches!(poisoned, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+        "a refined gradient that is not finite must be a typed failure: {poisoned:?}"
+    );
+    assert!(
+        matches!(short, Err(super::cohort::EventHistoryError::Fit { .. })),
+        "a refined gradient of the wrong length must be refused: {short:?}"
     );
 }
 

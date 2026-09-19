@@ -167,7 +167,11 @@ pub struct RiskSetCentring {
 }
 
 impl RiskSetCentring {
-    /// Compare reference calculations at identical parameters and profiles.
+    /// The largest difference of the log normalisers and log risk masses
+    /// between this reference calculation and a refined one at identical
+    /// parameters and profiles, in nats. The fit log reports it for the
+    /// grid it returns; the grid is certified in the coefficients' units
+    /// ([`reference_tail`]), and nothing gates on this.
     fn discrepancy(&self, refined: &Self, marks: usize) -> Result<f64, EventHistoryError> {
         if self.coefficients != refined.coefficients || self.profiles != refined.profiles
             || self.mask_of_mark != refined.mask_of_mark || self.masks != refined.masks {
@@ -1165,10 +1169,11 @@ pub(crate) struct EventHistorySpec {
     /// Starting Gauss-Hermite order per latent axis.
     pub gauss_hermite_order: usize,
     /// The certificate's tolerance: the largest shift any fitted coefficient
-    /// is estimated to make under a refinement of the Gauss-Hermite order
-    /// or time mesh, in units of its posterior standard deviation. This is
-    /// a local first-order stationarity check, not a bound on every forecast
-    /// or on the posterior approximation. The default is 0.05.
+    /// is estimated to make under a refinement of the Gauss-Hermite order,
+    /// the time mesh or the reference grid, in units of its posterior
+    /// standard deviation. This is a local first-order stationarity check,
+    /// not a bound on every forecast or on the posterior approximation. The
+    /// default is 0.05.
     pub quadrature_tolerance: f64,
     /// The reference population every mark's baseline is the marginal rate
     /// of. `None` centres the latent term on the stationary prior, so
@@ -1176,9 +1181,6 @@ pub(crate) struct EventHistorySpec {
     /// with; `Some` centres it on the risk set at every age, so `exp(η⁰)` is
     /// the incidence among those still at risk (see `super::preserve`).
     pub reference: Option<ReferenceStrata>,
-    /// Required maximum coarse/fine discrepancy in log reference moments
-    /// and log risk masses, evaluated at the same coefficient state.
-    pub reference_tolerance: f64,
     pub options: BlockwiseFitOptions,
 }
 
@@ -1190,7 +1192,6 @@ impl EventHistorySpec {
             gauss_hermite_order: 9,
             quadrature_tolerance: 5e-2,
             reference: None,
-            reference_tolerance: 1e-4,
             options: BlockwiseFitOptions::default(),
         }
     }
@@ -1289,12 +1290,16 @@ pub struct EventHistoryFit {
     pub rank_path: Vec<RankStep>,
     /// The decrease of the outer LAML criterion each accepted atom brought.
     pub atom_evidence: Vec<f64>,
-    /// Summed time and latent-order discrepancies at fixed coefficients, before each
-    /// refinement. Every returned reference fit meets reference_tolerance.
+    /// Per reference grid the selection ran on, in order, the first-order
+    /// move of any fitted coefficient the next grid makes at the fitted
+    /// coefficients, in posterior standard deviations ([`RefinementCheck`]).
     pub reference_refinements: Vec<f64>,
     /// Authoritative centring at the final coefficient state.
     pub centring: Option<RiskSetCentring>,
-    /// Sum of the fixed-parameter time and latent-order discrepancies; absent for prior centring.
+    /// The returned reference grid's certificate, in posterior standard
+    /// deviations: the geometric-tail estimate from its first two
+    /// fixed-coefficient refinement steps ([`reference_tail`]), within
+    /// `quadrature_tolerance`; absent for prior centring.
     pub reference_certificate: Option<f64>,
 }
 
@@ -1828,15 +1833,193 @@ pub struct UnresolvedGrowth {
     pub reason: String,
 }
 
+/// The number of intervals of the reference grid at `refinement`: the
+/// quadrature order's cells, halved `refinement` times.
+fn reference_intervals(quadrature_order: usize, refinement: usize) -> Result<usize, EventHistoryError> {
+    u32::try_from(refinement)
+        .ok()
+        .and_then(|shift| 1usize.checked_shl(shift))
+        .and_then(|cells| quadrature_order.max(2).checked_mul(cells))
+        .ok_or_else(|| EventHistoryError::NumericalFailure {
+            reason: format!("the reference grid at refinement {refinement} has more intervals than a machine word counts"),
+        })
+}
+
+/// The fit's posterior covariance over all `total` coefficients and each
+/// coefficient's posterior standard deviation: the operator a refinement's
+/// gradient discrepancy is turned into a coefficient move with, and the units
+/// that move is read in ([`RefinementCheck`]). The certificate needs the whole
+/// matrix, not only its diagonal: a gradient discrepancy in one coefficient
+/// moves every coefficient it is correlated with.
+fn posterior_scale(
+    fit: &UnifiedFitResult,
+    total: usize,
+) -> Result<(Array2<f64>, Vec<f64>), EventHistoryError> {
+    let covariance = fit
+        .beta_covariance()
+        .filter(|c| c.nrows() == total && c.ncols() == total)
+        .ok_or_else(|| EventHistoryError::Fit {
+            reason: format!(
+                "the fit carries no {total}×{total} posterior covariance, which the refinement certificate measures its shift in"
+            ),
+        })?
+        .clone();
+    let sd: Vec<f64> = (0..total)
+        .map(|q| covariance[[q, q]].max(0.0).sqrt())
+        .collect();
+    if let Some(q) = sd.iter().position(|s| !(s.is_finite() && *s > 0.0)) {
+        return Err(EventHistoryError::Fit {
+            reason: format!(
+                "coefficient {q} has no finite positive scale to measure a refinement's shift in ({}); it is unidentified at the fitted mode",
+                sd[q]
+            ),
+        });
+    }
+    Ok((covariance, sd))
+}
+
+/// A refinement's coefficient move ([`RefinementCheck`]): the largest
+/// `|(V (g′ − g))_q| / sd_q`, in posterior standard deviations, with the
+/// rounding band of computing it from the two gradients.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Shift {
+    pub value: f64,
+    /// `γ_{p+3} · max_q Σ_r |V_qr| |g′_r − g_r| / sd_q`, first order in the
+    /// unit roundoff: the subtraction, the `p`-term sum, the square root in
+    /// `sd_q` and the quotient. The gradients' and the covariance's own
+    /// rounding are not charged; no running bound is carried for either.
+    pub band: f64,
+}
+
+/// The move a refined setting's exact gradient `refined` makes the fitted
+/// mode take when it replaces the fitted setting's `current` at the same
+/// coefficients ([`Shift`]). A move that is not finite is a typed failure,
+/// never a shift a maximum silently skips.
+pub(crate) fn refinement_shift(
+    covariance: &Array2<f64>,
+    sd: &[f64],
+    current: &[f64],
+    refined: &[f64],
+) -> Result<Shift, EventHistoryError> {
+    let p = current.len();
+    if refined.len() != p || sd.len() != p || covariance.nrows() != p || covariance.ncols() != p {
+        return Err(EventHistoryError::Fit {
+            reason: format!(
+                "certificate: the refined setting has {} coefficients, the fit {p} with {} posterior scales and a {}×{} covariance",
+                refined.len(),
+                sd.len(),
+                covariance.nrows(),
+                covariance.ncols()
+            ),
+        });
+    }
+    let discrepancy: Vec<f64> = refined
+        .iter()
+        .zip(current.iter())
+        .map(|(refined, current)| refined - current)
+        .collect();
+    let growth = gam_math::roundoff::accumulation_growth(p + 3);
+    let (mut value, mut band) = (0.0_f64, 0.0_f64);
+    for (q, scale) in sd.iter().enumerate() {
+        let (mut move_q, mut magnitude) = (0.0_f64, 0.0_f64);
+        for (r, delta) in discrepancy.iter().enumerate() {
+            move_q += covariance[[q, r]] * delta;
+            magnitude += (covariance[[q, r]] * delta).abs();
+        }
+        let (shift_q, band_q) = (move_q.abs() / scale, growth * magnitude / scale);
+        if !(shift_q.is_finite() && band_q.is_finite()) {
+            return Err(EventHistoryError::NumericalFailure {
+                reason: format!(
+                    "certificate: coefficient {q} moves by {shift_q} posterior sd (rounding band {band_q}) under the refinement; the refined gradient is not finite"
+                ),
+            });
+        }
+        value = value.max(shift_q);
+        band = band.max(band_q);
+    }
+    Ok(Shift { value, band })
+}
+
+/// A reference grid's certificate, an estimate from its first two refinement
+/// steps at the fitted coefficients: `first`, this grid to the next, and
+/// `second`, the next grid to the one after. A move is a norm of `V (g′ − g)`,
+/// so the move to the limit grid is at most the sum of the steps, and were
+/// every step to contract by `q` that sum would be the geometric tail
+/// `d₁ + d₂/(1 − q)`, `q = d₂/d₁`. Each step is read at the edge of its rounding band against
+/// the certificate: `d₁ + b₁`, `d₂ + b₂` and `q = (d₂ + b₂)/(d₁ − b₁)`. The
+/// ratio is read from these two steps only, so the tail is an estimate, not
+/// a bound on the move: it covers the move only while the later steps
+/// contract at least that fast, and they need not (#2986: on seed 11 the later ratios were 0.62 and 0.34 after
+/// 0.059, and the direct move to the grid four halvings finer, 2.19e-4
+/// posterior sd, exceeded the tail, 2.12e-4), so the fit log prints every
+/// step it read.
+/// - `None` when the steps do not contract (`q ≥ 1`): the grid has no tail to
+///   read, and a finer grid is examined.
+/// - Two exact zeros are a grid the objective does not read, as at rank
+///   zero: certified at zero.
+/// - A first step within its rounding band leaves the ratio unresolved: a
+///   typed refusal, not a certificate.
+pub(crate) fn reference_tail(first: Shift, second: Shift) -> Result<Option<f64>, EventHistoryError> {
+    if first.value == 0.0 && second.value == 0.0 {
+        return Ok(Some(0.0));
+    }
+    let resolved = first.value - first.band;
+    if !(resolved > 0.0) {
+        return Err(EventHistoryError::NumericalFailure {
+            reason: format!(
+                "the reference grid's refinement moves the coefficients by {:.3e} posterior sd, within its rounding band {:.3e}, and the next refinement by {:.3e}: the steps' ratio is unresolved, so the grid has no certificate",
+                first.value, first.band, second.value
+            ),
+        });
+    }
+    let ratio = (second.value + second.band) / resolved;
+    if !(ratio < 1.0) {
+        return Ok(None);
+    }
+    Ok(Some(first.value + first.band + (second.value + second.band) / (1.0 - ratio)))
+}
+
+/// The first reference grid from `refinement` up whose tail estimate
+/// ([`reference_tail`]) is within `tolerance`, with that estimate and every
+/// step read on the way. `step(level)` is the fixed-coefficient move from grid
+/// `level` to grid `level + 1`, asked once per level, in order from
+/// `refinement`: a grid is examined only after every coarser one failed, so
+/// the selection reads no step past the one after the grid it picks. Nothing
+/// here refits. The steps are errors the fitted coefficients see, so the
+/// setting they pick is where selection is worth repeating.
+pub(crate) fn select_reference_grid(
+    refinement: usize,
+    tolerance: f64,
+    mut step: impl FnMut(usize) -> Result<Shift, EventHistoryError>,
+) -> Result<(usize, f64, Vec<Shift>), EventHistoryError> {
+    let mut steps = vec![step(refinement)?, step(refinement + 1)?];
+    let mut level = refinement;
+    loop {
+        let (first, second) = (steps[level - refinement], steps[level - refinement + 1]);
+        if let Some(certificate) = reference_tail(first, second)?
+            && certificate <= tolerance
+        {
+            return Ok((level, certificate, steps));
+        }
+        level += 1;
+        steps.push(step(level + 1)?);
+    }
+}
+
 /// The reference population's grid, its per-stratum designs, and where every
 /// cohort node sits on that grid.
 ///
 /// Uniform endpoints span the reference window. Every stratum shares these
-/// times, with its own covariate profile and contiguous design rows.
+/// times, with its own covariate profile and contiguous design rows. `widths`
+/// are the marks' design widths, the columns each mark's reference design
+/// materialises. The tables are admitted against the materialisation budget
+/// before anything is built, and the grid only while its times still resolve
+/// distinct steps.
 fn reference_tables(
     cohort: &EventHistoryCohort,
     strata: &ReferenceStrata,
     frozen_specs: &[TermCollectionSpec],
+    widths: &[usize],
     quadrature_order: usize,
     refinement: usize,
     nodes: &CohortNodes,
@@ -1860,13 +2043,33 @@ fn reference_tables(
             ),
         });
     }
-    let intervals = quadrature_order.max(2).checked_shl(refinement as u32)
-        .filter(|&n| n <= 32768).ok_or_else(|| EventHistoryError::NumericalFailure {
-            reason: "reference evolution exceeded its 32768-interval work limit".to_string(),
-        })?;
+    let intervals = reference_intervals(quadrature_order, refinement)?;
+    // Each grid row holds its covariate profile and time, then every mark's
+    // design row; the times and gaps are two more columns of the one stratum.
+    let rows = strata.strata().checked_mul(intervals + 1);
+    let columns = widths.iter().try_fold(cohort.covariates.ncols() + 3, |sum, width| sum.checked_add(*width));
+    let bytes = rows.zip(columns).and_then(|(rows, columns)| rows.checked_mul(columns)?.checked_mul(size_of::<f64>()));
+    let budget = gam_runtime::resource::ResourcePolicy::default_library().max_single_materialization_bytes;
+    if bytes.is_none_or(|bytes| bytes > budget) {
+        return Err(EventHistoryError::NumericalFailure {
+            reason: format!(
+                "the reference grid at refinement {refinement} ({intervals} intervals over {} strata) needs {} bytes of tables, above this machine's {budget}-byte materialisation budget",
+                strata.strata(),
+                bytes.map_or_else(|| "more than a machine word of".to_string(), |bytes| bytes.to_string())
+            ),
+        });
+    }
     let times: Vec<f64> = (0..=intervals).map(|n|
         if n == intervals { exit } else { entry + (exit - entry) * n as f64 / intervals as f64 }).collect();
     let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
+    if let Some(n) = grid.gaps.iter().position(|gap| !(*gap > 0.0)) {
+        return Err(EventHistoryError::NumericalFailure {
+            reason: format!(
+                "the reference grid at refinement {refinement} ({intervals} intervals over ({entry}, {exit})) no longer resolves its steps: interval {n} is {}",
+                grid.gaps[n]
+            ),
+        });
+    }
     let mut node_data = Array2::<f64>::zeros((strata.strata() * grid.len(), cohort.covariates.ncols() + 1));
     for (s, &profile) in strata.rows.iter().enumerate() {
         for (n, &time) in grid.times.iter().enumerate() {
@@ -2030,6 +2233,7 @@ pub(crate) fn fit_at_rank(
                 cohort,
                 strata,
                 &frozen_specs,
+                &dense.iter().map(|design| design.ncols()).collect::<Vec<_>>(),
                 spec.quadrature_order,
                 reference_refinement,
                 &nodes,
@@ -2105,27 +2309,7 @@ pub(crate) fn fit_at_rank(
             .family
             .exact_gradient(&states)
             .map_err(|reason| typed_failure(&candidate.family, reason))?;
-        if refined_gradient.len() != current_gradient.len() {
-            return Err(EventHistoryError::Fit {
-                reason: format!(
-                    "certificate: the refined setting has {} coefficients, the fit {}",
-                    refined_gradient.len(),
-                    current_gradient.len()
-                ),
-            });
-        }
-        let discrepancy: Vec<f64> = refined_gradient
-            .iter()
-            .zip(current_gradient.iter())
-            .map(|(refined, current)| refined - current)
-            .collect();
-        let mut shift = 0.0_f64;
-        for (q, scale) in sd.iter().enumerate() {
-            let move_q: f64 = (0..discrepancy.len())
-                .map(|r| covariance[[q, r]] * discrepancy[r])
-                .sum();
-            shift = shift.max(move_q.abs() / scale);
-        }
+        let shift = refinement_shift(covariance, sd, current_gradient, &refined_gradient)?.value;
         let log_likelihood = candidate
             .family
             .log_likelihood(&states)
@@ -2205,30 +2389,7 @@ pub(crate) fn fit_at_rank(
                 return Err(failure);
             }
         };
-        let total = built.family.total_width();
-        // The certificate turns a gradient discrepancy into a coefficient
-        // one through the posterior covariance, and reads the result in
-        // posterior standard deviations, so it needs the whole matrix.
-        let covariance = fit
-            .beta_covariance()
-            .filter(|c| c.nrows() == total && c.ncols() == total)
-            .ok_or_else(|| EventHistoryError::Fit {
-                reason: format!(
-                    "the fit carries no {total}×{total} posterior covariance, which the refinement certificate measures its shift in"
-                ),
-            })?
-            .clone();
-        let sd: Vec<f64> = (0..total)
-            .map(|q| covariance[[q, q]].max(0.0).sqrt())
-            .collect();
-        if let Some(q) = sd.iter().position(|s| !(s.is_finite() && *s > 0.0)) {
-            return Err(EventHistoryError::Fit {
-                reason: format!(
-                    "coefficient {q} has no finite positive scale to measure a refinement's shift in ({}); it is unidentified at the fitted mode",
-                    sd[q]
-                ),
-            });
-        }
+        let (covariance, sd) = posterior_scale(&fit, built.family.total_width())?;
         let value = fit.log_likelihood;
         let current_gradient = built
             .family
@@ -2612,6 +2773,7 @@ fn added_atom_probe_on_mesh(
             cohort,
             strata,
             &fit.frozen_specs,
+            &dense.iter().map(|design| design.ncols()).collect::<Vec<_>>(),
             spec.quadrature_order,
             reference_refinement,
             &nodes,
@@ -3461,70 +3623,89 @@ fn raise_incumbent(
 }
 
 /// Fit and select structure under one reference-normalised objective, then
-/// verify reference discretisation at fixed coefficients. If unresolved,
-/// repeat selection under the refined objective; never reinterpret a rank
-/// selected under stationary-prior centring as reference-law evidence.
+/// check the reference grid the way the refinement ladder checks the latent
+/// order and the time mesh ([`RefinementCheck`]): at the fitted coefficients,
+/// by the first-order move each finer grid makes the penalised mode take, in
+/// posterior standard deviations, against the same tolerance. The grid is
+/// certified by the geometric-tail estimate of those moves
+/// ([`reference_tail`]). The
+/// latent order the reference law is integrated at is the fit's own, which the
+/// ladder has already certified: its Gauss-Hermite rung evaluates the
+/// normaliser at the raised order too.
+///
+/// A grid that fails is not refitted rung by rung. The same fixed-coefficient
+/// steps continue to the first finer grid whose tail estimate is within it
+/// ([`select_reference_grid`]), and selection repeats once, under that
+/// grid's objective; a rank selected under one reference grid is never read
+/// as evidence under another. Each repeat refines the grid strictly, so the
+/// loop ends where the grid's own admission ([`reference_tables`]) or the
+/// evaluation's ([`preflight`]) refuses it, or where a step is no longer
+/// resolved above its rounding.
 pub(crate) fn fit_event_history(
     cohort: &mut EventHistoryCohort, spec: &EventHistorySpec,
 ) -> Result<EventHistoryFit, EventHistoryError> {
-    if !(spec.reference_tolerance.is_finite() && spec.reference_tolerance > 0.0) {
-        return Err(EventHistoryError::InvalidInput { reason: "reference tolerance must be finite and positive".to_string() });
-    }
-    let mut discrepancies = Vec::new();
-    let mut fitting_spec = spec.clone();
+    let mut shifts = Vec::new();
     let mut refinement = 2;
-    for _ in 0..16 {
-        let mut fit = match fit_event_history_on_grid(cohort, &fitting_spec, refinement) {
+    loop {
+        let mut fit = match fit_event_history_on_grid(cohort, spec, refinement) {
             Ok(fit) => fit,
             // The reference midpoint map does not contract at this grid's step
             // length, and a finer grid shortens the step.
             Err(refusal @ EventHistoryError::ReferenceStep { .. }) => {
                 log::info!("[event-history] reference refinement {refinement}: {refusal}; refining the reference grid");
                 refinement += 1;
-                if refinement > 10 { return Err(refusal); }
                 continue;
             }
             Err(error) => return Err(error),
         };
         let Some(strata) = spec.reference.as_ref() else { return Ok(fit); };
-        let refined = reference_tables(cohort, strata, &fit.frozen_specs,
-            spec.quadrature_order, refinement + 1, &fit.nodes)?;
-        let fine_family = fit.family.clone().with_reference(Some(Arc::new(refined)));
-        let fine = fine_family.refresh_normaliser(&fit.fit.block_states)?;
-        let coarse_centring = fit.centring.as_ref().ok_or_else(|| EventHistoryError::Fit {
+        let started = std::time::Instant::now();
+        let total = fit.family.total_width();
+        let (covariance, sd) = posterior_scale(&fit.fit, total)?;
+        let widths: Vec<usize> = fit.designs.iter().map(|design| design.design.ncols()).collect();
+        let states = &fit.fit.block_states;
+        let mut previous = fit.family.exact_gradient(states)
+            .map_err(|reason| typed_failure(&fit.family, reason))?;
+        let mut next_grid = None;
+        let (chosen, certificate, steps) = select_reference_grid(refinement, spec.quadrature_tolerance, |level| {
+            let finer = level + 1;
+            preflight(fit.family.gh.order, fit.rank(), reference_intervals(spec.quadrature_order, finer)? + 1,
+                fit.marks(), total)?;
+            let tables = reference_tables(cohort, strata, &fit.frozen_specs, &widths,
+                spec.quadrature_order, finer, &fit.nodes)?;
+            let family = fit.family.clone().with_reference(Some(Arc::new(tables)));
+            let gradient = family.exact_gradient(states).map_err(|reason| typed_failure(&family, reason))?;
+            let step = refinement_shift(&covariance, &sd, &previous, &gradient)?;
+            previous = gradient;
+            if level == refinement {
+                next_grid = Some(family);
+            }
+            Ok(step)
+        })?;
+        shifts.push(steps[0].value);
+        // The grid's own error in nats, beside the estimate that governs it.
+        let coarse = fit.centring.as_ref().ok_or_else(|| EventHistoryError::Fit {
             reason: "reference fit is missing its centring values".to_string(),
         })?;
-        let time_gap = coarse_centring.discrepancy(&fine, fit.marks())?;
-        let next_order = fit.family.gh.order + 4;
-        let latent_gap = if fit.rank() == 0 { 0.0 } else {
-            preflight(next_order, fit.rank(), fine.grid.len(), fit.marks(), fit.family.total_width())?;
-            let mut latent_family = fine_family.clone();
-            latent_family.gh = Arc::new(GaussHermite::new(next_order)?);
-            if !latent_family.held_rates.iter().all(|r| *r == Some(0.0))
-                && latent_family.gh.lebesgue_constant * f64::EPSILON * fine.grid.len() as f64
-                    > spec.reference_tolerance {
-                return Err(EventHistoryError::NumericalFailure { reason:
-                    "reference latent quadrature cannot be refined within its interpolation roundoff bound".to_string() });
-            }
-            let latent = latent_family.refresh_normaliser(&fit.fit.block_states)?;
-            fine.discrepancy(&latent, fit.marks())?
-        };
-        let gap = time_gap + latent_gap;
-        discrepancies.push(gap);
-        log::info!("[event-history] reference refinement {refinement}: time discrepancy {time_gap:.3e}, latent discrepancy {latent_gap:.3e} nats");
-        if gap <= spec.reference_tolerance {
-            fit.reference_certificate = Some(gap);
-            fit.reference_refinements = discrepancies;
+        let next = next_grid.ok_or_else(|| EventHistoryError::Fit {
+            reason: "the reference certificate read no finer grid".to_string(),
+        })?;
+        let nats = coarse.discrepancy(&next.refresh_normaliser(states)?, fit.marks())?;
+        log::info!(
+            "[event-history] reference refinement {refinement} (rank {}, Gauss-Hermite order {}, mesh {}): fixed-coefficient steps {:?} posterior sd (bands {:?}); grid {chosen}'s tail estimate {certificate:.3e} is within {}; the next grid moves the log normalisers by {nats:.3e} nats; {:.3} s",
+            fit.rank(),
+            fit.quadrature.gauss_hermite_order,
+            fit.quadrature.mesh_refinement,
+            steps.iter().map(|step| step.value).collect::<Vec<_>>(),
+            steps.iter().map(|step| step.band).collect::<Vec<_>>(),
+            spec.quadrature_tolerance,
+            started.elapsed().as_secs_f64()
+        );
+        if chosen == refinement {
+            fit.reference_certificate = Some(certificate);
+            fit.reference_refinements = shifts;
             return Ok(fit);
         }
-        if latent_gap > time_gap {
-            fitting_spec.gauss_hermite_order = next_order;
-        } else {
-            refinement += 1;
-            if refinement > 10 { break; }
-        }
+        refinement = chosen;
     }
-    Err(EventHistoryError::NumericalFailure {
-        reason: format!("reference evolution unresolved after refinement: {:?}", discrepancies),
-    })
 }
