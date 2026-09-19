@@ -1102,9 +1102,21 @@ struct SmoothTermLrRow {
     correction_provenance: &'static str,
 }
 
+/// A smooth term the per-term LR test does not report, with its typed reason.
+#[derive(Serialize)]
+struct SmoothTermLrUnavailableRow {
+    name: String,
+    term_idx: usize,
+    /// Machine-readable reason, e.g. `"shape_constrained"`.
+    p_value_unavailable: &'static str,
+    /// One-sentence explanation of why no p-value exists.
+    explanation: &'static str,
+}
+
 #[derive(Serialize)]
 struct SmoothTermLrPayload {
     smooth_terms: Vec<SmoothTermLrRow>,
+    unavailable: Vec<SmoothTermLrUnavailableRow>,
 }
 
 fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
@@ -1247,6 +1259,7 @@ fn smooth_term_lr_inference_dataset_json_impl(
     if spec.smooth_terms.is_empty() {
         let payload = SmoothTermLrPayload {
             smooth_terms: Vec::new(),
+            unavailable: Vec::new(),
         };
         return serde_json::to_string(&payload)
             .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"));
@@ -1316,7 +1329,21 @@ fn smooth_term_lr_inference_dataset_json_impl(
         })
         .collect::<Vec<_>>();
 
-    let payload = SmoothTermLrPayload { smooth_terms };
+    let unavailable =
+        gam::families::fit_orchestration::drivers::smooth_term_lr_unavailable_forspec(&spec)
+            .into_iter()
+            .map(|r| SmoothTermLrUnavailableRow {
+                name: r.name,
+                term_idx: r.term_idx,
+                p_value_unavailable: r.reason.label(),
+                explanation: r.reason.explanation(),
+            })
+            .collect::<Vec<_>>();
+
+    let payload = SmoothTermLrPayload {
+        smooth_terms,
+        unavailable,
+    };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"))
 }

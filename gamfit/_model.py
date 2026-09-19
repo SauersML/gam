@@ -587,9 +587,17 @@ class Model:
         null refit converged, else ``"none"`` (the uncorrected reference stands,
         never weakened).
 
+        A shape-constrained smooth (``shape=...``) gets no LR p-value. Its null
+        :math:`f = 0` is the apex of the constraint cone and the fitted
+        coefficients are a truncated posterior mean, so no :math:`\\chi^2`,
+        spectral or chi-bar-square reference is calibrated. Such a term appears
+        as a row with only ``name``, ``term_idx``, ``p_value_unavailable``
+        (``"shape_constrained"``) and ``explanation``; every tested row carries
+        no ``p_value_unavailable`` key.
+
         Needs the training ``data`` for the per-term null refits, exactly as
-        :meth:`curvature` does. Returns an empty list when the model has no
-        penalized smooth term.
+        :meth:`curvature` does. Rows are in term order. Returns an empty list
+        when the model has no penalized smooth term.
         """
         headers, rows, _ = normalize_table(data)
         try:
@@ -599,7 +607,8 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
         payload = json.loads(raw)
-        return list(payload.get("smooth_terms", []))
+        terms = list(payload["smooth_terms"]) + list(payload["unavailable"])
+        return sorted(terms, key=lambda row: row["term_idx"])
 
     def basis_check(self, data: Any) -> list[dict[str, Any]]:
         r"""Per-smooth basis-adequacy report: is each smooth's basis big enough (#2774)?

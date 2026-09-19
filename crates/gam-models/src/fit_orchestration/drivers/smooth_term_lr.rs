@@ -2539,6 +2539,40 @@ impl SmoothLrReferenceDf {
     }
 }
 
+/// A smooth term the per-term LR test does not report, with the typed reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmoothTermLrUnavailable {
+    /// Smooth-term name (matches the summary row).
+    pub name: String,
+    /// Smooth-term index within `resolvedspec.smooth_terms`.
+    pub term_idx: usize,
+    /// Why no p-value exists for this term.
+    pub reason: gam_solve::estimate::SmoothPValueUnavailable,
+}
+
+/// The smooth terms of `resolvedspec` that [`smooth_term_lr_inference_forspec`]
+/// cannot test, each with its typed reason. A shape-constrained term's null
+/// `f = 0` is the apex of its constraint cone, so the LR statistic has no
+/// calibrated reference law (see [`gam_solve::estimate::SmoothPValueUnavailable`]).
+pub fn smooth_term_lr_unavailable_forspec(
+    resolvedspec: &TermCollectionSpec,
+) -> Vec<SmoothTermLrUnavailable> {
+    resolvedspec
+        .smooth_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(term_idx, term)| {
+            gam_solve::estimate::smooth_pvalue_unavailable(term.shape).map(|reason| {
+                SmoothTermLrUnavailable {
+                    name: term.name.clone(),
+                    term_idx,
+                    reason,
+                }
+            })
+        })
+        .collect()
+}
+
 /// The Bartlett-corrected per-term significance report for one penalized smooth
 /// term (#1063). Unlike the summary table's Wood rank-truncated **Wald**
 /// statistic, this is a genuine **likelihood-ratio** statistic from a
@@ -2706,8 +2740,10 @@ fn fitted_rho_penalty_components(
 /// 5. Otherwise (no closed-form jets, or a null refit that did not converge) the
 ///    uncorrected `χ²_d` stands with provenance `none` — never weakened.
 ///
-/// Random-effect smooths and shape-constrained smooths are skipped (their tests
-/// are not a central-χ² LR), matching the summary table's policy.
+/// Random-effect smooths are skipped (their tests are not a central-χ² LR).
+/// Shape-constrained smooths are skipped too; they have no calibrated LR
+/// reference, and [`smooth_term_lr_unavailable_forspec`] names them with the
+/// typed reason, matching the summary table's policy.
 pub fn smooth_term_lr_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2838,9 +2874,9 @@ pub fn smooth_term_lr_inference_forspec(
         let (block_start, k) = penalty_range
             .map(|range| (range.start, range.len()))
             .unwrap_or((0, 0));
-        // Shape-constrained smooths get no central-χ² LR (cone-projected
-        // boundary test); the summary table skips them too.
-        if design_term.shape != ShapeConstraint::None {
+        // Shape-constrained smooths have no calibrated LR reference; they are
+        // reported by `smooth_term_lr_unavailable_forspec` instead.
+        if gam_solve::estimate::smooth_pvalue_unavailable(design_term.shape).is_some() {
             continue;
         }
         // Shifted into the GLOBAL coefficient layout — see `smooth_start` above.

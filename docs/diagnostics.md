@@ -58,6 +58,30 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
 
+### Shape-constrained smooths have no significance p-value
+
+A smooth with `shape=monotone_increasing` (or `monotone_decreasing`, `convex`,
+`concave`) reports `edf` and `ref_df` in `summary().smooth_terms` but no
+`chi_sq` or `p_value`. The row carries `p_value_unavailable =
+"shape_constrained"` instead, and `model.smooth_significance(data)` returns the
+same reason in place of an LR row. The printed summary (Python and CLI) names
+the reason under the smooth table.
+
+Why the number is withheld:
+
+- The null `f = 0` is the apex of the constraint cone. Under a flat truth the
+  estimator sits on the cone boundary, so neither the Wald χ² nor the LR's
+  spectral reference describes the statistic's null law.
+- Chi-bar-square (a mixture of χ² laws weighted by the cone's face
+  probabilities) and tests conditional on the active set are the textbook fixes.
+  Both are the null law of the **cone projection** with a fixed cone. The
+  coefficients here are the **truncated posterior mean**, which lies strictly
+  inside the cone and has no active set. Its λ is selected by REML on the same
+  data. Neither reference applies.
+
+`basis_check` is unaffected: it tests structure outside the term's column span,
+which the cone does not restrict.
+
 ## basis_check() — is the basis big enough?
 
 A converged, `certified` fit says nothing about whether the basis it was given

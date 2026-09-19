@@ -225,7 +225,11 @@ class Summary:
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
         and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
         Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
-        only. Empty when the model has no smooth or random-effect terms; every
+        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
+        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
+        instead, because its null ``f = 0`` is the apex of the constraint cone
+        and no calibrated reference exists for the truncated posterior mean.
+        Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
         Why :attr:`smooth_terms` could not be built (a model saved without its
@@ -446,7 +450,8 @@ class Summary:
         table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``, ``p_value``
         (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
-        Wood Wald test for ordinary penalized smooths).
+        Wood Wald test for ordinary penalized smooths). A shape-constrained row
+        adds a ``p_value_unavailable`` column naming the reason.
         """
         import pandas as pd
 
