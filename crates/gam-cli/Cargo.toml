@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gam = { path = "../.." }
+gam-build-identity = { path = "../gam-build-identity" }
 gam-data = { path = "../gam-data" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
