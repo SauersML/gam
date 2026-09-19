@@ -1,9 +1,21 @@
 use super::*;
 
+/// `gam --version`: the package version, which every commit between releases
+/// shares, then the commit and saved-model payload version that tell two
+/// engines apart (gam#3007, gam#3157).
+static LONG_VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{}\ncommit {}\nmodel payload version {}",
+        env!("CARGO_PKG_VERSION"),
+        gam_build_identity::describe(),
+        gam::inference::model::MODEL_PAYLOAD_VERSION
+    )
+});
+
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
 #[command(about = "Formula-first GAM CLI", long_about = None)]
-#[command(version)]
+#[command(version, long_version = LONG_VERSION.as_str())]
 #[command(arg_required_else_help = true)]
 pub(crate) struct Cli {
     #[command(subcommand)]

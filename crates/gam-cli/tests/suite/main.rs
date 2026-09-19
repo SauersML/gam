@@ -10,6 +10,7 @@ mod latent_measure_request_document_2956;
 mod bug_hunt_predict_uncertainty_shifts_point_mean_for_curved_link;
 mod bug_hunt_sas_link_finalize_inner_cap_leak;
 mod bug_hunt_sas_link_outer_inner_cap_guard;
+mod build_identity_version_3007;
 mod cli_bad_input_contract;
 mod criterion_absence_words_on_fit_lines_2627;
 mod fit_data_boundary;
