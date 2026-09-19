@@ -37,34 +37,13 @@ path = "src/lib.rs"
 # adding a `publish = false` path-dependency under a publishable crate. The
 # measured first cut is the opposite direction — peel upper leaves (predict, CLI)
 # off a temporarily-monolithic engine. See the #1521 thread for the plan.
-members = [
-    "crates/gam-data",
-    "crates/gam-spec",
-    "crates/gam-linalg",
-    "crates/gam-linalg-test-support",
-    "crates/gam-geometry",
-    "crates/gam-model-api",
-    "crates/gam-gpu",
-    "crates/gam-identifiability",
-    "crates/gam-terms",
-    "crates/gam-solve",
-    "crates/gam-model-kernels",
-    "crates/gam-custom-family",
-    "crates/gam-models",
-    "crates/gam-event-history",
-    "crates/gam-row-macros",
-    "crates/gam-inference",
-    "crates/gam-report",
-    "crates/gam-config",
-    "crates/gam-sae",
-    "crates/gam-cli",
-    "crates/gam-math",
-    "crates/gam-predict",
-    "crates/gam-problem",
-    "crates/gam-pyffi",
-    "crates/gam-runtime",
-    "crates/gam-test-support",
-]
+# Every directory under crates/ is a member. The glob (not a list) is what
+# keeps the PyPI sdist's workspace equal to this one: maturin keeps a glob
+# member that matches a path dependency of the extension and drops every listed
+# member that is not one, which would leave the shipped Cargo.lock describing
+# a crate the sdist no longer has and `locked = true` (pyproject.toml) refusing
+# to build it. pyproject.toml ships crates/gam-cli for the same reason.
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.dependencies]

@@ -3,6 +3,7 @@
 import importlib.util
 import pathlib
 import re
+import subprocess
 import sys
 import unittest
 
@@ -31,7 +32,33 @@ class PyprojectMatrixTests(unittest.TestCase):
     def test_every_advertised_version_is_installed_on_the_reference_family(self):
         versions = wheel_smoke.classifier_python_versions(self.project)
         matrix = wheel_smoke.build_matrix(["linux-x86_64"], self.project)["include"]
-        self.assertEqual([lane["python"] for lane in matrix], versions)
+        self.assertEqual([lane["python"] for lane in matrix if not lane["free_threaded"]], versions)
+
+    def test_free_threaded_wheels_are_built_and_installed_on_every_family(self):
+        self.assertEqual(wheel_smoke.free_threaded_python_versions(self.project), ["3.14t"])
+        self.assertEqual(wheel_smoke.build_interpreters(self.project), ["3.10", "3.14t"])
+        matrix = wheel_smoke.build_matrix(list(wheel_smoke.SCOPES["full"]), self.project)["include"]
+        for family in wheel_smoke.FAMILIES:
+            lanes = [lane for lane in matrix if lane["family"] == family and lane["free_threaded"]]
+            self.assertEqual([lane["python"] for lane in lanes], ["3.14t"], family)
+            self.assertEqual({lane["resolution"] for lane in lanes}, {"highest"}, family)
+
+    def test_free_threaded_lanes_follow_the_classifier(self):
+        classifiers = [c for c in self.project["classifiers"] if "Free Threading" not in c]
+        project = dict(self.project, classifiers=classifiers)
+        self.assertEqual(wheel_smoke.free_threaded_python_versions(project), [])
+        self.assertEqual(wheel_smoke.build_interpreters(project), ["3.10"])
+        matrix = wheel_smoke.build_matrix(["linux-x86_64"], project)["include"]
+        self.assertFalse(any(lane["free_threaded"] for lane in matrix))
+
+    def test_the_workflows_read_the_matrix_and_interpreters_from_the_command_line(self):
+        # The workflows run the CLI, not build_matrix: it must read the
+        # [project] table itself.
+        script = ROOT / "scripts/wheel_smoke.py"
+        for args in (["matrix", "--scope", "full"], ["matrix", "--families", "linux-x86_64"], ["interpreters"]):
+            done = subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.split(), wheel_smoke.build_interpreters(self.project))
 
     def test_every_family_brackets_the_range_with_the_floor_on_lowest_requirements(self):
         versions = wheel_smoke.classifier_python_versions(self.project)
@@ -84,6 +111,28 @@ class RequirementTests(unittest.TestCase):
         self.assertEqual(closure, {"gamfit", "numpy", "foo-bar"})
 
 
+class WheelSelectionTests(unittest.TestCase):
+    WHEELS = [
+        pathlib.Path("gamfit-0.1.268-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        pathlib.Path("gamfit-0.1.268-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+        pathlib.Path("gamfit-0.1.268-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"),
+    ]
+
+    def test_gil_interpreters_install_the_abi3_wheel(self):
+        for tag in ("cp310", "cp313", "cp314"):
+            self.assertEqual(wheel_smoke.wheel_for(self.WHEELS, tag, False), self.WHEELS[0], tag)
+
+    def test_free_threaded_interpreters_install_their_own_wheel(self):
+        self.assertEqual(wheel_smoke.wheel_for(self.WHEELS, "cp313", True), self.WHEELS[1])
+        self.assertEqual(wheel_smoke.wheel_for(self.WHEELS, "cp314", True), self.WHEELS[2])
+
+    def test_a_missing_or_ambiguous_wheel_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "exactly one cp315t"):
+            wheel_smoke.wheel_for(self.WHEELS, "cp315", True)
+        with self.assertRaisesRegex(SystemExit, "exactly one abi3"):
+            wheel_smoke.wheel_for(self.WHEELS[:1] * 2, "cp310", False)
+
+
 class WheelContentTests(unittest.TestCase):
     def test_package_sources_marker_and_extension_are_clean(self):
         paths = [
@@ -120,6 +169,19 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("- smoke", needs)
         self.assertIn("needs.smoke.result == 'success'", needs)
         self.assertRegex(release, r"twine check --strict dist/\*")
+
+    def test_every_pypi_builder_builds_the_free_threaded_interpreters(self):
+        workflow = (ROOT / ".github/workflows/pypi-wheels.yml").read_text()
+        for job in ("linux", "musllinux", "macos", "windows"):
+            body = workflow[workflow.index(f"\n  {job}:\n") :]
+            body = body[: body.index("upload-artifact")]
+            self.assertRegex(body, r"-i \$\{\{ (needs\.gate|steps\.interpreters)\.outputs\.", job)
+        self.assertTrue("python3 scripts/wheel_smoke.py interpreters" in workflow, "pypi-wheels.yml")
+
+    def test_the_rolling_build_ships_and_smokes_free_threaded_wheels(self):
+        workflow = (ROOT / ".github/workflows/wheel-nightly.yml").read_text()
+        for needle in ("python3 scripts/wheel_smoke.py interpreters", "gamfit-free-threaded-"):
+            self.assertTrue(needle in workflow, f"wheel-nightly.yml lacks {needle!r}")
 
     def test_smoke_jobs_run_the_shared_script_without_the_package_checkout(self):
         for name in ("pypi-wheels.yml", "wheel-nightly.yml"):

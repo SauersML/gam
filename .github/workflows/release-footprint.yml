@@ -1,0 +1,56 @@
+name: Release footprint
+
+# PyPI keeps every file of every release against one project size limit
+# (RELEASING.md), so the sdist that pypi-wheels.yml would upload is built and
+# checked on every change that can alter it, not first at release time:
+# scripts/release_footprint.py compiles it exactly as shipped with its
+# Cargo.lock and refuses any file that compilation never reads (a test module,
+# fixture, example or benchmark that the [tool.maturin] excludes in
+# pyproject.toml missed). pypi-wheels.yml runs the same check before upload.
+
+on:
+  pull_request:
+    paths:
+      # Any crate file: a new test module or fixture ships unless an exclude
+      # covers it, and a new source ships only if no exclude drops it.
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "build.rs"
+      - "pyproject.toml"
+      - "scripts/release_footprint.py"
+      - ".github/workflows/release-footprint.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-footprint-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # The maturin pypi-wheels.yml builds the published sdist with.
+      - name: Build the sdist
+        run: |
+          set -euo pipefail
+          python -m pip install maturin==1.14.1
+          maturin sdist --out dist --manifest-path crates/gam-pyffi/Cargo.toml
+      - name: Check the sdist footprint
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          python scripts/release_footprint.py sdist dist/*.tar.gz --target-dir "$RUNNER_TEMP/sdist-target"

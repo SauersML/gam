@@ -71,6 +71,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       smoke_matrix: ${{ steps.smoke-matrix.outputs.matrix }}
+      interpreters: ${{ steps.interpreters.outputs.versions }}
+      linux_interpreters: ${{ steps.interpreters.outputs.linux }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -108,6 +110,21 @@ jobs:
           matrix=$(python3 scripts/wheel_smoke.py matrix --scope "$SCOPE")
           echo "$matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      # One abi3 wheel on the requires-python floor plus one wheel per
+      # free-threaded version, from the same classifiers. The manylinux and
+      # musllinux images name their interpreters python3.X[t]; maturin builds
+      # one they lack from its bundled sysconfig, which is all a Linux
+      # extension needs (it does not link libpython).
+      - name: Plan the build interpreters
+        id: interpreters
+        shell: bash
+        run: |
+          set -euo pipefail
+          versions=$(python3 scripts/wheel_smoke.py interpreters)
+          echo "$versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "linux=$(printf 'python%s ' $versions)" >> "$GITHUB_OUTPUT"
 
       # Resolve metadata once before the matrix fans out. Running without
       # --locked is deliberate in this ephemeral checkout: Cargo can reveal the
@@ -164,6 +181,7 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+            -i ${{ needs.gate.outputs.linux_interpreters }}
           manylinux: 2014
           # #1534: inside the manylinux container the mounted workspace is
           # owned by a different uid than the build user, so git refuses
@@ -222,6 +240,7 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+            -i ${{ needs.gate.outputs.linux_interpreters }}
           manylinux: musllinux_1_2
           # #1534: same dubious-ownership fix as the manylinux job — the
           # musllinux_1_2 container mounts the workspace under a foreign uid,
@@ -275,6 +294,25 @@ jobs:
           source .github/scripts/release-cache.sh
           release_cache_start
           echo "RUSTC_WRAPPER=$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+      # macOS and Windows extensions link against the interpreter, so each
+      # build interpreter must exist on the runner: uv's managed CPython
+      # builds include the free-threaded ones.
+      - name: Install the build interpreters
+        id: interpreters
+        shell: bash
+        env:
+          INTERPRETERS: ${{ needs.gate.outputs.interpreters }}
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          python -m uv python install $INTERPRETERS
+          paths=()
+          for version in $INTERPRETERS; do
+            path=$(python -m uv python find "$version")
+            paths+=("$path")
+          done
+          echo "paths=${paths[*]}" >> "$GITHUB_OUTPUT"
       - name: Build macOS wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -288,6 +326,7 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+            -i ${{ steps.interpreters.outputs.paths }}
       - name: Require measured compiler-cache health
         shell: bash
         run: |
@@ -334,6 +373,27 @@ jobs:
           release_cache_start
           # Cargo is a native Windows executable, so use its native path.
           echo "RUSTC_WRAPPER=$(cygpath -w "$RUSTC_WRAPPER")" >> "$GITHUB_ENV"
+      # macOS and Windows extensions link against the interpreter, so each
+      # build interpreter must exist on the runner: uv's managed CPython
+      # builds include the free-threaded ones.
+      - name: Install the build interpreters
+        id: interpreters
+        shell: bash
+        env:
+          INTERPRETERS: ${{ needs.gate.outputs.interpreters }}
+          UV_PYTHON_PREFERENCE: only-managed
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          python -m uv python install $INTERPRETERS
+          paths=()
+          for version in $INTERPRETERS; do
+            path=$(python -m uv python find "$version")
+            # maturin splits -i on spaces: forward slashes, no backslashes.
+            path=$(cygpath -m "$path")
+            paths+=("$path")
+          done
+          echo "paths=${paths[*]}" >> "$GITHUB_OUTPUT"
       - name: Build Windows wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -347,6 +407,7 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
+            -i ${{ steps.interpreters.outputs.paths }}
       - name: Require measured compiler-cache health
         shell: bash
         run: |
@@ -381,6 +442,14 @@ jobs:
           # `locked = true` lives in pyproject.toml so both `build` and
           # `sdist` receive it in maturin's supported configuration layer.
           args: --out dist --manifest-path crates/gam-pyffi/Cargo.toml
+      # Every release keeps its sdist on PyPI for good: refuse one that ships
+      # files the build never reads, or that no longer compiles as shipped.
+      - name: Check the sdist footprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          python3 scripts/release_footprint.py sdist dist/*.tar.gz --target-dir "$RUNNER_TEMP/sdist-target"
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
@@ -439,9 +508,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -e RESOLUTION -v "$GITHUB_WORKSPACE:/w" -w /w "python:${PYTHON_VERSION}-alpine" sh -euc '
+          # No Alpine image ships a free-threaded CPython: the 3.14t lane runs
+          # uv's managed musl build of it on the python:3.14-alpine image.
+          docker run --rm -e RESOLUTION -e PYTHON_VERSION -v "$GITHUB_WORKSPACE:/w" -w /w "python:${PYTHON_VERSION%t}-alpine" sh -euc '
             python -m pip install --root-user-action=ignore uv
-            python smoke-src/scripts/wheel_smoke.py run --wheel-dir wheelhouse --resolution "$RESOLUTION"
+            case "$PYTHON_VERSION" in *t) python -m uv python install "$PYTHON_VERSION" ;; esac
+            python smoke-src/scripts/wheel_smoke.py run --wheel-dir wheelhouse --resolution "$RESOLUTION" --python "$PYTHON_VERSION"
           '
 
   release:
@@ -486,6 +558,13 @@ jobs:
       }}
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: release-src
+          sparse-checkout: |
+            scripts/release_footprint.py
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -502,6 +581,18 @@ jobs:
       # upload time; refuse the whole set here, before any file is uploaded.
       - name: Check distribution metadata
         run: python -m twine check --strict dist/*
+      # twine uploads file by file, so a project that fills up mid-upload is
+      # left with a release missing some of its wheels. Refuse before the
+      # first file instead. A limit PyPI raised on request is invisible to its
+      # API: record it in the repository variable (RELEASING.md).
+      - name: Refuse an upload that would fill the PyPI project
+        shell: bash
+        env:
+          PYPI_INDEX_URL: https://pypi.org/simple/
+          PYPI_PROJECT_SIZE_LIMIT_GIB: ${{ vars.PYPI_PROJECT_SIZE_LIMIT_GIB }}
+        run: |
+          set -euo pipefail
+          python release-src/scripts/release_footprint.py storage dist --index-url "$PYPI_INDEX_URL" ${PYPI_PROJECT_SIZE_LIMIT_GIB:+--project-limit-gib "$PYPI_PROJECT_SIZE_LIMIT_GIB"}
       - name: Upload to PyPI via twine
         env:
           TWINE_USERNAME: __token__
