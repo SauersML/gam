@@ -107,7 +107,8 @@ def test_poisson_null_term_is_not_bartlett_corrected_for_selection_twice() -> No
     # replicates (bench/pvalue_calibration/pv-lr-refit).
     row = _rows("poisson", 0)["s(x2)"]
     assert row["correction_provenance"] == "lawley_lr_fixed_lambda", row["correction_provenance"]
-    assert row["bartlett_factor"] == row["bartlett_factor_conditional"]
+    # The ρ-variation lane is not entered, so it reports nothing.
+    assert row["bartlett_factor_conditional"] is None and row["rho_variation_shift"] is None
     assert abs(row["bartlett_factor"] - 1.0) < 1e-2, row["bartlett_factor"]
     # With `c` that close to one the corrected tail is the replayed law's own
     # tail, to within the reference's stated accuracy.
