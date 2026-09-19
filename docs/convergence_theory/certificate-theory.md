@@ -459,14 +459,14 @@ Limitations: every check uses Gaussian REML. The LAML and non-Gaussian cases wer
 | GradientReproducibility (2× spread) | `ro/run.rs:4678, 4695` | an empirical noise estimate with factor 2 | **heuristic**. Replace with the analytic δ_λ band |
 | FixedPointResidual | `ro/run.rs:3217-3228` | config.tolerance | **heuristic** (no gradient on that route) |
 | polish step budget (self-concordance, M = 1) | `ro/newton_polish.rs:357-380` | Boyd–Vandenberghe §9.6.3 with an assumed L = 2 | **invalid assumption** (§3.6). Replace with the Corollary 1 recursion |
-| "decrement stopped contracting" stop | `ro/newton_polish.rs:106-127` | holds only inside the Kantorovich region | **heuristic stop**. Delete (§3.11) |
+| "decrement stopped contracting" stop | `ro/newton_polish.rs` (was :106-127) | holds only inside the Kantorovich region | **deleted**: the walk is bounded by each kept step's decrease `> band_f` and `V` bounded below; the λ₊ ≤ 2λ² test now only orders faces before Newton (§3.11) |
 | `rail_face` C ≻ 0 test | `ro/rail_face.rs:369-383` (docs `:62-76`) | sufficient, not necessary | **wrong as a gate** (false negatives, §3.8). Replace with c_j > δ_c (disjoint) / simplex min (overlapping) |
 | per-coordinate c_j | `ro/rail_face.rs:385-434` | Prop. 5, exact | **principled**. Promote it to *the* face test |
 | LARGE_STEP_DELTA 1.0, PROBE_DELTA 1.0 | `ro/run.rs:4937-4995, 6833, 7114` | value probes | **heuristic**. Delete (Theorem 4 needs no probes) |
 | asymptote window 12, MIN_TAIL_SAMPLES 3, EXP4_* | `ro/asymptote_certificate.rs:81, 86, 221, 226, 230` | curve fitting of tails | **heuristic**. Delete; replace with Prop. 5 + Theorem 4 |
 | ASYMPTOTE_* (1e-4, 18, 0.5, 6), TAIL_SNAP_DRIFT_REL | `ro/run.rs:5744, 5757, 5769-5770, 5456, 5896, 6417` | same | **heuristic**. Delete |
 | TAIL_SNAP_CURVATURE_BAND (0.25, 4.0) | `ro/run.rs:6356, 6492` | a guess at the exponential-tail curvature ratio. The exact ratio is Prop. 7 (h₀ = 1, contraction e⁻¹) | **heuristic**. Delete |
-| FACE_LAW_ERROR_SLACK 4.0, ORDER_BAND 0.5, DOMAIN_MARGIN 1e-6 | `ro/run.rs:6037, 6050, 6154` | none | **magic**. Delete |
+| FACE_LAW_ERROR_SLACK 4.0, ORDER_BAND 0.5, DOMAIN_MARGIN 1e-6 | `ro/run.rs:6037, 6050, 6154` | none | **magic**. Deleted with `falsify_face_law`; the analytic face proof spends no criterion evaluation |
 | CERTIFY_RESUME_PROGRESS_REL | `ro/run.rs:7327` | none | **heuristic** |
 | LOG_STRENGTH box as a proxy for ∞; RepresentabilityFace rung | `ro/run.rs:8495, 8507`; `ro/rail.rs:31-230` | violates the SPEC (hand box) | **delete**. Replace with t-coordinates (the domain t ≥ 0) |
 

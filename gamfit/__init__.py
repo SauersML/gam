@@ -11,7 +11,7 @@ The top level holds the fit / load entry points and the fitted-model
 classes. Everything else lives in a public submodule, loaded on first
 attribute access:
 
-- ``gamfit.errors`` -- the exception hierarchy (``gamfit.errors.GamError``, ...)
+- ``gamfit.errors`` -- the exception hierarchy (``gamfit.errors.GamfitError``, ...)
 - ``gamfit.results`` -- result, prediction, and posterior-sample types
 - ``gamfit.plot`` -- matplotlib plotting (optional ``gamfit[plot]`` extra)
 - ``gamfit.smooth`` / ``gamfit.basis`` / ``gamfit.penalties`` -- term

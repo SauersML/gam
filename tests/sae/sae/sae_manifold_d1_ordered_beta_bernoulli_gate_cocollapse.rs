@@ -155,7 +155,7 @@ fn sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse() {
         RIDGE_BETA,
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    // A `GamError` here (inner solve stalls at fixed ρ) is the #2228 refusal.
+    // A `GamfitError` here (inner solve stalls at fixed ρ) is the #2228 refusal.
     let result = problem
         .run(
             &mut objective,

@@ -1554,35 +1554,52 @@ fn a_full_newton_step_that_raises_the_criterion_is_damped_3012() {
     );
 }
 
-/// A scripted criterion whose Newton step lowers it but lands where the
-/// decrement is larger: at `ρ = 1` the gradient and curvature are `c` (so
-/// `λ̂² = n·c`), and at `ρ = 0` the gradient doubles (`λ̂² = 4n·c`). The polish
-/// does not move along a Newton sequence that stopped contracting (#3012): it
-/// refuses by name.
+/// `V = n·(0.6 + s·φ(ρ))` with `φ(ρ) = ρ²/2 + w·ln cosh((ρ − m)/w)`: a convex
+/// criterion with its minimum at `ρ* = 1` and a curvature bump of height `1/w`
+/// at `m = 5`, where the polish is handed the point.
+const BUMP_3012: fn(f64) -> [f64; 3] = |rho| {
+    const S: f64 = 1.0e-2 / 2_000.0;
+    const W: f64 = 0.1;
+    const M: f64 = 5.0;
+    let z = (rho - M) / W;
+    let a = z.abs();
+    let ln_cosh = a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2;
+    let sech = 1.0 / z.cosh();
+    [
+        0.6 + S * (0.5 * rho * rho + W * ln_cosh),
+        S * (rho + z.tanh()),
+        S * (1.0 + sech * sech / W),
+    ]
+};
+
+/// From `ρ = 5`, on top of [`BUMP_3012`]'s curvature bump, the Newton step is
+/// short (`λ̂² ≈ 2.3e-2`) and lowers the criterion by `≈ 1.8e-2`, a resolvable
+/// decrease, but lands at `ρ ≈ 4.55` off the bump, where the decrement has grown
+/// to `λ̂² ≈ 0.125`. The criterion fell, so the walk is still descending: the
+/// polish keeps taking Newton steps (#3012), which reach `ρ* = 1` in two more,
+/// and certifies there on the decrement rung.
 #[test]
-fn a_decrement_that_stops_contracting_ends_the_polish_3012() {
-    const C: f64 = 1.0e-5;
-    let (outcome, _) = certify_scripted_2954(
-        2_000,
-        1.0,
-        (-20.0, 20.0),
-        None,
-        |rho| {
-            if rho > 0.5 {
-                [0.6 + C * rho, C, C]
-            } else {
-                [0.6 + C * rho, 2.0 * C, C]
-            }
-        },
-        None,
-    );
-    let message = outcome
-        .expect_err("a decrement that grew after the step must not certify")
-        .to_string();
+fn a_decrement_that_grows_after_a_resolvable_step_keeps_polishing_3012() {
+    let (outcome, published) =
+        certify_scripted_2954(2_000, 5.0, (-20.0, 20.0), None, BUMP_3012, None);
+    let certificate =
+        outcome.expect("a criterion that fell along the step is polished to its minimum");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
     assert!(
-        message.contains("Newton-decrement above tolerance after polish")
-            && message.contains("the Newton decrement stopped contracting"),
-        "{message}",
+        polish.decreases.len() >= 2,
+        "the polish must continue past the step after which λ̂² grew: {polish:?}",
+    );
+    assert!(polish.rails.is_empty(), "{polish:?}");
+    // Near `ρ*` the curvature is `n·s·(1 + sech²(40)/w) ≈ n·s = 1e-2`, so the
+    // certified decrement bounds the distance left to the minimum.
+    let reach = 2.0 * (polish.lambda_sq_after / 1.0e-2).sqrt() + 64.0 * f64::EPSILON;
+    assert!(
+        (published[0] - 1.0).abs() <= reach,
+        "published {:.9} against the minimum 1 within {reach:.3e}",
+        published[0],
     );
 }
 

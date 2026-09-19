@@ -65,7 +65,7 @@ def _draw(family: str, eta: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 def _basis_check_p_values(family, n, formula, truth, reps, seed):
     """Return the basis_check p-values and provenance counts for ``reps`` replicates.
 
-    A replicate whose fit the engine refuses (``FitError``) is counted under
+    A replicate whose fit the engine refuses (``ConvergenceError``) is counted under
     ``"fit_refused"``: a refused fit publishes no basis check, and fit
     robustness is not what this file calibrates.
     """
@@ -78,7 +78,7 @@ def _basis_check_p_values(family, n, formula, truth, reps, seed):
             warnings.simplefilter("ignore")
             try:
                 model = gamfit.fit({"x": x, "y": y}, formula, family=family)
-            except gamfit.errors.FitError:
+            except gamfit.errors.ConvergenceError:
                 provenance["fit_refused"] += 1
                 continue
         row = model.summary().basis_checks[0]

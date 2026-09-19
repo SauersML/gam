@@ -9,6 +9,8 @@ pub(crate) const STANDARD_PREDICTION_INTERVAL_COLUMNS: [&str; 2] =
     ["posterior_mean_lower", "posterior_mean_upper"];
 pub(crate) const STANDARD_PREDICTION_STD_ERROR_COLUMN: &str =
     "posterior_mean_standard_error";
+pub(crate) const STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN: &str =
+    "linear_predictor_standard_error";
 pub(crate) const PREDICTION_NOISE_SCALE_COLUMN: &str = "noise_scale";
 pub(crate) const SPECIALIZED_PREDICTION_BASE_COLUMNS: [&str; 2] = ["eta", "mean"];
 /// Survival prediction columns. `survival_prob_plugin` is the plug-in
@@ -305,6 +307,7 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     posterior_mean: Option<ArrayView1<'_, f64>>,
     noise_scale: Option<ArrayView1<'_, f64>>,
     expectile_curves: &[(String, Array1<f64>)],
+    linear_predictor_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_standard_error: Option<ArrayView1<'_, f64>>,
     posterior_mean_lower: Option<ArrayView1<'_, f64>>,
     posterior_mean_upper: Option<ArrayView1<'_, f64>>,
@@ -334,17 +337,24 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
         columns.push((name.as_str(), values));
     }
 
+    let eta_standard_error = linear_predictor_standard_error.map(|values| values.to_vec());
     let standard_error = posterior_mean_standard_error.map(|values| values.to_vec());
     let lower = posterior_mean_lower.map(|values| values.to_vec());
     let upper = posterior_mean_upper.map(|values| values.to_vec());
-    match (standard_error.as_ref(), lower.as_ref(), upper.as_ref()) {
-        (Some(standard_error), Some(lower), Some(upper)) => {
+    match (
+        eta_standard_error.as_ref(),
+        standard_error.as_ref(),
+        lower.as_ref(),
+        upper.as_ref(),
+    ) {
+        (Some(eta_standard_error), Some(standard_error), Some(lower), Some(upper)) => {
             if posterior_mean.is_none() {
                 return Err(CliError::Internal {
                     reason: "posterior uncertainty cannot be emitted without posterior_mean"
                         .to_string(),
                 });
             }
+            columns.push((STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN, eta_standard_error));
             columns.push((
                 STANDARD_PREDICTION_STD_ERROR_COLUMN,
                 standard_error,
@@ -352,10 +362,10 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
             columns.push((STANDARD_PREDICTION_INTERVAL_COLUMNS[0], lower));
             columns.push((STANDARD_PREDICTION_INTERVAL_COLUMNS[1], upper));
         }
-        (None, None, None) => {}
+        (None, None, None, None) => {}
         _ => {
             return Err(CliError::Internal {
-                reason: "standard prediction requires posterior standard error and both bounds together"
+                reason: "standard prediction requires both posterior standard errors and both bounds together"
                     .to_string(),
             });
         }

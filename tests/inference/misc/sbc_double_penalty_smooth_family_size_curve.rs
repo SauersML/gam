@@ -43,7 +43,7 @@ use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam_solve::estimate::smooth_term_summary_rows;
+use gam_solve::estimate::{SummaryBlockOffset, smooth_term_summary_rows};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Beta, Distribution, Gamma, Normal, Poisson, Uniform};
@@ -208,6 +208,7 @@ fn tested_row(family: Family, rep: u64, effect: f64) -> Result<SmoothRow, String
         &fit.design,
         &fit.fit,
         fit.fit.weighted_gram(),
+        SummaryBlockOffset::default(),
     );
     let row = rows
         .iter()
@@ -326,7 +327,11 @@ const LOCATION_SCALE_NULL_REPLICATIONS: u64 = 1000;
 fn location_scale_tested_row(rep: u64, effect: f64) -> Result<SmoothRow, String> {
     let data = dataset_with(
         LOCATION_SCALE_SEED + rep,
-        |eta, x1, rng| eta + Normal::new(0.0, 0.3 * x1.exp()).expect("normal").sample(rng),
+        |eta, x1, rng| {
+            eta + Normal::new(0.0, 0.3 * x1.exp())
+                .expect("normal")
+                .sample(rng)
+        },
         effect,
     );
     let config = FitConfig {
@@ -339,7 +344,12 @@ fn location_scale_tested_row(rep: u64, effect: f64) -> Result<SmoothRow, String>
         panic!("location-scale rep {rep}: expected a Gaussian location-scale fit");
     };
     let fit = &location_scale.fit;
-    let rows = smooth_term_summary_rows(&fit.mean_design, &fit.fit, None);
+    let rows = smooth_term_summary_rows(
+        &fit.mean_design,
+        &fit.fit,
+        None,
+        SummaryBlockOffset::default(),
+    );
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))
