@@ -18,11 +18,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from .worker import BINOMIAL_FAMILIES, FAMILIES, LIBS
+from .worker import BINOMIAL_FAMILIES, EXTRA_DESIGNS, FAMILIES, LIBS
 from .worker import DESIGNS as ALL_DESIGNS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
 SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
+# The Gaussian identity sweep (audit lane sweep-gaussian): every core design
+# plus a tensor-with-additive-smooth and a factor-by smooth.
+GAUSSIAN_SWEEP_DESIGNS: tuple[str, ...] = ALL_DESIGNS + EXTRA_DESIGNS
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,33 @@ PLANS: dict[str, Plan] = {
                 Cell(f, 1_000_000, d) for f in ("gaussian", "poisson") for d in ("p1", "p5")
             ),
             reps=1,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="gaussian_small",
+            description=(
+                "Gaussian identity, n in {1e2, 1e3, 1e4} x {p1, p5, p20, te, te+s, by},"
+                " 3 reps (the nightly Gaussian regression cells)"
+            ),
+            cells=_grid((100, 1_000, 10_000), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=1_200.0,
+        ),
+        Plan(
+            name="gaussian_1e5",
+            description="Gaussian identity, n=1e5 x {p1, p5, p20, te, te+s, by}, 3 reps",
+            cells=_grid((100_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="gaussian_1e6",
+            description=(
+                "Gaussian identity, n=1e6 x {p1, p5, p20, te, te+s, by}, 3 reps:"
+                " wall, CPU and peak RSS at the largest scale"
+            ),
+            cells=_grid((1_000_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
             timeout_s=3_600.0,
         ),
         Plan(

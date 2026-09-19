@@ -97,22 +97,30 @@ def thread_env(threads: int | None) -> dict[str, str]:
     return {k: str(threads) for k in THREAD_ENV}
 
 
-def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+def run_isolated(
+    cmd: list[str],
+    cwd: str,
+    timeout_s: float,
+    memcap_mb: float,
+    threads: int | None = 1,
+    env_extra: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Run one worker subprocess, policing the safety net; return its record."""
+    """Run one worker subprocess under the thread env and the safety net.
+
+    ``threads`` pins every pool in :data:`THREAD_ENV` (``None`` leaves each
+    pool at its host default, see :func:`thread_env`). The worker must print
+    one ``RESULT {json}`` line. Returns that object with the harness fields
+    added: ``status`` (the worker's own, or ``timeout`` / ``memcap`` when the
+    safety net killed the process tree, or ``crash`` when it exited without a
+    RESULT line), ``returncode``, ``proc_wall_s``, ``peak_tree_rss_mb``,
+    ``peak_threads``, ``load_start``/``load_end`` and, for any status but
+    ``ok``, ``stderr_tail``.
+    """
     env = {k: v for k, v in os.environ.items() if k not in THREAD_ENV}
-    env.update(thread_env(cell.threads))
+    env.update(thread_env(threads))
     env.pop("PYTHONPATH", None)
-    cmd = [
-        sys.executable,
-        str(WORKER),
-        lib,
-        cell.family,
-        str(cell.n),
-        cell.design,
-        str(seed),
-    ]
+    if env_extra:
+        env.update(env_extra)
     load_start = os.getloadavg()
     t0 = time.perf_counter()
     proc = subprocess.Popen(
@@ -123,9 +131,9 @@ def run_rep(
     peak_threads = 0
     status = "ok"
     while proc.poll() is None:
-        rss, threads = _sample(_tree(ps))
+        rss, n_threads = _sample(_tree(ps))
         peak_tree_rss = max(peak_tree_rss, rss)
-        peak_threads = max(peak_threads, threads)
+        peak_threads = max(peak_threads, n_threads)
         elapsed = time.perf_counter() - t0
         if rss > memcap_mb:
             status = "memcap"
@@ -151,13 +159,6 @@ def run_rep(
         else:
             status = str(rec.get("status", "error"))
     rec.update(
-        lib=lib,
-        family=cell.family,
-        n=cell.n,
-        design=cell.design,
-        threads=cell.threads,
-        concurrency=cell.concurrency,
-        seed=seed,
         status=status,
         returncode=proc.returncode,
         proc_wall_s=wall,
@@ -168,6 +169,32 @@ def run_rep(
     )
     if status != "ok":
         rec["stderr_tail"] = stderr[-2000:]
+    return rec
+
+
+def run_rep(
+    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+) -> dict[str, Any]:
+    """Run one worker subprocess, policing the safety net; return its record."""
+    cmd = [
+        sys.executable,
+        str(WORKER),
+        lib,
+        cell.family,
+        str(cell.n),
+        cell.design,
+        str(seed),
+    ]
+    rec = run_isolated(cmd, cwd, timeout_s, memcap_mb, threads=cell.threads)
+    rec.update(
+        lib=lib,
+        family=cell.family,
+        n=cell.n,
+        design=cell.design,
+        threads=cell.threads,
+        concurrency=cell.concurrency,
+        seed=seed,
+    )
     return rec
 
 
