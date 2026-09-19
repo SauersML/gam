@@ -148,7 +148,7 @@ mod tests {
         Ok((
             op.pirls_hat_diag(),
             op.jeffreys_logdet(),
-            op.pirls_firth_score_shift(),
+            op.pirls_jeffreys_eta_score(),
         ))
     }
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
@@ -226,7 +226,7 @@ mod tests {
         );
 
         for link in [&cloglog, &mixture] {
-            let (hat, logdet, shift) = compute_jeffreys_pirls_diagnostics(
+            let (hat, logdet, score) = compute_jeffreys_pirls_diagnostics(
                 link,
                 x.view(),
                 eta.view(),
@@ -234,7 +234,7 @@ mod tests {
             )
             .expect("supported Firth inverse link");
             assert_eq!(hat.len(), x.nrows());
-            assert_eq!(shift.len(), x.nrows());
+            assert_eq!(score.len(), x.nrows());
             assert!(
                 logdet.is_finite(),
                 "Jeffreys logdet must stay finite for {link:?}"
@@ -244,8 +244,8 @@ mod tests {
                 "hat diagonal must stay finite and non-negative for {link:?}: {hat:?}"
             );
             assert!(
-                shift.iter().all(|value| value.is_finite()),
-                "Firth score shift must stay finite for {link:?}: {shift:?}"
+                score.iter().all(|value| value.is_finite()),
+                "Jeffreys eta-score must stay finite for {link:?}: {score:?}"
             );
         }
     }
@@ -302,16 +302,16 @@ mod tests {
                     .expect("factored weighted operator");
                 let hat_f = op_f.pirls_hat_diag();
                 let logdet_f = op_f.jeffreys_logdet();
-                let shift_f = op_f.pirls_firth_score_shift();
-                let (hat_o, logdet_o, shift_o) =
+                let score_f = op_f.pirls_jeffreys_eta_score();
+                let (hat_o, logdet_o, score_o) =
                     compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
                         .expect("oracle weighted diagnostics");
                 assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
                 for i in 0..x.nrows() {
                     assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
                     assert_relative_eq!(
-                        shift_f[i],
-                        shift_o[i],
+                        score_f[i],
+                        score_o[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -323,7 +323,7 @@ mod tests {
                     .expect("factored unweighted operator");
                 let hat_fu = op_fu.pirls_hat_diag();
                 let logdet_fu = op_fu.jeffreys_logdet();
-                let shift_fu = op_fu.pirls_firth_score_shift();
+                let score_fu = op_fu.pirls_jeffreys_eta_score();
                 let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
                     .expect("full unweighted operator");
                 assert_relative_eq!(
@@ -333,7 +333,7 @@ mod tests {
                     max_relative = 1e-12
                 );
                 let hat_ou = op_u.pirls_hat_diag();
-                let shift_ou = op_u.pirls_firth_score_shift();
+                let score_ou = op_u.pirls_jeffreys_eta_score();
                 for i in 0..x.nrows() {
                     assert_relative_eq!(
                         hat_fu[i],
@@ -342,8 +342,8 @@ mod tests {
                         max_relative = 1e-12
                     );
                     assert_relative_eq!(
-                        shift_fu[i],
-                        shift_ou[i],
+                        score_fu[i],
+                        score_ou[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );

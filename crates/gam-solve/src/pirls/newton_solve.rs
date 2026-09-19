@@ -429,8 +429,16 @@ pub(super) fn build_firth_design_factor_dense(
 /// The inner objective is `data + penalty - Φ`, so its Newton curvature is
 /// `H₀ - HΦ`, not the Fisher-scoring surrogate `H₀`.  Building the full
 /// β-dependent operator here shares the reduced Fisher inverse, leverage, and
-/// Hadamard-Gram contraction between the score shift and `HΦ`; the expensive
+/// Hadamard-Gram contraction between the Jeffreys score and `HΦ`; the expensive
 /// design Gram/eigenspace remains cached in `factor` (#1575).
+///
+/// The third output is the per-row linear-predictor score of the Jeffreys term,
+/// `∂Φ/∂η_i = ½ w'_i h_diag_i`, so `∂Φ/∂β = Xᵀ(∂Φ/∂η)`. With fixed prior
+/// weights `a_i` the operator's `h_diag_i = a_i x_iᵀ I⁻¹ x_i` already carries
+/// `a_i` (its reduced design is `A^{1/2} X Q`), so this score carries each prior
+/// weight exactly once. It is returned as a score rather than as a
+/// working-response shift because the shift that reproduces it depends on the
+/// caller's score weights (see the Firth block of the PIRLS working update).
 pub(super) fn jeffreys_pirls_diagnostics_and_hessian_from_factor(
     factor: &FirthDesignFactor,
     link: &InverseLink,
@@ -438,12 +446,7 @@ pub(super) fn jeffreys_pirls_diagnostics_and_hessian_from_factor(
 ) -> Result<(Array1<f64>, f64, Array1<f64>, Array2<f64>), EstimationError> {
     let op = FirthDenseOperator::build_from_design_factor(factor, link, &eta.to_owned())?;
     let hat_diag = &op.w * &op.h_diag;
-    let mut score_shift = Array1::<f64>::zeros(op.w.len());
-    for i in 0..op.w.len() {
-        if op.w[i] > 0.0 {
-            score_shift[i] = 0.5 * (op.w1[i] / op.w[i]) * op.h_diag[i];
-        }
-    }
+    let eta_score = 0.5 * (&op.w1 * &op.h_diag);
     let diag_term = gam_linalg::faer_ndarray::fast_xt_diag_x(
         &op.x_dense,
         &(&op.w2 * &op.h_diag),
@@ -454,7 +457,7 @@ pub(super) fn jeffreys_pirls_diagnostics_and_hessian_from_factor(
     if !hphi.iter().all(|value| value.is_finite()) {
         crate::bail_invalid_estim!("Firth/Jeffreys coefficient Hessian is non-finite");
     }
-    Ok((hat_diag, op.jeffreys_logdet(), score_shift, hphi))
+    Ok((hat_diag, op.jeffreys_logdet(), eta_score, hphi))
 }
 
 pub(crate) fn certify_positive_semidefinite_hessian(
