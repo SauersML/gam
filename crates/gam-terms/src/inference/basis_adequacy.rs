@@ -155,6 +155,70 @@
 //! removes whatever `β̂` does. The `H⁻¹`-projected variant has no such property,
 //! since its correction term is a specific function of the score equation it
 //! assumed.
+//!
+//! # The conditional reference for canonical families
+//!
+//! For a Gaussian response the score is exactly normal and the `χ²`/`F`
+//! references above are exact. For a binomial or Poisson response they are
+//! only first-order, and the first-order error is not small and not
+//! symmetric: at `n = 200` with a 24-direction enrichment the product
+//! statistic read KS `p = 0.0045` (binomial) and `1.4e-7` (Poisson) against
+//! uniformity, with sizes `0.030 / 0.0027` at nominal `0.05 / 0.01` — a
+//! conservative test, which is as much a miscalibration as an
+//! anti-conservative one. The cause is that the score is evaluated at an
+//! estimated `β`: its conditional mean is not zero, its covariance is not `I`,
+//! and its fourth cumulant is not the Gaussian one, each at `O(1/n)` per
+//! direction and so `O(r/n)` on the statistic — the same order as its
+//! deviation from `r`.
+//!
+//! A canonical link removes the nuisance exactly. `Xᵀ(w∘y)` is sufficient for
+//! `β` under `H₀`, so the law of the data GIVEN it does not depend on `β` at
+//! all; and the unpenalized null MLE `μ̃` is a function of it, so every weight
+//! built from `μ̃` — `W = wV`, `W₁ = wκ₃`, `W₂ = wκ₄`, the projection, the
+//! whitening, `L = Z̃K` — is a constant under that conditioning. The test
+//! refers the score `u = Lᵀ w(y − μ̃)` to its conditional law, expanded
+//! (the double-saddlepoint cumulant expansion of the score given the
+//! sufficient statistic) to the order the unconditional reference misses.
+//! With `H = X G⁻ Xᵀ`, `h = diag(H)`, `A = LLᵀ`:
+//!
+//! ```text
+//!     E[u | ·]   = δ = −½ Lᵀ(W₁∘h)
+//!     Cov[u | ·] = Σ = I − ½(D₁ − D₂ − D₃)
+//!                  D₁ = Lᵀ diag(W₂∘h) L,  D₂ = Lᵀ diag(W₁∘H(W₁∘h)) L,
+//!                  D₃ = (W₁∘L)ᵀ (H∘H) (W₁∘L)
+//!     K₄ = Σ W₂ A_nn² − 2 Σ W₁ₙW₁ₙ′ A_nn′² H_nn′ − (W₁∘diag A)ᵀ H (W₁∘diag A)
+//! ```
+//!
+//! `T_c = (u − δ)ᵀΣ⁻¹(u − δ)` then has conditional mean `r` and variance
+//! `2r + K₄` to this order, and `c·χ²_{r/c}` with `c = 1 + K₄/(2r)` is the
+//! scaled `χ²` with those two moments — so the tail is matched in both
+//! directions rather than bounded in one. Measured at `n = 200`, 10 000
+//! replicates: binomial KS `p = 0.14`, sizes `0.097 / 0.049 / 0.0094` at
+//! `0.1 / 0.05 / 0.01`; Poisson KS `p = 0.82`. The Rust tests
+//! `conditional_test_is_uniform_under_the_null_*` pin both tails.
+//!
+//! The expansion is at the UNPENALIZED null MLE on the test's rows, not at the
+//! penalized fit: the penalized `β̂` is not the conditional law's natural
+//! centre, and the projection annihilates everything in `span(X)` anyway, so
+//! the penalty's only effect on the score would be the shrinkage bias this
+//! module exists to exclude. Separation needs no special case: the null MLE
+//! then sits on a face, the separated rows' weights vanish, and their
+//! responses — fixed by the conditioning — contribute nothing.
+//!
+//! The expansion's small parameter is, row by row, the leverage `W h` times
+//! the standardized cumulants `κ₃/V^{3/2}`, `κ₄/V²` — and those grow like
+//! `1/V` where `μ̃` is extreme. A row that is both high-leverage and near a
+//! boundary (the edge of a polynomial-like design with `μ̃` near 0 or 1, or a
+//! low Poisson count) can therefore push `Σ` off positive definiteness or
+//! `c` below zero. That is the expansion saying it does not describe the
+//! conditional law there, and the test reports "not measured" rather than a
+//! number: 20 of 4000 null replicates in the binomial unit-test harness. The
+//! same mechanism is the open accuracy limit of this reference: with Poisson
+//! means `0.14–0.82` at `n = 200` and 24 null-plus-enrichment directions, 19%
+//! of null replicates are refused and the measured ones read KS `p ≈ 0.01`
+//! over 8000 — resolving that regime needs the next order of the expansion,
+//! not a tolerance.
+//!
 //! # What it does not claim
 //!
 //! `λ̂` is held at its fitted value and the enrichment is a fixed alternative,
@@ -258,6 +322,446 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
         return None;
     }
 
+    let geometry = enrichment_geometry(
+        input.enrichment,
+        input.design,
+        input.hessian_weights,
+        input.score_weights,
+        input.score,
+        input.design_gram,
+    )?;
+    let rank = geometry.basis.ncols();
+    let statistic = geometry.projected.iter().map(|value| value * value).sum::<f64>();
+    let statistic = statistic / input.dispersion;
+    if !statistic.is_finite() || statistic < 0.0 {
+        return None;
+    }
+
+    let reference_df = rank as f64;
+    let p_value = match input.scale {
+        SmoothTestScale::Known => chi_square_sf(statistic, reference_df),
+        SmoothTestScale::Estimated => {
+            let residual_df = input
+                .residual_df
+                .filter(|value| value.is_finite() && *value > 0.0)?;
+            // `φ̂` was estimated from the fit's residual sum `ν·φ̂`, and the
+            // residual's projection onto the tested directions, `T·φ̂` on `r`
+            // d.f., is part of that sum. `T/r` against `F(r, ν)` therefore divides
+            // by a scale that contains its own numerator: the ratio is
+            // `(ν/r)·Beta(r/2, (ν − r)/2)`, bounded and conservative at every
+            // level. The scale that is independent of the numerator is the rest
+            // of the sum, `(ν − T)·φ̂` on `ν − r` d.f., which gives the classical
+            // added-variable `F` (exact for an unpenalized Gaussian fit). With
+            // `ν ≤ r` or `T ≥ ν`, nothing is left to estimate that scale from.
+            let independent_df = residual_df - reference_df;
+            let independent_sum = residual_df - statistic;
+            if !(independent_df > 0.0 && independent_sum > 0.0) {
+                return None;
+            }
+            let f_statistic = (statistic / reference_df) / (independent_sum / independent_df);
+            fisher_snedecor_sf(f_statistic, reference_df, independent_df)
+        }
+    };
+    if !p_value.is_finite() {
+        return None;
+    }
+    Some(BasisAdequacyResult {
+        statistic,
+        rank,
+        p_value,
+    })
+}
+
+/// A canonical-link exponential family whose sufficient statistic `Xᵀ(w∘y)`
+/// the conditional test in [`conditional_basis_adequacy_test`] conditions on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonicalExponentialFamily {
+    /// `y` a proportion in `[0, 1]`, prior weight the trial count;
+    /// `b(η) = log(1 + eᶯ)`.
+    BinomialLogit,
+    /// `y` a count, `b(η) = eᶯ`.
+    PoissonLog,
+}
+
+/// The unit cumulant function and its first four derivatives at `η`.
+struct UnitCumulants {
+    /// `b(η)`.
+    log_partition: f64,
+    /// `μ = b′(η)`.
+    mean: f64,
+    /// `V = b″(η)`.
+    variance: f64,
+    /// `κ₃ = b‴(η)`.
+    third: f64,
+    /// `κ₄ = b⁗(η)`.
+    fourth: f64,
+}
+
+impl CanonicalExponentialFamily {
+    fn cumulants(self, eta: f64) -> UnitCumulants {
+        match self {
+            Self::BinomialLogit => {
+                // Every quantity from `e^{−|η|}`, so none of them cancels:
+                // `μ(1 − μ)` formed from a rounded `μ ≈ 1` loses all its digits
+                // exactly where a well-separated row puts it.
+                let decay = (-eta.abs()).exp();
+                let log_partition = eta.max(0.0) + decay.ln_1p();
+                let mean = if eta >= 0.0 {
+                    1.0 / (1.0 + decay)
+                } else {
+                    decay / (1.0 + decay)
+                };
+                let variance = decay / ((1.0 + decay) * (1.0 + decay));
+                // `1 − 2μ = −tanh(η/2)`.
+                let skew = -(0.5 * eta).tanh();
+                UnitCumulants {
+                    log_partition,
+                    mean,
+                    variance,
+                    third: variance * skew,
+                    fourth: variance * (1.0 - 6.0 * variance),
+                }
+            }
+            Self::PoissonLog => {
+                let mean = eta.exp();
+                UnitCumulants {
+                    log_partition: mean,
+                    mean,
+                    variance: mean,
+                    third: mean,
+                    fourth: mean,
+                }
+            }
+        }
+    }
+
+    fn admits_response(self, response: f64) -> bool {
+        match self {
+            Self::BinomialLogit => (0.0..=1.0).contains(&response),
+            Self::PoissonLog => response.is_finite() && response >= 0.0,
+        }
+    }
+}
+
+/// The unpenalized maximum-likelihood fit of the null model `η = Xβ + offset`
+/// on the test's rows, and the cumulant weights the conditional reference law
+/// is built from. Produced by [`canonical_null_fit`].
+pub struct CanonicalNullFit {
+    /// `W = w·V(μ̃)`: Fisher and Hessian weight at once (canonical link).
+    weights: Array1<f64>,
+    /// `W₁ = w·κ₃(μ̃)`.
+    third: Array1<f64>,
+    /// `W₂ = w·κ₄(μ̃)`.
+    fourth: Array1<f64>,
+    /// `s = w∘(y − μ̃)`, the score of the null model's log-likelihood in `η`.
+    score: Array1<f64>,
+    /// `G = XᵀWX` factored at `μ̃`.
+    gram: DesignGramFactor,
+    /// `X̄` with `X̄X̄ᵀ = X G⁻ Xᵀ`, from the same factor.
+    whitened: Array2<f64>,
+}
+
+/// The unpenalized MLE of the null model on the given rows, by damped Newton in
+/// the linear predictor.
+///
+/// The iteration lives in `η`, not `β`: starting from any `η₀` in the model's
+/// affine span (the penalized fit's own linear predictor, offset included, is
+/// the natural one), each step `η ← η + t·X G⁻ Xᵀ w(y − μ)` stays in that span,
+/// so no coefficient frame and no offset has to be carried. A step is taken
+/// only if it STRICTLY lowers `f(η) = Σ w(b(η) − yη)`; otherwise `t` halves.
+///
+/// Converged is a certificate, not a count. The Newton decrement
+/// `λ² = gᵀG⁻g` is twice the predicted remaining decrease, and once that is
+/// inside the rounding band of `f` itself — `γ_{m+p²}·Σ|w b(η)| + |w y η|`,
+/// the same band P-IRLS certifies against — no further step can be told apart
+/// from roundoff. There is no iteration cap: every accepted step strictly
+/// decreases a floating-point value that is bounded below, so the loop ends,
+/// and it ends either certified or with a step so small that `η + t·Δη`
+/// rounds back to `η`, which is reported as `None`.
+///
+/// An MLE that does not exist in the interior (separation) is not special-cased.
+/// The iterates walk the separated rows to the boundary, where their weight and
+/// score vanish; what remains is the MLE of the face model, and the conditional
+/// law on the separated rows is degenerate (their responses are fixed by the
+/// conditioning), which is exactly what zero weight encodes.
+pub fn canonical_null_fit(
+    design: ArrayView2<'_, f64>,
+    response: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+    start_eta: ArrayView1<'_, f64>,
+    family: CanonicalExponentialFamily,
+) -> Option<CanonicalNullFit> {
+    let m = design.nrows();
+    let p = design.ncols();
+    if m == 0
+        || p == 0
+        || response.len() != m
+        || prior_weights.len() != m
+        || start_eta.len() != m
+        || response.iter().any(|&y| !family.admits_response(y))
+        || prior_weights.iter().any(|&w| !(w.is_finite() && w >= 0.0))
+        || start_eta.iter().any(|eta| !eta.is_finite())
+        || design.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    let band_growth = gam_linalg::roundoff::accumulation_growth(m + p * p);
+    // `(f(η), Σ|terms|)`, or `None` when a term is not finite (an overflowing
+    // Poisson mean), which the line search treats as "not a decrease".
+    let objective = |eta: &Array1<f64>| -> Option<(f64, f64)> {
+        let mut value = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for row in 0..m {
+            let weight = prior_weights[row];
+            if weight == 0.0 {
+                continue;
+            }
+            let partition = weight * family.cumulants(eta[row]).log_partition;
+            let linear = weight * response[row] * eta[row];
+            value += partition - linear;
+            magnitude += partition.abs() + linear.abs();
+        }
+        (value.is_finite() && magnitude.is_finite()).then_some((value, magnitude))
+    };
+    let mut eta = start_eta.to_owned();
+    let (mut value, mut magnitude) = objective(&eta)?;
+    loop {
+        let mut weights = Array1::<f64>::zeros(m);
+        let mut third = Array1::<f64>::zeros(m);
+        let mut fourth = Array1::<f64>::zeros(m);
+        let mut score = Array1::<f64>::zeros(m);
+        for row in 0..m {
+            let weight = prior_weights[row];
+            let unit = family.cumulants(eta[row]);
+            weights[row] = weight * unit.variance;
+            third[row] = weight * unit.third;
+            fourth[row] = weight * unit.fourth;
+            score[row] = weight * (response[row] - unit.mean);
+        }
+        let gram = DesignGramFactor::new(weighted_gram(design, weights.view())?.view())?;
+        let gradient = design.t().dot(&score);
+        let direction = gram.solve(&gradient.clone().insert_axis(ndarray::Axis(1)))?;
+        let direction = direction.column(0).to_owned();
+        let decrement = gradient.dot(&direction);
+        if !decrement.is_finite() {
+            return None;
+        }
+        if decrement <= 2.0 * band_growth * magnitude {
+            let whitened = gram.whiten(design)?;
+            return Some(CanonicalNullFit {
+                weights,
+                third,
+                fourth,
+                score,
+                gram,
+                whitened,
+            });
+        }
+        let step = design.dot(&direction);
+        let mut length = 1.0_f64;
+        loop {
+            let candidate = &eta + &(length * &step);
+            if candidate == eta {
+                return None;
+            }
+            if let Some((next_value, next_magnitude)) = objective(&candidate)
+                && next_value < value
+            {
+                eta = candidate;
+                value = next_value;
+                magnitude = next_magnitude;
+                break;
+            }
+            length *= 0.5;
+        }
+    }
+}
+
+/// Conditional score test of `H₀: γ = 0` in `η = Xβ + Zγ` for a
+/// canonical-link binomial or Poisson model, given the null model's sufficient
+/// statistic `Xᵀ(w∘y)`.
+///
+/// Conditioning on `Xᵀ(w∘y)` removes the nuisance `β` exactly: under `H₀` the
+/// conditional law of the data does not depend on it. The statistic is the
+/// score `u = LᵀS`, `L = Z̃K` the whitened residualized enrichment at the
+/// unpenalized null MLE `μ̃` and `S = w∘(y − μ̃)`, and its conditional
+/// law is expanded to the order at which the unconditional `χ²_r` reference is
+/// wrong (see the module header, "The conditional reference for canonical
+/// families"):
+///
+/// ```text
+///     E[u | Xᵀy] ≈ δ,   Cov[u | Xᵀy] ≈ Σ,   T_c = (u − δ)ᵀ Σ⁻¹ (u − δ),
+///     p = P(χ²_{r/c} > T_c / c),   c = 1 + K₄ / (2r),
+/// ```
+///
+/// the scaled `χ²` matching the conditional mean and variance of `T_c`.
+///
+/// `None` when the geometry supports no test (as in
+/// [`basis_adequacy_score_test`]), when `Σ` is not positive definite, or when
+/// `c ≤ 0` — the expansion is then outside the range where it describes the
+/// conditional law, and "not measured" is the honest report.
+pub fn conditional_basis_adequacy_test(
+    enrichment: ArrayView2<'_, f64>,
+    design: ArrayView2<'_, f64>,
+    null_fit: &CanonicalNullFit,
+) -> Option<BasisAdequacyResult> {
+    use gam_linalg::faer_ndarray::FaerCholesky;
+    const ROW_BLOCK: usize = 4096;
+    let m = design.nrows();
+    let p = design.ncols();
+    let q = enrichment.ncols();
+    if m == 0
+        || p == 0
+        || q == 0
+        || enrichment.nrows() != m
+        || null_fit.weights.len() != m
+        || null_fit.whitened.nrows() != m
+        || null_fit.gram.dimension() != p
+    {
+        return None;
+    }
+    let geometry = enrichment_geometry(
+        enrichment,
+        design,
+        null_fit.weights.view(),
+        null_fit.weights.view(),
+        null_fit.score.view(),
+        &null_fit.gram,
+    )?;
+    let r = geometry.basis.ncols();
+
+    // `L = Z̃K`, `m × r`: no wider than the enrichment the caller already holds.
+    let mut basis_rows = Array2::<f64>::zeros((m, r));
+    let mut start = 0usize;
+    while start < m {
+        let stop = (start + ROW_BLOCK).min(m);
+        let mut residualized = enrichment.slice(ndarray::s![start..stop, ..]).to_owned();
+        residualized -= &design
+            .slice(ndarray::s![start..stop, ..])
+            .dot(&geometry.coefficient_shift);
+        basis_rows
+            .slice_mut(ndarray::s![start..stop, ..])
+            .assign(&residualized.dot(&geometry.basis));
+        start = stop;
+    }
+    let whitened = &null_fit.whitened;
+    let third = &null_fit.third;
+    let fourth = &null_fit.fourth;
+    // `h = diag(H)` and `A_d = diag(LLᵀ)`, `H = X̄X̄ᵀ = X G⁻ Xᵀ`.
+    let leverage: Array1<f64> = whitened.rows().into_iter().map(|row| row.dot(&row)).collect();
+    let enrichment_leverage: Array1<f64> = basis_rows
+        .rows()
+        .into_iter()
+        .map(|row| row.dot(&row))
+        .collect();
+    let skewed_leverage = third * &leverage;
+    // `H(W₁∘h)`.
+    let smoothed_skew = whitened.dot(&whitened.t().dot(&skewed_leverage));
+
+    // Conditional mean offset `δ = −½ Lᵀ(W₁∘h)`.
+    let offset = -0.5 * basis_rows.t().dot(&skewed_leverage);
+
+    // `D₁ − D₂ = Lᵀ diag(W₂∘h − W₁∘H(W₁∘h)) L`.
+    let diagonal_weight = &(fourth * &leverage) - &(third * &smoothed_skew);
+    let mut weighted_rows = basis_rows.clone();
+    for (mut row, &weight) in weighted_rows.rows_mut().into_iter().zip(diagonal_weight.iter()) {
+        row.iter_mut().for_each(|value| *value *= weight);
+    }
+    let mut curvature = basis_rows.t().dot(&weighted_rows);
+
+    // `D₃ = Σ_{j,k} M_jkᵀ M_jk`, `M_jk = Σ_n W₁ₙ x̄ₙⱼ x̄ₙₖ Lₙ`, and the kurtosis
+    // cross term `k₂ = 2 Σ_j ‖Lᵀ diag(W₁∘x̄_j) L‖²_F`, together in one sweep
+    // over the whitened columns: `O(m·r·p²/2 + m·r²·p)`, with only `m × r` and
+    // `p × r` scratch alive at once.
+    let mut coupling = Array2::<f64>::zeros((r, r));
+    let mut kurtosis_cross = 0.0_f64;
+    let columns = whitened.ncols();
+    for j in 0..columns {
+        let mut scaled = basis_rows.clone();
+        for (mut row, (&skew, &value)) in scaled
+            .rows_mut()
+            .into_iter()
+            .zip(third.iter().zip(whitened.column(j).iter()))
+        {
+            let factor = skew * value;
+            row.iter_mut().for_each(|entry| *entry *= factor);
+        }
+        let skew_gram = basis_rows.t().dot(&scaled);
+        kurtosis_cross += 2.0 * skew_gram.iter().map(|value| value * value).sum::<f64>();
+        // Rows `k ≥ j` of `M_j = X̄[:, j..]ᵀ (diag(W₁∘x̄_j) L)`; the `k > j`
+        // blocks stand for both `(j, k)` and `(k, j)`.
+        let pair = whitened.slice(ndarray::s![.., j..]).t().dot(&scaled);
+        let diagonal = pair.row(0).to_owned();
+        coupling += &(2.0 * pair.t().dot(&pair));
+        for a in 0..r {
+            for b in 0..r {
+                coupling[(a, b)] -= diagonal[a] * diagonal[b];
+            }
+        }
+    }
+    curvature -= &coupling;
+
+    // `Σ = I − ½(D₁ − D₂ − D₃)`.
+    let mut covariance = -0.5 * &curvature;
+    for a in 0..r {
+        covariance[(a, a)] += 1.0;
+    }
+    let covariance = 0.5 * (&covariance + &covariance.t());
+    if covariance.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let factor = covariance.cholesky(Side::Lower).ok()?;
+    let centered = &geometry.projected - &offset;
+    let statistic = centered.dot(&factor.solvevec(&centered));
+
+    // `K₄ = Σ W₂ A_d² − k₂ − ‖X̄ᵀ(W₁∘A_d)‖²`.
+    let skewed_enrichment = third * &enrichment_leverage;
+    let smoothed = whitened.t().dot(&skewed_enrichment);
+    let fourth_cumulant = (fourth * &enrichment_leverage.mapv(|value| value * value)).sum()
+        - kurtosis_cross
+        - smoothed.dot(&smoothed);
+    let reference_df = r as f64;
+    let scale = 1.0 + fourth_cumulant / (2.0 * reference_df);
+    if !(statistic.is_finite() && statistic >= 0.0 && scale.is_finite() && scale > 0.0) {
+        return None;
+    }
+    let p_value = chi_square_sf(statistic / scale, reference_df / scale);
+    p_value.is_finite().then_some(BasisAdequacyResult {
+        statistic,
+        rank: r,
+        p_value,
+    })
+}
+
+/// The whitened geometry of an enrichment against a fitted design: everything
+/// both tests in this module share before they choose a reference law.
+struct EnrichmentGeometry {
+    /// `C = G⁻(XᵀW_H Z)` (`p × q`), so `Z̃ = Z − X·C`.
+    coefficient_shift: Array2<f64>,
+    /// `K` (`q × r`): the estimable directions, whitened so that
+    /// `Kᵀ Z̃ᵀ W_F Z̃ K = I`. `L = Z̃K` is the orthonormal-in-`W_F` score basis.
+    basis: Array2<f64>,
+    /// `Kᵀ Z̃ᵀ s` — the score in that basis, `Var = φ·I` under the null.
+    projected: Array1<f64>,
+}
+
+/// Project the fitted design out of the enrichment in the `W_H` metric,
+/// whiten the residual from its own `W_F` covariance, and keep the directions
+/// the design cannot represent. The module header derives each step.
+///
+/// Shapes are the caller's contract: `enrichment` is `m × q`, `design` `m × p`
+/// with `design_gram.dimension() == p`, and the three vectors have length `m`.
+fn enrichment_geometry(
+    enrichment: ArrayView2<'_, f64>,
+    design: ArrayView2<'_, f64>,
+    hessian_weights: ArrayView1<'_, f64>,
+    score_weights: ArrayView1<'_, f64>,
+    score: ArrayView1<'_, f64>,
+    design_gram: &DesignGramFactor,
+) -> Option<EnrichmentGeometry> {
+    let m = design.nrows();
+    let p = design.ncols();
+    let q = enrichment.ncols();
     // Row-blocked first pass: `X_SᵀW_H Z` (the projection's right-hand side) and
     // `E = ZᵀW_F Z`, the enrichment's own UNPROJECTED Gram. Blocked for the same
     // reason the second pass is — a second `m × q` array is 37 MB at
@@ -277,12 +781,12 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
     let mut start = 0usize;
     while start < m {
         let stop = (start + ROW_BLOCK).min(m);
-        let block = input.enrichment.slice(ndarray::s![start..stop, ..]);
+        let block = enrichment.slice(ndarray::s![start..stop, ..]);
         let mut hessian_weighted = block.to_owned();
         let mut fisher_weighted = block.to_owned();
         for local in 0..(stop - start) {
-            let curvature = input.hessian_weights[start + local];
-            let fisher = input.score_weights[start + local];
+            let curvature = hessian_weights[start + local];
+            let fisher = score_weights[start + local];
             if !curvature.is_finite() || !(fisher.is_finite() && fisher >= 0.0) {
                 return None;
             }
@@ -296,8 +800,7 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
                 .for_each(|value| *value *= fisher);
         }
         raw_information += &block.t().dot(&fisher_weighted);
-        cross += &input
-            .design
+        cross += &design
             .slice(ndarray::s![start..stop, ..])
             .t()
             .dot(&hessian_weighted);
@@ -320,7 +823,7 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
     // the fitted column span over these rows. `Z̃ = Z − X_S·C` is the part of the
     // enrichment the realized design cannot represent, and it satisfies
     // `Z̃ᵀW_H X_S = 0`.
-    let coefficient_shift = input.design_gram.solve(&cross)?;
+    let coefficient_shift = design_gram.solve(&cross)?;
     if coefficient_shift.iter().any(|value| !value.is_finite()) {
         return None;
     }
@@ -340,20 +843,16 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
     while start < m {
         let stop = (start + ROW_BLOCK).min(m);
         let rows = stop - start;
-        let mut residualized = input
-            .enrichment
-            .slice(ndarray::s![start..stop, ..])
-            .to_owned();
-        residualized -= &input
-            .design
+        let mut residualized = enrichment.slice(ndarray::s![start..stop, ..]).to_owned();
+        residualized -= &design
             .slice(ndarray::s![start..stop, ..])
             .dot(&coefficient_shift);
         u += &residualized
             .t()
-            .dot(&input.score.slice(ndarray::s![start..stop]));
+            .dot(&score.slice(ndarray::s![start..stop]));
         let mut weighted = residualized.clone();
         for local in 0..rows {
-            let weight = input.score_weights[start + local];
+            let weight = score_weights[start + local];
             if !(weight.is_finite() && weight >= 0.0) {
                 return None;
             }
@@ -432,62 +931,35 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
     {
         return None;
     }
-    let projected: Array1<f64> = rotation.t().dot(&whitening.t().dot(&u));
     // A symmetric generalized eigenproblem of this size cannot resolve an
     // energy fraction below `dimension · ε`; deriving the boundary from the
     // arithmetic removes the production `1e-9` knob that caused these issues.
     // Since `τ = raw/residual`, retain exactly `τ · floor < 1`.
     let geometry_floor = (p.max(q) as f64) * f64::EPSILON;
-    let mut statistic = 0.0_f64;
-    let mut rank = 0usize;
-    for (index, &raw_energy) in raw_energy_per_residual.iter().enumerate() {
-        let raw_energy = raw_energy.max(0.0);
-        if raw_energy * geometry_floor < 1.0 {
-            let component = projected[index];
-            statistic += component * component;
-            rank += 1;
-        }
-    }
-    if rank == 0 {
+    let kept: Vec<usize> = raw_energy_per_residual
+        .iter()
+        .enumerate()
+        .filter(|(_, raw_energy)| raw_energy.max(0.0) * geometry_floor < 1.0)
+        .map(|(index, _)| index)
+        .collect();
+    if kept.is_empty() {
         return None;
     }
-    let statistic = statistic / input.dispersion;
-    if !statistic.is_finite() || statistic < 0.0 {
+    let rotated = whitening.dot(&rotation);
+    let mut basis = Array2::<f64>::zeros((q, kept.len()));
+    for (slot, &index) in kept.iter().enumerate() {
+        basis.column_mut(slot).assign(&rotated.column(index));
+    }
+    let projected = basis.t().dot(&u);
+    if basis.iter().any(|value| !value.is_finite())
+        || projected.iter().any(|value| !value.is_finite())
+    {
         return None;
     }
-
-    let reference_df = rank as f64;
-    let p_value = match input.scale {
-        SmoothTestScale::Known => chi_square_sf(statistic, reference_df),
-        SmoothTestScale::Estimated => {
-            let residual_df = input
-                .residual_df
-                .filter(|value| value.is_finite() && *value > 0.0)?;
-            // `φ̂` was estimated from the fit's residual sum `ν·φ̂`, and the
-            // residual's projection onto the tested directions, `T·φ̂` on `r`
-            // d.f., is part of that sum. `T/r` against `F(r, ν)` therefore divides
-            // by a scale that contains its own numerator: the ratio is
-            // `(ν/r)·Beta(r/2, (ν − r)/2)`, bounded and conservative at every
-            // level. The scale that is independent of the numerator is the rest
-            // of the sum, `(ν − T)·φ̂` on `ν − r` d.f., which gives the classical
-            // added-variable `F` (exact for an unpenalized Gaussian fit). With
-            // `ν ≤ r` or `T ≥ ν`, nothing is left to estimate that scale from.
-            let independent_df = residual_df - reference_df;
-            let independent_sum = residual_df - statistic;
-            if !(independent_df > 0.0 && independent_sum > 0.0) {
-                return None;
-            }
-            let f_statistic = (statistic / reference_df) / (independent_sum / independent_df);
-            fisher_snedecor_sf(f_statistic, reference_df, independent_df)
-        }
-    };
-    if !p_value.is_finite() {
-        return None;
-    }
-    Some(BasisAdequacyResult {
-        statistic,
-        rank,
-        p_value,
+    Some(EnrichmentGeometry {
+        coefficient_shift,
+        basis,
+        projected,
     })
 }
 
@@ -587,14 +1059,14 @@ pub struct DesignGramFactor {
 enum DesignGramFactorKind {
     /// The ordinary route. `O(p³)` once, then `O(p²q)` per solve.
     Cholesky(gam_linalg::faer_ndarray::FaerCholeskyFactor),
-    /// Rank-deficient fallback: the spectral pseudo-inverse, held as
-    /// `U diag(1/λ) Uᵀ` over the directions above the rank floor. It projects
-    /// onto `range(G)`, which is the right answer for a design that is
-    /// rank-deficient in the fit's own frame — directions the design cannot
-    /// span in the `W_H` metric are not directions to project out. A dense
-    /// symmetric eigendecomposition is the expensive route (it is the #2757
-    /// cost complaint at `p = 4096`), so it is the exception rather than the
-    /// default.
+    /// Rank-deficient fallback: the spectral pseudo-inverse, held as its square
+    /// root `R = U diag(1/√λ)` over the directions above the rank floor, so that
+    /// `G⁺ = R Rᵀ`. It projects onto `range(G)`, which is the right answer for a
+    /// design that is rank-deficient in the fit's own frame — directions the
+    /// design cannot span in the `W_H` metric are not directions to project
+    /// out. A dense symmetric eigendecomposition is the expensive route (it is
+    /// the #2757 cost complaint at `p = 4096`), so it is the exception rather
+    /// than the default.
     SpectralPseudoInverse(Array2<f64>),
 }
 
@@ -624,24 +1096,20 @@ impl DesignGramFactor {
             return None;
         }
         let floor = largest * (dimension as f64) * f64::EPSILON;
-        let mut scaled = eigenvectors.clone();
-        for (index, &eigenvalue) in eigenvalues.iter().enumerate() {
-            let factor = if eigenvalue > floor {
-                1.0 / eigenvalue
-            } else {
-                0.0
-            };
-            scaled
-                .column_mut(index)
-                .iter_mut()
-                .for_each(|v| *v *= factor);
+        let kept: Vec<usize> = (0..dimension)
+            .filter(|&index| eigenvalues[index] > floor)
+            .collect();
+        let mut root = Array2::<f64>::zeros((dimension, kept.len()));
+        for (slot, &index) in kept.iter().enumerate() {
+            let scale = 1.0 / eigenvalues[index].sqrt();
+            for row in 0..dimension {
+                root[(row, slot)] = eigenvectors[(row, index)] * scale;
+            }
         }
-        let pseudo_inverse = scaled.dot(&eigenvectors.t());
-        pseudo_inverse
-            .iter()
+        root.iter()
             .all(|value| value.is_finite())
             .then_some(Self {
-                kind: DesignGramFactorKind::SpectralPseudoInverse(pseudo_inverse),
+                kind: DesignGramFactorKind::SpectralPseudoInverse(root),
                 dimension,
             })
     }
@@ -654,12 +1122,43 @@ impl DesignGramFactor {
     fn solve(&self, rhs: &Array2<f64>) -> Option<Array2<f64>> {
         let solved = match &self.kind {
             DesignGramFactorKind::Cholesky(factor) => factor.solve_mat(rhs),
-            DesignGramFactorKind::SpectralPseudoInverse(inverse) => inverse.dot(rhs),
+            DesignGramFactorKind::SpectralPseudoInverse(root) => root.dot(&root.t().dot(rhs)),
         };
         solved
             .iter()
             .all(|value| value.is_finite())
             .then_some(solved)
+    }
+
+    /// The design in `G`-whitened coordinates, `X̄ = X R` with `R Rᵀ = G⁻`.
+    ///
+    /// Its rows give the hat matrix directly, `X G⁻ Xᵀ = X̄ X̄ᵀ`, through the
+    /// SAME factor every projection in this module uses: the Cholesky route
+    /// takes `R = L⁻ᵀ`, the pseudo-inverse route its stored square root. So the
+    /// leverages and the projection agree on which directions `range(G)` has,
+    /// which two independently thresholded factorizations would not guarantee.
+    fn whiten(&self, design: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        if design.ncols() != self.dimension {
+            return None;
+        }
+        let whitened = match &self.kind {
+            DesignGramFactorKind::Cholesky(factor) => {
+                // `L⁻¹` by one triangular solve against the identity, then a
+                // single GEMM for all rows: `O(p³ + m·p²)` in blocked kernels,
+                // where a per-row triangular solve would be `m` scalar sweeps.
+                let lower = factor.lower_triangular();
+                let inverse = gam_linalg::triangular::forward_substitution_lower_matrix(
+                    lower.view(),
+                    Array2::<f64>::eye(self.dimension).view(),
+                );
+                design.dot(&inverse.t())
+            }
+            DesignGramFactorKind::SpectralPseudoInverse(root) => design.dot(root),
+        };
+        whitened
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(whitened)
     }
 }
 
@@ -805,21 +1304,16 @@ mod tests {
         assert_eq!(out.rank, 2);
     }
 
-    /// A correctly specified fit produces a p-value that is not concentrated at
-    /// zero: the mean of the statistic sits near its reference d.f.
+    /// A correctly specified fit produces uniform p-values.
     ///
     /// This is the null-behaviour anchor. `y` is linear in `x` and the design
-    /// spans that exactly, so the quadratic/cubic enrichment tests a true `H₀`;
-    /// `E[T] = rank` is the moment identity a correctly scaled score statistic
-    /// must satisfy.
+    /// spans that exactly, so the quadratic/cubic enrichment tests a true `H₀`.
     #[test]
-    fn null_statistic_has_mean_near_its_reference_df() {
+    fn null_statistic_is_uniform_under_its_reference() {
         let n = 400;
-        let replicates = 200;
+        let replicates = 2000;
         let mut rng = Lcg(1_234_567);
-        let mut total = 0.0;
-        let mut rank_seen = 0usize;
-        let mut rejections = 0usize;
+        let mut p_values = Vec::with_capacity(replicates);
         for _ in 0..replicates {
             let mut design = Array2::<f64>::zeros((n, 2));
             let mut enrichment = Array2::<f64>::zeros((n, 3));
@@ -835,24 +1329,13 @@ mod tests {
             }
             let harness = GaussianHarness::new(design, enrichment, y, 0.0);
             let out = basis_adequacy_score_test(harness.input()).expect("estimable enrichment");
-            total += out.statistic;
-            rank_seen = out.rank;
-            if out.p_value < 0.05 {
-                rejections += 1;
-            }
+            assert_eq!(out.rank, 3);
+            p_values.push(out.p_value);
         }
-        let mean = total / replicates as f64;
-        let expected = rank_seen as f64;
-        // sd(χ²_r)/√reps = √(2r/reps) ≈ 0.17 for r = 3, reps = 200; 4σ ≈ 0.7.
-        assert!(
-            (mean - expected).abs() < 0.7,
-            "null mean statistic {mean} should sit near rank {expected}"
-        );
-        // Nominal 5% over 200 draws: sd = √(0.05·0.95/200) ≈ 0.0154, so 0.12 is
-        // a ~4.5σ band around 0.05 — loose enough to be stable, tight enough to
-        // catch a statistic that is systematically inflated.
-        let size = rejections as f64 / replicates as f64;
-        assert!(size < 0.12, "null rejection rate {size} is inflated");
+        // An unpenalized Gaussian fit with known scale makes `T` exactly `χ²₃`,
+        // so both tails are held to Monte Carlo error: a conservative
+        // reference fails this exactly as an inflated one does.
+        assert_uniform(&p_values, "gaussian known-scale score test");
     }
 
     /// A basis that cannot reach the truth is detected: the same design/enrichment
@@ -1374,5 +1857,291 @@ mod tests {
         estimated_without_df.scale = SmoothTestScale::Estimated;
         estimated_without_df.residual_df = None;
         assert_eq!(basis_adequacy_score_test(estimated_without_df), None);
+    }
+
+    /// Kolmogorov–Smirnov `p` of `p_values` against `U(0, 1)`: the asymptotic
+    /// Kolmogorov tail at Stephens' finite-sample-corrected statistic.
+    fn kolmogorov_smirnov_uniform_p_value(p_values: &[f64]) -> f64 {
+        let mut sorted = p_values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let count = sorted.len() as f64;
+        let distance = sorted
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let above = (index as f64 + 1.0) / count - value;
+                let below = value - index as f64 / count;
+                above.max(below)
+            })
+            .fold(0.0_f64, f64::max);
+        let root = count.sqrt();
+        let scaled = distance * (root + 0.12 + 0.11 / root);
+        // `Q(t) = 2 Σ_{k≥1} (−1)^{k−1} e^{−2k²t²}`, summed until a term no longer
+        // moves the partial sum.
+        let mut tail = 0.0_f64;
+        let mut k = 1.0_f64;
+        loop {
+            let term = 2.0 * (-2.0 * k * k * scaled * scaled).exp();
+            let signed = if (k as u64) % 2 == 1 { term } else { -term };
+            if tail + signed == tail {
+                break;
+            }
+            tail += signed;
+            k += 1.0;
+        }
+        tail.clamp(0.0, 1.0)
+    }
+
+    /// Hold null p-values to `U(0, 1)` in BOTH directions: a two-sided
+    /// Kolmogorov–Smirnov test over the whole range, and the empirical size at
+    /// each conventional level within 3.5 Monte Carlo standard errors of that
+    /// level. A conservative reference — sizes below nominal, mass piled near
+    /// `p = 1` — fails here exactly as an anti-conservative one does.
+    fn assert_uniform(p_values: &[f64], label: &str) {
+        assert!(
+            p_values.iter().all(|value| (0.0..=1.0).contains(value)),
+            "{label}: p-values outside [0, 1]"
+        );
+        let count = p_values.len() as f64;
+        let ks = kolmogorov_smirnov_uniform_p_value(p_values);
+        assert!(ks > 1e-3, "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates");
+        for level in [0.01, 0.05, 0.10] {
+            let size = p_values.iter().filter(|&&value| value <= level).count() as f64 / count;
+            let standard_error = (level * (1.0 - level) / count).sqrt();
+            assert!(
+                (size - level).abs() <= 3.5 * standard_error,
+                "{label}: size {size:.4} at level {level} is {:+.1} Monte Carlo SE from nominal",
+                (size - level) / standard_error
+            );
+        }
+    }
+
+    /// Fixed-design canonical GLM harness: `x` on a regular grid, `X` the
+    /// Legendre polynomials of degree `< p` in `2x − 1`, `Z` the cubic radial
+    /// functions `|x − c|³` at `q` equally spaced centres, and `η₀ = Xβ₀`
+    /// inside `span(X)`, so the enrichment tests a true `H₀`.
+    struct CanonicalHarness {
+        design: Array2<f64>,
+        enrichment: Array2<f64>,
+        eta: Array1<f64>,
+        family: CanonicalExponentialFamily,
+    }
+
+    impl CanonicalHarness {
+        fn new(
+            n: usize,
+            p: usize,
+            q: usize,
+            coefficients: &[f64],
+            family: CanonicalExponentialFamily,
+        ) -> Self {
+            let mut design = Array2::<f64>::zeros((n, p));
+            let mut enrichment = Array2::<f64>::zeros((n, q));
+            for row in 0..n {
+                let x = (row as f64 + 0.5) / n as f64;
+                let t = 2.0 * x - 1.0;
+                let (mut previous, mut current) = (1.0, t);
+                design[(row, 0)] = 1.0;
+                if p > 1 {
+                    design[(row, 1)] = t;
+                }
+                for degree in 1..p.saturating_sub(1) {
+                    let k = degree as f64;
+                    let next = ((2.0 * k + 1.0) * t * current - k * previous) / (k + 1.0);
+                    previous = current;
+                    current = next;
+                    design[(row, degree + 1)] = next;
+                }
+                for column in 0..q {
+                    let centre = (column as f64 + 0.5) / q as f64;
+                    enrichment[(row, column)] = (x - centre).abs().powi(3);
+                }
+            }
+            let mut beta = Array1::<f64>::zeros(p);
+            for (slot, &value) in beta.iter_mut().zip(coefficients) {
+                *slot = value;
+            }
+            let eta = design.dot(&beta);
+            Self {
+                design,
+                enrichment,
+                eta,
+                family,
+            }
+        }
+
+        fn draw(&self, extra_eta: &Array1<f64>, rng: &mut Lcg) -> Array1<f64> {
+            self.eta
+                .iter()
+                .zip(extra_eta)
+                .map(|(&base, &extra)| {
+                    let eta = base + extra;
+                    match self.family {
+                        CanonicalExponentialFamily::BinomialLogit => {
+                            let mean = 1.0 / (1.0 + (-eta).exp());
+                            if rng.next_uniform() < mean { 1.0 } else { 0.0 }
+                        }
+                        CanonicalExponentialFamily::PoissonLog => {
+                            // Knuth's multiplicative sampler: exact, and cheap at
+                            // the small means this harness uses.
+                            let floor = (-eta.exp()).exp();
+                            let mut product = rng.next_uniform();
+                            let mut count = 0.0;
+                            while product > floor {
+                                product *= rng.next_uniform();
+                                count += 1.0;
+                            }
+                            count
+                        }
+                    }
+                })
+                .collect()
+        }
+
+        fn p_value(&self, response: &Array1<f64>) -> Option<BasisAdequacyResult> {
+            let n = response.len();
+            let null_fit = canonical_null_fit(
+                self.design.view(),
+                response.view(),
+                Array1::<f64>::ones(n).view(),
+                Array1::<f64>::zeros(n).view(),
+                self.family,
+            )?;
+            conditional_basis_adequacy_test(self.enrichment.view(), self.design.view(), &null_fit)
+        }
+
+        /// Null p-values over `replicates` draws, and how many draws the
+        /// expansion refused (`Σ` not positive definite or `c ≤ 0`).
+        fn null_p_values(&self, replicates: usize, seed: u64) -> (Vec<f64>, usize) {
+            let mut rng = Lcg(seed);
+            let none = Array1::<f64>::zeros(self.eta.len());
+            let mut p_values = Vec::with_capacity(replicates);
+            for _ in 0..replicates {
+                let response = self.draw(&none, &mut rng);
+                if let Some(out) = self.p_value(&response) {
+                    p_values.push(out.p_value);
+                }
+            }
+            let refused = replicates - p_values.len();
+            (p_values, refused)
+        }
+    }
+
+    /// A refusal is "not measured", never a p-value, so it cannot bias the
+    /// reported ones in either direction — but it must stay rarer than the
+    /// Monte Carlo resolution at the smallest level `assert_uniform` checks, or
+    /// the measured replicates would no longer stand for the null draws.
+    fn assert_refusals_rare(refused: usize, replicates: usize, label: &str) {
+        let level = 0.01_f64;
+        let count = replicates as f64;
+        let tolerance = 3.5 * (level * (1.0 - level) / count).sqrt();
+        assert!(
+            (refused as f64) / count <= tolerance,
+            "{label}: {refused} of {replicates} replicates refused"
+        );
+    }
+
+    /// The unconditional `χ²_r` reference is wrong at `O(r/n)` for a binomial
+    /// response — in this harness its p-values fail uniformity at KS
+    /// `p ≈ 1e-9` over 4000 replicates. The conditional reference holds both
+    /// tails.
+    #[test]
+    fn conditional_test_is_uniform_under_the_null_binomial() {
+        let harness = CanonicalHarness::new(
+            200,
+            6,
+            12,
+            &[0.3, 0.8, -0.5],
+            CanonicalExponentialFamily::BinomialLogit,
+        );
+        let (p_values, refused) = harness.null_p_values(4000, 20_260_919);
+        assert_refusals_rare(refused, 4000, "binomial conditional score test");
+        assert_uniform(&p_values, "binomial conditional score test");
+    }
+
+    #[test]
+    fn conditional_test_is_uniform_under_the_null_poisson() {
+        let harness = CanonicalHarness::new(
+            200,
+            6,
+            12,
+            &[1.0, 0.5, -0.3],
+            CanonicalExponentialFamily::PoissonLog,
+        );
+        let (p_values, refused) = harness.null_p_values(4000, 20_260_920);
+        assert_refusals_rare(refused, 4000, "poisson conditional score test");
+        assert_uniform(&p_values, "poisson conditional score test");
+    }
+
+    /// A truth with structure the degree-5 design cannot represent is rejected
+    /// decisively, for both families.
+    #[test]
+    fn conditional_test_detects_a_basis_too_small_for_the_truth() {
+        for (family, coefficients) in [
+            (CanonicalExponentialFamily::BinomialLogit, [0.3, 0.8, -0.5]),
+            (CanonicalExponentialFamily::PoissonLog, [1.0, 0.5, -0.3]),
+        ] {
+            let harness = CanonicalHarness::new(2000, 6, 12, &coefficients, family);
+            let missing: Array1<f64> = (0..2000)
+                .map(|row| (20.0 * (row as f64 + 0.5) / 2000.0).sin())
+                .collect();
+            let mut rng = Lcg(20_260_921);
+            let response = harness.draw(&missing, &mut rng);
+            let out = harness.p_value(&response).expect("measured");
+            assert!(out.p_value < 1e-8, "{family:?}: p = {:.3e} under a missing sin(20x)", out.p_value);
+        }
+    }
+
+    /// The null fit is the unpenalized MLE: its score is orthogonal to the
+    /// design to within the certification band, from any start in the span.
+    #[test]
+    fn canonical_null_fit_solves_the_score_equation() {
+        let harness = CanonicalHarness::new(
+            300,
+            4,
+            6,
+            &[0.2, 0.9],
+            CanonicalExponentialFamily::BinomialLogit,
+        );
+        let mut rng = Lcg(99);
+        let response = harness.draw(&Array1::zeros(300), &mut rng);
+        let start = harness.design.column(1).mapv(|value| 3.0 * value);
+        let fit = canonical_null_fit(
+            harness.design.view(),
+            response.view(),
+            Array1::<f64>::ones(300).view(),
+            start.view(),
+            harness.family,
+        )
+        .expect("interior MLE");
+        let gradient = harness.design.t().dot(&fit.score);
+        let scale = harness.design.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            gradient.iter().all(|value| value.abs() < 1e-6 * scale * 300.0),
+            "score equation residual {gradient:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_null_fit_refuses_inadmissible_responses() {
+        let harness = CanonicalHarness::new(
+            20,
+            2,
+            3,
+            &[0.0],
+            CanonicalExponentialFamily::PoissonLog,
+        );
+        let mut response = Array1::<f64>::ones(20);
+        response[3] = -1.0;
+        assert!(
+            canonical_null_fit(
+                harness.design.view(),
+                response.view(),
+                Array1::<f64>::ones(20).view(),
+                Array1::<f64>::zeros(20).view(),
+                harness.family,
+            )
+            .is_none()
+        );
     }
 }
