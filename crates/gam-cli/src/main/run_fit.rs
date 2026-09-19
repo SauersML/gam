@@ -2,10 +2,10 @@ use super::*;
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     // GUARD (#2030): the geometry carrier's optional owned row evidence MUST
-    // survive compaction. Saved ALO explicitly requires `geometry.working`;
-    // `None` correctly means unavailable, while truncating a present vector
-    // would corrupt a valid single-diagonal fit. `FitInference` deliberately
-    // has no duplicate copy, so only this one source of truth is retained.
+    // survive compaction of the in-memory fit: `None` correctly means
+    // unavailable, while truncating a present vector would corrupt a valid
+    // single-diagonal fit. It is never serialized (a saved model carries no
+    // per-row training data), so compaction has nothing to gain from it.
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }
@@ -57,7 +57,6 @@ fn fit_request_document_from_fit_args(
         noise_formula: args.predict_noise.clone(),
         noise_offset: args.noise_offset_column.clone(),
         offset: args.offset_column.clone(),
-        precompute_conformal: Some(args.precompute_conformal),
         scale_dimensions: args.scale_dimensions.then_some(true),
         sigma_time_k: args.sigma_time_k,
         slope_time_k: args.slope_time_k,
@@ -113,7 +112,7 @@ fn expand_cli_automatic_formula(
         &formula, &dataset, fit_config,
     )
     .map_err(|error| error.to_string())?;
-    print_inference_summary(&automatic.notes);
+    print_inference_summary(&automatic.notes, &[]);
     Ok(automatic.formula)
 }
 
@@ -265,17 +264,20 @@ fn run_canonical_standard_fit(
     fit_config: &FitConfig,
 ) -> Result<(), String> {
     let phase_start = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit start n={}",
         dataset.values.nrows()
     );
     let outcome = fit_from_formula_with_notes(formula, dataset, fit_config)
         .map_err(canonical_standard_fit_error)?;
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&outcome.inference_notes);
+    print_inference_summary(
+        &outcome.inference_notes.advisories,
+        &outcome.inference_notes.informational,
+    );
 
     match outcome.result {
         FitResult::Standard(mut result) => {
@@ -442,18 +444,18 @@ fn run_library_formula_fit(
     let dataset = load_fit_dataset_with_roles(&args.data, &requested_columns, parsed, false)?;
     require_dataset_rows("fit", &args.data, dataset.values.nrows())?;
     let phase_start = std::time::Instant::now();
-    log::info!("[PHASE] formula fit start n={}", dataset.values.nrows());
+    log::debug!("[PHASE] formula fit start n={}", dataset.values.nrows());
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,
         &dataset,
         fit_config,
     )
     .map_err(|error| format!("formula fit failed: {error}"))?;
-    log::info!(
+    log::debug!(
         "[PHASE] formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&payload.inference_notes);
+    print_inference_summary(&payload.inference_notes, &payload.informational_notes);
     if let Some(fit) = payload.fit_result.as_ref() {
         cli_out!(
             "{} fit | status={} | iterations={} | loglik={:.6e} | reml_score={} | raw_reml_score={}",
@@ -611,7 +613,7 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
                 frozen_parametric_residualization: None,
                 name: term.name.clone(),
                 basis: (**inner).clone(),
-                shape: term.shape,
+                shape: term.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -619,7 +621,7 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
             frozen_parametric_residualization: None,
             name: term.name.clone(),
             basis: (**smooth).clone(),
-            shape: term.shape,
+            shape: term.shape.clone(),
             joint_null_rotation: None,
         }),
         SmoothBasisSpec::FactorSmooth { spec } => {

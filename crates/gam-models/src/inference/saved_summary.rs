@@ -451,6 +451,11 @@ pub struct ScanIntrospection {
     pub log_likelihood: f64,
     /// Gaussian deviance — the weighted residual sum of squares.
     pub deviance: f64,
+    /// REML-profiled Gaussian scale: the innovations quadratic (data residual
+    /// energy plus roughness energy at the posterior mode) over `n − order`,
+    /// the `order` diffuse null-space directions the restricted likelihood
+    /// integrates out.
+    pub sigma2: f64,
     /// Number of pooled knots (the smoother's natural coefficient count).
     pub n_knots: usize,
 }
@@ -470,6 +475,7 @@ pub fn scan_introspection(model: &FittedModel) -> Result<Option<ScanIntrospectio
         reml_cost: -fit.restricted_loglik,
         log_likelihood: fit.log_likelihood,
         deviance: fit.deviance(),
+        sigma2: fit.sigma2,
         n_knots: fit.knots.len(),
     }))
 }
@@ -513,6 +519,7 @@ fn scan_summary_payload(
         // row.
         basis_checks: summary_basis_checks(model),
         deviance: scan.deviance,
+        scale: Some(scan.sigma2),
         log_likelihood: Some(scan.log_likelihood),
         n_obs: Some(scan.training_sample_size),
         // The scan does not compute the penalized-Hessian null-space logdet the TK
@@ -526,7 +533,6 @@ fn scan_summary_payload(
         ),
         null_space_logdet: None,
         null_dim: None,
-        iterations: 0,
         edf_total: Some(scan.edf),
         edf_rank_bound: Vec::new(),
         information_criteria: scan_information_criteria(scan)?,
@@ -546,6 +552,7 @@ fn scan_summary_payload(
         // fabricated "certified" block here would be the exact confusion
         // #2411 exists to remove.
         convergence: None,
+        notes: summary_notes(model),
     })
 }
 
@@ -584,6 +591,7 @@ fn summary_convergence(fit: &gam_solve::estimate::UnifiedFitResult) -> SummaryCo
         certified: certificate.is_none_or(|certificate| certificate.certifies()),
         inner_status: evidence.inner_status().label().to_string(),
         outer_iterations: evidence.outer_iterations(),
+        inner_iterations: fit.inner_cycles,
         outer,
         estimator: SummaryEstimator::of(fit),
     }
@@ -681,9 +689,21 @@ impl SummaryInformationCriteria {
     }
 }
 
+/// Why a fit with no single response family (a location-scale or other
+/// multi-block fit) reports no AIC.
+pub const NO_AIC_WITHOUT_A_SCALAR_FAMILY: &str =
+    "the fit models its response through several linear predictors and has no single \
+     response family or scalar dispersion, which both AICs and their scale degrees of \
+     freedom are defined from";
+
 fn summary_information_criteria(
     fit: &UnifiedFitResult,
 ) -> Result<SummaryInformationCriteria, String> {
+    if fit.likelihood_family.is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(
+            NO_AIC_WITHOUT_A_SCALAR_FAMILY,
+        ));
+    }
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
@@ -758,6 +778,15 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
+    // A custom family has no scalar response distribution, hence no single
+    // dispersion to report; every built-in family resolves one.
+    let scale = match fit.likelihood_family {
+        None => None,
+        Some(_) => Some(
+            fit.dispersion_phi()
+                .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?,
+        ),
+    };
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -766,6 +795,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
+        scale,
         // Declined at the same boundary and for the same reason as the
         // criterion: with `φ̂ = 0` there is no normalized density, and the
         // stored `0.0` is the `UserProvided` tag saying so. Emitting it as a
@@ -781,7 +811,6 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         },
         null_space_logdet: fit.artifacts.null_space_logdet,
         null_dim: fit.artifacts.null_space_dim.map(|dim| dim as f64),
-        iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         edf_rank_bound: fit.edf_rank_bound().to_vec(),
         information_criteria,
@@ -796,6 +825,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
         coefficient_se_source: display_uncertainty.map(|view| view.definition.as_str().to_string()),
         convergence: Some(summary_convergence(&fit)),
+        notes: summary_notes(model),
     })
 }
 
@@ -976,6 +1006,15 @@ pub struct SummaryPayload {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub deployment_extensions: Vec<SavedDeploymentExtension>,
     pub deviance: f64,
+    /// Estimated scale (dispersion) `φ̂` of the response distribution, the
+    /// same value the log-likelihood and every standard error are evaluated
+    /// at. Families with a known scale report it (`1` for Poisson, binomial);
+    /// a Gaussian REML fit reports the residual-d.f. estimator
+    /// `φ̂ = Σ wᵢ(yᵢ − μ̂ᵢ)² / (n − edf)`, with `n` the positive-weight rows and
+    /// `edf = p − Σ_k tr(λ_k H⁻¹ S_k)` (the `edf_total` field); a spline-scan fit reports the smoother's
+    /// REML-profiled `σ̂²`. `None` only for a custom-family fit, which has no
+    /// scalar response distribution.
+    pub scale: Option<f64>,
     /// Reported log-likelihood at the converged mode. Carried so
     /// `compare_models` can form the Occam-penalised conditional AIC it ranks on
     /// (issue #1362). `None` means the fit has no normalized likelihood at the
@@ -1016,7 +1055,6 @@ pub struct SummaryPayload {
     pub null_space_logdet: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub null_dim: Option<f64>,
-    pub iterations: usize,
     pub edf_total: Option<f64>,
     /// Each penalty block's rank-bound status beside the EDF fields (#2901). An
     /// `Uncertified` or `NotAssessed` block's trace and EDF are published unclamped,
@@ -1073,6 +1111,23 @@ pub struct SummaryPayload {
     /// (the O(n) spline scan).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub convergence: Option<SummaryConvergence>,
+    /// The notes the fit recorded, advisories (`inference_notes`: the model
+    /// differs from the literal request) first, then informational notes
+    /// (`informational_notes`: defaults chosen on the user's behalf). Empty
+    /// when the fit recorded none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Every note the fit recorded, advisories first.
+fn summary_notes(model: &FittedModel) -> Vec<String> {
+    let payload = model.payload();
+    payload
+        .inference_notes
+        .iter()
+        .chain(&payload.informational_notes)
+        .cloned()
+        .collect()
 }
 
 /// How the optimization that produced this fit terminated.
@@ -1092,6 +1147,10 @@ pub struct SummaryConvergence {
     pub inner_status: String,
     /// Outer iterations covered by the proof.
     pub outer_iterations: usize,
+    /// Inner iterations of the final certified inner solve at the reported
+    /// smoothing parameters (P-IRLS iterations, or blockwise cycles for a
+    /// custom family).
+    pub inner_iterations: usize,
     /// `None` when no smoothing coordinate was optimized: there is no outer
     /// stationarity equation to solve, which is a different statement from a
     /// projected gradient that happened to be zero.

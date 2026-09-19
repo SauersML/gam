@@ -117,7 +117,6 @@ def main():
     args = ap.parse_args()
 
     import gamfit
-    gamfit.set_log_level("warn")
 
     print("# 2502 d>=2 re-run at MEASURED parity, real ambient sphere")
     print(f"# n_train={args.n_train} n_test={args.n_test} p={args.p} "

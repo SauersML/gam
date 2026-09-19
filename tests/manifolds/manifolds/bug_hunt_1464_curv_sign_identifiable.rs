@@ -33,7 +33,7 @@ struct KappaTraceLogger;
 
 impl log::Log for KappaTraceLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         let message = record.args().to_string();
@@ -49,7 +49,7 @@ static KAPPA_TRACE_LOGGER: KappaTraceLogger = KappaTraceLogger;
 fn install_kappa_trace_logger() {
     // Losing the race to an already-installed logger leaves that logger in place.
     if log::set_logger(&KAPPA_TRACE_LOGGER).is_ok() {
-        log::set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Debug);
     }
 }
 

@@ -1257,7 +1257,7 @@ impl<'a> RemlState<'a> {
             let grad = result
                 .gradient_for_mode(eval_mode, theta.len())
                 .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
-            log::info!(
+            log::debug!(
                 "[outer-timing] compute_joint_hyper_eval (unified, rho_dim={}, psi_dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 hyper_dirs.len(),
@@ -1283,7 +1283,7 @@ impl<'a> RemlState<'a> {
             // and silently degraded large-K joint-hyper outers to the dense
             // path even when the eval-side had elected Operator.
             let eval = self.compute_outer_eval_with_order(&rho, order)?;
-            log::debug!(
+            log::trace!(
                 "[outer-timing] compute_joint_hyper_eval (rho-only, dim={}): {:.3}s  cost={:.6e}",
                 rho_dim,
                 t_outer_start.elapsed().as_secs_f64(),
@@ -1324,7 +1324,7 @@ impl<'a> RemlState<'a> {
         if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
             && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
         {
-            log::warn!(
+            log::debug!(
                 "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large; falling back to rho-only REML"
             );
@@ -1386,7 +1386,7 @@ impl<'a> RemlState<'a> {
             };
             Ok((ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv))
         };
-        log::debug!(
+        log::trace!(
             "[outer-timing] build_tau_unified_objects_from_bundle ({}, n={}, p={}, psi_dim={}): {:.1}ms",
             backend_label,
             n_x,
@@ -1980,9 +1980,7 @@ impl<'a> RemlState<'a> {
                 if !is_gaussian_identity {
                     // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
                     let c_x_tau_beta = directional_curvature_weights(c_array, &x_tau_beta_j);
-                    let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
-                    b_j +=
-                        &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
+                    b_j += &Self::xt_diag_x_dense(x_dense, &c_x_tau_beta);
                 }
 
                 // Firth Hessian drifts: −(H_φ)_{τ_j}|_β.
@@ -3041,7 +3039,7 @@ impl<'a> RemlState<'a> {
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
+            log::debug!(
                 "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large"
             );
@@ -3181,7 +3179,6 @@ impl<'a> RemlState<'a> {
 
         // Build HyperCoord for each link parameter.
         let mut coords = Vec::with_capacity(aux_dim);
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         for j in 0..aux_dim {
             // a_j = dF/dθ_j|_{β fixed} = -dℓ/dθ_j|_{η fixed}.
             let a_j = -direct_ll[j];
@@ -3195,8 +3192,7 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (SAS, beta-logistic).
-            let b_j =
-                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j = Self::xt_diag_x_dense(x_dense, &dw_explicit_by_j[j]);
 
             coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
@@ -3245,7 +3241,7 @@ impl<'a> RemlState<'a> {
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
+            log::debug!(
                 "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
                  dense design materialization too large"
             );
@@ -3363,7 +3359,6 @@ impl<'a> RemlState<'a> {
         }
 
         let mut coords = Vec::with_capacity(aux_dim);
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         for j in 0..aux_dim {
             let a_j = -direct_ll[j];
             let g_j = {
@@ -3373,8 +3368,7 @@ impl<'a> RemlState<'a> {
             // B_j = X^T diag(dw_obs_j) X — the fixed-β observed Hessian drift.
             // Uses observed-information weight derivatives (not Fisher) for exact
             // REML/LAML with non-canonical links (mixture/blended).
-            let b_j =
-                Self::xt_diag_x_dense_into(x_dense, &dw_explicit_by_j[j], &mut weighted_scratch);
+            let b_j = Self::xt_diag_x_dense(x_dense, &dw_explicit_by_j[j]);
 
             coords.push(super::reml_outer_engine::HyperCoord {
                 a: a_j,
@@ -3452,7 +3446,6 @@ impl<'a> RemlState<'a> {
             ));
         }
         let mut coords = Vec::with_capacity(aux_dim);
-        let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
         for j in 0..aux_dim {
             let a_j = -jets.iter().map(|jet| jet.log_likelihood[j]).sum::<f64>();
             let du = Array1::from_iter(jets.iter().map(|jet| jet.score[j]));
@@ -3461,7 +3454,7 @@ impl<'a> RemlState<'a> {
                 a: a_j,
                 g: -x_dense.t().dot(&du),
                 drift: super::reml_outer_engine::HyperCoordDrift::from_dense(
-                    Self::xt_diag_x_dense_into(x_dense, &dw, &mut weighted_scratch),
+                    Self::xt_diag_x_dense(x_dense, &dw),
                 ),
                 // The penalties do not depend on (σ, ν).
                 ld_s: 0.0,
@@ -3650,7 +3643,6 @@ fn link_ext_pair_objects_from_rows(
     dw_deta: Vec<Array1<f64>>,
 ) -> LinkExtPairObjects {
     let p_dim = x_eff.ncols();
-    let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
     let mut g_pairs: Vec<Array1<f64>> = Vec::with_capacity(aux_dim * aux_dim);
     let mut b_pairs: Vec<Array2<f64>> = Vec::with_capacity(aux_dim * aux_dim);
     for idx in 0..aux_dim * aux_dim {
@@ -3660,11 +3652,7 @@ fn link_ext_pair_objects_from_rows(
             continue;
         }
         g_pairs.push(-x_eff.t().dot(&d2u[idx]));
-        b_pairs.push(super::assembly::xt_diag_x_dense_into(
-            &x_eff,
-            &d2w[idx],
-            &mut weighted_scratch,
-        ));
+        b_pairs.push(super::assembly::xt_diag_x_dense(&x_eff, &d2w[idx]));
     }
 
     let a_pairs = std::sync::Arc::new(a_pairs);
@@ -3719,9 +3707,8 @@ fn link_ext_pair_objects_from_rows(
             }
             let eta_dir = drift_x.dot(delta);
             let diag = mixed * &eta_dir;
-            let mut scratch = Array2::<f64>::zeros((0, 0));
             Ok(Some(super::reml_outer_engine::DriftDerivResult::Dense(
-                super::assembly::xt_diag_x_dense_into(&drift_x, &diag, &mut scratch),
+                super::assembly::xt_diag_x_dense(&drift_x, &diag),
             )))
         },
     );

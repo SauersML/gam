@@ -52,7 +52,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
                 frozen_parametric_residualization: None,
                 name: term.name.clone(),
                 basis: (**inner).clone(),
-                shape: term.shape,
+                shape: term.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -69,7 +69,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
             frozen_parametric_residualization: None,
             name: term.name.clone(),
             basis: (**smooth).clone(),
-            shape: term.shape,
+            shape: term.shape.clone(),
             joint_null_rotation: None,
         }),
         SmoothBasisSpec::FactorSmooth { .. } => 7,
@@ -84,7 +84,7 @@ pub(crate) fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
                 frozen_parametric_residualization: None,
                 name: term.name.clone(),
                 basis: (**inner).clone(),
-                shape: term.shape,
+                shape: term.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -327,7 +327,7 @@ mod tests {
             frozen_parametric_residualization: None,
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }

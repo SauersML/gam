@@ -167,7 +167,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert model.training_table_kind == "records"
     assert not model.is_survival
     assert not model.is_transformation_normal
-    assert summary["iterations"] >= 0
+    assert summary["convergence"]["outer_iterations"] >= 0
     assert not summary.coefficients_frame().empty
 
     predicted = model.predict(prediction_rows())

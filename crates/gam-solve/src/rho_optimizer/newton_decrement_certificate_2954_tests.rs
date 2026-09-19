@@ -37,7 +37,7 @@ fn certify_row_summed_quadratic_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -251,7 +251,7 @@ fn an_evaluation_without_parts_takes_no_decrement_verdict_2954() {
 fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
     let n_obs = 1_000;
     let config = OuterConfig {
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -328,7 +328,7 @@ fn certify_scripted_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -459,6 +459,42 @@ fn an_exponential_tail_is_railed_at_its_bound_and_certified_there_2954() {
         }),
         "the certificate records the face kind: {:?}",
         certificate.railed_facts,
+    );
+}
+
+/// `V = n·(0.6 + s·(e^ρ − 1 − ρ))` with `n·s = 1e-4`: an interior optimum at
+/// `ρ = 0` whose third derivative equals its second, so `½V‴/V″^(3/2) =
+/// 1/(2√(n·s)) = 50` and Newton converges quadratically at fifty times the unit
+/// self-concordant rate, as a LAML criterion does along a smooth whose penalty
+/// barely binds. From `ρ = 0.5` (`λ̂ ≈ 5.0e-3`) the unit-rate bound allows two
+/// steps against the channel band `≈ 2.8e-10`, and they leave `½λ̂² ≈ 1.5e-9`.
+/// The decrement is still contracting at Newton's rate, so the polish takes a
+/// third step past the budget (#3012), and that one reaches the band: the mint
+/// certifies the optimum instead of refusing a walk that is converging.
+#[test]
+fn a_criterion_at_a_steep_quadratic_rate_is_polished_to_its_optimum_2954() {
+    const STEEP_2954: fn(f64) -> [f64; 3] = |rho| {
+        let s = 1.0e-4 / 2_000.0;
+        [
+            0.6 + s * (rho.exp() - 1.0 - rho),
+            s * (rho.exp() - 1.0),
+            s * rho.exp(),
+        ]
+    };
+    let (outcome, published) =
+        certify_scripted_2954(2_000, 0.5, (-20.0, 20.0), None, STEEP_2954, None);
+    let certificate = outcome.expect("Newton at the measured rate reaches the optimum");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    assert_eq!(polish.decreases.len(), 3, "{polish:?}");
+    assert_eq!(polish.step_budget, 2, "{polish:?}");
+    assert!(polish.rails.is_empty(), "{polish:?}");
+    assert!(
+        published[0].abs() <= 1.0e-4,
+        "published at ρ = {:.3e}",
+        published[0]
     );
 }
 
@@ -673,7 +709,7 @@ fn a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_301
 fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(1_000),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -791,7 +827,7 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -904,7 +940,7 @@ fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -1069,7 +1105,7 @@ fn certify_two_route_walk_2954(
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(n),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(COEFFICIENTS_2954),
         },
@@ -1223,7 +1259,7 @@ fn an_inner_mode_without_a_residual_takes_no_decrement_verdict_2954() {
     let config = OuterConfig {
         tolerance: OUTER_TOL_2954,
         objective_scale: Some(2_000.0),
-        rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
             n_obs: Some(2_000),
             p_coefficients: Some(COEFFICIENTS_2954),
         },

@@ -122,7 +122,7 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
         level: Default::default(),
@@ -196,7 +196,7 @@ fn run_fit(max_outer_iter: usize) -> Result<(), String> {
 /// moved the failure past a budget would still trip the smaller one.
 #[test]
 fn regression_2726_joint_and_scalar_rho_routes_share_theta0() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     for max_outer_iter in [15usize, 60] {
         let outcome = run_fit(max_outer_iter);
         match &outcome {
@@ -233,7 +233,7 @@ fn regression_2726_joint_and_scalar_rho_routes_share_theta0() {
 /// original refusal was budget-independent.
 #[test]
 fn regression_2726_out_of_window_fixture_still_fits() {
-    gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
+    gam_solve::progress_log::init_logging_at(log::LevelFilter::Debug);
     // Two budgets: the fixture's short one, on which a stop is a statement
     // about the budget and not about the criterion, and the engine's own. The
     // #2726 defect refused identically on both; a budget stop on the short arm

@@ -368,9 +368,16 @@ pub(crate) fn run_generate_unified(
 pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
     reject_multinomial_model(&args.model, "summary")?;
     let model = SavedModel::load_from_path(&args.model)?;
-    // One renderer owns the text; gamfit's `Model.summary()` prints the same
-    // string from the same payload.
-    let text = render_summary_text(&saved_model_summary(&model)?);
+    let summary = saved_model_summary(&model)?;
+    // `--json` prints the payload itself, the document gamfit's
+    // `Model.summary()` reads; otherwise one renderer owns the text, and
+    // gamfit prints the same string from the same payload.
+    let text = if args.json {
+        serde_json::to_string_pretty(&summary)
+            .map_err(|err| format!("failed to serialize summary: {err}"))?
+    } else {
+        render_summary_text(&summary)
+    };
     use std::io::Write as _;
     writeln!(std::io::stdout(), "{text}")
         .map_err(|error| format!("failed to write the summary: {error}"))
@@ -998,6 +1005,32 @@ fn report_family_residuals(
                     let dist = Gamma::new(shape, shape / mu[i])
                         .map_err(|e| format!("Gamma residual at μ={}: {e}", mu[i]))?;
                     to_normal(dist.cdf(y[i]))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
+            })
+        }
+        ResponseFamily::InverseGaussian => {
+            // Pearson dispersion under V(μ) = μ³: φ̂ = Σ(y−μ)²/μ³/(n − edf).
+            let phi = (0..n)
+                .map(|i| (y[i] - mu[i]).powi(2) / mu[i].powi(3))
+                .sum::<f64>()
+                / residual_dof;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err("inverse-Gaussian dispersion estimate is not positive".to_string());
+            }
+            let values = (0..n)
+                .map(|i| {
+                    if !(y[i] > 0.0 && mu[i] > 0.0) {
+                        return Err(format!(
+                            "inverse-Gaussian response and mean must be positive, got y={} μ={}",
+                            y[i], mu[i]
+                        ));
+                    }
+                    // IG(μ, λ = 1/φ): Var = φμ³.
+                    to_normal(inverse_gaussian_cdf(y[i], mu[i], 1.0 / phi))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(FamilyResiduals {

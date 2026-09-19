@@ -1073,7 +1073,8 @@ mod linux_impl {
 pub(crate) use linux_impl::{GpuGaussianPlsInput, GpuPirlsDispatchInput};
 #[cfg(target_os = "linux")]
 pub(crate) use linux_impl::{
-    try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
+    try_gpu_gaussian_pls_admit, try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit,
+    try_gpu_pirls_loop_dispatch,
 };
 
 #[cfg(test)]

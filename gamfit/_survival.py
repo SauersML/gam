@@ -685,11 +685,11 @@ def competing_risks_prediction_from_ffi_payload(
     )
 
 
-def term_blocks_for_model(model_bytes: bytes) -> tuple[TermBlock, ...]:
-    """Return per-term coefficient column ranges for a saved model."""
+def term_blocks_for_model(model: Any) -> tuple[TermBlock, ...]:
+    """Return per-term coefficient column ranges for a compiled fitted model."""
     return tuple(
         TermBlock(name=str(name), kind=str(kind), start=int(start), end=int(end))
-        for name, kind, start, end in rust_module().term_blocks_for_model(model_bytes)
+        for name, kind, start, end in rust_module().term_blocks_for_model(model)
     )
 
 

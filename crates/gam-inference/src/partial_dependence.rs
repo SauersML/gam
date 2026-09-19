@@ -419,7 +419,7 @@ mod tests {
         SmoothTermSpec {
             name: name.to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
             frozen_parametric_residualization: None,
         }
