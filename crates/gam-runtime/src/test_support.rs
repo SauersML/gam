@@ -3,7 +3,7 @@
 //! Production instruments its solvers through the `log` facade — the BMS
 //! intercept-solve counters, the GL-ladder rung histogram, the cell-moment cache
 //! stats, the certificate-bound discriminator. Every one of those is a
-//! `log::info!`, and **the `log` facade drops every record until some binary
+//! `log::debug!`, and **the `log` facade drops every record until some binary
 //! installs a backend**. No test binary in this workspace installed one, so all
 //! of that instrumentation has been running and producing nothing, in unit tests
 //! and integration tests alike. Two lanes independently spent hours re-deriving
@@ -48,7 +48,7 @@ struct StderrDiagnosticLogger;
 
 impl log::Log for StderrDiagnosticLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -80,7 +80,7 @@ static INSTALL_ONCE: Once = Once::new();
 
 /// Install the stderr diagnostic backend for this process, once.
 ///
-/// Call it from any test that wants to read production's `log::info!` output.
+/// Call it from any test that wants to read production's `log::debug!` output.
 /// It is safe to call from every test in a binary and from several binaries at
 /// once: `log::set_logger` may only be called once per process, so the work is
 /// behind a [`Once`], and a losing call is treated as success — some other
@@ -93,7 +93,7 @@ static INSTALL_ONCE: Once = Once::new();
 pub fn install_diagnostic_logger() {
     INSTALL_ONCE.call_once(|| {
         if log::set_logger(&DIAGNOSTIC_LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
 }
@@ -157,13 +157,13 @@ mod tests {
         install_diagnostic_logger();
         install_diagnostic_logger();
         // The facade only forwards records at or below the max level; if the
-        // install silently did nothing, production's `log::info!` diagnostics
+        // install silently did nothing, production's `log::debug!` diagnostics
         // stay invisible and every caller of this module is misled.
         assert!(
-            log::max_level() >= log::LevelFilter::Info,
+            log::max_level() >= log::LevelFilter::Debug,
             "diagnostic logger must leave Info records enabled, got {}",
             log::max_level()
         );
-        assert!(log::log_enabled!(log::Level::Info));
+        assert!(log::log_enabled!(log::Level::Debug));
     }
 }

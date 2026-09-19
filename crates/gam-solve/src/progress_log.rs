@@ -1,10 +1,13 @@
-//! Stderr progress logger for the `gam` CLI and the `gamfit` Python bindings.
+//! Stderr progress logger for the `gam` CLI and for Rust tests and examples.
 //!
 //! Installs a global [`log`] backend that timestamps each record (elapsed since
 //! process start), strips terminal control / escape sequences, and writes to
 //! stderr under a write-lock so concurrent solver threads never interleave
-//! partial lines. This is the sole logger bootstrap for the CLI binary and the
-//! Python extension module.
+//! partial lines. The `gamfit` Python extension installs its own backend that
+//! forwards records to Python `logging` instead (`gam-pyffi`'s `python_log`).
+//!
+//! Library code logs only at `debug` and `trace`: a solver diagnostic is never
+//! something the caller must act on, so no default filter shows it.
 //!
 //! (Extracted from the former TUI `visualizer` module, which has been removed
 //! along with its `crossterm`/`ratatui` dependencies; only the stderr logging
@@ -121,16 +124,12 @@ fn human_elapsed(elapsed: Duration) -> String {
 
 /// Default verbosity when the user has not requested an explicit level.
 ///
-/// A single ordinary fit (e.g. a 400-row `s(x)` P-spline) emits thousands of
-/// per-iteration `[OUTER ...]` / `[GAM ALO]` `info!`/`warn!` records. Writing
-/// them to stderr under a write-lock is not free — when stderr is a terminal
-/// or a pipe it is *measurable* fit overhead (#1689), and for the common case
-/// (a library call from Python that just wants the model back) the stream is
-/// pure noise. So the out-of-the-box level is `Warn`: genuine problems still
-/// surface, but the routine progress chatter is silent unless explicitly
-/// requested. Power users opt back in by calling [`set_log_level`] (e.g.
-/// `set_log_level("info")`) or [`log::set_max_level`] directly — verbosity is
-/// set through an explicit API, not a process-global env var.
+/// Library diagnostics are `debug`/`trace` records, so `Warn` shows none of
+/// them. Keeping the filter below `debug` also keeps them free: a single fit
+/// emits thousands of per-iteration records, and some sites guard real work on
+/// `log_enabled!` (#1688, #1689). Callers opt in by passing the level they want
+/// to [`set_log_level`] or [`init_logging_at`] — verbosity is set through an
+/// explicit API, not a process-global env var.
 const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Warn;
 
 /// Parse one verbosity spelling into a [`LevelFilter`]. Case-insensitive,
@@ -149,8 +148,8 @@ fn parse_log_level(value: &str) -> Option<LevelFilter> {
 }
 
 /// Map a caller-supplied verbosity spelling onto a [`LevelFilter`]. Wraps the
-/// internal `parse_log_level` for out-of-crate callers (the CLI `--log-level`
-/// flag, the Python `set_log_level` shim). Returns `None` for blank/unrecognized
+/// internal `parse_log_level` for out-of-crate callers (example binaries that
+/// take a level argument). Returns `None` for blank/unrecognized
 /// input so the caller decides the fallback rather than guessing here.
 pub fn parse_level_directive(raw: &str) -> Option<LevelFilter> {
     parse_log_level(raw)
@@ -175,10 +174,9 @@ pub fn init_logging() {
 /// Install the stderr logger at an explicit verbosity. Idempotent in the sense
 /// that the first caller wins the global `log` backend registration; **every**
 /// call (re-)applies the requested max level, so an embedding can call
-/// `init_logging()` early and later raise the level via `init_logging_at` (e.g.
-/// the Python `set_log_level` shim) without losing the override. This is how a
-/// caller opts back into the verbose `Info`/`debug`/`trace` solver trace that
-/// the `Warn` default suppresses for performance (#1688).
+/// `init_logging()` early and later raise the level via `init_logging_at`
+/// without losing the override. This is how a caller opts into the
+/// `debug`/`trace` solver trace that the `Warn` default suppresses (#1688).
 pub fn init_logging_at(level: LevelFilter) {
     LOG_START.get_or_init(Instant::now);
     // First caller wins the backend registration; an already-installed logger

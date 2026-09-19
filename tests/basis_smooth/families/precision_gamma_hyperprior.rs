@@ -69,6 +69,7 @@ fn linear_fixture() -> (
         }],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     (data, y, weights, offset, spec)
 }

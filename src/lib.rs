@@ -163,10 +163,6 @@ pub use gam_report as report;
 /// re-exported here so existing `crate::psis` / `gam::psis` callers (including
 /// `inference::{rho_posterior, model_comparison}`) resolve it downward.
 pub use gam_solve::psis;
-/// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
-/// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
-/// so the public `gam::rho_uncertainty` path is preserved.
-pub use gam_solve::rho_uncertainty;
 /// `gam::solver` — the estimation-engine public surface.
 ///
 /// Almost everything is the `gam-solve` crate, re-exported wholesale. The one
@@ -298,14 +294,15 @@ pub mod smooth {
     pub use gam_models::fit_orchestration::drivers::{
         CurvatureInference, FittedTermCollectionWithSpec, SmoothLrCorrection,
         SmoothLrProfiledScale, SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelection,
-        SmoothLrSelectionDecline, SmoothTermLrInference, SpatialLengthScaleOptimizationTiming,
+        SmoothLrSelectionDecline, SmoothTermLrInference, SmoothTermLrUnavailable,
+        SpatialLengthScaleOptimizationTiming,
         build_term_collection_designs_and_freeze_joint, build_term_collection_designs_joint,
         curvature_inference_forspec, fit_term_collection_forspec,
         fit_term_collection_with_coefficient_groups,
         fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
         fit_term_collection_with_penalty_block_gamma_priors,
         fit_term_collectionwith_spatial_length_scale_optimization, get_constant_curvature_kappa,
-        smooth_term_lr_inference_forspec,
+        smooth_term_lr_inference_forspec, smooth_term_lr_unavailable_forspec,
     };
 }
 

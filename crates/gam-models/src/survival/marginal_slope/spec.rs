@@ -381,7 +381,7 @@ pub(crate) fn split_persisted_latent_calibrations(
 
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] fit start n={} marginal_terms={} slope_terms={}",
         n,
         spec.marginalspec.linear_terms.len()

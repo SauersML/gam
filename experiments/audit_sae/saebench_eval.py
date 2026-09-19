@@ -15,14 +15,14 @@ axes the issue asks for:
 
   - ``chart-interp`` — orientation-quotiented weighted cyclic phase-lock of a
     recovered chart coordinate ``t`` against ground-truth cyclic labels
-    (``gamfit.chart_interp_score``). An interpretability metric for *coordinates*,
+    (``gamfit.sae.chart_interp_score``). An interpretability metric for *coordinates*,
     not just latents.
   - ``dose-response calibration`` — measured next-token KL vs the local
     output-Fisher prediction along steered arcs, with the unit-speed constancy
-    kill-test (``gamfit.dose_response_calibration``).
+    kill-test (``gamfit.sae.dose_response_calibration``).
   - the frozen-dictionary capability ``audit`` (routability floor, dark-matter
     fraction, dual certificate, absorption pairs, per-atom Betti topology and
-    atlas nerve) via ``gamfit.audit_sae``.
+    atlas nerve) via ``gamfit.sae.audit_sae``.
 
 Inputs are typed observation ledgers harvested by the model-facing code
 (a dose-response ledger json, a chart-fit json, a decoder + activations pair);
@@ -69,7 +69,7 @@ def _preflight_gamfit() -> None:
             f"{getattr(gamfit, '__version__', '?')} at {os.path.dirname(gamfit.__file__)} is "
             f"missing required metric entry point(s): {', '.join(missing)}. Upgrade the venv "
             f"wheel to a build that exposes the #1942 SAEBench scorers (>= the commit that "
-            f"landed gamfit.chart_interp_score / dose_response_calibration / audit_sae), and "
+            f"landed gamfit.sae.chart_interp_score / dose_response_calibration / audit_sae), and "
             f"note gamfit needs python >= 3.10 (no wheel for the MSI-node default 3.6)."
         )
 
@@ -122,7 +122,7 @@ def dose_response_report(
     per-intervention records carrying ``method``, ``dt`` (unit-speed arc length),
     a predicted-nats variant, ``measured_kl`` (patched-forward next-token KL),
     ``within_validity`` and ``heldout``. Each method is scored independently by
-    ``gamfit.dose_response_calibration``; the manifold method is the headline,
+    ``gamfit.sae.dose_response_calibration``; the manifold method is the headline,
     the linear baselines are the deconfounding arm the issue describes."""
     doc = json.loads(ledger_path.read_text())
     rows = doc["rows"]
@@ -159,7 +159,7 @@ def dose_response_report(
             out["per_method"][method] = {"n": 0, "skipped": "no valid rows"}
             continue
         try:
-            rep = gamfit.dose_response_calibration(obs)
+            rep = gamfit.sae.dose_response_calibration(obs)
         except Exception as exc:  # noqa: BLE001 - surface the scorer's own message
             out["per_method"][method] = {"n": len(obs), "error": str(exc)}
             continue
@@ -216,7 +216,7 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
     The fit json is the manifold-SAE chart fit: ``fit.per_atom[k].cyclic_ordering``
     carries ``words_present`` and their recovered ``angles_rad``. The recovered
     angle is converted to turns and scored against the ground-truth calendar
-    cyclic label by ``gamfit.chart_interp_score``. Each cyclic-ordering record
+    cyclic label by ``gamfit.sae.chart_interp_score``. Each cyclic-ordering record
     must also carry a ``matched_spectrum_null`` object with the null fit's
     ``angles_rad`` draws, closed protocol, readout, seed, declared draw count,
     and significance level. The observed cyclic-ordering record must name the
@@ -277,7 +277,7 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                 f"does not match null readout {null_readout!r}"
             )
         try:
-            readout = gamfit.ChartInterpReadout(observed_readout)
+            readout = gamfit.sae.ChartInterpReadout(observed_readout)
         except (TypeError, ValueError) as error:
             raise ValueError(
                 f"atom {entry.get('atom')!r} cyclic_ordering.readout must name "
@@ -285,13 +285,13 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
             ) from error
         protocol_value = null.get("protocol")
         try:
-            protocol = gamfit.ChartInterpNullProtocol(protocol_value)
+            protocol = gamfit.sae.ChartInterpNullProtocol(protocol_value)
         except (TypeError, ValueError) as error:
             raise ValueError(
                 f"atom {entry.get('atom')!r} matched_spectrum_null.protocol "
                 "must name a supported closed chart-null protocol"
             ) from error
-        calibration = gamfit.ChartInterpNullCalibration(
+        calibration = gamfit.sae.ChartInterpNullCalibration(
             protocol=protocol,
             readout=readout,
             seed=int(null["seed"]),
@@ -299,7 +299,7 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
             observation_draws=null_obs,
         )
         alpha = float(null["significance_level"])
-        rep = gamfit.chart_interp_score(obs, calibration, alpha)
+        rep = gamfit.sae.chart_interp_score(obs, calibration, alpha)
         family = "weekday" if period == 7 else ("month" if period == 12 else f"period{period}")
         results.append(
             {
@@ -397,7 +397,7 @@ def audit_report(
         # dark-matter, dual certificate, absorption) are still audited. Topology
         # / atlas null claims should be read with this caveat.
         null = np.zeros((acts.shape[0], k), dtype=np.float32)
-    routed = gamfit.audit_sae(
+    routed = gamfit.sae.audit_sae(
         decoder,
         acts,
         codes=codes,

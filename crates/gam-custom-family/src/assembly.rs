@@ -430,6 +430,7 @@ pub(crate) fn unified_joint_cost_gradient(
         gam_problem::HessianValue,
         [f64; 4],
         Option<Array2<f64>>,
+        Option<Array2<f64>>,
     ),
     CustomFamilyError,
 > {
@@ -506,7 +507,7 @@ pub(crate) fn unified_joint_cost_gradient(
     let gradient = result
         .gradient_for_mode(eval_mode, rho.len() + n_joint + ext_dim)
         .map_err(|reason| CustomFamilyError::TrialPointRefused { reason })?;
-    log::debug!(
+    log::trace!(
         "[UNIFIED-GRAD] mode={eval_mode:?} present={gradient_present} trace_skip={trace_skip} \
          |g|={:.6e} len={} n_joint={n_joint} rho_len={} ext={ext_dim}",
         gradient.iter().map(|g| g * g).sum::<f64>().sqrt(),
@@ -516,6 +517,7 @@ pub(crate) fn unified_joint_cost_gradient(
 
     let hessian = result.hessian;
     let ext_mode_response_cols = result.ext_mode_response_cols;
+    let rho_mode_response_cols = result.rho_mode_response_cols;
 
     Ok((
         cost,
@@ -523,6 +525,7 @@ pub(crate) fn unified_joint_cost_gradient(
         hessian,
         criterion_components,
         ext_mode_response_cols,
+        rho_mode_response_cols,
     ))
 }
 
@@ -1285,7 +1288,7 @@ pub(crate) fn joint_outer_evaluate(
             .and_then(|cache| cache.get(operator_fingerprint));
 
         let assembled: Arc<dyn HessianFactorization> = if let Some(cached) = cached_operator {
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] reusing cached same-ρ assembled operator (fingerprint hit)"
             );
             cached
@@ -1400,7 +1403,7 @@ pub(crate) fn joint_outer_evaluate(
     // price it with the SAME logdet kernel the operator route uses for this
     // `pseudo_logdet_mode`, and compare its logdet to the assembled operator's. An
     // apples-to-apples match proves no collapse entered the assembly; a divergence
-    // is a true defect. We `log::error!` and then `assert!`, so the regression is
+    // is a true defect. We `log::debug!` and then `assert!`, so the regression is
     // never silent. This makes the gam#1395 collapse structurally observable at
     // its source rather than only at the far-downstream objective value.
     //
@@ -1459,7 +1462,7 @@ pub(crate) fn joint_outer_evaluate(
                         let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
                         let gap = (assembled_logdet - reference_logdet).abs();
                         if gap > tol {
-                            log::error!(
+                            log::debug!(
                                 "[gam#1395] assembled joint-Hessian logdet diverges from the \
                                  ground-truth penalized Hessian: assembled={assembled_logdet:.9e} \
                                  reference={reference_logdet:.9e} gap={gap:.3e} tol={tol:.3e} \
@@ -1477,7 +1480,7 @@ pub(crate) fn joint_outer_evaluate(
                     }
                 }
                 Err(error) => {
-                    log::debug!(
+                    log::trace!(
                         "[gam#1395] logdet guard skipped: ground-truth factorization failed: {error}"
                     );
                 }
@@ -1506,7 +1509,7 @@ pub(crate) fn joint_outer_evaluate(
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] joint penalty subspace trace installed correction={:.6e}",
                 kernel.logdet_correction
             );
@@ -1517,7 +1520,7 @@ pub(crate) fn joint_outer_evaluate(
     };
     if let Some(kernel) = penalty_subspace_trace.as_ref() {
         for (psi, partial) in completion_psi_partials.iter().enumerate() {
-            log::info!(
+            log::debug!(
                 "[2930-COMPLETION-PSI] psi={psi} half_trace={:.6e}",
                 0.5 * rho_curvature_scale * kernel.trace_projected_logdet(partial)
             );
@@ -1570,8 +1573,14 @@ pub(crate) fn joint_outer_evaluate(
     } else {
         None
     };
-    let (objective, grad, outer_hessian, criterion_components, ext_mode_response_cols) =
-        unified_joint_cost_gradient(
+    let (
+        objective,
+        grad,
+        outer_hessian,
+        criterion_components,
+        ext_mode_response_cols,
+        rho_mode_response_cols,
+    ) = unified_joint_cost_gradient(
             inner,
             specs,
             per_block,
@@ -1605,7 +1614,7 @@ pub(crate) fn joint_outer_evaluate(
             robust_jeffreys_phi,
         )?;
     if !objective.is_finite() {
-        log::warn!(
+        log::debug!(
             "joint outer evaluation produced non-finite objective: log_likelihood={} penalty_value={} block_logdet_h={:?} block_logdet_s={:?} include_logdet_h={} include_logdet_s={} rho_curvature_scale={}",
             inner.log_likelihood,
             inner.penalty_value,
@@ -1672,7 +1681,10 @@ pub(crate) fn joint_outer_evaluate(
             .map(|st| st.beta.clone())
             .collect(),
         active_sets: inner.active_sets.clone(),
-        cached_inner: Some(cached_inner_mode_from_result(inner)),
+        cached_inner: Some(CachedInnerMode {
+            rho_mode_responses: rho_mode_response_cols.map(Arc::new),
+            ..cached_inner_mode_from_result(inner)
+        }),
     };
 
     Ok(OuterObjectiveEvalResult {
@@ -1828,7 +1840,7 @@ pub(crate) fn joint_outer_evaluate_efs(
         )?;
         kernel.map(|mut kernel| {
             kernel.logdet_correction = projected_logdet - hessian_op.logdet();
-            log::debug!(
+            log::trace!(
                 "[OUTER hessian-route] joint EFS penalty subspace trace installed correction={:.6e}",
                 kernel.logdet_correction
             );
@@ -1931,7 +1943,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     let per_block = split_log_lambdas(rho, penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
-        log::warn!(
+        log::debug!(
             "[OUTER] custom-family EFS inner solve did not converge after {} cycle(s); \
              skipping EFS derivative assembly for theta_dim={}",
             inner.cycles,
@@ -2900,6 +2912,10 @@ pub(crate) struct CachedInnerMode {
     pub(crate) active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
     pub(crate) terminal_working_sets: Option<Vec<BlockWorkingSet>>,
     pub(crate) terminal_likelihood_score: Option<TerminalLikelihoodScore>,
+    /// The mode's IFT tangent, `v_k = H⁻¹ a_k` per penalty coordinate (the per-block
+    /// log-λ's, then the joint penalties), when the evaluation that filed it formed them:
+    /// `dβ̂/dρ_k = −v_k`. A branch continuation predicts from it (gam#2973).
+    pub(crate) rho_mode_responses: Option<Arc<Array2<f64>>>,
     /// The smoothing state this cached mode was solved at (#2615). A lookup
     /// compares against this, not against a key rebuilt from the caller's
     /// coordinates.

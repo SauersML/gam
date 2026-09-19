@@ -261,7 +261,7 @@ pub(crate) fn log_joint_pcg_diagnostics(
     } else {
         None
     };
-    log::info!(
+    log::debug!(
         "[PIRLS/blockwise joint-Newton/PCG] cycle={} p={} n={} iters={} rel_res={:.3e} res0={:.3e} res_final={:.3e} res_ratio={:.3e} ritz_cond~{} jacobi_diag_ratio~{}",
         cycle,
         total_p,
@@ -1027,7 +1027,7 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
                     // easier — instead of rejecting the whole seed (#1025:
                     // 'failed to project block 0' killed an otherwise-healthy
                     // competing-risks seed outright).
-                    log::warn!(
+                    log::debug!(
                         "exact-newton projected stationarity vector: cone projection failed \
                          for block {b}; using the conservative unprojected residual"
                     );
@@ -1139,7 +1139,7 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
             .copied()
             .map(f64::abs)
             .fold(0.0_f64, f64::max);
-        log::warn!(
+        log::debug!(
             "[exact-newton kkt-residual projection] dropping projected KKT residual to None: \
              len={} nan_count={} inf_count={} finite_max={:.3e}. The unified evaluator will \
              treat this convergent path as if no residual were available, which silently \
@@ -1863,7 +1863,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                     };
                     match approximation {
                         Ok(approximation) => {
-                            log::warn!(
+                            log::debug!(
                                 "[custom-family covariance] constrained fit converged with an \
                                  improper quadratic posterior on its cone ({}); publishing the \
                                  certified {} (#979)",
@@ -1895,7 +1895,7 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                             });
                         }
                         Err(refusal) => {
-                            log::warn!(
+                            log::debug!(
                                 "[custom-family covariance] constrained fit converged, but its \
                                  ambient posterior precision is not positive definite ({reason}); \
                                  retaining the converged constrained MODE under a typed \
@@ -2409,7 +2409,7 @@ pub fn first_order_smoothing_correction(
         match gam_solve::estimate::invert_identified_rho_hessian(&h_sub, 0, &g_sub, None, &[]) {
             Ok(inverted) => inverted,
             Err(refusal) => {
-                log::info!(
+                log::debug!(
                     "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
                      rho_dimension={k_outer} railed={}: {refusal}",
                     k_outer - ki,

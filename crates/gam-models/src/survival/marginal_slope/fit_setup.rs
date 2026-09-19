@@ -66,7 +66,7 @@ pub(crate) fn build_time_blockspec(
                 }
             })
             .collect();
-        log::info!(
+        log::debug!(
             "[marginal-slope/time_surface-diag] design_exit {n_rows}x{p_cols}; constant cols={degenerate_cols}/{p_cols}; ref_col={ref_col}; per-col span={:?}; |cos vs ref (mean-centered)|={:?}",
             spans.iter().map(|s| format!("{s:.3e}")).collect::<Vec<_>>(),
             cosines,
@@ -630,7 +630,7 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
         .assign(&shrinkage_value);
     time_block.penalties.push(shrinkage);
     time_block.nullspace_dims.push(0);
-    log::info!(
+    log::debug!(
         "[survival-marginal-slope] added time_block nullspace shrinkage penalty (p={p}, penalties={})",
         time_block.penalties.len(),
     );
@@ -690,6 +690,7 @@ pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollec
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     for spec in specs {
         out.linear_terms.extend(spec.linear_terms.clone());

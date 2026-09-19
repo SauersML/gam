@@ -1,4 +1,4 @@
-"""Tests for :class:`gamfit.PoincareAtoms`.
+"""Tests for :class:`gamfit.torch.PoincareAtoms`.
 
 Cover the contract claims made in the docstring:
 
@@ -20,7 +20,7 @@ pytest.importorskip("gamfit._rust")
 
 
 def _atoms(**kwargs):
-    return gamfit.PoincareAtoms(**kwargs)
+    return gamfit.torch.PoincareAtoms(**kwargs)
 
 
 def test_distance_self_is_zero() -> None:

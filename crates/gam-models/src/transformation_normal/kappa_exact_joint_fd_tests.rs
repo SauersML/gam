@@ -124,9 +124,10 @@ fn build_fixture_with_penalties(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
     // Mirror `fit_transformation_normal`: a bootstrap build freezes the chart,
     // the response complexity is resolved against the bootstrap tensor width,

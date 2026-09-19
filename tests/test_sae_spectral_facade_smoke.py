@@ -15,7 +15,7 @@ import math
 import numpy as np
 import pytest
 
-from gamfit import (
+from gamfit.sae import (
     atlas_nerve_diagram,
     block_firing_coordinates,
     block_sparse_dictionary_fit,

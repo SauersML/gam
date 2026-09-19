@@ -2,10 +2,10 @@ use super::*;
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     // GUARD (#2030): the geometry carrier's optional owned row evidence MUST
-    // survive compaction. Saved ALO explicitly requires `geometry.working`;
-    // `None` correctly means unavailable, while truncating a present vector
-    // would corrupt a valid single-diagonal fit. `FitInference` deliberately
-    // has no duplicate copy, so only this one source of truth is retained.
+    // survive compaction of the in-memory fit: `None` correctly means
+    // unavailable, while truncating a present vector would corrupt a valid
+    // single-diagonal fit. It is never serialized (a saved model carries no
+    // per-row training data), so compaction has nothing to gain from it.
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }
@@ -46,7 +46,7 @@ fn fit_request_document_from_fit_args(
         baseline_scale: args.baseline_scale,
         baseline_shape: args.baseline_shape,
         baseline_target: Some(args.baseline_target.clone()),
-        expectile_tau: args.expectile_tau,
+        expectile_tau: args.expectile_tau.clone(),
         family: family_arg_canonical_name(args.family).map(str::to_string),
         firth: args.firth.then_some(true),
         frailty_kind,
@@ -57,8 +57,6 @@ fn fit_request_document_from_fit_args(
         noise_formula: args.predict_noise.clone(),
         noise_offset: args.noise_offset_column.clone(),
         offset: args.offset_column.clone(),
-        precompute_conformal: Some(args.precompute_conformal),
-        persistent_warm_start_root: args.persistent_warm_start_root.clone(),
         scale_dimensions: args.scale_dimensions.then_some(true),
         sigma_time_k: args.sigma_time_k,
         slope_time_k: args.slope_time_k,
@@ -114,7 +112,7 @@ fn expand_cli_automatic_formula(
         &formula, &dataset, fit_config,
     )
     .map_err(|error| error.to_string())?;
-    print_inference_summary(&automatic.notes);
+    print_inference_summary(&automatic.notes, &[]);
     Ok(automatic.formula)
 }
 
@@ -149,7 +147,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // response forced to a factor) and persistence envelope, so dispatch it
     // before the scalar-response standard path. The stale note below about "the
     // CLI has no multinomial family" no longer holds for this early return.
-    if fit_config.family.as_deref() == Some("multinomial") {
+    if fit_config
+        .family
+        .as_deref()
+        .is_some_and(gam::families::fit_orchestration::is_multinomial_family_name)
+    {
         return run_fit_multinomial(&args, &parsed, &formula_text, &fit_config);
     }
     // Transformation-normal fits go through the library materializer, which refuses
@@ -194,14 +196,13 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
-    // `--expectile-tau` only has meaning under `--family expectile`; reject the
-    // combination upfront rather than silently ignoring the asymmetry.
-    if fit_config.expectile_tau.is_some() && fit_config.family.as_deref() != Some("expectile") {
-        return Err(
-            "--expectile-tau requires --family expectile (the asymmetry is only used by the \
-             expectile estimator)"
-                .to_string(),
-        );
+    // Several expectile levels are one joint location-scale fit, which the
+    // library's formula-to-payload service assembles like any location-scale model.
+    let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|levels| levels.len() > 1);
+    if joint_expectile {
+        return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
     let requested_columns = fit_required_columns(&parsed, &fit_config)
         .map_err(|error| error.to_string())?
@@ -216,6 +217,9 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // integer covariate is untouched.
     let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
+    // The saved payload below is assembled from this table, so it is the one
+    // the fit sees: zero-weight rows are deleted, not merely down-weighted.
+    let ds = drop_zero_weight_rows(&ds, &fit_config).map_err(|error| error.to_string())?;
     // Every single-parameter formula fit, the expectile estimator included, is
     // owned end-to-end by gam-models; this route adds the CLI's summary lines and
     // its compact saved fit.
@@ -254,17 +258,20 @@ fn run_canonical_standard_fit(
     fit_config: &FitConfig,
 ) -> Result<(), String> {
     let phase_start = std::time::Instant::now();
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit start n={}",
         dataset.values.nrows()
     );
     let outcome = fit_from_formula_with_notes(formula, dataset, fit_config)
         .map_err(canonical_standard_fit_error)?;
-    log::info!(
+    log::debug!(
         "[PHASE] canonical formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&outcome.inference_notes);
+    print_inference_summary(
+        &outcome.inference_notes.advisories,
+        &outcome.inference_notes.informational,
+    );
 
     match outcome.result {
         FitResult::Standard(mut result) => {
@@ -273,11 +280,6 @@ fn run_canonical_standard_fit(
                 .likelihood_family
                 .clone()
                 .unwrap_or_else(LikelihoodSpec::gaussian_identity);
-            let model_label = if fit_config.family.as_deref() == Some("expectile") {
-                "expectile"
-            } else {
-                "standard"
-            };
             print_spatial_aniso_scales(&result.resolvedspec);
             let status = result.fit.convergence_evidence().inner_status().label();
             let iterations = result.fit.outer_iterations;
@@ -297,6 +299,25 @@ fn run_canonical_standard_fit(
                 fit_config,
                 result,
             })?;
+            // The persisted estimator tag, not the requested family string,
+            // names an expectile fit: the same `Expectile(tau=...)` the saved
+            // summary and Python `family_name` report.
+            let (model_label, family_name) = match payload.estimator {
+                gam::inference::model::FittedEstimator::Expectile { tau } => (
+                    "expectile",
+                    gam::inference::model::expectile_display_name(tau),
+                ),
+                gam::inference::model::FittedEstimator::Likelihood => {
+                    ("standard", family.name().to_string())
+                }
+                // Joint expectile levels route to the library fit above; a
+                // standard payload never carries them.
+                gam::inference::model::FittedEstimator::ExpectileLocationScale { .. } => {
+                    return Err(
+                        "a standard fit assembled a joint expectile estimator".to_string()
+                    );
+                }
+            };
             let fit = payload
                 .fit_result
                 .as_ref()
@@ -304,7 +325,7 @@ fn run_canonical_standard_fit(
             cli_out!(
                 "{} fit | family={} | status={} | iterations={} | terms={} | edf={:.3} | loglik={:.6e} | reml_score={} | raw_reml_score={}",
                 model_label,
-                family.name(),
+                family_name,
                 status,
                 iterations,
                 term_count,
@@ -417,18 +438,18 @@ fn run_library_formula_fit(
     let dataset = load_fit_dataset_with_roles(&args.data, &requested_columns, parsed, false)?;
     require_dataset_rows("fit", &args.data, dataset.values.nrows())?;
     let phase_start = std::time::Instant::now();
-    log::info!("[PHASE] formula fit start n={}", dataset.values.nrows());
+    log::debug!("[PHASE] formula fit start n={}", dataset.values.nrows());
     let payload = gam::inference::model_payload_builders::fit_formula_to_payload(
         formula,
         &dataset,
         fit_config,
     )
     .map_err(|error| format!("formula fit failed: {error}"))?;
-    log::info!(
+    log::debug!(
         "[PHASE] formula fit end elapsed={:.3}s",
         phase_start.elapsed().as_secs_f64()
     );
-    print_inference_summary(&payload.inference_notes);
+    print_inference_summary(&payload.inference_notes, &payload.informational_notes);
     if let Some(fit) = payload.fit_result.as_ref() {
         cli_out!(
             "{} fit | status={} | iterations={} | loglik={:.6e} | reml_score={} | raw_reml_score={}",
@@ -586,7 +607,7 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
                 frozen_parametric_residualization: None,
                 name: term.name.clone(),
                 basis: (**inner).clone(),
-                shape: term.shape,
+                shape: term.shape.clone(),
                 joint_null_rotation: None,
             })
         }
@@ -594,7 +615,7 @@ pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize>
             frozen_parametric_residualization: None,
             name: term.name.clone(),
             basis: (**smooth).clone(),
-            shape: term.shape,
+            shape: term.shape.clone(),
             joint_null_rotation: None,
         }),
         SmoothBasisSpec::FactorSmooth { spec } => {
