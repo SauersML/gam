@@ -2,11 +2,10 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeedBatch,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
     Order2AtomChannels, RuntimeJetScalar,
 };
 use gam_row_macros::{row_atom, row_program};
-use wide::f64x4;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -2486,237 +2485,6 @@ fn pullback_from_channel_cache(
     }
 }
 
-/// The lanes whose packed outer-derivative `stack` is exactly zero in EVERY
-/// entry. The scalar [`sls_row_nll`] SKIPS composing such a term
-/// ([`stack_is_exactly_zero`]) — both to keep a `0·∞` far-tail product from
-/// manufacturing `NaN` and to leave the term a pristine `+0.0` constant. The
-/// SIMD batch shares one `compose_unary` across four lanes and so cannot branch
-/// per row; this mask lets it mirror the scalar skip lane-by-lane.
-///
-/// Returned as a `f64x4` predicate mask (all-ones lanes where the stack is
-/// NONzero, i.e. the term is ACTIVE), ready to drive [`f64x4::blend`]. A lane
-/// entry of `-0.0` counts as zero, exactly as `stack_is_exactly_zero`'s
-/// `*v == 0.0` does (`-0.0 == 0.0`), so the two paths agree on which rows are
-/// skipped.
-#[inline]
-fn active_stack_lane_mask(stack: &[f64x4; 5]) -> f64x4 {
-    let zero = f64x4::splat(0.0);
-    stack[0].simd_ne(zero)
-        | stack[1].simd_ne(zero)
-        | stack[2].simd_ne(zero)
-        | stack[3].simd_ne(zero)
-        | stack[4].simd_ne(zero)
-}
-
-/// Blend a composed term with a sign-clean neutral on the lanes the scalar path
-/// skips, so the batch nll matches [`sls_row_nll`] to the bit on every lane.
-///
-/// `active` is [`active_stack_lane_mask`] (set where the term's stack is
-/// NONzero). On active lanes the raw `composed` channels survive — bit-identical
-/// to the scalar `term.compose_unary(stack)` for that row. On inactive lanes
-/// every channel becomes `neutral`:
-///
-/// - `+0.0` for the LEADING (`u0`) term, matching the scalar's assignment
-///   `nll = S::constant(0.0)` for a skipped first term.
-/// - `-0.0` for a term that is ADDED (`u1`, `g`), because `-0.0` is the
-///   sign-preserving additive identity: `x + (-0.0) == x` bit-for-bit for every
-///   `x` (including `±0.0`, `±∞`, `NaN`), so `nll.add(neutral) == nll` exactly on
-///   the skipped lanes — whereas a `+0.0` neutral would flip a running `-0.0`
-///   channel to `+0.0` and desynchronise from the scalar's skipped add.
-///
-/// The blend is bitwise, so a `0·∞ = NaN` produced on a skipped far-tail lane is
-/// discarded (never propagated), matching the scalar which never forms it.
-#[inline]
-fn select_active_term(
-    composed: OneSeedBatch<SLS_ROW_K>,
-    active: f64x4,
-    neutral: f64,
-) -> OneSeedBatch<SLS_ROW_K> {
-    let n = f64x4::splat(neutral);
-    let pick = |channel: f64x4| active.blend(channel, n);
-    let mut out = composed;
-    out.base.v = pick(out.base.v);
-    out.eps.v = pick(out.eps.v);
-    for i in 0..SLS_ROW_K {
-        out.base.g[i] = pick(out.base.g[i]);
-        out.eps.g[i] = pick(out.eps.g[i]);
-        for j in 0..SLS_ROW_K {
-            out.base.h[i][j] = pick(out.base.h[i][j]);
-            out.eps.h[i][j] = pick(out.eps.h[i][j]);
-        }
-    }
-    out
-}
-
-/// SIMD 4-rows-per-pass evaluation of [`sls_row_nll`] at the packed one-seed
-/// directional scalar, for a group of FOUR rows that share the SAME gating
-/// signature (`cens_on` = the censored term is active for every lane,
-/// `event_on` = the event terms are active for every lane). The op graph mirrors
-/// [`sls_row_nll`] term-for-term over [`OneSeedBatch`]; by the engine's lane
-/// identity (`OneSeedBatch` lane `i` `to_bits`== `OneSeed` row `i`), lane `i` of
-/// the returned scalar's `contracted_third` equals `sls_row_nll` evaluated at
-/// `OneSeed` on row `i`.
-///
-/// **Why homogeneous groups.** [`sls_row_nll`] GATES the censored / event terms
-/// per row (`if censored_weight != 0.0` / `if event_weight != 0.0`) precisely to
-/// avoid `0·∞ = NaN` when an inactive branch's residual-distribution stack is
-/// non-finite. Batching rows that share a gating signature lets the batch compose
-/// a term ONLY when it is active for all four lanes — where the stack is
-/// guaranteed finite. Per-row/censoring/event weights are folded into each
-/// `compose_unary` coefficient stack (pre-scale) via the shared
-/// [`sls_outer_plan`], exactly as the scalar `sls_row_nll` does — NOT applied as
-/// a post-composition scale, which would round the contracted third channel
-/// differently by 1 ulp — so composition is `to_bits`-identical per lane.
-///
-/// **Why the per-lane stack mask.** The `(cens, event)` signature is not the only
-/// gate the scalar applies: `sls_row_nll` ALSO skips a term whose outer stack is
-/// exactly zero ([`stack_is_exactly_zero`]) and leaves it a pristine `+0.0`
-/// constant. That case is common, not exotic — a row with no left truncation
-/// carries `S(entry) = 1`, so its ENTRY (`u0`) stack is exactly `[0,0,0,0,0]`
-/// even though the row weight is nonzero, and left-truncated and non-truncated
-/// rows freely share a `(cens, event)` group. Composing that zero stack forms
-/// `0·(negative jet channel) = -0.0` (or `0·∞ = NaN` on a far-tail row) where the
-/// scalar's skip yields `+0.0`. So each term is masked per lane via
-/// [`select_active_term`]: active lanes keep the raw composition, skipped lanes
-/// take the sign-clean neutral (`+0.0` for the assigned leading term, `-0.0` for
-/// an added term — the sign-preserving additive identity), reproducing the scalar
-/// bit-for-bit on every lane and never propagating a masked-out `NaN`.
-#[inline]
-fn sls_row_nll_onesseed_batch(
-    vars: &[OneSeedBatch<SLS_ROW_K>; SLS_ROW_K],
-    k: &[&SurvivalExactRowKernel; 4],
-    cens_on: bool,
-    event_on: bool,
-) -> OneSeedBatch<SLS_ROW_K> {
-    let inv_sigma_entry = vars[7].neg().exp();
-    let u0 = vars[0].sub(&vars[4]).mul(&inv_sigma_entry);
-    let inv_sigma_exit = vars[6].neg().exp();
-    let residual_exit = vars[1].sub(&vars[3]);
-    let u1 = residual_exit.mul(&inv_sigma_exit);
-    let g = vars[2].sub(&vars[5]).sub(&residual_exit.mul(&vars[8]));
-
-    // Fold the per-row/censoring/event weights into each `compose_unary`
-    // coefficient stack (pre-scale) via the shared `sls_outer_plan`, exactly as
-    // the scalar `sls_row_nll` does, then compose ONCE per index term. The
-    // homogeneous gating signature guarantees all four lanes agree on which
-    // terms are active, so the per-lane plans share the same `Some`/`None`
-    // structure and pack lane-for-lane into the batched coefficient stacks.
-    let plans: [SlsOuterPlan<5>; 4] =
-        std::array::from_fn(|lane| sls_outer_plan::<5>(k[lane]));
-    let pack = |get: fn(&SlsOuterPlan<5>) -> [f64; 5]| -> [f64x4; 5] {
-        let per_lane: [[f64; 5]; 4] = std::array::from_fn(|lane| get(&plans[lane]));
-        std::array::from_fn(|order| f64x4::new(std::array::from_fn(|lane| per_lane[lane][order])))
-    };
-
-    // Leading term: the scalar ASSIGNS `nll = zero(u0)? const 0 : u0.compose(..)`,
-    // so skipped lanes take the `+0.0` neutral (matching `S::constant(0.0)`).
-    let u0_stack = pack(|plan| plan.u0);
-    let mut nll = select_active_term(
-        u0.compose_unary(u0_stack),
-        active_stack_lane_mask(&u0_stack),
-        0.0,
-    );
-    // The scalar collapses the censored and event `u1` contributions into ONE
-    // combined stack (`plan.u1`) and composes it once; mirror that. A
-    // homogeneous group's `u1` term is active exactly when a censored or event
-    // term is active. Added terms take the `-0.0` neutral on skipped lanes so the
-    // add is a bit-exact no-op there (`x + (-0.0) == x`).
-    if cens_on || event_on {
-        let u1_stack = pack(|plan| plan.u1.expect("homogeneous group has an active u1 stack"));
-        let term = select_active_term(
-            u1.compose_unary(u1_stack),
-            active_stack_lane_mask(&u1_stack),
-            -0.0,
-        );
-        nll = nll.add(&term);
-    }
-    if event_on {
-        let g_stack = pack(|plan| plan.g.expect("homogeneous group has an active g stack"));
-        let term = select_active_term(
-            g.compose_unary(g_stack),
-            active_stack_lane_mask(&g_stack),
-            -0.0,
-        );
-        nll = nll.add(&term);
-        // The scale's linear `−η_ls` in the event log-density, on the lanes the
-        // scalar adds it.
-        let log_scale = f64x4::new(std::array::from_fn(|lane| plans[lane].g_log_scale));
-        let term = select_active_term(
-            vars[6].mul(&OneSeedBatch::<SLS_ROW_K>::constant(log_scale)),
-            log_scale.simd_ne(f64x4::splat(0.0)),
-            -0.0,
-        );
-        nll = nll.add(&term);
-    }
-    nll
-}
-
-/// Contracted-third tensors `Σ_c ℓ_{xyc} dir_c` for every row in `start..end`
-/// at swept axis `a`, computed 4 rows per SIMD pass. Rows are grouped by their
-/// gating signature `(censored-active, event-active)` so each batch is
-/// homogeneous (see [`sls_row_nll_onesseed_batch`]); a partial trailing batch
-/// pads the unused lanes with the batch's first row (a valid same-signature row)
-/// and ignores those lanes. Output `out[row − start]` is `to_bits`-identical to
-/// the scalar `sls_row_nll(seed_direction(primary, dir))?.contracted_third()` the
-/// per-axis reducer computed inline — the grouping and SIMD only change HOW each
-/// independent per-row tensor is produced, never its value or the downstream
-/// pullback order.
-fn batched_axis_thirds(
-    inputs: &[([f64; SLS_ROW_K], SurvivalExactRowKernel)],
-    chans: &[Vec<Option<(usize, Array1<f64>)>>],
-    a: usize,
-    start: usize,
-    end: usize,
-) -> Vec<[[f64; SLS_ROW_K]; SLS_ROW_K]> {
-    let m = end - start;
-    let mut out = vec![[[0.0_f64; SLS_ROW_K]; SLS_ROW_K]; m];
-    // Per-row direction (axis-dependent) materialized once.
-    let dirs: Vec<[f64; SLS_ROW_K]> = (start..end)
-        .map(|row| axis_direction_from_channel_cache(&chans[row], a))
-        .collect();
-    // Partition local indices by gating signature: (censored-active, event-active).
-    let signature = |row: usize| -> (bool, bool) {
-        let ker = &inputs[row].1;
-        (ker.w * (1.0 - ker.d) != 0.0, ker.w * ker.d != 0.0)
-    };
-    let mut groups: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for li in 0..m {
-        let (c, e) = signature(start + li);
-        let key = (c as usize) | ((e as usize) << 1);
-        groups[key].push(li);
-    }
-    for (key, group) in groups.iter().enumerate() {
-        if group.is_empty() {
-            continue;
-        }
-        let cens_on = key & 1 != 0;
-        let event_on = key & 2 != 0;
-        for batch in group.chunks(4) {
-            let cnt = batch.len();
-            // Pad missing lanes with the batch's first (valid same-signature) row.
-            let li_of = |lane: usize| batch[if lane < cnt { lane } else { 0 }];
-            let kers: [&SurvivalExactRowKernel; 4] =
-                std::array::from_fn(|lane| &inputs[start + li_of(lane)].1);
-            let vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
-                let value =
-                    f64x4::new(std::array::from_fn(|lane| inputs[start + li_of(lane)].0[c]));
-                let dir = f64x4::new(std::array::from_fn(|lane| dirs[li_of(lane)][c]));
-                OneSeedBatch::seed_direction(value, c, dir)
-            });
-            let third =
-                sls_row_nll_onesseed_batch(&vars, &kers, cens_on, event_on).contracted_third();
-            for (lane, &li) in batch.iter().enumerate() {
-                for x in 0..SLS_ROW_K {
-                    for y in 0..SLS_ROW_K {
-                        out[li][x][y] = third[x][y].to_array()[lane];
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
 /// [`sls_row_nll`]; this exposes it through [`gam_math::jet_tower::RowProgram`]
 /// so the `RowKernel` contraction channels derive mechanically from `eval` (via
@@ -2930,30 +2698,32 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         }
     }
 
-    /// Batched all-axes first directional derivative with the per-row NLL
-    /// derivative stack built ONCE and reused across every swept axis.
+    /// Batched all-axes first directional derivative with each row's primary
+    /// values and outer derivative plan built ONCE and reused across every
+    /// swept axis.
     ///
     /// The generic per-axis dispatcher computes the `p` matrices `{∂H/∂β[e_a]}`
     /// by running `p` independent single-direction sweeps. Each sweep, for each
-    /// row, calls `row_third_contracted` → `row_nll_inputs` →
+    /// row, calls `row_third_contracted` → `row_nll_inputs_opt` →
     /// `exact_row_kernel_rescaled`, the special-function-heavy derivative ladder
     /// (`exp` / `log` / log-Φ derivatives). That ladder is INDEPENDENT of the
     /// swept axis, so the per-axis path rebuilds it `p` times per row — the
     /// dominant cost of the inner-Newton Jeffreys term and the outer-REML
     /// Jeffreys `H_Φ` drift, which probe this every joint evaluation. Here each
-    /// row's `(primary, kernel)` is materialized a single time, then every axis
-    /// closes against the cached stack with only the cheap `OneSeed` jet
-    /// arithmetic and the design-row pullback.
+    /// row's primary values, plan and channel rows are materialized a single
+    /// time, then every axis closes with the generated third contraction and the
+    /// cached pullback.
     ///
     /// **Correctness contract.** Output `a` equals, bit-for-bit, the generic
-    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the same
-    /// `RowSet` reduction primitive (chunk-index-order
-    /// `par_try_reduce_fold`), the same per-row
-    /// `jacobian_action → sls_row_nll(seed_direction(..)).contracted_third() →
-    /// add_pullback_hessian` pipeline, reading a cached `(primary, kernel)` that
-    /// is identical (a pure function of `row`) to the per-call rebuild. Only the
-    /// full-data unit-weight `RowSet::All` case is accelerated; a subsample
-    /// declines (`None`) so the generic Horvitz–Thompson per-axis path runs.
+    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the unit-axis
+    /// direction read from the channel cache (`axis_direction_from_channel_cache`),
+    /// the `sls_row_third_generated_with_plan` contraction the per-row hook
+    /// reaches through `sls_row_third_generated`, the same pullback order, and the
+    /// chunk-ordered reduction of `RowSet::All::par_try_reduce_fold`. A row without
+    /// an exact kernel (non-positive weight) is the per-row hook's all-zero matrix,
+    /// whose pullback adds nothing. Only the full-data unit-weight `RowSet::All`
+    /// case is accelerated; a subsample declines (`None`) so the generic
+    /// Horvitz–Thompson per-axis path runs.
     fn directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -2971,38 +2741,19 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         };
         Some((|| {
             let n = gam_math::jet_tower::RowProgram::n_rows(self);
-            // Two per-row builds shared by EVERY axis, so the special-function and
-            // design-materialization cost is paid once instead of `p` times:
-            //   * `inputs[row]`  — the special-function-heavy NLL derivative stack
-            //     (`exact_row_kernel_rescaled`: exp / log / log-Φ ladders), and
-            //   * `chans[row]`   — the nine channels' dense design rows, which the
-            //     per-axis pullback previously re-materialized through
-            //     `channel_row`/`add_pullback_hessian` for every `(row, axis)`.
-            // The unit-axis direction is then read straight out of `chans`
-            // (`axis_direction_from_channel_cache`), retiring the per-axis
-            // `jacobian_action` dot products as well. Only the cheap `OneSeed` jet
-            // contraction (which fixes the bit-identity contract) stays in the
-            // `p`-loop.
-            let inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = (0..n)
+            // Per row, shared by every axis: the primary values and outer derivative plan.
+            let fixed: Vec<Option<([f64; SLS_ROW_K], SlsOuterPlan<5>)>> = (0..n)
                 .into_par_iter()
-                .map(|row| self.row_nll_inputs(row))
+                .map(|row| {
+                    Ok(self
+                        .row_nll_inputs_opt(row)?
+                        .map(|(primary, kernel)| (primary, sls_outer_plan::<5>(&kernel))))
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
                 .into_par_iter()
                 .map(|row| self.cached_channel_rows(row))
                 .collect();
-            // The per-(row, axis) `OneSeed` contraction — the dominant remaining
-            // cost after the channel cache retired the design materialization —
-            // is now evaluated FOUR rows per SIMD pass (`batched_axis_thirds` over
-            // `OneSeedBatch`/`wide::f64x4`). The contracted-third of a row is a
-            // pure function of `(row, axis)`, so it is computed in any
-            // convenient (regime-grouped) order, while the pullback into the dense
-            // accumulator stays in the canonical row order. This manual reducer
-            // reproduces `RowSet::All::par_try_reduce_fold` term-for-term:
-            // contiguous `ARROW_ROW_CHUNK` chunks, sequential per-row pullback
-            // within a chunk (`w = 1.0`), and in-order `total + acc` combine — so
-            // the dense Hessian is `to_bits`-identical to the scalar reducer the
-            // bit-identity oracle pins.
             let n_chunks = arrow_row_chunk_count(n);
             (0..p)
                 .into_par_iter()
@@ -3013,15 +2764,16 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                             .map(|chunk_idx| {
                                 let start = chunk_idx * ARROW_ROW_CHUNK;
                                 let end = (start + ARROW_ROW_CHUNK).min(n);
-                                let thirds = batched_axis_thirds(&inputs, &chans, a, start, end);
                                 let mut acc = Array2::<f64>::zeros((p, p));
                                 for row in start..end {
-                                    pullback_from_channel_cache(
-                                        &chans[row],
-                                        &thirds[row - start],
-                                        1.0,
-                                        &mut acc,
-                                    );
+                                    let Some((primary, plan)) = fixed[row].as_ref() else {
+                                        continue;
+                                    };
+                                    let direction =
+                                        axis_direction_from_channel_cache(&chans[row], a);
+                                    let third =
+                                        sls_row_third_generated_with_plan(primary, plan, &direction);
+                                    pullback_from_channel_cache(&chans[row], &third, 1.0, &mut acc);
                                 }
                                 acc
                             })
@@ -7791,7 +7543,7 @@ mod patterned_order2_perf_tests {
     }
 }
 #[cfg(test)]
-mod simd_batch_bit_identity_tests {
+mod all_axes_third_tests {
     use super::*;
     use gam_math::jet_scalar::OneSeed;
 
@@ -7905,35 +7657,53 @@ mod simd_batch_bit_identity_tests {
         }
     }
 
-    /// The SIMD 4-rows-per-pass `batched_axis_thirds` is `to_bits`-identical, for
-    /// EVERY row, to the scalar `sls_row_nll(seed_direction(..))?.contracted_third()`
-    /// the per-axis reducer used inline — across mixed gating regimes (so the
-    /// signature grouping AND the non-multiple-of-4 trailing batch are exercised),
-    /// signed-zero primary/design channels, null (`w = 0`) rows, and non-finite
-    /// poisoned inactive residual-distribution stacks.
+    /// Entrywise agreement of two contracted thirds: `NaN` exactly where the
+    /// scalar is `NaN`, otherwise within the `1e-11` relative band the dense-tower
+    /// oracle above uses (the two paths accumulate the same terms in different
+    /// orders, so cancelling entries differ by more than a few ulps).
+    fn assert_thirds_agree(
+        generated: &[[f64; SLS_ROW_K]; SLS_ROW_K],
+        scalar: &[[f64; SLS_ROW_K]; SLS_ROW_K],
+        context: &str,
+    ) {
+        for x in 0..SLS_ROW_K {
+            for y in 0..SLS_ROW_K {
+                let g = generated[x][y];
+                let s = scalar[x][y];
+                if s.is_nan() {
+                    assert!(g.is_nan(), "scalar NaN but generated {g} at {context} x={x} y={y}");
+                } else {
+                    assert!(
+                        (g - s).abs() <= 1e-11 * g.abs().max(s.abs()).max(1.0),
+                        "generated third {g} != scalar {s} at {context} x={x} y={y}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The all-axes override's per-row contraction, `sls_row_third_generated`, agrees
+    /// with the scalar `sls_row_nll` at the one-seed jet across mixed gating regimes,
+    /// signed-zero primary and design channels, null (`w = 0`) rows, and non-finite
+    /// poisoned inactive residual-distribution stacks, which neither path may touch.
     #[test]
-    fn batched_axis_thirds_matches_scalar_per_row_to_bits() {
+    fn generated_axis_third_matches_scalar_row_nll() {
         let mut rng = Lcg(0x9E3779B97F4A7C15);
         let block_of = [0usize, 0, 0, 1, 1, 1, 2, 2, 2];
         let mut compared = 0usize;
-        let mut tail_batches_seen = 0usize;
         for _ in 0..2500 {
             let widths = [1 + rng.range(4), 1 + rng.range(4), 1 + rng.range(4)];
             let offs = [0usize, widths[0], widths[0] + widths[1]];
             let p = widths[0] + widths[1] + widths[2];
-            let m = 5 + rng.range(20); // generally not a multiple of 4
-            if m % 4 != 0 {
-                tail_batches_seen += 1;
-            }
-
-            let mut inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = Vec::with_capacity(m);
+            let m = 5 + rng.range(20);
+            let mut rows: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = Vec::with_capacity(m);
             let mut chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = Vec::with_capacity(m);
             for _ in 0..m {
                 let sig = rng.range(4);
                 let kernel = make_kernel(&mut rng, sig);
                 let primary: [f64; SLS_ROW_K] =
                     std::array::from_fn(|_| if rng.step() & 7 == 0 { 0.0 } else { rng.val() });
-                inputs.push((primary, kernel));
+                rows.push((primary, kernel));
                 let row_chans: Vec<Option<(usize, Array1<f64>)>> = (0..SLS_ROW_K)
                     .map(|c| {
                         let blk = block_of[c];
@@ -7950,67 +7720,35 @@ mod simd_batch_bit_identity_tests {
                     .collect();
                 chans.push(row_chans);
             }
-
             let a = rng.range(p);
-            let batched = batched_axis_thirds(&inputs, &chans, a, 0, m);
-            for row in 0..m {
-                let dir_k = axis_direction_from_channel_cache(&chans[row], a);
-                let kernel = &inputs[row].1;
-                let primary = &inputs[row].0;
+            for (row, (primary, kernel)) in rows.iter().enumerate() {
+                let direction = axis_direction_from_channel_cache(&chans[row], a);
+                let generated = sls_row_third_generated(primary, kernel, &direction);
                 let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
-                    std::array::from_fn(|c| OneSeed::seed_direction(primary[c], c, dir_k[c]));
+                    std::array::from_fn(|c| OneSeed::seed_direction(primary[c], c, direction[c]));
                 let scalar = sls_row_nll(&vars, kernel)
                     .expect("scalar row NLL")
                     .contracted_third();
-                for x in 0..SLS_ROW_K {
-                    for y in 0..SLS_ROW_K {
-                        let b = batched[row][x][y];
-                        let s = scalar[x][y];
-                        if s.is_nan() {
-                            assert!(
-                                b.is_nan(),
-                                "scalar NaN but SIMD finite at row={row} x={x} y={y} axis={a}"
-                            );
-                        } else {
-                            assert_eq!(
-                                b.to_bits(),
-                                s.to_bits(),
-                                "SIMD batch != scalar third at row={row} x={x} y={y} axis={a}"
-                            );
-                        }
-                        compared += 1;
-                    }
-                }
+                assert_thirds_agree(&generated, &scalar, &format!("row={row} axis={a}"));
+                compared += SLS_ROW_K * SLS_ROW_K;
             }
         }
         assert!(
             compared >= 100_000,
             "expected >=100k channel comparisons, got {compared}"
         );
-        assert!(
-            tail_batches_seen > 0,
-            "non-multiple-of-4 trailing batches were never exercised"
-        );
     }
 
-    /// Direct root-cause guard for the per-lane zero-stack skip. A single
-    /// homogeneous (pure-censored) SIMD group whose four lanes MIX
-    /// no-left-truncation rows (entry `u0` stack exactly `[0,0,0,0,0]`, because
-    /// `S(entry)=1`, yet a nonzero row weight) with left-truncated rows (nonzero
-    /// entry stack). The scalar `sls_row_nll` SKIPS the zero `u0` stack
-    /// (`stack_is_exactly_zero`) and leaves it a clean `+0.0`; the batch must
-    /// reproduce that lane-by-lane rather than compose the zero stack (which
-    /// forms `0·(neg channel) = -0.0`, or `0·∞ = NaN` on a far-tail lane).
-    ///
-    /// This is the angle the random sweep under-covers: `make_kernel` only zeros
-    /// the WHOLE entry stack for `w = 0` rows, never for a weighted row, so it
-    /// never exercises a weighted no-truncation lane sharing a group with a
-    /// truncated one — the exact per-lane divergence this guards.
+    /// Root-cause guard for the zero-stack skip. A weighted row with no left
+    /// truncation carries an entry `u0` stack of exactly `[0,0,0,0,0]` (because
+    /// `S(entry) = 1`). The row program skips that stack rather than composing it,
+    /// which would form `0·(negative channel) = -0.0`, or `0·∞ = NaN` on a far-tail
+    /// row. Rows alternate truncated and untruncated; the third row is far-tail.
     #[test]
-    fn per_lane_zero_entry_stack_skip_matches_scalar_to_bits() {
+    fn zero_entry_stack_skip_keeps_generated_third_clean() {
         // A pure-censored kernel: event terms inactive (poisoned non-finite so a
         // regression that composes them would surface), entry stack zeroed for
-        // the no-left-truncation lanes.
+        // the no-left-truncation rows.
         fn censored_kernel(entry_zero: bool) -> SurvivalExactRowKernel {
             let (log_s0, r0, dr0, ddr0, dddr0) = if entry_zero {
                 (0.0, 0.0, 0.0, 0.0, 0.0)
@@ -8019,7 +7757,7 @@ mod simd_batch_bit_identity_tests {
             };
             SurvivalExactRowKernel {
                 w: 1.3,
-                d: 0.0, // pure censored -> (cens_on, event_on) = (true, false)
+                d: 0.0,
                 log_s0,
                 r0,
                 dr0,
@@ -8045,16 +7783,9 @@ mod simd_batch_bit_identity_tests {
             }
         }
 
-        // Lane layout: truncated / no-truncation / no-truncation-FAR-TAIL /
-        // truncated — a mixed group so the per-lane mask (not a group-level skip)
-        // is what must fire. `entry_zero[lane]` marks the no-truncation lanes.
         let entry_zero = [false, true, true, false];
-        let kernels: [SurvivalExactRowKernel; 4] =
-            std::array::from_fn(|lane| censored_kernel(entry_zero[lane]));
-
-        // Per-row primary channels and directions. Lane 2 is a far-tail lane:
-        // primary[7] = -720 makes `exp(-p7) = exp(720) = +inf`, so `u0`'s jet
-        // channels blow up to +/-inf; composing its zero stack would form NaN.
+        // Row 2 is far-tail: primary[7] = -720 makes `exp(-p7) = +inf`, so `u0`'s
+        // jet channels blow up; composing its zero stack would form NaN.
         let primaries: [[f64; SLS_ROW_K]; 4] = [
             [0.3, -0.4, 0.5, 0.6, -0.2, 0.1, 0.25, -0.35, 0.15],
             [-0.2, 0.35, -0.15, 0.45, 0.3, -0.05, 0.2, 0.4, -0.1],
@@ -8067,61 +7798,29 @@ mod simd_batch_bit_identity_tests {
             [0.3, -0.7, 0.6, 0.2, -0.4, 0.15, 0.5, 0.45, -0.2],
             [0.2, 0.3, -0.4, 0.6, 0.1, -0.5, 0.25, -0.35, 0.4],
         ];
-
-        // Batch: seed one OneSeedBatch per channel, four rows packed lane-wise.
-        let batch_vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
-            let value = f64x4::new(std::array::from_fn(|lane| primaries[lane][c]));
-            let dir = f64x4::new(std::array::from_fn(|lane| dirs[lane][c]));
-            OneSeedBatch::seed_direction(value, c, dir)
-        });
-        let kernel_refs: [&SurvivalExactRowKernel; 4] = std::array::from_fn(|lane| &kernels[lane]);
-        let batched =
-            sls_row_nll_onesseed_batch(&batch_vars, &kernel_refs, true, false).contracted_third();
-
-        for lane in 0..4 {
-            let scalar_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
-                OneSeed::seed_direction(primaries[lane][c], c, dirs[lane][c])
+        for row in 0..4 {
+            let kernel = censored_kernel(entry_zero[row]);
+            let generated = sls_row_third_generated(&primaries[row], &kernel, &dirs[row]);
+            let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
+                OneSeed::seed_direction(primaries[row][c], c, dirs[row][c])
             });
-            let scalar = sls_row_nll(&scalar_vars, &kernels[lane])
+            let scalar = sls_row_nll(&vars, &kernel)
                 .expect("scalar row NLL")
                 .contracted_third();
-            for x in 0..SLS_ROW_K {
-                for y in 0..SLS_ROW_K {
-                    let b = batched[x][y].to_array()[lane];
-                    let s = scalar[x][y];
-                    if s.is_nan() {
-                        assert!(
-                            b.is_nan(),
-                            "scalar NaN but SIMD finite at lane={lane} x={x} y={y}"
-                        );
-                    } else {
-                        assert_eq!(
-                            b.to_bits(),
-                            s.to_bits(),
-                            "SIMD batch != scalar at lane={lane} x={x} y={y} (b={b}, s={s})"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Explicit sign/finiteness pins for the no-truncation lanes: the `u0`-only
-        // cross channel [4][7] (entry eta_t x entry eta_ls) must be a clean +0.0,
-        // and the far-tail lane 2 must not leak the composed `0·∞ = NaN`.
-        for &lane in &[1usize, 2] {
-            let entry_cross = batched[4][7].to_array()[lane];
-            assert_eq!(
-                entry_cross.to_bits(),
-                0.0f64.to_bits(),
-                "no-truncation lane {lane} entry cross channel must be +0.0, got {entry_cross}"
-            );
-            for x in 0..SLS_ROW_K {
-                for y in 0..SLS_ROW_K {
-                    assert!(
-                        batched[x][y].to_array()[lane].is_finite(),
-                        "no-truncation lane {lane} leaked non-finite at [{x}][{y}]"
-                    );
-                }
+            assert_thirds_agree(&generated, &scalar, &format!("row={row}"));
+            if entry_zero[row] {
+                // The `u0`-only cross channel (entry η_t × entry η_ls) is a clean +0.0,
+                // and the far-tail row leaks no composed `0·∞ = NaN`.
+                assert_eq!(
+                    generated[4][7].to_bits(),
+                    0.0f64.to_bits(),
+                    "untruncated row {row} entry cross channel must be +0.0, got {}",
+                    generated[4][7]
+                );
+                assert!(
+                    generated.iter().flatten().all(|v| v.is_finite()),
+                    "untruncated row {row} leaked a non-finite entry"
+                );
             }
         }
     }
