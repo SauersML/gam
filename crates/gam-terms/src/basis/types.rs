@@ -231,7 +231,10 @@ pub enum BSplineKnotSpec {
         num_basis: usize,
     },
     Automatic {
-        num_internal_knots: Option<usize>,
+        /// Internal-knot count. Always resolved by the caller (the formula
+        /// default is `heuristic_knots_for_column`); the basis builder has no
+        /// second, row-count-based default of its own.
+        num_internal_knots: usize,
         placement: BSplineKnotPlacement,
         /// `true` when nobody chose `num_internal_knots`: it is the formula
         /// default's starting resolution, which the standard formula workflow
@@ -532,6 +535,16 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
+/// The low-rank thin-plate resolution `k = 10 * 3^(d - 1)` for a `d`-dimensional
+/// spatial smooth (30 centers in 2-D): mgcv's default basis size for thin-plate
+/// and Duchon splines. It is the adaptive pilot's starting size
+/// ([`starting_num_centers`]) and the implicit cap on an inferred Duchon center
+/// count.
+pub fn low_rank_center_resolution(d: usize) -> usize {
+    let exponent = u32::try_from(d.saturating_sub(1)).unwrap_or(u32::MAX);
+    10usize.saturating_mul(3usize.saturating_pow(exponent))
+}
+
 /// Starting center count for saturation-driven spatial fitting.
 ///
 /// The structural minimum (`d + 1` polynomial directions plus one radial
@@ -557,8 +570,7 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
 /// Capped by [`default_num_centers`] so the pilot never exceeds the validated
 /// production basis.
 pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    let low_rank_resolution = 10usize
-        .saturating_mul(3usize.saturating_pow(d.saturating_sub(1).min(u32::MAX as usize) as u32));
+    let low_rank_resolution = low_rank_center_resolution(d);
     let supported_rows = low_rank_resolution.saturating_mul(ROWS_PER_SUPPORTED_CENTER);
     let pilot = if n > supported_rows {
         let density_ratio = n as f64 / supported_rows as f64;
@@ -619,6 +631,15 @@ pub fn basis_is_saturated(
     penalized_edf >= capacity - margin
 }
 
+/// The one center-placement rule for a spatial (radial-kernel) smooth of
+/// dimension `d`.
+///
+/// In low dimensions (`d <= 3`) a center count is a resolution request, so the
+/// centers are deterministic maximin (farthest-point) geometry: kriging and
+/// Duchon accuracy are governed by fill distance, and equal-mass midpoints
+/// leave holes and endpoint under-resolution that REML then compensates for by
+/// over-smoothing low-noise signals (#504). In higher dimensions the centers
+/// are equal-mass covariance representatives.
 pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d <= 3 {
         CenterStrategy::FarthestPoint { num_centers }
@@ -627,22 +648,10 @@ pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> Ce
     }
 }
 
+/// [`default_spatial_center_strategy`] for an inferred center count, wrapped in
+/// `Auto` so adaptive resolution may resize it before the centers are frozen.
 pub(crate) fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
-    let strategy = if d == 1 {
-        // In one dimension, farthest-point selection is the deterministic
-        // maximin grid over the observed domain. Equal-mass midpoints leave the
-        // low-frequency Duchon radial block slightly under-resolved at the
-        // boundaries, and REML then compensates with an over-smooth λ on
-        // low-noise signals (#504). The maximin grid matches the native
-        // reproducing-kernel interpolation geometry. The default strategy below
-        // extends the same space-filling contract to low-dimensional spatial
-        // GP bases, where kriging accuracy is governed by fill distance rather
-        // than marginal quantile balance.
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    };
-    CenterStrategy::Auto(Box::new(strategy))
+    CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
 }
 
 pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {

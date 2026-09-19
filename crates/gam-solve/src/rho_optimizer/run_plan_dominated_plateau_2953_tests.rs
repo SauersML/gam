@@ -516,6 +516,8 @@ fn a_fatal_failure_of_the_saddle_escape_search_propagates_as_it_is_2953() {
 // lands near the centre.
 
 const REENTRY_START: f64 = -3.7;
+/// The observations the re-entry fixture declares: `τ_stat = 1/(2n) = 5e-4`.
+const REENTRY_N_OBS: usize = 1_000;
 const REENTRY_MARKER: &str =
     "the #2953 re-entry fixture refuses a point it evaluated before its last reset";
 
@@ -565,6 +567,7 @@ fn reentry_problem(
         .with_fallback_policy(fallback)
         .with_bounds(array![-6.0], array![6.0])
         .with_initial_rho(array![REENTRY_START])
+        .with_problem_size(REENTRY_N_OBS, 1)
         .with_max_iter(max_iter)
         .with_cache_session(session);
     (cache_dir, problem)
