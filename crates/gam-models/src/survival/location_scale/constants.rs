@@ -48,18 +48,6 @@ pub(crate) const MONOTONE_CONE_FEASIBILITY_GATE_TOL: f64 =
 /// near-degenerate constraint set and keeps the warm-start best-effort.
 pub(crate) const DYKSTRA_PROJECTION_MAX_SWEEPS: usize = 100;
 
-/// Levenberg damping schedule for the direct parametric-AFT Newton solve. When
-/// the Hessian is not Cholesky-factorizable, damping starts at
-/// `INITIAL × max(1, ‖diag H‖∞)`, grows by `GROWTH` per failed factorization,
-/// and the solve aborts once it would exceed `MAX × max(1, ‖diag H‖∞)` (the
-/// Hessian is then numerically unsalvageable). All three scale with the
-/// Hessian's diagonal magnitude so the schedule is units-invariant.
-pub(crate) const LEVENBERG_INITIAL_DAMPING_REL: f64 = 1e-8;
-
-pub(crate) const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
-
-pub(crate) const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
-
 /// Relative floor for the coupled-survival SCALE-COUPLED block trust-region
 /// metric (issue #1569). The free scale predictor `η_σ` enters the likelihood
 /// through the standardized index `u = inv_sigma·(h − η_t)` with
@@ -90,26 +78,6 @@ pub(crate) const SCALE_COUPLED_TRUST_METRIC_FLOOR_REL: f64 = 1e-6;
 pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
 
 pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
-
-/// Near-stationary acceptance tolerance for a stalled line search in the reduced
-/// parametric-AFT direct MLE. When the damped-Newton ascent direction admits no
-/// Armijo-sufficient step — i.e. `ℓ` can no longer be increased to numerical
-/// precision — AND the half-Newton-decrement `½·gᵀH⁻¹g` is below this bound, the
-/// iterate IS the numerical MLE and is accepted rather than reported as a
-/// convergence failure (gam#2112). A decrement above this bound at a stalled line
-/// search signals a genuinely wrong curvature model (not an MLE) and stays a hard
-/// error. The bound is generous relative to the primary objective tolerance
-/// (≈`1e-7`): a remaining gap of `1e-4` nats is a Mahalanobis distance of only
-/// `√(2·1e-4) ≈ 0.014` standard errors from the optimum, so it accepts a fully
-/// converged fit while still separating it from a real optimizer breakdown, whose
-/// decrement is orders of magnitude larger.
-pub(crate) const REDUCED_AFT_NEWTON_STALL_TOL: f64 = 1e-4;
-
-/// Relative ridge added to the normal-equations diagonal of the structural
-/// time-coefficient warm-start least squares (× the largest diagonal of XᵀX,
-/// floored at 1). Stabilizes the best-effort guess against a rank-deficient
-/// derivative design without materially biasing it.
-pub(crate) const STRUCTURAL_GUESS_RIDGE_REL: f64 = 1e-6;
 
 /// Target byte budget for one row-chunk when streaming a design matrix's
 /// trailing columns into a dense buffer. The per-chunk row count is derived as

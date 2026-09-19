@@ -112,22 +112,33 @@ pub(crate) fn structural_time_initial_beta_guess(
         target[i] = (desired - derivative_offset_exit[i]).max(0.0);
     }
 
+    // Minimum-norm least squares `β = (XᵀX)⁺ Xᵀt`: the unique solution with no
+    // component along a direction the derivative design does not observe. The
+    // pseudo-inverse drops exactly the eigen-directions of XᵀX indistinguishable
+    // from zero in floating point — `|λ_i|` within the accumulated rounding of
+    // forming XᵀX (`n` products per entry) and of the eigensolve (`p` sweeps),
+    // relative to `λ_max` — so no ridge biases the identified directions.
+    use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+    use gam_linalg::roundoff::accumulation_growth;
     let xtx = gam_linalg::faer_ndarray::fast_ata(design_derivative_exit);
     let xty = fast_atv(design_derivative_exit, &target);
-    let eps =
-        STRUCTURAL_GUESS_RIDGE_REL * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
-    let mut lhs = xtx;
-    for i in 0..p {
-        lhs[[i, i]] += eps;
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&xtx, faer::Side::Lower).ok()?;
+    let lambda_max = eigenvalues.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    if !(lambda_max > 0.0) {
+        return None;
     }
-
-    use gam_linalg::faer_ndarray::FaerCholesky;
-    let chol = lhs.cholesky(faer::Side::Lower).ok()?;
-    let mut beta_init = chol.solvevec(&xty);
+    let rank_band = accumulation_growth(n + p) * lambda_max;
+    let mut beta_init = Array1::<f64>::zeros(p);
+    for (k, &lambda) in eigenvalues.iter().enumerate() {
+        if lambda > rank_band {
+            let q = eigenvectors.column(k);
+            beta_init.scaled_add(q.dot(&xty) / lambda, &q);
+        }
+    }
     if let Some(lower_bounds) = coefficient_lower_bounds
         && let Some(constraints) = lower_bound_constraints(lower_bounds)
     {
-        // `beta_init` is the length-`p` ridge solution and `constraints` is
+        // `beta_init` is the length-`p` minimum-norm solution and `constraints` is
         // derived from the same `p`-column derivative design, so the projection
         // is dimensionally consistent by construction. If a future refactor
         // breaks that invariant, abandon the structural guess rather than

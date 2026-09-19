@@ -19,16 +19,13 @@ use crate::fit_orchestration::FitFailure;
 /// exactly as for any custom-family fit.
 pub(crate) fn fit_reduced_parametric_aft(
     prepared: &PreparedSurvivalLocationScaleModel,
-    options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, FitFailure> {
     use gam_linalg::faer_ndarray::FaerCholesky;
 
     let specs = &prepared.blockspecs;
-    let (states, log_likelihood, h) = prepared.family.fit_parametric_aft_direct_mle(
-        specs,
-        options.inner_max_cycles.max(1),
-        options.inner_tol,
-    )?;
+    let (states, log_likelihood, h) = prepared
+        .family
+        .fit_parametric_aft_direct_mle(specs)?;
 
     let p_total = h.nrows();
     // Conditional covariance Var(θ | λ) = H⁻¹ in the reduced coordinate system.
@@ -150,7 +147,7 @@ fn fit_survival_location_scale_with_geometry_authority(
     // path below.
     let fit = match authority {
         SurvivalLocationScaleFitAuthority::Direct if prepared.is_reduced_parametric_aft() => {
-            fit_reduced_parametric_aft(&prepared, &options)?
+            fit_reduced_parametric_aft(&prepared)?
         }
         SurvivalLocationScaleFitAuthority::Direct => {
             fit_custom_family_arming_on_evidence(&prepared.family, &prepared.blockspecs, &options)?
