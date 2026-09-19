@@ -8028,7 +8028,7 @@ fn model_partial_dependence_impl(
         term,
         grid,
     )?;
-    let x = standard_mean_design_dense(&model, table.table.clone())?;
+    let design = standard_mean_design(&model, table.table.clone())?;
     let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let beta = &fit.beta;
     // The partial-effect band prices its SEs off the covariance the fit
@@ -8045,20 +8045,26 @@ fn model_partial_dependence_impl(
          partial-dependence standard errors"
             .to_string()
     })?;
-    let blocks = term_blocks_for_model_impl(model)?;
-    let (start, end) = blocks
-        .iter()
-        .find(|(name, _, _, _)| name.as_str() == term)
-        .map(|(_, _, s, e)| (*s, *e))
+    // The grid design already carries every term's columns; reading the range
+    // from it spares a second design build just to locate the term.
+    let mut terms = design.linear_ranges.iter().chain(&design.smooth_ranges);
+    let range = terms
+        .find(|(name, _)| name.as_str() == term)
+        .map(|(_, range)| range.clone())
         .ok_or_else(|| {
-            let available: Vec<&str> = blocks.iter().map(|(n, _, _, _)| n.as_str()).collect();
+            let available: Vec<&str> = design
+                .linear_ranges
+                .iter()
+                .chain(&design.smooth_ranges)
+                .map(|(name, _)| name.as_str())
+                .collect();
             format!("partial_dependence: term {term:?} not found; available: {available:?}")
         })?;
     let (predicted, standard_error) = gam_predict::term_diagnostics::term_partial_dependence(
-        x.view(),
+        design.dense.view(),
         beta.view(),
         cov.view(),
-        start..end,
+        range,
     )?;
     Ok(PartialDependenceOutput {
         table,
@@ -8078,7 +8084,7 @@ fn model_variance_share_encoded_impl(
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    let x = standard_mean_design_dense(&model, dataset)?;
+    let x = standard_mean_design(&model, dataset)?.dense;
     let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
@@ -8147,16 +8153,24 @@ fn model_variance_share(
     })
 }
 
+/// A standard model's dense mean-block design on caller rows, with the global
+/// coefficient range of each linear and smooth term.
+struct StandardMeanDesign {
+    dense: Array2<f64>,
+    linear_ranges: Vec<(String, std::ops::Range<usize>)>,
+    smooth_ranges: Vec<(String, std::ops::Range<usize>)>,
+}
+
 /// Internal full mean-block design used by term diagnostics.
 ///
 /// This is deliberately distinct from the public affine predictor design.  A
 /// link-wiggle's final fitted predictor uses the mean block as its row offset
 /// and a LinkWiggle-frame matrix, so returning this internal matrix from the
 /// public API was the architectural root cause of #2299.
-fn standard_mean_design_dense(
+fn standard_mean_design(
     model: &FittedModel,
     dataset: EncodedDataset,
-) -> Result<Array2<f64>, String> {
+) -> Result<StandardMeanDesign, String> {
     // A scan-routed model never materializes a dense B-spline design — the
     // exact O(n) state-space smoother is the whole point — so there is no model
     // matrix to export. Replace the cryptic "missing resolved_termspec" error
@@ -8206,14 +8220,19 @@ fn standard_mean_design_dense(
     let dense = design
         .design
         .try_to_dense_by_chunks("design_matrix prediction design")?;
-    append_deployment_extension_columns(
+    let dense = append_deployment_extension_columns(
         model.payload(),
         dataset.values.view(),
         &col_map,
         training_headers,
         dense,
     )
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    Ok(StandardMeanDesign {
+        dense,
+        linear_ranges: design.linear_ranges,
+        smooth_ranges: design.smooth_ranges,
+    })
 }
 
 fn posterior_credible_interval_impl(

@@ -5219,15 +5219,30 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
             prediction.affine_offset, full.affine_offset,
             "`{formula}`: the prediction offset must equal the full rebuild's"
         );
+        assert_eq!(
+            prediction.linear_ranges, full.linear_ranges,
+            "`{formula}`: the prediction linear ranges must equal the full rebuild's"
+        );
+        let width = |ranges: &[(String, std::ops::Range<usize>)]| -> usize {
+            ranges.iter().map(|(_, range)| range.len()).sum()
+        };
+        let smooth_start = full.intercept_range.len()
+            + width(&full.linear_ranges)
+            + width(&full.random_effect_ranges);
         let full_ranges: Vec<_> = full
             .smooth
             .terms
             .iter()
-            .map(|term| (term.name.clone(), term.coeff_range.clone()))
+            .map(|term| {
+                let range = &term.coeff_range;
+                let columns = (smooth_start + range.start)..(smooth_start + range.end);
+                (term.name.clone(), columns)
+            })
             .collect();
         assert_eq!(
-            prediction.smooth_coefficient_ranges, full_ranges,
-            "`{formula}`: the prediction smooth coefficient ranges must equal the full rebuild's"
+            prediction.smooth_ranges, full_ranges,
+            "`{formula}`: the prediction smooth ranges must be the full rebuild's, placed after \
+             the intercept, linear and random-effect columns"
         );
         assert!(
             !full.smooth.penalties.is_empty(),

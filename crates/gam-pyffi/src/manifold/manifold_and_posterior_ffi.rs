@@ -424,7 +424,6 @@ fn smooth_basis_kind_label(basis: &gam::terms::smooth::SmoothBasisSpec) -> &'sta
 /// build fails (e.g. no training ranges available).
 fn smooth_term_column_ranges(
     payload: &FittedModelPayload,
-    smooth_start: usize,
 ) -> Option<Vec<(String, std::ops::Range<usize>)>> {
     let spec = payload.resolved_termspec.as_ref()?;
     if spec.smooth_terms.is_empty() {
@@ -448,13 +447,7 @@ fn smooth_term_column_ranges(
     }
     let design =
         gam::terms::smooth::build_term_collection_prediction_design(data.view(), spec).ok()?;
-    Some(
-        design
-            .smooth_coefficient_ranges
-            .into_iter()
-            .map(|(name, r)| (name, (smooth_start + r.start)..(smooth_start + r.end)))
-            .collect(),
-    )
+    Some(design.smooth_ranges)
 }
 
 fn coefficient_provenance_for_state(
@@ -543,8 +536,7 @@ fn coefficient_provenance_for_state(
     // without saved ranges, or unusual basis variants), the columns simply
     // keep their default `__global__` labels.
     if !spec.smooth_terms.is_empty() {
-        let smooth_start = col;
-        if let Some(smooth_ranges) = smooth_term_column_ranges(payload, smooth_start) {
+        if let Some(smooth_ranges) = smooth_term_column_ranges(payload) {
             for ((name, range), term_spec) in smooth_ranges.iter().zip(spec.smooth_terms.iter()) {
                 let kind = smooth_basis_kind_label(&term_spec.basis);
                 for idx in range.clone() {
@@ -729,7 +721,7 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design_dense(&model, dataset)
+            standard_mean_design(&model, dataset).map(|design| design.dense)
         },
     )?;
     serde_json::to_string(&rows)

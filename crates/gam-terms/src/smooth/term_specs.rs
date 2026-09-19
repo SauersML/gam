@@ -2325,9 +2325,10 @@ pub(crate) enum SmoothPenaltyDemand {
 pub struct TermCollectionPredictionDesign {
     pub design: DesignMatrix,
     pub affine_offset: Array1<f64>,
-    /// Each smooth term's name and coefficient range, relative to the smooth
-    /// block, in spec order.
-    pub smooth_coefficient_ranges: Vec<(String, Range<usize>)>,
+    /// Each linear term's name and global coefficient range, in spec order.
+    pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Each smooth term's name and global coefficient range, in spec order.
+    pub smooth_ranges: Vec<(String, Range<usize>)>,
 }
 
 impl TermCollectionPredictionDesign {

@@ -614,6 +614,7 @@ pub fn build_term_collection_prediction_design(
     let TermCollectionDesign {
         design,
         affine_offset,
+        linear_ranges,
         smooth,
         ..
     } = build_term_collection_design_inner_with_policy_and_plan(
@@ -623,13 +624,21 @@ pub fn build_term_collection_prediction_design(
         true,
         SmoothPenaltyDemand::DesignOnly,
     )?;
+    // The smooth block closes the global layout, so its first column sits one
+    // smooth-block width before the design's last.
+    let smooth_start = design.ncols() - smooth.total_smooth_cols();
     Ok(TermCollectionPredictionDesign {
         design,
         affine_offset,
-        smooth_coefficient_ranges: smooth
+        linear_ranges,
+        smooth_ranges: smooth
             .terms
             .into_iter()
-            .map(|term| (term.name, term.coeff_range))
+            .map(|term| {
+                let range = term.coeff_range;
+                let columns = (smooth_start + range.start)..(smooth_start + range.end);
+                (term.name, columns)
+            })
             .collect(),
     })
 }
