@@ -722,6 +722,9 @@ enum OuterEvaluationArtifacts {
     /// it, so one dense evaluation decomposes its state once.
     Dense(DenseExactAGeometry),
     MatrixFree(MatrixFreeOuterArtifacts),
+    /// #2234 step 1a — the arrow orbit lane's bordered elimination the streaming criterion
+    /// priced a closure-certified circle orbit off.
+    ArrowOrbit(ArrowOrbitGeometry),
 }
 
 pub(crate) struct OuterCriterionEvaluation {
@@ -1242,16 +1245,24 @@ impl SaeManifoldOuterObjective {
         if evaluated.cost.is_finite() {
             self.adopt_collapse_prevention_gates_from_root();
         }
+        let artifacts = match evaluated.evidence {
+            StreamingOuterEvidence::Bundle(bundle) => {
+                OuterEvaluationArtifacts::MatrixFree(MatrixFreeOuterArtifacts {
+                    system: bundle.system,
+                    exact_a_cache: bundle.exact_a_cache,
+                    logdet_derivative_bundle: bundle.logdet_derivative_bundle,
+                    efs_inverse_probe_bundle: bundle.efs_inverse_probe_bundle,
+                })
+            }
+            StreamingOuterEvidence::ArrowOrbit(geometry) => {
+                OuterEvaluationArtifacts::ArrowOrbit(geometry)
+            }
+        };
         Ok(OuterCriterionEvaluation {
             cost: evaluated.cost,
             loss: evaluated.loss,
             cache: evaluated.cache,
-            artifacts: OuterEvaluationArtifacts::MatrixFree(MatrixFreeOuterArtifacts {
-                system: evaluated.system,
-                exact_a_cache: evaluated.exact_a_cache,
-                logdet_derivative_bundle: evaluated.logdet_derivative_bundle,
-                efs_inverse_probe_bundle: evaluated.efs_inverse_probe_bundle,
-            }),
+            artifacts,
         })
     }
 
@@ -1295,6 +1306,19 @@ impl SaeManifoldOuterObjective {
                         Some(&matrix_free.system),
                         None,
                     )?
+            }
+            OuterEvaluationArtifacts::ArrowOrbit(geometry) => {
+                // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
+                // log-determinant channel and the adjoint read the orbit lane's elimination.
+                let solver = DeflatedArrowSolver::plain(&evaluation.cache);
+                self.term.analytic_outer_rho_gradient_components_arrow_orbit(
+                    self.target.view(),
+                    rho,
+                    &evaluation.loss,
+                    &evaluation.cache,
+                    &solver,
+                    geometry,
+                )?
             }
             OuterEvaluationArtifacts::Dense(geometry) => {
                 let lambda_smooth = rho
@@ -2802,7 +2826,7 @@ impl SaeManifoldOuterObjective {
             OuterEvaluationArtifacts::MatrixFree(artifacts) => {
                 artifacts.efs_inverse_probe_bundle.as_ref()
             }
-            OuterEvaluationArtifacts::Dense(_) => None,
+            OuterEvaluationArtifacts::Dense(_) | OuterEvaluationArtifacts::ArrowOrbit(_) => None,
         };
         let traces = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
             self.term

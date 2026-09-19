@@ -618,6 +618,10 @@ pub(crate) use construction::{
     BundleEvidenceGeometry, DenseExactAGeometry, EvidenceOperator,
     FittedResponseDivergenceEstimator,
 };
+// #2234 — the arrow orbit lane's elimination, which its streaming evaluation hands the gradient,
+// and the typed reason a `SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute` carries.
+pub(crate) use construction::{ArrowOrbitGeometry, StreamingOuterEvidence};
+pub use construction::{ArrowOrbitCertificate, ArrowOrbitRefusal};
 
 pub use crate::inference::atlas_nerve::AtlasCoveringSide;
 pub use atlas_topology::*;

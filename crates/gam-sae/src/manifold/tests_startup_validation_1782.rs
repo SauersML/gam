@@ -843,8 +843,8 @@ fn seed_infeasibility_channel_is_named_2609() {
             Err(SaeCriterionError::IndefiniteObservedInformation { block }) => {
                 format!("INDEFINITE-OBSERVED-INFORMATION block={block}")
             }
-            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom }) => {
-                format!("ORBIT-CRITERION-UNAVAILABLE-ON-ARROW-ROUTE atom={atom}")
+            Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom, refusal }) => {
+                format!("ORBIT-CRITERION-UNAVAILABLE-ON-ARROW-ROUTE atom={atom} lane={}: {refusal}", refusal.lane())
             }
             Err(SaeCriterionError::Numerical(message)) => {
                 format!("NUMERICAL(fatal, never mapped to +inf) {message}")

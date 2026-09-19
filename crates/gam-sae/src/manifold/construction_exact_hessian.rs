@@ -2684,11 +2684,21 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<std::collections::BTreeMap<usize, Array2<f64>>, String> {
+        let mut operators = DensePenaltyDerivatives::new(cache.delta_t_len() + cache.k);
+        self.raw_penalty_curvature_operators_into(rho, cache, &mut operators)?;
+        Ok(operators.by_flat)
+    }
+
+    /// [`Self::raw_penalty_curvature_operators_by_flat`] written into `sink` (#2234): every
+    /// entry sits on a row's coordinate block or on the border block, so an arrow-held weight
+    /// contracts it as it is written.
+    fn raw_penalty_curvature_operators_into<S: PenaltyDerivativeSink + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        sink: &mut S,
+    ) -> Result<(), String> {
         let total_t = cache.delta_t_len();
-        let k = cache.k;
-        let dim = total_t + k;
-        let mut c_by_flat: std::collections::BTreeMap<usize, Array2<f64>> =
-            std::collections::BTreeMap::new();
 
         // Smoothing: Cₐ = (λ_a·½(Sₐ+Sₐᵀ)) ⊗ I on atom a's β-block.
         let lambda_smooth = rho.lambda_smooth_vec()?;
@@ -2732,9 +2742,7 @@ impl SaeManifoldTerm {
             let off = beta_offsets[a];
             let r = beta_out_dim(a);
             let lambda = lambda_smooth[a];
-            let c = c_by_flat
-                .entry(flat)
-                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+            sink.touch(flat);
             for mu in 0..m {
                 for nu in 0..m {
                     let ds_sym = 0.5 * (ds[[nu, mu]] + ds[[mu, nu]]);
@@ -2743,7 +2751,7 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     for oc in 0..r {
-                        c[[total_t + off + nu * r + oc, total_t + off + mu * r + oc]] += val;
+                        sink.add(flat, total_t + off + nu * r + oc, total_t + off + mu * r + oc, val);
                     }
                 }
             }
@@ -2756,9 +2764,7 @@ impl SaeManifoldTerm {
             let r = beta_out_dim(a);
             let lambda = lambda_smooth[a];
             let flat = rho.smooth_flat_index(a);
-            let c = c_by_flat
-                .entry(flat)
-                .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+            sink.touch(flat);
             for mu in 0..m {
                 for nu in 0..m {
                     let s_sym = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
@@ -2767,7 +2773,7 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     for oc in 0..r {
-                        c[[total_t + off + nu * r + oc, total_t + off + mu * r + oc]] += val;
+                        sink.add(flat, total_t + off + nu * r + oc, total_t + off + mu * r + oc, val);
                     }
                 }
             }
@@ -2808,9 +2814,7 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     let flat = rho.ard_flat_index(kk, axis);
-                    let c = c_by_flat
-                        .entry(flat)
-                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                    sink.touch(flat);
                     match Self::ard_sphere_log_precision_derivative(
                         &sphere_factors[kk],
                         point,
@@ -2820,13 +2824,10 @@ impl SaeManifoldTerm {
                         hess,
                         w_row * prior.grad,
                     ) {
-                        Some(derivative) => {
-                            let mut block = c.slice_mut(ndarray::s![base..base + q, base..base + q]);
-                            block += &derivative;
-                        }
+                        Some(derivative) => sink.add_row_block(flat, base, &derivative),
                         None => {
                             let g_idx = base + start + axis;
-                            c[[g_idx, g_idx]] += hess;
+                            sink.add(flat, g_idx, g_idx, hess);
                         }
                     }
                 }
@@ -2842,11 +2843,9 @@ impl SaeManifoldTerm {
             match self.sparse_logit_curvature_rho_derivative(rho, cache)? {
                 SparseLogitCurvature::Inert => {}
                 SparseLogitCurvature::Diagonal(entries) => {
-                    let c = c_by_flat
-                        .entry(sparse_flat)
-                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                    sink.touch(sparse_flat);
                     for (slot, value) in entries {
-                        c[[slot, slot]] += value;
+                        sink.add(sparse_flat, slot, slot, value);
                     }
                 }
                 SparseLogitCurvature::CrossRowOwnedElsewhere => {
@@ -2860,7 +2859,7 @@ impl SaeManifoldTerm {
             }
         }
 
-        Ok(c_by_flat)
+        Ok(())
     }
 
     /// The ρ-derivative of the EXACT-minus-majorizer
@@ -2891,8 +2890,19 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<std::collections::BTreeMap<usize, Array2<f64>>, String> {
-        let total_t = cache.delta_t_len();
-        let dim = total_t + cache.k;
+        let mut deltas = DensePenaltyDerivatives::new(cache.delta_t_len() + cache.k);
+        self.exact_stationarity_penalty_derivative_delta_into(rho, cache, &mut deltas)?;
+        Ok(deltas.by_flat)
+    }
+
+    /// [`Self::exact_stationarity_penalty_derivative_delta_by_flat`] written into `sink`
+    /// (#2234): every delta is row-local.
+    pub(crate) fn exact_stationarity_penalty_derivative_delta_into<S: PenaltyDerivativeSink + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        sink: &mut S,
+    ) -> Result<(), String> {
         let k_atoms = self.k_atoms();
         let ard_precisions = self.validated_ard_precisions(rho)?;
         let row_w = self.row_loss_weights.as_deref();
@@ -2938,8 +2948,6 @@ impl SaeManifoldTerm {
                 )),
                 _ => None,
             };
-        let mut deltas: std::collections::BTreeMap<usize, Array2<f64>> =
-            std::collections::BTreeMap::new();
         let mut assignments = Array1::<f64>::zeros(k_atoms);
         for row in 0..self.n_obs() {
             let base = cache.row_offsets[row];
@@ -2958,9 +2966,7 @@ impl SaeManifoldTerm {
                     .as_slice()
                     .expect("softmax assignments row must be contiguous");
                 let m = softmax_majorizer_log_mean(a_soft);
-                let c = deltas
-                    .entry(sparse_flat)
-                    .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
+                sink.touch(sparse_flat);
                 for (a, va) in vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom: ka } = *va else {
                         continue;
@@ -2983,7 +2989,7 @@ impl SaeManifoldTerm {
                         } else {
                             h_entropy
                         };
-                        c[[base + a, base + b]] += w_row * delta;
+                        sink.add(sparse_flat, base + a, base + b, w_row * delta);
                     }
                 }
             }
@@ -3000,10 +3006,7 @@ impl SaeManifoldTerm {
                     // shared seam, so no second weighting here.
                     let neg = remainder[row * k_atoms + atom];
                     if neg != 0.0 {
-                        let c = deltas
-                            .entry(*sparse_flat)
-                            .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
-                        c[[base + a, base + a]] += neg;
+                        sink.add(*sparse_flat, base + a, base + a, neg);
                     }
                 }
             }
@@ -3021,14 +3024,11 @@ impl SaeManifoldTerm {
                     .negative_hessian_remainder();
                 if neg != 0.0 {
                     let flat = rho.ard_flat_index(atom, axis);
-                    let c = deltas
-                        .entry(flat)
-                        .or_insert_with(|| Array2::<f64>::zeros((dim, dim)));
-                    c[[base + a, base + a]] += w_row * neg;
+                    sink.add(flat, base + a, base + a, w_row * neg);
                 }
             }
         }
-        Ok(deltas)
+        Ok(())
     }
 
     /// The complete frozen-state derivative of the raw exact stationarity
@@ -3606,11 +3606,14 @@ impl SaeManifoldTerm {
 
     /// Dense reconstruction of the θ-adjoint `Γ_w = tr(inv · ∂H/∂θ_w)` against an
     /// arbitrary dense joint inverse `inv` (`dim×dim` over the `(t, β)` blocks).
-    pub(crate) fn logdet_theta_adjoint_dense(
+    ///
+    /// #2234 — `inv` is read on the arrow's positions only, so it may be held as arrow blocks
+    /// (the arrow orbit lane's weights); the ordered Beta--Bernoulli leg alone needs it dense.
+    pub(crate) fn logdet_theta_adjoint_dense<W: JointWeight + ?Sized>(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
-        inv: &Array2<f64>,
+        inv: &W,
         skip_deflation_dk: bool,
         exact_a: bool,
         // #2330 Patch D — the data target, required ONLY for the exact-A
@@ -3767,7 +3770,7 @@ impl SaeManifoldTerm {
             let inv_vv_block = if !defl_live {
                 Array2::<f64>::zeros((0, 0))
             } else {
-                inv.slice(s![base..base + q, base..base + q]).to_owned()
+                inv.row_block(base, q)
             };
             // #2933 F24 — on a sphere row the tower keeps its ambient derivatives as
             // matrices, converts them (`SphereRowConversion`), contracts the converted
@@ -3801,7 +3804,7 @@ impl SaeManifoldTerm {
                 let mut converted = 0.0_f64;
                 for a in 0..q {
                     for b in 0..q {
-                        converted += inv[[base + b, base + a]] * d_tt[[a, b]];
+                        converted += inv.entry(base + b, base + a) * d_tt[[a, b]];
                     }
                 }
                 if defl_live && !skip_deflation_dk {
@@ -3815,7 +3818,7 @@ impl SaeManifoldTerm {
                 for a in 0..q {
                     for (beta_pos, ch) in border.iter().enumerate() {
                         converted +=
-                            2.0 * inv[[base + a, total_t + ch.index]] * d_tbeta[[a, beta_pos]];
+                            2.0 * inv.entry(base + a, total_t + ch.index) * d_tbeta[[a, beta_pos]];
                     }
                 }
                 converted
@@ -3993,7 +3996,7 @@ impl SaeManifoldTerm {
                         if collect_matrices {
                             dh_mat[[a, b]] = dh;
                         }
-                        gamma += inv[[base + b, base + a]] * dh;
+                        gamma += inv.entry(base + b, base + a) * dh;
                     }
                 }
                 if defl_live && !skip_deflation_dk {
@@ -4027,14 +4030,14 @@ impl SaeManifoldTerm {
                         if sphere_conversion.is_some() {
                             dh_border[[a, beta_pos]] = dh;
                         }
-                        gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                        gamma += 2.0 * inv.entry(base + a, total_t + ch.index) * dh;
                     }
                 }
                 for (beta_i, ch_i) in border.iter().enumerate() {
                     for (beta_j, ch_j) in border.iter().enumerate() {
                         let dh = sae_dot(jets.beta_deriv(w, beta_i), jets.beta(beta_j))
                             + sae_dot(jets.beta(beta_i), jets.beta_deriv(w, beta_j));
-                        let contribution = inv[[total_t + ch_i.index, total_t + ch_j.index]] * dh;
+                        let contribution = inv.entry(total_t + ch_i.index, total_t + ch_j.index) * dh;
                         gamma += contribution;
                         beta_beta += contribution;
                     }
@@ -4080,7 +4083,7 @@ impl SaeManifoldTerm {
                         if collect_matrices {
                             dh_mat[[a, b]] = dh;
                         }
-                        gamma += inv[[base + b, base + a]] * dh;
+                        gamma += inv.entry(base + b, base + a) * dh;
                     }
                 }
                 if defl_live && !skip_deflation_dk {
@@ -4100,7 +4103,7 @@ impl SaeManifoldTerm {
                         if sphere_conversion.is_some() {
                             dh_border[[a, beta_pos]] = dh;
                         }
-                        gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
+                        gamma += 2.0 * inv.entry(base + a, total_t + ch.index) * dh;
                     }
                 }
                 match sphere_conversion.as_ref() {
@@ -4114,12 +4117,18 @@ impl SaeManifoldTerm {
             }
         }
         if exact_a {
-            gamma_beta += &self.exact_decoder_prior_theta_trace(
-                cache, inv.slice(s![total_t.., total_t..]),
-            )?;
+            let border = inv.border_block(total_t).ok_or_else(|| {
+                format!("logdet_theta_adjoint_dense: the weight holds no border after {total_t} coordinates")
+            })?;
+            gamma_beta += &self.exact_decoder_prior_theta_trace(cache, border)?;
         }
         // Fold the entire ordered-BB prior derivative into the logit slots.
         if let Some(data) = patchd_obb_adjoint.as_ref() {
+            let inv = inv.dense().ok_or_else(|| {
+                "logdet_theta_adjoint_dense: the ordered Beta--Bernoulli prior leg reads cross-row \
+                 entries, which an arrow-held weight does not carry"
+                    .to_string()
+            })?;
             let obb = self.dense_exact_a_ordered_bb_logit_theta_adjoint(cache, inv, data)?;
             gamma_t += &obb;
         }
@@ -4185,6 +4194,53 @@ impl SaeManifoldTerm {
         matrix_free_system: Option<&ArrowSchurSystem>,
         dense_geometry: Option<&DenseExactAGeometry>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
+        self.analytic_outer_rho_gradient_components_on_route(
+            target,
+            rho,
+            loss,
+            cache,
+            solver,
+            evidence,
+            matrix_free_system,
+            dense_geometry.map(ExactAGeometry::Dense),
+        )
+    }
+
+    /// #2234 step 1a — [`Self::analytic_outer_rho_gradient_components_with_bundle`] on the arrow
+    /// orbit lane: the value was priced off `geometry`, and its log-determinant channels and
+    /// stationarity adjoint are read off it, as the dense route's are read off its block.
+    pub(crate) fn analytic_outer_rho_gradient_components_arrow_orbit(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        geometry: &ArrowOrbitGeometry,
+    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
+        self.analytic_outer_rho_gradient_components_on_route(
+            target,
+            rho,
+            loss,
+            cache,
+            solver,
+            None,
+            None,
+            Some(ExactAGeometry::ArrowOrbit(geometry)),
+        )
+    }
+
+    fn analytic_outer_rho_gradient_components_on_route(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        evidence: Option<BundleEvidenceGeometry<'_>>,
+        matrix_free_system: Option<&ArrowSchurSystem>,
+        exact_geometry: Option<ExactAGeometry<'_>>,
+    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.assignment
             .validate_rho_domain(rho)
             .map_err(OuterGradientError::internal)?;
@@ -4216,7 +4272,7 @@ impl SaeManifoldTerm {
         // `B` channels, or the inverses of two different operators, against an
         // `A`-valued score. A dense route without its block (#2267) would decompose `A`
         // again for each consumer. Refuse them.
-        match (evidence.as_ref(), matrix_free_system, dense_geometry) {
+        match (evidence.as_ref(), matrix_free_system, exact_geometry) {
             (None, None, Some(_)) => {}
             (Some(geometry), Some(_), None) if geometry.operator.is_exact_a() => {}
             (bundle, system, dense) => {
@@ -4240,7 +4296,13 @@ impl SaeManifoldTerm {
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
         let rank_charge = self
-            .production_rank_charge_derivative(target, rho, loss, cache, dense_geometry)
+            .production_rank_charge_derivative(
+                target,
+                rho,
+                loss,
+                cache,
+                exact_geometry.and_then(ExactAGeometry::dense),
+            )
             .map_err(OuterGradientError::internal)?;
         // #2330 Phase-2 / #2333 — which operator the logdet channels belong to
         // is a property of the ROUTE, and it is known here, before any of them is
@@ -4316,7 +4378,11 @@ impl SaeManifoldTerm {
         // a caller that hand-picks `penalized_quasi_laplace_criterion_streaming_exact_with_cache`
         // on a shape the plan would have admitted (see
         // `tests_streaming_outer_gradient_2026`, which does exactly that on purpose).
-        if exact_a_logdet_route {
+        //
+        // #2234 — the arrow orbit lane is bundle-free too, and its value is the streaming one
+        // by construction, so the guard reads the plan only for the dense block.
+        let dense_block_route = !matches!(exact_geometry, Some(ExactAGeometry::ArrowOrbit(_)));
+        if exact_a_logdet_route && dense_block_route {
             let value_route_is_exact_a = self
                 .streaming_plan()
                 .map_err(OuterGradientError::internal)?
@@ -4629,7 +4695,7 @@ impl SaeManifoldTerm {
         let (gamma, dense_stationarity_adjoint) = match majorizer_gamma {
             Some(gamma) => (gamma, None),
             None => {
-                let geometry = dense_geometry.ok_or_else(|| {
+                let geometry = exact_geometry.ok_or_else(|| {
                     OuterGradientError::internal(
                         "analytic_outer_rho_gradient_components_with_bundle: the dense exact-A \
                          log-determinant channels need the evaluation's spectral block"
@@ -4640,9 +4706,23 @@ impl SaeManifoldTerm {
                     logdet_trace: exact_logdet_trace,
                     theta_adjoint: exact_gamma,
                     stationarity_adjoint,
-                } = self
-                    .dense_exact_a_logdet_channels(target, rho, cache, geometry, &rank_charge.theta)
-                    .map_err(OuterGradientError::internal)?;
+                } = match geometry {
+                    ExactAGeometry::Dense(geometry) => self.dense_exact_a_logdet_channels(
+                        target,
+                        rho,
+                        cache,
+                        geometry,
+                        &rank_charge.theta,
+                    ),
+                    ExactAGeometry::ArrowOrbit(geometry) => self.arrow_orbit_logdet_channels(
+                        target,
+                        rho,
+                        cache,
+                        geometry,
+                        &rank_charge.theta,
+                    ),
+                }
+                .map_err(OuterGradientError::internal)?;
                 logdet_trace = exact_logdet_trace;
                 (exact_gamma, Some(stationarity_adjoint))
             }
@@ -5479,6 +5559,22 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
     ) -> Result<(Array2<f64>, Option<Array2<f64>>), String> {
+        let dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let gap_border = self.probe_exact_hessian_arrow(rho, target, cache, &mut a)?;
+        Ok((a, gap_border))
+    }
+
+    /// The probes of [`Self::materialize_exact_hessian_dense_with_gap_border`], written into
+    /// `sink` (#2234): the dense route holds them as its `dim × dim` block and the arrow orbit
+    /// lane as arrow blocks, the same entries either way. Returns the gap border.
+    pub(crate) fn probe_exact_hessian_arrow<S: ExactHessianProbeSink + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        sink: &mut S,
+    ) -> Result<Option<Array2<f64>>, String> {
         let total_t = cache.delta_t_len();
         let k = cache.k;
         let dim = sae_exact_stationarity_dim(total_t, k);
@@ -5502,7 +5598,6 @@ impl SaeManifoldTerm {
         // #2731 — and one residual-curvature plan: the row jets and residual are
         // contracted here once, where every probe used to rebuild them.
         let residual = self.prepare_residual_curvature_rows(target, cache)?;
-        let mut a = Array2::<f64>::zeros((dim, dim));
         // #2731 — every probe is an independent apply of one fixed operator against
         // plans prepared once for this state, so the probes run on the rayon pool.
         // Columns are written serially in probe order: `a` is bit-identical to the
@@ -5548,21 +5643,12 @@ impl SaeManifoldTerm {
                 for row in 0..n_rows {
                     let (start, end) = (offsets[row], offsets[row + 1]);
                     if start + slot < end {
-                        let col = start + slot;
-                        for i in start..end {
-                            a[[i, col]] = av.t[i];
-                        }
+                        sink.row_slot_column(start, end, slot, &av.t);
                     }
                 }
             }
         }
-        for (coefficient, carrier) in &mass_carriers {
-            for &(row, left) in carrier {
-                for &(col, right) in carrier {
-                    a[[row, col]] += coefficient * left * right;
-                }
-            }
-        }
+        sink.add_mass_carriers(&mass_carriers)?;
         // #2731 — each border probe is `apply_exact_hessian_prepared` with leg (5)
         // of `ΔC` computed here and folded into `ΔC·e_j` exactly as
         // `apply_exact_hessian_minus_b_prepared` folds it, so the column is
@@ -5608,24 +5694,13 @@ impl SaeManifoldTerm {
             for (offset, column) in columns.into_iter().enumerate() {
                 let (av, leg) = column?;
                 let j = batch_start + offset;
-                let col = total_t + j;
-                for i in 0..total_t {
-                    a[[i, col]] = av.t[i];
-                    a[[col, i]] = av.t[i];
-                }
+                sink.border_column(total_t, j, &av);
                 for i in 0..k {
-                    a[[total_t + i, col]] = av.beta[i];
                     leg_columns[[i, j]] = leg[i];
                 }
             }
         }
-        for r in 0..dim {
-            for c in (r + 1)..dim {
-                let avg = 0.5 * (a[[r, c]] + a[[c, r]]);
-                a[[r, c]] = avg;
-                a[[c, r]] = avg;
-            }
-        }
+        sink.symmetrize();
         // `E = B − A` and leg (5) is the β-tier part of `A − B` on the border, so
         // `E_ββ` negates the kept columns. The remainder is a difference of two
         // symmetric operators; symmetrize the probe assembly so the basin quadratic
@@ -5657,7 +5732,7 @@ impl SaeManifoldTerm {
             build_elapsed.as_secs_f64(),
             build_elapsed.as_secs_f64() * 1.0e3 / ((slots + k).max(1) as f64),
         );
-        Ok((a, gap_border))
+        Ok(gap_border)
     }
 
     /// #2336 — the coordinate-block (t-index → (atom, axis)) map for a cache, so

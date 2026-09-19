@@ -277,14 +277,16 @@ pub enum SaeCriterionError {
     IndefiniteObservedInformation {
         block: &'static str,
     },
-    /// #2234 — atom `atom` carries a closure-certified circle orbit, whose evidence the dense
-    /// exact-`A` route integrates exactly: `log|A_s| − log det N − 2·log I + log 2π`. The arrow
-    /// (streaming) route factors `A` on its per-row blocks and reduced Schur, and has no signed
-    /// factorization carrying the rank-2 orbit correction, so it cannot price that criterion. It
-    /// refuses by this name rather than through the indefinite-`A` verdict, which would claim the
-    /// state has no Laplace normalizer while the dense route prices the same state finitely.
+    /// #2234 — atom `atom` carries a closure-certified circle orbit, whose evidence both routes
+    /// integrate exactly: `log|A_s| − log det N − 2·log I + log 2π`. The arrow route prices it on
+    /// its exact reduced-Schur orbit lane where the stiffened pencil is certified free of band and
+    /// negative directions (step 1a). `refusal` names the arrow lane that could not price this
+    /// state and why. It refuses by this name rather than through the indefinite-`A` verdict,
+    /// which would claim the state has no Laplace normalizer while the dense route prices the
+    /// same state finitely.
     OrbitCriterionUnavailableOnArrowRoute {
         atom: usize,
+        refusal: ArrowOrbitRefusal,
     },
 }
 
@@ -349,11 +351,11 @@ impl std::fmt::Display for SaeCriterionError {
                 "exact observed-information Hessian is indefinite at the converged mode \
                  ({block} block): ½log|A| is undefined (the inner point is not a maximum)"
             ),
-            Self::OrbitCriterionUnavailableOnArrowRoute { atom } => write!(
+            Self::OrbitCriterionUnavailableOnArrowRoute { atom, refusal } => write!(
                 f,
-                "atom {atom} carries a closure-certified circle orbit: its orbit-eliminated criterion \
-                 (#2234) is priced only on the dense exact-A route, and the arrow (streaming) route \
-                 has no signed factorization carrying the rank-2 orbit correction"
+                "atom {atom} carries a closure-certified circle orbit, and the arrow route's {} \
+                 cannot price its orbit-eliminated criterion (#2234): {refusal}",
+                refusal.lane()
             ),
         }
     }
@@ -800,6 +802,10 @@ include!("construction_rank_charge_derivative.rs");
 // [#2234] The declared compact chart orbit, integrated exactly: the stiffened operator the dense
 // exact-A block prices and the orbit-eliminated exact-A pseudo-inverse beside it.
 include!("construction_orbit_elimination.rs");
+
+// [#2234] The same orbit-eliminated evidence on the arrow route, off one elimination of the
+// bordered operator, and the arrow-held seams the exact-A channels read their operands through.
+include!("construction_orbit_arrow.rs");
 
 // [#780] The outer-gradient error taxonomy (`OuterGradientError`), the
 // `ForcedRowLayout` override alias, the `COTRAIN_*` co-training weight

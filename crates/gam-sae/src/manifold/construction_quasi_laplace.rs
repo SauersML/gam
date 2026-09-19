@@ -26,10 +26,29 @@ pub(crate) struct StreamingEvidenceArtifacts {
     pub(crate) exact_a_cache: ArrowFactorCache,
 }
 
+/// Which lane priced one streaming evaluation's evidence, with what its derivative reads.
+pub(crate) enum StreamingEvidence {
+    Bundle(StreamingEvidenceArtifacts),
+    /// #2234 — a closure-certified circle orbit, priced by the arrow orbit lane, whose geometry is
+    /// the whole of what its derivative reads.
+    ArrowOrbit(ArrowOrbitGeometry),
+}
+
 pub(crate) struct StreamingOuterEvaluation {
     pub(crate) cost: f64,
     pub(crate) loss: SaeManifoldLoss,
     pub(crate) cache: ArrowFactorCache,
+    pub(crate) evidence: StreamingOuterEvidence,
+}
+
+/// What one streaming outer evaluation's derivative reads beside its `B` cache, by lane.
+pub(crate) enum StreamingOuterEvidence {
+    Bundle(StreamingBundleEvidence),
+    /// #2234 step 1a — the arrow orbit lane's bordered elimination the value was priced off.
+    ArrowOrbit(ArrowOrbitGeometry),
+}
+
+pub(crate) struct StreamingBundleEvidence {
     pub(crate) system: ArrowSchurSystem,
     /// The factor cache of the exact-`A` evidence operator this evaluation's
     /// `logdet_derivative_bundle` was produced from (#2515). The from-probes
@@ -2655,6 +2674,36 @@ impl SaeManifoldTerm {
                 return Err(error);
             }
         };
+        let artifacts = artifacts.ok_or_else(|| {
+            SaeCriterionError::Numerical(
+                "streaming outer evaluation did not retain its matrix-free evidence system \
+                 and exact-A factor cache"
+                    .to_string(),
+            )
+        });
+        let (system, exact_a_cache) = match artifacts {
+            Ok(StreamingEvidence::Bundle(StreamingEvidenceArtifacts {
+                majorizer_system,
+                exact_a_cache,
+            })) => (majorizer_system, exact_a_cache),
+            Ok(StreamingEvidence::ArrowOrbit(geometry)) => {
+                // #2234 — the orbit lane prices the value off its own elimination and asks the
+                // rational lane for nothing.
+                drop(lane.take_logdet_derivative_bundle());
+                drop(lane.take_inverse_probes());
+                return Ok(StreamingOuterEvaluation {
+                    cost,
+                    loss,
+                    cache,
+                    evidence: StreamingOuterEvidence::ArrowOrbit(geometry),
+                });
+            }
+            Err(error) => {
+                drop(lane.take_logdet_derivative_bundle());
+                drop(lane.take_inverse_probes());
+                return Err(error);
+            }
+        };
         let logdet_derivative_bundle = lane.take_logdet_derivative_bundle().ok_or_else(|| {
             SaeCriterionError::Numerical(
                 "streaming outer evaluation did not emit the rational value's derivative bundle"
@@ -2668,16 +2717,6 @@ impl SaeManifoldTerm {
                     .to_string(),
             ));
         }
-        let StreamingEvidenceArtifacts {
-            majorizer_system: system,
-            exact_a_cache,
-        } = artifacts.ok_or_else(|| {
-            SaeCriterionError::Numerical(
-                "streaming outer evaluation did not retain its matrix-free evidence system \
-                 and exact-A factor cache"
-                    .to_string(),
-            )
-        })?;
         // #2515 — THE SPECTRAL-DEFLATION REFUSAL THAT STOOD HERE IS GONE, AND THE
         // NUMBER IT WAS RETAINED ON IS WHY. Four eras, each disproved by a
         // measurement rather than by an argument; keeping all four because the
@@ -2753,10 +2792,12 @@ impl SaeManifoldTerm {
             cost,
             loss,
             cache,
-            system,
-            exact_a_cache,
-            logdet_derivative_bundle,
-            efs_inverse_probe_bundle,
+            evidence: StreamingOuterEvidence::Bundle(StreamingBundleEvidence {
+                system,
+                exact_a_cache,
+                logdet_derivative_bundle,
+                efs_inverse_probe_bundle,
+            }),
         })
     }
 
@@ -2805,7 +2846,7 @@ impl SaeManifoldTerm {
             f64,
             SaeManifoldLoss,
             ArrowFactorCache,
-            Option<StreamingEvidenceArtifacts>,
+            Option<StreamingEvidence>,
         ),
         SaeCriterionError,
     > {
@@ -2860,7 +2901,7 @@ impl SaeManifoldTerm {
             f64,
             SaeManifoldLoss,
             ArrowFactorCache,
-            Option<StreamingEvidenceArtifacts>,
+            Option<StreamingEvidence>,
         ),
         SaeCriterionError,
     > {
@@ -2913,20 +2954,20 @@ impl SaeManifoldTerm {
             &options,
             true,
         )?;
-        // #2234 — the arrow route factors `A` itself, so it cannot price the orbit-eliminated
-        // criterion the dense route prices for a closure-certified circle orbit. It refuses by name
-        // at every such state, off the same predicate the dense route stiffens on, so the two
-        // routes never price one state differently without saying so.
-        if let Some(atom) = self
+        // #2234 — a closure-certified circle orbit is integrated exactly on this route too, off the
+        // same predicate the dense route stiffens on: the arrow orbit lane prices
+        // `log|A_s| − log det N − 2·Σ log I_k + K·log 2π` off one elimination of the bordered
+        // operator where the stiffened pencil is certified free of band and negative directions,
+        // and every other orbit state refuses by the lane's name, so the two routes never price
+        // one state differently without saying so.
+        let orbit_generators: Vec<CircleOrbitGenerator> = self
             .separated_compact_orbit_pricing(rho, target, &converged_cache)?
-            .iter()
-            .find_map(|pricing| match pricing {
-                CompactOrbitPricing::ExactCircle(generator) => Some(generator.atom),
+            .into_iter()
+            .filter_map(|pricing| match pricing {
+                CompactOrbitPricing::ExactCircle(generator) => Some(generator),
                 CompactOrbitPricing::Laplace { .. } => None,
             })
-        {
-            return Err(SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { atom });
-        }
+            .collect();
         // #9: accumulate the per-atom Grams + N_eff in the same log-det pass.
         // These are required by the canonical rank-charge criterion.
         let mut rank_inputs = StreamingRankInputs::default();
@@ -2937,15 +2978,33 @@ impl SaeManifoldTerm {
         // one as an infeasible ρ (`+inf`, steer away) and the untyped one as a
         // defect that aborts the fit. Same verdict, two behaviours, chosen by which
         // route the memory planner picked — this issue's genus one level up.
-        let (log_det, evidence_artifacts) = self
-            .streaming_exact_arrow_log_det_with_lane_and_system(
+        let (log_det, evidence_artifacts) = if orbit_generators.is_empty() {
+            self.streaming_exact_arrow_log_det_with_lane_and_system(
                 target,
                 rho,
                 registry,
                 Some(&mut rank_inputs),
                 lane,
             )
-            .map_err(SaeCriterionError::from_arrow_refusal)?;
+            .map_err(SaeCriterionError::from_arrow_refusal)?
+        } else {
+            // The rank charge's Grams and effective sizes come off the same full-row
+            // assembly the streaming log-determinant accumulates them from.
+            rank_inputs.grams = self.empty_decoder_gram_accumulator();
+            rank_inputs.n_eff = vec![0.0; self.k_atoms()];
+            self.assemble_full_matrix_free_evidence_system(
+                target,
+                rho,
+                registry,
+                Some(&mut rank_inputs),
+            )?;
+            let geometry =
+                self.arrow_orbit_geometry(rho, target, &converged_cache, orbit_generators)?;
+            (
+                geometry.log_det(),
+                Some(StreamingEvidence::ArrowOrbit(geometry)),
+            )
+        };
         // The returned row-factor cache and the external matrix-free log|S|
         // estimate are one evidence operator. Stamp the authoritative joint
         // value onto the cache so from-probes theta-adjoint consumers can verify
@@ -3432,7 +3491,7 @@ impl SaeManifoldTerm {
         registry: Option<&AnalyticPenaltyRegistry>,
         mut rank_inputs: Option<&mut StreamingRankInputs>,
         mut lane: Option<&mut SurrogateLaneState>,
-    ) -> Result<(f64, Option<StreamingEvidenceArtifacts>), String> {
+    ) -> Result<(f64, Option<StreamingEvidence>), String> {
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: target must be ({}, {}); got {:?}",
@@ -3625,10 +3684,10 @@ impl SaeManifoldTerm {
             }
             return Ok((
                 log_det_tt + log_det_schur,
-                exact_a_cache.map(|exact_a_cache| StreamingEvidenceArtifacts {
+                exact_a_cache.map(|exact_a_cache| StreamingEvidence::Bundle(StreamingEvidenceArtifacts {
                     majorizer_system: sys,
                     exact_a_cache,
-                }),
+                })),
             ));
         }
         let n_total = self.n_obs();
