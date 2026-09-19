@@ -280,8 +280,6 @@ def _build_fit_payload(
     smooths: Mapping[Any, Any] | None,
     config: dict[str, Any] | None,
     residual_columns: Sequence[str] | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
 ) -> dict[str, Any]:
     normalized_latents = _normalize_latents(latents)
     payload: dict[str, Any] = {
@@ -325,8 +323,6 @@ def _build_fit_payload(
         "noise_formula": noise_formula,
         "noise_offset": noise_offset,
         "flexible_link": flexible_link,
-        "outer_tol": outer_tol,
-        "inner_tol": inner_tol,
         "precision_hyperpriors": precision_hyperpriors,
         # `FitRequestConfigDocument` is `deny_unknown_fields` and names these
         # three `latent_coordinates` / `analytic_penalties` /
@@ -625,9 +621,6 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
-    outer_tol: float | None = ...,
-    inner_tol: float | None = ...,
-    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
@@ -674,9 +667,6 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
-    outer_tol: float | None = ...,
-    inner_tol: float | None = ...,
-    warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
@@ -722,9 +712,6 @@ def fit(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
-    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
@@ -914,21 +901,6 @@ def fit(
         link fixed at its canonical/parametric form, letting the data shape
         the response transformation. Corresponds to the CLI flexible-link path
         (``FitConfig.flexible_link``).
-    outer_tol:
-        Absolute stationarity tolerance of the outer (smoothing-parameter)
-        search, for a fit that must converge past the default stop, such as a
-        reference fit. It is handed to the route's outer optimizer unchanged,
-        and a family's own floor on the default does not raise it. When
-        omitted, each route keeps its default: ``1e-10`` for standard GAMs and
-        ``1e-5`` for the custom-family routes (marginal-slope, survival,
-        transformation-normal, location-scale), which the binary
-        marginal-slope route floors at ``2e-5``. Corresponds to the
-        fit-request key ``outer_tol``.
-    inner_tol:
-        Absolute coefficient stationarity tolerance of the custom-family inner
-        solver (default ``1e-6``). A standard GAM without a link-wiggle refit
-        has no inner tolerance to set and raises instead of ignoring it.
-        Corresponds to the fit-request key ``inner_tol``.
     warm_start_from:
         A fitted :class:`Model` of the same formula to resume from. The outer
         search starts at that model's certified point (its smoothing parameters
@@ -1066,8 +1038,6 @@ def fit(
             ("noise_formula", noise_formula),
             ("noise_offset", noise_offset),
             ("flexible_link", flexible_link),
-            ("outer_tol", outer_tol),
-            ("inner_tol", inner_tol),
             ("warm_start_from", warm_start_from),
         ]:
             if arg_val is not None:
@@ -1124,8 +1094,6 @@ def fit(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        outer_tol=outer_tol,
-        inner_tol=inner_tol,
         precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,
@@ -1240,9 +1208,6 @@ def fit_array(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
-    warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
@@ -1309,8 +1274,6 @@ def fit_array(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        outer_tol=outer_tol,
-        inner_tol=inner_tol,
         precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,

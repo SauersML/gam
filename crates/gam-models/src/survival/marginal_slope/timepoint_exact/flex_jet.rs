@@ -918,6 +918,220 @@ impl FlexJet for Jet1 {
     }
 }
 
+// ── ArenaJet2 / ArenaJet1: the timepoint builder's row-arena carriers ──────
+
+thread_local! {
+    /// Per-worker order-≤2 FLEX timepoint workspace (gam#2971). The largest
+    /// timepoint tape is retained across rows, so a warmed value/gradient/Hessian
+    /// or value/gradient timepoint writes its channels without visiting the
+    /// global allocator.
+    static FLEX_TIMEPOINT_JET_ARENA: std::cell::RefCell<DynamicJetArena> =
+        std::cell::RefCell::new(DynamicJetArena::new());
+}
+
+fn with_flex_timepoint_jet_arena<R>(evaluate: impl FnOnce(&DynamicJetArena) -> R) -> R {
+    FLEX_TIMEPOINT_JET_ARENA.with(|workspace| {
+        let mut arena = workspace.borrow_mut();
+        arena.reset();
+        let result = evaluate(&arena);
+        arena.reset();
+        result
+    })
+}
+
+/// [`Jet2`] with its channels in a row arena (gam#2971): the same channels and
+/// the same per-entry formulas in the same operand order, so every channel is
+/// `to_bits`-identical to `Jet2`'s. `Jet2` allocates a gradient and a Hessian
+/// vector per primitive operation, and the timepoint builder runs tens of
+/// thousands of them per row, so the survival flex row program spent its time in
+/// the allocator.
+#[derive(Clone, Copy)]
+struct ArenaJet2<'arena> {
+    arena: &'arena DynamicJetArena,
+    v: f64,
+    g: &'arena [f64],
+    h: &'arena [f64],
+}
+
+impl<'arena> ArenaJet2<'arena> {
+    /// The seeded primary `axis` at value `x`, as [`Jet2::primary`].
+    fn primary(x: f64, axis: usize, p: usize, arena: &'arena DynamicJetArena) -> Self {
+        Self {
+            arena,
+            v: x,
+            g: arena.alloc_slice_fill_with(p, |i| if i == axis { 1.0 } else { 0.0 }),
+            h: arena.alloc_slice_fill_with(p * p, |_| 0.0),
+        }
+    }
+
+    #[inline]
+    fn p(&self) -> usize {
+        self.g.len()
+    }
+
+    /// A jet of this one's dimension whose gradient and Hessian entries are
+    /// `gradient(i)` and `hessian(k)` over the flat row-major index.
+    #[inline]
+    fn from_entries(
+        &self,
+        v: f64,
+        gradient: impl FnMut(usize) -> f64,
+        hessian: impl FnMut(usize) -> f64,
+    ) -> Self {
+        let p = self.p();
+        Self {
+            arena: self.arena,
+            v,
+            g: self.arena.alloc_slice_fill_with(p, gradient),
+            h: self.arena.alloc_slice_fill_with(p * p, hessian),
+        }
+    }
+}
+
+impl JetField for ArenaJet2<'_> {
+    #[inline]
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        self.from_entries(self.v + o.v, |i| self.g[i] + o.g[i], |k| self.h[k] + o.h[k])
+    }
+    fn sub(&self, o: &Self) -> Self {
+        self.from_entries(self.v - o.v, |i| self.g[i] - o.g[i], |k| self.h[k] - o.h[k])
+    }
+    fn mul(&self, o: &Self) -> Self {
+        let p = self.p();
+        let g = self
+            .arena
+            .alloc_slice_fill_with(p, |i| self.v * o.g[i] + self.g[i] * o.v);
+        let h = self.arena.alloc_slice_fill_with(p * p, |_| 0.0);
+        for i in 0..p {
+            for j in 0..p {
+                h[i * p + j] = self.v * o.h[i * p + j]
+                    + self.g[i] * o.g[j]
+                    + self.g[j] * o.g[i]
+                    + self.h[i * p + j] * o.v;
+            }
+        }
+        Self {
+            arena: self.arena,
+            v: self.v * o.v,
+            g,
+            h,
+        }
+    }
+    fn scale(&self, s: f64) -> Self {
+        self.from_entries(self.v * s, |i| self.g[i] * s, |k| self.h[k] * s)
+    }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Order-≤2 reads only [f, f', f''].
+        let p = self.p();
+        let (f, f1, f2) = (d[0], d[1], d[2]);
+        let g = self.arena.alloc_slice_fill_with(p, |i| f1 * self.g[i]);
+        let h = self.arena.alloc_slice_fill_with(p * p, |_| 0.0);
+        for i in 0..p {
+            for j in 0..p {
+                h[i * p + j] = f2 * self.g[i] * self.g[j] + f1 * self.h[i * p + j];
+            }
+        }
+        Self {
+            arena: self.arena,
+            v: f,
+            g,
+            h,
+        }
+    }
+    fn constant_like(&self, v: f64) -> Self {
+        self.from_entries(v, |_| 0.0, |_| 0.0)
+    }
+    fn with_value(&self, v: f64) -> Self {
+        // The channels are immutable arena slices, so they are shared, not copied.
+        Self { v, ..*self }
+    }
+}
+
+impl FlexJet for ArenaJet2<'_> {
+    const ORDER: usize = 2;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 6]) -> Self {
+        self.from_entries(
+            factors[0] * self.v,
+            |i| factors[1] * self.g[i],
+            |k| factors[2] * self.h[k],
+        )
+    }
+}
+
+/// [`Jet1`] with its gradient in a row arena (gam#2971), `to_bits`-identical
+/// to `Jet1` channel for channel, as [`ArenaJet2`] is to [`Jet2`].
+#[derive(Clone, Copy)]
+struct ArenaJet1<'arena> {
+    arena: &'arena DynamicJetArena,
+    v: f64,
+    g: &'arena [f64],
+}
+
+impl<'arena> ArenaJet1<'arena> {
+    /// The seeded primary `axis` at value `x`, as [`Jet1::primary`].
+    fn primary(x: f64, axis: usize, p: usize, arena: &'arena DynamicJetArena) -> Self {
+        Self {
+            arena,
+            v: x,
+            g: arena.alloc_slice_fill_with(p, |i| if i == axis { 1.0 } else { 0.0 }),
+        }
+    }
+
+    #[inline]
+    fn from_entries(&self, v: f64, gradient: impl FnMut(usize) -> f64) -> Self {
+        Self {
+            arena: self.arena,
+            v,
+            g: self.arena.alloc_slice_fill_with(self.g.len(), gradient),
+        }
+    }
+}
+
+impl JetField for ArenaJet1<'_> {
+    #[inline]
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        self.from_entries(self.v + o.v, |i| self.g[i] + o.g[i])
+    }
+    fn sub(&self, o: &Self) -> Self {
+        self.from_entries(self.v - o.v, |i| self.g[i] - o.g[i])
+    }
+    fn mul(&self, o: &Self) -> Self {
+        self.from_entries(self.v * o.v, |i| self.v * o.g[i] + self.g[i] * o.v)
+    }
+    fn scale(&self, s: f64) -> Self {
+        self.from_entries(self.v * s, |i| self.g[i] * s)
+    }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Order-≤1 reads only [f, f'].
+        self.from_entries(d[0], |i| d[1] * self.g[i])
+    }
+}
+
+impl FlexJet for ArenaJet1<'_> {
+    const ORDER: usize = 1;
+
+    #[inline]
+    fn scale_homogeneous_orders(&self, factors: [f64; 6]) -> Self {
+        self.from_entries(factors[0] * self.v, |i| factors[1] * self.g[i])
+    }
+}
+
 // ── Jet3: one-seed directional, contracted third (doc §A.2) ────────────────
 
 /// An [`Jet2`] base plus one nilpotent ε (`ε² = 0`) holding another [`Jet2`].
@@ -3410,16 +3624,66 @@ impl SurvivalMarginalSlopeFamily {
         cached: &CachedPartitionCells,
     ) -> Result<SurvivalFlexTimepointExact, String> {
         let p = primary.total;
+        with_flex_timepoint_jet_arena(|arena| {
+            let (eta, chi, d) = self.survival_timepoint_jets(
+                row,
+                primary,
+                q,
+                q_index,
+                a,
+                b,
+                beta_h,
+                beta_w,
+                o_infl,
+                cached,
+                |x, axis| ArenaJet2::primary(x, axis, p, arena),
+            )?;
+            let to_g = |j: &ArenaJet2<'_>| Array1::from(j.g.to_vec());
+            let to_h = |j: &ArenaJet2<'_>| -> Result<Array2<f64>, String> {
+                Array2::from_shape_vec((p, p), j.h.to_vec()).map_err(|e| e.to_string())
+            };
+            Ok(SurvivalFlexTimepointExact {
+                eta: eta.value(),
+                chi: chi.value(),
+                d: d.value(),
+                eta_u: to_g(&eta),
+                eta_uv: to_h(&eta)?,
+                chi_u: to_g(&chi),
+                chi_uv: to_h(&chi)?,
+                d_u: to_g(&d),
+                d_uv: to_h(&d)?,
+            })
+        })
+    }
+
+    /// The timepoint `(eta, chi, d)` jets of [`flex_timepoint_inputs_generic`]
+    /// on the carrier `seed` builds: `seed(x, axis)` is the primary `axis` at
+    /// value `x`, and a constant when `axis` names no primary.
+    fn survival_timepoint_jets<J: FlexJet + MomentTerm>(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
+        cached: &CachedPartitionCells,
+        seed: impl Fn(f64, usize) -> J,
+    ) -> Result<(J, J, J), String> {
+        let p = primary.total;
         let d_check = self.evaluate_survival_denom_d(row, a, b, beta_h, beta_w)?;
         let z_obs = self.observed_score_projection(row);
         let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
         let calibration = calibration_from_cached(cached);
 
-        let template = Jet2::primary(0.0, usize::MAX, p);
-        let b_jet = Jet2::primary(b, primary.g, p);
-        let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+        let template = seed(0.0, usize::MAX);
+        let b_jet = seed(b, primary.g);
+        let du: Vec<J> = (0..p).map(|u| seed(0.0, u)).collect();
         let q_jet = add_const(&du[q_index], q);
-        let (eta, chi, d) = flex_timepoint_inputs_generic(
+        flex_timepoint_inputs_generic(
             &template,
             &b_jet,
             &du,
@@ -3434,23 +3698,7 @@ impl SurvivalMarginalSlopeFamily {
             obs_coeff,
             &obs_fixed,
             &calibration,
-        )?;
-
-        let to_g = |j: &Jet2| Array1::from(j.g.clone());
-        let to_h = |j: &Jet2| -> Result<Array2<f64>, String> {
-            Array2::from_shape_vec((p, p), j.h.clone()).map_err(|e| e.to_string())
-        };
-        Ok(SurvivalFlexTimepointExact {
-            eta: eta.value(),
-            chi: chi.value(),
-            d: d.value(),
-            eta_u: to_g(&eta),
-            eta_uv: to_h(&eta)?,
-            chi_u: to_g(&chi),
-            chi_uv: to_h(&chi)?,
-            d_u: to_g(&d),
-            d_uv: to_h(&d)?,
-        })
+        )
     }
 
     /// #932 grad-only single-source: the exact timepoint `(eta, chi, d)` VALUE +
@@ -3479,40 +3727,29 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<SurvivalFlexTimepointFirstOrderExact, String> {
         let cached = self.build_cached_partition(row, primary, a, b, beta_h, beta_w)?;
         let p = primary.total;
-        let d_check = self.evaluate_survival_denom_d(row, a, b, beta_h, beta_w)?;
-        let z_obs = self.observed_score_projection(row);
-        let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
-        let calibration = calibration_from_cached(&cached);
-
-        let template = Jet1::primary(0.0, usize::MAX, p);
-        let b_jet = Jet1::primary(b, primary.g, p);
-        let du: Vec<Jet1> = (0..p).map(|u| Jet1::primary(0.0, u, p)).collect();
-        let q_jet = add_const(&du[q_index], q);
-        let (eta, chi, d) = flex_timepoint_inputs_generic(
-            &template,
-            &b_jet,
-            &du,
-            a,
-            d_check,
-            primary.g,
-            primary.infl,
-            &q_jet,
-            &const_jet_like(&template, 1.0),
-            z_obs,
-            o_infl,
-            obs_coeff,
-            &obs_fixed,
-            &calibration,
-        )?;
-
-        let to_g = |j: &Jet1| Array1::from(j.g.clone());
-        Ok(SurvivalFlexTimepointFirstOrderExact {
-            eta: eta.value(),
-            chi: chi.value(),
-            d: d.value(),
-            eta_u: to_g(&eta),
-            chi_u: to_g(&chi),
-            d_u: to_g(&d),
+        with_flex_timepoint_jet_arena(|arena| {
+            let (eta, chi, d) = self.survival_timepoint_jets(
+                row,
+                primary,
+                q,
+                q_index,
+                a,
+                b,
+                beta_h,
+                beta_w,
+                o_infl,
+                &cached,
+                |x, axis| ArenaJet1::primary(x, axis, p, arena),
+            )?;
+            let to_g = |j: &ArenaJet1<'_>| Array1::from(j.g.to_vec());
+            Ok(SurvivalFlexTimepointFirstOrderExact {
+                eta: eta.value(),
+                chi: chi.value(),
+                d: d.value(),
+                eta_u: to_g(&eta),
+                chi_u: to_g(&chi),
+                d_u: to_g(&d),
+            })
         })
     }
 }
@@ -5879,6 +6116,137 @@ mod moment_engine_tests {
             retained_bytes(),
             first,
             "same-width FLEX third row grew its warmed arena"
+        );
+    }
+
+    /// gam#2971: the production timepoint carriers are the `Vec` jets they
+    /// replaced, bit for bit. On a g+h+w row with nonzero warp and deviation
+    /// coefficients, the value/gradient/Hessian timepoint built on
+    /// [`ArenaJet2`] and the value/gradient timepoint built on [`ArenaJet1`]
+    /// carry every channel of the same timepoint built on [`Jet2`] and [`Jet1`]
+    /// with identical bits, and a second same-width row reuses the warmed arena
+    /// tape without growing it.
+    #[test]
+    fn flex_timepoint_arena_carriers_are_the_vec_jets_bitwise_2971() {
+        let family = make_ghw_flex_family(16);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let h_len = primary.h.as_ref().map(|r| r.len()).unwrap_or(0);
+        let w_len = primary.w.as_ref().map(|r| r.len()).unwrap_or(0);
+        let beta_h = Array1::from_iter(
+            (0..h_len).map(|i| 0.1 + 0.05 * (i as f64) - 0.02 * ((i % 2) as f64)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..w_len).map(|i| -0.08 + 0.04 * (i as f64) + 0.01 * ((i % 3) as f64)),
+        );
+        let (bh, bw) = (Some(&beta_h), Some(&beta_w));
+        let g = 0.2_f64;
+        let bits = |values: &[f64]| values.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        for row in [2usize, 6, 11] {
+            let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * 0.15;
+            let a1 = family
+                .solve_row_survival_intercept_with_slot(
+                    q1,
+                    g,
+                    bh,
+                    bw,
+                    Some((row, SurvivalInterceptSlotKind::Exit)),
+                )
+                .expect("intercept solve")
+                .0;
+            let cached = family
+                .build_cached_partition(row, &primary, a1, g, bh, bw)
+                .expect("cached partition");
+            let (eta, chi, d) = family
+                .survival_timepoint_jets(
+                    row,
+                    &primary,
+                    q1,
+                    primary.q1,
+                    a1,
+                    g,
+                    bh,
+                    bw,
+                    0.0,
+                    &cached,
+                    |x, axis| Jet2::primary(x, axis, p),
+                )
+                .expect("Vec-jet timepoint");
+            let order2 = family
+                .compute_survival_timepoint_exact_jet_from_cached(
+                    row, &primary, q1, primary.q1, a1, g, bh, bw, 0.0, &cached,
+                )
+                .expect("arena value/gradient/Hessian timepoint");
+            for (name, vec_jet, value, gradient, hessian) in [
+                ("eta", &eta, order2.eta, &order2.eta_u, &order2.eta_uv),
+                ("chi", &chi, order2.chi, &order2.chi_u, &order2.chi_uv),
+                ("d", &d, order2.d, &order2.d_u, &order2.d_uv),
+            ] {
+                assert_eq!(value.to_bits(), vec_jet.v.to_bits(), "row {row} {name} value");
+                assert_eq!(
+                    bits(gradient.as_slice().expect("contiguous")),
+                    bits(&vec_jet.g),
+                    "row {row} {name} gradient"
+                );
+                assert_eq!(
+                    bits(hessian.as_slice().expect("contiguous")),
+                    bits(&vec_jet.h),
+                    "row {row} {name} Hessian"
+                );
+            }
+            let (eta1, chi1, d1) = family
+                .survival_timepoint_jets(
+                    row,
+                    &primary,
+                    q1,
+                    primary.q1,
+                    a1,
+                    g,
+                    bh,
+                    bw,
+                    0.0,
+                    &cached,
+                    |x, axis| Jet1::primary(x, axis, p),
+                )
+                .expect("Vec-jet first-order timepoint");
+            let order1 = family
+                .compute_survival_timepoint_first_order_exact(
+                    row, &primary, q1, primary.q1, a1, g, bh, bw, 0.0,
+                )
+                .expect("arena value/gradient timepoint");
+            for (name, vec_jet, value, gradient) in [
+                ("eta", &eta1, order1.eta, &order1.eta_u),
+                ("chi", &chi1, order1.chi, &order1.chi_u),
+                ("d", &d1, order1.d, &order1.d_u),
+            ] {
+                assert_eq!(value.to_bits(), vec_jet.v.to_bits(), "row {row} first-order {name} value");
+                assert_eq!(
+                    bits(gradient.as_slice().expect("contiguous")),
+                    bits(&vec_jet.g),
+                    "row {row} first-order {name} gradient"
+                );
+            }
+        }
+        let retained = with_flex_timepoint_jet_arena(|arena| arena.allocated_bytes());
+        assert!(retained > 0, "the timepoint arena did not retain its warm tape");
+        let row = 6usize;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * 0.15;
+        let a1 = family
+            .solve_row_survival_intercept_with_slot(q1, g, bh, bw, None)
+            .expect("intercept solve")
+            .0;
+        let cached = family
+            .build_cached_partition(row, &primary, a1, g, bh, bw)
+            .expect("cached partition");
+        family
+            .compute_survival_timepoint_exact_jet_from_cached(
+                row, &primary, q1, primary.q1, a1, g, bh, bw, 0.0, &cached,
+            )
+            .expect("warmed timepoint");
+        assert_eq!(
+            with_flex_timepoint_jet_arena(|arena| arena.allocated_bytes()),
+            retained,
+            "a same-width timepoint grew its warmed arena"
         );
     }
 
