@@ -103,7 +103,7 @@ def test_dir_lists_the_api_and_the_submodules() -> None:
         "PoincareAtoms",
         "InterchangeSwapDecoder",
         # Names that now live only in their submodule.
-        "GamError",
+        "GamfitError",
         "Diagnostics",
         "PosteriorSamples",
         "BSpline",
@@ -118,7 +118,7 @@ def test_removed_names_are_not_top_level(name: str) -> None:
 
 
 def test_each_name_has_one_public_home() -> None:
-    assert gamfit.errors.GamError.__name__ == "GamError"
+    assert gamfit.errors.GamfitError.__name__ == "GamfitError"
     assert gamfit.topology.Sphere is not gamfit.smooth.Sphere
     for sub in SUBMODULES - {"torch", "sklearn", "kernels_jax", "kernels_torch"}:
         module = getattr(gamfit, sub)

@@ -158,7 +158,7 @@
 //! `(n−M_p)/2·log D_p` and its first variation is `ΔD_p/(2φ̂)`.) The two
 //! penalty logdets have no `β̂`-dependence, so their Schur content is
 //! unchanged, and everything downstream — the `C ≻ 0` proof, per-coordinate
-//! `c_j`, the `Unidentified` typing, the value-domain falsification — is
+//! `c_j`, the `Unidentified` typing — is
 //! family-blind because none of it depends on how `C` was built. Gaussian
 //! identity is the `c ≡ 0` member: the rank-2 term vanishes identically and
 //! the form reduces to the REML one, which is the built-in exactness check.
@@ -168,6 +168,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::roundoff::accumulation_growth;
 use crate::model_types::FacePositivityRoute;
 use gam_terms::construction::CanonicalPenalty;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
@@ -213,9 +214,6 @@ pub struct RailFaceLimit {
     pub released_penalties: Vec<Array2<f64>>,
     /// `Qᵀg_c`: the limit score in the released directions.
     pub released_score: Array1<f64>,
-    /// Condition number of the `Z`-block solve that formed the Schur
-    /// complements. It is the error-amplifying step in building `C`.
-    pub form_conditioning: f64,
     /// Rigorous bound on `‖ΔC‖₂`, the floating-point error of the assembled
     /// form. With `γ_p = p·u/(1 − p·u)` (`u = ε/2`, `p` the coefficient
     /// dimension), every product and Schur solve that built `C` contributes
@@ -349,14 +347,6 @@ pub(crate) fn released_rank(matrix: &Array2<f64>) -> Result<usize, String> {
     Ok(values.len())
 }
 
-/// `γ_n = n·u/(1 − n·u)`, `u = ε/2`: the standard bound on the relative
-/// rounding error of an `n`-term floating-point inner product (Higham,
-/// *Accuracy and Stability*, §3.1).
-fn rounding_gamma(n: usize) -> f64 {
-    let nu = (n as f64) * 0.5 * f64::EPSILON;
-    nu / (1.0 - nu)
-}
-
 /// `½·tr(A⁻¹C)` for a symmetric positive-definite `A`, computed on `A`'s own
 /// spectrum so a near-singular `A` reports its failure instead of amplifying
 /// round-off through an explicit inverse.
@@ -426,8 +416,6 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
             .released_penalties
             .iter()
             .any(|a| a.iter().any(|v| !v.is_finite()))
-        || !limit.form_conditioning.is_finite()
-        || limit.form_conditioning < 1.0
     {
         return refuse("face limit data is not finite".to_string());
     }
@@ -450,7 +438,7 @@ pub(crate) fn certify_rail_face(limit: &RailFaceLimit) -> RailFaceVerdict {
     // (bounded on its operands, `form_error_bound`) plus the symmetric
     // eigensolver's own backward error `γ_q‖C‖` — Weyl moves every eigenvalue
     // by at most the norm of the perturbation.
-    let gamma_q = rounding_gamma(q);
+    let gamma_q = accumulation_growth(q);
     let curvature_band = limit.form_error_bound + gamma_q * form_norm;
     let positive_form = min_curvature > curvature_band;
 
@@ -759,7 +747,7 @@ impl OverlapFace<'_> {
     fn evaluate(&self, t: &[f64], with_gradients: bool) -> Result<OverlapPoint, String> {
         let q = self.q;
         let m = self.penalties.len();
-        let gamma_q = rounding_gamma(q);
+        let gamma_q = accumulation_growth(q);
         let mut pinned = Array2::<f64>::zeros((q, q));
         let mut weighted = Array2::<f64>::zeros((q, q));
         let mut any_pinned = false;
@@ -788,7 +776,7 @@ impl OverlapFace<'_> {
             }
             let top = range_values.iter().fold(0.0_f64, |acc, v| acc.max(*v));
             let gap = range_values.iter().fold(f64::INFINITY, |acc, v| acc.min(*v));
-            let perturbation = (gamma_q + (m as f64) * rounding_gamma(m + 1)) * top;
+            let perturbation = (gamma_q + (m as f64) * accumulation_growth(m + 1)) * top;
             (null, perturbation / gap)
         } else {
             (Array2::<f64>::eye(q), 0.0)
@@ -812,8 +800,8 @@ impl OverlapFace<'_> {
         // `M/(1+η) ≼ M̃ ≼ M/(1−η)`, so `|P̃ − P| ≤ ρP` with `ρ = η/(1−η)`.
         let conditioning = sigma_max / sigma_min;
         let arithmetic = gamma_q
-            + (m as f64) * rounding_gamma(m + 1)
-            + (q as f64 + 1.0) * rounding_gamma(q * q + q);
+            + (m as f64) * accumulation_growth(m + 1)
+            + (q as f64 + 1.0) * accumulation_growth(q * q + q);
         let eta = arithmetic * conditioning;
         // The leaked basis perturbs `M` by at most `2θ(1 + ‖A_free‖/σ_min)‖M‖`:
         // once through the outer `Q`, once through the reduced solve.
@@ -936,7 +924,7 @@ fn certify_overlapping_face(
     curvature_band: f64,
 ) -> Result<(f64, f64), String> {
     let m = overlap.penalties.len();
-    let gamma_m = rounding_gamma(m + 1);
+    let gamma_m = accumulation_growth(m + 1);
     let mut vertices: Vec<Vec<f64>> = Vec::new();
     let mut vertex_values: Vec<OverlapPoint> = Vec::new();
     let mut vertex_index: std::collections::HashMap<Vec<u64>, usize> =
@@ -1030,7 +1018,7 @@ fn certify_overlapping_face(
             let error = at_vertex.positive_error
                 + at_centroid.negative_error
                 + linear_error
-                + rounding_gamma(3)
+                + accumulation_growth(3)
                     * (at_vertex.positive + at_centroid.negative + linear.abs());
             lower = lower.min(bound);
             worst_error = worst_error.max(error);
@@ -1529,7 +1517,7 @@ fn assemble_face_limit(input: FaceLimitAssembly<'_>) -> RailFaceLimitOutcome {
     let drift_norm = released_curvature_drift
         .as_ref()
         .map_or(0.0, |drift_q| drift_q.dot(drift_q).sqrt());
-    let form_error_bound = rounding_gamma(k_matrix.nrows())
+    let form_error_bound = accumulation_growth(k_matrix.nrows())
         * ((frobenius(&k_matrix) + frobenius(&s_rest)) * (1.0 + form_conditioning)
             + score_norm * score_norm / dispersion
             + 2.0 * score_norm * drift_norm);
@@ -1545,7 +1533,6 @@ fn assemble_face_limit(input: FaceLimitAssembly<'_>) -> RailFaceLimitOutcome {
         first_order_form,
         released_penalties,
         released_score,
-        form_conditioning,
         form_error_bound,
         limit_beta,
         limit_dispersion: dispersion,
@@ -1900,7 +1887,6 @@ mod rail_face_tests {
             first_order_form: form,
             released_penalties: penalties,
             released_score: score,
-            form_conditioning: 1.0,
             form_error_bound: 0.0,
             limit_beta: Array1::zeros(0),
             limit_dispersion: 1.0,

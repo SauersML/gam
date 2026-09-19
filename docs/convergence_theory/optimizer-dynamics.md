@@ -444,7 +444,7 @@ SPEC classes: **C** cap, **F** fallback/retry, **M** magic constant, **B** box, 
 | `run.rs:4678` | GRADIENT_REPRODUCIBILITY_WIDENING=2 | M | band_g |
 | `run.rs:4937` | LARGE_STEP_DELTA=1 | M | delete |
 | `run.rs:5744`, `5757`, `5769` | ASYMPTOTE_* (rel tol 1e−4, 18 probes, δ 0.5) | M, D | delete; face certificate |
-| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | delete; exact f_w(0) with band_μ |
+| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | **deleted**: the analytic face proof mints rails with no value probe |
 | `run.rs:6417` | TAIL_SNAP_DRIFT_REL=1e−2 | M | delete |
 | `run.rs:6833`, `7114` | PROBE_DELTA=1.0 (FD tail probe) | D (SPEC violation) | delete |
 | `run.rs:6969` | PROBE_DOMAIN_MARGIN=1e−6 | M | delete |

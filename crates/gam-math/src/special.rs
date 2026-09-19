@@ -440,6 +440,19 @@ pub fn polygamma_stack(x: f64, orders: usize) -> [f64; 5] {
     crate::jet_tower::polygamma_positive_stack(x, orders)
 }
 
+/// `[ψ(x+½) − ψ(x), ψ₁(x+½) − ψ₁(x), …]` through the first `orders` entries (at
+/// most five), zero past them; for `x ≤ 0` or non-finite `x` those entries are
+/// `NaN`.
+///
+/// Each gap is accurate to a few ulps relative at every `x`, where the
+/// difference of two [`polygamma_stack`] values cancels: it keeps about seven
+/// digits of the digamma gap at `x = 2.5·10⁷`. Half-shifted polygamma gaps are
+/// the `ν`-derivatives of the Student-t normalizer `lgΓ((ν+1)/2) − lgΓ(ν/2)`.
+#[inline]
+pub fn polygamma_half_shift_gap_stack(x: f64, orders: usize) -> [f64; 5] {
+    crate::jet_tower::polygamma_half_shift_gap_stack(x, orders)
+}
+
 /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points, computed via
 /// Newton iteration on the Legendre-polynomial roots (Bonnet's three-term
 /// recurrence, cosine initial guess). Returns `(nodes, weights)` with nodes

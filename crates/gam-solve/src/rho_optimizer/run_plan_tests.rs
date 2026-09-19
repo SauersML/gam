@@ -43,12 +43,7 @@ fn certificate_attests_consistent_quadratic() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![2.0, 2.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![2.0, 2.0]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| {
@@ -192,7 +187,7 @@ fn analytic_hessian_candidate_screening_requires_only_first_order_evidence_2414(
 
     assert!(
         certified
-            .result()
+            .0
             .criterion_certificate
             .as_ref()
             .is_some_and(OuterCriterionCertificate::certifies),
@@ -226,12 +221,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0]);
     let mut obj = problem
         .build_objective(
             PilotState::default(),
@@ -293,16 +283,10 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 #[test]
 fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
-    let seed_config = gam_problem::SeedConfig {
-        max_seeds: 1,
-        seed_budget: 1,
-        ..Default::default()
-    };
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
         .with_initial_rho(array![1.5])
-        .with_seed_config(seed_config)
         .with_problem_size(8, 3);
     let config = problem.config();
 
@@ -355,18 +339,18 @@ fn terminal_certification_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "certification-baseline")
         .expect("baseline outer run");
-    let diagnosed =
-        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
+    let certified_result =
+        run_outer(&mut certified, &config, "certification-run").expect("certified outer run");
 
-    assert_eq!(baseline.rho, diagnosed.rho);
+    assert_eq!(baseline.rho, certified_result.rho);
     assert_eq!(
         baseline.final_value.to_bits(),
-        diagnosed.final_value.to_bits()
+        certified_result.final_value.to_bits()
     );
-    assert_eq!(baseline.iterations, diagnosed.iterations);
-    assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
+    assert_eq!(baseline.iterations, certified_result.iterations);
+    assert_eq!(baseline.final_grad_norm, certified_result.final_grad_norm);
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -382,12 +366,7 @@ fn certificate_flags_value_gradient_desync() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![1.0, 1.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![1.0, 1.0]);
     // eval(): a self-consistent but WRONG world (shifted center) so the
     // line search accepts steps and BFGS converges to wrong_center.
     // eval_cost(): the TRUE criterion value — the path the audit probes.
@@ -817,13 +796,7 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
             Array1::from_elem(1, -WRONG_RAIL_FACE),
             Array1::from_elem(1, WRONG_RAIL_FACE),
         )
-        .with_initial_rho(reseed)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(reseed);
     let mut recovery_obj = recovery_problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
@@ -852,12 +825,17 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
 /// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
 /// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes
 /// when it is already stationary at iteration 0. The route publishes no gradient
-/// parts, so the raw band is the `1e-12` tolerance.
+/// parts, so the raw band is the `1e-12` tolerance. It declares `n = 5000`
+/// observations, so the criterion resolution is `τ_stat = 1/(2n) = 1e-4`.
 fn audit_interior_with_dense_curvature(
     theta_hat: Array1<f64>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(5_000),
+            p_coefficients: Some(1),
+        },
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -1932,7 +1910,6 @@ fn closure_objective_delegates() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2033,7 +2010,6 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     }
@@ -2061,12 +2037,7 @@ fn writable_inner_seed_hook_does_not_authorize_off_target_evaluations() {
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(literal_seed.clone())
         .with_bounds(array![-8.0], array![8.0])
-        .with_max_iter(1)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_max_iter(1);
     let literal_for_cost = literal_seed.clone();
     let literal_for_eval = literal_seed.clone();
     let mut obj = problem
@@ -2135,13 +2106,7 @@ fn auxiliary_psi_is_never_synthetically_oversmoothed() {
         .with_psi_dim(1)
         .with_initial_rho(literal_seed.clone())
         .with_bounds(array![-8.0, -8.0], array![8.0, 8.0])
-        .with_max_iter(1)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            num_auxiliary_trailing: 1,
-            ..Default::default()
-        });
+        .with_max_iter(1);
     let literal_for_cost = literal_seed.clone();
     let literal_for_eval = literal_seed.clone();
     let mut obj = problem
@@ -2243,7 +2208,6 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2257,7 +2221,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2324,7 +2288,6 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2338,7 +2301,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2416,7 +2379,6 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2430,7 +2392,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2495,7 +2457,6 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2509,7 +2470,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2886,7 +2847,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -2951,7 +2912,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3025,7 +2986,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3083,7 +3044,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3116,12 +3077,11 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// negative curvature, and once a PSD improving iterate replaces the saddle as
 /// best, the next filled window certifies THAT point.
 /// A configuration whose certificate band is exactly `band` at every criterion
-/// value: the absolute tolerance with no point-anchored relative widening. The guard judges a stall's claim by the certificate's band
+/// value: the absolute tolerance. The guard judges a stall's claim by the certificate's band
 /// (#2817), so a guard fixture that means "stationary below `band`" builds this.
 fn claim_band_config(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
-        rel_cost_tolerance: Some(0.0),
         ..OuterConfig::default()
     }
 }
@@ -3334,7 +3294,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3403,7 +3363,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3483,7 +3443,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3566,7 +3526,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3673,7 +3633,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -4443,7 +4403,8 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_tolerance(1.0e-10);
+        .with_tolerance(1.0e-10)
+        .with_problem_size(1_000, 1);
     let config = problem.config();
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -5316,62 +5277,6 @@ fn finite_outer_eval_reports_gradient_length_mismatch() {
     );
 }
 
-#[test]
-fn run_with_initial_seed_still_considers_generated_candidates() {
-    let generated =
-        crate::seeding::generate_rho_candidates(
-            1,
-            None,
-            &gam_problem::SeedConfig::default(),
-            gam_problem::OrderedRhoBounds::new(-12.0, 12.0).expect("fixture seed domain"),
-        );
-    let valid_seed = generated
-        .first()
-        .expect("seed generator should yield at least one candidate")
-        .clone();
-    let expected_seed = valid_seed.clone();
-    let initial_seed = array![9.0];
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    let problem = OuterProblem::new(1)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_seed_config(seed_config)
-        .with_initial_rho(initial_seed)
-        .with_max_iter(1);
-    let mut obj = problem.build_objective(
-        (),
-        {
-            let valid_seed = valid_seed.clone();
-            move |_: &mut (), theta: &Array1<f64>| {
-                if theta == valid_seed {
-                    Ok(0.0)
-                } else {
-                    Ok(f64::INFINITY)
-                }
-            }
-        },
-        move |_: &mut (), theta: &Array1<f64>| {
-            if theta == valid_seed {
-                Ok(OuterEval {
-                    cost: 0.0,
-                    gradient: Array1::zeros(1),
-                    hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
-                })
-            } else {
-                Ok(OuterEval::infeasible(theta.len()))
-            }
-        },
-        None::<fn(&mut ())>,
-        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
-    let result = problem
-        .run(&mut obj, "generated seed should remain reachable")
-        .expect("generated seed should still be eligible when an initial seed is provided");
-    assert_eq!(result.rho, expected_seed);
-}
-
 #[derive(Clone, Copy)]
 enum ReactiveDomainMode {
     FiniteAtColdSeed,
@@ -5569,11 +5474,6 @@ fn run_reactive_domain_fixture(
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(array![SEED])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .with_max_iter(4);
     let mut objective = ReactiveDomainObjective::new(SEED, mode);
     let result = problem.run(&mut objective, "reactive-domain-entry fixture");
@@ -5726,14 +5626,6 @@ fn model_upper_mask_audit_eager_eval(
     )
 }
 
-fn one_seed_config() -> gam_problem::SeedConfig {
-    gam_problem::SeedConfig {
-        max_seeds: 1,
-        seed_budget: 1,
-        ..Default::default()
-    }
-}
-
 fn record_other_model_upper_bound(upper: f64) {
     let other_model = OuterConfig {
         model_domain_bounds: Some((array![-10.0], array![upper])),
@@ -5751,9 +5643,7 @@ fn lower_model_rail_singleton_search_preserves_derivative_in_screening_and_mint_
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(array![-5.0], array![5.0])
-        .with_initial_rho(array![-5.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(one_seed_config());
+        .with_initial_rho(array![-5.0]);
     let mut objective = problem.build_objective_with_eval_order(
         ModelUpperMaskAudit::default(),
         model_upper_mask_audit_cost,
@@ -5864,9 +5754,7 @@ fn model_upper_rail_masks_derivative_in_screening_and_mint_2514() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(array![-5.0], array![5.0])
-        .with_initial_rho(array![5.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(one_seed_config());
+        .with_initial_rho(array![5.0]);
     let mut objective = problem.build_objective_with_eval_order(
         ModelUpperMaskAudit::default(),
         model_upper_mask_audit_cost,
@@ -5967,11 +5855,6 @@ fn custom_box_and_seed_are_intersected_with_both_objective_faces() {
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-1_000.0], array![1_000.0])
         .with_initial_rho(array![-900.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .with_max_iter(1);
     let mut objective = ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
     drop(problem.run(&mut objective, "two-sided objective-domain intersection"));
@@ -6114,95 +5997,6 @@ fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
     );
 }
 
-/// #2080 — the continuation's COLD ENTRY leg is a constant of the problem, so
-/// the seed cascade must evaluate it ONCE, not once per seed.
-///
-/// `ContinuationPath::step` pins the entering leg at `s = 1`, and `s = 1` is
-/// bitwise the legal upper box for rho and the contract's literal entry state
-/// for the scalars (`literal_endpoint_bits_survive_without_affine_rounding`
-/// pins the rho half); the walk is opened with an empty warm start. None of the
-/// three depends on the seed, so if that leg refuses for one seed it refuses
-/// identically for every other one. Measured on the real fixture before this
-/// gate existed (#2599's K=2 determinism test): four attempts, 247 of 248 log
-/// lines byte-identical across the seed blocks, the sole difference being the
-/// seed index in the refusal message — 1577 s of wall spent replaying one
-/// evaluation.
-///
-/// `NeverOpens` never establishes finite evidence, so every walk dies on the
-/// entering leg and each walk installs exactly one scalar state: the entry one.
-/// Counting those installs therefore counts WALKS, which is the quantity this
-/// change is about. The test also pins what must NOT change — every seed is
-/// still attempted, still rejected, still individually reported — so a future
-/// edit cannot satisfy the count by shortening the cascade instead.
-#[test]
-fn cold_entry_leg_is_evaluated_once_across_the_whole_seed_cascade_2080() {
-    const SEED: f64 = 0.125;
-    let problem = OuterProblem::new(1)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![SEED])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 4,
-            ..Default::default()
-        })
-        .with_max_iter(4);
-    let mut objective = ReactiveDomainObjective::new(SEED, ReactiveDomainMode::NeverOpens);
-    let error = problem
-        .run(&mut objective, "cold-entry replay fixture")
-        .expect_err("a path that never establishes finite evidence must still refuse");
-    let message = error.to_string();
-
-    // Read the seed count off the refusal rather than assuming the generator
-    // honoured `max_seeds`. If only one seed was ever attempted there is no
-    // cross-seed replay to observe and this test would be asserting nothing.
-    let generated = message
-        .split_once("generated=")
-        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<usize>().ok())
-        .unwrap_or_else(|| panic!("refusal must report a seed count; got: {message}"));
-    assert!(
-        generated >= 2,
-        "this fixture needs at least two generated seeds to test cross-seed replay, \
-         but the cascade generated {generated}; refusal: {message}"
-    );
-
-    let contract = ReactiveDomainObjective::scalar_contract();
-    let entry_installs = objective
-        .installed_scalar_states
-        .iter()
-        .filter(|state| state.bitwise_eq(contract.entry()))
-        .count();
-    assert_eq!(
-        entry_installs, 1,
-        "the cold entry waypoint is seed-independent, so {generated} seeds must share ONE \
-         evaluation of it; the cascade installed the entry scalar state {entry_installs} times"
-    );
-
-    // Coverage that must survive the deduplication: every seed is still
-    // attempted and still refused on its own line, and no seed reaches the
-    // solver on the strength of a replayed verdict.
-    assert_eq!(
-        objective.derivative_evals, 0,
-        "the outer solver must not start without finite exact-seed evidence"
-    );
-    let replays = message.matches("(replayed:").count();
-    assert_eq!(
-        replays,
-        generated - 1,
-        "every seed after the first must be answered by the recorded entry verdict; \
-         got {replays} replays for {generated} seeds. Refusal: {message}"
-    );
-    assert!(
-        message.contains("reactive domain entry refused"),
-        "the replayed verdict must still be the typed entry refusal: {message}"
-    );
-    assert!(
-        objective.checkpoint_domain_open.is_none(),
-        "typed refusal must not leak an active waypoint transaction"
-    );
-}
-
 /// #979: the generic gradient-residue floor and a caller's strict local-minimum
 /// requirement answer different questions. A floor-cleared raw negative Hessian
 /// may mint for a generic objective, but must not satisfy a mode selector that
@@ -6299,12 +6093,9 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
 
 #[test]
 fn run_indefinite_analytic_seed_stays_on_arc_and_its_declared_curvature_is_measured() {
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![0.0])
         .with_max_iter(1);
     let mut obj = problem.build_objective(
@@ -6395,12 +6186,9 @@ fn run_seed_materialization_failure_surfaces_arc_error_verbatim() {
     // verbatim — there is no lateral demote to BFGS+BfgsApprox that would
     // silently discard the analytic outer Hessian, and no budget retry
     // (#2817). Hence the runner returns the original Err.
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![0.0])
         .with_max_iter(1);
     let mut obj = problem.build_objective(
@@ -6443,29 +6231,19 @@ fn run_nonconverged_arc_returns_typed_checkpoint_without_a_budget_retry() {
     // We use a quartic `cost = SCALE·(x − OFFSET)^4` from `initial_rho = [5.0]`
     // with `max_iter = 1`, which no seed can finish.
     //
-    // OFFSET is what makes the subject reachable, and it is not cosmetic. The
-    // seed budget bounds how many seeds are STARTED SPECULATIVELY, not how many
-    // may be tried: `should_start_next_seed` keeps going while no candidate has
-    // certified, because a fit whose budgeted seeds all fail should try the rest
-    // rather than refuse. So with a plain `x^4` the cascade walks past the
-    // exhausted `[5.0]` ladder to the always-injected neutral baseline `[0.0]`,
-    // which is the EXACT global minimum of `x^4` — it certifies at iteration 0,
-    // the run returns `Ok`, and the refusal this test exists to observe never
-    // happens. Putting the optimum at ½ leaves it stationary at NO
-    // generated candidate (they are integers), so every seed exhausts its budget
-    // and the runner must produce the typed checkpoint. SCALE keeps the residual
-    // gradient far above the stationarity band after the cascade, so the verdict
-    // cannot turn on how close a seed happened to land.
+    // The search runs from its one start `[5.0]`; there is no further seed to
+    // fall back on. OFFSET puts the optimum at ½ so no integer start (including
+    // the neutral baseline `[0.0]` a derived start would pick) is the exact
+    // minimum and certifies at iteration 0; the single budgeted iteration must
+    // exhaust and the runner must produce the typed checkpoint. SCALE keeps the
+    // residual gradient far above the stationarity band after that iteration,
+    // so the verdict cannot turn on how close the step happened to land.
     const OFFSET: f64 = 0.5;
     const SCALE: f64 = 1.0e6;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![5.0])
         .with_max_iter(1)
         .with_cache_session(Arc::clone(&session));
@@ -6502,11 +6280,10 @@ fn run_nonconverged_arc_returns_typed_checkpoint_without_a_budget_retry() {
     );
 }
 
-// The seed cascade: keep-best / parsimony ranking, Gaussian multistart,
-// expensive-seed screening and its cap ladder, the seed budget, and seed
-// projection before validation. Split out for the source-file length budget.
-#[path = "run_plan_seed_cascade_tests.rs"]
-mod run_plan_seed_cascade_tests;
+// The one derived outer start: a single trajectory, the start's provenance, and
+// seed projection before validation. Split out for the source-file length budget.
+#[path = "run_plan_single_start_tests.rs"]
+mod run_plan_single_start_tests;
 
 // #2953: the typed refusal that reports a declined certified optimum, and the continuation
 // that publishes in its place.
@@ -6558,7 +6335,7 @@ mod run_plan_stopped_run_2953_tests;
 /// custom-family effective-df ceiling once emitted an upper bound below
 /// `rho_lower_bound`, inverting the box, and `f64::clamp(min, max)` with
 /// `min > max` then panicked inside `project_to_bounds` and escaped as an opaque
-/// "panicked inside Rust boundary" `GamError` across the FFI. The projection no
+/// "panicked inside Rust boundary" `GamfitError` across the FFI. The projection no
 /// longer panics, so an inverted box would instead place seeds outside it; the
 /// runner rejects any such box up front, before a seed is projected against it.
 #[test]
@@ -6569,12 +6346,7 @@ fn inverted_rho_box_is_a_typed_error_not_a_clamp_panic_2370() {
         .with_initial_rho(array![0.0])
         // lower (-10) strictly ABOVE upper (-11.855…): the exact inversion the
         // effective-df ceiling produced for a binomial flexible_link fit.
-        .with_bounds(array![-10.0], array![-11.855421824787882])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_bounds(array![-10.0], array![-11.855421824787882]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
@@ -6612,12 +6384,7 @@ fn pinned_equal_rho_bounds_are_accepted_2370() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(array![2.0])
-        .with_bounds(array![2.0], array![2.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_bounds(array![2.0], array![2.0]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),

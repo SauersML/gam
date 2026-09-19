@@ -3849,7 +3849,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // plateau-flat-objective convergence certificate in the inner-cycle
     // body now handles that case directly, so the cap stays fixed at the
     // baseline for the lifetime of this outer call.
-    let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
+    let inner_max_cycles = inner_max_cycles_base.max(1);
     // Each block's assembled penalty matrix depends only on that block's
     // penalties and smoothing parameters. Build these setup matrices in
     // parallel, but keep the coordinate-descent and line-search loops below
@@ -3980,7 +3980,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 None
             };
             let mut cached_mode_acceptable = true;
-            let mut certified_workspace = cached.joint_workspace.clone();
+            let mut certified_workspace = None;
             if has_joint_exacthessian {
                 match exact_joint_mode_curvature_certificate(
                     family,
@@ -4579,6 +4579,22 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             let predicted_reduction = alpha_accepted * rhs_dot_delta
                 - 0.5 * alpha_accepted * alpha_accepted * delta_dot_hpen;
             let actual_reduction = obj_before_block - objective_cycle_prev;
+            // What comparing the two block objectives accumulates, so the
+            // controller's rejection override is judged against the rounding
+            // this evaluation can carry (gam#2977 S2). Only this block's
+            // penalty moved; the other blocks' penalty values enter through
+            // the objective magnitudes.
+            let (_, old_block_penalty_accumulation) =
+                block_quadratic_penalty_with_accumulation(&beta_old, s_lambda);
+            let (_, trial_block_penalty_accumulation) =
+                block_quadratic_penalty_with_accumulation(&states[b].beta, s_lambda);
+            let block_accumulation = ObjectiveAccumulation::between_endpoints(
+                spec.solver_design().nrows(),
+                s_lambda.len(),
+                [obj_before_block, objective_cycle_prev],
+                [old_block_penalty_accumulation, trial_block_penalty_accumulation],
+                [0.0, 0.0],
+            );
             let trust_update = update_joint_trust_region_radius(
                 block_max_step[b],
                 alpha_accepted * step_metric_norm,
@@ -4595,6 +4611,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 // measured", which leaves this site byte-identical — and with
                 // nothing measured the residual flag cannot be consulted.
                 0.0,
+                block_accumulation.roundoff_ceiling(),
                 false,
             );
             block_max_step[b] = trust_update.radius;
