@@ -307,18 +307,6 @@ pub(crate) enum SmoothingCorrectionStatus {
 pub(crate) const FIRTH_OUTER_HESSIAN_NOT_ANALYTIC: &str =
     "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only";
 
-/// The structural refusal of the outer ρ-Hessian once the #784 block-local
-/// correction is latched into the criterion: `Δ_b` is spliced with its exact
-/// ρ-gradient but no ρ-Hessian, so the corrected search ran on BFGS and no
-/// analytic ρ-Hessian exists at its end. `compute_lamlhessian_consistent`
-/// refuses with exactly this text and the smoothing correction maps it to
-/// [`SmoothingCorrectionUnavailable::OuterHessianNotAnalytic`], as for
-/// [`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`]. Inverting the Laplace Hessian without
-/// `∂²Δ_b` instead reads the missing curvature as a contradiction of the
-/// criterion and refuses the fit.
-pub(crate) const BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC: &str =
-    "the latched #784 block-local correction has no analytic outer rho-Hessian";
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SmoothingCorrectionUnavailable {
     ObjectiveInnerHessian {
@@ -335,9 +323,8 @@ pub(crate) enum SmoothingCorrectionUnavailable {
         error: String,
     },
     /// The outer ρ-Hessian has no analytic form for this fit — a
-    /// non-canonical Firth link, or a latched #784 block correction, whose
-    /// outer search ran on BFGS (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`,
-    /// `BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC`). Structural and expected, not a
+    /// non-canonical Firth link, whose outer search ran on BFGS
+    /// (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`). Structural and expected, not a
     /// numerical failure: the caller ships the conditional covariance and
     /// labels the correction absent.
     OuterHessianNotAnalytic {
@@ -1840,9 +1827,7 @@ pub(crate) fn compute_smoothing_correction(
         Ok(h) => h,
         Err(err) => {
             let message = err.to_string();
-            let reason = if message.contains(FIRTH_OUTER_HESSIAN_NOT_ANALYTIC)
-                || message.contains(BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC)
-            {
+            let reason = if message.contains(FIRTH_OUTER_HESSIAN_NOT_ANALYTIC) {
                 log::debug!(
                     "LAML Hessian is not analytic for this fit ({}); the smoothing correction \
                      is typed-unavailable.",

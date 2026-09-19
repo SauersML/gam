@@ -5516,12 +5516,15 @@ pub(crate) enum BlockCorrectionDecision {
 /// rule over the whole block. Beside them sit the paired-rule errors measured
 /// at that admission: the certificate every later evaluation at those orders
 /// carries, since the paired error no longer switches anything once the
-/// orders are latched (#2748).
+/// orders are latched (#2748). `hessian_refusal` is the mathematical reason
+/// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
+/// correction carries its exact ρ-Hessian into the criterion.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
+    pub(crate) hessian_refusal: Option<String>,
 }
 
 pub(crate) struct RemlState<'a> {

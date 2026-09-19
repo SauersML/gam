@@ -158,15 +158,24 @@ impl<'a> RemlState<'a> {
         *self.block_correction_decision_guard() = BlockCorrectionDecision::DeferredToOptimum;
     }
 
-    /// Whether the #784 correction is latched into this fit's criterion. Its
-    /// value and exact ρ-gradient are spliced, but `Δ_b` has no analytic
-    /// ρ-Hessian, so a latched criterion declares none: the search continues on
-    /// BFGS curvature and the smoothing correction is typed-unavailable, as for
-    /// a non-canonical Firth link.
-    pub(crate) fn block_correction_latched(&self) -> bool {
-        self.block_correction_admission
+    /// Why the latched #784 correction has no closed-form ρ-Hessian on this
+    /// fit, or `None` when it is not latched or carries its exact ρ-Hessian
+    /// (`block_correction_hessian`). A criterion with a refused Hessian declares
+    /// none: its search runs on BFGS curvature and its smoothing-corrected
+    /// covariance refuses with this reason.
+    pub(crate) fn block_correction_hessian_refusal(&self) -> Option<String> {
+        if self
+            .block_correction_admission
             .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
+            == 0
+        {
+            return None;
+        }
+        self.block_correction_axis_orders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|latch| latch.hessian_refusal.clone())
     }
 
     pub(crate) fn block_correction_admission_deferred(&self) -> bool {
@@ -678,6 +687,16 @@ impl<'a> RemlState<'a> {
                 },
             });
         }
+        // Whether `Δ_b` has a closed-form ρ-Hessian on this fit, and how its row
+        // curvature is read off the mode. It reads only the family, the link,
+        // the inner solve's curvature contract and the latched block shape, so
+        // it is one answer for the whole fit.
+        let hessian_support = super::block_correction_hessian::block_correction_row_curvature(
+            pirls_result,
+            &target.inverse_link,
+            axis_split,
+            m,
+        );
 
         // Integrate each piece and contract its moments into the gradient
         // channels at once, so one axis target (and its moments) is alive at a
@@ -741,17 +760,22 @@ impl<'a> RemlState<'a> {
         let x = x_dense.as_ref();
         // Φ and its derivatives in the whitened block coordinates
         // a_i = Λ^{-1/2} V_bᵀ x_i.
-        let mixed = if axis_split {
-            let (c_obs, d_obs, e_obs) = self.hessian_cde_arrays(pirls_result)?;
-            let mut whitened = x.dot(&target.block_vecs);
-            for r in 0..m {
-                let scale = target.block_lambdas[r].sqrt().recip();
-                whitened.column_mut(r).mapv_inplace(|v| v * scale);
-            }
-            let term = mixed_axis_laplace_term(whitened.view(), &c_obs, &d_obs, &e_obs);
-            Some((term, whitened))
+        let curvature_derivatives = if axis_split || hessian_support.is_ok() {
+            Some(self.hessian_cde_arrays(pirls_result)?)
         } else {
             None
+        };
+        let mixed = match (axis_split, curvature_derivatives.as_ref()) {
+            (true, Some((c_obs, d_obs, e_obs))) => {
+                let mut whitened = x.dot(&target.block_vecs);
+                for r in 0..m {
+                    let scale = target.block_lambdas[r].sqrt().recip();
+                    whitened.column_mut(r).mapv_inplace(|v| v * scale);
+                }
+                let term = mixed_axis_laplace_term(whitened.view(), c_obs, d_obs, e_obs);
+                Some((term, whitened))
+            }
+            _ => None,
         };
 
         let delta_b = pieces.iter().map(|piece| piece.quadrature.value).sum::<f64>()
@@ -823,18 +847,27 @@ impl<'a> RemlState<'a> {
 
         // Latch the admission on the first evaluation that reaches here with
         // every gate cleared. Everything below this point splices, so this is
-        // the exact boundary of "the correction is part of this model".
+        // the exact boundary of "the correction is part of this model". An
+        // admission latched without its quadrature (a caller that fixed the
+        // block dimension) latches the quadrature here, so the criterion's
+        // Hessian declaration reads this fit's own answer.
+        {
+            let mut latch = self
+                .block_correction_axis_orders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if latched_block_dim.is_none() || latch.is_none() {
+                *latch = Some(BlockQuadratureLatch {
+                    axis_orders: axis_orders.clone(),
+                    axis_quadrature_errors: axis_quadrature_errors.clone(),
+                    axis_split,
+                    hessian_refusal: hessian_support.as_ref().err().cloned(),
+                });
+            }
+        }
         if latched_block_dim.is_none() {
             self.block_correction_admission
                 .store(m + 1, std::sync::atomic::Ordering::Relaxed);
-            *self
-                .block_correction_axis_orders
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(BlockQuadratureLatch {
-                axis_orders: axis_orders.clone(),
-                axis_quadrature_errors: axis_quadrature_errors.clone(),
-                axis_split,
-            });
             let mut decision = self.block_correction_decision_guard();
             if *decision == BlockCorrectionDecision::DecidingAtOptimum {
                 *decision = BlockCorrectionDecision::AdmittedAtOptimum;
@@ -1027,6 +1060,51 @@ impl<'a> RemlState<'a> {
                 g_mat[(q, jr)] = r_tilde[(q, jr)] / gap;
             }
         }
+
+        // The exact ρ-Hessian of `−Δ_b` on the same eigensystem, nodes and
+        // mode: every pair is resolved above, so the eigenframe is twice
+        // differentiable here. A fit whose `Δ_b` has no closed-form Hessian
+        // declares none (`BlockQuadratureLatch::hessian_refusal`), and its
+        // smoothing-corrected covariance refuses with that reason.
+        let cost_hessian = match (&hessian_support, curvature_derivatives.as_ref()) {
+            (Ok(curvature), Some((c_obs, d_obs, e_obs))) => {
+                let fourth = if axis_split {
+                    Some(super::block_correction_hessian::curvature_fourth_derivative(
+                        pirls_result,
+                        &target.inverse_link,
+                        &target.prior_weights,
+                        e_obs,
+                    )?)
+                } else {
+                    None
+                };
+                let second_order = super::block_correction_hessian::block_correction_cost_hessian(
+                    &target,
+                    &super::block_correction_hessian::BlockCorrectionHessianInputs {
+                        curvature: *curvature,
+                        axis_split,
+                        axis_orders: &axis_orders,
+                        evals: &evals,
+                        evecs: &evecs,
+                        block_cols: &block_cols,
+                        c: c_obs,
+                        d: d_obs,
+                        e_f: fourth.as_ref().map(|f| (e_obs, f)),
+                    },
+                )?;
+                log::trace!(
+                    "[#784] ρ-Hessian pieces V={:?} (quadrature {:?}), Φ={:?}",
+                    second_order.piece_values,
+                    pieces
+                        .iter()
+                        .map(|piece| piece.quadrature.value)
+                        .collect::<Vec<_>>(),
+                    second_order.mixed_value,
+                );
+                Some(second_order)
+            }
+            _ => None,
+        };
         let q_c_raw = evecs.dot(&g_mat).dot(&target.block_vecs.t()); // p × p
         let mut q_mat = 0.5 * (&q_c_raw + &q_c_raw.t());
         for jr in 0..m {
@@ -1058,64 +1136,11 @@ impl<'a> RemlState<'a> {
         let mut audit_mode: Vec<f64> = Vec::new();
         let mut audit_spliced: Vec<f64> = Vec::new();
 
-        // WARNING (#2623) -- READ THIS BEFORE CHANGING THE SIGN IN THIS LOOP.
-        //
-        // The convention of the four channels is NOT settled by the contract
-        // comment above, which is self-inconsistent. The authoritative
-        // statement is on the type, in gam-problem laplace_sampler_contract:
-        //
-        //     value:        Delta_b            added to the block marginal
-        //                                      log-likelihood, SUBTRACTED
-        //                                      from the REML/LAML cost
-        //     rho_gradient: d(Delta_b)/d(rho)  explicit channel (a) ONLY
-        //
-        // So channel (a) is PLUS quadrature.rho_gradient, not its negation, and a
-        // sum of four Delta_b-side channels is d(Delta_b)/d(rho), not
-        // d(cost)/d(rho). The formula above labels its left side d(cost)/d(rho)
-        // while listing (a) in Delta_b-side form, and separately calls the
-        // NEGATION of quadrature.rho_gradient channel (a). A Delta_b-side term
-        // cannot appear unnegated in a cost-side total, so the label, the terms
-        // and the type contract cannot all three be right.
-        //
-        // What is settled: value is PLUS Delta_b, confirmed independently by
-        // block_quadrature_marginal_recovers_analytic_quartic_correction, which
-        // checks it against a 20001-point trapezoid reference and asserts it is
-        // negative for an added quartic penalty. So the value: -delta_b
-        // below is correct.
-        //
-        // What is OPEN: whether trace_j and mode_j below are Delta_b-side or
-        // cost-side. The two readings differ by exactly 2*(trace_j + mode_j),
-        // which #2623 measures at about 9.65 on a fold where the true slope is
-        // a three-way near-cancellation and each channel is 25-30x the sum. So
-        // the wrong reading does not perturb the search, it INVERTS it: an
-        // outer gradient of +9.4547 AT the cost minimum, Wolfe failure, and 178
-        // evaluations at one theta.
-        //
-        // DO NOT resolve this by reading, in either direction. It is decided by
-        // giving the typed rho-block audit (enable_rho_outer_audit, #2454) a row
-        // whose fixture ASSERTS the #784 splice engaged, then comparing each
-        // channel against finite differences separately. The existing FD guard
-        // cannot see it: both of its rows are deliberately well-behaved, so the
-        // splice declines and trace_j and mode_j are never exercised at all.
-        //
-        // MEASURED (#2623), and the answer is NEITHER SIGN. The channel record
-        // published below drove the #2623 probe, which finite-differenced Delta_b
-        // itself on fixtures where the splice
-        // engages. On two well-conditioned cells whose importance sampler is
-        // essentially exact (ESS 507.9/512 and 500.1/512) the FD reference is
-        // stable to six digits over h from 3e-4 to 3e-3, and the envelope
-        // channels agree with it to 1e-7 relative -- so the stencil is sound.
-        // Against that reference the three channels below match at no sign
-        // assignment. The four measured ratios of the shipped line to the truth
-        // are 0.84, -1.40, -1.43 and -17.4; for the proposed flip they are -12.1,
-        // 4.36, 8.88 and 27.8. Decisively, WHICH sign is closer changes between
-        // the two rho coordinates of a SINGLE evaluation, and no global sign
-        // convention can do that. So this is a wrong contraction, not a wrong
-        // sign, and flipping it exchanges one wrong gradient for another -- which
-        // is also what the flip measured end-to-end. The residual total gradient
-        // error is 1e-4 to 1.3e-1 relative in these mild regimes and INVERTS the
-        // search on the #2623 fold, where the true slope is a three-way
-        // near-cancellation.
+        // Every channel is on the cost side: `gradient[j]` is ∂(−Δ_b)/∂ρ_j, the
+        // derivative of the `value: −Δ_b` this function returns. The engaged
+        // finite-difference rows in `regression_block_correction_outer_hessian_fd`
+        // pin the total against cost differences on single- and multi-axis blocks
+        // (#2623).
         let mut gradient = Array1::<f64>::zeros(n_rho + n_ext);
         for j in 0..n_rho {
             let lam_j = target.lambdas[j];
@@ -1123,15 +1148,12 @@ impl<'a> RemlState<'a> {
             // v_j = H⁻¹ a_j through the same eigendecomposition as Q.
             let uta = evecs.t().dot(&a_j);
             let v_j = evecs.dot(&(&uta / &evals));
-            // tr(A_j Q) = λ_j Σ_c (S_j Q[:,c])_c.
-            let mut tr_sq = 0.0_f64;
-            for c in 0..p {
-                let s_col = transformed_penalty_matvec(
-                    &target.penalties[j],
-                    &q_mat.column(c).to_owned(),
-                );
-                tr_sq += s_col[c];
-            }
+            // tr(A_j Q) = λ_j tr(S_j Q), over the penalty's own block. `S_j` acts
+            // on a direction here, so the prior mean the score is centred on
+            // does not enter.
+            let penalty = &target.penalties[j];
+            let range = penalty.col_range.clone();
+            let tr_sq = (&penalty.local * &q_mat.slice(ndarray::s![range.clone(), range])).sum();
             // tr(C[v_j] Q) = Σ_i c_i (X v_j)_i rowq_i.
             let xv_j = gam_linalg::faer_ndarray::fast_av(x, &v_j);
             let mut tr_cq = 0.0_f64;
@@ -1166,10 +1188,17 @@ impl<'a> RemlState<'a> {
                 },
             );
         }
+        if let Some(second_order) = cost_hessian.as_ref() {
+            log::trace!(
+                "[#784] ρ-gradient spliced {:?} against the Hessian's own {:?}",
+                gradient,
+                second_order.implied_gradient,
+            );
+        }
         Ok(TkCorrectionTerms {
             value: -delta_b,
             gradient: Some(gradient),
-            hessian: None,
+            hessian: cost_hessian.map(|second_order| second_order.hessian),
         })
     }
 }
@@ -1279,7 +1308,7 @@ fn block_target_channel_moments(
 
 /// The block target restricted to its axis `r`: the same excess `ΔF`, with the
 /// displacement confined to the block eigenvector `u_r` and its curvature `λ_r`.
-fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784BlockTarget<'t> {
+pub(super) fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784BlockTarget<'t> {
     Gam784BlockTarget {
         x_transformed: target.x_transformed,
         block_vecs: target
@@ -1307,12 +1336,12 @@ fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784Bloc
 }
 
 /// The mixed-axis second-order Laplace term `Φ` and its derivatives.
-struct MixedAxisLaplaceTerm {
-    value: f64,
+pub(super) struct MixedAxisLaplaceTerm {
+    pub(super) value: f64,
     /// `∂Φ/∂a_i`, row `i` (n × m).
-    a_gradient: Array2<f64>,
+    pub(super) a_gradient: Array2<f64>,
     /// `∂Φ/∂η_i` at fixed `a_i`, through `(c_i, d_i)(η_i)` (n).
-    eta_gradient: Array1<f64>,
+    pub(super) eta_gradient: Array1<f64>,
 }
 
 /// The part of the second-order Laplace expansion of a block marginal that no
@@ -1340,7 +1369,7 @@ struct MixedAxisLaplaceTerm {
 ///             + (1/6) d_i T(a_i, a_i, a_i) − (5/12) d_i Σ_r T_rrr a_ir³.
 ///
 /// The cost is O(n·m³).
-fn mixed_axis_laplace_term(
+pub(super) fn mixed_axis_laplace_term(
     a: ndarray::ArrayView2<'_, f64>,
     c: &Array1<f64>,
     d: &Array1<f64>,
