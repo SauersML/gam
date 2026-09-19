@@ -1948,29 +1948,18 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
     }
 
-    /// Dimension-based scale `√(n+1) · √p` for the structural KKT bound, with
-    /// `n+1` counting the appended test row. Matches `kkt_dimension_scale` in
-    /// the main P-IRLS state: under standardized columns the augmented score
-    /// `Xᵀ(μ − y)` has components of order O(√(n+1)), so an absolute
-    /// `‖g‖ < τ` test becomes systematically too tight as `n` grows. This
-    /// scaling restores the advertised per-observation meaning of `τ`.
-    fn kkt_dimension_scale(&self) -> f64 {
-        (((self.n + 1) as f64).sqrt()) * ((self.p as f64).max(1.0).sqrt())
-    }
-
     /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
     /// the `WorkingState::certifies_kkt` certificate the engine's main solver
-    /// uses: the iterate certifies stationarity at tolerance `tol` under
-    /// EITHER the dimension-scaled absolute bound OR the data-driven
-    /// natural-scale relative bound. The earlier predicate compared the
-    /// PRECONDITIONED Newton step `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose
-    /// floating-point floor is `~ε·(n+1)/λ_min(H)` — n-dependent and not
-    /// compensated by `(1 + ‖β‖)`, so genuinely-converged fits (e.g. raw
-    /// gradient floor `3.6e-8` at moderate n) were rejected as non-converged.
+    /// uses: the dimensionless residual `‖g‖ / (‖score‖ + ‖S·β‖)` is below
+    /// `tol`. The earlier predicate compared the PRECONDITIONED Newton step
+    /// `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose floating-point floor is
+    /// `~ε·(n+1)/λ_min(H)` — n-dependent and not compensated by `(1 + ‖β‖)`,
+    /// so genuinely-converged fits (e.g. raw gradient floor `3.6e-8` at
+    /// moderate n) were rejected as non-converged.
     fn kkt_converged(&self, beta: &Array1<f64>, z: f64, tol: f64) -> bool {
         let g_norm = vec_norm(&self.penalized_score(beta, z));
-        g_norm < tol * self.kkt_dimension_scale()
-            || g_norm / (1.0 + self.gradient_natural_scale(beta, z)) < tol
+        gam_solve::pirls::relative_gradient_residual(g_norm, self.gradient_natural_scale(beta, z))
+            < tol
     }
 
     /// Augmented penalized NLL (line-search merit function).
