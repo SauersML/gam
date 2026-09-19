@@ -10,7 +10,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let mut y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);
     let mut inference_notes = FitNotes::default();
-    let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
+    let weights = resolve_fit_weight_column(data, col_map, config.weight_column.as_deref())?;
     reject_too_few_rows_for_formula(parsed, weights.view())?;
 
     let noise_formula = config

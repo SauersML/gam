@@ -1,0 +1,5 @@
+[6s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.9679e3). This indicates a numerical instability.
+[6s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.8363e3). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.9343e3). This indicates a numerical instability.
+[9s] [GAM COST]   -> P-IRLS INNER LOOP FAILED. Error: Hessian matrix is not positive definite (minimum eigenvalue: -2.8881e3). This indicates a numerical instability.
+max |eta - (b0 + sum pdep)| = 8.881784197001252e-16  max|eta| = 4.869217229679132

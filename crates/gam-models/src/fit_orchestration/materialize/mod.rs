@@ -14,7 +14,8 @@ mod transformation;
 mod validation;
 
 pub use columns::{
-    expand_automatic_fit_formula, fit_required_columns, formula_columns, resolve_offset_column,
+    expand_automatic_fit_formula, fit_required_columns, formula_columns,
+    resolve_fit_weight_column, resolve_offset_column,
     resolve_weight_column,
 };
 pub(crate) use columns::resolve_continuous_column;

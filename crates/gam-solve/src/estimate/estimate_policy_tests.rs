@@ -728,6 +728,154 @@ fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
     ));
 }
 
+/// F4 (bench/pygam_audit): a smooth's null space is penalized only by its
+/// double-penalty ridge, which REML releases along a separator, so a separator
+/// in that null space certifies like one in a parametric column, and so does a
+/// quasi-complete one (margin zero) that the strict certificate cannot claim. A
+/// response only the smooth's roughness-penalized directions can follow keeps
+/// them out, as do classes that interleave.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
+    // An intercept and seven hat functions on the knots 0, 1/6, ..., 1. The
+    // second-difference penalty leaves the linear functions of x unpenalized.
+    let n = 40;
+    let k = 7;
+    let p = 1 + k;
+    let hat_design = |xs: &[f64]| {
+        let mut x = Array2::<f64>::zeros((xs.len(), p));
+        for (row, &xi) in xs.iter().enumerate() {
+            x[[row, 0]] = 1.0;
+            for j in 0..k {
+                let knot = j as f64 / (k - 1) as f64;
+                x[[row, 1 + j]] = (1.0 - (k - 1) as f64 * (xi - knot).abs()).max(0.0);
+            }
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+    let xs: Vec<f64> = (0..n).map(|i| i as f64 / (n - 1) as f64).collect();
+    let design = hat_design(&xs);
+    let w = Array1::ones(n);
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+
+    let mut d2 = Array2::<f64>::zeros((k - 2, k));
+    for r in 0..k - 2 {
+        d2[[r, r]] = 1.0;
+        d2[[r, r + 1]] = -2.0;
+        d2[[r, r + 2]] = 1.0;
+    }
+    let bending = d2.t().dot(&d2);
+    // The projector onto the bending penalty's null space, span{1, j}.
+    let constant = Array1::from_elem(k, 1.0 / (k as f64).sqrt());
+    let centered = Array1::from_shape_fn(k, |j| j as f64 - 0.5 * (k - 1) as f64);
+    let slope = &centered / centered.dot(&centered).sqrt();
+    let null_ridge = {
+        let c = constant.view().insert_axis(ndarray::Axis(1));
+        let s = slope.view().insert_axis(ndarray::Axis(1));
+        c.dot(&c.t()) + s.dot(&s.t())
+    };
+    let canonical = |locals: &[Array2<f64>]| {
+        let specs: Vec<PenaltySpec> = locals
+            .iter()
+            .map(|local| PenaltySpec::Block {
+                local: local.clone(),
+                col_range: 1..p,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect();
+        gam_terms::construction::canonicalize_penalty_specs(
+            &specs,
+            &vec![0; specs.len()],
+            p,
+            "prefit separation null-space pin",
+        )
+        .expect("canonicalize the smooth's penalties")
+        .0
+    };
+    let double_penalty = canonical(&[bending.clone(), null_ridge]);
+    let bending_only = canonical(&[bending]);
+
+    let step: Array1<f64> = xs.iter().map(|&xi| f64::from(u8::from(xi > 0.5))).collect();
+    for (label, penalties) in [
+        ("double penalty", &double_penalty),
+        ("bending only", &bending_only),
+    ] {
+        let err = reject_prefit_binomial_separation(&cfg, step.view(), w.view(), &design, penalties)
+            .expect_err("a separator in the smooth's null space must be certified");
+        assert!(
+            matches!(err, EstimationError::PrefitLinearSeparationDetected { .. }),
+            "{label}: expected a linear-separation certificate, got {err:?}"
+        );
+    }
+
+    let bump: Array1<f64> = xs
+        .iter()
+        .map(|&xi| f64::from(u8::from((xi - 0.5).abs() < 0.2)))
+        .collect();
+    reject_prefit_binomial_separation(&cfg, bump.view(), w.view(), &design, &double_penalty)
+        .expect("no linear function of x separates a bump; the bending penalty bounds the rest");
+
+    // Quasi-complete separation: x on the tenths grid, y = 1{x > 0.5} except
+    // that the rows tied at x = 0.5 alternate between the classes. No direction
+    // separates strictly, but x − 0.5 is ≥ 0 on the positives, ≤ 0 on the
+    // negatives and nonzero off the tie, so the likelihood has no maximizer.
+    let tenths: Vec<f64> = (0..44).map(|i| (i % 11) as f64 / 10.0).collect();
+    let tenths_design = hat_design(&tenths);
+    let tenths_w = Array1::ones(tenths.len());
+    let mut tie = 0usize;
+    let quasi: Array1<f64> = tenths
+        .iter()
+        .map(|&xi| {
+            if xi == 0.5 {
+                tie += 1;
+                f64::from(u8::from(tie % 2 == 1))
+            } else {
+                f64::from(u8::from(xi > 0.5))
+            }
+        })
+        .collect();
+    for (label, penalties) in [
+        ("double penalty", &double_penalty),
+        ("bending only", &bending_only),
+    ] {
+        let err = reject_prefit_binomial_separation(
+            &cfg,
+            quasi.view(),
+            tenths_w.view(),
+            &tenths_design,
+            penalties,
+        )
+        .expect_err("a quasi-complete separator in the smooth's null space must be certified");
+        assert!(
+            matches!(
+                err,
+                EstimationError::PrefitLinearSeparationDetected { min_signed_margin, .. }
+                    if min_signed_margin == 0.0
+            ),
+            "{label}: expected a quasi-separation certificate, got {err:?}"
+        );
+    }
+    // One positive below the tie leaves the classes interleaved: the MLE exists.
+    let mut overlapped = quasi.clone();
+    overlapped[1] = 1.0;
+    reject_prefit_binomial_separation(
+        &cfg,
+        overlapped.view(),
+        tenths_w.view(),
+        &tenths_design,
+        &double_penalty,
+    )
+    .expect("classes that cross the threshold are not quasi-separated");
+}
+
 #[test]
 fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     let x = array![
