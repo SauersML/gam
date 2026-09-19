@@ -5,7 +5,7 @@
   estimated-dispersion families), the lack-of-fit p-value compared `T/r` with
   `F(r, ν)`. But `νφ̂` contains the numerator's own share `T·φ̂`, so `T/r` is
   `(ν/r)·Beta(r/2, (ν − r)/2)`, not F. The test was conservative: at n = 200 under an
-  adequate basis it rejected 2.3% of the time at 0.05 and never at 0.01 (1000 seeded
+  adequate basis it rejected 2.3% of the time at 0.05 and 0.1% at 0.01 (1000 seeded
   replicates). It now refers `(T/r)·(ν − r)/(ν − T)` to `F(r, ν − r)`, the classical test of
   the enrichment columns added to the fit, and reports no p-value when `ν ≤ r` or `T ≥ ν`.
   Estimated-scale `basis_checks` p-values are smaller than before. Known-scale families
