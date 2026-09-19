@@ -128,7 +128,6 @@ magic	crates/gam-terms/src/basis/duchon_kernel_math.rs	> 1e-8	https://github.com
 magic	crates/gam-terms/src/basis/duchon_psi_derivatives.rs	.max(1e-30)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/basis/duchon_psi_derivatives.rs	.max(1e-30)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/basis/duchon_psi_derivatives.rs	< 1e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-terms/src/basis/duchon_thinplate.rs	> 1e-14	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/basis/latent_design.rs	<= 1.0e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/basis/matern_kernel.rs	.max(1e-12)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-terms/src/basis/sphere_basis.rs	.max(1e-12)	https://github.com/SauersML/gam/issues/2469
