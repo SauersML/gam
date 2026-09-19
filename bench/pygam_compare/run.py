@@ -79,22 +79,18 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
     return rss, threads
 
 
-def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+def supervise(
+    cmd: list[str], timeout_s: float, memcap_mb: float, cwd: str
 ) -> dict[str, Any]:
-    """Run one worker subprocess, policing the safety net; return its record."""
+    """Run one worker subprocess under the safety net; return its record.
+
+    The worker prints its result as one ``RESULT {json}`` line; the record is
+    that object plus the supervisor's own measurements (process-tree peak RSS
+    and thread count, wall time, host load). Shared with bench/real_data.
+    """
     env = dict(os.environ)
     env.update(THREAD_ENV)
     env.pop("PYTHONPATH", None)
-    cmd = [
-        sys.executable,
-        str(WORKER),
-        lib,
-        cell.family,
-        str(cell.n),
-        cell.design,
-        str(seed),
-    ]
     load_start = os.getloadavg()
     t0 = time.perf_counter()
     proc = subprocess.Popen(
@@ -133,11 +129,6 @@ def run_rep(
         else:
             status = str(rec.get("status", "error"))
     rec.update(
-        lib=lib,
-        family=cell.family,
-        n=cell.n,
-        design=cell.design,
-        seed=seed,
         status=status,
         returncode=proc.returncode,
         proc_wall_s=wall,
@@ -148,6 +139,24 @@ def run_rep(
     )
     if status != "ok":
         rec["stderr_tail"] = stderr[-2000:]
+    return rec
+
+
+def run_rep(
+    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+) -> dict[str, Any]:
+    """Run one rep of ``cell`` for ``lib``; return its record."""
+    cmd = [
+        sys.executable,
+        str(WORKER),
+        lib,
+        cell.family,
+        str(cell.n),
+        cell.design,
+        str(seed),
+    ]
+    rec = supervise(cmd, timeout_s, memcap_mb, cwd)
+    rec.update(lib=lib, family=cell.family, n=cell.n, design=cell.design, seed=seed)
     return rec
 
 
