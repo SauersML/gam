@@ -41,7 +41,6 @@
 //! is audited against the definition, not against itself.
 
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::types::LikelihoodSpec;
 use gam_linalg::faer_ndarray::FaerEigh;
