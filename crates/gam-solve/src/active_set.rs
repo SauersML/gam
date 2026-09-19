@@ -582,8 +582,8 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     // A refusal and an answer of zero are not the same fact.
     //
     // `project_stationarity_residual_on_constraint_cone` returns `None` on a
-    // non-finite target, a width mismatch, or the Lawson-Hanson `3m + 30`
-    // guard being reached -- and this `if let` used to leave `lambda` at its
+    // non-finite target, a width mismatch, or a Lawson-Hanson iterate that is not
+    // polar at its own resolution -- and this `if let` used to leave `lambda` at its
     // zeros in every one of those cases, with no trace. That is
     // indistinguishable from NNLS genuinely reporting `λ = 0`: both give
     // `stationarity == ‖grad‖∞` and print `stat_rel = 1.000e0`.
@@ -688,10 +688,18 @@ where
     if target_inf == 0.0 {
         return Some((Vec::new(), target.clone()));
     }
-    // Gradient tolerance in λ-space: with unit rows, `w_i = a_î·r` is bounded
-    // by ‖r‖, so a relative band on the target scale is dimensionless.
-    let tol_w = 1e-10 * target_inf;
-    let lambda_floor = 1e-14 * target_inf;
+    // The resolution of a unit correlation `wᵢ = âᵢ·r` at the current residual
+    // (#2469). The raw product `aᵢ·r` sums `p` rounded terms, so it errs by at most
+    // `γ_p·Σ_j|a_ij·r_j| ≤ γ_p·‖aᵢ‖·‖r‖` (Cauchy–Schwarz). The residual is itself
+    // known only to its band, which moves the product by at most `‖aᵢ‖·‖band‖`.
+    // Divided by `‖aᵢ‖`, a correlation is resolved above `γ_p·‖r‖ + ‖band‖`. The
+    // division by the computed norm is second order. A passive coefficient moves
+    // the residual by `λ̂_j·âⱼ`, so one at or below the same resolution changes it by
+    // less than the arithmetic resolves.
+    let resolution = |residual: &Array1<f64>, band: &Array1<f64>| {
+        gam_math::roundoff::accumulation_growth(p) * residual.dot(residual).sqrt()
+            + band.dot(band).sqrt()
+    };
 
     let mut lambda_unit = Array1::<f64>::zeros(m);
     let mut passive: Vec<usize> = Vec::new();
@@ -728,20 +736,30 @@ where
         least_squares_min_norm_any_shape(&design, target)
     };
 
-    let max_outer = m.saturating_mul(3).saturating_add(30);
-    for _ in 0..max_outer {
+    // Termination is structural, with no step count (#2469):
+    // - Between residual moves, every outer step takes its entering row out of the
+    //   eligible set, into the passive set or banned, and the inner loop bans every
+    //   row it drops. So at most `m` steps pass before the residual moves or no row
+    //   is eligible.
+    // - Every residual move decreases the objective, so exact Lawson–Hanson never
+    //   holds the same passive set at two moves. A repeat is rounding-level
+    //   cycling, and the loop stops there, leaving the verdict to the terminal
+    //   polarity check. There are finitely many passive sets.
+    let mut passive_sets_at_moves: HashSet<Vec<usize>> = HashSet::new();
+    loop {
         // Most-ascent candidate among non-passive, non-banned rows.
         let values = row_values(&residual)?;
         if values.len() != m || values.iter().any(|value| !value.is_finite()) {
             return None;
         }
+        let entering_floor = resolution(&residual, &residual_band);
         let mut best: Option<(usize, f64)> = None;
         for i in 0..m {
             if in_passive[i] || banned[i] || row_norms[i] <= 0.0 {
                 continue;
             }
             let w = values[i] / row_norms[i];
-            if w > tol_w && best.map(|(_, best_w)| w > best_w).unwrap_or(true) {
+            if w > entering_floor && best.map(|(_, best_w)| w > best_w).unwrap_or(true) {
                 best = Some((i, w));
             }
         }
@@ -751,13 +769,16 @@ where
         passive.push(entering);
         in_passive[entering] = true;
 
+        // Each inner step either accepts, stops as stuck, or drops at least one
+        // passive row, so it ends within `passive.len()` steps.
+        let coefficient_floor = entering_floor;
         let mut inner_ok = false;
-        for _ in 0..(m + 2) {
+        loop {
             let Some(z) = solve_passive(&passive) else {
                 return None;
             };
             let min_z = z.iter().copied().fold(f64::INFINITY, f64::min);
-            if min_z > lambda_floor {
+            if min_z > coefficient_floor {
                 for (pos, &row) in passive.iter().enumerate() {
                     lambda_unit[row] = z[pos];
                 }
@@ -768,7 +789,7 @@ where
             // then drop every zeroed row from the passive set.
             let mut alpha = 1.0_f64;
             for (pos, &row) in passive.iter().enumerate() {
-                if z[pos] <= lambda_floor {
+                if z[pos] <= coefficient_floor {
                     let current = lambda_unit[row];
                     let denom = current - z[pos];
                     if denom > 0.0 {
@@ -783,7 +804,7 @@ where
             }
             let mut retained = Vec::with_capacity(passive.len());
             for &row in &passive {
-                if lambda_unit[row] > lambda_floor {
+                if lambda_unit[row] > coefficient_floor {
                     retained.push(row);
                 } else {
                     lambda_unit[row] = 0.0;
@@ -845,22 +866,28 @@ where
         residual_band = new_band;
         if moved {
             banned.iter_mut().for_each(|b| *b = false);
+            let mut passive_set = passive.clone();
+            passive_set.sort_unstable();
+            if !passive_sets_at_moves.insert(passive_set) {
+                break;
+            }
         } else if !inner_ok {
             break;
         }
     }
 
     // Exact Moreau/KKT exit: the residual must lie in the polar cone, i.e.
-    // every unit generator has non-positive correlation (within the same
-    // scale-relative tolerance used for entering). This distinguishes normal
-    // Lawson–Hanson termination from exhausting the floating-point pivot cap;
-    // a capped non-polar iterate is not a projection and must never reach a
-    // stationarity certificate or projected-gradient direction.
+    // every unit generator has non-positive correlation, resolved at the same
+    // band used for entering. This distinguishes normal Lawson–Hanson
+    // termination from a stop on a repeated passive set. A non-polar iterate is
+    // not a projection and must never reach a stationarity certificate or
+    // projected-gradient direction.
     let final_values = row_values(&residual)?;
+    let polar_floor = resolution(&residual, &residual_band);
     if final_values.len() != m
         || final_values.iter().any(|value| !value.is_finite())
         || (0..m).any(|row| {
-            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > tol_w
+            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > polar_floor
         })
     {
         return None;
@@ -901,9 +928,9 @@ where
 /// Rows are unit-normalized internally so pivot ordering and tolerances are
 /// scale-invariant; the returned `λ` is in original row units. Zero rows
 /// carry `λ = 0`. Classic LH terminates after finitely many passive-set
-/// changes; a `3m + 30` outer guard bounds float pathologies, and the terminal
-/// full-row polarity check refuses rather than returning a non-KKT iterate if
-/// that guard is ever reached.
+/// changes. Here a passive set repeated at a residual move ends the loop
+/// structurally, with no step count, and the terminal full-row polarity check
+/// refuses rather than returning a non-KKT iterate (#2469).
 pub(crate) fn nonnegative_cone_multipliers(
     rows: &Array2<f64>,
     target: &Array1<f64>,
@@ -4763,6 +4790,41 @@ mod tests {
                 assert_relative_eq!(left, right, epsilon = 1e-12);
             }
         }
+    }
+
+    /// #2469: the cone projection enters, and certifies polarity for, every
+    /// correlation resolved above its own rounding band `γ_p·‖r‖ + ‖band‖`, not
+    /// above `1e-10·‖t‖∞`.
+    /// - Target `(1e-11, 1)` against the generator `e₁` has correlation `1e-11`: far
+    ///   above the band (`≈ 2.2e-16`) and below the replaced `1e-10` cutoff. That
+    ///   cutoff returned `λ = 0` with `(1e-11, 1)` as the "projection", which is
+    ///   not polar, since `e₁` still has positive correlation with it. The
+    ///   projection is `(0, 1)` with `λ = 1e-11`.
+    /// - A correlation at rounding level is not entered: the target `e₂` against
+    ///   `e₁` is already polar.
+    #[test]
+    fn nnls_enters_every_correlation_resolved_above_its_band_2469() {
+        let rows = array![[1.0, 0.0]];
+        let gap = 1.0e-11_f64;
+        let band = gam_math::roundoff::accumulation_growth(2) * (1.0 + gap * gap).sqrt();
+        assert!(
+            gap > band && gap < 1.0e-10,
+            "fixture premise: the correlation {gap:.1e} sits between the band {band:.3e} and the \
+             replaced 1e-10 cutoff"
+        );
+        let (lambda, projected) = nonnegative_cone_multipliers(&rows, &array![gap, 1.0])
+            .expect("a resolved correlation is projected");
+        assert!(
+            (lambda[0] - gap).abs() <= band,
+            "the resolved correlation enters with its multiplier: {lambda:?}"
+        );
+        assert!(projected[0].abs() <= band, "the projection is polar: {projected:?}");
+        assert_eq!(projected[1], 1.0);
+
+        let (lambda, projected) =
+            nonnegative_cone_multipliers(&rows, &array![0.0, 1.0]).expect("already polar");
+        assert_eq!(lambda[0], 0.0);
+        assert_eq!(projected, array![0.0, 1.0]);
     }
 
     #[test]
