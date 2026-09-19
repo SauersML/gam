@@ -1055,6 +1055,7 @@ pub(crate) fn run_predict_unified(
         posterior_mean_upper,
         point_covariance,
         uncertainty_covariance,
+        point_provenance,
     ) = (
         columns.linear_predictor_plugin,
         columns.mean_plugin,
@@ -1064,6 +1065,7 @@ pub(crate) fn run_predict_unified(
         columns.posterior_mean_upper,
         columns.point_covariance_source,
         columns.uncertainty_covariance_source,
+        columns.point_covariance_provenance,
     );
     let specialised_point = posterior_mean
         .as_ref()
@@ -1140,6 +1142,9 @@ pub(crate) fn run_predict_unified(
         specialised_point.len(),
         covariance_provenance_note(point_covariance, uncertainty_covariance)
     );
+    if let Some(line) = point_covariance_provenance_line(point_provenance.as_ref()) {
+        cli_out!("{line}");
+    }
     Ok(())
 }
 

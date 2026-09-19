@@ -139,8 +139,13 @@ def shape_predict_response(
     # #2296: a curved-link posterior-mean POINT integrates the conditional
     # posterior even when the band is smoothing-corrected — a separate,
     # result-owned fact carried under its own key.
-    return _attach_covariance_provenance(
+    shaped = _attach_covariance_provenance(
         shaped, "point_covariance_source", parsed.get("point_covariance_source")
+    )
+    # gam#2985: when the fit withheld its covariance, the posterior-mean point
+    # says what it is conditional on, under its own key.
+    return _attach_covariance_provenance(
+        shaped, "point_covariance_note", parsed.get("point_covariance_note")
     )
 
 

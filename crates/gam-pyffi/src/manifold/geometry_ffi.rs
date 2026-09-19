@@ -7214,6 +7214,7 @@ fn predict_dataset_with_options_impl(
             .uncertainty
             .map(|source| source.as_str().to_string()),
         point_covariance_source: provenance.point.map(|source| source.as_str().to_string()),
+        point_covariance_note: provenance.point_note,
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
@@ -7222,10 +7223,13 @@ fn predict_dataset_with_options_impl(
 /// what the evaluator actually consumed for the point estimate and for the
 /// attached SE/band. Presenters serialize these values; the request string is
 /// never evidence.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct PredictColumnsCovarianceProvenance {
     pub(crate) point: Option<gam_predict::InferenceCovarianceMode>,
     pub(crate) uncertainty: Option<gam_predict::InferenceCovarianceMode>,
+    /// What the posterior-mean point is conditional on when the fit withheld its
+    /// covariance (gam#2985).
+    pub(crate) point_note: Option<String>,
 }
 
 fn predict_columns(
@@ -7316,6 +7320,7 @@ fn predict_columns(
                 uncertainty: options
                     .interval
                     .map(|_| gam_predict::InferenceCovarianceMode::Conditional),
+                point_note: None,
             },
         ));
     }
@@ -7432,6 +7437,10 @@ fn predict_columns(
     let provenance = PredictColumnsCovarianceProvenance {
         point: resolved.point_covariance_source,
         uncertainty: resolved.uncertainty_covariance_source,
+        point_note: resolved
+            .point_covariance_provenance
+            .as_ref()
+            .map(gam_predict::PointCovarianceProvenance::explain),
     };
     let posterior_mean = resolved.posterior_mean.ok_or_else(|| {
         "default prediction did not produce the required posterior mean".to_string()
@@ -7564,6 +7573,7 @@ fn predict_encoded_table_conformal_impl(
         ),
         covariance_source: None,
         point_covariance_source: None,
+        point_covariance_note: None,
     })
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
@@ -7601,6 +7611,7 @@ fn predict_encoded_table_full_conformal_impl(
         )),
         covariance_source: None,
         point_covariance_source: None,
+        point_covariance_note: None,
     })
     .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }

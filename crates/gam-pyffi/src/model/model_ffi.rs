@@ -173,6 +173,11 @@ struct PredictionPayload {
     /// point is a plug-in that consulted no coefficient covariance.
     #[serde(skip_serializing_if = "Option::is_none")]
     point_covariance_source: Option<String>,
+    /// What a posterior-mean POINT is conditional on when the fit withheld its
+    /// covariance (gam#2985): `PointCovarianceProvenance::explain`. Omitted when
+    /// the point integrates the fit's own covariance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    point_covariance_note: Option<String>,
 }
 
 /// Typed wire payload for NUTS posterior draws.
@@ -6362,6 +6367,7 @@ mod prediction_payload_tests {
             interval_method: None,
             covariance_source: Some("smoothing-corrected".to_string()),
             point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: None,
         };
 
         let value = serde_json::to_value(payload).expect("serialize prediction payload");
@@ -6370,6 +6376,43 @@ mod prediction_payload_tests {
                 .get("covariance_source")
                 .and_then(|item| item.as_str()),
             Some("smoothing-corrected")
+        );
+        assert!(
+            value.get("point_covariance_note").is_none(),
+            "a point on the fit's own covariance carries no note"
+        );
+    }
+
+    /// gam#2985: a withheld fit's posterior-mean point reaches Python with the
+    /// typed provenance note beside its covariance source.
+    #[test]
+    fn a_withheld_fit_prediction_payload_carries_its_point_note_2985() {
+        let declined = gam::estimate::CovarianceDeclined::
+            BmsGeneratedRegressorResidualRepairChannelUnavailable {
+                unavailable_channel: "the pin's missing channel".to_string(),
+            };
+        let note =
+            gam_predict::PointCovarianceProvenance::ConditionalOnFittedLatentLaw { declined }.explain();
+        let payload = PredictionPayload {
+            columns: BTreeMap::from([("posterior_mean".to_string(), vec![0.4])]),
+            model_class: "bernoulli marginal-slope".to_string(),
+            point_column: "posterior_mean",
+            point_shape: "estimand_explicit",
+            family: "probit".to_string(),
+            interval_method: None,
+            covariance_source: None,
+            point_covariance_source: Some("conditional".to_string()),
+            point_covariance_note: Some(note.clone()),
+        };
+        let value = serde_json::to_value(payload).expect("serialize prediction payload");
+        assert_eq!(
+            value.get("point_covariance_note").and_then(|item| item.as_str()),
+            Some(note.as_str())
+        );
+        assert!(
+            note.contains("conditional on the fitted latent law")
+                && note.contains("the pin's missing channel"),
+            "{note}"
         );
     }
 

@@ -237,6 +237,40 @@ def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     np.testing.assert_allclose(out.mean_upper, [0.40, 0.58, 1.0])
 
 
+def test_withheld_fit_point_note_reaches_the_prediction_dict_2985(monkeypatch: Any) -> None:
+    """gam#2985: a fit that withheld its covariance predicts its posterior mean
+    conditional on the fitted latent law, and the FFI payload says so under
+    ``point_covariance_note``; the dict result carries that note beside
+    ``point_covariance_source``, and a payload without it adds no key."""
+    columns = {"linear_predictor": [-0.2, 0.3], "mean": [0.43, 0.61]}
+    note = (
+        "posterior mean conditional on the fitted latent law; the generated-regressor "
+        "correction was declined: no coefficient covariance was published"
+    )
+    withheld = json.loads(
+        _payload(
+            "marginal-slope",
+            "bernoulli-marginal-slope",
+            "marginal_slope_probability",
+            "mean",
+            columns,
+        )
+    )
+    withheld["point_covariance_source"] = "conditional"
+    withheld["point_covariance_note"] = note
+
+    out = _dispatch(monkeypatch, json.dumps(withheld), return_type="dict")
+
+    assert isinstance(out, PredictionResult)
+    assert out["point_covariance_source"] == "conditional"
+    assert out["point_covariance_note"] == note
+
+    published = dict(withheld)
+    del published["point_covariance_note"]
+    plain = _dispatch(monkeypatch, json.dumps(published), return_type="dict")
+    assert "point_covariance_note" not in plain
+
+
 def test_bernoulli_marginal_slope_no_interval_stays_1d(monkeypatch: Any) -> None:
     """Without an interval request the marginal-slope point payload is still a
     bare 1-D probability vector even if the backend volunteered extra columns —
