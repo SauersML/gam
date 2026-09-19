@@ -4,7 +4,8 @@ Pins the user-visible contract of:
 
 * intercept removal (``0 + ...``, ``... + 0``, ``... - 1``): an unpenalized
   slope without the intercept is ordinary least squares through the origin,
-  and ``0 + g`` is the cell-means model;
+  and a term that spans the constant (``0 + g``, ``0 + g:h``, ``0 + s(x)``)
+  keeps the intercept, so only the constant is unpenalized;
 * backtick-quoted, non-identifier column names and ``C()`` as a ``factor()``
   alias;
 * ``domain=[a, b]`` on ``s()`` (validated against the data, linear
@@ -72,15 +73,52 @@ def test_default_slope_without_intercept_passes_through_the_origin():
     assert abs(_predict(with_intercept, {"x": np.array([0.0])})[0]) > 1.0
 
 
-def test_zero_plus_factor_is_the_cell_means_model():
-    levels = np.array(["a", "b", "c"])
-    g = np.resize(levels, N)
-    means = {"a": 1.0, "b": 2.0, "c": 4.0}
-    y = np.array([means[v] for v in g]) + 0.1 * np.sin(np.arange(N))
-    model = gamfit.fit({"y": y, "g": g}, "y ~ 0 + g", family="gaussian")
-    fitted = _predict(model, {"g": levels})
-    expected = [y[g == level].mean() for level in levels]
-    np.testing.assert_allclose(fitted, expected, rtol=1e-9)
+_CONSTANT_SPANNING = [
+    ("y ~ 0 + g", "y ~ g"),
+    ("y ~ g - 1", "y ~ g"),
+    ("y ~ 0 + g:h", "y ~ g:h"),
+    ("y ~ 0 + s(x)", "y ~ s(x)"),
+]
+
+
+def _factor_noise_data(seed: int, n: int = 240) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    return {
+        "y": 3.0 + rng.standard_normal(n),
+        "g": np.resize(np.array(["a", "b", "c"]), n),
+        "h": np.resize(np.array(["u", "v"]), n + n // 3)[n // 3 :],
+        "x": rng.uniform(0.0, 1.0, n),
+    }
+
+
+@pytest.mark.parametrize(("formula", "with_intercept"), _CONSTANT_SPANNING)
+def test_a_term_spanning_the_constant_keeps_the_intercept(formula, with_intercept):
+    # The constant is the one unpenalized direction; the term keeps every
+    # other penalty, so the fit is the intercept formula's.
+    data = _factor_noise_data(0)
+    data["y"] = data["y"] + np.where(data["g"] == "b", 1.0, 0.0) + np.sin(4.0 * data["x"])
+    dropped = gamfit.fit(data, formula, family="gaussian")
+    kept = gamfit.fit(data, with_intercept, family="gaussian")
+    np.testing.assert_allclose(_predict(dropped, data), _predict(kept, data), rtol=1e-10)
+
+
+@pytest.mark.parametrize("formula", ["y ~ 0 + g", "y ~ 0 + g:h", "y ~ 0 + s(x)"])
+def test_pure_noise_recovers_only_the_constant(formula):
+    # Under a constant response every non-constant direction has a penalty
+    # REML can drive to the null. Freeing the level by stripping the term's
+    # penalties left unpenalized non-constant directions (the level contrasts
+    # of `g`, every cell of `g:h`, the slope of `s(x)`), so its excess edf over
+    # the constant was at least one in every replicate. A penalized fit's
+    # excess is random, with an atom at zero where REML puts every smoothing
+    # parameter on its rail: the null must be reachable.
+    excess = []
+    for seed in range(8):
+        data = _factor_noise_data(seed)
+        model = gamfit.fit(data, formula, family="gaussian")
+        excess.append(float(model.summary().edf_total) - 1.0)
+        fitted = _predict(model, data)
+        assert abs(float(np.mean(fitted)) - float(np.mean(data["y"]))) < 1e-8
+    assert min(excess) < 1e-6, excess
 
 
 def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
