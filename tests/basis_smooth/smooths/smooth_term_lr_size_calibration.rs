@@ -12,14 +12,10 @@
 //! returns to nominal. This harness measures that directly, comparing three
 //! lanes from the SAME live driver (`smooth_term_lr_inference_forspec`):
 //!
-//!   (a) first-order χ²        — the published reference read at `statistic_lr`,
-//!   (b) fixed-λ Bartlett      — the reference read at `W / c_cond`,
-//!   (c) estimated-λ Bartlett  — the published `p_value`, built with the
-//!                                ρ̂-variation factor where it is available
+//!   (a) first-order χ²        — `p_value_uncorrected`,
+//!   (b) fixed-λ Bartlett      — `p_value_corrected` with the conditional factor,
+//!   (c) estimated-λ Bartlett  — `p_value_corrected` with the ρ̂-variation factor
 //!                                (`correction == LawleyLrEstimatedLambda`).
-//!
-//! Only (c) is a published p-value; (a) and (b) are reconstructed here from the
-//! report's own reference so the harness can show what the correction buys.
 //!
 //! Empirical size at `α` is `#{p ≤ α}/R`. Its Monte-Carlo standard error is
 //! `√(α(1−α)/R)`; the assertions use a `±k·SE` band so they are robust to the
@@ -166,16 +162,13 @@ fn run_one(
         &req.options,
     )
     .map_err(|error| error.to_string())?;
-    Ok(reports.into_iter().find(|r| r.name.contains('z')))
-}
-
-/// The first-order lane: the report's own reference read at the raw statistic,
-/// with no Bartlett factor. The report does not publish it as a p-value; the
-/// harness reconstructs it to measure what the correction removes.
-fn uncorrected_p_value(r: &SmoothTermLrInference) -> f64 {
-    r.ref_df_provenance
-        .tail_probability_with_bound(r.statistic_lr)
-        .0
+    // A term the driver could not test carries its typed reason; it is a
+    // refusal exactly like a full-fit refusal and is counted the same way.
+    reports
+        .into_iter()
+        .find(|r| r.name.contains('z'))
+        .map(|r| r.outcome.map_err(|reason| reason.to_string()))
+        .transpose()
 }
 
 /// Empirical-size accumulators for one grid cell, across the three lanes.
@@ -199,8 +192,8 @@ impl SizeCounts {
         // `bartlett_factor_conditional` carries the fixed-λ factor; otherwise the
         // applied `bartlett_factor` IS the fixed-λ factor. We reconstruct the
         // fixed-λ corrected statistic from whichever factor is the conditional one.
-        let p_first = uncorrected_p_value(r);
-        let p_est = r.p_value; // applied lane (estimated-λ where available)
+        let p_first = r.p_value_uncorrected;
+        let p_est = r.p_value_corrected; // applied lane (estimated-λ where available)
         let c_fixed = r
             .bartlett_factor_conditional
             .unwrap_or(r.bartlett_factor)
@@ -390,9 +383,8 @@ fn null_simulation_size_is_calibrated_small_n() {
                         // applied, the `material` flag must follow the 10% rule.
                         if !matches!(r.correction, SmoothLrCorrection::None) {
                             let factor_move = (r.bartlett_factor - 1.0).abs();
-                            let p_first = uncorrected_p_value(&r);
-                            let p_hi = p_first.max(r.p_value);
-                            let p_lo = p_first.min(r.p_value);
+                            let p_hi = r.p_value_uncorrected.max(r.p_value_corrected);
+                            let p_lo = r.p_value_uncorrected.min(r.p_value_corrected);
                             let p_move = (p_hi - p_lo) / p_hi.max(f64::MIN_POSITIVE);
                             let expected = factor_move > 0.10 || p_move > 0.10;
                             assert_eq!(

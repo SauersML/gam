@@ -77,7 +77,10 @@ fn smooth_lr_report(x: &[f64], y: &[f64]) -> super::drivers::SmoothTermLrInferen
     )
     .expect("smooth-term LR inference");
     assert_eq!(reports.len(), 1, "exactly one smooth term expected");
-    reports.into_iter().next().expect("one smooth term")
+    let report = reports.into_iter().next().expect("one smooth term");
+    report
+        .outcome
+        .unwrap_or_else(|reason| panic!("{}: no LR inference: {reason}", report.name))
 }
 
 #[test]
@@ -96,7 +99,7 @@ fn flat_null_smooth_ref_df_floored_and_not_significant_1766() {
         let (ref_df, w, p) = (
             report.ref_df,
             report.statistic_lr,
-            report.p_value,
+            report.p_value_corrected,
         );
         let provenance = &report.ref_df_provenance;
         // `ref_df` must sit inside Wood's analytic band `[edf, 2·edf]` and the
@@ -154,7 +157,7 @@ fn strong_signal_smooth_still_flagged_1766() {
     let (ref_df, w, p) = (
         report.ref_df,
         report.statistic_lr,
-        report.p_value,
+        report.p_value_corrected,
     );
     assert!(
         ref_df > 1.0,

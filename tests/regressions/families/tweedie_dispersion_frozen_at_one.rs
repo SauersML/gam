@@ -111,7 +111,6 @@ fn fit_tweedie_eta_se(x: &[f64], y: &[f64], eval: &[f64]) -> Option<(Vec<f64>, f
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,
-            multi_point_joint: false,
             ..PredictUncertaintyOptions::default()
         },
     )

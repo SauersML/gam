@@ -61,6 +61,13 @@ pub enum SmoothPValueUnavailable {
     /// REML λ̂ as known and is anti-conservative under the null, so it is not
     /// published in its place.
     SelectionRefused,
+    /// A random-effect term whose variance-component score test
+    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
+    /// the test's own reason.
+    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// A random-effect term the fit carries no test record for: a model saved
+    /// before the test existed, or a fit route that does not compute it.
+    RandomEffectTestNotRecorded,
 }
 
 impl SmoothPValueUnavailable {
@@ -69,6 +76,8 @@ impl SmoothPValueUnavailable {
         match self {
             Self::ShapeConstrained => "shape_constrained",
             Self::SelectionRefused => "selection_refused",
+            Self::RandomEffect(reason) => reason.label(),
+            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
         }
     }
 
@@ -84,6 +93,10 @@ impl SmoothPValueUnavailable {
                 "selection refused: the lambda-selection replay could not resolve this term's \
                  penalty geometry or selection, so no calibrated p-value exists; the fixed-lambda \
                  tail is anti-conservative and is not reported in its place"
+            }
+            Self::RandomEffect(reason) => reason.explanation(),
+            Self::RandomEffectTestNotRecorded => {
+                "the fit carries no variance-component test for this random effect"
             }
         }
     }

@@ -24,8 +24,9 @@ pub enum SmoothLrCorrection {
     LawleyLrEstimatedLambda,
     /// A per-term likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)` that has
     /// been Bartlett-corrected with the fixed-λ Lawley factor `c = E[W|λ]/d`
-    /// (`W* = W/c`, referenced against `χ²_d`). This is used only when the
-    /// estimated-λ handoff is unavailable.
+    /// (`W* = W/c`, referenced against `χ²_d`). This is used when a λ̂-selection
+    /// replay already carries the estimation of `λ` in the reference law, and
+    /// when the estimated-λ handoff is unavailable.
     LawleyLrFixedLambda,
     /// No second-order correction was applied — either the family has no
     /// closed-form Lawley cumulant jets or the null refit did not converge — so
@@ -363,6 +364,14 @@ pub struct SmoothLrProfiledScale {
 }
 
 impl SmoothLrReferenceDf {
+    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
+    /// replay held out. This is the tail `Self::tail_probability_with_bound`
+    /// reports when nothing was selected, and it is the reference the replay
+    /// corrects.
+    pub fn conditional_tail_probability(&self, statistic: f64) -> f64 {
+        self.conditional_tail_with_bound(statistic).0
+    }
+
     /// `P(W > statistic)` under this reference, with an absolute bound on its
     /// error.
     ///
@@ -393,7 +402,9 @@ impl SmoothLrReferenceDf {
         if !conditional.is_finite() {
             return (conditional, bound);
         }
-        let (shift, standard_error) = replay.tail_shift(self.selection_threshold(statistic));
+        let threshold = self.selection_threshold(statistic);
+        let (shift, standard_error) =
+            replay.tail_shift_at(threshold, replay.observed_selection_threshold(threshold));
         (
             (conditional + shift).clamp(0.0, 1.0),
             bound + 2.0 * standard_error,
@@ -450,16 +461,7 @@ impl SmoothLrReferenceDf {
             .collect()
     }
 
-    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
-    /// replay held out — and its certified truncation bound. This is the tail
-    /// [`Self::tail_probability_with_bound`] reports when nothing was selected,
-    /// and it is the law the replay corrects.
-    ///
-    /// It is a building block of the reference, not a p-value: read against a
-    /// fitted `λ̂` it prices the smoothing parameter as given and is
-    /// anti-conservative, which is why [`SmoothTermLrInference`] does not
-    /// publish it.
-    pub fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
+    fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
         if !statistic.is_finite() {
             return (f64::NAN, f64::NAN);
         }
@@ -499,6 +501,166 @@ impl SmoothLrReferenceDf {
             });
         }
         tail_with_bound(&terms, 0.0)
+    }
+
+    /// The typed p-value: a point value when its published accuracy resolves
+    /// it away from zero, and an explicit ceiling when it does not.
+    ///
+    /// `(value, accuracy)` is what [`Self::tail_probability_with_bound`] returned
+    /// at the statistic. When `value ≤ accuracy` the interval the reference
+    /// certifies, `[value − accuracy, value + accuracy]`, contains zero: the
+    /// digits of `value` are not the tail, and publishing them as a probability
+    /// would be publishing noise. What IS known there is the interval's top, so
+    /// that is what is reported.
+    ///
+    /// `None` when the value or its accuracy is not a number, which the driver
+    /// reports as [`SmoothLrUnavailable::TailNotComputable`].
+    pub fn typed_p_value(value: f64, accuracy: f64) -> Option<SmoothLrPValue> {
+        if !(value.is_finite() && accuracy.is_finite()) {
+            return None;
+        }
+        if value > accuracy {
+            return Some(SmoothLrPValue::Resolved(value));
+        }
+        // "p ≤ 0" is false for every continuous law; a ceiling that rounds to
+        // zero is lifted to the smallest positive double, the least
+        // representable true statement.
+        Some(SmoothLrPValue::UpperBound(
+            (value.max(0.0) + accuracy).clamp(f64::from_bits(1), 1.0),
+        ))
+    }
+}
+
+/// A smooth term's LR p-value as the reference can actually certify it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SmoothLrPValue {
+    /// A point value, resolved away from zero by the published accuracy
+    /// [`SmoothTermLrInference::p_value_bound`].
+    Resolved(f64),
+    /// `p ≤` this ceiling. The published accuracy does not separate the value
+    /// from zero, so a point value would be noise; see
+    /// [`SmoothLrReferenceDf::typed_p_value`].
+    UpperBound(f64),
+}
+
+/// Why a tested smooth term carries no LR p-value. Every smooth term the LR test
+/// applies to gets a row: a p-value ([`SmoothLrPValue`]) or one of these, never a
+/// silent gap and never an error for the whole call because one term's test
+/// could not run. (A shape-constrained term, which the test does not apply to,
+/// is named by [`smooth_term_lr_unavailable_forspec`].)
+#[derive(Clone, Debug, PartialEq)]
+pub enum SmoothLrUnavailable {
+    /// The term spans no coefficient columns in the fitted design, so there is
+    /// nothing to drop and no hypothesis to test.
+    EmptyCoefficientBlock,
+    /// The term's null law has no positive mean or no positive two-moment
+    /// shape/scale — the tested block carries no degree of freedom the data can
+    /// move, so no tail can be read from it.
+    DegenerateReference,
+    /// The full model could not be refitted from the supplied data, so no term
+    /// has an `ℓ_full` to be compared against.
+    FullRefitFailed(String),
+    /// The reduced model (this term's block fixed at zero, every other
+    /// smoothing parameter at the full fit's `λ̂`) did not reach a converged
+    /// optimum. A fit object is only ever the product of a converged
+    /// optimization, so there is no `ℓ_null` and no statistic.
+    NullFitNotConverged(String),
+    /// The reduced model is not the full model with this term's block
+    /// constrained to zero at the full fit's `λ̂` — a penalty spans the tested
+    /// block and a surviving one, a constraint needs the tested block, the
+    /// link shape was estimated jointly, or the fit uses the bounded-linear
+    /// route — so no nested likelihood ratio is defined for it here.
+    NullFitUnsupported(String),
+    /// The reduced model converged but its log-likelihood is not finite.
+    NullLogLikelihoodNotFinite,
+    /// The statistic was formed but the reference returned no finite tail or
+    /// accuracy for it.
+    TailNotComputable,
+    /// `λ̂` was chosen but the replay that prices the choice refused
+    /// ([`SmoothLrSelectionDecline::is_refusal`]). The fixed-`λ` conditional
+    /// tail is not substituted: it prices `λ̂` as given and is
+    /// anti-conservative — on a Bernoulli null term the penalty had absorbed it
+    /// read `p = 0.0005`.
+    SelectionRefused(SmoothLrSelectionDecline),
+}
+
+impl SmoothLrUnavailable {
+    /// Stable machine-readable label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::EmptyCoefficientBlock => "empty_coefficient_block",
+            Self::DegenerateReference => "degenerate_reference",
+            Self::FullRefitFailed(_) => "full_refit_failed",
+            Self::NullFitNotConverged(_) => "null_fit_not_converged",
+            Self::NullFitUnsupported(_) => "null_fit_unsupported",
+            Self::NullLogLikelihoodNotFinite => "null_log_likelihood_not_finite",
+            Self::TailNotComputable => "tail_not_computable",
+            Self::SelectionRefused(_) => "selection_refused",
+        }
+    }
+}
+
+impl std::fmt::Display for SmoothLrUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyCoefficientBlock => f.write_str("the term spans no coefficient columns"),
+            Self::DegenerateReference => {
+                f.write_str("the term's null law has no positive mean, shape or scale")
+            }
+            Self::FullRefitFailed(message) => write!(f, "full-model refit failed: {message}"),
+            Self::NullFitNotConverged(message) => {
+                write!(f, "the reduced model (term fixed at zero) did not converge: {message}")
+            }
+            Self::NullFitUnsupported(message) => {
+                write!(f, "no nested reduced model for this term: {message}")
+            }
+            Self::NullLogLikelihoodNotFinite => {
+                f.write_str("the reduced model's log-likelihood is not finite")
+            }
+            Self::TailNotComputable => {
+                f.write_str("the reference produced no finite tail at this statistic")
+            }
+            Self::SelectionRefused(reason) => write!(
+                f,
+                "the smoothing parameter was selected but its selection replay refused ({})",
+                reason.label()
+            ),
+        }
+    }
+}
+
+/// One smooth term's LR significance outcome: the report, or why there is none.
+#[derive(Clone, Debug)]
+pub struct SmoothTermLrReport {
+    /// Smooth-term name (matches the summary row).
+    pub name: String,
+    /// Smooth-term index within `resolvedspec.smooth_terms`.
+    pub term_idx: usize,
+    pub outcome: Result<SmoothTermLrInference, SmoothLrUnavailable>,
+}
+
+impl SmoothTermLrReport {
+    /// The report, when the test ran.
+    pub fn inference(&self) -> Option<&SmoothTermLrInference> {
+        self.outcome.as_ref().ok()
+    }
+}
+
+impl SmoothLrPValue {
+    /// The point value, when there is one.
+    pub fn value(self) -> Option<f64> {
+        match self {
+            Self::Resolved(value) => Some(value),
+            Self::UpperBound(_) => None,
+        }
+    }
+
+    /// The ceiling, when the tail was reported as one.
+    pub fn upper_bound(self) -> Option<f64> {
+        match self {
+            Self::UpperBound(bound) => Some(bound),
+            Self::Resolved(_) => None,
+        }
     }
 }
 
@@ -581,25 +743,14 @@ pub struct SmoothTermLrInference {
     pub rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     pub statistic_corrected: f64,
-    /// The term's p-value: `P(W > W*)` under [`Self::ref_df_provenance`] — the
-    /// statistic's own null law with the λ̂-selection replay applied
-    /// ([`SmoothLrReferenceDf::tail_probability_with_bound`]), read at the
-    /// Bartlett-corrected statistic. Dividing the statistic by `c` and scaling
+    /// Uncorrected tail probability `P(χ²_ν > W/g)` under the null law's own
+    /// two-moment reference.
+    pub p_value_uncorrected: f64,
+    /// Corrected tail probability `P(χ²_ν > W*/g)`; equals the uncorrected value
+    /// when no correction was applied. Dividing the statistic by `c` and scaling
     /// every spectral weight by `c` are the same operation on this reference, so
     /// the Bartlett correction composes without a second convention.
-    ///
-    /// This is the only p-value the report publishes. The fixed-`λ` conditional
-    /// tail and the uncorrected tail it replaces are anti-conservative under the
-    /// null (they price `λ̂` as given and drop the `O(1/n)` mean shift), so they
-    /// are not offered as alternatives; the reference is published whole, so a
-    /// consumer who wants to see how the correction moved the answer can still
-    /// evaluate it at `statistic_lr`.
-    ///
-    /// NaN when there is no answer to publish: the statistic itself is NaN (a
-    /// null refit refused), or `λ̂` was chosen but its selection replay refused
-    /// ([`SmoothLrSelectionDecline::is_refusal`]; the reason is in
-    /// `ref_df_provenance.selection`). A fixed-`λ` tail is never substituted.
-    pub p_value: f64,
+    pub p_value_corrected: f64,
     /// Whether the second-order correction is **material** (#939 deliverable 4):
     /// the per-test diagnostic "is `n` too small for first-order inference
     /// *here*?". `true` when a correction was applied and it moves the result by
@@ -608,8 +759,32 @@ pub struct SmoothTermLrInference {
     /// p-value change `|p* − p| / max(p, p*, ε)`. `false` when `correction` is
     /// [`SmoothLrCorrection::None`] (no correction was applied).
     pub material: bool,
-    /// Which statistic the p-value is built from.
+    /// Which statistic the corrected p-value is built from.
     pub correction: SmoothLrCorrection,
+    /// The CONDITIONAL tail of the corrected statistic — the p-value the
+    /// fixed-`λ` law alone would report, before the λ̂-selection replay moves it
+    /// (#2672).
+    ///
+    /// Published so the correction is visible rather than folded in:
+    /// `p_value_corrected − p_value_conditional` is exactly what treating `λ̂` as
+    /// chosen rather than given is worth on this fit, and it is the quantity a
+    /// reader should be shown if they are going to be asked to accept it. Equal
+    /// to `p_value_corrected` when no selection was possible.
+    pub p_value_conditional: f64,
+    /// Certified absolute accuracy of the two published p-values — the larger of
+    /// the two bounds [`SmoothLrReferenceDf::tail_probability_with_bound`]
+    /// returned (#2672).
+    ///
+    /// `0.0` on the closed-form lane (a degraded reference without a profiled
+    /// scale), where the tail is a chi-square survival function. On the exact
+    /// lane it is the inversion's own derived error bound, so a consumer reads
+    /// the accuracy rather than inheriting it.
+    pub p_value_bound: f64,
+    /// [`Self::p_value_corrected`] as the reference can certify it: the point
+    /// value when [`Self::p_value_bound`] resolves it away from zero, else an
+    /// explicit ceiling `p ≤ bound` — a strong effect's tail sits below the
+    /// quadrature's absolute accuracy, and its digits there are roundoff.
+    pub p_value: SmoothLrPValue,
 }
 
 /// The materiality threshold for [`SmoothTermLrInference::material`] (#939
@@ -681,8 +856,13 @@ fn fitted_rho_penalty_components(
 /// 1. Fit the full model and read `ℓ_full` and the per-term coefficient ranges /
 ///    EDF / influence block. The full design's column layout fixes the tested
 ///    block for the Lawley factor.
-/// 2. For each penalized smooth term, refit a null model with that term dropped
-///    from the spec; `W = max(2(ℓ_full − ℓ_null), 0)`.
+/// 2. For each penalized smooth term, fit the nested null model: the full
+///    design and likelihood with that term's coefficient block fixed at zero and
+///    every surviving smoothing parameter held at the full fit's `λ̂`
+///    ([`gam_solve::estimate::fit_nested_at_fitted_log_lambdas`]). Re-selecting
+///    `λ` for the reduced model would make `W` the difference of two REML
+///    optima, which at a null-railed term is the outer search's tolerance and
+///    not a likelihood ratio. `W = 2(ℓ_full − ℓ_null)`.
 /// 3. The reference d.f. `d` is the Wood truncation `tr(F)²/tr(F²)` on the
 ///    term's influence block (the same `ref_df` the summary Wald row reports),
 ///    floored at `max(edf, null_dim, 1)`: this LR test drops the whole term, so
@@ -696,13 +876,22 @@ fn fitted_rho_penalty_components(
 ///    `W` with [`gam_terms::inference::lawley::lawley_lr_bartlett_factor`]. The
 ///    null annihilates the tested block's penalty (`S_λ β₀ = 0` on that block),
 ///    so the penalized Lawley expansion applies verbatim.
-/// 5. Otherwise (no closed-form jets, or a null refit that did not converge) the
-///    uncorrected `χ²_d` stands with provenance `none` — never weakened.
+/// 5. Otherwise (no closed-form jets) the uncorrected `χ²_d` stands with
+///    provenance `none` — never weakened.
 ///
-/// Random-effect smooths are skipped (their tests are not a central-χ² LR).
-/// Shape-constrained smooths are skipped too; they have no calibrated LR
-/// reference, and [`smooth_term_lr_unavailable_forspec`] names them with the
-/// typed reason, matching the summary table's policy.
+/// # Output
+///
+/// Exactly one [`SmoothTermLrReport`] per tested smooth term, in term order.
+/// Its outcome is either the inference — whose [`SmoothTermLrInference::p_value`]
+/// is a resolved value or an explicit ceiling — or the typed
+/// [`SmoothLrUnavailable`] reason the term has none: a reduced model whose fit
+/// did not converge, a degenerate reference, and so on. A failure of one term's
+/// refit is that term's reason and never the call's error; `Err` is reserved
+/// for inputs that break the driver's own invariants.
+///
+/// Shape-constrained smooths have no calibrated LR reference, and
+/// [`smooth_term_lr_unavailable_forspec`] names them with the typed reason,
+/// matching the summary table's policy, so they get no report here.
 pub fn smooth_term_lr_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -711,7 +900,7 @@ pub fn smooth_term_lr_inference_forspec(
     resolvedspec: &TermCollectionSpec,
     family: LikelihoodSpec,
     options: &FitOptions,
-) -> Result<Vec<SmoothTermLrInference>, EstimationError> {
+) -> Result<Vec<SmoothTermLrReport>, EstimationError> {
     use gam_terms::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
         lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
@@ -720,7 +909,10 @@ pub fn smooth_term_lr_inference_forspec(
     let n = data.nrows();
     // Full fit: ℓ_full, the per-term coefficient ranges/EDF/influence, and the
     // full design whose column layout fixes each tested block for Lawley.
-    let full = fit_term_collection_forspec(
+    //
+    // A failure here is every term's reason, reported per term like any other:
+    // the call's contract is one row per smooth, each a p-value or a reason.
+    let full = match fit_term_collection_forspec(
         data,
         y,
         weights,
@@ -728,7 +920,22 @@ pub fn smooth_term_lr_inference_forspec(
         resolvedspec,
         family.clone(),
         options,
-    )?;
+    ) {
+        Ok(full) => full,
+        Err(error) => {
+            let message = error.to_string();
+            return Ok(resolvedspec
+                .smooth_terms
+                .iter()
+                .enumerate()
+                .map(|(term_idx, term)| SmoothTermLrReport {
+                    name: term.name.clone(),
+                    term_idx,
+                    outcome: Err(SmoothLrUnavailable::FullRefitFailed(message.clone())),
+                })
+                .collect());
+        }
+    };
     let ll_full = full.fit.log_likelihood;
     let p_total = full.design.design.ncols();
     let lambdas = full.fit.lambdas.as_slice().ok_or_else(|| {
@@ -837,8 +1044,35 @@ pub fn smooth_term_lr_inference_forspec(
         },
     );
 
-    let mut out = Vec::<SmoothTermLrInference>::new();
+    // The nested null of every term is the full problem with one block fixed at
+    // zero, solved at the full fit's `ρ̂` on the offset the full fit was solved
+    // with. The bounded-linear route solves a different problem (a box on the
+    // bounded coefficients) that this nested fit does not reproduce.
+    let null_offset = full
+        .design
+        .compose_offset(offset, "smooth likelihood-ratio null model")
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let bounded_linear = resolvedspec.has_bounded_linear_terms();
+    let nested_inputs = gam_solve::estimate::NestedFixedLambdaInputs {
+        design: &full.design.design,
+        y,
+        weights,
+        offset: null_offset.view(),
+        penalties: &full.design.penalties,
+        nullspace_dims: &full.design.nullspace_dims,
+        linear_constraints: full.design.linear_constraints.as_ref(),
+        fit: &full.fit,
+        tol: options.tol,
+        link_shape_estimated: options.optimize_sas || options.optimize_mixture,
+    };
+
+    let mut out = Vec::<SmoothTermLrReport>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
+        let report = |outcome| SmoothTermLrReport {
+            name: design_term.name.clone(),
+            term_idx,
+            outcome,
+        };
         let penalty_range = full
             .design
             .smooth_term_penalty_range(term_idx)
@@ -855,6 +1089,7 @@ pub fn smooth_term_lr_inference_forspec(
         let coeff_range = (smooth_start + design_term.coeff_range.start)
             ..(smooth_start + design_term.coeff_range.end);
         if coeff_range.start >= coeff_range.end || coeff_range.end > p_total {
+            out.push(report(Err(SmoothLrUnavailable::EmptyCoefficientBlock)));
             continue;
         }
         // Per-term EDF for the χ² reference df FALLBACK (used only when the
@@ -962,6 +1197,45 @@ pub fn smooth_term_lr_inference_forspec(
                 (lo - rho, hi - rho)
             })
             .collect();
+        // Null model: this term's block fixed at zero, at the full fit's `ρ̂`.
+        // It is solved before the reference because the selection replay
+        // scores the OBSERVED data too: the tested block's score at the nested
+        // null, `g_j = X_jᵀ ∂ℓ/∂η`, is the draw the replay's own `z` stands in
+        // for (see `SmoothLrSelectionReplay::observed`). The reasons keep their
+        // precedence — a degenerate reference is reported before the null fit's.
+        let null_outcome = if bounded_linear {
+            None
+        } else {
+            Some(gam_solve::estimate::fit_nested_at_fitted_log_lambdas(
+                &nested_inputs,
+                coeff_range.clone(),
+            )?)
+        };
+        // The score is on the replay's unit-dispersion scale. Every family
+        // whose working weight already carries the dispersion reads it off the
+        // reporting likelihood directly; the profiled Gaussian's score is
+        // `X_jᵀ W (y − μ̂₀)` (unit `φ`), and dividing by `√(D_f / E[V])` puts
+        // it on the scale the selection threshold `expm1((W − B)/n)·E[V]` is
+        // expressed in — the same `D_f/E[V]` that threshold divides out.
+        let observed_score = match null_outcome.as_ref() {
+            Some(gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null)) => {
+                let block_score = full_design_dense
+                    .slice(ndarray::s![.., coeff_range.start..coeff_range.end])
+                    .t()
+                    .dot(&null.eta_score);
+                let unit_scale = match profiled_residual.as_ref() {
+                    Some((residual_weights, residual_unit_dimension)) => {
+                        let expected_residual =
+                            residual_weights.iter().sum::<f64>() + residual_unit_dimension;
+                        full.fit.deviance / expected_residual
+                    }
+                    None => 1.0,
+                };
+                (unit_scale.is_finite() && unit_scale > 0.0)
+                    .then(|| block_score.mapv(|value| value / unit_scale.sqrt()))
+            }
+            _ => None,
+        };
         let reference = lr_null_reference(
             influence,
             hessian_inverse.as_ref(),
@@ -972,6 +1246,7 @@ pub fn smooth_term_lr_inference_forspec(
             &log_scale_windows,
             &term_penalties,
             &term_log_lambda,
+            observed_score.as_ref(),
         );
         let mut reference = reference;
         let ref_df = reference.mean;
@@ -982,49 +1257,38 @@ pub fn smooth_term_lr_inference_forspec(
             && reference.scale.is_finite()
             && reference.scale > 0.0)
         {
+            out.push(report(Err(SmoothLrUnavailable::DegenerateReference)));
             continue;
         }
 
-        // Null model: drop this smooth term from the spec and refit. The term's
-        // name pins which spec entry to remove (design and spec share names).
-        let mut null_spec = resolvedspec.clone();
-        let Some(spec_pos) = null_spec
-            .smooth_terms
-            .iter()
-            .position(|t| t.name == design_term.name)
-        else {
+        let Some(null_outcome) = null_outcome else {
+            out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(
+                "the model has bounded linear terms, whose box-constrained fit the \
+                 nested fixed-lambda null does not reproduce"
+                    .to_string(),
+            ))));
             continue;
         };
-        null_spec.smooth_terms.remove(spec_pos);
-        let null_fit = fit_term_collection_forspec(
-            data,
-            y,
-            weights,
-            offset,
-            &null_spec,
-            family.clone(),
-            options,
-        );
-        let (statistic_lr, eta_null, null_residual_df) = match null_fit {
-            Ok(null) if null.fit.log_likelihood.is_finite() => {
-                let w = (2.0 * (ll_full - null.fit.log_likelihood)).max(0.0);
-                // η at the null fit: X_null β_null + affine_offset + offset
-                // (per-row linear predictor; design-layout independent — Lawley
-                // reads it on the full design rows). `compose_offset` folds the
-                // design's fixed affine channel (non-zero endpoint anchor,
-                // #2297) into the user offset.
-                let null_offset = null
-                    .design
-                    .compose_offset(offset, "smooth likelihood-ratio null model")
-                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                let mut eta = null.design.design.dot(&null.fit.beta);
-                eta += &null_offset;
-                let residual_df =
-                    profiled_residual_degrees_of_freedom(&null.fit, profiled_observations);
-                (w, Some(eta), residual_df)
+        let null = match null_outcome {
+            gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null) => null,
+            gam_solve::estimate::NestedFixedLambdaOutcome::NotConverged(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitNotConverged(message))));
+                continue;
             }
-            _ => (f64::NAN, None, None),
+            gam_solve::estimate::NestedFixedLambdaOutcome::Unsupported(message) => {
+                out.push(report(Err(SmoothLrUnavailable::NullFitUnsupported(message))));
+                continue;
+            }
         };
+        if !null.log_likelihood.is_finite() {
+            out.push(report(Err(SmoothLrUnavailable::NullLogLikelihoodNotFinite)));
+            continue;
+        }
+        let log_likelihood_ratio = 2.0 * (ll_full - null.log_likelihood);
+        // η at the null fit, offset included: Lawley reads it on the full
+        // design's rows.
+        let eta_null = Some(null.eta);
+        let null_residual_df = null.profiled_residual_df;
 
         // The estimated-scale channel needs BOTH fits' residual degrees of
         // freedom, so it is completed here rather than where the rest of the
@@ -1045,11 +1309,24 @@ pub fn smooth_term_lr_inference_forspec(
                 residual_unit_dimension: *residual_unit_dimension,
             });
         }
+        // The statistic's support is the reference's. A known-scale `W` is a
+        // non-negative combination of chi-squares, so a negative value is the
+        // two fits' optimizer noise and zero is the same event. A profiled `W`
+        // is `n·ln(1 + Q/V) + B`, whose support starts at `B`, and `B < 0`
+        // whenever the full fit spends any residual degree of freedom the null
+        // does not (`n·ln x < n(x − 1) ≤ ν_0(x − 1)` for `x = ν_f/ν_0 < 1`,
+        // since `ν_0 ≤ n`): a `W` in `(B, 0)` is an ordinary null draw, and moving
+        // it to zero scored it as `P(W > 0)` — an atom near 0.6 carrying the
+        // half of the null replicates whose term REML shrinks away.
+        let statistic_lr = if reference.profiled_scale.is_some() {
+            log_likelihood_ratio
+        } else {
+            log_likelihood_ratio.max(0.0)
+        };
         let ref_df_provenance = reference.clone();
 
-        // The uncorrected tail is read only to judge how far the correction
-        // moved the answer (`material`); it is not published as a p-value.
-        let (p_uncorrected, _) = reference.tail_probability_with_bound(statistic_lr);
+        let (p_uncorrected, mut p_bound) = reference.tail_probability_with_bound(statistic_lr);
+        let mut p_conditional = reference.conditional_tail_probability(statistic_lr);
 
         // Magic Bartlett correction: only when the LR statistic is finite, the
         // family has closed-form jets, n is in the resolvable regime, and the
@@ -1089,7 +1366,18 @@ pub fn smooth_term_lr_inference_forspec(
                 {
                     let mut c_applied = c_cond;
                     correction = SmoothLrCorrection::LawleyLrFixedLambda;
-                    if let Some(cov) = rho_covariance
+                    // The ρ-variation mean shift is a first-order account of what
+                    // estimating `λ` does to `W`. A selection replay already puts
+                    // the whole of that into the law — it re-selects `λ` on every
+                    // draw — so adding the shift as well counts it twice. On a
+                    // term REML shrinks to its null the double count is not
+                    // small: an `O(1/n)` shift over `ref_df ~ 1e-5` is a factor
+                    // near 70, and it moved every such term's p-value to ~1.
+                    // With a replay, only the fixed-`λ` factor — the
+                    // non-Gaussian part of the conditional law, which the
+                    // replay's Gaussian quadratic form does not carry — applies.
+                    if reference.selection.replay().is_none()
+                        && let Some(cov) = rho_covariance
                         && let Ok(total_shift) = lawley_lr_mean_shift_with_rho_variation(
                             full_design_dense.view(),
                             &kappas,
@@ -1120,7 +1408,11 @@ pub fn smooth_term_lr_inference_forspec(
                     // the same operation on this reference — the law is exactly
                     // scale-equivariant — so the correction composes with the
                     // scaled reference without a second convention.
-                    p_corrected = reference.tail_probability_with_bound(statistic_corrected).0;
+                    let (corrected, corrected_bound) =
+                        reference.tail_probability_with_bound(statistic_corrected);
+                    p_corrected = corrected;
+                    p_conditional = reference.conditional_tail_probability(statistic_corrected);
+                    p_bound = p_bound.max(corrected_bound);
                 }
             }
         }
@@ -1147,7 +1439,18 @@ pub fn smooth_term_lr_inference_forspec(
             SmoothLrCorrection::None => false,
         };
 
-        out.push(SmoothTermLrInference {
+        if let SmoothLrSelection::Declined(reason) = reference.selection
+            && reason.is_refusal()
+        {
+            out.push(report(Err(SmoothLrUnavailable::SelectionRefused(reason))));
+            continue;
+        }
+        let Some(p_value) = SmoothLrReferenceDf::typed_p_value(p_corrected, p_bound) else {
+            out.push(report(Err(SmoothLrUnavailable::TailNotComputable)));
+            continue;
+        };
+
+        out.push(report(Ok(SmoothTermLrInference {
             name: design_term.name.clone(),
             term_idx,
             statistic_lr,
@@ -1157,10 +1460,14 @@ pub fn smooth_term_lr_inference_forspec(
             bartlett_factor_conditional,
             rho_variation_shift,
             statistic_corrected,
-            p_value: p_corrected,
+            p_value_uncorrected: p_uncorrected,
+            p_value_corrected: p_corrected,
             material,
             correction,
-        });
+            p_value_conditional: p_conditional,
+            p_value_bound: p_bound,
+            p_value,
+        })));
     }
     Ok(out)
 }
@@ -1316,6 +1623,7 @@ fn lr_null_reference(
     log_scale_windows: &[(f64, f64)],
     term_penalties: &[Array2<f64>],
     term_log_lambda: &[f64],
+    observed_score: Option<&Array1<f64>>,
 ) -> SmoothLrReferenceDf {
     let from_moments = |mean: f64, second_moment: f64, source| SmoothLrReferenceDf {
         weights: Vec::new(),
@@ -1386,6 +1694,7 @@ fn lr_null_reference(
                     term_penalties,
                     term_log_lambda,
                     log_scale_windows,
+                    observed_score,
                 ),
                 profiled_scale: None,
             };
@@ -1588,6 +1897,7 @@ mod lr_null_reference_tests {
             WINDOW,
             &[],
             &[],
+            None,
         );
         assert_eq!(exact.source, SmoothLrReferenceSource::NullSpectrum);
         assert_eq!(exact.weights.len(), q);
@@ -1595,7 +1905,7 @@ mod lr_null_reference_tests {
         // No `H⁻¹` (or no penalty): the moments off `F`, and NO weights — which
         // is exactly the condition `tail_probability_with_bound` switches on.
         for degraded in [
-            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[]),
+            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[], None),
             lr_null_reference(
                 Some(&influence),
                 Some(&hessian_inverse),
@@ -1606,6 +1916,7 @@ mod lr_null_reference_tests {
                 WINDOW,
                 &[],
                 &[],
+                None,
             ),
         ] {
             assert_eq!(degraded.source, SmoothLrReferenceSource::SpectralMomentMatch);
@@ -1614,18 +1925,18 @@ mod lr_null_reference_tests {
         }
 
         // Nothing at all: the unit-weight shape with its `max(edf, null_dim, 1)`.
-        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[]);
+        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[], None);
         assert_eq!(fallback.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert!(fallback.weights.is_empty());
         assert_eq!(fallback.chi_square_df, 2.5);
         assert_eq!(fallback.scale, 1.0);
         // The `max(edf, null_dim, 1)` shape is retained only on this lane.
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[]).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[], None).chi_square_df,
             3.0
         );
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[]).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[], None).chi_square_df,
             1.0
         );
     }
@@ -1726,6 +2037,124 @@ mod profiled_scale_reference_tests {
         assert!(just_above < 1.0 && just_above > 0.999, "{just_above}");
     }
 
+    /// A profiled `W` between the offset and zero is an ordinary draw from the
+    /// reference: its tail is resolved, strictly between the tail at zero and
+    /// one, and falls as `W` rises. Scoring it as `W = 0` put an atom at the
+    /// tail at zero under half of the null replicates.
+    #[test]
+    fn a_statistic_between_the_offset_and_zero_is_scored_where_it_is() {
+        use super::SmoothLrPValue;
+        let subject = reference(
+            vec![1.0_f64, 0.5],
+            Some(SmoothLrProfiledScale {
+                observations: 30.0,
+                deterministic_offset: -0.61,
+                residual_weights: vec![0.25],
+                residual_unit_dimension: 24.0,
+            }),
+        );
+        let (at_zero, _) = subject.tail_probability_with_bound(0.0);
+        let mut previous = 1.0;
+        for &statistic in &[-0.5_f64, -0.3, -0.1, -1e-3] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            assert!(value.is_finite() && accuracy.is_finite(), "W={statistic}: {value} ± {accuracy}");
+            assert!(value > at_zero && value < previous, "W={statistic}: {value} vs [{at_zero}, {previous}]");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value))
+            );
+            previous = value;
+        }
+    }
+
+    /// A huge effect is reported as a finite tiny p-value that is the tail.
+    ///
+    /// On the profiled reference the tail is `P(F_{q,ν} > c·ν/(g·q))` in closed
+    /// form (see the flat-spectrum test above), which `fisher_snedecor_sf`
+    /// evaluates in log space. The reference's inversion is accurate relative
+    /// to the tail, so a tail of `10⁻⁹⁰` is resolved as a point value within
+    /// its own published accuracy of the exact one — not rounded to zero, and
+    /// not floored at an absolute accuracy.
+    #[test]
+    fn a_huge_effect_is_a_finite_tiny_p_value_at_the_exact_tail() {
+        use super::SmoothLrPValue;
+        let (q, scale, nu) = (4usize, 0.37_f64, 26.0_f64);
+        let observations = nu + q as f64;
+        let subject = reference(
+            vec![scale; q],
+            Some(SmoothLrProfiledScale {
+                observations,
+                deterministic_offset: 0.0,
+                residual_weights: Vec::new(),
+                residual_unit_dimension: nu,
+            }),
+        );
+        for &statistic in &[90.0_f64, 150.0, 400.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let ratio = (statistic / observations).exp_m1();
+            let exact =
+                gam_math::probability::fisher_snedecor_sf(ratio * nu / (scale * q as f64), q as f64, nu);
+            assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value)),
+                "W={statistic}: {value:.3e} ± {accuracy:.3e}"
+            );
+            assert!(
+                (value - exact).abs() <= accuracy,
+                "W={statistic}: {value:.6e} ± {accuracy:.3e} against the exact tail {exact:.6e}"
+            );
+        }
+    }
+
+    /// A value its own accuracy does not separate from zero is published as the
+    /// top of the certified interval, never as a point value, and never as a
+    /// ceiling of zero.
+    #[test]
+    fn an_unresolved_tail_is_the_top_of_its_certified_interval() {
+        use super::SmoothLrPValue;
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(4e-17, 1e-13),
+            Some(SmoothLrPValue::UpperBound(1e-13 + 4e-17))
+        );
+        // A residue below zero is not part of the ceiling.
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(-3e-15, 1e-13),
+            Some(SmoothLrPValue::UpperBound(1e-13))
+        );
+        assert_eq!(
+            SmoothLrReferenceDf::typed_p_value(0.0, 0.0),
+            Some(SmoothLrPValue::UpperBound(f64::from_bits(1)))
+        );
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, 1e-13), Some(SmoothLrPValue::Resolved(0.2)));
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(f64::NAN, 0.0), None);
+        assert_eq!(SmoothLrReferenceDf::typed_p_value(0.2, f64::NAN), None);
+    }
+
+    /// On a flat known-scale spectrum the law is a chi-square with a closed-form
+    /// tail, so the inversion can be checked against it: even a tail of `10⁻⁴⁰`
+    /// is a resolved finite value within its own accuracy of the exact one — no
+    /// floor at `10⁻¹⁶`, no `1 − cdf` cancellation.
+    #[test]
+    fn a_closed_form_tail_resolves_arbitrarily_deep() {
+        use super::SmoothLrPValue;
+        let subject = reference(vec![1.0; 3], None);
+        for &statistic in &[80.0_f64, 200.0, 600.0] {
+            let (value, accuracy) = subject.tail_probability_with_bound(statistic);
+            let exact = gam_math::probability::chi_square_sf(statistic, 3.0);
+            assert!(exact > 0.0 && exact < 1e-16, "W={statistic}: {exact:.3e}");
+            assert_eq!(
+                SmoothLrReferenceDf::typed_p_value(value, accuracy),
+                Some(SmoothLrPValue::Resolved(value)),
+                "W={statistic}: {value:.3e} ± {accuracy:.3e}"
+            );
+            assert!(
+                (value - exact).abs() <= accuracy,
+                "W={statistic}: {value:.6e} ± {accuracy:.3e} against the exact tail {exact:.6e}"
+            );
+        }
+    }
+
     /// A `λ̂` that WAS chosen but whose selection replay refused has no p-value.
     ///
     /// The tail used to fall through to the conditional (fixed-`λ`) law on ANY
@@ -1743,6 +2172,7 @@ mod profiled_scale_reference_tests {
             SmoothLrSelectionDecline::WindowClosed,
             SmoothLrSelectionDecline::GridRefused,
             SmoothLrSelectionDecline::SelectionUnresolved,
+            SmoothLrSelectionDecline::ObservedScoreUnusable,
         ];
         for decline in declines {
             let mut subject = reference(vec![1.0_f64, 0.6, 0.2], None);
@@ -1812,7 +2242,7 @@ mod lr_null_spectrum_moment_tests {
         let f = ndarray::array![[0.5_f64, 40.0], [40.0, 0.5]];
         let [mean, _] = lr_null_spectral_moments(Some(&f), &(0..2)).unwrap();
         assert!(mean < 0.0, "the corrupted block's first moment is {mean}");
-        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[]);
+        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[], None);
         assert_eq!(reference.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert_eq!(reference.chi_square_df, 1.0);
         assert_eq!(reference.scale, 1.0);
@@ -1835,7 +2265,7 @@ mod lr_null_spectrum_moment_tests {
             [0.0, 0.0]
         );
         assert_eq!(
-            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[]).source,
+            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[], None).source,
             SmoothLrReferenceSource::UnitWeightFallback
         );
     }

@@ -70,7 +70,7 @@ def test_shape_constrained_pvalue_is_withheld_with_a_typed_reason(shape: str) ->
     assert [row["term_idx"] for row in lr] == sorted(row["term_idx"] for row in lr)
     by_name = {row["name"]: row for row in lr}
     assert set(by_name) == {"s(x1)", shaped_name}, lr
-    assert by_name["s(x1)"].get("p_value") is not None, by_name["s(x1)"]
+    assert by_name["s(x1)"].get("p_value_corrected") is not None, by_name["s(x1)"]
     assert "p_value_unavailable" not in by_name["s(x1)"], by_name["s(x1)"]
     withheld = by_name[shaped_name]
     assert withheld["p_value_unavailable"] == "shape_constrained", withheld

@@ -253,8 +253,10 @@ class Summary:
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
         and — for penalized smooths — ``chi_sq`` (the whitened Wald
         statistic) and ``p_value``, read against the statistic's null law with
-        the REML selection of ``λ`` replayed. Random-effect smooths report
-        ``edf`` only. A shape-constrained smooth (``shape=...``) has no
+        the REML selection of ``λ`` replayed. Random-effect blocks carry the
+        score test of their variance component ``σ²_b = 0`` in ``chi_sq`` /
+        ``p_value``, scored against its exact boundary null law, with
+        ``ref_df`` its effective d.f. A shape-constrained smooth (``shape=...``) has no
         ``chi_sq`` or ``p_value``; it carries
         ``p_value_unavailable = "shape_constrained"`` instead, because its null
         ``f = 0`` is the apex of the constraint cone and no calibrated reference

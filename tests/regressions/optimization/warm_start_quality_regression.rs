@@ -136,7 +136,6 @@ fn fit_at_rho_full(
         },
         PenaltyConfig {
             canonical_penalties: penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,
@@ -331,7 +330,6 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
         },
         PenaltyConfig {
             canonical_penalties: &penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,

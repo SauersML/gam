@@ -92,7 +92,7 @@ pub(crate) use super::*;
 mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
-    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
+    use super::{DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily, WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance, compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical, pirls_data_log_kernel_from_eta, select_active_set_release, should_log_pirls_decision_summary, should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, unit_measure_deviance_and_log_kernel_from_eta, update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state, write_negative_binomial_log_working_state, write_poisson_log_working_state, write_tweedie_log_working_state};
     use crate::estimate::EstimationError;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use approx::assert_relative_eq;
@@ -1233,8 +1233,8 @@ mod tests {
             .map(|root| {
                 let rank = root.nrows();
                 CanonicalPenalty {
-                    local: root.t().dot(&root),
-                    root,
+                    local: root.t().dot(&root).into_shared(),
+                    root: root.into_shared(),
                     col_range: 0..p,
                     total_dim: p,
                     nullity: p - rank,
@@ -1296,7 +1296,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,
@@ -1317,7 +1316,7 @@ mod tests {
     #[test]
     pub(crate) fn sparse_native_reparam_preserves_declared_penalty() {
         use gam_terms::construction::{
-            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+            CanonicalPenalty, EngineDims, stable_reparameterization_original_frame,
         };
         use ndarray::array;
 
@@ -1325,16 +1324,13 @@ mod tests {
         let root = array![[1.0, 0.0]];
         let canonical = vec![CanonicalPenalty::from_dense_root(root, p)];
         let lambdas = [3.0f64];
-        let base = stable_reparameterization_engine_canonical(
+        let result = stable_reparameterization_original_frame(
             &canonical,
             &lambdas,
             EngineDims::new(p, canonical.len()),
             None,
         )
         .expect("declared penalty must reparameterize");
-        let result = super::loop_driver::build_sparse_native_reparam_result(
-            base, &canonical, &lambdas, p,
-        );
 
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for (actual, expected) in gram.iter().zip(result.s_transformed.iter()) {
@@ -1397,11 +1393,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -1434,7 +1430,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -1535,11 +1530,11 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let r = array![[1.0]];
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            root: r.clone(),
+            root: r.clone().into_shared(),
             col_range: 0..r.ncols(),
             total_dim: r.ncols(),
             nullity: 0,
-            local: r.t().dot(&r),
+            local: r.t().dot(&r).into_shared(),
             prior_mean: Array1::zeros(r.ncols()),
             positive_eigenvalues: Vec::new(),
             op: None,
@@ -1574,7 +1569,6 @@ mod tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 1,
                     coefficient_lower_bounds: None,
@@ -2259,6 +2253,74 @@ mod tests {
         assert_eq!(data_kernel, -0.5 * raw_weighted_rss / phi);
     }
 
+    #[test]
+    fn unit_measure_single_pass_objective_is_bit_identical_to_the_two_pass_objective() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(2_026_091_9);
+        let n = 4096usize;
+        let eta = Array1::from_iter((0..n).map(|_| -6.0 + 8.0 * rng.random::<f64>()));
+        let bernoulli_y = eta.mapv(|e| {
+            let p = 1.0 / (1.0 + (-e).exp());
+            if rng.random::<f64>() < p { 1.0 } else { 0.0 }
+        });
+        let bernoulli_w = Array1::from_iter((0..n).map(|i| if i % 97 == 0 { 0.0 } else { 1.0 }));
+        let trials = Array1::from_iter((0..n).map(|i| (1 + i % 9) as f64));
+        let trials_y = Array1::from_iter(
+            (0..n).map(|i| (rng.random::<f64>() * (trials[i] + 1.0)).floor().min(trials[i]) / trials[i]),
+        );
+        let poisson_eta = eta.mapv(|e| 0.25 * e);
+        let poisson_y = poisson_eta.mapv(|e| (rng.random::<f64>() * 2.0 * e.exp()).floor());
+        let poisson_w = Array1::from_iter((0..n).map(|_| 0.5 + rng.random::<f64>()));
+
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        let log = InverseLink::Standard(StandardLink::Log);
+        let binomial = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            logit.clone(),
+        ));
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            log.clone(),
+        ));
+        let cases = [
+            ("bernoulli", &binomial, &logit, &bernoulli_y, &eta, &bernoulli_w),
+            ("binomial trials", &binomial, &logit, &trials_y, &eta, &trials),
+            ("poisson", &poisson, &log, &poisson_y, &poisson_eta, &poisson_w),
+        ];
+        for (label, likelihood, link, y, eta, w) in cases {
+            let deviance =
+                calculate_deviance_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("two-pass deviance");
+            let log_kernel =
+                pirls_data_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view(), deviance)
+                    .expect("two-pass data log-kernel");
+            let (fused_deviance, fused_log_kernel) =
+                unit_measure_deviance_and_log_kernel_from_eta(y.view(), eta, likelihood, link, w.view())
+                    .expect("single-pass objective")
+                    .expect("unit-measure family takes the single pass");
+            assert_eq!(fused_deviance.to_bits(), deviance.to_bits(), "{label} deviance");
+            assert_eq!(fused_log_kernel.to_bits(), log_kernel.to_bits(), "{label} log-kernel");
+        }
+
+        let profiled_gaussian = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ));
+        assert!(
+            unit_measure_deviance_and_log_kernel_from_eta(
+                poisson_y.view(),
+                &poisson_eta,
+                &profiled_gaussian,
+                &profiled_gaussian.spec.link,
+                poisson_w.view(),
+            )
+            .expect("profiled Gaussian is declined, not rejected")
+            .is_none()
+        );
+    }
+
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must
     /// report the conventional **unscaled** deviance `D = 2·Σ wᵢ·d(yᵢ, μᵢ)` —
     /// exactly like Poisson/Binomial/NB/Beta and R/mgcv/statsmodels — and must
@@ -2590,11 +2652,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2627,7 +2689,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -2668,11 +2729,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2705,7 +2766,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -4190,11 +4250,11 @@ mod root_cause_tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -4228,7 +4288,6 @@ mod root_cause_tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
@@ -4293,11 +4352,11 @@ mod root_cause_tests {
                 .map(|r| {
                     let local = r.t().dot(r);
                     gam_terms::construction::CanonicalPenalty {
-                        root: r.clone(),
+                        root: r.clone().into_shared(),
                         col_range: 0..r.ncols(),
                         total_dim: r.ncols(),
                         nullity: 0,
-                        local,
+                        local: local.into_shared(),
                         prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
@@ -4331,7 +4390,6 @@ mod root_cause_tests {
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,
-                        balanced_penalty_root: None,
                         reparam_invariant: None,
                         p: 3,
                         coefficient_lower_bounds: None,

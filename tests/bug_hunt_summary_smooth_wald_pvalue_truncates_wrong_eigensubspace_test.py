@@ -63,7 +63,7 @@ def test_dominant_smooth_wald_pvalue_is_significant():
 
     # Ground truth: the LR test finds the term overwhelmingly significant.
     assert lr["statistic_lr"] > 100.0, f"LR statistic unexpectedly small: {lr}"
-    assert lr["p_value"] < 1e-6
+    assert lr["p_value_corrected"] < 1e-6
 
     # The bug: summary Wald reported chi_sq ~ 1.74, p ~ 0.99 for this same term.
     assert wald["chi_sq"] is not None and wald["p_value"] is not None
@@ -100,9 +100,9 @@ def test_wald_and_lr_agree_on_significance_direction():
     for name in ("s(x1)", "s(x2)"):
         w = wald[name]
         l = lr[name]
-        if l["p_value"] < 1e-4:
+        if l["p_value_corrected"] < 1e-4:
             assert w["p_value"] < 1e-2, (
-                f"{name}: LR significant (p={l['p_value']:.3g}) but "
+                f"{name}: LR significant (p={l['p_value_corrected']:.3g}) but "
                 f"Wald not (p={w['p_value']:.3g})"
             )
         # A p-value is always a valid probability.

@@ -69,7 +69,7 @@ def _sweep() -> list[dict[str, float]]:
                 "freq": f,
                 "term_edf": term_edf,
                 "ref_df": float(rec["ref_df"]),
-                "p": float(rec["p_value"]),
+                "p": float(rec["p_value_corrected"]),
                 # A fit that stalls without converging (the flat-valley REML
                 # stall on an unidentified term, #1762) has an untrustworthy edf,
                 # so smooth_significance deliberately references it against the
@@ -140,10 +140,10 @@ def test_moderate_signal_is_not_judged_over_conservatively() -> None:
         f"moderate fit judged against an inflated ref_df={rec['ref_df']:.2f} "
         f"(term_edf={term_edf:.2f})"
     )
-    assert rec["p_value"] < 1e-2, (
+    assert rec["p_value_corrected"] < 1e-2, (
         "a genuine moderate signal was not detected "
         f"(term_edf={term_edf:.2f}, ref_df={rec['ref_df']:.2f}, "
-        f"p={rec['p_value']:.3g}) — reference d.f. is over-conservative"
+        f"p={rec['p_value_corrected']:.3g}) — reference d.f. is over-conservative"
     )
 
 
@@ -168,7 +168,7 @@ def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
         model = gamfit.fit({"x": list(x), "y": list(y)}, "y ~ s(x)")
         summary = model.summary()
         rec = model.smooth_significance({"x": list(x), "y": list(y)})[0]
-        p = float(rec["p_value"])
+        p = float(rec["p_value_corrected"])
         if int(model.outer_iterations) >= 200:  # the stall signature
             stalls += 1
             if worst is None or p < worst[1]:

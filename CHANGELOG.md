@@ -15,22 +15,15 @@
   publishes no p-value, with `pvalue_unavailable = "selection_refused"`, rather than the
   anti-conservative fixed-`λ` tail. The design Gram the old test needed is no longer
   built: `smooth_term_summary_rows(design, spec, fit)` lost its whitening argument.
-- **`smooth_significance` publishes one calibrated p-value per term.** Each row used to
-  carry `p_value_uncorrected`, `p_value_corrected`, `p_value_conditional` and
-  `p_value_bound`, and they disagreed under the null. The conditional (fixed-`λ`) tail
-  treats the REML `λ̂` as given instead of chosen from the same data, and on
-  `y ~ s(x) + s(z)` with a null `z` it rejected at 0.075–0.105 (Gaussian) and
-  0.30 (binomial, n = 100) against a nominal 0.05. The rows now carry a single
-  `p_value`, taken from the Bartlett-corrected statistic with the λ̂-selection replay
-  applied. `statistic_lr`, `statistic_corrected` and the full reference (`reference_*`,
-  `selection`) are still published. When `λ̂` was chosen but the selection replay could
-  not be computed (`selection` is `geometry_refused`, `grid_refused` or
-  `selection_unresolved`), `p_value` is NaN. Before this change such rows silently
-  published the conditional tail, which gave a null binomial term `p = 0.0005`. A
-  `rho_covariance` whose shape does not match the fit's penalty components is now an
-  error; before, the estimated-`λ` Bartlett factor was dropped without notice.
-  **Migration:** read `p_value`, in the Rust report, the pyffi rows and
-  `gamfit` alike.
+- **`smooth_significance` publishes no p-value when the λ̂-selection replay refuses.**
+  When `λ̂` was chosen but the replay could not be computed (`selection` is
+  `geometry_refused`, `grid_refused`, `selection_unresolved` or
+  `observed_score_unusable`), the row silently published the conditional (fixed-`λ`)
+  tail, which treats `λ̂` as given and gave a null binomial term `p = 0.0005`. Such a
+  row now has `outcome = Err(SmoothLrUnavailable::SelectionRefused(reason))`
+  (`p_value_unavailable = "selection_refused"`). A `rho_covariance` whose shape does not
+  match the fit's penalty components is now an error; before, the estimated-`λ`
+  Bartlett factor was dropped without notice.
 - **The λ̂-selection replay no longer refuses Bernoulli draws whose penalty shares
   saturate.** The certified search enclosed the criterion's slope and curvature through
   the shares `s = x/(1+x)` and their complements, and computed the complement as `1 − s`.

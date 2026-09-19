@@ -54,7 +54,8 @@ def _record(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
         "edf_total": float(summary.edf_total),
         "W": float(rec["statistic_lr"]),
         "ref_df": float(rec["ref_df"]),
-        "p_value": float(rec["p_value"]),
+        "p_corrected": float(rec["p_value_corrected"]),
+        "p_uncorrected": float(rec["p_value_uncorrected"]),
     }
 
 
@@ -94,7 +95,7 @@ def test_null_false_positive_rate_is_calibrated() -> None:
         x = np.linspace(0.0, 1.0, N)
         y = rng.standard_normal(N)  # pure noise
         rec = _record(x, y)
-        if rec["p_value"] < ALPHA:
+        if rec["p_corrected"] < ALPHA:
             rejections += 1
     fpr = rejections / n_seeds
     assert fpr <= 0.15, (
@@ -108,10 +109,10 @@ def test_strong_signal_still_flagged() -> None:
     xp = rng.uniform(0.0, 1.0, 300)
     yp = np.sin(8.0 * xp) + 0.3 * rng.standard_normal(300)
     rec = _record(xp, yp)
-    assert rec["p_value"] < 1e-3, (
+    assert rec["p_corrected"] < 1e-3, (
         "power control: a strong wiggly smooth was not flagged "
         f"(W={rec['W']:.3g}, edf={rec['edf']:.3f}, ref_df={rec['ref_df']:.3g}, "
-        f"p={rec['p_value']:.3g})"
+        f"p={rec['p_corrected']:.3g})"
     )
 
 

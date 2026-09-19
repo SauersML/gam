@@ -181,8 +181,60 @@ def test_tensor_single_k_broadcasts(surface: dict[str, np.ndarray]) -> None:
     assert _width(a, "te(") == 5 * 5 - 1
 
 
+def _factor_fit(amplitude: float, seed: int) -> tuple[np.ndarray, np.ndarray, float]:
+    """Fitted level values, raw group means and edf of a penalized y ~ factor(g)."""
+    levels = np.array(list("abcde"))
+    rng = np.random.default_rng(seed)
+    n = 500
+    g = levels[rng.integers(0, levels.size, n)]
+    effect = amplitude * np.linspace(-2.0, 2.0, levels.size)
+    y = effect[np.searchsorted(levels, g)] + rng.normal(0.0, 1.0, n)
+    m = gamfit.fit({"g": g, "y": y}, "y ~ factor(g)")
+    fitted = np.asarray(m.predict({"g": levels}), float)
+    means = np.array([y[g == level].mean() for level in levels])
+    (row,) = m.summary().smooth_terms
+    return fitted, means, float(row["edf"])
+
+
+NOISE_SEEDS = range(90, 96)
+
+
+def test_penalized_factor_shrinks_pure_noise_levels_to_the_null() -> None:
+    """factor(g) is REML-penalized by default (a prior towards no effect), so on
+    levels that are pure noise it shrinks the raw group means towards the grand
+    mean. Each level keeps a fraction s_j in [0, 1) of its raw deviation and the
+    term's edf is at least max s_j, so the fitted level spread is at most
+    min(1, edf) times the raw spread: it vanishes with the edf, and REML drives
+    the edf to zero (the between-level variance onto its boundary) on some of
+    these seeds."""
+    edfs = []
+    for seed in NOISE_SEEDS:
+        fitted, means, edf = _factor_fit(0.0, seed)
+        assert np.ptp(fitted) < min(1.0, edf) * np.ptp(means), (seed, edf)
+        edfs.append(edf)
+    # An unpenalized factor would spend L - 1 = 4 edf on every seed.
+    assert min(edfs) < 1e-6, edfs
+
+
+@pytest.mark.parametrize("seed", NOISE_SEEDS)
+def test_penalized_factor_tracks_group_means_as_the_signal_grows(seed: int) -> None:
+    """The shrinkage of a level towards the grand mean falls as the between-level
+    variance grows against the noise: the level contrasts approach the raw group
+    contrasts and the edf approaches, but never reaches, L - 1."""
+    gaps, edfs = [], []
+    for amplitude in (0.3, 3.0, 30.0):
+        fitted, means, edf = _factor_fit(amplitude, seed)
+        gaps.append(
+            float(np.max(np.abs((fitted - fitted.mean()) - (means - means.mean()))))
+            / float(np.ptp(means))
+        )
+        edfs.append(edf)
+    assert gaps[0] > gaps[1] > gaps[2], gaps
+    assert edfs[0] < edfs[1] < edfs[2] < len("abcde") - 1, edfs
+
+
 # test_utils::test_check_X_categorical_prediction_exceeds_training
-def test_unseen_fixed_factor_level_at_predict_raises() -> None:
+def test_unseen_factor_level_at_predict_raises() -> None:
     rng = np.random.default_rng(55)
     n = 300
     age = rng.uniform(18.0, 80.0, n)

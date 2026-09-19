@@ -112,6 +112,8 @@ fn lr_report_with(
     .into_iter()
     .find(|report| report.name.contains('z'))
     .expect("a report for the s(z) term")
+    .outcome
+    .unwrap_or_else(|reason| panic!("s(z) has no LR inference: {reason}"))
 }
 
 /// `(deviance, ν = D/σ̂², edf_total, design columns)` for one formula, through
@@ -362,11 +364,11 @@ fn the_published_tail_matches_a_direct_simulation_of_its_own_law() {
         // Invert `c = expm1((w − B)/n)` to get the statistic this ratio is the
         // threshold for, so the reference is asked in the units it takes.
         let statistic = scale.observations * ratio.ln_1p() + scale.deterministic_offset;
-        let (published, bound) = reference.conditional_tail_with_bound(statistic);
+        let published = reference.conditional_tail_probability(statistic);
         let counted =
             sample.iter().filter(|(q, v)| q - ratio * v > 0.0).count() as f64 / DRAWS as f64;
         let standard_error = (counted * (1.0 - counted) / DRAWS as f64).sqrt();
-        let bar = 4.0 * standard_error + bound;
+        let bar = 4.0 * standard_error + report.p_value_bound;
         eprintln!(
             "[2672-simulation] c={ratio:.6e} W={statistic:.6} published={published:.6} \
              counted={counted:.6} |Δ|={:.3e} bar={bar:.3e}",
@@ -376,7 +378,8 @@ fn the_published_tail_matches_a_direct_simulation_of_its_own_law() {
             (published - counted).abs() <= bar,
             "at c = {ratio:.6e} the reference reports {published} and a direct simulation of \
              its own law counts {counted} ({DRAWS} draws, s.e. {standard_error:.3e}); the \
-             reference certifies {bound:.3e}"
+             report certifies {}",
+            report.p_value_bound
         );
     }
 }
