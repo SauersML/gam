@@ -695,8 +695,11 @@ pub struct SaeManifoldTerm {
     /// and carries them onto every materialized chunk. When this flag is `true` the
     /// per-chunk assembly SKIPS its own gate refresh and uses the carried global
     /// gate, so the reduced β-Newton step and line-search objective are
-    /// chunk-size invariant. Default `false` (the dense/full-batch path refreshes
-    /// per assembly, bit-for-bit unchanged). Transient (Clone starts `false`).
+    /// chunk-size invariant. Default `false`: a term with no declared gates
+    /// refreshes them per assembly. A successful quasi-Laplace pricing leaves the
+    /// gates its value read declared (`true`), and a minted fit keeps them, so
+    /// re-pricing a priced state prices the same objective (#2933 F05).
+    /// Transient (Clone starts `false`).
     pub(crate) streaming_gates_frozen: bool,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit

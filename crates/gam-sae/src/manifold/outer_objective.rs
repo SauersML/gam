@@ -1829,10 +1829,9 @@ impl SaeManifoldOuterObjective {
         } = self;
         let fitted_rho = current_rho;
         let mut fitted = term;
-        // #2933 F05 — the declared gates belong to this objective's hyperparameter
-        // solve. The minted fit re-derives them at its next assembly, as every term
-        // outside an objective does.
-        fitted.streaming_gates_frozen = false;
+        // #2933 F05 — the minted fit keeps the gates its certified value was priced
+        // under, so re-pricing it (the shape-uncertainty recompute) prices the same
+        // objective. A clone or an atom compaction drops them.
         if last_loss.is_none() {
             return Err(
                 "SaeManifoldOuterObjective::into_fitted: certified state has no converged inner loss"
@@ -2505,8 +2504,7 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
     ) -> Result<InstalledEnvelopeBasin, String> {
         if let Some((converged, priced)) = self.take_priced_probe_handoff(rho_flat) {
-            self.term = converged;
-            self.seeded_beta = None;
+            self.install_envelope_argmin(converged);
             return Ok(InstalledEnvelopeBasin::Installed { priced });
         }
 
@@ -2520,9 +2518,18 @@ impl SaeManifoldOuterObjective {
                 "SAE basin-envelope protocol violated: a finite probe at the requested rho did not install its exact-rho converged-state handoff"
                     .to_string()
             })?;
+        self.install_envelope_argmin(converged);
+        Ok(InstalledEnvelopeBasin::Installed { priced })
+    }
+
+    /// Install an envelope argmin's converged state. The envelope hands a basin
+    /// member's clone, and `Clone` drops the collapse-prevention gates, so the
+    /// installed state re-declares the objective's gates: its priced value and the
+    /// gradient that differentiates it read exactly those (#2933 F05).
+    fn install_envelope_argmin(&mut self, converged: SaeManifoldTerm) {
         self.term = converged;
         self.seeded_beta = None;
-        Ok(InstalledEnvelopeBasin::Installed { priced })
+        self.declare_collapse_prevention_gates_on_term();
     }
 
     /// Re-converge one saved basin `member` at `rho_flat` through the
