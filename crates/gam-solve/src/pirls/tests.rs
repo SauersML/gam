@@ -1320,7 +1320,7 @@ mod tests {
     #[test]
     pub(crate) fn sparse_native_reparam_preserves_declared_penalty() {
         use gam_terms::construction::{
-            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+            CanonicalPenalty, EngineDims, stable_reparameterization_original_frame,
         };
         use ndarray::array;
 
@@ -1328,16 +1328,13 @@ mod tests {
         let root = array![[1.0, 0.0]];
         let canonical = vec![CanonicalPenalty::from_dense_root(root, p)];
         let lambdas = [3.0f64];
-        let base = stable_reparameterization_engine_canonical(
+        let result = stable_reparameterization_original_frame(
             &canonical,
             &lambdas,
             EngineDims::new(p, canonical.len()),
             None,
         )
         .expect("declared penalty must reparameterize");
-        let result = super::loop_driver::build_sparse_native_reparam_result(
-            base, &canonical, &lambdas, p,
-        );
 
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for (actual, expected) in gram.iter().zip(result.s_transformed.iter()) {

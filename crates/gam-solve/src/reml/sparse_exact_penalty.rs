@@ -7,40 +7,28 @@
 use crate::estimate::EstimationError;
 use gam_terms::construction::CanonicalPenalty;
 
-/// Return the count of block-separable canonical penalties eligible for the
-/// sparse-exact REML path. `None` means at least two penalties overlap in
-/// coefficient range, so the sparse backend must not use block-local assembly.
+/// Return the count of canonical penalties the sparse-exact REML path carries,
+/// after checking that every penalty's coefficient range lies inside `0..p`.
+///
+/// Penalties may share or overlap coefficient ranges (a smooth's double
+/// penalty, `by`-factor smooths): the sparse path assembles `S_λ` from every
+/// component, takes `log|S_λ|₊` and its ρ-derivatives from the merged
+/// eigenspace blocks of [`super::penalty_logdet::PenaltyPseudologdet`], and
+/// reads each `tr(H⁻¹S_k)` from that penalty's own block, so no layout
+/// restriction beyond valid ranges applies.
 pub(crate) fn sparse_penalty_block_count_from_canonical(
     penalties: &[CanonicalPenalty],
     p: usize,
-) -> Result<Option<usize>, EstimationError> {
-    if penalties.is_empty() {
-        return Ok(Some(0));
-    }
-
-    // Check for overlapping ranges.
-    let mut sorted_ranges: Vec<(usize, usize, usize)> = penalties
-        .iter()
-        .enumerate()
-        .map(|(i, cp)| (i, cp.col_range.start, cp.col_range.end))
-        .collect();
-    for &(penalty_ordinal, start, end) in &sorted_ranges {
+) -> Result<usize, EstimationError> {
+    for (penalty_ordinal, cp) in penalties.iter().enumerate() {
+        let (start, end) = (cp.col_range.start, cp.col_range.end);
         if start > end || end > p {
             crate::bail_invalid_estim!(
                 "canonical penalty {penalty_ordinal} has invalid column range {start}..{end} for p={p}"
             );
         }
     }
-    sorted_ranges.sort_by_key(|&(_, start, _)| start);
-    for pair in sorted_ranges.windows(2) {
-        let (_, _, end_left) = pair[0];
-        let (_, start_right, _) = pair[1];
-        if end_left > start_right {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(penalties.len()))
+    Ok(penalties.len())
 }
 
 #[cfg(test)]
@@ -76,9 +64,32 @@ mod tests {
         ];
 
         let block_count = sparse_penalty_block_count_from_canonical(&penalties, 5)
-            .unwrap()
-            .expect("non-overlapping canonical blocks should be sparse-block compatible");
+            .expect("non-overlapping canonical blocks should be sparse-exact compatible");
 
         assert_eq!(block_count, 3);
+    }
+
+    /// A smooth's double penalty puts two components on one coefficient
+    /// range. The sparse-exact path handles shared ranges exactly, so such a
+    /// layout must not be refused (it used to route every `s(x) + group(g)`
+    /// fit to the dense p×p backend).
+    #[test]
+    fn canonical_sparse_penalty_block_count_accepts_shared_ranges() {
+        let penalties = vec![
+            canonical_penalty(0..2, array![[2.0, 0.5], [0.5, 3.0]], vec![2.0, 3.0], 5),
+            canonical_penalty(0..2, array![[1.0, 0.0], [0.0, 0.0]], vec![1.0], 5),
+            canonical_penalty(2..5, Array2::eye(3), vec![1.0, 1.0, 1.0], 5),
+        ];
+
+        let block_count = sparse_penalty_block_count_from_canonical(&penalties, 5)
+            .expect("shared canonical ranges should be sparse-exact compatible");
+
+        assert_eq!(block_count, 3);
+    }
+
+    #[test]
+    fn canonical_sparse_penalty_block_count_rejects_out_of_range_penalty() {
+        let penalties = vec![canonical_penalty(3..6, Array2::eye(3), vec![1.0; 3], 6)];
+        assert!(sparse_penalty_block_count_from_canonical(&penalties, 5).is_err());
     }
 }

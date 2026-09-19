@@ -102,9 +102,7 @@ impl<'a> RemlState<'a> {
         let Some(x_sparse) = x_sparse else {
             return Ok(dense_backend("design_not_sparse", None, None));
         };
-        let Some(block_count) = self.sparse_penalty_block_count else {
-            return Ok(dense_backend("penalty_blocks_not_separable", None, None));
-        };
+        let block_count = self.sparse_penalty_block_count;
 
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
         for (k, cp) in self.canonical_penalties.iter().enumerate() {
@@ -216,7 +214,7 @@ mod tests {
         let rendered = measured.basis();
         assert!(
             rendered.contains("reason=penalized_hessian_too_dense"),
-            "the basis must name which of the six routes decided: {rendered}"
+            "the basis must name which route decided: {rendered}"
         );
         assert!(
             rendered.contains("density_h_est=0.6654") && rendered.contains("nnz_h_est=4096"),

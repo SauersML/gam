@@ -4789,9 +4789,9 @@ pub(crate) struct EvalShared {
     /// hold the bare `RemlGeometry` label, so every consumer that reported
     /// `backend {:?}` reported a two-valued enum and nothing that could
     /// falsify it: `select_reml_geometry` measures a penalized-Hessian
-    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its six routes
-    /// and never measures it on the other five, and the label is identical
-    /// across all six. Storing the decision rather than its outcome makes a
+    /// density against `SPARSE_HESSIAN_MAX_DENSITY` on one of its routes
+    /// and never measures it on the others, and the label is identical
+    /// across all of them. Storing the decision rather than its outcome makes a
     /// bundle unrepresentable without the basis for its own label.
     pub(crate) geometry: SparseRemlDecision,
     /// The exact H_total matrix used for LAML cost computation.
@@ -5546,7 +5546,7 @@ pub(crate) struct RemlState<'a> {
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
     pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
-    pub(crate) sparse_penalty_block_count: Option<usize>,
+    pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
     pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,

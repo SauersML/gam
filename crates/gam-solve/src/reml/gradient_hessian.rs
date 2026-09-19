@@ -4200,8 +4200,8 @@ impl<'a> RemlState<'a> {
         // routed dense logged nothing, so `penalized_hessian_too_dense` (a
         // density genuinely measured above the threshold) could not be told from
         // `design_not_sparse`, `constraints_present`,
-        // `penalty_blocks_not_separable`, `firth_bias_reduction_active` or
-        // `sparse_stats_failed` — four of which never measure a density at all.
+        // `firth_bias_reduction_active` or `sparse_stats_failed` — none of
+        // which measures a density at all.
         // "Which side of SPARSE_HESSIAN_MAX_DENSITY does this design land on"
         // was therefore unanswerable from a log for exactly the shapes where it
         // decides the cost. Report the decision itself, with the threshold it
@@ -6346,11 +6346,6 @@ impl<'a> RemlState<'a> {
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "sparse exact geometry requires sparse original design".to_string(),
-            )
-        })?;
-        self.sparse_penalty_block_count.ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "sparse exact geometry requires block-separable penalties".to_string(),
             )
         })?;
 
