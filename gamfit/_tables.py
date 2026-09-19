@@ -61,7 +61,10 @@ CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
 def normalize_table(
-    data: Any, *, required_columns: Sequence[str] | None = None
+    data: Any,
+    *,
+    required_columns: Sequence[str] | None = None,
+    positional_headers: Sequence[str] | None = None,
 ) -> tuple[list[str], _EncodedTable, str]:
     """Encode ``data`` as a Rust-owned typed table.
 
@@ -72,10 +75,14 @@ def normalize_table(
     decides what every column means, so all input libraries share one set of
     inference rules and one set of ``DataError`` messages. pandas needs no
     pyarrow for any of this.
+
+    ``positional_headers`` names the columns of a NumPy input (by default the
+    synthetic ``x0, x1, ...``); prediction passes the names the model binds a
+    positional array to.
     """
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
-    columns, kind = _table_column_views(data)
+    columns, kind = _table_column_views(data, positional_headers)
     if required_columns is not None:
         names = list(required_columns)
         missing = set(names) - set(columns)
@@ -162,7 +169,9 @@ def _reject_unsupported_dtype(name: str, dtype: Any) -> None:
         )
 
 
-def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
+def _table_column_views(
+    data: Any, positional_headers: Sequence[str] | None = None
+) -> tuple[dict[str, Any], str]:
     """Return zero-copy/lazy column views for the primary Rust table boundary."""
     kind = detect_table_kind(data)
     if kind == "pandas":
@@ -182,12 +191,19 @@ def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
 
         values = np.asarray(data)
         if values.ndim == 1:
-            return {"x0": values}, kind
+            values = values[:, None]
         if values.ndim != 2:
             raise ValueError("numpy input must be 1D or 2D")
-        return {
-            f"x{index}": values[:, index] for index in range(values.shape[1])
-        }, kind
+        names = (
+            [f"x{index}" for index in range(values.shape[1])]
+            if positional_headers is None
+            else list(positional_headers)
+        )
+        if len(names) != values.shape[1]:
+            raise ValueError(
+                f"numpy input has {values.shape[1]} columns but {len(names)} names"
+            )
+        return {name: values[:, index] for index, name in enumerate(names)}, kind
     if isinstance(data, Mapping):
         columns: dict[str, Any] = {}
         for key, value in data.items():
@@ -283,10 +299,17 @@ def restore_output_table(
     if target == "dict":
         return PredictionResult(columns)
     if target == "numpy":
+        # A structured array: one named field per output column, so a NumPy
+        # result is read by the same names as the DataFrame path
+        # (``pred["posterior_mean_lower"]``).
         import numpy as np
 
-        ordered = list(columns)
-        return np.column_stack([columns[name] for name in ordered])
+        arrays = {name: np.asarray(values) for name, values in columns.items()}
+        rows = len(next(iter(arrays.values()))) if arrays else 0
+        table = np.empty(rows, dtype=[(name, array.dtype) for name, array in arrays.items()])
+        for name, array in arrays.items():
+            table[name] = array
+        return table
     library = _import_output_library(target)
     if target == "pyarrow":
         return library.table(columns)
@@ -368,6 +391,18 @@ def sequence_table_columns(rows: Sequence[Sequence[Any]]) -> dict[str, list[Any]
         for index, value in enumerate(row):
             columns[headers[index]].append(value)
     return columns
+
+
+def numpy_table_width(array: Any) -> int:
+    """Column count of a 1-D (one column) or 2-D NumPy input."""
+    import numpy as np
+
+    shape = np.shape(array)
+    if len(shape) == 1:
+        return 1
+    if len(shape) != 2:
+        raise ValueError("numpy input must be 1D or 2D")
+    return int(shape[1])
 
 
 def numpy_table_columns(array: Any) -> dict[str, list[Any]]:
