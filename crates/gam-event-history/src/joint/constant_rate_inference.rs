@@ -433,22 +433,43 @@ fn incidence(
 
 #[cfg(test)]
 mod tests {
-    use super::super::law::JointSpecification;
+    use super::super::data::{FrozenJointSchema, JointTables};
+    use super::super::model::rank_zero_declarations;
     use super::*;
-    use crate::{Event, SubjectHistory};
 
-    fn record(entry: f64, exit: f64, events: &[(f64, usize)]) -> SubjectHistory {
-        SubjectHistory {
-            id: "s".to_string(),
-            entry,
-            exit,
-            events: events
-                .iter()
-                .map(|&(time, mark)| Event { time, mark })
-                .collect(),
-            segments: Vec::new(),
+    /// The rank-zero histories of `subjects` as `(entry, exit, events)`, events
+    /// as `(time, mark index)`, encoded through the production encoder with the
+    /// declared marks, as `fit_joint_event_model` encodes them. Returns the
+    /// marks' kinds and one history per subject.
+    fn histories(
+        marks: &[(&str, MarkKind)],
+        subjects: &[(f64, f64, &[(f64, usize)])],
+    ) -> Result<(Vec<MarkKind>, Vec<JointHistory>), EventHistoryError> {
+        let declared: Vec<(String, MarkKind)> =
+            marks.iter().map(|&(name, kind)| (name.to_string(), kind)).collect();
+        let mut tables = JointTables::default();
+        for (i, &(entry, exit, events)) in subjects.iter().enumerate() {
+            let id = format!("s{i}");
+            tables.subjects.id.push(id.clone());
+            tables.subjects.entry.push(entry);
+            tables.subjects.exit.push(exit);
+            for &(time, mark) in events {
+                tables.events.id.push(id.clone());
+                tables.events.time.push(time);
+                tables.events.mark.push(marks[mark].0.to_string());
+            }
         }
+        let (schema, encoded) =
+            FrozenJointSchema::fit(&rank_zero_declarations(Some(declared)), &tables)?;
+        Ok((schema.mark_kinds, encoded.into_iter().map(|subject| subject.history).collect()))
     }
+
+    const COMPETING: [(&str, MarkKind); 4] = [
+        ("diagnosis", MarkKind::Once),
+        ("cvd_death", MarkKind::Terminal),
+        ("other_death", MarkKind::Terminal),
+        ("visit", MarkKind::Recurrent),
+    ];
 
     /// Roundoff bar of two routes to one value: `eps * S_abs * ceil(log2 n)`
     /// over the `n` summands the routes accumulate.
@@ -566,21 +587,33 @@ mod tests {
 
     #[test]
     fn competing_forecasts_are_the_gamma_posterior_predictive() {
-        let spec = JointSpecification::new(vec![
-            MarkKind::Once,
-            MarkKind::Terminal,
-            MarkKind::Terminal,
-            MarkKind::Recurrent,
-        ])
-        .unwrap();
         // A death of the first cause at 4, and a subject prevalent for the
         // diagnosis with two visits, censored at 6.
-        let cohort = [
-            record(0.0, 4.0, &[(4.0, 1)]),
-            record(0.0, 6.0, &[(0.0, 0), (1.0, 3), (5.0, 3)]),
-        ];
-        let posterior =
-            ConstantRatePosterior::infer(&spec.marks, cohort.iter().map(|s| spec.history(s))).unwrap();
+        let (marks, cohort) = histories(
+            &COMPETING,
+            &[(0.0, 4.0, &[(4.0, 1)]), (0.0, 6.0, &[(0.0, 0), (1.0, 3), (5.0, 3)])],
+        )
+        .unwrap();
+        // The encoded cohort's sufficient statistics, re-derived from the
+        // tables. Subject 0 is at risk for every mark on its one cell (0, 4] and
+        // fires cvd_death at 4. Subject 1 enters prevalent for the diagnosis (its
+        // event at 0 equals its entry), so that mark starts outside its risk
+        // set; it is at risk for the other three marks on cells (0, 1], (1, 5],
+        // (5, 6] of weights 1, 4, 1, and records two visits. Hence exposures
+        // (4, 10, 10, 10) and counts (0, 1, 0, 2), every weight an exact integer.
+        assert!(cohort[0].initially_at_risk[0] && !cohort[1].initially_at_risk[0]);
+        let mut counts_total = [0u64; 4];
+        let mut exposure_total = [0.0_f64; 4];
+        for history in &cohort {
+            let (counts, exposure) = history.rate_statistics(&marks);
+            for d in 0..4 {
+                counts_total[d] += counts[d];
+                exposure_total[d] += exposure[d];
+            }
+        }
+        assert_eq!(counts_total, [0, 1, 0, 2]);
+        assert_eq!(exposure_total.map(f64::to_bits), [4.0_f64, 10.0, 10.0, 10.0].map(f64::to_bits));
+        let posterior = ConstantRatePosterior::infer(&marks, cohort.into_iter().map(Ok)).unwrap();
         // Exposures (4, 10, 10, 10) and counts (0, 1, 0, 2): the score
         // sum_d (E_d - y_d c)/(E_d + c) vanishes where 3c^2 - 22c - 160 = 0.
         let counts = [0.0_f64, 1.0, 0.0, 2.0];
@@ -604,15 +637,14 @@ mod tests {
         }
 
         // A new history adds exposure 2 to every mark.
-        let conditioned = posterior
-            .condition(&spec.marks, &spec.history(&record(0.0, 2.0, &[])).unwrap())
-            .unwrap();
+        let (_, new) = histories(&COMPETING, &[(0.0, 2.0, &[])]).unwrap();
+        let conditioned = posterior.condition(&marks, &new[0]).unwrap();
         let rates = conditioned.rates.clone().unwrap();
         assert!(rates[1].log_rate == rates[2].log_rate && rates[2].log_rate == rates[3].log_rate);
         let (b_d, b_t) = (rates[0].log_rate.exp(), rates[1].log_rate.exp());
         let delta = b_t - b_d;
         let horizons = [0.0, 0.5, 3.0, 40.0];
-        let forecast = conditioned.forecast(&spec.marks, &[true; 4], &horizons).unwrap();
+        let forecast = conditioned.forecast(&marks, &[true; 4], &horizons).unwrap();
         assert_eq!(forecast.survival[0], 1.0);
         assert!(forecast.incidence.row(0).iter().all(|&p| p == 0.0));
         for (h, &u) in horizons.iter().enumerate().skip(1) {
@@ -661,30 +693,25 @@ mod tests {
 
     #[test]
     fn an_event_free_cohort_is_the_exact_zero_rate_law() {
-        let spec = JointSpecification::new(vec![MarkKind::Once, MarkKind::Terminal]).unwrap();
-        let cohort = [record(0.0, 3.0, &[]), record(0.0, 5.0, &[])];
-        let posterior =
-            ConstantRatePosterior::infer(&spec.marks, cohort.iter().map(|s| spec.history(s))).unwrap();
+        let marks = [("diagnosis", MarkKind::Once), ("death", MarkKind::Terminal)];
+        let (kinds, cohort) = histories(&marks, &[(0.0, 3.0, &[]), (0.0, 5.0, &[])]).unwrap();
+        let posterior = ConstantRatePosterior::infer(&kinds, cohort.into_iter().map(Ok)).unwrap();
         assert_eq!(posterior.rates, None);
-        let forecast = posterior.forecast(&spec.marks, &[true, true], &[1.0, 1e300]).unwrap();
+        let forecast = posterior.forecast(&kinds, &[true, true], &[1.0, 1e300]).unwrap();
         assert_eq!(forecast.survival, [1.0, 1.0]);
         assert!(forecast.incidence.iter().all(|&p| p == 0.0));
-        let quiet = spec.history(&record(0.0, 2.0, &[])).unwrap();
-        assert_eq!(posterior.condition(&spec.marks, &quiet).unwrap(), posterior);
-        let diagnosed = spec.history(&record(0.0, 2.0, &[(1.0, 0)])).unwrap();
-        let error = posterior.condition(&spec.marks, &diagnosed).err().unwrap().to_string();
+        let (_, quiet) = histories(&marks, &[(0.0, 2.0, &[])]).unwrap();
+        assert_eq!(posterior.condition(&kinds, &quiet[0]).unwrap(), posterior);
+        let (_, diagnosed) = histories(&marks, &[(0.0, 2.0, &[(1.0, 0)])]).unwrap();
+        let error = posterior.condition(&kinds, &diagnosed[0]).err().unwrap().to_string();
         assert!(error.contains("probability zero"), "{error}");
         // Everyone prevalent for the only mark: no exposure identifies the strength.
-        let prevalent = JointSpecification::new(vec![MarkKind::Once]).unwrap();
-        let error = ConstantRatePosterior::infer(
-            &prevalent.marks,
-            [record(0.0, 2.0, &[(0.0, 0)])]
-                .iter()
-                .map(|s| prevalent.history(s)),
-        )
-        .err()
-        .unwrap()
-        .to_string();
+        let (prevalent, histories_prevalent) =
+            histories(&[("only", MarkKind::Once)], &[(0.0, 2.0, &[(0.0, 0)])]).unwrap();
+        let error = ConstantRatePosterior::infer(&prevalent, histories_prevalent.into_iter().map(Ok))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("unidentified"), "{error}");
     }
 }

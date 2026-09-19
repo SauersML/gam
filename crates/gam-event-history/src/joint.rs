@@ -22,6 +22,10 @@ pub use model::{ConditionedJointModel, JointEventModel, JointForecast, fit_joint
 // law.rs (jls-law after slice 0): specification, history, complete-path density
 mod law;
 
+// data.rs (jls-ingest): long-table data contract and the frozen encoding schema
+mod data;
+pub use data::{EventTable, JointTables, SubjectTable};
+
 // constant_rate_inference.rs (jls-serve): exact rank-zero rate posterior and its forecasts
 mod constant_rate_inference;
 

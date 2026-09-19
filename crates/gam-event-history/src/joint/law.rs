@@ -15,7 +15,7 @@
 //! at-risk exposures `E_d` are sufficient statistics.
 
 use super::emission;
-use crate::{EventHistoryError, MarkKind, SubjectHistory};
+use crate::{EventHistoryError, MarkKind};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -157,143 +157,6 @@ impl JointSpecification {
             measurements: vec![],
             genetic_mean: vec![],
             genetic_precision: Array2::zeros((0, 0)),
-        })
-    }
-
-    /// The node sequence of one follow-up record at rank zero. An event at or
-    /// before entry is prior history: a once-only mark leaves the risk set it
-    /// opens with, a recurrent one is not compensated, and a terminal one
-    /// leaves nothing to model. Nodes are entry, the distinct event times and
-    /// exit; events at one time form one node, and each node after entry
-    /// carries its preceding gap as one compensator point.
-    pub(super) fn history(&self, subject: &SubjectHistory) -> Result<JointHistory, EventHistoryError> {
-        let id = &subject.id;
-        if !subject.segments.is_empty() {
-            return Err(invalid(format!(
-                "subject {id:?}: the rank-zero joint model has no covariate terms, so a history takes no covariate segments"
-            )));
-        }
-        if !(subject.entry.is_finite() && subject.exit.is_finite() && subject.entry < subject.exit) {
-            return Err(invalid(format!(
-                "subject {id:?} needs finite entry < exit, got {} and {}",
-                subject.entry, subject.exit
-            )));
-        }
-        let marks = self.marks.len();
-        if let Some(event) = subject
-            .events
-            .iter()
-            .find(|e| e.mark >= marks || !e.time.is_finite() || e.time > subject.exit)
-        {
-            return Err(invalid(format!(
-                "subject {id:?} has an event of mark {} at {}; marks are 0..{marks} and no event follows the exit {}",
-                event.mark, event.time, subject.exit
-            )));
-        }
-        let mut events: Vec<_> = subject.events.iter().collect();
-        events.sort_by(|a, b| a.time.total_cmp(&b.time));
-        let mut times = vec![subject.entry];
-        // Each cell is one point at its node time: at rank zero the population
-        // functions are constant, so the one-point rule is exact.
-        let mut points = vec![CompensatorPoint {
-            node: 0,
-            time: subject.entry,
-            weight: 0.0,
-        }];
-        let mut nodes: Vec<Vec<usize>> = vec![vec![]];
-        let mut initially_at_risk = vec![true; marks];
-        let mut fired = vec![false; marks];
-        let mut terminated = false;
-        let mut previous = subject.entry;
-        for event in events {
-            let kind = self.marks[event.mark];
-            if terminated && kind == MarkKind::Terminal {
-                return Err(invalid(format!(
-                    "subject {id:?} has an event of mark {} after the terminal event that ended its follow-up",
-                    event.mark
-                )));
-            }
-            if kind != MarkKind::Recurrent && std::mem::replace(&mut fired[event.mark], true) {
-                return Err(invalid(format!(
-                    "subject {id:?} has two events of the {} mark {}, which fires at most once",
-                    kind.name(),
-                    event.mark
-                )));
-            }
-            if event.time <= subject.entry {
-                match kind {
-                    MarkKind::Once => initially_at_risk[event.mark] = false,
-                    MarkKind::Terminal => {
-                        return Err(invalid(format!(
-                            "subject {id:?} has a terminal event at {}, at or before its entry {}; it has no follow-up to model",
-                            event.time, subject.entry
-                        )));
-                    }
-                    MarkKind::Recurrent => (),
-                }
-                continue;
-            }
-            if kind == MarkKind::Terminal {
-                if event.time != subject.exit {
-                    return Err(invalid(format!(
-                        "subject {id:?}: a terminal event at {} must end follow-up, but the exit is {}",
-                        event.time, subject.exit
-                    )));
-                }
-                terminated = true;
-            }
-            if event.time > previous {
-                let node = times.len();
-                times.push(event.time);
-                points.extend([
-                    CompensatorPoint {
-                        node,
-                        time: event.time,
-                        weight: 0.0,
-                    },
-                    CompensatorPoint {
-                        node,
-                        time: event.time,
-                        weight: event.time - previous,
-                    },
-                ]);
-                nodes.push(vec![]);
-                previous = event.time;
-            }
-            let last = nodes.len() - 1;
-            nodes[last].push(event.mark);
-        }
-        if subject.exit > previous {
-            let node = times.len();
-            times.push(subject.exit);
-            points.extend([
-                CompensatorPoint {
-                    node,
-                    time: subject.exit,
-                    weight: 0.0,
-                },
-                CompensatorPoint {
-                    node,
-                    time: subject.exit,
-                    weight: subject.exit - previous,
-                },
-            ]);
-            nodes.push(vec![]);
-        }
-        let count = times.len();
-        let rows = points.len();
-        Ok(JointHistory {
-            times,
-            points,
-            weight_error: 0.0,
-            events: nodes,
-            initially_at_risk,
-            baseline_design: Array2::ones((rows, 1)),
-            population_design: Array2::ones((rows, 1)),
-            drive_design: Array2::zeros((count - 1, 0)),
-            entry_design: vec![],
-            genetics: vec![],
-            measurements: vec![],
         })
     }
 }
@@ -599,22 +462,36 @@ impl JointLikelihood {
 
 #[cfg(test)]
 mod tests {
+    use super::super::data::{FrozenJointSchema, JointTables};
+    use super::super::model::rank_zero_declarations;
     use super::*;
     use crate::test_support::{Bound, agrees};
-    use crate::{CovariateSegment, Event};
     use gam_math::nested_dual::JetField;
 
-    fn subject(entry: f64, exit: f64, events: &[(f64, usize)]) -> SubjectHistory {
-        SubjectHistory {
-            id: "s".to_string(),
-            entry,
-            exit,
-            events: events
-                .iter()
-                .map(|&(time, mark)| Event { time, mark })
-                .collect(),
-            segments: Vec::new(),
+    /// The rank-zero histories of follow-up records `(entry, exit, events)`,
+    /// events as `(time, mark index)`, encoded as `fit_joint_event_model`
+    /// encodes them: by the production table encoder under the rank-zero
+    /// declarations of `marks`.
+    fn rank_zero_histories(marks: &[MarkKind], records: &[(f64, f64, &[(f64, usize)])]) -> Vec<JointHistory> {
+        let names: Vec<String> = (0..marks.len()).map(|d| format!("m{d}")).collect();
+        let mut tables = JointTables::default();
+        for (i, &(entry, exit, events)) in records.iter().enumerate() {
+            let id = format!("s{i}");
+            tables.subjects.id.push(id.clone());
+            tables.subjects.entry.push(entry);
+            tables.subjects.exit.push(exit);
+            for &(time, mark) in events {
+                tables.events.id.push(id.clone());
+                tables.events.time.push(time);
+                tables.events.mark.push(names[mark].clone());
+            }
         }
+        let declared = names.iter().cloned().zip(marks.iter().copied()).collect();
+        let (schema, subjects) =
+            FrozenJointSchema::fit(&rank_zero_declarations(Some(declared)), &tables).unwrap();
+        assert_eq!(schema.mark_names, names);
+        assert_eq!(schema.mark_kinds, marks);
+        subjects.into_iter().map(|subject| subject.history).collect()
     }
 
     fn specification(k: usize, families: Vec<MeasurementFamily>, genes: usize) -> JointSpecification {
@@ -681,13 +558,11 @@ mod tests {
         .unwrap();
         // Mark 2 is prevalent at entry, recurrent mark 1 fires twice, and the
         // incident once-only mark 0 ties with the terminal event.
-        let history = spec
-            .history(&subject(
-                1.0,
-                7.5,
-                &[(7.5, 3), (0.5, 2), (2.0, 1), (3.0, 1), (7.5, 0)],
-            ))
-            .unwrap();
+        let history = rank_zero_histories(
+            &spec.marks,
+            &[(1.0, 7.5, &[(7.5, 3), (0.5, 2), (2.0, 1), (3.0, 1), (7.5, 0)])],
+        )
+        .remove(0);
         let model = JointLikelihood::new(spec.clone()).unwrap();
         model.validate_history(&history).unwrap();
         assert_eq!(history.events.last().unwrap().len(), 2);
@@ -760,7 +635,7 @@ mod tests {
         let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&exposure), bits(&slice_exposure));
         assert_eq!(history.open_risk_set(&spec.marks), None);
-        let open = spec.history(&subject(0.0, 4.0, &[(1.0, 0), (0.0, 2)])).unwrap();
+        let open = rank_zero_histories(&spec.marks, &[(0.0, 4.0, &[(1.0, 0), (0.0, 2)])]).remove(0);
         model.validate_history(&open).unwrap();
         assert_eq!(
             open.open_risk_set(&spec.marks),
@@ -770,26 +645,12 @@ mod tests {
     }
 
     #[test]
-    fn histories_refuse_records_the_law_cannot_hold() {
-        let spec =
-            JointSpecification::new(vec![MarkKind::Once, MarkKind::Terminal, MarkKind::Terminal])
-                .unwrap();
-        for (record, reason) in [
-            (subject(0.0, 5.0, &[(3.0, 1)]), "must end follow-up"),
-            (subject(0.0, 5.0, &[(1.0, 0), (2.0, 0)]), "fires at most once"),
-            (subject(0.0, 5.0, &[(6.0, 0)]), "no event follows the exit"),
-            (subject(0.0, 5.0, &[(0.0, 1)]), "no follow-up to model"),
-            (subject(0.0, 5.0, &[(5.0, 1), (5.0, 2)]), "after the terminal event"),
-            (subject(5.0, 5.0, &[]), "entry < exit"),
-        ] {
-            let error = spec.history(&record).err().unwrap().to_string();
-            assert!(error.contains(reason), "{error}");
-        }
-        let mut segmented = subject(0.0, 5.0, &[]);
-        segmented.segments.push(CovariateSegment { start: 0.0, row: 0 });
-        let error = spec.history(&segmented).err().unwrap().to_string();
-        assert!(error.contains("no covariate terms"), "{error}");
+    fn a_specification_needs_a_mark() {
+        // The follow-up records a rank-zero history cannot hold are refused by the
+        // table encoder, through the cohort rules (data_tests.rs:
+        // records_a_rank_zero_history_could_not_hold_are_refused_by_the_cohort_rules).
         assert!(JointSpecification::new(Vec::new()).is_err());
+        assert!(JointSpecification::new(vec![MarkKind::Recurrent]).is_ok());
     }
 
     #[test]

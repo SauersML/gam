@@ -4429,5 +4429,13 @@
     },
     "reason": "#2822 (i2280): the keyed touched-pair store is deleted, and with it the reservation that chose between dense and keyed partials. plan_touched_pair_fold now charges the governor per dense partial and admits as many as fit, down to an in-place serial reduction.",
     "evidence": "Gate dy3 run i2280-fold-g1 (direct-dy3-i2280-fold-g1.log) at b78a4a2f5e: public_api_census.py refused exactly this removal. At eded626399, git grep -w finds reserve_dense_touched_pair_partials only in crates/gam-solve/src/arrow_schur/reduced_solve.rs (declaration and its caller) and touched_pair_fold_2900_tests.rs; the landing names it nowhere."
+  },
+  {
+    "base": "017ee5ce8ca8539e7e90ba3236913566f0595f68",
+    "removed": {
+      "crates/gam-event-history/src/joint/law.rs::history": 1
+    },
+    "reason": "#2961 landing 4: JointSpecification::history, the law's own rank-zero record builder, is deleted. joint/data.rs's FrozenJointSchema is the one encoder the fit, conditioning and every surface use; history()'s refusals are the cohort's, reached through that encoder.",
+    "evidence": "Direct lane dy6 run ad-nuts-l4-g2 (gate8, base 309d02a7bc, exact tree 3ea9320389, patch md5 57909cfe) had public_api_census.py refuse exactly this one removal. Its only production callers were joint/model.rs's fit and condition, which this landing rewrites to encode through FrozenJointSchema. Re-gated on direct lane dy5 run jls-l4-g3 (gate8), on the same code plus one comment in data_tests.rs and the A12 bench's joint-rank0 arm ported to the table API (code patch md5 758b354f), with these entries in its tree."
   }
 ]

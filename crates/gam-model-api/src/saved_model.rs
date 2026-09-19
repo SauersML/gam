@@ -27,8 +27,12 @@ pub enum SavedModelError {
         /// The kind this reader reads.
         expected: &'static str,
     },
-    /// The document has another version, or none.
-    #[error("the saved {kind} model has version {found:?}; this build reads only version {expected}")]
+    /// The document has another version, or none. No version is migrated: a
+    /// payload of another version lacks what this build needs to rebuild its
+    /// model, so the remedy is to refit.
+    #[error(
+        "the saved {kind} model has version {found:?}; this build reads only version {expected}, so refit the model with this build"
+    )]
     Version {
         /// The kind of model.
         kind: &'static str,

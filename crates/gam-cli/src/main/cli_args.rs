@@ -43,7 +43,7 @@ pub(crate) struct JointEventsFitArgs {
     #[arg(
         long,
         value_name = "CSV",
-        help = "Events table: columns id, time, mark; an event at or before its subject's entry is prior history"
+        help = "Events table: columns id, time, mark, with rows in any order; an event at or before its subject's entry is prior history"
     )]
     pub(crate) events: PathBuf,
     #[arg(
@@ -67,7 +67,11 @@ pub(crate) struct JointEventsForecastArgs {
         help = "Histories to condition on: columns id, entry, exit; each forecast opens at its history's exit"
     )]
     pub(crate) subjects: PathBuf,
-    #[arg(long, value_name = "CSV", help = "Their events: columns id, time, mark")]
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Their events: columns id, time, mark, with rows in any order"
+    )]
     pub(crate) events: PathBuf,
     #[arg(
         long,

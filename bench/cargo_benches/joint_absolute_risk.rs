@@ -207,7 +207,7 @@ use gam::event_history::{
     MarkKind, PopulationForecastRequest, SubjectHistory, fit_event_history_formulas, forecast_history,
     population_forecast,
 };
-use gam::event_history::joint::fit_joint_event_model;
+use gam::event_history::joint::{JointTables, fit_joint_event_model};
 use gam::families::custom_family::BlockwiseFitOptions;
 use ndarray::{Array1, Array2};
 use opt::{Bfgs, BfgsError, FirstOrderSample, FusedObjective, MaxIterations, ObjectiveEvalError, Tolerance};
@@ -1845,6 +1845,23 @@ fn subject_history(
     }
 }
 
+/// The joint event model's long tables for `subjects`: one subject row each and one event row per
+/// event, its mark named from `mark_names`.
+fn joint_tables(subjects: &[SubjectHistory], mark_names: &[String]) -> JointTables {
+    let mut tables = JointTables::default();
+    for subject in subjects {
+        tables.subjects.id.push(subject.id.clone());
+        tables.subjects.entry.push(subject.entry);
+        tables.subjects.exit.push(subject.exit);
+        for event in &subject.events {
+            tables.events.id.push(subject.id.clone());
+            tables.events.time.push(event.time);
+            tables.events.mark.push(mark_names[event.mark].clone());
+        }
+    }
+    tables
+}
+
 fn row_table(rows: &[(f64, Vec<f64>)], columns: usize) -> Result<Array2<f64>, String> {
     let mut values = Vec::with_capacity(rows.len() * columns);
     for row in rows {
@@ -2276,7 +2293,8 @@ fn joint_rank_zero_arm(train: &[Record], test: &[Record], grid: &Grid) -> Result
         .collect();
     report(format!("[a12-fit] arm=joint-rank0 status=started subjects={}", subjects.len()));
     let started = Instant::now();
-    let model = match fit_joint_event_model(mark_names, mark_kinds, &subjects) {
+    let vocabulary = mark_names.iter().cloned().zip(mark_kinds).collect();
+    let model = match fit_joint_event_model(Some(vocabulary), &joint_tables(&subjects, &mark_names)) {
         Ok(model) => model,
         Err(error) => {
             report(format!(
@@ -2305,7 +2323,12 @@ fn joint_rank_zero_arm(train: &[Record], test: &[Record], grid: &Grid) -> Result
             }
             let history = subject_history(record, format!("test{i}"), s, &[], 0);
             requests += 1;
-            match model.condition(&history).and_then(|conditioned| conditioned.forecast(&grid.horizons)) {
+            // One subject per table, so a refusal is counted per history; `condition` returns one
+            // conditioned model per subject.
+            let forecast = model
+                .condition(&joint_tables(std::slice::from_ref(&history), &mark_names))
+                .and_then(|conditioned| conditioned[0].forecast(&grid.horizons));
+            match forecast {
                 Ok(forecast) => {
                     for target in 0..TARGETS {
                         if record.diagnosed_by(target, s) {

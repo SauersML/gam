@@ -1,15 +1,17 @@
 //! `gam joint-events`: fit the joint event model to subjects and events tables
 //! and save it, or condition a saved model on histories and forecast (#2961).
-//! Both actions run the one Rust model path the Python library also calls.
+//! Both actions hand the tables to the one Rust model path the Python library
+//! also calls; the vocabulary, identifiers and records are checked there.
 
 use crate::cli_args::{
     JointEventsAction, JointEventsArgs, JointEventsFitArgs, JointEventsForecastArgs,
 };
-use gam::event_history::joint::{JointEventModel, fit_joint_event_model};
-use gam::event_history::{Event, MarkKind, SubjectHistory, mark_index_of, resolve_mark_vocabulary};
+use gam::event_history::MarkKind;
+use gam::event_history::joint::{
+    EventTable, JointEventModel, JointTables, SubjectTable, fit_joint_event_model,
+};
 use ndarray::Array2;
 use serde_json::json;
-use std::collections::HashMap;
 use std::path::Path;
 
 /// The named columns of a CSV table, in the order named.
@@ -44,52 +46,40 @@ fn read_columns(path: &Path, names: &[&str]) -> Result<Vec<Vec<String>>, String>
     Ok(columns)
 }
 
-fn parse_f64(value: &str, what: &str) -> Result<f64, String> {
-    value
-        .parse::<f64>()
-        .map_err(|_| format!("{what}: {value:?} is not a number"))
+fn numbers(cells: &[String], what: &str) -> Result<Vec<f64>, String> {
+    cells
+        .iter()
+        .map(|value| {
+            value
+                .parse::<f64>()
+                .map_err(|_| format!("{what}: {value:?} is not a number"))
+        })
+        .collect()
 }
 
-/// The subjects with no events yet, and every event row as its subject's index,
-/// time and mark label.
-fn read_histories(
-    subjects: &Path,
-    events: &Path,
-) -> Result<(Vec<SubjectHistory>, Vec<(usize, f64, String)>), String> {
-    let columns = read_columns(subjects, &["id", "entry", "exit"])?;
-    let mut index = HashMap::new();
-    let mut histories = Vec::with_capacity(columns[0].len());
-    for (i, ((id, entry), exit)) in columns[0]
-        .iter()
-        .zip(&columns[1])
-        .zip(&columns[2])
-        .enumerate()
-    {
-        if index.insert(id.clone(), i).is_some() {
-            return Err(format!("duplicate subject id {id:?} in {}", subjects.display()));
-        }
-        histories.push(SubjectHistory {
-            id: id.clone(),
-            entry: parse_f64(entry, "entry")?,
-            exit: parse_f64(exit, "exit")?,
-            events: Vec::new(),
-            segments: Vec::new(),
-        });
-    }
-    let rows = read_columns(events, &["id", "time", "mark"])?;
-    let mut records = Vec::with_capacity(rows[0].len());
-    for ((id, time), mark) in rows[0].iter().zip(&rows[1]).zip(&rows[2]) {
-        let subject = *index
-            .get(id)
-            .ok_or_else(|| format!("event subject {id:?} is not in the subjects table"))?;
-        records.push((subject, parse_f64(time, "event time")?, mark.clone()));
-    }
-    Ok((histories, records))
+/// The subjects table `(id, entry, exit)` and the events table `(id, time,
+/// mark)` as the model's tables.
+fn read_tables(subjects: &Path, events: &Path) -> Result<JointTables, String> {
+    let subject_columns = read_columns(subjects, &["id", "entry", "exit"])?;
+    let event_columns = read_columns(events, &["id", "time", "mark"])?;
+    Ok(JointTables {
+        subjects: SubjectTable {
+            id: subject_columns[0].clone(),
+            entry: numbers(&subject_columns[1], "entry")?,
+            exit: numbers(&subject_columns[2], "exit")?,
+        },
+        events: EventTable {
+            id: event_columns[0].clone(),
+            time: numbers(&event_columns[1], "event time")?,
+            mark: event_columns[2].clone(),
+        },
+        ..JointTables::default()
+    })
 }
 
 fn fit(args: JointEventsFitArgs) -> Result<(), String> {
-    let (mut histories, records) = read_histories(&args.subjects, &args.events)?;
-    let declared = if args.marks.is_empty() {
+    let tables = read_tables(&args.subjects, &args.events)?;
+    let marks = if args.marks.is_empty() {
         None
     } else {
         let mut pairs = Vec::with_capacity(args.marks.len());
@@ -101,17 +91,7 @@ fn fit(args: JointEventsFitArgs) -> Result<(), String> {
         }
         Some(pairs)
     };
-    let labels: Vec<&str> = records.iter().map(|record| record.2.as_str()).collect();
-    let (mark_names, mark_kinds, marks) =
-        resolve_mark_vocabulary(declared, &labels).map_err(|e| e.to_string())?;
-    for (record, mark) in records.iter().zip(marks) {
-        histories[record.0].events.push(Event {
-            time: record.1,
-            mark,
-        });
-    }
-    let model =
-        fit_joint_event_model(mark_names, mark_kinds, &histories).map_err(|e| e.to_string())?;
+    let model = fit_joint_event_model(marks, &tables).map_err(|e| e.to_string())?;
     model.save(&args.out).map_err(|e| e.to_string())
 }
 
@@ -121,20 +101,16 @@ fn rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
 
 fn forecast(args: JointEventsForecastArgs) -> Result<(), String> {
     let model = JointEventModel::load(&args.model).map_err(|e| e.to_string())?;
-    let (mut histories, records) = read_histories(&args.subjects, &args.events)?;
-    for (subject, time, label) in records {
-        let mark = mark_index_of(model.mark_names(), &label).map_err(|e| e.to_string())?;
-        histories[subject].events.push(Event { time, mark });
-    }
-    let mut forecasts = Vec::with_capacity(histories.len());
-    for history in &histories {
-        let f = model
-            .condition(history)
-            .and_then(|conditioned| conditioned.forecast(&args.horizons))
+    let tables = read_tables(&args.subjects, &args.events)?;
+    let conditioned = model.condition(&tables).map_err(|e| e.to_string())?;
+    let mut forecasts = Vec::with_capacity(conditioned.len());
+    for history in &conditioned {
+        let f = history
+            .forecast(&args.horizons)
             .map_err(|e| e.to_string())?;
         forecasts.push(json!({
-            "id": history.id,
-            "time": history.exit,
+            "id": history.id(),
+            "time": history.exit(),
             "horizons": f.horizons,
             "survival": f.survival,
             "incidence": rows(&f.incidence),

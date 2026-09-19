@@ -32,8 +32,8 @@ class JointEventModel:
         return dict(zip(self._native.mark_names(), self._native.mark_kinds()))
 
     def save(self, path: str | Path) -> None:
-        """Write the saved model: the mark vocabulary and the posterior that
-        forecasting integrates, never the training records."""
+        """Write the saved model: the frozen encoding schema and the posterior
+        that forecasting integrates, never the training records."""
         self._native.save(str(path))
 
     def forecast(
@@ -45,12 +45,12 @@ class JointEventModel:
     ) -> dict[str, np.ndarray]:
         """Condition on one history and forecast after its exit ``s``.
 
-        ``events`` are ``(time, mark)`` pairs; an event at or before ``entry``
-        is prior history. Returns ``survival``, the probability that no terminal
-        mark fires by ``s + u``; ``incidence`` (horizons × marks), the probability
-        that each mark's next occurrence falls in ``(s, s + u]`` before any
-        terminal mark; and ``incidence_error``, a bound on each incidence's
-        numerical error."""
+        ``events`` are ``(time, mark)`` pairs in any order; an event at or
+        before ``entry`` is prior history. Returns ``survival``, the probability
+        that no terminal mark fires by ``s + u``; ``incidence`` (horizons ×
+        marks), the probability that each mark's next occurrence falls in
+        ``(s, s + u]`` before any terminal mark; and ``incidence_error``, a bound
+        on each incidence's numerical error."""
         out = self._native.forecast(
             float(entry),
             float(exit),
@@ -74,31 +74,22 @@ def fit_joint_event_model(
     """Fit the joint event model.
 
     ``subjects`` has columns ``id, entry, exit`` and ``events`` has ``id, time,
-    mark``. ``marks`` declares the mark vocabulary and each mark's kind, e.g.
-    ``{"diagnosis": "once", "death": "terminal"}``, or a sequence of names that
-    are all recurrent; without it the observed marks, all recurrent."""
-    subject_ids = _labels(_column(subjects, id_column), "subject identifiers")
-    index = {sid: i for i, sid in enumerate(subject_ids)}
-    if len(index) != len(subject_ids):
-        raise ValueError("subject identifiers must be distinct")
+    mark``; rows may come in any order. ``marks`` declares the mark
+    vocabulary and each mark's kind, e.g. ``{"diagnosis": "once", "death":
+    "terminal"}``, or a sequence of names that are all recurrent; without it the
+    observed marks, all recurrent."""
     if marks is None:
         declared_marks = None
     elif isinstance(marks, Mapping):
         declared_marks = [(str(k), str(v)) for k, v in marks.items()]
     else:
         declared_marks = [(str(m), "recurrent") for m in marks]
-    event_subject = []
-    for value in _column(events, id_column):
-        label = str(value)
-        if label not in index:
-            raise ValueError(f"event subject {label!r} is not in the subjects table")
-        event_subject.append(index[label])
     native = rust_module().fit_joint_event_model(
         declared_marks,
-        subject_ids,
+        _labels(_column(subjects, id_column), "subject identifiers"),
         _column(subjects, "entry").astype(float).tolist(),
         _column(subjects, "exit").astype(float).tolist(),
-        event_subject,
+        _labels(_column(events, id_column), "event subject identifiers"),
         _column(events, "time").astype(float).tolist(),
         _labels(_column(events, "mark"), "mark names"),
     )

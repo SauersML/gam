@@ -1268,5 +1268,22 @@
     ],
     "reason": "#2822 (i2280): the reduced-Schur fold marks its touched pairs as a column bitset per left index, and a governor-declined dense footprint admits fewer dense partials (down to an in-place serial reduction) instead of falling back to a keyed hash store. The keyed store is deleted with its selector: the private enum TouchedPairStore (dense or keyed), the pub enum TouchedPairStoreKind that reported which one a fold used, and the pub fn reserve_dense_touched_pair_partials, replaced by plan_touched_pair_fold's per-partial charge. The two tests that pinned the keyed fallback are restated: dense_and_keyed_touched_pair_stores_fold_the_same_words_2822 as the_touched_pair_fold_folds_the_same_words_at_every_partial_count_2822, and a_dense_touched_pair_footprint_the_governor_declines_folds_keyed_2822 as a_declined_footprint_folds_with_fewer_dense_partials_never_a_hashed_store_2822.",
     "evidence": "Gate dy3 run i2280-fold-g1 (direct-dy3-i2280-fold-g1.log, tree e90dc86e at b78a4a2f5e): source_removal_guard.py listed exactly these five removals, and both mutant arms FIRED. At eded626399, git grep -w finds TouchedPairStore, TouchedPairStoreKind and reserve_dense_touched_pair_partials only in crates/gam-solve/src/arrow_schur/reduced_solve.rs and touched_pair_fold_2900_tests.rs, and the two deleted test names only at their declarations there; the landing blobs name none of the three. Job 1265248 at b78a4a2f5e with this change: gam-solve 1950/1950, the arrow_schur and touched-pair pins 143/143."
+  },
+  {
+    "base": "017ee5ce8ca8539e7e90ba3236913566f0595f68",
+    "items": [
+      "crates/gam-cli/src/main/run_joint_events.rs:fn:parse_f64",
+      "crates/gam-cli/src/main/run_joint_events.rs:fn:read_histories",
+      "crates/gam-cli/tests/suite/joint_events_reload_2961.rs:fn:history",
+      "crates/gam-event-history/src/joint/constant_rate_inference.rs:fn:record",
+      "crates/gam-event-history/src/joint/law.rs:fn:histories_refuse_records_the_law_cannot_hold",
+      "crates/gam-event-history/src/joint/law.rs:fn:history",
+      "crates/gam-event-history/src/joint/law.rs:fn:subject",
+      "crates/gam-event-history/src/joint/model.rs:fn:fits_refuse_an_inconsistent_vocabulary",
+      "crates/gam-event-history/src/joint/model.rs:fn:subject",
+      "crates/gam-event-history/src/joint/model.rs:fn:validate_mark_names"
+    ],
+    "reason": "#2961 landing 4: joint/data.rs is the joint model's one table encoder, and every surface hands it raw columns. JointSpecification::history, the law's own rank-zero record builder, is deleted with its test-only callers' helpers (law.rs subject, constant_rate_inference.rs record, model.rs subject, the CLI suite test's history); those tests now build histories through the production encoder with their assertions and bars unchanged. The CLI's own cell parser and record builder (parse_f64, read_histories) go because the CLI no longer builds SubjectHistory records. validate_mark_names is replaced by the cohort's vocabulary check at the fit and by validate_schema on load. histories_refuse_records_the_law_cannot_hold's refusals are now the cohort's, asserted through the encoder in data_tests.rs records_a_rank_zero_history_could_not_hold_are_refused_by_the_cohort_rules; its JointSpecification::new(empty) check moved to a_specification_needs_a_mark. fits_refuse_an_inconsistent_vocabulary is superseded by fits_refuse_what_the_rank_zero_model_cannot_hold, which keeps its duplicate-name arm.",
+    "evidence": "Direct lane dy6 run ad-nuts-l4-g2 (gate8, base 309d02a7bc, exact tree 3ea9320389, patch md5 57909cfe) had source_removal_guard.py list exactly these 10 guarded removals, each with removed_declarations 1; law.rs history has two declarations and only the pub(super) builder is removed, while the test helper history(genes) stays. The same run's workspace check, gam-pyffi check and 37/37 joint tests passed on that tree. Re-gated on direct lane dy5 run jls-l4-g3 (gate8), on the same code plus one comment in data_tests.rs and the A12 bench's joint-rank0 arm ported to the table API (code patch md5 758b354f), with these entries in its tree."
   }
 ]
