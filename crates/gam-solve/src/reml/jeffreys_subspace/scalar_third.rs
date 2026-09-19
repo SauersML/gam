@@ -4,18 +4,6 @@
 use super::*;
 use super::mixed::inverse_difference;
 
-fn floor_third(x: f64, floor: f64) -> f64 {
-    if x >= jeffreys_cap(floor) {
-        if floor > CONDITIONING_GATE_ABSOLUTE_CLEAR { 2.0 / floor.powi(3) } else { 0.0 }
-    } else if x >= floor {
-        0.0
-    } else if x >= 0.0 {
-        2.0 / floor.powi(3) - 6.0 * x / floor.powi(4)
-    } else {
-        2.0 / floor.powi(3) - 6.0 * x / (floor - x).powi(4)
-    }
-}
-
 /// `(G₁₁₁, G₁₁₂, G₁₂₂, G₂₂₂)` of the conditioning gate, read from the gate's own third
 /// partials. A local copy that picks the absolute branch by `∂G/∂λ_max == 0` goes wrong
 /// once the floor-collapse factor gives the absolute branch a `λ_max` motion (gam#2765).
@@ -69,7 +57,7 @@ impl JeffreysHphiDriftBase {
         let u0 = 0.5 * self.evals.iter().map(|&x| jeffreys_antiderivative(x,self.floor)).sum::<f64>();
         let uf = 0.5 * self.evals.iter().map(|&x| jeffreys_antiderivative_floor_sensitivity(x,self.floor)).sum::<f64>();
         let uff = 0.5 * self.evals.iter().map(|&x| jeffreys_antiderivative_floor_second_sensitivity(x,self.floor)).sum::<f64>();
-        let ufff = 0.5 * self.evals.iter().map(|&x| floor_third(x,self.floor)).sum::<f64>();
+        let ufff = 0.5 * self.evals.iter().map(|&x| jeffreys_antiderivative_floor_third_sensitivity(x, self.floor)).sum::<f64>();
         let (gm,gx) = conditioning_gate_weight_grad(self.evals[self.idx_min],self.evals[self.idx_max]);
         let (gmm,gmx,gxx) = conditioning_gate_weight_hess(self.evals[self.idx_min],self.evals[self.idx_max]);
         let gt = gate_third(self.evals[self.idx_min], self.evals[self.idx_max]);
