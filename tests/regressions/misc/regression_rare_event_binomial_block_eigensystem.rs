@@ -22,8 +22,10 @@
 //!
 //! The fixture is a synthetic analogue of `default`: the same covariate
 //! scales, the same class balance and the same factor-by-income structure.
-//! Each seed fails on the pre-repair code; the two-smooth model is asserted as
-//! well because it is the minimal failing cell.
+//! The cases are the (seed, formula) pairs of seeds 1 to 10 that the
+//! pre-repair code refused with that stall (`|Pg|` from `4.4e-5` to `5.6e-3`
+//! against the `3e-5` bound); every pair of those seeds fits after it. The
+//! two-smooth model is included because it is the minimal failing cell.
 
 use csv::StringRecord;
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
@@ -39,9 +41,9 @@ use rand_distr::{Distribution, Normal, Uniform};
 fn default_like(seed: u64, n: usize) -> (gam::data::EncodedDataset, f64) {
     let mut rng = StdRng::seed_from_u64(seed);
     let unit = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
-    let balance_law = Normal::new(835.0, 480.0).expect("balance law");
-    let student_income = Normal::new(17_500.0, 4_500.0).expect("student income law");
-    let other_income = Normal::new(40_000.0, 10_000.0).expect("income law");
+    let balance_law = Normal::<f64>::new(835.0, 480.0).expect("balance law");
+    let student_income = Normal::<f64>::new(17_500.0, 4_500.0).expect("student income law");
+    let other_income = Normal::<f64>::new(40_000.0, 10_000.0).expect("income law");
     let mut rows: Vec<StringRecord> = Vec::with_capacity(n);
     let mut positives = 0usize;
     for _ in 0..n {
@@ -80,56 +82,35 @@ fn rare_event_binomial_on_raw_covariates_fits() {
         family: Some("binomial-logit".to_string()),
         ..FitConfig::default()
     };
-    for seed in [1_u64, 2, 7] {
+    const FACTOR_MODEL: &str = "y ~ factor(student) + s(balance) + s(income)";
+    const ADDITIVE_MODEL: &str = "y ~ s(balance) + s(income)";
+    for (seed, formula) in [
+        (2_u64, FACTOR_MODEL),
+        (9, FACTOR_MODEL),
+        (5, ADDITIVE_MODEL),
+        (6, ADDITIVE_MODEL),
+        (10, ADDITIVE_MODEL),
+    ] {
         let (data, prevalence) = default_like(seed, 2000);
         assert!(
             (0.01..0.06).contains(&prevalence),
             "seed {seed}: the fixture is a rare-event cell, prevalence {prevalence:.3}"
         );
-        for formula in [
-            "y ~ factor(student) + s(balance) + s(income)",
-            "y ~ s(balance) + s(income)",
-        ] {
-            let fit = gam::fit_from_formula(formula, &data, &config).unwrap_or_else(|error| {
-                panic!(
-                    "seed {seed} `{formula}` (prevalence {prevalence:.3}) must fit. A search \
-                     whose criterion carries the #784 correction can only certify when the \
-                     correction is a function of rho, not of the eigensolver's rounding on \
-                     the assembled Hessian: {error}"
-                )
-            });
-            let gam::FitResult::Standard(standard) = &fit else {
-                panic!("seed {seed} `{formula}` is a standard GLM fit");
-            };
-            let score = standard.fit.reml_score().unwrap_or(f64::NAN);
-            assert!(
-                score.is_finite(),
-                "seed {seed} `{formula}` minted a fit with no finite REML/LAML criterion"
-            );
-        }
-    }
-}
-
-#[test]
-fn tmp_scan_rare_event_seeds() {
-    init_parallelism();
-    let config = FitConfig {
-        family: Some("binomial-logit".to_string()),
-        ..FitConfig::default()
-    };
-    for seed in 1_u64..=10 {
-        let (data, prevalence) = default_like(seed, 2000);
-        for formula in [
-            "y ~ factor(student) + s(balance) + s(income)",
-            "y ~ s(balance) + s(income)",
-        ] {
-            let t = std::time::Instant::now();
-            let outcome = gam::fit_from_formula(formula, &data, &config);
-            let msg = match &outcome {
-                Ok(_) => "OK".to_string(),
-                Err(e) => format!("ERR {}", e.to_string().chars().take(160).collect::<String>()),
-            };
-            eprintln!("[scan] seed={seed} prev={prevalence:.3} `{formula}` {:.1}s {msg}", t.elapsed().as_secs_f64());
-        }
+        let fit = gam::fit_from_formula(formula, &data, &config).unwrap_or_else(|error| {
+            panic!(
+                "seed {seed} `{formula}` (prevalence {prevalence:.3}) must fit. A search \
+                 whose criterion carries the #784 correction can only certify when the \
+                 correction is a function of rho, not of the eigensolver's rounding on \
+                 the assembled Hessian: {error}"
+            )
+        });
+        let gam::FitResult::Standard(standard) = &fit else {
+            panic!("seed {seed} `{formula}` is a standard GLM fit");
+        };
+        let score = standard.fit.reml_score().unwrap_or(f64::NAN);
+        assert!(
+            score.is_finite(),
+            "seed {seed} `{formula}` minted a fit with no finite REML/LAML criterion"
+        );
     }
 }
