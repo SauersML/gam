@@ -317,6 +317,64 @@ fn the_value_only_likelihood_drops_the_origin_entry_factor_like_the_frame_kernel
     }
 }
 
+/// `Σ` in this family's defining identity is the conditional score covariance
+/// `Var(z | a)` (gam#2766), and the frame kernel reads `1ᵀΣ1` off the family.
+/// The value-only likelihood the trust region scores a trial on must read the
+/// same number. The time-constant frame's value-only route rebuilt its row
+/// inputs with `1ᵀΣ1 = 1`, so under a non-unit covariance a backtracking trial
+/// was scored on another likelihood than the one whose gradient and Hessian
+/// built the step, and the inner solve stalled at its trust-radius floor
+/// (gam#2952). The follow-up-varying frame is the control: its value-only route
+/// already read the kernel's inputs.
+#[test]
+fn the_value_only_likelihood_reads_the_score_covariance_like_the_frame_kernel_2952() {
+    for frame_is_follow_up_varying in [false, true] {
+        let unit = family(frame_is_follow_up_varying);
+        let mut conditional = family(frame_is_follow_up_varying);
+        conditional.score_covariance = ScoreCovarianceField::pooled(
+            MarginalSlopeCovariance::diagonal(ndarray::array![0.64])
+                .expect("a 1x1 non-unit latent-score covariance"),
+        );
+        let point = states(&conditional, interior_slope_beta());
+        let value_only = conditional
+            .log_likelihood_only(&point)
+            .expect("value-only likelihood");
+        let mut kernel = 0.0_f64;
+        let mut magnitude = 0.0_f64;
+        for row in 0..N_ROWS {
+            let (nll, _, _) = conditional
+                .compute_row_primary_gradient_hessian_uncached(row, &point)
+                .expect("frame kernel row");
+            kernel -= nll;
+            magnitude += nll.abs();
+        }
+        // Both routes sum the same row values, so they may differ by the
+        // rounding of two N_ROWS-term sums and nothing more: 2·γ_{n−1}·Σ|termᵢ|
+        // with γ_k = k·u/(1 − k·u) and u = ε/2.
+        let unit_roundoff = 0.5 * f64::EPSILON;
+        let terms = (N_ROWS - 1) as f64;
+        let summation_rounding =
+            2.0 * terms * unit_roundoff / (1.0 - terms * unit_roundoff) * magnitude;
+        assert!(
+            (value_only - kernel).abs() <= summation_rounding,
+            "follow_up_varying={frame_is_follow_up_varying}: value-only likelihood \
+             {value_only:.15e} differs from the frame kernel's {kernel:.15e} by {:.3e}, beyond \
+             the rounding {summation_rounding:.3e} of their sums",
+            (value_only - kernel).abs()
+        );
+        // The covariance has to move this likelihood, or the agreement above
+        // grades nothing.
+        let unit_value = unit
+            .log_likelihood_only(&point)
+            .expect("value-only likelihood");
+        assert!(
+            (unit_value - value_only).abs() > summation_rounding,
+            "follow_up_varying={frame_is_follow_up_varying}: Var(z | a) = 0.64 leaves the \
+             likelihood at its unit-covariance value {unit_value:.15e}"
+        );
+    }
+}
+
 #[test]
 fn the_fixture_step_really_leaves_the_domain_2765() {
     let family = family(true);

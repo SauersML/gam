@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import math
-import tempfile
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, overload
 
-from ._binding import RustExtensionUnavailableError, extension_status, rust_module
-from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
+from ._binding import RustExtensionUnavailableError, extension_status
+from ._binding import rust_module as rust_module
+from ._calibrated_slope import CtnStage1 as CtnStage1
+from ._calibrated_slope import normalize_ctn_stage1
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -22,6 +22,28 @@ from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
+
+if TYPE_CHECKING:
+    from ._model import MultinomialModel
+    from ._rust import ManifoldSAESupport
+    from ._sae_manifold import ManifoldSAE
+
+# ``family`` spellings that route ``fit`` to the multinomial-logit solver; the
+# runtime check also folds case and ``_``/``-``, which a Literal cannot express.
+MultinomialFamily: TypeAlias = Literal[
+    "multinomial",
+    "multinomial-logit",
+    "multinomial_logit",
+    "categorical",
+    "categorical-logit",
+    "categorical_logit",
+    "softmax",
+]
+# Every class ``load``/``loads`` can return; the payload header selects one.
+LoadedModel: TypeAlias = (
+    "Model | MultinomialModel | ResponseGeometryModel | ManifoldSAE | ManifoldSAESupport"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
@@ -183,7 +205,8 @@ def cross_fit_shared_precision_groups(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return json.loads(raw)
+    fitted: dict[str, dict[str, Any]] = json.loads(raw)
+    return fitted
 
 
 def build_info() -> dict[str, Any]:
@@ -280,8 +303,6 @@ def _build_fit_payload(
     smooths: Mapping[Any, Any] | None,
     config: dict[str, Any] | None,
     residual_columns: Sequence[str] | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
 ) -> dict[str, Any]:
     normalized_latents = _normalize_latents(latents)
     payload: dict[str, Any] = {
@@ -325,8 +346,6 @@ def _build_fit_payload(
         "noise_formula": noise_formula,
         "noise_offset": noise_offset,
         "flexible_link": flexible_link,
-        "outer_tol": outer_tol,
-        "inner_tol": inner_tol,
         "precision_hyperpriors": precision_hyperpriors,
         # `FitRequestConfigDocument` is `deny_unknown_fields` and names these
         # three `latent_coordinates` / `analytic_penalties` /
@@ -381,16 +400,6 @@ def _warm_start_model_bytes(warm_start_from: Any) -> bytes | None:
             f"{type(warm_start_from).__name__}"
         )
     return bytes(warm_start_from._model_bytes)
-
-
-@contextlib.contextmanager
-def _warm_start_scratch(model_bytes: bytes | None) -> Any:
-    """A scratch directory for the warm start's one-entry cache, removed after the fit."""
-    if model_bytes is None:
-        yield None
-        return
-    with tempfile.TemporaryDirectory(prefix="gamfit-warm-start-") as scratch:
-        yield scratch
 
 
 def _jsonable_array(value: Any) -> Any:
@@ -593,6 +602,65 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
         raise map_exception(exc) from exc
 
 
+MULTINOMIAL_FAMILY_NAMES = frozenset(
+    {"multinomial", "multinomial-logit", "categorical", "categorical-logit", "softmax"}
+)
+
+
+def is_multinomial_family(family: str | None) -> bool:
+    """Whether ``family`` names the softmax (multinomial-logit) likelihood."""
+    if family is None:
+        return False
+    return str(family).lower().replace("_", "-") in MULTINOMIAL_FAMILY_NAMES
+
+
+@overload
+def fit(
+    data: Any,
+    formula: str,
+    *,
+    family: MultinomialFamily,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
+    offset: str | None = ...,
+    weights: str | None = ...,
+    persistent_warm_start_root: str | Path | None = ...,
+    transformation_normal: bool | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
+    survival_likelihood: str | None = ...,
+    survival_time_anchor: float | None = ...,
+    baseline_target: str | None = ...,
+    baseline_scale: float | None = ...,
+    baseline_shape: float | None = ...,
+    baseline_rate: float | None = ...,
+    baseline_makeham: float | None = ...,
+    z_column: str | None = ...,
+    residual_columns: Sequence[str] | None = ...,
+    link: str | None = ...,
+    slope_formula: str | None = ...,
+    frailty_kind: str | None = ...,
+    frailty_sd: float | None = ...,
+    hazard_loading: str | None = ...,
+    scale_dimensions: bool | None = ...,
+    firth: bool | None = ...,
+    noise_formula: str | None = ...,
+    noise_offset: str | None = ...,
+    flexible_link: bool | None = ...,
+    warm_start_from: None = ...,
+    precision_hyperpriors: Any | None = ...,
+    constraints: Mapping[str, Any] | None = ...,
+    response_geometry: None = ...,
+    response_columns: list[str] | tuple[str, ...] | None = ...,
+    response_coordinates: str | None = ...,
+    response_reference: int | None = ...,
+    fisher_rao_w: Any | None = ...,
+    latents: Mapping[str, Any] | None = ...,
+    penalties: Sequence[Any] | None = ...,
+    smooths: Mapping[Any, Any] | None = ...,
+    config: dict[str, Any] | None = ...,
+) -> MultinomialModel: ...
+
+
 @overload
 def fit(
     data: Any,
@@ -625,8 +693,6 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
-    outer_tol: float | None = ...,
-    inner_tol: float | None = ...,
     warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
@@ -674,8 +740,6 @@ def fit(
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
-    outer_tol: float | None = ...,
-    inner_tol: float | None = ...,
     warm_start_from: Model | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
@@ -722,8 +786,6 @@ def fit(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
     warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
@@ -736,7 +798,7 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel:
+) -> Model | MultinomialModel | ResponseGeometryModel:
     """Fit a GAM model from a formula and tabular data.
 
     Manifold sparse autoencoders have their own explicit
@@ -914,32 +976,20 @@ def fit(
         link fixed at its canonical/parametric form, letting the data shape
         the response transformation. Corresponds to the CLI flexible-link path
         (``FitConfig.flexible_link``).
-    outer_tol:
-        Absolute stationarity tolerance of the outer (smoothing-parameter)
-        search, for a fit that must converge past the default stop, such as a
-        reference fit. It is handed to the route's outer optimizer unchanged,
-        and a family's own floor on the default does not raise it. When
-        omitted, each route keeps its default: ``1e-10`` for standard GAMs and
-        ``1e-5`` for the custom-family routes (marginal-slope, survival,
-        transformation-normal, location-scale), which the binary
-        marginal-slope route floors at ``2e-5``. Corresponds to the
-        fit-request key ``outer_tol``.
-    inner_tol:
-        Absolute coefficient stationarity tolerance of the custom-family inner
-        solver (default ``1e-6``). A standard GAM without a link-wiggle refit
-        has no inner tolerance to set and raises instead of ignoring it.
-        Corresponds to the fit-request key ``inner_tol``.
     warm_start_from:
-        A fitted :class:`Model` of the same formula to resume from. The outer
-        search starts at that model's certified point (its smoothing parameters
-        and coefficient mode) and certifies as usual. If the point is still
-        stationary on this data, the search accepts it with no outer
-        iterations. Otherwise the search runs from it. It is a warm start,
-        never a shortcut past the certificate. Custom-family fits
-        (marginal-slope, survival, transformation-normal, location-scale)
-        accept it. A model of another formula, of other terms or design
-        width, or from a route that records no point is refused by name, as is
-        a fit that searches length-scale or other auxiliary coordinates.
+        A fitted :class:`Model` of the same formula to resume from. The model
+        records its certified outer point (smoothing parameters, any
+        length-scale and auxiliary coordinates, and the coefficient mode), the
+        criterion value certified there, and a fingerprint of the inputs. On
+        the same formula, data and settings, the search that certified the
+        point accepts it with no outer iterations where it is still certified,
+        and every other search of the fit runs as it runs cold. On other data
+        or settings the point cannot change which optimum is reported: a
+        search that takes the best of several independent seeds adds it to the
+        seed set, and a search that certifies its first certifiable seed does
+        not use it. The model notes say which. A model of another formula, or
+        one recording no point (fitted before this version: refit it), is
+        refused by name.
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
@@ -1066,8 +1116,6 @@ def fit(
             ("noise_formula", noise_formula),
             ("noise_offset", noise_offset),
             ("flexible_link", flexible_link),
-            ("outer_tol", outer_tol),
-            ("inner_tol", inner_tol),
             ("warm_start_from", warm_start_from),
         ]:
             if arg_val is not None:
@@ -1124,8 +1172,6 @@ def fit(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        outer_tol=outer_tol,
-        inner_tol=inner_tol,
         precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,
@@ -1155,14 +1201,7 @@ def fit(
     # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
     # to select an independent smoothing parameter per (class, term), from the
     # same `MultinomialFitRequest::new` defaults the CLI uses.
-    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
-    if family_canonical in {
-        "multinomial",
-        "multinomial-logit",
-        "categorical",
-        "categorical-logit",
-        "softmax",
-    }:
+    if is_multinomial_family(family):
         if warm_start_bytes is not None:
             raise ValueError("warm_start_from is not supported for multinomial fits")
         try:
@@ -1186,18 +1225,11 @@ def fit(
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     try:
-        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
-            model_bytes = bytes(
-                rust_module().fit_table(
-                    headers,
-                    rows,
-                    formula,
-                    json.dumps(payload),
-                    fisher_w,
-                    warm_start_bytes,
-                    warm_start_dir,
-                )
+        model_bytes = bytes(
+            rust_module().fit_table(
+                headers, rows, formula, json.dumps(payload), fisher_w, warm_start_bytes
             )
+        )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
@@ -1240,8 +1272,6 @@ def fit_array(
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
-    outer_tol: float | None = None,
-    inner_tol: float | None = None,
     warm_start_from: Model | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
@@ -1309,8 +1339,6 @@ def fit_array(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        outer_tol=outer_tol,
-        inner_tol=inner_tol,
         precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,
@@ -1319,18 +1347,11 @@ def fit_array(
     )
     warm_start_bytes = _warm_start_model_bytes(warm_start_from)
     try:
-        with _warm_start_scratch(warm_start_bytes) as warm_start_dir:
-            model_bytes = bytes(
-                rust_module().fit_array(
-                    X_arr,
-                    Y_arr,
-                    formula,
-                    json.dumps(payload),
-                    None,
-                    warm_start_bytes,
-                    warm_start_dir,
-                )
+        model_bytes = bytes(
+            rust_module().fit_array(
+                X_arr, Y_arr, formula, json.dumps(payload), None, warm_start_bytes
             )
+        )
     except Exception as exc:
         raise map_exception(exc) from exc
     model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
@@ -1341,7 +1362,7 @@ def fit_array(
 SUPPORT_SAE_SCHEMA = "gamfit.ManifoldSAE/support-v2"
 
 
-def model_from_dict(payload: Any) -> Any:
+def model_from_dict(payload: Any) -> ManifoldSAE | ManifoldSAESupport:
     """Rebuild a manifold-SAE from an already-decoded ``to_dict()`` payload.
 
     :func:`load` owns the on-disk case, where the schema tag is read out of the
@@ -1372,7 +1393,7 @@ def model_from_dict(payload: Any) -> Any:
     return ManifoldSAE.from_dict(payload)
 
 
-def load(path: str | Path) -> Any:
+def load(path: str | Path) -> LoadedModel:
     """Load a fitted model previously written with :func:`gamfit.save`.
 
     Reads the file and dispatches through :func:`loads`.
@@ -1410,7 +1431,7 @@ def save(model: Any, path: str | Path) -> None:
     saver(path)
 
 
-def loads(model_bytes: bytes) -> Any:
+def loads(model_bytes: bytes) -> LoadedModel:
     """Load a fitted model from an in-memory bytes payload.
 
     The Rust ``saved_model_kind`` reads the payload header and selects the
@@ -1478,7 +1499,13 @@ def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeomet
     from ._response_geometry import SharedGaussianRemlTangentFit
 
     def _model_from_b64(encoded: str) -> Model:
-        return loads(base64.b64decode(encoded.encode("ascii")))
+        model = loads(base64.b64decode(encoded.encode("ascii")))
+        if not isinstance(model, Model):
+            raise ValueError(
+                "response-geometry coordinate archive does not hold a scalar Model; "
+                f"got {type(model).__name__}"
+            )
+        return model
 
     models = tuple(
         _model_from_b64(encoded) for encoded in payload.get("coordinate_models_b64", [])

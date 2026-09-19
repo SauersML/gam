@@ -30,9 +30,21 @@ Two stages, each one call:
               float64 ``.npy`` per array id, as the surface's CLI transport reads
               them: ``inputs``; per setting ``<name>.gate``, ``.activation``,
               ``.up``, ``.hidden``, ``.output`` (``rows x width``); per distinct
-              edit ``edit<k>.left`` and ``edit<k>.right``; ``ones<C>``; and
-              ``manifest.json`` naming every id, file, setting and edit, with the
-              executor's dtype, device and TF32 flag as recorded before any copy.
+              edit ``edit<k>.left`` and ``edit<k>.right``; ``ones<C>``; the norm
+              stage's ``norm.inputs`` and ``norm.output``; and ``manifest.json``
+              naming every id, file, setting and edit, with the executor's dtype,
+              device and TF32 flag as recorded before any copy.
+
+The norm stage runs the source's own ``Qwen3RMSNorm`` (the harvested layer's
+``post_attention_layernorm``, float64 weight) on the harvested pre-norm rows. Its
+source casts the rows to float32 before normalizing and back after, so the stage
+output is float64 while the norm ran in float32. The manifest records that from the
+installed source (``internal_dtype``), and whether ``torch.rsqrt`` returned exactly the
+correctly rounded ``1 / sqrt`` at the stage's float32 arguments on this device
+(``rsqrt_is_reciprocal_sqrt``). The reference is numpy's float32 ``sqrt`` and division,
+each an IEEE correctly rounded operation, not ``torch.sqrt``: with MKL, torch's float32
+``sqrt`` runs through VML, which is not correctly rounded. Rust declares the matching
+band program, whose rsqrt step assumes those two correctly rounded operations.
 
 A setting with no edits is the all-on setting and runs ``execute_native``.
 Checkpoints load with ``local_files_only=True``: nothing downloads.
@@ -42,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -51,7 +64,7 @@ import numpy as np
 import torch
 import transformers
 from transformers import AutoConfig
-from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP
+from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
 
 from gamfit.torch.parameter_interventions import (
     FactoredDelta,
@@ -103,12 +116,30 @@ def _block(harvest: str) -> tuple[dict, Qwen3MLP]:
     return meta, mlp
 
 
-def _rows(harvest: str, rows: int, hidden: int) -> np.ndarray:
-    """The leading ``rows`` post-norm rows, widened exactly to float64."""
-    post_norm = np.load(os.path.join(harvest, "post_norm.npy"), mmap_mode="r")
-    if post_norm.ndim != 2 or post_norm.shape[1] != hidden or post_norm.shape[0] < rows:
-        raise SystemExit(f"post_norm.npy has shape {post_norm.shape}; need at least {rows} x {hidden}")
-    return np.ascontiguousarray(np.asarray(post_norm[:rows], dtype=np.float64))
+def _rows(harvest: str, rows: int, hidden: int, name: str = "post_norm.npy") -> np.ndarray:
+    """The leading ``rows`` rows of a harvested float32 array, widened exactly to float64."""
+    harvested = np.load(os.path.join(harvest, name), mmap_mode="r")
+    if harvested.ndim != 2 or harvested.shape[1] != hidden or harvested.shape[0] < rows:
+        raise SystemExit(f"{name} has shape {harvested.shape}; need at least {rows} x {hidden}")
+    return np.ascontiguousarray(np.asarray(harvested[:rows], dtype=np.float64))
+
+
+# The statement of Qwen3RMSNorm.forward that moves the norm into float32 (transformers'
+# modeling_qwen3.py). Its presence in the installed source is what the manifest reports.
+FLOAT32_CAST = "hidden_states = hidden_states.to(torch.float32)"
+
+
+def _norm(harvest: str, meta: dict) -> tuple[Qwen3RMSNorm, str]:
+    """The harvested layer's ``post_attention_layernorm`` as the source's ``Qwen3RMSNorm`` in
+    float64, and the dtype its installed source normalizes in."""
+    if meta.get("norm_class") != "Qwen3RMSNorm":
+        raise SystemExit(f"{harvest} records no Qwen3RMSNorm post_attention_layernorm: {meta.get('norm_class')}")
+    norm = Qwen3RMSNorm(int(meta["hidden_size"]), eps=float(meta["norm_epsilon"])).to(torch.float64)
+    weight = torch.from_numpy(np.load(os.path.join(harvest, "post_attention_layernorm.weight.npy")))
+    norm.load_state_dict({"weight": weight}, strict=True)
+    norm.eval()
+    internal = "float32" if FLOAT32_CAST in inspect.getsource(Qwen3RMSNorm.forward) else "unknown"
+    return norm, internal
 
 
 def registry(args: argparse.Namespace) -> int:
@@ -282,6 +313,32 @@ def execute(args: argparse.Namespace) -> int:
     finally:
         for handle in handles:
             handle.remove()
+    norm, internal = _norm(args.harvest, meta)
+    pre_norm = torch.from_numpy(_rows(args.harvest, rows, hidden, "pre_norm.npy")).view(1, rows, hidden)
+    with torch.no_grad():
+        normalized = norm(pre_norm)
+        # The rsqrt arguments the source forms, by the source's own statements.
+        arguments = pre_norm.to(torch.float32).pow(2).mean(-1, keepdim=True) + norm.variance_epsilon
+        reference = np.float32(1) / np.sqrt(arguments.numpy())
+        rsqrt_is_reciprocal_sqrt = bool(np.array_equal(torch.rsqrt(arguments).numpy(), reference))
+    if normalized.dtype != torch.float64:
+        raise SystemExit(f"the norm stage returned {normalized.dtype}")
+    norm_record = {
+        "class": type(norm).__name__,
+        "epsilon": norm.variance_epsilon,
+        "internal_dtype": internal,
+        "rsqrt_is_reciprocal_sqrt": rsqrt_is_reciprocal_sqrt,
+        "gain": os.path.join(args.harvest, "post_attention_layernorm.weight.npy"),
+        "inputs": save("norm.inputs", pre_norm.reshape(rows, hidden).numpy()),
+        "output": save("norm.output", normalized.reshape(rows, hidden).numpy()),
+        "dtype": str(normalized.dtype).removeprefix("torch."),
+        "device": str(normalized.device),
+    }
+    print(
+        f"[execute] norm {norm_record['class']} internal={internal} eps={norm_record['epsilon']} "
+        f"rsqrt_is_reciprocal_sqrt={rsqrt_is_reciprocal_sqrt}",
+        flush=True,
+    )
     # The runner reads the TF32 flag right before each forward; one export has one flag.
     tf32_flags = sorted({entry["tf32_matmul"] for entry in ran})
     if len(tf32_flags) != 1:
@@ -301,6 +358,7 @@ def execute(args: argparse.Namespace) -> int:
         "settings_md5": _md5(args.settings),
         "files": {array_id: {"path": path, "md5": _md5(path)} for array_id, path in files.items()},
         "settings": ran,
+        "norm": norm_record,
         "versions": {"torch": torch.__version__, "transformers": transformers.__version__, "numpy": np.__version__},
         "seconds": round(time.time() - t0, 1),
     }
@@ -315,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="stage", required=True)
 
     r = sub.add_parser("registry", help="parameter registry and use sites of the harvested block")
-    r.add_argument("--harvest", required=True, help="export_block.py harvest directory of a Qwen3MLP")
+    r.add_argument("--harvest", required=True, help="export_block.py harvest directory of a Qwen3MLP and its norm")
     r.add_argument("--rows", type=int, required=True, help="leading post-norm rows, one (1, rows) unit")
     r.add_argument("--out", required=True, help="registry.json")
 

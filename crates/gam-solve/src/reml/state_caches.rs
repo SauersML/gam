@@ -1102,26 +1102,46 @@ pub(crate) fn reml_fixed_glm_dispersion(
 /// block displacement `t` (coordinates in the curvature-heavy H-eigenvector
 /// subspace `V_b`), for the non-Gaussian remainder
 ///
-///   ΔF(t) = F(β̂ + δ) − F(β̂) − ½ δᵀ H δ,   δ = V_b t,
-///   F(β)  = −ℓ(β) + ½ βᵀ S(ρ) β.
+///   ΔF(t) = F(β̂ + δ) − F(β̂) − ½ δᵀ H δ,   δ = V_b t,  s = X δ,
+///   F(β)  = Σ_i ψ_i(x_iᵀβ) + ½ βᵀ S(ρ) β,   ψ_i = D_i/(2φ),
 ///
-/// Using the mode condition `S β̂ = ∇ℓ(β̂)` and `∇²ℓ = −Xᵀ W X`, the penalty's
-/// (exactly quadratic) curvature cancels and the remainder reduces to a
-/// family-uniform expression in the deviance plus the explicit penalty score:
+/// with `H = Xᵀ W X + S(ρ)` and `W_i = ψ_i''(η̂_i)`. The penalty is exactly
+/// quadratic, so its curvature cancels against `S(ρ)` in `H` and only its
+/// linear term `(S β̂)·δ` survives. The mode condition `∇F(β̂) = 0` is
+/// `S β̂ = −Xᵀ ψ'(η̂)`, so that linear term is `−ψ'(η̂)·s`, and the remainder is
+/// the per-row Taylor remainder of the likelihood beyond second order:
 ///
-///   ΔF(t) = [D(η̂ + Xδ) − D(η̂)]/(2φ)          (= −[ℓ(β̂+δ) − ℓ(β̂)])
-///           + (S β̂)·δ                          (penalty-score channel)
-///           − ½ Σ_i W_i (Xδ)_i².               (likelihood-curvature subtraction)
+///   ΔF(t) = Σ_i [ψ_i(η̂_i + s_i) − ψ_i(η̂_i) − ψ_i'(η̂_i) s_i − ½ W_i s_i²].
+///
+/// On the exact mode this equals the form that keeps `(S β̂)·δ`, and so do its
+/// total ρ-derivatives. The two differ in what they do with the mode's
+/// rounding, and the difference decides whether the outer search can converge.
+/// `(S β̂)·δ` rebuilt from `λ_k (S_k β̂)` is a sum over penalties that the outer
+/// search drives to `λ = e^{27}` and beyond, where `S_k β̂` itself is a
+/// rounding residue of `‖β̂‖`. Measured on a near-separated binomial CV fold
+/// (n = 160, `y ~ s(x) + s(z)`): `λ = 8.4e11` times a residue near `3e-15`
+/// put a spurious linear term of `±4e-4` along a block direction whose
+/// curvature is `0.035`, while the inner solve's own KKT residual along that
+/// direction was `1e-12` to `1e-17`. The quadrature's first-order response to a
+/// linear term is `−E_p[t]`, about 1.66 there, so `Δ_b` moved by up to `1.6e-3`
+/// between evaluations at one ρ, which no line search can descend through;
+/// the fit ended with `|Pg| = 3e-2` and `StepSizeTooSmall`. The row form is a
+/// sum over bounded per-row terms with no `λ` in it, so it has no such channel.
+///
+/// Firth: the Jeffreys term `J = −½ log|I(β)|` is part of `F`, so the mode
+/// condition carries `∇J`, and `H` carries `∇²J`. Its linear and quadratic
+/// Taylor terms cancel in `ΔF` exactly as the penalty's do. What this target
+/// leaves out is the Jeffreys remainder beyond second order, which is
+/// `O(n^{-3/2})` next to the likelihood remainder's `O(n^{-1/2})`. The
+/// penalty-score form instead left out `∇J·δ`, a first-order term, and
+/// measured `Δ_b ≈ 9.3` on the same fold's Firth retry.
 ///
 /// `D/2` and its η-score come from one fallible family row oracle; `φ = 1` for
 /// families whose reported deviance already carries the likelihood scale
 /// (including fixed-scale Gaussian and Beta), and is the EDM dispersion for
-/// unscaled Gamma/Tweedie deviance. The only place
-/// ρ appears *explicitly* (with δ held fixed in coefficient space) is the
-/// penalty-score term, giving the exact explicit ρ-gradient
-///   ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ.
-/// The implicit β̂(ρ) channel is the same envelope term the surrounding
-/// Laplace/LAML evaluator already accounts for at the mode.
+/// unscaled Gamma/Tweedie deviance. With δ held fixed in coefficient space ρ
+/// does not appear in `ΔF` explicitly: it enters only through the mode `β̂(ρ)`
+/// (via `η̂`, `ψ'(η̂)` and `W`), which the mode-motion channel differentiates.
 pub(crate) struct Gam784BlockTarget<'t> {
     /// `X_t` (transformed-basis dense design, matching `h_total`/`solve_c_array`).
     pub(crate) x_transformed: &'t Array2<f64>,
@@ -1148,7 +1168,8 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) phi: f64,
     /// Penalty scores `S_k β̂` per canonical penalty (unscaled by λ_k).
     /// Shared from the eval bundle's once-per-inner-solution cache
-    /// (`EvalShared::canonical_penalty_scores_at_mode`).
+    /// (`EvalShared::canonical_penalty_scores_at_mode`). `ΔF` does not read
+    /// them; the evaluator's mode response `dβ̂/dρ_k = −H⁻¹ λ_k S_k β̂` does.
     pub(crate) penalty_scores: Arc<Vec<Array1<f64>>>,
     /// TRANSFORMED-frame canonical penalties — the same coordinate frame as
     /// `x_transformed`, `block_vecs` and the mode β̂ they are contracted
@@ -1163,7 +1184,8 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) lambdas: Vec<f64>,
     /// Certified `D(eta_hat)/(2 phi)` on the exact row surface.
     pub(crate) base_scaled_half_deviance: f64,
-    /// Its per-row eta gradient, cached once for the sampler moment channels.
+    /// Its per-row eta gradient `ψ'(η̂)`: the linear Taylor term of `ΔF`, and
+    /// the base the sampler moment channels are measured against.
     pub(crate) base_neg_score_at_mode: Array1<f64>,
     /// `Σ_i |D_i(eta_hat)/(2 phi)|`, the absolute sum the base half-deviance
     /// accumulated, for [`BlockExcessTarget::excess_rounding_band`].
@@ -1225,8 +1247,8 @@ impl Gam784BlockTarget<'_> {
         self.likelihood_surface_at(eta).map(|(_, score)| score)
     }
 
-    /// The excess at one node of the batched sweeps, from its columns of
-    /// `Δ = V_b·T` (`delta`) and `S = X_t·Δ` (`s`), with the displaced η-score
+    /// The excess at one node of the batched sweeps, from its column `s` of
+    /// `S = X_t·V_b·T`, with the displaced η-score
     /// written into `score` when one is given. `half` is the calling worker's
     /// half-deviance scratch.
     ///
@@ -1236,7 +1258,6 @@ impl Gam784BlockTarget<'_> {
     /// allocation per node for a sweep that is itself only arithmetic.
     fn node_excess(
         &self,
-        delta: ndarray::ArrayView1<'_, f64>,
         s: ndarray::ArrayView1<'_, f64>,
         half: &mut [f64],
         mut score: Option<&mut [f64]>,
@@ -1269,14 +1290,7 @@ impl Gam784BlockTarget<'_> {
                 });
             }
         }
-        let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
-        let delta = delta.to_owned();
-        let mut penalty_term = 0.0_f64;
-        for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
-            penalty_term += lam * score.dot(&delta);
-        }
-        let curv = self.observed_quadratic(s)?;
-        Ok(neg_loglik_diff + penalty_term - 0.5 * curv)
+        self.remainder_at(scaled_half_deviance, s)
     }
 
     /// [`BlockExcessTarget::excess_with_displaced_neg_score_batch`] and
@@ -1323,7 +1337,6 @@ impl Gam784BlockTarget<'_> {
                 |half, sidx| {
                     let mut score = keep_score.then(|| Array1::<f64>::zeros(n));
                     let excess = match self.node_excess(
-                        delta_all.column(sidx),
                         s_all.column(sidx),
                         half,
                         score.as_mut().map(|score| {
@@ -1343,6 +1356,18 @@ impl Gam784BlockTarget<'_> {
                 },
             )
             .collect()
+    }
+
+    /// `ΔF` from the displaced scaled half-deviance at `η̂ + s`: the row
+    /// Taylor remainder `ψ(η̂ + s) − ψ(η̂) − ψ'(η̂)·s − ½ Σ_i W_i s_i²`.
+    fn remainder_at(
+        &self,
+        displaced_scaled_half_deviance: f64,
+        s: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<f64, EstimationError> {
+        let curv = self.observed_quadratic(s)?;
+        let value_diff = displaced_scaled_half_deviance - self.base_scaled_half_deviance;
+        Ok(value_diff - self.base_neg_score_at_mode.dot(&s) - 0.5 * curv)
     }
 
     /// `sum_i W_i s_i^2`, one deterministic Neumaier pass that preserves signed
@@ -1463,35 +1488,25 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     fn excess(&self, t: &Array1<f64>) -> f64 {
-        let (delta, s) = self.displacement(t);
+        let (_delta, s) = self.displacement(t);
         let eta_disp = &self.eta_hat + &s;
         let Ok((scaled_half_deviance, _score)) = self.likelihood_surface_at(&eta_disp) else {
             return f64::INFINITY;
         };
-        // −[ℓ(β̂+δ) − ℓ(β̂)] = [D_disp − D_base]/(2φ).
-        let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
-        // Penalty-score channel (S β̂)·δ = Σ_k λ_k (S_k β̂)·δ.
-        let mut penalty_term = 0.0_f64;
-        for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
-            penalty_term += lam * score.dot(&delta);
-        }
-        // Likelihood-curvature subtraction ½ Σ_i W_i s_i².
-        let Ok(curv) = self.observed_quadratic(s.view()) else {
-            return f64::INFINITY;
-        };
-        neg_loglik_diff + penalty_term - 0.5 * curv
+        self.remainder_at(scaled_half_deviance, s.view())
+            .unwrap_or(f64::INFINITY)
     }
 
     /// The rounding band of [`Self::excess`] at `t`, from what its sums accumulate:
     /// - the displaced and base scaled half-deviances, compensated sums over `n`
     ///   rows. Each row oracle rounds in fewer than `n` operations, so each sum
     ///   carries at most `accumulation_band(n, Σ|row|)`.
-    /// - the penalty channel `Σ_k λ_k (S_k β̂)·δ`, an inner product over
-    ///   `rho_dim()·p` terms.
+    /// - the linear Taylor term `ψ'(η̂)·s`, an inner product over `n` terms.
     /// - the observed quadratic `Σ_i W_i s_i²`, a compensated sum over `n` terms.
     /// - the design product `s = X_t V_b t`, whose entries round within
     ///   `γ_{p(m+1)}·Σ_j |x_ij|·‖δ‖∞`. That moves the displaced surface by at most
-    ///   `|score_i|` times it, and the quadratic by `|W_i|·|s_i|` times it.
+    ///   `|ψ'(η̂_i + s_i)|` times it, the linear term by `|ψ'(η̂_i)|` times it and
+    ///   the quadratic by `|W_i|·|s_i|` times it.
     ///
     /// A row surface that does not evaluate returns `+∞`, which no bar passes.
     fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
@@ -1512,21 +1527,13 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         let deviance_band = gam_linalg::roundoff::accumulation_band(n, displaced_absolute)
             + gam_linalg::roundoff::accumulation_band(n, self.base_absolute_half_deviance);
         let p = delta.len();
-        let penalty_absolute: f64 = self
-            .penalty_scores
+        let linear_absolute: f64 = self
+            .base_neg_score_at_mode
             .iter()
-            .zip(self.lambdas.iter())
-            .map(|(score, &lam)| {
-                lam.abs()
-                    * score
-                        .iter()
-                        .zip(delta.iter())
-                        .map(|(left, right)| (left * right).abs())
-                        .sum::<f64>()
-            })
+            .zip(s.iter())
+            .map(|(score, value)| (score * value).abs())
             .sum();
-        let penalty_band =
-            gam_linalg::roundoff::accumulation_band(self.lambdas.len() * p, penalty_absolute);
+        let linear_band = gam_linalg::roundoff::accumulation_band(n, linear_absolute);
         let curvature_absolute: f64 = self
             .weights_obs
             .iter()
@@ -1538,37 +1545,33 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         let design_growth =
             gam_linalg::roundoff::accumulation_growth(p * (self.block_lambdas.len() + 1));
         let mut design_band = 0.0_f64;
-        for (((design_row, row), weight), value) in self
+        for ((((design_row, row), base_score), weight), value) in self
             .x_transformed
             .rows()
             .into_iter()
             .zip(rows.iter())
+            .zip(self.base_neg_score_at_mode.iter())
             .zip(self.weights_obs.iter())
             .zip(s.iter())
         {
             let row_absolute: f64 = design_row.iter().map(|entry| entry.abs()).sum();
             let entry_band = design_growth * row_absolute * delta_max;
-            design_band += (row.eta_score.abs() + weight.abs() * value.abs()) * entry_band;
+            design_band += (row.eta_score.abs() + base_score.abs() + weight.abs() * value.abs())
+                * entry_band;
         }
-        deviance_band + penalty_band + 0.5 * curvature_band + design_band
+        deviance_band + linear_band + 0.5 * curvature_band + design_band
     }
 
+    /// Zero: with `δ` held fixed in coefficient space, ρ reaches `ΔF` only
+    /// through the mode `β̂(ρ)` (see the type's derivation), and that motion is
+    /// the evaluator's mode channel, not an explicit one.
     fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
-        // Only the coefficient displacement `δ = V_b t` (O(pm)) is needed here;
-        // the per-row score `s = X_t δ` (the O(np) design matvec) that
-        // `displacement` also computes is unused, so skip it.
-        let delta = self.block_vecs.dot(t);
-        let mut grad = Array1::<f64>::zeros(self.lambdas.len());
-        for (k, (score, &lam)) in self
-            .penalty_scores
-            .iter()
-            .zip(self.lambdas.iter())
-            .enumerate()
-        {
-            // ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ (the only explicit ρ-appearance).
-            grad[k] = lam * score.dot(&delta);
-        }
-        grad
+        assert_eq!(
+            t.len(),
+            self.block_dim(),
+            "#784 block displacement length must match the block dimension"
+        );
+        Array1::<f64>::zeros(self.lambdas.len())
     }
 
     fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
@@ -1585,13 +1588,13 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     /// [`Self::excess_batch`], which runs it) holds its columns of `Δ = V_b·T` (p) and
     /// `S = X_t·Δ` (n), each at most twice because `fast_ab`'s small-shape route forms
     /// the product before assigning it; its result entry, displaced score (n) and
-    /// excess-only result; the `δ` copy (p); and a half-deviance scratch of `n` rows. The scratch is one per
+    /// excess-only result; and a half-deviance scratch of `n` rows. The scratch is one per
     /// worker, not per node, but a node is charged a whole one so the bound holds for
     /// any split of the batch.
     fn node_working_bytes(&self) -> Option<usize> {
         let n = self.eta_hat.len();
         let p = self.block_vecs.nrows();
-        p.checked_mul(3)?
+        p.checked_mul(2)?
             .checked_add(n.checked_mul(4)?)?
             .checked_add(1)?
             .checked_mul(std::mem::size_of::<f64>())?
@@ -1602,20 +1605,14 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     /// and one atomic row-oracle sweep at `η̂ + s`. Each row's value and score
     /// are evaluated together on the same unprojected surface (#784, #1082).
     fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
-        let (delta, s) = self.displacement(t);
+        let (_delta, s) = self.displacement(t);
         let eta_disp = &self.eta_hat + &s;
         let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
             return (f64::INFINITY, None);
         };
-        let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
-        let mut penalty_term = 0.0_f64;
-        for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
-            penalty_term += lam * score.dot(&delta);
-        }
-        let Ok(curv) = self.observed_quadratic(s.view()) else {
+        let Ok(excess) = self.remainder_at(scaled_half_deviance, s.view()) else {
             return (f64::INFINITY, None);
         };
-        let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
         if excess.is_finite() {
             (excess, Some(ngs))
         } else {
@@ -1637,7 +1634,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     ///
     /// Column `s` of `S` is exactly `fast_av(X_t, V_b · t_s)` — the same vector
     /// the serial path forms — and everything downstream (the row oracle,
-    /// deviance, penalty-score and curvature terms) is then computed per-column
+    /// deviance, linear Taylor and curvature terms) is then computed per-column
     /// with byte-for-byte the same arithmetic as the serial
     /// `excess_with_displaced_neg_score`. Only the matvec→GEMM reassociation can
     /// perturb `S` (faer reduces the inner `p`-sum the same way per output
@@ -1807,5 +1804,115 @@ mod exact_deviance_state_cache_tests {
         }
         // At the mode the excess is exactly the base's cancellation.
         approx::assert_abs_diff_eq!(batch[0].0, 0.0, epsilon = 1.0e-12);
+    }
+
+    /// `ΔF` is the definition `F(β̂+δ) − F(β̂) − ½ δᵀ H δ` at an exact mode, and
+    /// reads nothing of the penalty.
+    ///
+    /// The mode is exact by construction: a Poisson-log likelihood at an
+    /// arbitrary `β̂`, and the rank-one penalty `S = g gᵀ/(−g·β̂)` for
+    /// `g = Xᵀ ψ'(η̂)`, which gives `S β̂ = −g`. The target is handed penalty
+    /// scores that are a stiff `λ = 1e12` times a residue of `3e-15` — what a
+    /// railed smoothing parameter does to `S_k β̂` in floating point — and must
+    /// match the definition regardless. Rebuilding `(S β̂)·δ` from those scores
+    /// put `3e-3·δ` into `ΔF`, and that noise stopped the outer search on a
+    /// near-separated binomial CV fold.
+    #[test]
+    fn remainder_is_the_taylor_definition_at_an_exact_mode_and_ignores_penalty_rounding() {
+        let x = array![
+            [1.0, 0.2],
+            [1.0, -0.7],
+            [1.0, 1.3],
+            [1.0, 0.4],
+            [1.0, -1.1],
+            [1.0, 0.9]
+        ];
+        let y = array![3.0, 0.0, 6.0, 2.0, 1.0, 4.0];
+        let beta_hat = array![0.3, 0.1];
+        let eta_hat = x.dot(&beta_hat);
+        let mu = eta_hat.mapv(f64::exp);
+        let psi = |eta: &Array1<f64>| -> f64 {
+            eta.iter()
+                .zip(y.iter())
+                .map(|(&e, &yi): (&f64, &f64)| {
+                    let m = e.exp();
+                    let log_ratio = if yi > 0.0 { yi * (yi.ln() - e) } else { 0.0 };
+                    log_ratio - (yi - m)
+                })
+                .sum()
+        };
+        let g = x.t().dot(&(&mu - &y));
+        let curvature = -g.dot(&beta_hat);
+        assert!(curvature > 0.0, "fixture needs g·β̂ < 0 for a PSD penalty");
+        let s_pen = {
+            let mut s_pen = Array2::<f64>::zeros((2, 2));
+            for a in 0..2 {
+                for b in 0..2 {
+                    s_pen[(a, b)] = g[a] * g[b] / curvature;
+                }
+            }
+            s_pen
+        };
+        let mode_residual = &g + &s_pen.dot(&beta_hat);
+        assert!(mode_residual.iter().all(|r| r.abs() < 1.0e-12));
+
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ));
+        let inverse_link = InverseLink::Standard(StandardLink::Log);
+        let prior_weights = Array1::<f64>::ones(6);
+        let base_rows = crate::pirls::deviance_eta_rows_with_log_measure_scale(
+            y.view(),
+            &eta_hat,
+            &likelihood,
+            &inverse_link,
+            prior_weights.view(),
+            0.0,
+        )
+        .expect("base rows");
+        let base_half: Vec<f64> = base_rows.iter().map(|row| row.half_deviance).collect();
+        let base_scaled_half_deviance: f64 = base_half.iter().sum();
+        let base_absolute_half_deviance: f64 = base_half.iter().map(|v| v.abs()).sum();
+        let base_neg_score_at_mode = Array1::from_iter(base_rows.iter().map(|row| row.eta_score));
+        let weights_obs = mu.clone();
+        let weights_obs_log_abs = weights_obs.mapv(f64::ln);
+        let target = Gam784BlockTarget {
+            x_transformed: &x,
+            block_vecs: Array2::eye(2),
+            block_lambdas: array![1.0, 1.0],
+            eta_hat: eta_hat.clone(),
+            weights_obs,
+            weights_obs_log_abs,
+            y: y.clone(),
+            row_measures: crate::pirls::DevianceRowMeasure::rows(prior_weights.view(), 0.0),
+            prior_weights,
+            likelihood,
+            inverse_link,
+            phi: 1.0,
+            penalty_scores: Arc::new(vec![array![3.0e-15, -3.0e-15]]),
+            penalties: &[],
+            lambdas: vec![1.0e12],
+            base_scaled_half_deviance,
+            base_neg_score_at_mode,
+            base_absolute_half_deviance,
+        };
+
+        let h = x.t().dot(&Array2::from_diag(&mu).dot(&x)) + &s_pen;
+        let objective = |beta: &Array1<f64>| psi(&x.dot(beta)) + 0.5 * beta.dot(&s_pen.dot(beta));
+        let draws = array![[0.4, -0.25, 0.05], [-0.3, 0.6, 0.02]];
+        let batch = target.excess_with_displaced_neg_score_batch(&draws);
+        for (column, (batched, _)) in draws.columns().into_iter().zip(batch) {
+            let t = column.to_owned();
+            let definition = objective(&(&beta_hat + &t)) - objective(&beta_hat) - 0.5 * t.dot(&h.dot(&t));
+            let excess = target.excess(&t);
+            let band = target.excess_rounding_band(&t);
+            assert!(
+                (excess - definition).abs() <= 1.0e-12 * definition.abs().max(1.0) + band,
+                "ΔF {excess:.17e} against the definition {definition:.17e} at t = {t:?}"
+            );
+            assert!((excess - batched).abs() <= band, "batched ΔF {batched:.17e} against {excess:.17e}");
+            assert!(target.excess_rho_gradient(&t).iter().all(|&v| v == 0.0));
+        }
     }
 }

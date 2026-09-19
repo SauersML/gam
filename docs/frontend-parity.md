@@ -31,6 +31,7 @@ APIs such as a matrix kernel.
 | Posterior coefficient sampling | `gam::inference::sample` / `gam::hmc` | `sample --samples --seed` | `Model.sample` with the same controls | Same Rust sampler |
 | Posterior predictive / response generation | `gam::predict::generative` | `generate --n-draws --seed` | `sample_replicates`, `iter_replicates`; multinomial `posterior_predict` | Same Rust generator |
 | Summary and HTML report | saved model / `gam::report` | `report` | `summary`, `report` | Parity |
+| Model comparison on the smoothing-corrected AIC | `compare_saved_models` | `compare MODEL... --names` | `compare_models`, `Model.evidence_ratio_vs` | Same Rust function; identical JSON |
 | Persistence | saved-model envelope | fit writes and all consumers read it | `save`, `load`, `loads`, `Model.save`, `dumps`, `model_from_dict` | One Rust wire format |
 | Multinomial fit/predict/inference | Rust multinomial request/model | selected by `--family multinomial` | `family="multinomial"`, `MultinomialModel` | Parity |
 | Event history | Rust event-history engine | `fit-events` | `fit_event_history`, `EventHistoryModel` | Parity |
@@ -48,6 +49,7 @@ The one global flag is `--log-level`.
 | `transformation-score` | `MODEL LABELLED_DATA --out`; offset and ID columns |
 | `diagnose` | `MODEL DATA` |
 | `sample` | `MODEL DATA`; `--samples`, `--seed`, `--out` |
+| `compare` | `MODEL...`; `--names` |
 | `generate` | `MODEL DATA`; `--n-draws`, `--seed`, `--out` |
 | `report` | `MODEL [DATA] [OUT]` |
 | `fit-events` | `--subjects`, `--events`, `--covariates`, `--formula` or `--mark-formula` (one per mark), `--marks`, `--horizons-after-exit`, `--forecast-cutoff`, `--reference-row`, `--reference-stratum`, `--out` |
@@ -64,17 +66,17 @@ The formula front doors are `fit`, `fit_array`, `validate_formula`, and
 `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`,
 `baseline_makeham`, `z_column`, `link`, `slope_formula`, `frailty_kind`,
 `frailty_sd`, `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
-`noise_offset`, `flexible_link`, `outer_tol`, `inner_tol`, `warm_start_from`,
-`precision_hyperpriors`, `constraints`, `response_geometry`, `response_columns`,
-`response_coordinates`, `response_reference`, `fisher_rao_w`, `latents`,
-`penalties`, `smooths`, and `config`.
+`noise_offset`, `flexible_link`, `warm_start_from`, `precision_hyperpriors`,
+`constraints`, `response_geometry`, `response_columns`, `response_coordinates`,
+`response_reference`, `fisher_rao_w`, `latents`, `penalties`, `smooths`, and
+`config`.
 
 The fitted `Model` public workflow methods/properties are `predict`,
 `predict_array`, `transformation_score`, `summary`,
 `smoothing_parameters`, `check`, `curvature`, `smooth_significance`,
 `basis_check`, `debiased_functional`, `report`, `sample`, `sample_replicates`,
 `iter_replicates`, `design_matrix`, `design_matrix_array`, `difference_smooth`,
-`partial_dependence`, `variance_share`, `conditional_aic`, `evidence_ratio_vs`,
+`partial_dependence`, `variance_share`, `evidence_ratio_vs`,
 `diagnose`, `plot`, persistence methods, group extension, and model metadata.
 `MultinomialModel` exposes classes, deviance/iterations, prediction and standard
 errors, posterior prediction, smooth significance, summary, and persistence.
