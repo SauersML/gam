@@ -1053,96 +1053,124 @@ fn sample_standard(
     .map_err(|e| format!("NUTS sampling failed: {e}"));
     drop(sampler_design_copy_reservation);
     let mut result = result?;
-    add_smoothing_parameter_displacement(&mut result, fit.smoothing_correction_first_order(), cfg)?;
+    recolor_to_smoothing_corrected_covariance(
+        &mut result,
+        fit.beta_covariance(),
+        fit.beta_covariance_corrected(),
+    )?;
     Ok(result)
 }
 
-/// Integrate the smoothing-parameter uncertainty into exact-likelihood draws
+/// Carry the smoothing-parameter uncertainty into exact-likelihood draws
 /// conditional on `ρ̂`, so `sample()` describes the same smoothing-corrected
 /// posterior `summary()` and `predict(se=True)` publish for every family.
 ///
-/// NUTS / Pólya-Gamma Gibbs target `π(β | ρ̂, y)`. The first-order
-/// correction `D = J V_ρ Jᵀ` (with `J = ∂β̂/∂ρ`) is the covariance of the
-/// linearized mode shift `β̂(ρ) − β̂(ρ̂)` under `ρ ~ N(ρ̂, V_ρ)`. Adding an
-/// independent `N(0, D)` displacement to each conditional draw therefore
-/// samples the mixture `∫ π(β | ρ, y) π(ρ | y) dρ` to the order the
-/// correction is exact: the draws have covariance `Vb + D`, the published
-/// first-order `V_c`, while keeping the exact conditional shape (skew,
-/// saturation) of the likelihood. On fits whose primary correction escalated
-/// to sigma-point cubature the within-`ρ` change in curvature
-/// `E_ρ[φH⁻¹] − φH⁻¹(ρ̂)` is not represented; the mode-shift term is.
+/// NUTS / Pólya-Gamma Gibbs target `π(β | ρ̂, y)`, whose Laplace covariance is
+/// the published conditional `Vb`. The published corrected `V_c` integrates
+/// over `ρ` — first-order `Vb + J V_ρ Jᵀ`, or the sigma-point cubature
+/// `E_ρ[φH⁻¹] + Cov_ρ[β̂(ρ)]`, which can sit below `Vb` in directions where
+/// the curvature grows with `λ`. Every draw is mapped through the linear
+/// optimal-transport map between the two Gaussians,
 ///
-/// A fit with no first-order correction (no smoothing parameters, or a typed
-/// absence recorded at fit time) keeps its conditional draws and provenance.
-fn add_smoothing_parameter_displacement(
+/// ```text
+///     β ↦ β̄ + T (β − β̄),   T = Vb^{-1/2} (Vb^{1/2} V_c Vb^{1/2})^{1/2} Vb^{-1/2},
+/// ```
+///
+/// the unique symmetric positive semi-definite `T` with `T Vb T = V_c`, about
+/// the draws' own mean `β̄`. Draws with covariance `Vb` therefore leave with
+/// covariance `V_c` in either direction of change, while the exact conditional
+/// shape (skew, saturation) is carried through the linear map.
+///
+/// A fit that publishes no corrected covariance (a typed absence recorded at
+/// fit time) keeps its conditional draws and provenance; a fit with no
+/// smoothing coordinate publishes `V_c = Vb`, so its draws are already the
+/// corrected posterior.
+fn recolor_to_smoothing_corrected_covariance(
     result: &mut NutsResult,
-    first_order_correction: Option<&Array2<f64>>,
-    cfg: &NutsConfig,
+    conditional: Option<&Array2<f64>>,
+    corrected: Option<&Array2<f64>>,
 ) -> Result<(), String> {
-    const CONTEXT: &str = "standard posterior smoothing-parameter displacement";
-    let Some(correction) = first_order_correction else {
+    const CONTEXT: &str = "standard posterior smoothing-parameter correction";
+    let Some(corrected) = corrected else {
         return Ok(());
     };
-    let p = result.samples.ncols();
-    if correction.nrows() != p || correction.ncols() != p {
-        return Err(format!(
-            "{CONTEXT}: first-order smoothing correction is {}x{}, expected {p}x{p}",
-            correction.nrows(),
-            correction.ncols(),
-        ));
-    }
-    // `D` is a Gram matrix `J V_ρ Jᵀ` of rank at most dim(ρ), so it is
-    // factored by its eigendecomposition rather than a Cholesky that its
-    // null space would break. Eigenvalues inside the eigensolver's round-off
-    // band `p·ε·λ_max` are that null space; a negative eigenvalue beyond it
-    // means the stored matrix is not a covariance and is refused.
-    let symmetric = (correction + &correction.t()) * 0.5;
-    let (eigenvalues, eigenvectors) = symmetric.eigh(Side::Lower).map_err(|err| {
-        format!("{CONTEXT}: eigendecomposition of the first-order correction failed: {err}")
+    let conditional = conditional.ok_or_else(|| {
+        format!("{CONTEXT}: the fit publishes a corrected covariance but no conditional one")
     })?;
-    let largest = eigenvalues.iter().fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    let round_off = p as f64 * f64::EPSILON * largest;
-    let mut factor = Array2::<f64>::zeros((p, p));
-    for (column, &value) in eigenvalues.iter().enumerate() {
-        if value < -round_off {
+    let p = result.samples.ncols();
+    for (name, matrix) in [("conditional", conditional), ("corrected", corrected)] {
+        if matrix.nrows() != p || matrix.ncols() != p {
             return Err(format!(
-                "{CONTEXT}: first-order smoothing correction has eigenvalue {value:e} below the \
-                 round-off band -{round_off:e}; it is not a covariance"
+                "{CONTEXT}: {name} covariance is {}x{}, expected {p}x{p}",
+                matrix.nrows(),
+                matrix.ncols(),
             ));
         }
-        let scale = value.max(0.0).sqrt();
-        for row in 0..p {
-            factor[(row, column)] = eigenvectors[(row, column)] * scale;
-        }
     }
+    if !std::ptr::eq(conditional, corrected) {
+        let (conditional_values, conditional_vectors) =
+            symmetric_eigh(conditional, CONTEXT, "conditional")?;
+        if let Some(value) = conditional_values.iter().find(|value| **value <= 0.0) {
+            return Err(format!(
+                "{CONTEXT}: conditional covariance has eigenvalue {value:e}; it is not positive \
+                 definite"
+            ));
+        }
+        let root = symmetric_function(&conditional_values, &conditional_vectors, f64::sqrt);
+        let inverse_root =
+            symmetric_function(&conditional_values, &conditional_vectors, |v| v.sqrt().recip());
+        let (inner_values, inner_vectors) =
+            symmetric_eigh(&root.dot(corrected).dot(&root), CONTEXT, "whitened corrected")?;
+        // `V_c` may be rank-deficient in principle; eigenvalues inside the
+        // eigensolver's round-off band `p·ε·μ_max` are that null space, while a
+        // negative eigenvalue beyond it means `V_c` is not a covariance.
+        let largest = inner_values.iter().fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        let round_off = p as f64 * f64::EPSILON * largest;
+        if let Some(value) = inner_values.iter().find(|value| **value < -round_off) {
+            return Err(format!(
+                "{CONTEXT}: corrected covariance has eigenvalue {value:e} below the round-off \
+                 band -{round_off:e}; it is not a covariance"
+            ));
+        }
+        let inner_root = symmetric_function(&inner_values, &inner_vectors, |v| v.max(0.0).sqrt());
+        let transport = inverse_root.dot(&inner_root).dot(&inverse_root);
 
-    // Draws are stored chain-major, `n_samples` rows per chain; each chain
-    // gets its own displacement stream so chains stay independent.
-    let mut eps = Array1::<f64>::zeros(p);
-    for (chain, mut chain_draws) in result
-        .samples
-        .axis_chunks_iter_mut(ndarray::Axis(0), cfg.n_samples)
-        .enumerate()
-    {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(chain_stream_seed(
-            cfg.seed,
-            chain,
-            0x5C0A_17D3_9E4B_62F1,
-        ));
-        for mut draw in chain_draws.rows_mut() {
-            for value in eps.iter_mut() {
-                *value = sample_standard_normal(&mut rng);
-            }
-            draw += &factor.dot(&eps);
-        }
+        let centre = result
+            .samples
+            .mean_axis(ndarray::Axis(0))
+            .ok_or_else(|| format!("{CONTEXT}: sampler returned no draws"))?;
+        let centred = &result.samples - &centre;
+        // `T` is symmetric, so `(T (β − β̄))ᵀ` for every row is `(β − β̄)ᵀ T`.
+        result.samples = centred.dot(&transport) + &centre;
+        result.posterior_mean = result
+            .samples
+            .mean_axis(ndarray::Axis(0))
+            .ok_or_else(|| format!("{CONTEXT}: sampler returned no draws"))?;
+        result.posterior_std = result.samples.std_axis(ndarray::Axis(0), 1.0);
     }
-    result.posterior_mean = result
-        .samples
-        .mean_axis(ndarray::Axis(0))
-        .ok_or_else(|| format!("{CONTEXT}: sampler returned no draws"))?;
-    result.posterior_std = result.samples.std_axis(ndarray::Axis(0), 1.0);
     result.covariance = InferenceCovarianceMode::SmoothingCorrected;
     Ok(())
+}
+
+fn symmetric_eigh(
+    matrix: &Array2<f64>,
+    context: &str,
+    name: &str,
+) -> Result<(Array1<f64>, Array2<f64>), String> {
+    let symmetric = (matrix + &matrix.t()) * 0.5;
+    symmetric
+        .eigh(Side::Lower)
+        .map_err(|err| format!("{context}: eigendecomposition of the {name} covariance failed: {err}"))
+}
+
+/// `U f(Λ) Uᵀ` for a symmetric matrix with eigendecomposition `U Λ Uᵀ`.
+fn symmetric_function(
+    eigenvalues: &Array1<f64>,
+    eigenvectors: &Array2<f64>,
+    function: impl Fn(f64) -> f64,
+) -> Array2<f64> {
+    let scaled = eigenvectors * &eigenvalues.mapv(function);
+    scaled.dot(&eigenvectors.t())
 }
 
 /// Exact posterior draws for a standard GLM with `bounded()` coefficients.
@@ -1762,19 +1790,32 @@ mod tests {
     use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, LinearOperator};
     use gam_problem::types::LikelihoodScaleMetadata;
 
-    fn conditional_draws(conditional_sd: &[f64], cfg: &NutsConfig) -> NutsResult {
-        let p = conditional_sd.len();
-        let n_total = cfg.n_samples * NUTS_CHAINS;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed ^ 0xFFFF);
-        let samples = Array2::from_shape_fn((n_total, p), |(_, j)| {
-            conditional_sd[j] * sample_standard_normal(&mut rng)
-        });
+    /// Draws whose sample mean is `mean` and whose sample covariance is exactly
+    /// `covariance`: standard-normal rows, centred and whitened by their own
+    /// sample covariance, then coloured.
+    fn draws_with_exact_moments(
+        mean: &Array1<f64>,
+        covariance: &Array2<f64>,
+        n_draws: usize,
+        seed: u64,
+    ) -> NutsResult {
+        let p = mean.len();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let raw = Array2::from_shape_fn((n_draws, p), |_| sample_standard_normal(&mut rng));
+        let raw_mean = raw.mean_axis(ndarray::Axis(0)).expect("draws");
+        let centred = &raw - &raw_mean;
+        let sample_covariance = centred.t().dot(&centred) / (n_draws as f64 - 1.0);
+        let (values, vectors) = symmetric_eigh(&sample_covariance, "test", "sample").expect("eigh");
+        let whiten = symmetric_function(&values, &vectors, |v| v.sqrt().recip());
+        let (values, vectors) = symmetric_eigh(covariance, "test", "target").expect("eigh");
+        let colour = symmetric_function(&values, &vectors, f64::sqrt);
+        let samples = centred.dot(&whiten).dot(&colour) + mean;
         NutsResult {
-            posterior_mean: Array1::zeros(p),
-            posterior_std: Array1::from(conditional_sd.to_vec()),
+            posterior_mean: samples.mean_axis(ndarray::Axis(0)).expect("draws"),
+            posterior_std: samples.std_axis(ndarray::Axis(0), 1.0),
             samples,
             rhat: 1.0,
-            ess: n_total as f64,
+            ess: n_draws as f64,
             converged: true,
             warmup_transitions: 0,
             sampler: PosteriorSampler::Nuts,
@@ -1782,76 +1823,96 @@ mod tests {
         }
     }
 
-    /// G3: exact-likelihood draws are conditional on `ρ̂`; after the
-    /// smoothing-parameter displacement their covariance must be the
-    /// smoothing-corrected `Vb + J V_ρ Jᵀ` that `summary()` publishes, and the
-    /// result must say so. The correction is rank-deficient (two smoothing
-    /// parameters, three coefficients), which a Cholesky factor would refuse.
-    #[test]
-    fn smoothing_parameter_displacement_gives_draws_the_corrected_covariance() {
-        let cfg = NutsConfig {
-            n_samples: 20_000,
-            target_accept: 0.8,
-            seed: 7,
-        };
-        let conditional_sd = [0.7, 1.0, 1.4];
-        let jacobian = ndarray::array![[0.9, -0.2], [0.4, 0.6], [-0.3, 1.1]];
-        let v_rho = ndarray::array![[0.5, 0.1], [0.1, 0.3]];
-        let correction = jacobian.dot(&v_rho).dot(&jacobian.t());
-        let mut result = conditional_draws(&conditional_sd, &cfg);
-        add_smoothing_parameter_displacement(&mut result, Some(&correction), &cfg)
-            .expect("PSD correction must be accepted");
-        assert_eq!(result.covariance, InferenceCovarianceMode::SmoothingCorrected);
+    fn sample_covariance(samples: &Array2<f64>) -> Array2<f64> {
+        let mean = samples.mean_axis(ndarray::Axis(0)).expect("draws");
+        let centred = samples - &mean;
+        centred.t().dot(&centred) / (samples.nrows() as f64 - 1.0)
+    }
 
-        let n = result.samples.nrows() as f64;
-        let mean = result.samples.mean_axis(ndarray::Axis(0)).expect("draws");
-        let centred = &result.samples - &mean;
-        let empirical = centred.t().dot(&centred) / (n - 1.0);
+    /// G3: exact-likelihood draws are conditional on `ρ̂`; after the
+    /// correction their covariance must be the smoothing-corrected `V_c` that
+    /// `summary()` publishes, and the result must say so. `V_c` here is the
+    /// cubature shape — wider than `Vb` in one direction and NARROWER in
+    /// another — which no additive displacement can reach.
+    #[test]
+    fn smoothing_correction_gives_draws_the_corrected_covariance() {
+        let conditional = ndarray::array![[0.49, 0.2, -0.1], [0.2, 1.0, 0.3], [-0.1, 0.3, 1.96]];
+        let widen = ndarray::array![[0.9, -0.2], [0.4, 0.6], [-0.3, 1.1]];
+        let mut corrected = &conditional + &widen.dot(&widen.t());
+        let narrow = ndarray::array![0.6, -0.5, 0.2];
         for i in 0..3 {
             for j in 0..3 {
-                let target =
-                    correction[(i, j)] + if i == j { conditional_sd[i].powi(2) } else { 0.0 };
-                // Monte Carlo SE of a covariance entry is √((Σii Σjj + Σij²)/n).
-                let scale = ((correction[(i, i)] + conditional_sd[i].powi(2))
-                    * (correction[(j, j)] + conditional_sd[j].powi(2))
-                    + target * target)
-                    .sqrt()
-                    / n.sqrt();
-                assert!(
-                    (empirical[(i, j)] - target).abs() < 5.0 * scale,
-                    "draw covariance [{i},{j}] = {} but Vb + J V_rho J^T = {target}",
-                    empirical[(i, j)]
-                );
+                corrected[(i, j)] -= 0.3 * narrow[i] * narrow[j];
             }
-            assert_eq!(result.posterior_mean[i], mean[i]);
+        }
+        let direction_variance = |covariance: &Array2<f64>| narrow.dot(&covariance.dot(&narrow));
+        assert!(direction_variance(&corrected) < direction_variance(&conditional));
+
+        let mean = ndarray::array![0.3, -1.2, 2.0];
+        let mut result = draws_with_exact_moments(&mean, &conditional, 500, 7);
+        let before = result.samples.clone();
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&conditional), Some(&corrected))
+            .expect("SPD covariances must be accepted");
+        assert_eq!(result.covariance, InferenceCovarianceMode::SmoothingCorrected);
+
+        let drawn = sample_covariance(&result.samples);
+        for i in 0..3 {
+            for j in 0..3 {
+                approx::assert_abs_diff_eq!(drawn[(i, j)], corrected[(i, j)], epsilon = 1e-10);
+            }
+            approx::assert_abs_diff_eq!(result.posterior_mean[i], mean[i], epsilon = 1e-10);
             approx::assert_relative_eq!(
                 result.posterior_std[i],
-                empirical[(i, i)].sqrt(),
+                drawn[(i, i)].sqrt(),
                 max_relative = 1e-12
             );
         }
+        // The map is affine: a draw's position within the conditional cloud
+        // (and so the likelihood's shape) is carried through, not resampled.
+        let displacement = &result.samples - &before;
+        assert!(displacement.iter().any(|value| value.abs() > 1e-3));
     }
 
     #[test]
-    fn smoothing_parameter_displacement_absent_or_indefinite() {
-        let cfg = NutsConfig {
-            n_samples: 16,
-            target_accept: 0.8,
-            seed: 3,
-        };
-        let mut result = conditional_draws(&[1.0, 1.0], &cfg);
+    fn smoothing_correction_absent_shared_or_invalid() {
+        let identity = Array2::<f64>::eye(2);
+        let mean = Array1::<f64>::zeros(2);
+        let mut result = draws_with_exact_moments(&mean, &identity, 16, 3);
         let before = result.samples.clone();
-        add_smoothing_parameter_displacement(&mut result, None, &cfg)
-            .expect("no correction leaves draws alone");
+
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), None)
+            .expect("no published correction leaves draws alone");
         assert_eq!(result.samples, before);
         assert_eq!(result.covariance, InferenceCovarianceMode::Conditional);
 
+        // No smoothing coordinate: the fit publishes `Vb` itself as `V_c`.
+        recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), Some(&identity))
+            .expect("V_c = Vb is already the corrected posterior");
+        assert_eq!(result.samples, before);
+        assert_eq!(result.covariance, InferenceCovarianceMode::SmoothingCorrected);
+
         let indefinite = ndarray::array![[1.0, 0.0], [0.0, -0.5]];
-        let err = add_smoothing_parameter_displacement(&mut result, Some(&indefinite), &cfg)
-            .expect_err("an indefinite correction is not a covariance");
+        let err = recolor_to_smoothing_corrected_covariance(
+            &mut result,
+            Some(&identity),
+            Some(&indefinite),
+        )
+        .expect_err("an indefinite corrected matrix is not a covariance");
         assert!(err.contains("not a covariance"), "{err}");
+        let err = recolor_to_smoothing_corrected_covariance(
+            &mut result,
+            Some(&indefinite),
+            Some(&identity),
+        )
+        .expect_err("an indefinite conditional matrix is not a covariance");
+        assert!(err.contains("not positive definite"), "{err}");
         let wrong_shape = Array2::<f64>::eye(3);
-        assert!(add_smoothing_parameter_displacement(&mut result, Some(&wrong_shape), &cfg).is_err());
+        assert!(
+            recolor_to_smoothing_corrected_covariance(&mut result, Some(&identity), Some(&wrong_shape))
+                .is_err()
+        );
+        assert!(recolor_to_smoothing_corrected_covariance(&mut result, None, Some(&identity)).is_err());
+        assert_eq!(result.samples, before);
     }
 
     #[test]

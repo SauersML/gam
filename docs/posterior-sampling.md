@@ -6,11 +6,14 @@ dispatches among NUTS, Polya-Gamma Gibbs, and a Gaussian Laplace
 approximation based on model class; see
 [Sampler dispatch](#sampler-dispatch) below. The MCMC routes sample the
 exact likelihood at the fitted smoothing parameters; on a standard GLM
-(NUTS and Pólya-Gamma) each draw then receives an independent
-smoothing-parameter displacement `N(0, J V_ρ Jᵀ)`, where `J = ∂β̂/∂ρ` and
-`V_ρ` is the REML/LAML smoothing-parameter covariance, so the draws integrate
-the smoothing uncertainty for every family (their covariance is the
-first-order `Vb + J V_ρ Jᵀ`). The Laplace route draws from the covariance the
+(NUTS and Pólya-Gamma) the draws are then mapped about their mean through
+the linear optimal-transport map `T = Vb^{-1/2}(Vb^{1/2} V_c Vb^{1/2})^{1/2}
+Vb^{-1/2}` that carries the conditional `Vb` onto the published
+smoothing-corrected `V_c` (`T Vb T = V_c`), so the draws integrate the
+smoothing uncertainty for every family while keeping the exact likelihood's
+shape. `V_c` may be wider or narrower than `Vb` in a given direction (the
+sigma-point cubature correction averages the curvature over `ρ`); the map
+reaches it either way. The Laplace route draws from the covariance the
 fit *publishes* — the smoothing-corrected `Vp` whenever the fit carries one —
 so its draw spread agrees with `summary().std_error` and with the default
 `predict(interval=...)` band on the same object. Every draw set reports
@@ -184,7 +187,7 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `converged` | `bool` | Sampler convergence flag. Laplace draws set this to `True`; NUTS and Gibbs paths require `rhat < 1.1` and `ess > 100`. |
 | `method` | `str` | `"nuts"`, `"polya-gamma"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
 | `exact` | `bool` | Whether `method` targets the exact posterior; the value behind `is_exact`. |
-| `covariance_source` | `str` | `"smoothing-corrected"` (standard-GLM NUTS / Pólya-Gamma draws with the smoothing-parameter displacement, and Laplace draws from the published `Vp`) or `"conditional"` (the other MCMC routes, and any fit without a smoothing correction). Same vocabulary as `predict()`. |
+| `covariance_source` | `str` | `"smoothing-corrected"` (standard-GLM NUTS / Pólya-Gamma draws transported onto `V_c`, and Laplace draws from the published `Vp`) or `"conditional"` (the other MCMC routes, and any fit without a smoothing correction). Same vocabulary as `predict()`. |
 | `model_class` | `str` | Saved-model predictive class. |
 | `family_kind` | `str` | Inverse-link tag (`"identity"`, `"logit"`, `"probit"`, `"cloglog"`, `"log"`, ...). |
 | `config` | `SamplingConfig` | Echo of the sampler configuration. |
