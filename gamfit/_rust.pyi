@@ -66,6 +66,7 @@ __all__ = [
     "PenaltySpectrumError",
     "PerfectSeparationError",
     "PirlsConvergenceError",
+    "PredictInputError",
     "PredictionError",
     "ProductManifold",
     "RESPONSE_GEOMETRY_SCHEMA",
@@ -1180,6 +1181,8 @@ class PerfectSeparationError(DataError): ...
 class PirlsConvergenceError(FitConvergenceError): ...
 
 class PredictionError(DataError): ...
+
+class PredictInputError(PredictionError): ...
 
 @final
 class ProductManifold:

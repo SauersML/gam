@@ -75,6 +75,7 @@ class RustModule(Protocol):
     PenaltySpectrumError: type[_rust.PenaltySpectrumError]
     PerfectSeparationError: type[_rust.PerfectSeparationError]
     PirlsConvergenceError: type[_rust.PirlsConvergenceError]
+    PredictInputError: type[_rust.PredictInputError]
     PredictionError: type[_rust.PredictionError]
     ProductManifold: type[_rust.ProductManifold]
     RESPONSE_GEOMETRY_SCHEMA: str
