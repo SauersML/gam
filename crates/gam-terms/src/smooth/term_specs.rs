@@ -2278,6 +2278,66 @@ pub fn weighted_blockwise_penalty_sum(
     out
 }
 
+fn compose_affine_offset(
+    design_rows: usize,
+    affine_offset: &Array1<f64>,
+    base: ArrayView1<'_, f64>,
+    context: &str,
+) -> Result<Array1<f64>, BasisError> {
+    let n = design_rows;
+    if affine_offset.len() != n || base.len() != n {
+        crate::bail_dim_basis!(
+            "{context}: design rows={n}, affine offset rows={}, base offset rows={}",
+            affine_offset.len(),
+            base.len()
+        );
+    }
+    if affine_offset.iter().any(|value| !value.is_finite())
+        || base.iter().any(|value| !value.is_finite())
+    {
+        crate::bail_invalid_basis!("{context}: offsets must be finite");
+    }
+    Ok(base.to_owned() + affine_offset)
+}
+
+/// Which parts of a smooth build the caller consumes.
+///
+/// A fitted model's frozen spec already carries every coefficient chart the
+/// design needs (identifiability transforms, persisted joint-null rotations,
+/// residualization corrections), so evaluating it on new rows needs only the
+/// design and its affine offset. Realizing the penalties there repeats the
+/// fit-time penalty normalization, PSD projection and collection-chart
+/// filtering on every prediction call, all of it discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmoothPenaltyDemand {
+    /// Build the design and the full penalty set (fitting, rebuilds, summaries).
+    Realize,
+    /// Build the design and affine offset only. A term whose design still
+    /// depends on its penalties (an unfrozen spec, whose joint-null rotation is
+    /// computed from them) realizes them regardless.
+    DesignOnly,
+}
+
+/// The row-evaluation half of a [`TermCollectionDesign`]: the design matrix and
+/// fixed affine channel of a frozen spec on new rows, with no penalties. The
+/// predictor is `affine_offset + design * beta`.
+#[derive(Clone, Debug)]
+pub struct TermCollectionPredictionDesign {
+    pub design: DesignMatrix,
+    pub affine_offset: Array1<f64>,
+}
+
+impl TermCollectionPredictionDesign {
+    /// See [`TermCollectionDesign::compose_offset`].
+    pub fn compose_offset(
+        &self,
+        base: ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, BasisError> {
+        compose_affine_offset(self.design.nrows(), &self.affine_offset, base, context)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
     /// The full design matrix.
@@ -2331,20 +2391,7 @@ impl TermCollectionDesign {
         base: ArrayView1<'_, f64>,
         context: &str,
     ) -> Result<Array1<f64>, BasisError> {
-        let n = self.design.nrows();
-        if self.affine_offset.len() != n || base.len() != n {
-            crate::bail_dim_basis!(
-                "{context}: design rows={n}, affine offset rows={}, base offset rows={}",
-                self.affine_offset.len(),
-                base.len()
-            );
-        }
-        if self.affine_offset.iter().any(|value| !value.is_finite())
-            || base.iter().any(|value| !value.is_finite())
-        {
-            crate::bail_invalid_basis!("{context}: offsets must be finite");
-        }
-        Ok(base.to_owned() + &self.affine_offset)
+        compose_affine_offset(self.design.nrows(), &self.affine_offset, base, context)
     }
 
     /// Evaluate `affine_offset + design * beta` with a checked coefficient
@@ -7982,6 +8029,21 @@ pub fn build_single_local_smooth_term(
     term: &SmoothTermSpec,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    build_single_local_smooth_term_for(data, term, workspace, SmoothPenaltyDemand::Realize)
+}
+
+/// [`build_single_local_smooth_term`] for a caller that states which parts it
+/// consumes. Under [`SmoothPenaltyDemand::DesignOnly`] a term whose coefficient
+/// chart is already frozen returns no penalties; a numeric or level `by=`
+/// passes the demand to its inner term. `BySmooth` and factor smooths build
+/// their inner term with the full penalty set, because their outer design is
+/// placed from the inner penalties.
+pub(crate) fn build_single_local_smooth_term_for(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    workspace: &mut crate::basis::BasisWorkspace,
+    demand: SmoothPenaltyDemand,
+) -> Result<LocalSmoothTermBuild, BasisError> {
     term.basis.validate_scale_configuration()?;
     validate_shape_request(term)?;
     if let SmoothBasisSpec::ByVariable {
@@ -8009,7 +8071,9 @@ pub fn build_single_local_smooth_term(
             shape: term.shape.clone(),
             joint_null_rotation: None,
         };
-        let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+        // Row gating only rescales the inner design, so the inner term needs
+        // exactly the penalties the caller needs.
+        let built = build_single_local_smooth_term_for(data, &inner_term, workspace, demand)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
     }
 
@@ -8659,7 +8723,17 @@ pub fn build_single_local_smooth_term(
     // dials do not. The operator triplet is therefore retained as the Matérn
     // penalty, and the κ-optimizer re-key / ψ-derivative paths route through the
     // same triplet builder so the block count stays ψ-stable (#1270).
-    if let SmoothBasisSpec::Matern { .. } = &term.basis {
+    //
+    // A frozen chart needs no penalty to place its design (the joint-null
+    // rotation below is the only penalty-derived design input, and a frozen
+    // spec persists it or has none), so a design-only caller skips the
+    // override and the renormalization below.
+    let realize_penalties = demand == SmoothPenaltyDemand::Realize
+        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
+    if !realize_penalties {
+        built.active_penalties.clear();
+        built.dropped_penalties.clear();
+    } else if let SmoothBasisSpec::Matern { .. } = &term.basis {
         let filtered = matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
         built.active_penalties = filtered.active;
         built.dropped_penalties = filtered.dropped;
@@ -8803,7 +8877,12 @@ pub(crate) fn build_smooth_design_withworkspace_unvalidated(
             "joint spatial center planner returned no smooth blocks".to_string(),
         )
     })?;
-    build_smooth_design_from_planned_terms(data, &planned_terms, workspace)
+    build_smooth_design_from_planned_terms(
+        data,
+        &planned_terms,
+        workspace,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 /// Build smooth terms after the sweep-level spatial planner has already run.
@@ -8817,6 +8896,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
     data: ArrayView2<'_, f64>,
     planned_terms: &[SmoothTermSpec],
     workspace: &mut crate::basis::BasisWorkspace,
+    demand: SmoothPenaltyDemand,
 ) -> Result<RawSmoothDesign, BasisError> {
     let policy = workspace.policy().clone();
     let local_builds: Vec<LocalSmoothTermBuild> = {
@@ -8825,7 +8905,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
             .par_iter()
             .map(|term| {
                 let mut term_workspace = crate::basis::BasisWorkspace::with_policy(policy.clone());
-                build_single_local_smooth_term(data, &term, &mut term_workspace)
+                build_single_local_smooth_term_for(data, &term, &mut term_workspace, demand)
             })
             .collect::<Result<Vec<_>, _>>()?
     };

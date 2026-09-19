@@ -72,7 +72,13 @@ pub(crate) fn build_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
-    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, false)
+    build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        spec,
+        policy,
+        false,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 /// Build a collection whose sweep-level spatial geometry has already been planned.
@@ -81,7 +87,13 @@ pub fn build_planned_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
-    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, true)
+    build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        spec,
+        policy,
+        true,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 fn build_term_collection_design_inner_with_policy_and_plan(
@@ -89,6 +101,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
     spatial_plan_is_resolved: bool,
+    demand: SmoothPenaltyDemand,
 ) -> Result<TermCollectionDesign, BasisError> {
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
@@ -104,7 +117,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         || {
             let mut ws = crate::basis::BasisWorkspace::with_policy(policy.clone());
             if spatial_plan_is_resolved {
-                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws)
+                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws, demand)
             } else {
                 build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
             }
@@ -185,6 +198,7 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         &spec.linear_terms,
         &spec.smooth_terms,
         level_carrier_smooth(spec),
+        demand,
     )?;
 
     let p_rand: usize = random_blocks.iter().map(|b| b.num_groups).sum();
@@ -572,6 +586,46 @@ pub fn build_term_collection_design_with_policy(
     let mut planned_spec = spec.clone();
     planned_spec.smooth_terms = planned_smooth_terms;
     build_term_collection_design_inner_with_policy(data, &planned_spec, policy)
+}
+
+/// Evaluate a fitted (frozen) spec's design and affine offset on new rows.
+///
+/// The result is the `design` and `affine_offset` that
+/// [`build_term_collection_design`] returns for the same rows, without
+/// realizing the penalties: prediction reads only the row map, and rebuilding
+/// the penalties re-ran their normalization, PSD projection and collection
+/// chart filtering on every call.
+pub fn build_term_collection_prediction_design(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+) -> Result<TermCollectionPredictionDesign, BasisError> {
+    validate_term_collection_finite_inputs(data, spec)?;
+    let mut planned_specs =
+        plan_joint_spatial_centers_for_term_blocks(data, &[spec.smooth_terms.clone()])?;
+    let planned_smooth_terms = planned_specs.pop().ok_or_else(|| {
+        BasisError::InvalidInput(
+            "joint spatial center planner returned no smooth terms for single-spec build"
+                .to_string(),
+        )
+    })?;
+    let mut planned_spec = spec.clone();
+    planned_spec.smooth_terms = planned_smooth_terms;
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    let TermCollectionDesign {
+        design,
+        affine_offset,
+        ..
+    } = build_term_collection_design_inner_with_policy_and_plan(
+        data,
+        &planned_spec,
+        &policy,
+        true,
+        SmoothPenaltyDemand::DesignOnly,
+    )?;
+    Ok(TermCollectionPredictionDesign {
+        design,
+        affine_offset,
+    })
 }
 
 /// Exact analytic derivative of an affine term-collection realization.
@@ -1559,6 +1613,7 @@ fn apply_global_smooth_identifiability(
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
     level_smooth: Option<usize>,
+    demand: SmoothPenaltyDemand,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
@@ -1932,14 +1987,19 @@ fn apply_global_smooth_identifiability(
         } else {
             term.metadata.clone()
         };
-        let (active_penalties, dropped_penalties) = penalties_in_collection_chart(
-            &term.active_penalties,
-            term.dropped_penalties.clone(),
-            coefficient_gauge.as_ref(),
-            &placed_metadata,
-            duchon_operator_penalty_request(termspec),
-            &term.name,
-        )?;
+        let (active_penalties, dropped_penalties) = match demand {
+            SmoothPenaltyDemand::Realize => penalties_in_collection_chart(
+                &term.active_penalties,
+                term.dropped_penalties.clone(),
+                coefficient_gauge.as_ref(),
+                &placed_metadata,
+                duchon_operator_penalty_request(termspec),
+                &term.name,
+            )?,
+            // The collection chart only relabels penalties; the design above
+            // is already placed.
+            SmoothPenaltyDemand::DesignOnly => (Vec::new(), Vec::new()),
+        };
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
                 if let Some(gauge) = coefficient_gauge.as_ref() {

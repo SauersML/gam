@@ -5156,3 +5156,97 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
         assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
     }
 }
+
+fn prediction_design_dataset(n: usize) -> Dataset {
+    let rows = (0..n)
+        .map(|i| {
+            let x = ((i * 37) % n) as f64 / (n - 1) as f64;
+            let z = ((i * 53) % n) as f64 / (n - 1) as f64;
+            let g = (i % 3) as f64;
+            vec![(4.0 * x).sin() + z * z + 0.3 * g, x, z, g]
+        })
+        .collect::<Vec<_>>();
+    let mut ds = continuous_dataset(&["y", "x", "z", "g"], rows);
+    ds.schema.columns[3].kind = ColumnKindTag::Categorical;
+    ds.schema.columns[3].levels = vec!["a".into(), "b".into(), "c".into()];
+    ds.column_kinds[3] = ColumnKindTag::Categorical;
+    ds
+}
+
+/// Prediction evaluates a fitted (frozen) spec on new rows, and reads only the
+/// design and its affine offset. The prediction builder must return exactly
+/// what the full build returns for those, while realizing no penalty for a
+/// frozen smooth: the full build re-ran every term's penalty normalization,
+/// PSD projection and collection-chart filtering on each prediction call.
+#[test]
+fn prediction_design_matches_full_build_without_realizing_penalties() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+
+        let full = crate::smooth::build_term_collection_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` full rebuild: {err}"));
+        let prediction =
+            crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+                .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        assert_eq!(
+            prediction.design.to_dense(),
+            full.design.to_dense(),
+            "`{formula}`: the prediction design must equal the full rebuild's"
+        );
+        assert_eq!(
+            prediction.affine_offset, full.affine_offset,
+            "`{formula}`: the prediction offset must equal the full rebuild's"
+        );
+        assert!(
+            !full.smooth.penalties.is_empty(),
+            "`{formula}`: the full rebuild realizes the smooth penalties"
+        );
+
+        for term in &frozen.smooth_terms {
+            // These kinds place their outer design from the inner penalties.
+            if matches!(
+                term.basis,
+                crate::smooth::SmoothBasisSpec::BySmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSmooth { .. }
+                    | crate::smooth::SmoothBasisSpec::FactorSumToZero { .. }
+            ) {
+                continue;
+            }
+            let mut workspace = crate::basis::BasisWorkspace::default();
+            let local = crate::smooth::build_single_local_smooth_term_for(
+                new_rows.view(),
+                term,
+                &mut workspace,
+                crate::smooth::SmoothPenaltyDemand::DesignOnly,
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` term {}: {err}", term.name));
+            assert!(
+                local.active_penalties.is_empty() && local.dropped_penalties.is_empty(),
+                "`{formula}`: frozen term {} must not realize penalties for a design-only build",
+                term.name
+            );
+        }
+    }
+}
