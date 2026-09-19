@@ -7,7 +7,7 @@ use ndarray::Array1;
 /// through a geometric periodic wrap that fired for any uniform open knot
 /// vector, moving a boundary-span point forward by one period onto unrelated
 /// interior columns (max|d1 - fd| ~ 1.7). This is the Rust-side mirror of the
-/// public `gamfit.bspline_basis_derivative(..., periodic=False)` repro.
+/// public `gamfit.basis.bspline_basis_derivative(..., periodic=False)` repro.
 #[test]
 fn nonperiodic_bspline_first_derivative_matches_central_difference() {
     let degree = 3usize;

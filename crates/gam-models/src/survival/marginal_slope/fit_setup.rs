@@ -690,6 +690,7 @@ pub(crate) fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollec
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     for spec in specs {
         out.linear_terms.extend(spec.linear_terms.clone());
@@ -818,12 +819,15 @@ pub(crate) fn combine_slope_surface_designs(
 ///
 /// This is a safeguarded 1D Newton solve on the true row objective. It does not
 /// use a coarse fixed grid scan. A row entering at the time origin carries no
-/// entry factor here, as in the fitted likelihood (gnomon#2336).
+/// entry factor here, as in the fitted likelihood (gnomon#2336), and each row's
+/// score reads its conditional variance `z_variance[i] = Var(z | a_i)`, the
+/// covariance the fitted likelihood reads (gam#2766, gam#2952).
 pub(crate) fn pooled_survival_baseline(
     event: &Array1<f64>,
     weights: &Array1<f64>,
     entry_at_origin: &Array1<bool>,
     z: &Array1<f64>,
+    z_variance: &Array1<f64>,
     q0: &Array1<f64>,
     q1: &Array1<f64>,
     qd1: &Array1<f64>,
@@ -844,6 +848,7 @@ pub(crate) fn pooled_survival_baseline(
                     qd1[i],
                     slope,
                     z[i],
+                    z_variance[i],
                     weights[i],
                     if entry_at_origin[i] { 0.0 } else { weights[i] },
                     event[i],

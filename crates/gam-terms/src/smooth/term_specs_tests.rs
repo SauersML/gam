@@ -156,6 +156,7 @@ mod spatial_psi_bound_coordinate_tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         };
         spatial_term_psi_bounds(data.view(), &spec, 0).expect("finite spatial ψ bounds")
     }
@@ -218,6 +219,7 @@ mod spatial_psi_bound_coordinate_tests {
                     shape: ShapeConstraint::None,
                     joint_null_rotation: None,
                 }],
+                level: Default::default(),
             };
             let geometry =
                 spatial_term_psi_bounds(source.view(), &spec, 0).expect("finite geometry window");
@@ -1062,6 +1064,7 @@ mod frozen_factor_level_collection_tests {
                     spec: marginal(),
                 },
             )],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();
@@ -1138,6 +1141,7 @@ mod frozen_factor_level_collection_tests {
                 smooth("nested", nested),
                 smooth("numeric", numeric_wrappers),
             ],
+            level: Default::default(),
         };
 
         let levels = spec.frozen_factor_levels_by_col();

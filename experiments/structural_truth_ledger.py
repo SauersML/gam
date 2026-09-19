@@ -26,7 +26,7 @@ number/verdict; aggregated into one ledger.
      ISOTROPIC NOISE (same dim/scale, no structure) must NOT hallucinate curved
      structure. Recover real AND reject noise = genuine truth-discrimination.
 
-NO fitting math lives here. It calls gamfit.sae_manifold_fit + ManifoldSAE.reconstruct,
+NO fitting math lives here. It calls gamfit.sae.sae_manifold_fit + ManifoldSAE.reconstruct,
 and reads the per-atom hybrid-split report (Theta, Delta-EV, evidence margin)
 that the production engine emits.
 """
@@ -70,7 +70,7 @@ def _pca_project(train, test, pcs):
 
 
 def _fit(z_tr, k, topology, seed, n_iter):
-    from gamfit import sae_manifold_fit
+    from gamfit.sae import sae_manifold_fit
 
     return sae_manifold_fit(
         z_tr, K=k, d_atom=1, atom_topology=topology,

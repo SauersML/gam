@@ -2161,188 +2161,88 @@ fn ring_state_from_parameters(
     })
 }
 
-/// Gradient and Hessian of the total observed log likelihood
-/// `ℓ = Σ_i log Σ_j π_j N(x_i | c + R u_j, s I_2)` in the coordinates of
-/// [`ring_state_parameters`], at the state whose E-step produced
-/// `responsibilities`.
-///
-/// Per row, with `a_ij = log π_j + log N(x_i | μ_j, s I_2)` and `γ_ij` its
-/// responsibility, `∇ℓ_i = Σ_j γ_ij ∇a_ij` and
-/// `∇²ℓ_i = Σ_j γ_ij (∇²a_ij + ∇a_ij ∇a_ijᵀ) − ∇ℓ_i ∇ℓ_iᵀ`. Writing
-/// `g = (x_i − μ_j)/s`, `u⊥ = (−sin φ_j, cos φ_j)`, `d = ‖x_i − μ_j‖²` and
-/// `t = log s`, the nonzero first derivatives of `a_ij` are `∂η_m = δ_jm − π_m`,
-/// `∂c = g`, `∂R = g·u_j`, `∂φ_j = R g·u⊥` and `∂t = d/(2s) − 1`. The second
-/// derivatives are `∂η_m∂η_l = −(π_m δ_ml − π_m π_l)`, `∂c∂c = −I/s`,
-/// `∂c∂R = −u_j/s`, `∂c∂φ_j = −R u⊥/s`, `∂R∂R = −1/s`, `∂R∂φ_j = g·u⊥`,
-/// `∂φ_j∂φ_j = −R²/s − R g·u_j`, `∂c∂t = −g`, `∂R∂t = −g·u_j`,
-/// `∂φ_j∂t = −R g·u⊥` and `∂t∂t = −d/(2s)`.
-fn ring_mixture_log_likelihood_derivatives(
-    data: ArrayView2<'_, f64>,
-    responsibilities: ArrayView2<'_, f64>,
-    state: &RingMixtureState,
-) -> Result<(Array1<f64>, Array2<f64>), String> {
-    let n = data.nrows();
-    let k = state.weights.len();
-    if data.ncols() != 2 || responsibilities.dim() != (n, k) {
-        return Err(
-            "ring-of-clusters derivatives need (n, k) responsibilities for two-column data"
-                .to_string(),
-        );
+/// Wraps the angle block of a difference of [`ring_state_parameters`] coordinates
+/// into `[−π, π)`, so a component whose angle crosses the `atan2` branch cut moves by
+/// its short arc.
+fn wrap_ring_angle_differences(difference: &mut Array1<f64>, k: usize) {
+    for component in 0..k {
+        let index = k + 2 + component;
+        difference[index] = (difference[index] + std::f64::consts::PI)
+            .rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
     }
-    let dim = 2 * k + 3;
-    let center_index = k - 1;
-    let radius_index = k + 1;
-    let variance_index = 2 * k + 2;
-    let variance = state.variance;
-    let radius = state.radius;
-    let means = ring_component_means(&state.center, radius, &state.directions);
-    let mut gradient = Array1::<f64>::zeros(dim);
-    let mut hessian = Array2::<f64>::zeros((dim, dim));
-    // The logit block of ∇²a_ij is the same for every (i, j), and each row's
-    // responsibilities sum to one.
-    for left in 0..k - 1 {
-        for right in 0..k - 1 {
-            let diagonal = if left == right {
-                state.weights[left]
-            } else {
-                0.0
-            };
-            hessian[[left, right]] -=
-                n as f64 * (diagonal - state.weights[left] * state.weights[right]);
-        }
-    }
-    let mut row_gradient = Array1::<f64>::zeros(dim);
-    let mut term_gradient = Array1::<f64>::zeros(dim);
-    for row in 0..n {
-        row_gradient.fill(0.0);
-        for component in 0..k {
-            let responsibility = responsibilities[[row, component]];
-            if responsibility == 0.0 {
-                continue;
-            }
-            let ux = state.directions[[component, 0]];
-            let uy = state.directions[[component, 1]];
-            let perp_x = -uy;
-            let perp_y = ux;
-            let gx = (data[[row, 0]] - means[[component, 0]]) / variance;
-            let gy = (data[[row, 1]] - means[[component, 1]]) / variance;
-            let squared_distance = variance * variance * (gx * gx + gy * gy);
-            let g_dot_u = gx * ux + gy * uy;
-            let g_dot_perp = gx * perp_x + gy * perp_y;
-            let angle_index = k + 2 + component;
-            term_gradient.fill(0.0);
-            for logit in 0..k - 1 {
-                let indicator = if logit == component { 1.0 } else { 0.0 };
-                term_gradient[logit] = indicator - state.weights[logit];
-            }
-            term_gradient[center_index] = gx;
-            term_gradient[center_index + 1] = gy;
-            term_gradient[radius_index] = g_dot_u;
-            term_gradient[angle_index] = radius * g_dot_perp;
-            term_gradient[variance_index] = 0.5 * squared_distance / variance - 1.0;
-            for left in 0..dim {
-                let scaled = responsibility * term_gradient[left];
-                if scaled == 0.0 {
-                    continue;
-                }
-                row_gradient[left] += scaled;
-                for right in 0..dim {
-                    hessian[[left, right]] += scaled * term_gradient[right];
-                }
-            }
-            let second_derivatives = [
-                (center_index, center_index, -1.0 / variance),
-                (center_index + 1, center_index + 1, -1.0 / variance),
-                (center_index, radius_index, -ux / variance),
-                (center_index + 1, radius_index, -uy / variance),
-                (center_index, angle_index, -radius * perp_x / variance),
-                (center_index + 1, angle_index, -radius * perp_y / variance),
-                (radius_index, radius_index, -1.0 / variance),
-                (radius_index, angle_index, g_dot_perp),
-                (
-                    angle_index,
-                    angle_index,
-                    -radius * radius / variance - radius * g_dot_u,
-                ),
-                (center_index, variance_index, -gx),
-                (center_index + 1, variance_index, -gy),
-                (radius_index, variance_index, -g_dot_u),
-                (angle_index, variance_index, -radius * g_dot_perp),
-                (variance_index, variance_index, -0.5 * squared_distance / variance),
-            ];
-            for (left, right, value) in second_derivatives {
-                hessian[[left, right]] += responsibility * value;
-                if left != right {
-                    hessian[[right, left]] += responsibility * value;
-                }
-            }
-        }
-        for left in 0..dim {
-            for right in 0..dim {
-                hessian[[left, right]] -= row_gradient[left] * row_gradient[right];
-            }
-        }
-        gradient += &row_gradient;
-    }
-    if gradient
-        .iter()
-        .chain(hessian.iter())
-        .any(|value| !value.is_finite())
-    {
-        return Err("ring-of-clusters log-likelihood derivatives are non-finite".to_string());
-    }
-    Ok((gradient, hessian))
 }
 
-/// One Newton ascent proposal on the observed log likelihood from `state`, whose
-/// E-step produced `responsibilities`, taken on the eigenspace where the observed
-/// information `−∇²ℓ` is resolvably positive: eigenvalues above the symmetric
-/// eigensolver's backward-error band `dim·ε·‖∇²ℓ‖₂`. The quadratic model has no
-/// maximum along the other directions, so the step leaves them to the EM update.
-/// At an over-fitted order that is not a corner case: the two components sharing
-/// one cluster give the information one negative eigenvalue (−7.4e-3 after one
-/// update, −3.9e-9 after ten, at k = 8 on seven planted ring clusters), so a
-/// proposal that required the whole matrix to be positive definite was refused at
-/// every iteration. `None` where no eigenvalue is resolvably positive or the step
-/// leaves the model's domain.
-fn ring_mixture_newton_proposal(
+/// One update of the ring mixture's generalized EM, accelerated by squared
+/// extrapolation (SQUAREM, Varadhan & Roland 2008, steplength S3). `state` carries its
+/// mean log likelihood, `first = M(state)` is its EM update, and
+/// `first_responsibilities` is `first`'s E-step.
+///
+/// At an over-fitted order the EM map contracts along one direction at its fraction
+/// of missing information. At k = 8 on seven planted ring clusters the successive
+/// updates are parallel (cosine 1.000000), lie on the observed information's
+/// lowest-curvature eigenvector, and shrink by 0.9989 to 0.9999 per update (job
+/// 1334303), so no update budget certifies the order. With `θ₁ = M(θ₀)`,
+/// `θ₂ = M(θ₁)`, `r = θ₁ − θ₀` and `v = (θ₂ − θ₁) − r`, S3 takes `α = −‖r‖/‖v‖`. For a
+/// map that contracts at any rate `ρ` along one direction that is `−1/(1 − ρ)`, and
+/// the extrapolation `θ₀ − 2αr + α²v` is exactly that direction's limit.
+///
+/// The update never lowers the likelihood. The extrapolation is stabilized by one EM
+/// update and kept only when its likelihood is at least `state`'s. Otherwise `α`
+/// backtracks toward `−1` by halving its distance from it, the SQUAREM safeguard. At
+/// `α = −1` the extrapolation is `θ₂`, two EM updates, which never lower the
+/// likelihood, so the backtracking ends at the latest where the halved distance
+/// rounds to zero. An extrapolation whose density is not representable backtracks
+/// like a lower one: it is a rejected proposal, not a failure of the current state.
+fn ring_mixture_squarem_update(
     data: ArrayView2<'_, f64>,
-    responsibilities: ArrayView2<'_, f64>,
     state: &RingMixtureState,
-    covariance_floor: f64,
-) -> Result<Option<RingMixtureState>, String> {
-    let (gradient, hessian) =
-        ring_mixture_log_likelihood_derivatives(data, responsibilities, state)?;
-    let dim = gradient.len();
-    let information = hessian.mapv(|value| -value);
-    let (eigenvalues, eigenvectors) = information.eigh(Side::Lower).map_err(|error| {
-        format!("ring-of-clusters observed information eigendecomposition failed: {error}")
-    })?;
-    let largest = eigenvalues
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let resolution = dim as f64 * f64::EPSILON * largest;
-    if !eigenvalues.iter().any(|&value| value > resolution) {
-        return Ok(None);
+    first: RingMixtureState,
+    first_responsibilities: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+) -> Result<RingMixtureState, String> {
+    let k = state.weights.len();
+    let completed_iterations = state.completed_iterations + 1;
+    let mut second = ring_mixture_m_step(data, first_responsibilities, &first, config)?;
+    second.mean_log_likelihood = ring_mixture_e_step(data, &second)?.mean_log_likelihood;
+    second.completed_iterations = completed_iterations;
+    let theta0 = ring_state_parameters(state)?;
+    let theta1 = ring_state_parameters(&first)?;
+    let mut r = &theta1 - &theta0;
+    wrap_ring_angle_differences(&mut r, k);
+    let mut second_step = &ring_state_parameters(&second)? - &theta1;
+    wrap_ring_angle_differences(&mut second_step, k);
+    let v = &second_step - &r;
+    let r_norm = r.dot(&r).sqrt();
+    let v_norm = v.dot(&v).sqrt();
+    if !(r_norm.is_finite() && v_norm > 0.0) {
+        return Ok(second);
     }
-    let projected = eigenvectors.t().dot(&gradient);
-    let mut step = Array1::<f64>::zeros(dim);
-    for index in 0..dim {
-        if !(eigenvalues[index] > resolution) {
-            continue;
+    let mut alpha = (-(r_norm / v_norm)).min(-1.0);
+    while alpha < -1.0 {
+        let extrapolated = &theta0 - &r.mapv(|x| 2.0 * alpha * x) + &v.mapv(|x| alpha * alpha * x);
+        if let Some(jumped) =
+            ring_state_from_parameters(&extrapolated, k, config.covariance_floor, completed_iterations)
+        {
+            let stabilized = ring_mixture_e_step(data, &jumped)
+                .and_then(|e_step| {
+                    ring_mixture_m_step(data, e_step.responsibilities.view(), &jumped, config)
+                })
+                .and_then(|mut candidate| {
+                    candidate.mean_log_likelihood =
+                        ring_mixture_e_step(data, &candidate)?.mean_log_likelihood;
+                    Ok(candidate)
+                });
+            if let Ok(mut candidate) = stabilized {
+                if candidate.mean_log_likelihood >= state.mean_log_likelihood {
+                    candidate.completed_iterations = completed_iterations;
+                    return Ok(candidate);
+                }
+            }
         }
-        let coefficient = projected[index] / eigenvalues[index];
-        for coordinate in 0..dim {
-            step[coordinate] += eigenvectors[[coordinate, index]] * coefficient;
-        }
+        alpha = 0.5 * (alpha - 1.0);
     }
-    let parameters = ring_state_parameters(state)? + &step;
-    Ok(ring_state_from_parameters(
-        &parameters,
-        state.weights.len(),
-        covariance_floor,
-        state.completed_iterations + 1,
-    ))
+    Ok(second)
 }
 
 /// Fit a deterministic, certified `k`-component isotropic Gaussian mixture
@@ -2486,30 +2386,17 @@ pub(crate) fn fit_ring_gaussian_mixture(
                 config.parameter_tol,
             ));
         }
-        // #2822 — at an over-fitted order two components share one cluster, and the
-        // EM map contracts along that split only at its fraction of missing
-        // information: 0.9995 per update at k = 8 on seven planted ring clusters,
-        // which no update budget certifies. A Newton step on the observed likelihood
-        // does not slow down along that direction. It replaces the EM update only
-        // when it climbs above it, so every accepted state still ascends and is
-        // certified by the same one-application EM residual above. A proposal whose
-        // density is not representable is a rejected proposal, not a failure of the
-        // current state.
-        state = match ring_mixture_newton_proposal(
+        // #2822 — the next state is the accelerated EM update (see
+        // `ring_mixture_squarem_update`). It never lowers the likelihood, so every
+        // accepted state still ascends and is certified by the same one-application EM
+        // residual above.
+        state = ring_mixture_squarem_update(
             data,
-            current.responsibilities.view(),
             &state,
-            config.covariance_floor,
-        )? {
-            Some(mut proposal) => match ring_mixture_e_step(data, &proposal) {
-                Ok(proposal_e_step) if proposal_e_step.mean_log_likelihood > next_mean => {
-                    proposal.mean_log_likelihood = proposal_e_step.mean_log_likelihood;
-                    proposal
-                }
-                _ => next,
-            },
-            None => next,
-        };
+            next,
+            next_e_step.responsibilities.view(),
+            config,
+        )?;
     }
     Err("ring-of-clusters generalized EM exhausted without a terminal certificate".to_string())
 }
@@ -2889,285 +2776,235 @@ impl UnionStructure {
     }
 }
 
-/// One fitted model in a REML/LAML evidence comparison.
+/// Criterion `compare_models` ranks on. It is the one ranking estimand; the
+/// REML/LAML `score_table` is a diagnostic beside it.
+pub const COMPARISON_CRITERION: &str = "aic_corrected";
+
+/// One fitted model in a model comparison, read from its fitted summary.
+///
+/// Every field is required: a model that cannot publish its corrected AIC is
+/// refused before it becomes a candidate, with the summary's own reason.
 #[derive(Clone, Debug)]
-pub struct RemlCandidate {
-    pub index: usize,
+pub struct ComparisonCandidate {
     pub name: String,
-    /// Comparable REML/LAML criterion, kept verbatim in the diagnostic score
-    /// table, or `None` for a fit without one (no criterion at all, or no
-    /// null-space metadata for the Tierney-Kadane normalizer). This is not the
-    /// conditional-AIC cost that ranks candidates, so its absence never blocks a
-    /// ranking.
-    pub score: Option<f64>,
-    /// Effective degrees of freedom consumed by the fitted mean. Required
-    /// because conditional AIC has no definition without its complexity term.
-    pub edf: f64,
-    /// Ordinary log-likelihood at the converged mode. Required because a raw
-    /// REML/LAML objective is a different estimand, not a ranking fallback.
-    pub log_lik: f64,
-    /// Response-family tag (e.g. "gaussian", "gamma", "binomial"). Carried so
-    /// `compare_reml_fits` can REFUSE to rank fits whose REML/LAML scores are on
-    /// incomparable base measures (a cross-family comparison is meaningless;
-    /// #1384). `None` for legacy payloads that did not record it — those are not
-    /// guarded (back-compatible), but every current FFI candidate carries it.
-    pub family: Option<String>,
-    /// Number of observations the fit was trained on. Carried so
-    /// `compare_reml_fits` can REFUSE to rank fits made on a different number of
-    /// observations (hence different data): `−2·loglik` and the REML/LAML
-    /// evidence grow with `n`, so a score difference between two fits with
-    /// different `n` is not a Bayes factor — the same incomparability the family
-    /// guard already rejects. `None` for payloads that do not record it (legacy /
-    /// O(n) scan smoothers), which the guard treats as unconstrained.
-    pub n_obs: Option<usize>,
+    /// Response-family label. Candidates of different families are refused:
+    /// their log-likelihoods live on different base measures (#1384).
+    pub family: String,
+    /// Training observations. Candidates fit on different `n` are refused:
+    /// `−2ℓ` grows with `n`, so their AIC gap is not an evidence ratio.
+    pub n_obs: usize,
+    /// Wood–Pya–Säfken smoothing-corrected AIC `−2ℓ + 2·(τ + p_scale)`, the
+    /// ranking criterion.
+    pub aic_corrected: f64,
+    /// AIC conditional on `λ̂`, `−2ℓ + 2·(tr(F) + p_scale)`, reported beside
+    /// the ranking for reference only.
+    pub aic_conditional: f64,
+    /// Corrected EDF `τ = tr(F) + tr(X'WX·C)/s`.
+    pub edf_corrected: f64,
+    /// Conditional EDF `tr(F)`.
+    pub edf_conditional: f64,
+    /// Comparable (Tierney-Kadane normalized) REML/LAML criterion, or `None`
+    /// for a fit without one. Diagnostic only; never ranks.
+    pub reml_score: Option<f64>,
 }
 
-impl RemlCandidate {
-    /// Cost used to RANK candidates and pick the winner.
-    ///
-    /// The REML/LAML marginal-likelihood evidence headline (`score`) does NOT
-    /// reliably Occam-penalise an added pure-noise smooth: on `y ~ s(x)` vs
-    /// `y ~ s(x) + s(z)` with `z ⟂ y`, the augmented model's evidence is
-    /// *lower* (apparently better) by a few nats on essentially every dataset,
-    /// because the Gaussian REML Occam pair `½(log|H| − log|S|₊)` collapses
-    /// toward zero for a finite-`λ̂` null term while that term still spends a
-    /// few effective degrees of freedom fitting noise (issue #1362).
-    ///
-    /// The conditional AIC `−2ℓ + 2·edf` prices exactly those spent degrees of
-    /// freedom and discriminates correctly: it penalises the noise smooth
-    /// (Δ ≈ +15 nats) yet rewards a genuinely relevant smooth (Δ ≈ −650),
-    /// preserving power. Ranking therefore requires both quantities and refuses
-    /// an invalid candidate rather than switching to the incomparable raw
-    /// evidence headline. The reported `score_table` still carries that raw
-    /// diagnostic unchanged.
-    pub(crate) fn ranking_score(&self) -> Result<f64, String> {
-        if let Some(score) = self.score
-            && !score.is_finite()
-        {
-            return Err(format!(
-                "compare_models: candidate '{}' has non-finite raw REML/LAML score {score}",
-                self.name
-            ));
-        }
-        if !(self.edf.is_finite() && self.edf >= 0.0) {
-            return Err(format!(
-                "compare_models: candidate '{}' requires finite non-negative edf_total, got {}",
-                self.name, self.edf
-            ));
-        }
-        if !self.log_lik.is_finite() {
-            return Err(format!(
-                "compare_models: candidate '{}' requires finite log_likelihood; \
-                 raw REML/LAML is not a substitute ranking estimand",
-                self.name
-            ));
-        }
-        let score = -2.0 * self.log_lik + 2.0 * self.edf;
-        if !score.is_finite() {
-            return Err(format!(
-                "compare_models: candidate '{}' conditional AIC is outside f64 range",
-                self.name
-            ));
-        }
-        Ok(score)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RemlComparison {
+/// Result of [`compare_models`], serialized verbatim by every frontend.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelComparison {
+    /// Always [`COMPARISON_CRITERION`].
+    pub criterion: &'static str,
+    /// Rows ordered by ascending `aic_corrected`; the first row is the winner.
     pub ranking: Vec<RankedRow>,
     pub winner: String,
     pub evidence_summary: String,
+    /// REML/LAML criterion per model, in ranking order. See [`ScoreRow`] for
+    /// when its gaps are meaningful.
     pub score_table: Vec<ScoreRow>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct RankedRow {
     pub name: String,
-    pub score: Option<f64>,
-    /// Cost gap from the winning model on the SAME scale used to order the
-    /// ranking (`ranking_score`, the Occam-penalised conditional AIC,
-    /// issue #1362). The winner is `argmin ranking_score`, so this
-    /// is `>= 0` for every row by construction — it never contradicts the
-    /// declared winner (issue #1465). `score` still carries the raw REML/LAML
-    /// diagnostic on its own explicitly labelled scale.
-    pub delta: f64,
-    /// Akaike evidence ratio of the winner over this row on the ranking scale.
-    /// `delta` is a conditional-AIC gap (a −2·log / deviance-scale quantity), so
-    /// the evidence ratio is `exp(½·delta) >= 1` (Burnham & Anderson), NOT
-    /// `exp(delta)` — the latter squares the intended ratio (issues #1465, #2124).
-    ///
-    /// This is NOT a Bayes factor and was renamed away from that word: a Bayes
-    /// factor is a ratio of prior-integrated marginal likelihoods, whereas this
-    /// is the relative likelihood `exp(−ΔAIC/2)`, which integrates over no
-    /// prior and must not be read against Jeffreys / Kass–Raftery thresholds.
-    /// The raw REML/LAML `score_table` keeps the Laplace-approximate
-    /// marginal-likelihood diagnostic on its own labelled scale.
-    pub evidence_ratio: f64,
-    pub edf: f64,
+    pub aic_corrected: f64,
+    /// `aic_corrected − min aic_corrected`, `>= 0` by construction, so it
+    /// never contradicts the declared winner (#1465).
+    pub delta_aic: f64,
+    /// Akaike evidence ratio of the winner over this row, `exp(½·delta_aic)`
+    /// (Burnham & Anderson; #2124). A relative likelihood, not a Bayes factor:
+    /// it integrates over no prior. `None` when it exceeds `f64` range; the
+    /// gap itself is `delta_aic`.
+    pub evidence_ratio: Option<f64>,
+    pub aic_conditional: f64,
+    pub edf_corrected: f64,
+    pub edf_conditional: f64,
 }
 
-#[derive(Clone, Debug)]
-/// One row of the diagnostic REML/LAML score table. The criterion and its
-/// factors are `None` for a candidate without a comparable criterion, and the
-/// factors are referenced to the minimum over the candidates that have one.
+/// One row of the diagnostic REML/LAML score table.
+///
+/// A REML/LAML gap between two fits is a log restricted-evidence ratio only
+/// when the fits share the family, the data, and the unpenalized fixed-effect
+/// space (identical parametric terms and penalty null spaces): REML integrates
+/// the penalized coefficients but conditions on that space, so fits with
+/// different fixed effects have restricted likelihoods on different
+/// error contrasts. Nested smooths added to a common parametric part qualify;
+/// a parametric term added or removed does not. The table is reported for that
+/// case and never decides the winner.
+#[derive(Clone, Debug, Serialize)]
 pub struct ScoreRow {
     pub name: String,
     pub reml_score: Option<f64>,
+    /// `reml_score − min reml_score` over the candidates that have one.
     pub delta_reml: Option<f64>,
-    /// `exp(delta_reml)`, the exp of this row's raw criterion gap to the
-    /// minimum. It is a restricted-evidence ratio only at plug-in λ, with
-    /// normalized evidence over a fixed-effect space the candidates share, and
-    /// never a prior-integrated Bayes factor.
+    /// `exp(delta_reml)`: the restricted-evidence ratio of the best-scoring fit
+    /// over this one, at plug-in `λ̂`, under the shared fixed-effect condition
+    /// above. `None` without a `delta_reml` or when the ratio exceeds `f64`
+    /// range.
     pub reml_criterion_ratio_best_over_model: Option<f64>,
     pub effective_dof: f64,
 }
 
-/// Gap `cost_b − cost_a` between two minimised criterion costs (lower is
-/// better), positive when `a` is better. The raw REML/LAML score table and the
-/// conditional-AIC ranking both use it. It is a Bayes factor on neither, and an
-/// AIC gap must be halved before it is a log evidence ratio.
-#[inline]
-pub fn criterion_gap(cost_a: f64, cost_b: f64) -> f64 {
-    cost_b - cost_a
+/// Refuse candidates that no information criterion can compare: different
+/// response families or different observation counts.
+fn check_comparable(candidates: &[&ComparisonCandidate]) -> Result<(), String> {
+    let Some(first) = candidates.first() else {
+        return Err("compare_models requires at least one fit".to_string());
+    };
+    for cand in candidates {
+        if cand.family != first.family {
+            return Err(format!(
+                "compare_models: cannot compare fits of different response families \
+                 ('{}' vs '{}'); their log-likelihoods are on incomparable base measures. \
+                 Compare models fit to the same response under the same family.",
+                first.family, cand.family
+            ));
+        }
+        if cand.n_obs != first.n_obs {
+            return Err(format!(
+                "compare_models: cannot compare fits made on a different number of \
+                 observations (n={} vs n={}); AIC scales with the sample size, so their \
+                 difference is not an evidence ratio. Compare models fit to the same \
+                 response on the same data.",
+                first.n_obs, cand.n_obs
+            ));
+        }
+        for (label, value) in [
+            ("aic_corrected", cand.aic_corrected),
+            ("aic_conditional", cand.aic_conditional),
+            ("edf_corrected", cand.edf_corrected),
+            ("edf_conditional", cand.edf_conditional),
+        ] {
+            if !value.is_finite() {
+                return Err(format!(
+                    "compare_models: candidate '{}' has non-finite {label} {value}",
+                    cand.name
+                ));
+            }
+        }
+        if let Some(score) = cand.reml_score
+            && !score.is_finite()
+        {
+            return Err(format!(
+                "compare_models: candidate '{}' has non-finite REML/LAML score {score}",
+                cand.name
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// Compare fitted models by the single evidence ordering contract used by
-/// topology ranking and seed screening: lower finite cost wins, with stable
-/// original-order tie handling.
-pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlComparison, String> {
-    if candidates.is_empty() {
-        return Err("compare_models requires at least one fit".to_string());
-    }
-    // Fail-loud comparability guard (#1384): REML/LAML evidence scores are only
-    // comparable across fits of the SAME response family — a Gaussian score and
-    // a Gamma score live on different log-density base measures, so their
-    // difference is not a Bayes factor. Ranking them anyway returns a confident
-    // but meaningless winner. Refuse when two candidates carry DIFFERENT family
-    // tags. Candidates with no family tag (`None`, legacy payloads) are not
-    // constrained, so this never spuriously rejects an older saved model.
-    {
-        let mut seen_family: Option<&str> = None;
-        for cand in &candidates {
-            if let Some(fam) = cand.family.as_deref() {
-                match seen_family {
-                    None => seen_family = Some(fam),
-                    Some(prev) if prev != fam => {
-                        return Err(format!(
-                            "compare_models: cannot compare fits of different response families                              ('{prev}' vs '{fam}'); their REML/LAML evidence scores are on                              incomparable base measures. Compare models fit to the same response                              under the same family."
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    }
-    // Fail-loud comparability guard (#1384 sibling): AIC / REML-LAML evidence are
-    // only comparable across fits of the SAME response on the SAME observations.
-    // `−2·loglik` (and the marginal-likelihood headline) grow with the number of
-    // observations `n`, so two fits with different `n` live on incomparable
-    // scales and their score gap is not a Bayes factor — comparing an n=500 and
-    // an n=100 fit of the same DGP otherwise declares the n=100 model the winner
-    // purely because fewer points give a less-negative total log-likelihood.
-    // Refuse when two candidates carry DIFFERENT observation counts. Candidates
-    // with no count (`None`, legacy / O(n) scan payloads) are unconstrained, so
-    // this never spuriously rejects a fit that simply did not record `n`.
-    {
-        let mut seen_n: Option<usize> = None;
-        for cand in &candidates {
-            if let Some(n) = cand.n_obs {
-                match seen_n {
-                    None => seen_n = Some(n),
-                    Some(prev) if prev != n => {
-                        return Err(format!(
-                            "compare_models: cannot compare fits made on a different number of \
-                             observations (n={prev} vs n={n}); AIC / REML-LAML evidence scales \
-                             with the sample size, so their score difference is not a Bayes \
-                             factor. Compare models fit to the same response on the same data."
-                        ));
-                    }
-                    Some(_) => {}
-                }
-            }
-        }
-    }
+/// `exp(log_ratio)` when it is a finite `f64`. A ratio past `f64::MAX` is
+/// reported as absent rather than `inf`, which JSON cannot carry; the finite
+/// log-scale gap beside it remains the exact comparison.
+fn representable_exp(log_ratio: f64) -> Option<f64> {
+    Some(log_ratio.exp()).filter(|ratio| ratio.is_finite())
+}
+
+/// Log Akaike evidence ratio of `a` over `b`, `½·(AIC_c(b) − AIC_c(a))`, on
+/// the same corrected AIC and under the same comparability guards as
+/// [`compare_models`].
+pub fn log_evidence_ratio(
+    a: &ComparisonCandidate,
+    b: &ComparisonCandidate,
+) -> Result<f64, String> {
+    check_comparable(&[a, b])?;
+    Ok(0.5 * (b.aic_corrected - a.aic_corrected))
+}
+
+/// Rank fitted models on their smoothing-corrected AIC: lower wins, with
+/// stable original-order tie handling.
+///
+/// The corrected AIC (Wood, Pya & Säfken 2016) prices the effective degrees
+/// of freedom a smooth spends *including* those spent by estimating its
+/// smoothing parameter. The conditional AIC `−2ℓ + 2·tr(F)` treats `λ̂` as
+/// known and so under-penalises a null smooth whose `λ̂` is finite, and the
+/// REML/LAML score collapses its Occam term for the same smooth (#1362).
+pub fn compare_models(
+    candidates: Vec<ComparisonCandidate>,
+) -> Result<ModelComparison, String> {
+    check_comparable(&candidates.iter().collect::<Vec<_>>())?;
     let priority_candidates = candidates
         .into_iter()
         .enumerate()
         .map(|(idx, row)| {
-            let ranking = row.ranking_score()?;
-            Ok(PriorityCandidate::new(row, idx, ranking, 0))
+            let cost = row.aic_corrected;
+            PriorityCandidate::new(row, idx, cost, 0)
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    candidates = rank_priority_candidates(priority_candidates)
+        .collect::<Vec<_>>();
+    let candidates: Vec<ComparisonCandidate> = rank_priority_candidates(priority_candidates)
         .into_iter()
         .map(|row| row.item)
         .collect();
 
     let winner = candidates[0].name.clone();
-    // The ranking `delta` / `evidence_ratio` must be measured on the SAME scale
-    // that orders the table — the `ranking_score` (Occam-penalised conditional
-    // AIC, issue #1362). `candidates[0]` is the winner =
-    // `argmin ranking_score`, so its ranking score IS the minimum; every row's
-    // ranking-scale gap is then `>= 0` and its evidence ratio `>= 1`, never
-    // contradicting the declared winner (issue #1465). Computing these against
-    // the AIC winner's *raw REML* — which is not the minimum raw REML once AIC
-    // and REML disagree — produced negative deltas and evidence ratios < 1 for
-    // non-winner rows.
-    let best_ranking_score = candidates[0].ranking_score()?;
-    // The raw-REML `score_table` stays on its explicitly labelled diagnostic
-    // scale, but is referenced to the genuine minimum raw REML so its factors are
-    // coherent (`>= 1`), rather than to whichever row happens to sit at index 0.
-    let best_raw_score = candidates.iter().filter_map(|c| c.score).reduce(f64::min);
-    let mut ranking = Vec::with_capacity(candidates.len());
-    let mut score_table = Vec::with_capacity(candidates.len());
-    for row in &candidates {
-        let delta = criterion_gap(best_ranking_score, row.ranking_score()?);
-        // `ranking_score` is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
-        // deviance-scale cost, so `delta` is a full ΔAIC gap. The Akaike evidence
-        // ratio for an AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson evidence ratio),
-        // hence the winner-over-row evidence ratio is `exp(½·delta)`. Reporting
-        // `delta.exp()` squared the intended ratio (issue #2124). `delta` itself is
-        // left on the AIC scale on purpose — only its exp() conversion is halved.
-        let evidence_ratio = (0.5 * delta).exp();
-        let delta_reml = best_raw_score
-            .zip(row.score)
-            .map(|(best, score)| criterion_gap(best, score));
-        ranking.push(RankedRow {
-            name: row.name.clone(),
-            score: row.score,
-            delta,
-            evidence_ratio,
-            edf: row.edf,
-        });
-        score_table.push(ScoreRow {
-            name: row.name.clone(),
-            reml_score: row.score,
-            delta_reml,
-            reml_criterion_ratio_best_over_model: delta_reml.map(f64::exp),
-            effective_dof: row.edf,
-        });
-    }
-    // The winner is decided by `ranking_score` (the Occam-penalised conditional
-    // AIC, issue #1362), which can disagree in sign with the raw
-    // REML/LAML criterion gap for a noise-augmented model. Summarise the actual
-    // decision margin so the headline never contradicts the chosen winner.
-    let evidence_summary = if let Some(runner_up) = candidates.get(1) {
-        let margin = runner_up.ranking_score()? - candidates[0].ranking_score()?;
-        // `margin` is a conditional-AIC gap (−2·log scale), so the Akaike evidence
-        // ratio is `exp(−½·margin)`; `format_exp_ratio` formats `exp()` of its
-        // argument, so pass the halved margin to headline `exp(½·margin)` rather
-        // than the squared `exp(margin)` (issue #2124).
-        format!(
-            "{} wins by evidence ratio {} over {}",
-            winner,
-            format_exp_ratio(0.5 * margin),
+    let best_aic = candidates[0].aic_corrected;
+    // Referenced to the genuine minimum REML score so its factors are `>= 1`,
+    // not to whichever row the AIC ordering puts first.
+    let best_reml = candidates
+        .iter()
+        .filter_map(|c| c.reml_score)
+        .reduce(f64::min);
+    let ranking = candidates
+        .iter()
+        .map(|row| {
+            let delta_aic = row.aic_corrected - best_aic;
+            RankedRow {
+                name: row.name.clone(),
+                aic_corrected: row.aic_corrected,
+                delta_aic,
+                evidence_ratio: representable_exp(0.5 * delta_aic),
+                aic_conditional: row.aic_conditional,
+                edf_corrected: row.edf_corrected,
+                edf_conditional: row.edf_conditional,
+            }
+        })
+        .collect();
+    let score_table = candidates
+        .iter()
+        .map(|row| {
+            let delta_reml = best_reml
+                .zip(row.reml_score)
+                .map(|(best, score)| score - best);
+            ScoreRow {
+                name: row.name.clone(),
+                reml_score: row.reml_score,
+                delta_reml,
+                reml_criterion_ratio_best_over_model: delta_reml.and_then(representable_exp),
+                effective_dof: row.edf_conditional,
+            }
+        })
+        .collect();
+    let evidence_summary = match candidates.get(1) {
+        // The AIC gap is on the −2·log scale; `format_exp_ratio` exponentiates
+        // its argument, so pass the halved gap (#2124).
+        Some(runner_up) => format!(
+            "{winner} wins by evidence ratio {} over {} (aic_corrected)",
+            format_exp_ratio(0.5 * (runner_up.aic_corrected - best_aic)),
             runner_up.name
-        )
-    } else {
-        format!("{winner} (single fit; no comparison)")
+        ),
+        None => format!("{winner} (single fit; no comparison)"),
     };
-    Ok(RemlComparison {
+    Ok(ModelComparison {
+        criterion: COMPARISON_CRITERION,
         ranking,
         winner,
         evidence_summary,
@@ -3793,26 +3630,27 @@ mod tests {
     }
 
     #[test]
-    fn compare_reml_fits_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
-        // Regression for #1465: the ranking `delta` / `evidence_ratio` must be
-        // measured on the SAME scale that orders the table (the Occam-penalised
-        // conditional AIC `ranking_score`), so every row's delta is >= 0 and its
+    fn compare_models_delta_and_evidence_ratio_never_contradict_winner_gh1465() {
+        // Regression for #1465: the ranking `delta_aic` / `evidence_ratio` must be
+        // measured on the SAME scale that orders the table (`aic_corrected`), so
+        // every row's delta is >= 0 and its
         // evidence ratio >= 1 — the table must never claim a non-winner beats the
         // declared winner. The scenario is exactly the case the comparison
         // exists to handle: AIC and raw REML DISAGREE. `m1` is the AIC winner
         // but does NOT carry the minimum raw REML (`m2` does) — the noise
         // extra-term case from the issue.
         //
-        // `ranking_score` = -2*log_lik + 2*edf; with log_lik = 0 it is `2*edf`,
-        // so the AIC order is m1 < m2 < m3 while the raw-REML order has m2 lowest.
-        let cand = |name: &str, score: f64, edf: f64| RemlCandidate {
-            index: 0,
+        // `aic_corrected` is set to 2*edf, so the AIC order is m1 < m2 < m3
+        // while the REML order has m2 lowest.
+        let cand = |name: &str, score: f64, edf: f64| ComparisonCandidate {
             name: name.to_string(),
-            score: Some(score),
-            edf,
-            log_lik: 0.0,
-            family: Some("gaussian".to_string()),
-            n_obs: Some(100),
+            family: "gaussian".to_string(),
+            n_obs: 100,
+            aic_corrected: 2.0 * edf,
+            aic_conditional: 2.0 * edf,
+            edf_corrected: edf,
+            edf_conditional: edf,
+            reml_score: Some(score),
         };
         // raw REML : m2 (41.605) < m1 (53.748) < m3 (120.011)
         // AIC=2*edf: m1 (100)    < m2 (102)    < m3 (130)
@@ -3821,28 +3659,28 @@ mod tests {
             cand("m2", 41.605, 51.0),
             cand("m3", 120.011, 65.0),
         ];
-        let cmp = compare_reml_fits(candidates).expect("comparison");
+        let cmp = compare_models(candidates).expect("comparison");
 
         assert_eq!(cmp.winner, "m1", "AIC winner");
         // No ranking row may contradict the declared winner.
         for row in &cmp.ranking {
             assert!(
-                row.delta >= 0.0,
+                row.delta_aic >= 0.0,
                 "ranking delta for {} must be >= 0, got {}",
                 row.name,
-                row.delta
+                row.delta_aic
             );
             assert!(
-                row.evidence_ratio >= 1.0 - 1e-12,
-                "ranking evidence_ratio for {} must be >= 1, got {}",
+                row.evidence_ratio.is_some_and(|ratio| ratio >= 1.0 - 1e-12),
+                "ranking evidence_ratio for {} must be >= 1, got {:?}",
                 row.name,
                 row.evidence_ratio
             );
         }
         let winner_row = cmp.ranking.iter().find(|r| r.name == "m1").unwrap();
-        assert!(winner_row.delta.abs() < 1e-12, "winner delta == 0");
+        assert!(winner_row.delta_aic.abs() < 1e-12, "winner delta == 0");
         assert!(
-            (winner_row.evidence_ratio - 1.0).abs() < 1e-9,
+            winner_row.evidence_ratio == Some(1.0),
             "winner evidence_ratio == 1"
         );
 
@@ -4500,107 +4338,12 @@ mod tests {
         assert!(residual <= 4.0 * f64::EPSILON);
     }
 
-    /// #2822 — the Newton polish's analytic gradient and Hessian of the observed
-    /// ring-mixture log likelihood agree with central differences of the likelihood
-    /// the E-step evaluates, at a state away from the optimum where every block is
-    /// live.
-    #[test]
-    fn ring_mixture_newton_derivatives_match_central_differences_2822() {
-        let data = seven_clusters_on_a_circle_2262();
-        let floor = GaussianMixtureConfig::default().covariance_floor;
-        let k = 4usize;
-        let angles = [0.3_f64, 1.9, 3.4, 5.0];
-        let state = RingMixtureState {
-            weights: array![0.1, 0.2, 0.3, 0.4],
-            center: array![0.3, -0.1],
-            radius: 1.7,
-            directions: Array2::from_shape_fn((k, 2), |(component, axis)| {
-                if axis == 0 {
-                    angles[component].cos()
-                } else {
-                    angles[component].sin()
-                }
-            }),
-            variance: 0.6,
-            mean_log_likelihood: f64::NAN,
-            completed_iterations: 0,
-        };
-        let total_log_likelihood = |parameters: &Array1<f64>| -> f64 {
-            let at = ring_state_from_parameters(parameters, k, floor, 0).unwrap();
-            ring_mixture_e_step(data.view(), &at)
-                .unwrap()
-                .mean_log_likelihood
-                * data.nrows() as f64
-        };
-        let analytic_gradient = |parameters: &Array1<f64>| -> Array1<f64> {
-            let at = ring_state_from_parameters(parameters, k, floor, 0).unwrap();
-            let e_step = ring_mixture_e_step(data.view(), &at).unwrap();
-            ring_mixture_log_likelihood_derivatives(
-                data.view(),
-                e_step.responsibilities.view(),
-                &at,
-            )
-            .unwrap()
-            .0
-        };
-        let parameters = ring_state_parameters(&state).unwrap();
-        let e_step = ring_mixture_e_step(data.view(), &state).unwrap();
-        let (gradient, hessian) = ring_mixture_log_likelihood_derivatives(
-            data.view(),
-            e_step.responsibilities.view(),
-            &state,
-        )
-        .unwrap();
-        let dim = parameters.len();
-        assert_eq!(dim, 2 * k + 3);
-        // Central differences at h = 1e-5: truncation O(h²·|ℓ'''|) and rounding
-        // O(ε·|ℓ|/h) ≈ 1e-8 on |ℓ| ≈ 500 sit far below the relative bar.
-        let h = 1.0e-5;
-        let mut worst_gradient = 0.0_f64;
-        let mut worst_hessian = 0.0_f64;
-        for coordinate in 0..dim {
-            let mut plus = parameters.clone();
-            let mut minus = parameters.clone();
-            plus[coordinate] += h;
-            minus[coordinate] -= h;
-            let difference =
-                (total_log_likelihood(&plus) - total_log_likelihood(&minus)) / (2.0 * h);
-            worst_gradient = worst_gradient
-                .max((difference - gradient[coordinate]).abs() / (1.0 + gradient[coordinate].abs()));
-            let column = (analytic_gradient(&plus) - analytic_gradient(&minus)) / (2.0 * h);
-            for row in 0..dim {
-                worst_hessian = worst_hessian.max(
-                    (column[row] - hessian[[row, coordinate]]).abs()
-                        / (1.0 + hessian[[row, coordinate]].abs()),
-                );
-            }
-        }
-        let gradient_scale = gradient
-            .iter()
-            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        let hessian_scale = hessian
-            .iter()
-            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-        assert!(
-            gradient_scale > 1.0 && hessian_scale > 1.0,
-            "the probe state must carry live derivatives: |g|={gradient_scale:.3e} |H|={hessian_scale:.3e}"
-        );
-        assert!(
-            worst_gradient <= 1.0e-6,
-            "analytic gradient disagrees with central differences: worst scaled error {worst_gradient:.3e}"
-        );
-        assert!(
-            worst_hessian <= 1.0e-6,
-            "analytic Hessian disagrees with central differences of the gradient: worst scaled error {worst_hessian:.3e}"
-        );
-    }
-
     /// #2822 — the order above the planted one certifies. An over-fitted order's EM
     /// contracts along the split component only at its fraction of missing
-    /// information; the Newton polish replaces those updates where it climbs
-    /// higher, so k = 8 on seven planted ring clusters meets the same certificate
-    /// as k = 7 instead of exhausting its update bound, and the BIC then prefers
-    /// the planted order.
+    /// information; the squared extrapolation steps to that contraction's limit, so
+    /// k = 8 on seven planted ring clusters meets the same certificate as k = 7
+    /// instead of exhausting its update bound, and the BIC then prefers the planted
+    /// order.
     #[test]
     fn ring_of_clusters_over_fitted_order_certifies_2822() {
         let data = seven_clusters_on_a_circle_2262();
@@ -4810,239 +4553,149 @@ mod tests {
         assert!(select_hybrid_split(&slots).is_err());
     }
 
-    // ── #1362: compare_models must Occam-penalise a pure-noise smooth ────────
+    // ── compare_models ranks on the smoothing-corrected AIC (#1362, slop G2) ──
     //
-    // These tests pin the ranking contract directly on `compare_reml_fits` with
-    // controlled (score, edf, log_lik) inputs taken from the actual #1362
-    // reproduction (Rust `reml_score` of `y ~ s(x)` vs `y ~ s(x) + s(z)` at
-    // n=700). They do not need a fitted GAM or a Python wheel.
+    // These tests pin the ranking contract on `compare_models` with controlled
+    // inputs. They need no fitted GAM or Python wheel.
 
-    fn cand(name: &str, score: f64, edf: f64, log_lik: f64) -> RemlCandidate {
-        RemlCandidate {
-            index: 0,
+    fn cand(name: &str, reml: f64, aic_conditional: f64, aic_corrected: f64) -> ComparisonCandidate {
+        ComparisonCandidate {
             name: name.to_string(),
-            score: Some(score),
-            edf,
-            log_lik,
-            family: None,
-            n_obs: None,
+            family: "Gaussian Identity".to_string(),
+            n_obs: 200,
+            aic_corrected,
+            aic_conditional,
+            edf_corrected: 6.0,
+            edf_conditional: 5.0,
+            reml_score: Some(reml),
         }
     }
 
     #[test]
-    fn ranking_score_is_conditional_aic_when_loglik_and_edf_present() {
-        // AIC = -2ℓ + 2·edf.
-        let c = cand("m", /*score (ignored)*/ 999.0, 6.748, -32.0866);
-        let expected = -2.0 * -32.0866 + 2.0 * 6.748;
-        assert!((c.ranking_score().expect("finite AIC") - expected).abs() < 1e-9);
+    fn compare_models_ranks_on_corrected_not_conditional_aic() {
+        // The noise-augmented `big` has the lower REML score AND the lower
+        // conditional AIC — the two criteria that treat λ̂ as known. Its
+        // corrected AIC, which prices the EDF its smoothing-parameter
+        // uncertainty spends, is higher, so the winner must be `small`.
+        let small = cand("small", 180.5, 100.0, 101.0);
+        let big = cand("big", 177.4, 99.0, 103.0);
+        let cmp = compare_models(vec![big, small]).expect("compare");
+        assert_eq!(cmp.criterion, "aic_corrected");
+        assert_eq!(cmp.winner, "small");
+        assert_eq!(cmp.ranking[0].name, "small");
+        assert!((cmp.ranking[1].delta_aic - 2.0).abs() < 1e-12);
+        assert!((cmp.ranking[1].aic_conditional - 99.0).abs() < 1e-12);
+        // The REML table keeps its own ordering on its own labelled scale.
+        let big_row = cmp.score_table.iter().find(|r| r.name == "big").unwrap();
+        assert_eq!(big_row.delta_reml, Some(0.0));
     }
 
     #[test]
-    fn ranking_score_refuses_non_finite_log_likelihood_instead_of_using_reml() {
-        let c = RemlCandidate {
-            index: 0,
-            name: "m".to_string(),
-            score: Some(151.28),
-            edf: 6.0,
-            log_lik: f64::NAN,
-            family: None,
-            n_obs: None,
-        };
-        let error = c
-            .ranking_score()
-            .expect_err("raw REML must not replace a missing likelihood");
-        assert!(error.contains("requires finite log_likelihood"));
-        assert!(error.contains("not a substitute ranking estimand"));
+    fn ranking_evidence_ratio_is_akaike_evidence_ratio_not_its_square() {
+        // #2124: for an AIC gap Δ the winner-over-loser evidence ratio is
+        // `exp(½Δ)`, not `exp(Δ)`. The REML table stays `exp(Δreml)`.
+        let delta_aic = 27.68_f64;
+        let winner = cand("winner", 100.0, 0.0, 0.0);
+        let loser = cand("loser", 110.0, delta_aic, delta_aic);
+        let cmp = compare_models(vec![winner, loser]).expect("compare");
+        assert_eq!(cmp.winner, "winner");
+        let loser_row = cmp.ranking.iter().find(|r| r.name == "loser").unwrap();
+        assert!((loser_row.delta_aic - delta_aic).abs() < 1e-9);
+        let expected = (0.5 * delta_aic).exp();
+        assert!(loser_row
+            .evidence_ratio
+            .is_some_and(|ratio| (ratio / expected - 1.0).abs() < 1e-9));
+        let loser_score_row = cmp.score_table.iter().find(|r| r.name == "loser").unwrap();
+        assert!(
+            loser_score_row
+                .reml_criterion_ratio_best_over_model
+                .is_some_and(|factor| (factor / 10.0_f64.exp() - 1.0).abs() < 1e-9)
+        );
+        assert!(cmp.evidence_summary.contains("winner wins by evidence ratio 1e+6.0 over loser"));
+    }
+
+    #[test]
+    fn log_evidence_ratio_agrees_with_compare_models_and_is_antisymmetric() {
+        let a = cand("a", 100.0, 90.0, 92.0);
+        let b = cand("b", 101.0, 91.0, 97.0);
+        let cmp = compare_models(vec![a.clone(), b.clone()]).expect("compare");
+        let b_row = cmp.ranking.iter().find(|r| r.name == "b").unwrap();
+        let log_ratio = log_evidence_ratio(&a, &b).expect("comparable");
+        assert!((log_ratio - 0.5 * b_row.delta_aic).abs() < 1e-12);
+        assert!((log_evidence_ratio(&b, &a).unwrap() + log_ratio).abs() < 1e-12);
+        assert_eq!(log_evidence_ratio(&a, &a).unwrap(), 0.0);
     }
 
     #[test]
     fn compare_models_rejects_pure_noise_smooth_despite_lower_evidence() {
-        // Seed-3000 numbers from the #1362 Rust reproduction:
-        //   small (y ~ s(x)):      reml=180.526, edf=6.748,  loglik=-32.0866
-        //   big   (y ~ s(x)+s(z)): reml=177.404, edf=14.250, loglik=-32.1212
-        // The big (noise-augmented) model has the LOWER (apparently better) raw
-        // REML evidence, yet it spends ~7.5 extra EDF fitting noise without
-        // improving the likelihood. The winner must be the SMALL model.
-        let small = cand("small", 180.526, 6.748, -32.0866);
-        let big = cand("big", 177.404, 14.250, -32.1212);
-
-        // Sanity: raw evidence (the broken headline) prefers big.
-        assert!(big.score < small.score);
-
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "small",
-            "compare_models must Occam-penalise the pure-noise smooth and pick the smaller model"
-        );
-        // The score table still reports the raw evidence headline unchanged, so
-        // Model.evidence / evidence_ratio_vs stay consistent with the table.
-        let small_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "small")
-            .expect("small row");
-        let big_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "big")
-            .expect("big row");
-        assert!(small_row
-            .reml_score
-            .is_some_and(|score| (score - 180.526).abs() < 1e-9));
+        // Seed-3000 numbers from the #1362 reproduction. The noise-augmented
+        // `big` has the lower raw REML score but spends ~7.5 extra EDF without
+        // improving the likelihood; on the Gaussian scale-counted AICs
+        // (`−2ℓ + 2(edf + 1)`) the small model wins.
+        let small = cand("small", 180.526, 79.669, 81.2);
+        let big = cand("big", 177.404, 94.742, 97.9);
+        assert!(big.reml_score < small.reml_score);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "small");
+        let big_row = cmp.score_table.iter().find(|r| r.name == "big").unwrap();
         assert!(big_row
             .reml_score
             .is_some_and(|score| (score - 177.404).abs() < 1e-9));
     }
 
     #[test]
-    fn ranking_evidence_ratio_is_akaike_evidence_ratio_not_its_square() {
-        // Issue #2124: `ranking_score` is the conditional AIC (`−2ℓ + 2·edf`), a
-        // −2·log / deviance-scale cost. For an AIC gap Δ the Akaike evidence ratio
-        // (Burnham & Anderson) is `exp(−½Δ)`, so the winner-over-loser
-        // `evidence_ratio` must be `exp(½Δ)` — NOT `exp(Δ)`, which squares it.
-        //
-        // Winner: AIC 0 (loglik 0, edf 0). Loser: AIC = 27.68 (loglik −13.84,
-        // edf 0), matching the ΔAIC in the issue repro. Raw REML scores are set
-        // distinct (100 vs 110) to lock the scoping: the raw score_table path
-        // must stay `exp(Δreml)` with NO halving.
-        let delta_aic = 27.68_f64;
-        let winner = cand("winner", 100.0, 0.0, 0.0);
-        let loser = cand("loser", 110.0, 0.0, -delta_aic / 2.0);
-
-        let cmp = compare_reml_fits(vec![winner, loser]).expect("compare");
-        assert_eq!(cmp.winner, "winner");
-
-        let loser_row = cmp
-            .ranking
-            .iter()
-            .find(|r| r.name == "loser")
-            .expect("loser ranking row");
-
-        // The AIC gap FIELD stays on the AIC scale, unchanged (issue #2124).
-        assert!((loser_row.delta - delta_aic).abs() < 1e-9);
-
-        // The evidence ratio is the Akaike ratio exp(½·ΔAIC) = exp(13.84)
-        // ≈ 1.03e6 — NOT the squared exp(27.68) ≈ 1.05e12 the bug reported.
-        let expected = (0.5 * delta_aic).exp();
-        assert!(
-            (loser_row.evidence_ratio / expected - 1.0).abs() < 1e-9,
-            "ranking evidence_ratio {} should be exp(½ΔAIC)={}, not exp(ΔAIC)={}",
-            loser_row.evidence_ratio,
-            expected,
-            delta_aic.exp()
-        );
-        // Explicit anti-regression: it must not be the squared ratio.
-        assert!(loser_row.evidence_ratio < delta_aic.exp() * 0.5);
-
-        // Scoping lock (issue #2124): the RAW-REML score_table path is untouched —
-        // its best-over-model Bayes factor is `exp(Δreml)` with NO halving. Raw
-        // scores 100 (winner) vs 110 (loser) give Δreml = 10, so the loser's raw
-        // Bayes factor is exp(10), not exp(5).
-        let loser_score_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "loser")
-            .expect("loser score row");
-        let expected_reml_ratio = 10.0_f64.exp();
-        assert!(
-            loser_score_row
-                .reml_criterion_ratio_best_over_model
-                .is_some_and(|factor| (factor / expected_reml_ratio - 1.0).abs() < 1e-9),
-            "raw-REML reml_criterion_ratio_best_over_model must stay exp(Δreml)=exp(10), got {:?}",
-            loser_score_row.reml_criterion_ratio_best_over_model
-        );
-    }
-
-    #[test]
     fn compare_models_keeps_power_for_a_relevant_smooth() {
-        // Seed-3000 relevant-z numbers from the same reproduction:
-        //   small: reml=1025.067, edf≈6.75,  loglik≈-368.99 (aic≈751.5)
-        //   big:   reml=199.509,  edf≈14.25, loglik≈-33.16  (aic≈94.8)
-        // A genuinely relevant smooth lowers BOTH the evidence and the AIC, so
-        // the bigger model must still win — a fix cannot just always pick small.
-        let small = cand("small", 1025.067, 6.75, -368.985);
-        let big = cand("big", 199.509, 14.25, -33.165);
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "big",
-            "compare_models must retain power: the relevant smooth's model must win"
-        );
+        // Seed-3000 relevant-z numbers: a genuinely relevant smooth lowers the
+        // REML score and the AICs, so the bigger model must still win.
+        let small = cand("small", 1025.067, 753.47, 755.0);
+        let big = cand("big", 199.509, 96.83, 99.9);
+        let cmp = compare_models(vec![small, big]).expect("compare");
+        assert_eq!(cmp.winner, "big");
     }
 
     #[test]
     fn compare_models_rejects_mismatched_observation_counts() {
-        // Two same-family fits on different-sized data are not comparable by
-        // AIC / evidence; the comparison must fail loud, mirroring the family
-        // guard, rather than declare a sample-size-driven winner.
-        let with_n = |name: &str, n: usize| RemlCandidate {
-            index: 0,
-            name: name.to_string(),
-            score: Some(100.0),
-            edf: 5.0,
-            log_lik: -40.0,
-            family: Some("gaussian".to_string()),
-            n_obs: Some(n),
-        };
-        let err = compare_reml_fits(vec![with_n("big", 500), with_n("small", 100)])
+        let mut other_n = cand("big_n", 100.0, 50.0, 51.0);
+        other_n.n_obs = 500;
+        let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_n.clone()])
             .expect_err("cross-n comparison must be rejected");
-        assert!(
-            err.contains("number of observations") && err.contains("500") && err.contains("100"),
-            "n-guard error should name the incomparable counts, got: {err}"
-        );
+        assert!(err.contains("number of observations") && err.contains("500"));
+        assert!(log_evidence_ratio(&cand("a", 1.0, 1.0, 1.0), &other_n).is_err());
+    }
 
-        // Same n is comparable.
-        compare_reml_fits(vec![with_n("a", 250), with_n("b", 250)])
-            .expect("same-n comparison must succeed");
+    #[test]
+    fn compare_models_rejects_mismatched_family() {
+        let mut other_family = cand("pois", 100.0, 50.0, 51.0);
+        other_family.family = "Poisson Log".to_string();
+        let err = compare_models(vec![cand("a", 100.0, 50.0, 51.0), other_family])
+            .expect_err("cross-family comparison must be rejected");
+        assert!(err.contains("different response families"));
+    }
 
-        // A missing count (`None`) is unconstrained: it must not block a
-        // comparison against a fit that does carry one (legacy / scan payloads).
-        let without_n = RemlCandidate {
-            index: 0,
-            name: "legacy".to_string(),
-            score: Some(90.0),
-            edf: 4.0,
-            log_lik: -35.0,
-            family: Some("gaussian".to_string()),
-            n_obs: None,
-        };
-        compare_reml_fits(vec![with_n("counted", 500), without_n])
-            .expect("an unconstrained (None) count must not trip the guard");
+    #[test]
+    fn compare_models_refuses_non_finite_criterion() {
+        let err = compare_models(vec![cand("a", 100.0, 50.0, f64::NAN)])
+            .expect_err("a NaN corrected AIC cannot rank");
+        assert!(err.contains("non-finite aic_corrected"));
     }
 
     #[test]
     fn a_candidate_without_a_comparable_criterion_ranks_and_reports_none_2627() {
         // #2627: a fit without null-space metadata has no comparable REML/LAML
-        // criterion. It still ranks on conditional AIC, and its score-table row
-        // reports the absence instead of a raw number under the comparable name.
-        // The other rows keep their factors, referenced among themselves.
-        let mut scan = cand("scan", 0.0, 4.0, -40.0);
-        scan.score = None;
-        let standard = cand("standard", 120.0, 5.0, -38.0);
-        let other = cand("other", 125.0, 5.0, -39.0);
-        // Conditional AIC: scan 88, standard 86, other 88.
-        let cmp = compare_reml_fits(vec![scan, standard, other]).expect("compare");
+        // criterion. It still ranks on the corrected AIC, and its score-table
+        // row reports the absence. The other rows keep their factors,
+        // referenced among themselves.
+        let mut no_reml = cand("no_reml", 0.0, 86.0, 88.0);
+        no_reml.reml_score = None;
+        let standard = cand("standard", 120.0, 84.0, 86.0);
+        let other = cand("other", 125.0, 86.0, 88.0);
+        let cmp = compare_models(vec![no_reml, standard, other]).expect("compare");
         assert_eq!(cmp.winner, "standard");
-
-        let scan_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "scan")
-            .expect("scan row");
-        assert_eq!(scan_row.reml_score, None);
-        assert_eq!(scan_row.delta_reml, None);
-        assert_eq!(scan_row.reml_criterion_ratio_best_over_model, None);
-        let scan_ranked = cmp
-            .ranking
-            .iter()
-            .find(|r| r.name == "scan")
-            .expect("scan ranking row");
-        assert_eq!(scan_ranked.score, None);
-
-        let other_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "other")
-            .expect("other row");
+        let no_reml_row = cmp.score_table.iter().find(|r| r.name == "no_reml").unwrap();
+        assert_eq!(no_reml_row.reml_score, None);
+        assert_eq!(no_reml_row.delta_reml, None);
+        assert_eq!(no_reml_row.reml_criterion_ratio_best_over_model, None);
+        let other_row = cmp.score_table.iter().find(|r| r.name == "other").unwrap();
         assert!(other_row
             .delta_reml
             .is_some_and(|delta| (delta - 5.0).abs() < 1e-12));

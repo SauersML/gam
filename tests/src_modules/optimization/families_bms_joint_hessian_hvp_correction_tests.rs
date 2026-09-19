@@ -2421,6 +2421,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
     let marginal_cov: Array1<f64> = data.column(2).to_owned();
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {
@@ -2641,6 +2642,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // centers ⇒ fewer penalty components ⇒ less marginal/slope coupling.
     let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
+        level: Default::default(),
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
         smooth_terms: vec![SmoothTermSpec {

@@ -13,7 +13,7 @@ identified up to permutation and signed scaling of its components.
 
 The runner is:
 
->>> result = gamfit.identifiable_factor_fit(
+>>> result = gamfit.identifiability.identifiable_factor_fit(
 ...     X, aux=labels, n_supervised=3, n_free=3,
 ...     encoder="mlp[256, 256]",
 ... )
@@ -40,6 +40,7 @@ from typing import Any
 
 import numpy as np
 
+from ._api import conditional_prior_ivae, derive_ivae_aux_scale, mechanism_sparsity_jacobian
 from ._binding import rust_module
 
 __all__ = [
@@ -47,7 +48,10 @@ __all__ = [
     "IdentifiabilityTheoremResult",
     "IdentifiableFactorFitResult",
     "check",
+    "conditional_prior_ivae",
+    "derive_ivae_aux_scale",
     "identifiable_factor_fit",
+    "mechanism_sparsity_jacobian",
 ]
 
 

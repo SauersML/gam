@@ -36,6 +36,7 @@ References
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -43,14 +44,17 @@ from torch import nn
 
 from .._binding import rust_module
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
-def _np_f64(t: torch.Tensor) -> np.ndarray:
+
+def _np_f64(t: torch.Tensor) -> NDArray[np.float64]:
     """Detach to a contiguous numpy float64 array for the Rust bridge."""
 
     return np.ascontiguousarray(t.detach().cpu().to(torch.float64).numpy())
 
 
-def _from_np(values: np.ndarray, ref: torch.Tensor) -> torch.Tensor:
+def _from_np(values: NDArray[np.float64], ref: torch.Tensor) -> torch.Tensor:
     """Promote a numpy array back to a torch tensor matching ``ref``."""
 
     return torch.from_numpy(np.ascontiguousarray(values)).to(
@@ -69,7 +73,7 @@ class _PoincareTangentDecode(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: Any,
         atoms: torch.Tensor,
         gates: torch.Tensor,
         curvature: float,
@@ -99,7 +103,9 @@ class _PoincareTangentDecode(torch.autograd.Function):
         return _from_np(x_hat_np, atoms)
 
     @staticmethod
-    def backward(ctx, grad_x_hat: torch.Tensor):
+    def backward(
+        ctx: Any, grad_x_hat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         rust = rust_module()
         atoms_p, gates, v, tangents, proj_scale = ctx.saved_tensors
         grad_np = _np_f64(grad_x_hat)
@@ -138,7 +144,7 @@ class _PoincareLorentzDecode(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: Any,
         atoms: torch.Tensor,
         gates: torch.Tensor,
         curvature: float,
@@ -170,7 +176,9 @@ class _PoincareLorentzDecode(torch.autograd.Function):
         return _from_np(x_hat_np, atoms)
 
     @staticmethod
-    def backward(ctx, grad_x_hat: torch.Tensor):
+    def backward(
+        ctx: Any, grad_x_hat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, None]:
         rust = rust_module()
         atoms_p, gates, v, tangents, proj_scale = ctx.saved_tensors
         grad_np = _np_f64(grad_x_hat)
@@ -329,15 +337,15 @@ class PoincareAtoms(nn.Module):
             return torch.as_tensor(d_scalar, dtype=a.dtype, device=a.device)
         a_flat = a.reshape(-1, a.shape[-1]).detach().cpu().to(torch.float64).numpy()
         b_flat = b.reshape(-1, b.shape[-1]).detach().cpu().to(torch.float64).numpy()
-        out = np.empty(a_flat.shape[0], dtype=np.float64)
+        flat_dists = np.empty(a_flat.shape[0], dtype=np.float64)
         for i in range(a_flat.shape[0]):
-            out[i] = rust.poincare_distance(
+            flat_dists[i] = rust.poincare_distance(
                 np.ascontiguousarray(a_flat[i]),
                 np.ascontiguousarray(b_flat[i]),
                 self.curvature,
             )
-        out = out.reshape(a.shape[:-1])
-        return torch.from_numpy(out).to(dtype=a.dtype, device=a.device)
+        dists = flat_dists.reshape(a.shape[:-1])
+        return torch.from_numpy(dists).to(dtype=a.dtype, device=a.device)
 
     # ------------------------------------------------------------------ forward
 
@@ -358,7 +366,7 @@ class PoincareAtoms(nn.Module):
             collapsed = False
 
         op = _PoincareLorentzDecode if self.lorentz else _PoincareTangentDecode
-        x2 = op.apply(self.atoms, z2, self.curvature)
+        x2: torch.Tensor = op.apply(self.atoms, z2, self.curvature)
         if collapsed:
             return x2.squeeze(0)
         return x2.reshape(*lead_shape, self.ball_dim)

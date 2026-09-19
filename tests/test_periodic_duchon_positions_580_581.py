@@ -50,7 +50,7 @@ def _circle_truth(n: int = 600, embed_dim: int = 16, seed: int = 1):
 def _min_penalty_eig(period: float | None) -> float:
     """Smallest eigenvalue of the periodic Duchon function-norm penalty."""
     centers = np.linspace(0.0, 1.0, 16, endpoint=False).reshape(-1, 1)
-    penalty = gamfit.duchon_function_norm_penalty(
+    penalty = gamfit.basis.duchon_function_norm_penalty(
         centers, m=2, periodic_per_axis=(True,), period=period
     )
     penalty = np.asarray(penalty, dtype=float)
@@ -72,7 +72,7 @@ def test_periodic_duchon_penalty_is_psd(period: float | None) -> None:
     # Scale-relative tolerance: the penalty's largest eigenvalue sets the scale.
     centers = np.linspace(0.0, 1.0, 16, endpoint=False).reshape(-1, 1)
     penalty = np.asarray(
-        gamfit.duchon_function_norm_penalty(
+        gamfit.basis.duchon_function_norm_penalty(
             centers, m=2, periodic_per_axis=(True,), period=period
         ),
         dtype=float,
@@ -94,7 +94,7 @@ def test_periodic_duchon_fit_positions_runs_and_is_psd(period: float | None) -> 
     a finite REML optimum, and report a PSD penalty spectrum in its cache.
     """
     t, y = _circle_truth()
-    out = gamfit.gaussian_reml_fit_positions(
+    out = gamfit.reml.gaussian_reml_fit_positions(
         t, y, basis_kind="duchon", basis_order=2, periodic=True, period=period
     )
     assert out.get("status") == "ok", f"fit did not converge for period={period}: {out.get('status')}"
@@ -117,7 +117,7 @@ def test_periodic_duchon_recovers_periodic_truth(period: float | None) -> None:
     that the solver does not crash.
     """
     t, y = _circle_truth(n=600, embed_dim=16, seed=3)
-    out = gamfit.gaussian_reml_fit_positions(
+    out = gamfit.reml.gaussian_reml_fit_positions(
         t, y, basis_kind="duchon", basis_order=2, periodic=True, period=period
     )
     assert out.get("status") == "ok"
@@ -139,10 +139,10 @@ def test_periodic_bspline_position_count_matches_cyclic_penalty() -> None:
     rng = np.random.default_rng(0)
     t = np.linspace(0.0, 1.0, 40, endpoint=False)
     y = np.cos(2.0 * np.pi * t)[:, None] + 0.05 * rng.standard_normal((t.size, 1))
-    _, helper_penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
+    _, helper_penalty = gamfit.basis.periodic_spline_curve_basis(t, n_knots=12, degree=3)
 
     for penalty in (None, helper_penalty):
-        out = gamfit.gaussian_reml_fit_positions(
+        out = gamfit.reml.gaussian_reml_fit_positions(
             t,
             y,
             knots_or_centers=12,
@@ -177,10 +177,10 @@ def test_periodic_bspline_position_fit_recovers_truth_issue_878() -> None:
     y = truth + 0.05 * rng.standard_normal(t.size)
 
     for k in (8, 12, 16):
-        _, helper_penalty = gamfit.periodic_spline_curve_basis(t, n_knots=k, degree=3)
+        _, helper_penalty = gamfit.basis.periodic_spline_curve_basis(t, n_knots=k, degree=3)
         assert np.asarray(helper_penalty).shape == (k, k)
         for penalty, name in ((None, "auto"), (np.asarray(helper_penalty), "explicit")):
-            out = gamfit.gaussian_reml_fit_positions(
+            out = gamfit.reml.gaussian_reml_fit_positions(
                 t,
                 y,
                 knots_or_centers=k,
@@ -214,7 +214,7 @@ def test_periodic_bspline_position_fit_default_count_issue_878() -> None:
     t = np.sort(rng.uniform(0.0, 1.0, 50))
     y = np.cos(2.0 * np.pi * t) + 0.05 * rng.standard_normal(t.size)
 
-    out = gamfit.gaussian_reml_fit_positions(t, y, periodic=True, period=1.0)
+    out = gamfit.reml.gaussian_reml_fit_positions(t, y, periodic=True, period=1.0)
     assert out.get("status") == "ok"
     penalty = np.asarray(out["penalty"])
     coeffs = np.asarray(out["coefficients"])
@@ -240,7 +240,7 @@ def test_periodic_duchon_fit_wraps_at_seam() -> None:
     centers = np.linspace(0.0, 1.0, 16, endpoint=False)
     # `duchon_basis` derives the wrap from the center span; match the fit to it.
     period = float(centers.max() - centers.min())
-    out = gamfit.gaussian_reml_fit_positions(
+    out = gamfit.reml.gaussian_reml_fit_positions(
         t, y, "duchon", centers, basis_order=2, periodic=True, period=period
     )
     assert out.get("status") == "ok"
@@ -248,7 +248,7 @@ def test_periodic_duchon_fit_wraps_at_seam() -> None:
     left = centers.min()
     probes = np.array([left + 1e-6, left + period - 1e-6])
     design = np.asarray(
-        gamfit.duchon_basis(probes, centers, m=2, periodic_per_axis=(True,)),
+        gamfit.basis.duchon_basis(probes, centers, m=2, periodic_per_axis=(True,)),
         dtype=float,
     )
     pred = design @ coeffs
@@ -314,7 +314,7 @@ def test_batched_positions_accepts_torch_row_offsets() -> None:
     t = torch.tensor(t_np)
     y = torch.tensor(y_np)
 
-    ref = gamfit.gaussian_reml_fit_positions_batched(
+    ref = gamfit.reml.gaussian_reml_fit_positions_batched(
         t, y, np.array([0, n, 2 * n], dtype=np.uintp), basis_kind="duchon", basis_order=2
     )
     for row_offsets in (
@@ -322,7 +322,7 @@ def test_batched_positions_accepts_torch_row_offsets() -> None:
         np.array([0, n, 2 * n], dtype=np.int64),
         [0, n, 2 * n],
     ):
-        out = gamfit.gaussian_reml_fit_positions_batched(
+        out = gamfit.reml.gaussian_reml_fit_positions_batched(
             t, y, row_offsets, basis_kind="duchon", basis_order=2
         )
         assert np.asarray(out["fitted"]).shape == (2 * n, 1)
@@ -341,6 +341,6 @@ def test_batched_positions_rejects_fractional_row_offsets() -> None:
     # Integral floats such as 150.0 are accepted by design (gam#581), so the
     # middle offset must carry a genuine fractional part to be refused.
     with pytest.raises(TypeError, match="integer-valued"):
-        gamfit.gaussian_reml_fit_positions_batched(
+        gamfit.reml.gaussian_reml_fit_positions_batched(
             t, y, np.array([0.0, 1.5 * n + 0.5, 2.0 * n]), basis_kind="duchon", basis_order=2
         )

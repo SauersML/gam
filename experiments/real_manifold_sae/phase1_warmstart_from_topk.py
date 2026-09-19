@@ -94,7 +94,7 @@ def main() -> None:
     for label, kwargs in (("cold", {}), ("warm", {"a_init": a_init})):
         t0 = time.time()
         try:
-            m = gamfit.sae_manifold_fit(
+            m = gamfit.sae.sae_manifold_fit(
                 z, K=k, d_atom=1, atom_topology="circle", top_k=3,
                 n_iter=args.n_iter, random_state=0, **kwargs,
             )

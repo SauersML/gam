@@ -6,20 +6,28 @@ build-backend = "maturin"
 name = "gamfit"
 version = "0.1.268"
 description = "Formula-first generalized additive models with a high-performance Rust core"
-readme = "README_PYPI.md"
+readme = { file = "README_PYPI.md", content-type = "text/markdown" }
+# The floor and every classifier version below are installed from the built
+# wheels by scripts/wheel_smoke.py (pypi-wheels.yml, wheel-nightly.yml), which
+# derives its Python matrix from these classifiers and refuses a floor that
+# disagrees with this line. The extension is abi3-py310 (crates/gam-pyffi).
 requires-python = ">=3.10"
+# SPDX expression (PEP 639). License :: classifiers are deliberately absent:
+# PEP 639 forbids combining them with a license expression.
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "SauersML" }]
 keywords = [
   "gam",
-  "gamfit",
   "generalized-additive-models",
-  "regression",
+  "additive-models",
+  "penalized-splines",
   "smoothing-splines",
   "thin-plate-spline",
   "reml",
+  "survival-analysis",
   "statistics",
+  "regression",
   "machine-learning",
   "rust",
 ]
@@ -35,32 +43,31 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Scientific/Engineering :: Information Analysis",
   "Topic :: Scientific/Engineering :: Mathematics",
   "Typing :: Typed",
 ]
+# numpy is the only runtime requirement: the wrapper hands numpy arrays to the
+# Rust extension and returns them. Its lower bound is a tested claim, not a
+# guess: the wheel smoke test's floor lane installs the oldest numpy this
+# range admits on the requires-python floor (uv --resolution lowest).
 dependencies = [
   "numpy>=1.26",
 ]
 
 [project.urls]
 Homepage = "https://github.com/SauersML/gam"
-Repository = "https://github.com/SauersML/gam"
+Documentation = "https://gamfit.readthedocs.io/"
+Source = "https://github.com/SauersML/gam"
 Issues = "https://github.com/SauersML/gam/issues"
 Changelog = "https://gamfit.readthedocs.io/en/latest/changelog/"
 
 [project.optional-dependencies]
-test = [
-  "pytest>=8",
-  "numpy>=1.26",
-  "pandas>=2.0",
-  "pyarrow>=14",
-  "matplotlib>=3.8",
-  "scikit-learn>=1.4",
-]
 cuda = [
   "nvidia-cublas-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
   "nvidia-cuda-nvrtc-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
@@ -69,16 +76,37 @@ cuda = [
   "nvidia-cusparse-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
   "nvidia-nvjitlink-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
-pandas = ["pandas>=2.0", "pyarrow>=14"]
+pandas = ["pandas>=2.0"]
 plot = ["matplotlib>=3.8"]
-sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
+sklearn = ["scikit-learn>=1.4"]
+all = [
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+]
+
+# Contributor tooling (PEP 735): resolved by `uv sync --group ...`, never
+# published as installable extras of the user-facing package.
+[dependency-groups]
+test = [
+  "pytest>=8",
+  "mypy>=2.3",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "polars>=1",
+  "matplotlib>=3.8",
+  "scikit-learn>=1.4",
+]
 type = [
-  "mypy>=1.18",
-  "numpy>=1.26",
+  "mypy>=2.3",
   "pandas>=2.0",
   "pandas-stubs",
   "pyarrow>=14",
+  "pyarrow-stubs",
   "polars>=1",
+  "jax>=0.4",
+  "safetensors",
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
   "scikit-learn-stubs",
@@ -86,13 +114,6 @@ type = [
   "pytest>=8",
   "types-requests",
   "vulture>=2.16",
-]
-all = [
-  "numpy>=1.26",
-  "pandas>=2.0",
-  "pyarrow>=14",
-  "matplotlib>=3.8",
-  "scikit-learn>=1.4",
 ]
 
 [tool.maturin]
@@ -114,6 +135,7 @@ testpaths = ["tests"]
 # ordinary failures: SPEC.md forbids XFAIL/XPASS masking.
 markers = [
   "slow: test is too slow for the default CI Python-API job (run explicitly or locally)",
+  "static_typing: mypy --strict over gamfit; needs the `type` dependency group plus torch",
 ]
 
 [tool.mypy]
