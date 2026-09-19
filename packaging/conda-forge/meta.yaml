@@ -1,0 +1,66 @@
+# Draft conda-forge recipe (RELEASING.md). Not submitted: a maintainer copies it
+# into a conda-forge/staged-recipes pull request once a release built with the
+# sdist excludes is on PyPI, setting the version and that sdist's sha256.
+{% set name = "gamfit" %}
+{% set version = "0.1.268" %}
+
+package:
+  name: {{ name }}
+  version: {{ version }}
+
+source:
+  url: https://pypi.org/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  # sha256 of the PyPI sdist, from https://pypi.org/project/gamfit/#files
+  sha256: FILL_IN_FROM_PYPI
+
+build:
+  number: 0
+  # requires-python in pyproject.toml.
+  skip: true  # [py<310]
+  script:
+    # conda-forge ships the licenses of every statically linked crate.
+    - cargo-bundle-licenses --format yaml --output THIRDPARTY.yml
+    # pyproject.toml sets `locked = true`: the sdist's Cargo.lock is used as is.
+    - {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ stdlib('c') }}
+    # At least the toolchain rust-toolchain.toml pins in the sdist.
+    - {{ compiler('rust') }}
+    - cargo-bundle-licenses
+    - python                                 # [build_platform != target_platform]
+    - cross-python_{{ target_platform }}     # [build_platform != target_platform]
+    - maturin >=1.7,<2                       # [build_platform != target_platform]
+  host:
+    - python
+    - pip
+    - maturin >=1.7,<2
+  run:
+    - python
+    - numpy >=1.26
+
+test:
+  requires:
+    - pip
+  imports:
+    - gamfit
+  # run_test.py beside this recipe fits and predicts with the installed package.
+  commands:
+    - pip check
+
+about:
+  home: https://github.com/SauersML/gam
+  summary: Formula-first generalized additive models with a high-performance Rust core
+  license: AGPL-3.0-or-later
+  license_file:
+    - LICENSE
+    - THIRDPARTY.yml
+  doc_url: https://gamfit.readthedocs.io/
+  dev_url: https://github.com/SauersML/gam
+
+extra:
+  # GitHub users (an organization cannot maintain a feedstock), set at submission.
+  recipe-maintainers:
+    - FILL_IN_GITHUB_USER

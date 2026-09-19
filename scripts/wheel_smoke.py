@@ -9,11 +9,13 @@ on its platform all pass ``maturin build`` and fail on a user's first
 pyGAM audit):
 
 ``run``
-    Create an empty virtualenv beside no checkout, install exactly one wheel
-    plus the runtime requirements its own metadata declares (binaries only),
-    and re-execute this file in ``check`` mode inside that venv under ``-I``
-    from a scratch directory, so neither the working tree nor ``PYTHONPATH``
-    nor user site-packages can stand in for the installed package.
+    Create an empty virtualenv beside no checkout, install the one wheel of
+    the family built for its interpreter (the abi3 wheel on a GIL build, the
+    interpreter's own ``cp3XYt`` wheel on a free-threaded one) plus the runtime
+    requirements its own metadata declares (binaries only), and re-execute this
+    file in ``check`` mode inside that venv under ``-I`` from a scratch
+    directory, so neither the working tree nor ``PYTHONPATH`` nor user
+    site-packages can stand in for the installed package.
 
     ``--resolution lowest`` installs the declared lower bound of every runtime
     requirement that has a binary for the interpreter, which is what makes the
@@ -23,13 +25,22 @@ pyGAM audit):
     Runs inside the fresh venv: the environment holds exactly gamfit and its
     declared requirement closure, the wheel carries only the package's own
     sources, typing marker and compiled extension, and a small gaussian and
-    binomial fit, predict, summary and save/load round-trip all work.
+    binomial fit, predict, summary and save/load round-trip all work. On a
+    free-threaded interpreter the GIL must still be off after the import: an
+    extension that does not declare free-threading support re-enables it.
 
 ``matrix``
     Print the GitHub Actions job matrix for the wheel families a workflow
     built. The Python versions come from the trove classifiers in
     pyproject.toml, so the versions the package advertises and the versions
     CI installs it on cannot drift apart.
+
+``interpreters``
+    Print the interpreters maturin builds wheels for, from the same
+    classifiers: the requires-python floor for the abi3 wheel, then one
+    free-threaded interpreter per advertised version that has one, because
+    the stable ABI does not exist for free-threaded builds and each needs its
+    own version-specific wheel.
 """
 
 from __future__ import annotations
@@ -72,6 +83,10 @@ SCOPES: dict[str, tuple[str, ...]] = {
 REFERENCE_FAMILY = "linux-x86_64"
 
 _CLASSIFIER = re.compile(r"^Programming Language :: Python :: (3\.\d+)$")
+_FREE_THREADING = re.compile(r"^Programming Language :: Python :: Free Threading :: ")
+
+# CPython's free-threaded build (PEP 703) exists from this version on.
+FREE_THREADED_SINCE = "3.13"
 
 
 # ---------------------------------------------------------------------- matrix
@@ -94,6 +109,23 @@ def classifier_python_versions(project: dict) -> list[str]:
         if (match := _CLASSIFIER.match(classifier))
     ]
     return sorted(found, key=_version_key)
+
+
+def free_threaded_python_versions(project: dict) -> list[str]:
+    """The free-threaded interpreters (``3.13t`` ...) the package advertises, oldest first.
+
+    A Free Threading classifier claims support on every advertised version
+    that has a free-threaded build; without one there are none.
+    """
+    if not any(_FREE_THREADING.match(classifier) for classifier in project["classifiers"]):
+        return []
+    since = _version_key(FREE_THREADED_SINCE)
+    return [f"{v}t" for v in classifier_python_versions(project) if _version_key(v) >= since]
+
+
+def build_interpreters(project: dict) -> list[str]:
+    """The interpreters maturin builds for: abi3 on the floor, then each free-threaded one."""
+    return [requires_python_floor(project), *free_threaded_python_versions(project)]
 
 
 def requires_python_floor(project: dict) -> str:
@@ -128,6 +160,21 @@ def build_matrix(families: list[str], project: dict) -> dict[str, list[dict[str,
                     # The floor interpreter gets the lowest declared requirement
                     # versions; every other lane gets the newest.
                     "resolution": "lowest" if python == floor else "highest",
+                    "free_threaded": False,
+                }
+            )
+        # Each free-threaded wheel is its own binary, so every one runs on
+        # every family. The requirement floor is the floor lane's to test (it
+        # predates free-threaded wheels: numpy 1.26 has none).
+        for python in free_threaded_python_versions(project):
+            include.append(
+                {
+                    "family": family,
+                    "runner": FAMILIES[family]["runner"],
+                    "musl": FAMILIES[family]["musl"],
+                    "python": python,
+                    "resolution": "highest",
+                    "free_threaded": True,
                 }
             )
     return {"include": include}
@@ -176,6 +223,20 @@ def requirement_closure(root: str, requires_of) -> set[str]:
     return seen
 
 
+def wheel_for(wheels: list[pathlib.Path], python_tag: str, free_threaded: bool) -> pathlib.Path:
+    """The one wheel of a family an interpreter installs.
+
+    A GIL interpreter takes the abi3 wheel; a free-threaded one takes the
+    wheel built for its own ABI (``cp313t``), which a GIL build cannot load.
+    """
+    abi = f"{python_tag}t" if free_threaded else "abi3"
+    # name-version[-build]-python-abi-platform.whl
+    matches = [wheel for wheel in wheels if wheel.name.removesuffix(".whl").split("-")[-2] == abi]
+    if len(matches) != 1:
+        raise SystemExit(f"expected exactly one {abi} gamfit wheel among {[w.name for w in wheels]}")
+    return matches[0]
+
+
 def stray_wheel_files(paths: list[str], dist_info: str, extension_suffixes: list[str]) -> list[str]:
     """Files the installed wheel carries that are not part of the package.
 
@@ -203,6 +264,12 @@ def stray_wheel_files(paths: list[str], dist_info: str, extension_suffixes: list
 
 
 # ------------------------------------------------------------------------ check
+def _gil_enabled() -> bool:
+    if sys.version_info >= (3, 13):
+        return sys._is_gil_enabled()
+    return True
+
+
 def check() -> None:
     import importlib.machinery
     from importlib import metadata
@@ -232,9 +299,19 @@ def check() -> None:
     if "gamfit/py.typed" not in files:
         raise SystemExit("wheel is missing the PEP 561 gamfit/py.typed marker")
 
+    import sysconfig
+
+    free_threaded = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
     import numpy as np
 
+    if free_threaded and _gil_enabled():
+        raise SystemExit(f"importing numpy {np.__version__} re-enabled the GIL")
+
     import gamfit
+
+    if free_threaded and _gil_enabled():
+        raise SystemExit("importing gamfit re-enabled the GIL: its extension does not declare free-threading support")
 
     site = pathlib.Path(sys.prefix).resolve()
     package = pathlib.Path(gamfit.__file__).resolve()
@@ -269,29 +346,38 @@ def check() -> None:
     if prob.shape != (7,) or not np.all((prob > 0.0) & (prob < 1.0)):
         raise SystemExit(f"binomial predict returned {prob!r}")
 
+    build = "free-threaded" if free_threaded else "GIL"
     print(
-        f"gamfit {gamfit.__version__} OK on Python {sys.version.split()[0]} "
+        f"gamfit {gamfit.__version__} OK on {build} Python {sys.version.split()[0]} "
         f"({sys.platform}) with numpy {np.__version__}; installed: {sorted(installed)}"
     )
 
 
 # -------------------------------------------------------------------------- run
-def run(wheel_dir: pathlib.Path, resolution: str) -> None:
-    wheels = sorted(wheel_dir.glob("gamfit-*.whl"))
-    if len(wheels) != 1:
-        raise SystemExit(f"expected exactly one gamfit wheel in {wheel_dir}, found {wheels}")
-    wheel = wheels[0].resolve()
+def run(wheel_dir: pathlib.Path, resolution: str, interpreter: str) -> None:
+    wheels = sorted(path.resolve() for path in wheel_dir.glob("gamfit-*.whl"))
     uv = [sys.executable, "-m", "uv"]
-    # uv must use this interpreter and PyPI only: no managed-Python download,
-    # no uv.toml or pyproject picked up from wherever the job happens to be.
+    # uv must use the interpreter under test and PyPI only: no managed-Python
+    # download, no uv.toml or pyproject picked up from wherever the job
+    # happens to be, and no PYTHON_GIL override of a free-threaded build.
     env = {**os.environ, "UV_PYTHON_DOWNLOADS": "never", "UV_NO_CONFIG": "1"}
-    env.pop("PYTHONPATH", None)
-    env.pop("VIRTUAL_ENV", None)
+    for name in ("PYTHONPATH", "VIRTUAL_ENV", "PYTHON_GIL"):
+        env.pop(name, None)
     with tempfile.TemporaryDirectory(prefix="gamfit-wheel-smoke-") as scratch:
         scratch_path = pathlib.Path(scratch)
         venv = scratch_path / "venv"
-        subprocess.run([*uv, "venv", "--python", sys.executable, str(venv)], check=True, env=env, cwd=scratch)
+        subprocess.run([*uv, "venv", "--python", interpreter, str(venv)], check=True, env=env, cwd=scratch)
         python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        probe = subprocess.run(
+            [
+                str(python), "-I", "-c",
+                "import sys, sysconfig; "
+                "print(f'cp{sys.version_info[0]}{sys.version_info[1]}', bool(sysconfig.get_config_var('Py_GIL_DISABLED')))",
+            ],
+            check=True, env=env, cwd=scratch, capture_output=True, text=True,
+        )
+        python_tag, free_threaded = probe.stdout.split()
+        wheel = wheel_for(wheels, python_tag, free_threaded == "True")
         subprocess.run(
             [
                 *uv, "pip", "install",
@@ -317,20 +403,28 @@ def main(argv: list[str] | None = None) -> None:
     run_parser = sub.add_parser("run", help="install one wheel into a fresh venv and check it")
     run_parser.add_argument("--wheel-dir", type=pathlib.Path, required=True)
     run_parser.add_argument("--resolution", choices=("lowest", "highest"), required=True)
+    run_parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="interpreter the venv is built on (a version uv can find, or a path); default: this one",
+    )
     sub.add_parser("check", help="(inside the fresh venv) verify the installed wheel")
     matrix_parser = sub.add_parser("matrix", help="print the smoke-test job matrix as JSON")
     selector = matrix_parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--scope", choices=sorted(SCOPES))
     selector.add_argument("--families", nargs="+", choices=sorted(FAMILIES))
+    sub.add_parser("interpreters", help="print the Python versions maturin builds wheels for")
     args = parser.parse_args(argv)
 
     if args.command == "run":
-        run(args.wheel_dir, args.resolution)
+        run(args.wheel_dir, args.resolution, args.python)
     elif args.command == "check":
         check()
+    elif args.command == "interpreters":
+        print(" ".join(build_interpreters(_pyproject()["project"])))
     else:
         families = list(SCOPES[args.scope]) if args.scope else args.families
-        print(json.dumps(build_matrix(families, _pyproject()), separators=(",", ":")))
+        print(json.dumps(build_matrix(families, _pyproject()["project"]), separators=(",", ":")))
 
 
 if __name__ == "__main__":
