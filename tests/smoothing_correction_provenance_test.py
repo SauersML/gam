@@ -143,17 +143,6 @@ BLOCK_CORRECTION_FOLDS = {"haberman_k20_fold0", "nearsep_n200_fold0"}
 # correction is exact (and zero): there is nothing for a cubature to integrate.
 NO_IDENTIFIED_DIRECTION = {"hepatitis_monotone_decreasing"}
 CUBATURE_FOLDS = sorted(set(FIXTURES) - BLOCK_CORRECTION_FOLDS - NO_IDENTIFIED_DIRECTION)
-# Folds whose Laplace Gaussian puts under 1/M of its mass inside the rho domain
-# (an identified but nearly flat direction): the truncated proposal cannot
-# supply M draws within M^2 and says so (#3010).
-PROPOSAL_OUTSIDE_SUPPORT = {
-    "mc_pois_rep0",
-    "cake_fold0",
-    "cake_fold3",
-    "haberman_k20_fold2",
-    "haberman_k20_fold4",
-}
-OUTSIDE_SUPPORT_REASON = "of its mass inside the rho domain"
 
 
 @pytest.mark.parametrize("name", CUBATURE_FOLDS)
@@ -189,10 +178,9 @@ def test_rho_posterior_khat_is_published(name):
         assert conv["rho_posterior_khat"] is None
         assert nonempty(conv["rho_posterior_reason"])
         return
-    if name in PROPOSAL_OUTSIDE_SUPPORT and status == "refused":
-        assert conv["rho_posterior_khat"] is None
-        assert OUTSIDE_SUPPORT_REASON in conv["rho_posterior_reason"], conv
-        return
+    # The proposal is never truncated to the rho box: a draw past a saturated
+    # face is valued by the criterion's affine continuation, so every other fold
+    # grades a k-hat rather than refusing for lack of in-box mass.
     assert status == "assessed", conv
     khat = conv["rho_posterior_khat"]
     assert isinstance(khat, float) and math.isfinite(khat)

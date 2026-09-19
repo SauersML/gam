@@ -3656,7 +3656,7 @@ impl FitConvergenceEvidence {
             evidence.push_str(&format!(
                 "; constrained residual={residual:.6e} decided by {deciding} \
                  (primal={:.6e} dual={:.6e} complementarity={:.6e} stationarity={:.6e}) \
-                 active={}/{} rank_deficient={} gradient_inf={:.6e} \
+                 active={}/{} rank_deficient={} gradient_scale={:.6e} \
                  relative={:.6e} vs tol={tolerance_text}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
@@ -6291,8 +6291,10 @@ impl UnifiedFitResult {
             // model into the `(Binomial, _)` "unsupported combination" error at
             // predict time, breaking the fit→predict round-trip. The
             // state-bearing links (SAS/BetaLogistic/Mixture/LatentCLogLog) are
-            // handled by the arms below; the identity/log standard links are not
-            // legal binomial cells and correctly fall to the catch-all.
+            // handled by the arms below. The log link is the state-less
+            // relative-risk cell (a generic variance × link cell with the
+            // feasibility set η < 0); the identity link is not a legal
+            // binomial cell and correctly falls to the catch-all.
             (
                 ResponseFamily::Binomial,
                 InverseLink::Standard(
@@ -6300,7 +6302,8 @@ impl UnifiedFitResult {
                     | StandardLink::Probit
                     | StandardLink::CLogLog
                     | StandardLink::LogLog
-                    | StandardLink::Cauchit,
+                    | StandardLink::Cauchit
+                    | StandardLink::Log,
                 ),
             ) => Ok(FittedLinkState::Standard(None)),
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {

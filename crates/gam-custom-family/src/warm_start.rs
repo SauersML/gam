@@ -21,7 +21,6 @@ pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> Ca
         converged: result.converged,
         block_logdet_h: result.block_logdet_h,
         block_logdet_s: result.block_logdet_s,
-        joint_workspace: result.joint_workspace.clone(),
         kkt_residual: result.kkt_residual.clone(),
         active_constraints: result.active_constraints.clone(),
         terminal_working_sets: result.terminal_working_sets.clone(),

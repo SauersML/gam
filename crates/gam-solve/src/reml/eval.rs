@@ -1089,15 +1089,16 @@ impl<'a> RemlState<'a> {
     ///
     /// [`Escalate`]: gam_problem::rho_posterior::RhoProposalAdequacy::Escalate
     ///
-    /// `rho_domain` is the box the outer arm searched and certified against
-    /// (the #2812 resolvability domain). It is the support of `π(ρ|y)`, so the
-    /// Tier-0 proposal is the plug-in Gaussian truncated to it (#3010): a draw
-    /// outside it is not a model, it is rejected before the inner solve, and
-    /// the truncation's normalizer cancels in the self-normalized weights. A
-    /// domain holding under `1/M` of the Gaussian is refused with
-    /// `ProposalOutsideSupport` rather than graded. A railed coordinate's Laplace
-    /// proposal is near-flat, so without this its draws land hundreds of
-    /// log-units past the face, where P-IRLS has no valid minimum to report.
+    /// `continuation` carries the box the outer arm searched and certified
+    /// against (the #2812 resolvability domain). That box is a numerical device,
+    /// not the support of `π(ρ|y)`: a draw outside it is still a model, the one
+    /// its saturated terms' limit fits give, and carries its mass. Such a draw
+    /// is valued by the criterion's affine continuation from the face
+    /// ([`CriterionContinuation`]), so the inner solve is only ever asked for
+    /// `ρ` inside the box, where P-IRLS has a resolvable minimum to report. A
+    /// draw past a literal face, or one the criterion cannot value, refuses the
+    /// diagnostic (or fails the escalation tier) with its reason; no draw is
+    /// dropped.
     ///
     /// `rho_proposal_axes` is the plug-in Gaussian the fit reports: the
     /// directions its certified `V_ρ` gives variance, railed coordinates
@@ -1106,13 +1107,15 @@ impl<'a> RemlState<'a> {
     /// `ρ = ρ̂ + Σ_j t_j a_j` with `t_j ~ N(0, v_j)`, so they grade the object
     /// the fit publishes. The raw outer Hessian instead keeps every direction
     /// the certificate declined to identify — a saturated or railed `λ` whose
-    /// curvature is at roundoff — and its Laplace proposal throws every draw
-    /// orders of magnitude past the box, where the grade has nothing to read.
-    /// The escalation's nodes, draws and moments are mapped back to `ρ`.
+    /// curvature is at roundoff — so its Laplace proposal grades a Gaussian
+    /// the fit never reports. The escalation's nodes, draws and moments are
+    /// mapped back to `ρ`.
+    ///
+    /// [`CriterionContinuation`]: crate::estimate::rho_domain::CriterionContinuation
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
-        rho_domain: &(Array1<f64>, Array1<f64>),
+        continuation: &crate::estimate::rho_domain::CriterionContinuation,
         rho_proposal_axes: Option<&[RhoProposalAxis]>,
         allow_escalation: bool,
         n_samples: Option<usize>,
@@ -1184,20 +1187,21 @@ impl<'a> RemlState<'a> {
             Some(basis) => basis.t().dot(&gradient),
             None => gradient,
         };
-        let in_domain = |rho: &Array1<f64>| {
-            rho.iter().enumerate().all(|(k, &value)| {
-                rho_domain.0.get(k).is_none_or(|&lower| value >= lower)
-                    && rho_domain.1.get(k).is_none_or(|&upper| value <= upper)
-            })
+        let cost = |rho: &Array1<f64>| {
+            self.without_persistent_warm_start_store(|| self.compute_cost(rho))
+                .map_err(|error| error.to_string())
+        };
+        // NUTS leapfrog gradients need the criterion value and gradient at the
+        // same rho; compute them through one value+gradient outer evaluation so
+        // the inner PIRLS solve and IFT state are shared by construction.
+        let cost_and_gradient = |rho: &Array1<f64>| {
+            self.without_persistent_warm_start_store(|| self.compute_cost_and_gradient(rho))
+                .map_err(|error| error.to_string())
         };
         let outcome = match escalator.rho_posterior_adequacy(
             &centre,
             &proposal_hessian,
-            &|t| {
-                let rho = to_rho(t);
-                self.without_persistent_warm_start_store(|| self.compute_cost(&rho).ok())
-            },
-            &|t| in_domain(&to_rho(t)),
+            &|t| continuation.value(&to_rho(t), cost, cost_and_gradient),
             n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
@@ -1247,37 +1251,24 @@ impl<'a> RemlState<'a> {
                 let escalation = escalator.escalate_rho_posterior(
                     &centre,
                     &proposal_hessian,
+                    // The prior is analytic in ρ, so it is read at the draw
+                    // itself; only the LAML part is continued from the face.
                     &mut |t| {
                         let rho = to_rho(t);
-                        if !in_domain(&rho) {
-                            return None;
-                        }
-                        self.without_persistent_warm_start_store(|| self.compute_cost(&rho).ok())
-                            .and_then(|cost| {
-                                self.rho_prior_distribution_correction(&rho)
-                                    .ok()
-                                    .map(|(prior_cost, _)| cost + prior_cost)
-                            })
+                        let laml = continuation.value(&rho, cost, cost_and_gradient)?;
+                        let (prior_cost, _) = self
+                            .rho_prior_distribution_correction(&rho)
+                            .map_err(|error| error.to_string())?;
+                        Ok(laml + prior_cost)
                     },
                     &mut |t| {
                         let rho = to_rho(t);
-                        if !in_domain(&rho) {
-                            return None;
-                        }
-                        self.without_persistent_warm_start_store(|| {
-                            // NUTS leapfrog gradients need the criterion value and
-                            // gradient at the same rho; compute them through one
-                            // value+gradient outer evaluation so the inner PIRLS
-                            // solve and IFT state are shared by construction.
-                            self.compute_cost_and_gradient(&rho).ok()
-                        })
-                        .and_then(|(cost, gradient)| {
-                            self.rho_prior_distribution_correction(&rho)
-                                .ok()
-                                .map(|(prior_cost, prior_gradient)| {
-                                    (cost + prior_cost, to_coordinates(gradient + prior_gradient))
-                                })
-                        })
+                        let (laml, gradient) =
+                            continuation.value_and_gradient(&rho, cost_and_gradient)?;
+                        let (prior_cost, prior_gradient) = self
+                            .rho_prior_distribution_correction(&rho)
+                            .map_err(|error| error.to_string())?;
+                        Ok((laml + prior_cost, to_coordinates(gradient + prior_gradient)))
                     },
                 );
                 Some(match basis.as_ref() {

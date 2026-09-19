@@ -1623,3 +1623,547 @@ fn exact_newton_displacement_solves_at_a_row_the_majorizer_does_not_curve_2933_f
         .expect("the exact Newton displacement certifies at a row the majorizer does not curve");
     assert!(displacement.max_abs().is_finite());
 }
+
+/// The dense exact Hessian `A` the certificate factors, at a term's installed state.
+fn dense_exact_hessian_2576(
+    term: &SaeSupportSparseTerm,
+    target: &Array2<f64>,
+    lambda: &[f64],
+    ard: &[Vec<f64>],
+) -> Array2<f64> {
+    let system = term
+        .assemble_arrow_schur(target.view(), lambda, ard)
+        .expect("arrow system");
+    let (beta_offsets, beta_dim) = term.beta_layout().expect("beta layout");
+    let rows = term
+        .support_outer_differential_rows(target.view(), ard, &beta_offsets)
+        .expect("exact differential rows");
+    let t_len = *system.row_offsets.last().unwrap_or(&0);
+    let (exact, _) = term
+        .support_outer_dense_hessian_matrices(&system, &rows, t_len, beta_dim)
+        .expect("dense pencil");
+    exact
+}
+
+/// The term moved by `h·direction`, with `direction` in the pencil's layout: the compact
+/// coordinates, then every decoder block in `beta_layout` order.
+fn displaced_term_2576(
+    term: &SaeSupportSparseTerm,
+    direction: &[f64],
+    h: f64,
+) -> SaeSupportSparseTerm {
+    let mut moved = term.clone();
+    let mut coordinates = Vec::new();
+    moved.snapshot_coordinates(&mut coordinates);
+    let t_len = coordinates.len();
+    for (value, step) in coordinates.iter_mut().zip(direction) {
+        *value += h * step;
+    }
+    moved.install_coordinates(&coordinates).expect("coordinates");
+    let (offsets, beta_dim) = moved.beta_layout().expect("beta layout");
+    assert_eq!(direction.len(), t_len + beta_dim);
+    let output_dim = moved.output_dim();
+    for atom in 0..moved.k_atoms() {
+        let mut decoder = moved.atoms[atom].decoder_coefficients().clone();
+        for basis in 0..decoder.nrows() {
+            for output in 0..output_dim {
+                decoder[[basis, output]] +=
+                    h * direction[t_len + offsets[atom] + basis * output_dim + output];
+            }
+        }
+        moved.atoms[atom].set_decoder_coefficients(decoder).expect("decoder");
+    }
+    moved
+}
+
+/// `max_v ‖A(θ + h·v) − A(θ)‖₂ / h` over the given unit directions: a lower bound on any
+/// Lipschitz constant of `A` on `B(θ, h)`.
+fn finite_difference_lipschitz_2576(
+    term: &SaeSupportSparseTerm,
+    target: &Array2<f64>,
+    lambda: &[f64],
+    ard: &[Vec<f64>],
+    directions: &[Vec<f64>],
+    h: f64,
+) -> f64 {
+    let base = dense_exact_hessian_2576(term, target, lambda, ard);
+    directions
+        .iter()
+        .map(|direction| {
+            let moved = displaced_term_2576(term, direction, h);
+            let change = &dense_exact_hessian_2576(&moved, target, lambda, ard) - &base;
+            let (eigenvalues, _) = change.eigh(Side::Lower).expect("change spectrum");
+            eigenvalues.iter().fold(0.0_f64, |current, value| current.max(value.abs())) / h
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+/// `count` unit directions of dimension `dim` from a fixed xorshift sequence, after the
+/// planted ones.
+fn unit_directions_2576(planted: Vec<Vec<f64>>, dim: usize, count: usize) -> Vec<Vec<f64>> {
+    let mut state = 0x2576_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    let normalize = |vector: Vec<f64>| {
+        let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+        vector.into_iter().map(|value| value / norm).collect::<Vec<_>>()
+    };
+    let mut out: Vec<Vec<f64>> = planted.into_iter().map(normalize).collect();
+    for _ in 0..count {
+        out.push(normalize((0..dim).map(|_| next()).collect()));
+    }
+    out
+}
+
+/// #2576 — the Hessian Lipschitz bound the Newton–Kantorovich certificate rests on
+/// dominates what finite differences of the exact Hessian measure on the same ball, on
+/// two fixtures that each make one term class of the bound carry the curvature change.
+///
+/// - One row of a first-harmonic periodic atom at `t = 0` with decoder `sin`, against
+///   the target 100: the residual term `−⟨r, D³f⟩` moves the coordinate curvature by
+///   `r·(2π)³·h` along the coordinate, about 24800·h, while the products of
+///   first and second jets move it by at most about 1200·h. Dropping the residual term
+///   from the bound puts it below this fixture's finite difference.
+/// - 400 rows of the same atom at `t = 0` with decoder `0.1·sin` and no residual:
+///   moving every coordinate together moves the decoder Gram `Σᵢφφᵀ` by
+///   `√n·‖φ∂φᵀ + ∂φφᵀ‖·h ≈ 20·8.9·h`, the one term with a single coordinate factor.
+///   The bound's per-row maxima are about 69, so dropping its `(Σᵢ …)^{1/2}` term puts it
+///   below this fixture's finite difference.
+#[test]
+fn hessian_lipschitz_bound_dominates_its_finite_differences_2576() {
+    let h = 1.0e-3;
+    for (rows, sine, target_value, planted_all_rows) in
+        [(1usize, 1.0_f64, 100.0_f64, false), (400, 0.1, 0.0, true)]
+    {
+        let evaluator: Arc<dyn SaeBasisSecondJet> =
+            Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
+        let atoms = vec![atom(
+            "periodic-lipschitz",
+            SaeAtomBasisKind::Periodic,
+            1,
+            evaluator,
+            &[0.0],
+            array![[0.0], [sine], [0.0]],
+        )];
+        let specs = vec![SaeAssignmentAtomSpec {
+            latent_dim: 1,
+            manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
+            retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
+        }];
+        let state = SaeAssignmentState::from_topk_support_heterogeneous(
+            rows,
+            1,
+            1,
+            specs,
+            vec![vec![0]; rows],
+            vec![vec![1.0]; rows],
+            vec![vec![0.0]; rows],
+        )
+        .expect("state");
+        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
+        let target = Array2::from_elem((rows, 1), target_value);
+        let lambda = vec![1.0_f64];
+        let ard = vec![vec![1.0_f64]];
+        let (_, beta_dim) = term.beta_layout().expect("beta layout");
+        let dim = term.coordinate_state_len() + beta_dim;
+        // The planted direction moves every coordinate together and no decoder entry.
+        let planted: Vec<f64> = (0..dim)
+            .map(|index| if index < rows && (planted_all_rows || index == 0) { 1.0 } else { 0.0 })
+            .collect();
+        let directions = unit_directions_2576(vec![planted], dim, 24);
+        let measured =
+            finite_difference_lipschitz_2576(&term, &target, &lambda, &ard, &directions, h);
+        let bound = match term
+            .support_hessian_lipschitz_bound(target.view(), &ard, h)
+            .expect("Lipschitz bound")
+        {
+            SupportHessianLipschitz::Bounded(bound) => bound,
+            SupportHessianLipschitz::Unavailable(reason) => {
+                panic!("a periodic atom's ball bound always exists: {reason}")
+            }
+        };
+        println!(
+            "[#2576 Lipschitz] rows {rows}, sine {sine}, target {target_value}: analytic \
+             {bound:.6e} vs finite difference {measured:.6e}"
+        );
+        assert!(
+            measured > 0.0 && bound >= measured,
+            "the Hessian Lipschitz bound {bound:.6e} must dominate the finite-difference \
+             Lipschitz estimate {measured:.6e} on the same ball ({rows} rows)"
+        );
+    }
+}
+
+/// #2576 — the Newton–Kantorovich certificate places the analytic minimum inside the
+/// radius it certifies. The scale-orbit fixture (`α = 1`) is displaced along its scale
+/// orbit by `s = 1 + 1.25e-8`, so the state is `‖θ − θ*‖₂ = √(8(s−1)² + 8(1/s−1)²) ≈
+/// 5e-8` from its known minimum (coordinates `±1`, slope `√8`, constant 0), about half
+/// the bound `tolerance × scale ≈ 9.6e-8`. The certificate must certify a radius that
+/// contains that distance and stays within the bound; the planted distance is the
+/// oracle. Displaced by `s = 1 + 1e-6` the Newton displacement exceeds the bound and it
+/// must refuse. Taking `η` as the rounding part `e/μ` alone, without `‖Δ‖`, certifies a
+/// radius of about `√(2e/L) ≈ 2e-8` here (`L ≈ 41`, `e ≈ 1e-14`), which misses the
+/// minimum.
+#[test]
+fn kantorovich_certificate_contains_the_analytic_minimum_2576() {
+    for (displacement, certifies) in [(1.25e-8_f64, true), (1.0e-6, false)] {
+        let scale = 1.0 + displacement;
+        let (term, target, lambda, ard, slope) = scale_orbit_fixture_2933(1.0, scale);
+        let tolerance = term.fixed_point_tolerance();
+        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+        let bound = tolerance * parameter_scale;
+        let (newton, _) = term
+            .exact_newton_solve(target.view(), &lambda, &ard)
+            .expect("exact Newton displacement");
+        let verdict = term
+            .support_kantorovich_certificate(target.view(), &lambda, &ard, &newton, bound)
+            .expect("certificate");
+        let rows = term.n_obs() as f64;
+        let distance =
+            (rows * (scale - 1.0).powi(2) + (slope / scale - slope).powi(2)).sqrt();
+        println!(
+            "[#2576 Kantorovich] s - 1 = {displacement:.3e}: distance {distance:.6e}, bound \
+             {bound:.6e}, Newton max {:.6e}, verdict {verdict:?}",
+            newton.max_abs()
+        );
+        match (certifies, verdict) {
+            (true, SupportKantorovichVerdict::Certified { radius, .. }) => {
+                assert!(
+                    distance <= radius && radius <= bound,
+                    "the certified radius {radius:.6e} must contain the analytic minimum at \
+                     {distance:.6e} and stay within the bound {bound:.6e}"
+                );
+            }
+            (false, SupportKantorovichVerdict::NotCertified(_)) => {}
+            (expected, verdict) => panic!(
+                "at s - 1 = {displacement:.3e} (distance {distance:.6e}, bound {bound:.6e}) the \
+                 certificate must {} it; got {verdict:?}",
+                if expected { "certify" } else { "refuse" }
+            ),
+        }
+    }
+}
+
+/// #2576 — an exact symmetry leaves the minimum an orbit, and the certificate is taken
+/// on the slice transverse to it. `support_outer_fixture_2933`'s plane atom (row 1,
+/// compact coordinates 1 and 2, slope rows 1 and 2 of its decoder) is a 2-D `Linear`
+/// atom with isotropic ARD `[1, 1]` and `S = I`, so rotating its coordinates and slope
+/// rows together by `Ê` is an exact `SO(2)` symmetry. A finite rotation leaves the
+/// objective within its rounding band, and differentiating `g(θ)·Êθ = 0` gives
+/// `A·Êθ = Ê·g` at every state, which the one declared generator `ξ = Êθ` meets to the
+/// rounding of `g` and, for `A` and its product with `ξ`, within the band of `A`'s spectrum
+/// each. The fit certifies with that direction projected off; without
+/// the quotient its converged state refused (`A − μ·I` failed at its last pivot for
+/// `μ ≈ 2.9e-6`, bottom eigenvalue `−1.0e-15`). With ARD `[1, 1.5]` the rotation is no
+/// longer a symmetry and no generator is declared.
+#[test]
+fn an_exact_rotation_symmetry_is_certified_on_its_slice_2576() {
+    let (mut term, target, lambda, ard) = support_outer_fixture_2933();
+    let tolerance = 1.0e-9;
+    term.solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
+        .expect("the rotation-symmetric fixture certifies on its slice");
+    let (offsets, beta_dim) = term.beta_layout().expect("beta layout");
+    let t_len = term.coordinate_state_len();
+    let (u0, u1) = (1usize, 2usize);
+    let (c0, c1) = (t_len + offsets[1] + 1, t_len + offsets[1] + 2);
+    let rotate = |vector: &Array1<f64>| {
+        let mut out = Array1::<f64>::zeros(vector.len());
+        for (first, second) in [(u0, u1), (c0, c1)] {
+            out[first] = -vector[second];
+            out[second] = vector[first];
+        }
+        out
+    };
+    let generators = term
+        .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
+        .expect("generators");
+    assert_eq!(generators.len(), 1, "one SO(2) generator for the 2-D linear atom");
+    let generator = &generators[0];
+    let mut state = Array1::<f64>::zeros(t_len + beta_dim);
+    let mut coordinates = Vec::new();
+    term.snapshot_coordinates(&mut coordinates);
+    state.slice_mut(ndarray::s![..t_len]).assign(&Array1::from(coordinates.clone()));
+    for (basis, value) in term.atoms[1].decoder_coefficients().column(0).iter().enumerate() {
+        state[t_len + offsets[1] + basis] = *value;
+    }
+    assert_eq!(generator, &rotate(&state), "the generator is Ê applied to the state");
+
+    let objective = term.penalized_objective(target.view(), &lambda, &ard).expect("objective");
+    let mut rotated = term.clone();
+    let (sin, cos) = 0.3_f64.sin_cos();
+    let mut turned = coordinates.clone();
+    turned[u0] = cos * coordinates[u0] - sin * coordinates[u1];
+    turned[u1] = sin * coordinates[u0] + cos * coordinates[u1];
+    rotated.install_coordinates(&turned).expect("coordinates");
+    let mut decoder = rotated.atoms[1].decoder_coefficients().clone();
+    let (first, second) = (decoder[[1, 0]], decoder[[2, 0]]);
+    decoder[[1, 0]] = cos * first - sin * second;
+    decoder[[2, 0]] = sin * first + cos * second;
+    rotated.atoms[1].set_decoder_coefficients(decoder).expect("decoder");
+    let turned_objective =
+        rotated.penalized_objective(target.view(), &lambda, &ard).expect("rotated objective");
+    let resolution = term.objective_descent_resolution(objective);
+    assert!(
+        (turned_objective - objective).abs() <= resolution,
+        "a finite rotation must leave the objective within its rounding band: {objective:.15e} \
+         -> {turned_objective:.15e}, band {resolution:.3e}"
+    );
+
+    let system = term
+        .assemble_arrow_schur(target.view(), &lambda, &ard)
+        .expect("arrow system");
+    let mut gradient = Array1::<f64>::zeros(t_len + beta_dim);
+    for (row, block) in system.rows.iter().enumerate() {
+        gradient
+            .slice_mut(ndarray::s![system.row_offsets[row]..system.row_offsets[row + 1]])
+            .assign(&block.gt);
+    }
+    gradient.slice_mut(ndarray::s![t_len..]).assign(&system.gb);
+    let exact = dense_exact_hessian_2576(&term, &target, &lambda, &ard);
+    let (values, _) = exact.eigh(Side::Lower).expect("A spectrum");
+    let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values.to_vec());
+    let gradient_band = term
+        .gradient_rounding_band(target.view(), &lambda, &ard)
+        .expect("gradient band");
+    let mismatch = &exact.dot(generator) - &rotate(&gradient);
+    let mismatch = mismatch.dot(&mismatch).sqrt();
+    let norm = generator.dot(generator).sqrt();
+    println!(
+        "[#2576 symmetry] ‖Aξ − Êg‖ {mismatch:.3e} vs 2‖ξ‖·band + ε_g = {:.3e}; spectrum \
+         {:.3e} .. {:.3e} .. {:.3e}; objective change under a 0.3 rad turn {:.3e} (band \
+         {resolution:.3e})",
+        2.0 * norm * band + gradient_band,
+        values[0],
+        values[1],
+        values[values.len() - 1],
+        turned_objective - objective,
+    );
+    assert!(
+        mismatch <= 2.0 * norm * band + gradient_band,
+        "the generator must meet A·ξ = Ê·g: mismatch {mismatch:.3e} against {:.3e}",
+        2.0 * norm * band + gradient_band
+    );
+
+    let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+    let bound = tolerance * parameter_scale;
+    let (newton, _) = term
+        .exact_newton_solve(target.view(), &lambda, &ard)
+        .expect("exact Newton displacement");
+    match term
+        .support_kantorovich_certificate(target.view(), &lambda, &ard, &newton, bound)
+        .expect("certificate")
+    {
+        SupportKantorovichVerdict::Certified { radius, symmetry_directions, .. } => assert!(
+            symmetry_directions == 1 && radius <= bound,
+            "certified off {symmetry_directions} directions within {radius:.3e} (bound {bound:.3e})"
+        ),
+        verdict => panic!("the slice certificate must certify at the converged state: {verdict:?}"),
+    }
+    let anisotropic = vec![ard[0].clone(), vec![1.0, 1.5]];
+    let generators = term
+        .support_exact_symmetry_generators(&anisotropic, &offsets, beta_dim)
+        .expect("generators");
+    assert!(generators.is_empty(), "anisotropic ARD breaks the rotation: no generator");
+}
+
+/// A periodic atom whose penalty leaves its constant column unpenalized (#2576).
+fn unpenalized_constant_periodic_atom_2576(
+    name: &str,
+    coordinate: f64,
+    decoder: Array2<f64>,
+) -> SaeManifoldAtom {
+    let evaluator: Arc<dyn SaeBasisSecondJet> =
+        Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
+    let reference = Array2::from_shape_vec((1, 1), vec![coordinate]).expect("reference");
+    let (phi, jet) = evaluator.evaluate(reference.view()).expect("evaluate");
+    SaeManifoldAtom::new_with_provided_function_gram(
+        name,
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::from_diag(&array![0.0, 1.0, 1.0]),
+    )
+    .expect("atom")
+    .with_basis_second_jet(evaluator)
+}
+
+/// Periodic atoms with unpenalized constants, every row routed to the pair `routes[row]`.
+fn constant_redistribution_fixture_2576(
+    k_atoms: usize,
+    routes: &[[u32; 2]],
+) -> (SaeSupportSparseTerm, Array2<f64>, Vec<f64>, Vec<Vec<f64>>) {
+    let atoms = (0..k_atoms)
+        .map(|atom| {
+            unpenalized_constant_periodic_atom_2576(
+                &format!("ring-{atom}"),
+                0.1 * atom as f64,
+                array![[0.2 * atom as f64], [0.7], [-0.3 + 0.1 * atom as f64]],
+            )
+        })
+        .collect();
+    let specs = (0..k_atoms)
+        .map(|_| SaeAssignmentAtomSpec {
+            latent_dim: 1,
+            manifold: SaeAtomBasisKind::Periodic.latent_manifold(1),
+            retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
+        })
+        .collect();
+    let rows = routes.len();
+    let state = SaeAssignmentState::from_topk_support_heterogeneous(
+        rows,
+        k_atoms,
+        2,
+        specs,
+        routes.iter().map(|route| route.to_vec()).collect(),
+        vec![vec![1.0, 1.0]; rows],
+        (0..rows)
+            .map(|row| vec![0.05 + 0.13 * row as f64, 0.61 - 0.07 * row as f64])
+            .collect(),
+    )
+    .expect("state");
+    let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
+    let target =
+        Array2::from_shape_fn((rows, 1), |(row, _)| (0.9 * row as f64).sin() + 0.2 * row as f64);
+    (term, target, vec![1.0; k_atoms], vec![vec![1.0]; k_atoms])
+}
+
+/// #2576 — atoms that share their rows can trade an unpenalized constant without any
+/// decode seeing it, an exact translation symmetry of the objective. Two periodic atoms
+/// with unpenalized constants, both routed to all eight rows, have one such direction per
+/// output channel: `A` annihilates it to the rounding band of its spectrum (a translation
+/// leaves `A·ξ = 0` at every state), a finite move along it leaves the objective within
+/// its rounding band, and the fit certifies with it projected off. Three atoms routed in
+/// an odd cycle (rows `{0,1}`, `{1,2}`, `{0,2}`) admit none, since `v₀ + v₁ = v₁ + v₂ =
+/// v₀ + v₂ = 0` forces `v = 0`.
+#[test]
+fn a_shared_constant_is_certified_on_its_slice_2576() {
+    let (mut term, target, lambda, ard) = constant_redistribution_fixture_2576(2, &[[0, 1]; 8]);
+    let tolerance = term.fixed_point_tolerance();
+    term.solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
+        .expect("a fit whose atoms share every row certifies on its slice");
+    let (offsets, beta_dim) = term.beta_layout().expect("beta layout");
+    let generators = term
+        .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
+        .expect("generators");
+    assert_eq!(generators.len(), term.output_dim(), "one shared constant per channel");
+    let unit = &generators[0] / generators[0].dot(&generators[0]).sqrt();
+    let exact = dense_exact_hessian_2576(&term, &target, &lambda, &ard);
+    let (values, _) = exact.eigh(Side::Lower).expect("A spectrum");
+    let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values.to_vec());
+    let action = exact.dot(&unit);
+    let residual = action.dot(&action).sqrt();
+    let objective = term.penalized_objective(target.view(), &lambda, &ard).expect("objective");
+    let t_len = term.coordinate_state_len();
+    let mut moved = term.clone();
+    for atom in 0..moved.k_atoms() {
+        let mut decoder = moved.atoms[atom].decoder_coefficients().clone();
+        decoder[[0, 0]] += 0.3 * unit[t_len + offsets[atom]];
+        moved.atoms[atom].set_decoder_coefficients(decoder).expect("decoder");
+    }
+    let moved_objective =
+        moved.penalized_objective(target.view(), &lambda, &ard).expect("moved objective");
+    let resolution = term.objective_descent_resolution(objective);
+    println!(
+        "[#2576 shared constant] ‖A ξ̂‖ {residual:.3e}, band {band:.3e}, spectrum {:.3e} .. \
+         {:.3e}; objective change under a 0.3 move {:.3e} (band {resolution:.3e})",
+        values[0],
+        values[1],
+        moved_objective - objective
+    );
+    assert!(residual <= 2.0 * band, "A must annihilate the translation: ‖A ξ̂‖ {residual:.3e}");
+    assert!(
+        (moved_objective - objective).abs() <= resolution,
+        "a finite shared-constant move must leave the objective within its band"
+    );
+    let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+    let bound = tolerance * parameter_scale;
+    let (newton, _) = term
+        .exact_newton_solve(target.view(), &lambda, &ard)
+        .expect("exact Newton displacement");
+    match term
+        .support_kantorovich_certificate(target.view(), &lambda, &ard, &newton, bound)
+        .expect("certificate")
+    {
+        SupportKantorovichVerdict::Certified { symmetry_directions, radius, .. } => assert!(
+            symmetry_directions == term.output_dim() && radius <= bound,
+            "certified off {symmetry_directions} directions within {radius:.3e} (bound {bound:.3e})"
+        ),
+        verdict => panic!("the shared constant must be projected off: {verdict:?}"),
+    }
+    let (odd, _, _, odd_ard) =
+        constant_redistribution_fixture_2576(3, &[[0, 1], [1, 2], [0, 2], [0, 1], [1, 2], [0, 2]]);
+    let (odd_offsets, odd_beta_dim) = odd.beta_layout().expect("beta layout");
+    let odd_generators = odd
+        .support_exact_symmetry_generators(&odd_ard, &odd_offsets, odd_beta_dim)
+        .expect("generators");
+    assert!(odd_generators.is_empty(), "an odd co-selection cycle admits no shared constant");
+}
+
+/// #2576 — a symmetry the certificate is not given is refused, never certified over. At
+/// the converged states of the two symmetric fixtures, the certificate on the slice of
+/// their declared generators certifies, and the same certificate given no generators
+/// refuses on its factorization: the rotation (`support_outer_fixture_2933`) and the
+/// shared constant (`constant_redistribution_fixture_2576`) leave `A` singular, so no
+/// `A − μ·I ≻ 0` exists without their quotient.
+#[test]
+fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
+    let rotation = support_outer_fixture_2933();
+    let shared = constant_redistribution_fixture_2576(2, &[[0, 1]; 8]);
+    for (name, (mut term, target, lambda, ard), tolerance) in [
+        ("rotation", rotation, 1.0e-9),
+        ("shared constant", shared, f64::NAN),
+    ] {
+        let tolerance = if tolerance.is_nan() { term.fixed_point_tolerance() } else { tolerance };
+        term.solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
+            .expect("the symmetric fixture certifies on the slice of its declared symmetry");
+        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+        let bound = tolerance * parameter_scale;
+        let (newton, _) = term
+            .exact_newton_solve(target.view(), &lambda, &ard)
+            .expect("exact Newton displacement");
+        let (offsets, beta_dim) = term.beta_layout().expect("beta layout");
+        let generators = term
+            .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
+            .expect("generators");
+        assert!(!generators.is_empty(), "{name}: the fixture declares its symmetry");
+        let admitted = term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &generators,
+            )
+            .expect("certificate on the declared slice");
+        assert!(
+            matches!(admitted, SupportKantorovichVerdict::Certified { .. }),
+            "{name}: the declared quotient certifies: {admitted:?}"
+        );
+        match term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &[],
+            )
+            .expect("certificate without the quotient")
+        {
+            SupportKantorovichVerdict::NotCertified(reason) => assert!(
+                reason.contains("not certified at μ"),
+                "{name}: the refusal must come from the factorization of the singular A: {reason}"
+            ),
+            verdict => {
+                panic!("{name}: a symmetry the certificate is not given must refuse: {verdict:?}")
+            }
+        }
+    }
+}

@@ -879,11 +879,6 @@ pub(super) struct BernoulliMarginalSlopeRowExactContext {
     pub(super) intercept: f64,
     pub(super) m_a: f64,
     pub(super) intercept_fast_path: bool,
-    /// Degree-9 per-row cell moments at the converged row intercept. The
-    /// top-of-cycle [`RowCellMomentsBundle`] (built at degree 9) is preferred
-    /// when present; this field remains the per-row lazy fallback for callers
-    /// without a bundle (e.g. legacy direct call sites).
-    pub(super) degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
 pub(super) struct BernoulliMarginalSlopeFlexRowScratch {

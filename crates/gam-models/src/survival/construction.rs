@@ -1032,8 +1032,14 @@ where
     // decided the survival time-block λ until a03438645 (#2670) nor the
     // engine's ±30 fallback applies (#2902 row 8).
     let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit).map_err(config)?;
+    // The criterion is the baseline likelihood summed over the survival
+    // records, in the `dim` baseline parameters themselves.
     let problem = contract
-        .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
+        .configure(
+            OuterProblem::new(dim)
+                .with_prefer_gradient_only(true)
+                .with_problem_size(age_exit.len(), dim),
+        )
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(

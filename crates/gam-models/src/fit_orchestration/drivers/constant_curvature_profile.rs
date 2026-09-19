@@ -207,6 +207,9 @@ struct ConstantCurvatureProfile<'a> {
     eta_bracket: (f64, f64),
     /// `η` seed — the auto rule's realized `ℓ_ref`, in logs.
     eta_seed: f64,
+    /// Coefficients of the profiled REML fit, `[1 | X]`: one representer per
+    /// realized center plus the intercept. Sizes the outer engine's resolution.
+    p_coefficients: usize,
     cache: std::cell::RefCell<std::collections::HashMap<(u64, u64), ProfiledRemlPsiJet>>,
     /// Value-only cache for the bracketing scan: `(V, ρ̂ railed)`; see
     /// [`Self::evaluate_value`].
@@ -483,6 +486,7 @@ impl<'a> ConstantCurvatureProfile<'a> {
             eta_bounds,
             eta_bracket: (span_lo.ln(), span_hi.ln()),
             eta_seed,
+            p_coefficients: centers.nrows() + 1,
             cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             value_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
@@ -607,6 +611,7 @@ impl<'a> ConstantCurvatureProfile<'a> {
             reason: error.to_string(),
         };
         let problem = OuterProblem::new(1)
+            .with_problem_size(self.response.len(), self.p_coefficients)
             .with_gradient(Derivative::Analytic)
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_vec(vec![lo]), Array1::from_vec(vec![hi]))
@@ -790,6 +795,47 @@ struct ConstantCurvatureOptimum {
     length_scale: f64,
 }
 
+/// The κ-profile outer problem: one coordinate on the chart-valid interval,
+/// sized by the `n_obs` rows the evidence sums, held to the fit's own `tol`
+/// exactly as every other outer route is. The exact `d²V_p/dκ²` and the
+/// declared size are what let the certificate resolve κ̂; the tolerance is not
+/// widened on this route's behalf.
+fn constant_curvature_kappa_problem(
+    n_obs: usize,
+    profile: &ConstantCurvatureProfile<'_>,
+    options: &FitOptions,
+    kappa_min: f64,
+    kappa_max: f64,
+) -> gam_solve::rho_optimizer::OuterProblem {
+    let initial_kappa = profile.spec.kappa.clamp(kappa_min, kappa_max);
+    gam_solve::rho_optimizer::OuterProblem::new(1)
+        .with_problem_size(n_obs, profile.p_coefficients)
+        .with_gradient(gam_problem::Derivative::Analytic)
+        // #2458: the κ profile supplies an EXACT d²V_p/dκ², so this route runs
+        // the same curvature-denominated stationarity certificate every other
+        // route runs. It previously declared `Unavailable` — not because the
+        // curvature was unavailable, but because this call site never asked the
+        // basis bundle for the seconds it already ships.
+        .with_hessian(gam_problem::DeclaredHessianForm::Dense)
+        // Gradient-only SEARCH is retained deliberately: the change this makes
+        // is the terminal certification, not the trajectory. Declaring the
+        // Hessian while preferring gradient-only routes the planner through the
+        // `(Analytic, Analytic) if prefer_gradient_only` arm to the same BFGS it
+        // used before, so kappa-hat is selected by the same solve -- but the
+        // terminal mint can now MEASURE curvature and run the derived criterion
+        // instead of the un-derived gradient band.
+        .with_prefer_gradient_only(true)
+        .with_disable_fixed_point(true)
+        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
+        .with_psi_dim(1)
+        .with_tolerance(options.tol)
+        .with_bounds(
+            Array1::from_vec(vec![kappa_min]),
+            Array1::from_vec(vec![kappa_max]),
+        )
+        .with_initial_rho(Array1::from_vec(vec![initial_kappa]))
+}
+
 /// Minimize the RANGE-PROFILED, continuously smoothing-profiled Gaussian REML
 /// evidence `V_p(κ) = min_{η,ρ} V(κ, η, ρ)` on the chart-valid κ interval, with
 /// the shared bounded analytic outer solver — so every accepted result has
@@ -848,32 +894,27 @@ fn constant_curvature_kappa_profile_optimum(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
-    let initial_kappa = profile.spec.kappa.clamp(kappa_min, kappa_max);
-    let problem = gam_solve::rho_optimizer::OuterProblem::new(1)
-        .with_gradient(gam_problem::Derivative::Analytic)
-        // #2458: the κ profile supplies an EXACT d²V_p/dκ², so this route runs
-        // the same curvature-denominated stationarity certificate every other
-        // route runs. It previously declared `Unavailable` — not because the
-        // curvature was unavailable, but because this call site never asked the
-        // basis bundle for the seconds it already ships.
-        .with_hessian(gam_problem::DeclaredHessianForm::Dense)
-        // Gradient-only SEARCH is retained deliberately: the change this makes
-        // is the terminal certification, not the trajectory. Declaring the
-        // Hessian while preferring gradient-only routes the planner through the
-        // `(Analytic, Analytic) if prefer_gradient_only` arm to the same BFGS it
-        // used before, so kappa-hat is selected by the same solve -- but the
-        // terminal mint can now MEASURE curvature and run the derived criterion
-        // instead of the un-derived gradient band.
-        .with_prefer_gradient_only(true)
-        .with_disable_fixed_point(true)
-        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
-        .with_psi_dim(1)
-        .with_tolerance(options.tol.max(f64::EPSILON.sqrt()))
-        .with_bounds(
-            Array1::from_vec(vec![kappa_min]),
-            Array1::from_vec(vec![kappa_max]),
-        )
-        .with_initial_rho(Array1::from_vec(vec![initial_kappa]));
+    solve_constant_curvature_kappa_profile(
+        y.len(),
+        profile,
+        options,
+        kappa_min,
+        kappa_max,
+        term_idx,
+    )
+}
+
+/// The κ solve of [`constant_curvature_kappa_profile_optimum`] on an already
+/// constructed profile over `n_obs` rows.
+fn solve_constant_curvature_kappa_profile(
+    n_obs: usize,
+    profile: ConstantCurvatureProfile<'_>,
+    options: &FitOptions,
+    kappa_min: f64,
+    kappa_max: f64,
+    term_idx: usize,
+) -> Result<ConstantCurvatureOptimum, EstimationError> {
+    let problem = constant_curvature_kappa_problem(n_obs, &profile, options, kappa_min, kappa_max);
     let mut objective = problem.build_objective(
         profile,
         |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {

@@ -92,7 +92,7 @@ pub(crate) use crate::probability::signed_probit_logcdf_and_mills_ratio;
 
 pub(crate) use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
+    SpatialLengthScaleOptimizationResult, build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
 pub(crate) use gam_terms::smooth::{
@@ -132,6 +132,7 @@ mod eval_sigma;
 mod family;
 mod feasibility;
 mod fit_entry;
+mod frozen_time_limit;
 mod fit_setup;
 mod flex_sensitivity;
 #[cfg(test)]
@@ -171,6 +172,7 @@ pub(crate) use family::*;
 pub(crate) use generated_regressor::*;
 pub(crate) use fit_entry::*;
 pub(crate) use fit_setup::*;
+pub use frozen_time_limit::*;
 pub(crate) use hessian::*;
 pub(crate) use joint_eval::*;
 pub use joint_latent_law::*;
