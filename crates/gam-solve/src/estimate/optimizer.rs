@@ -2476,7 +2476,6 @@ where
             },
             pirls::PenaltyConfig {
                 canonical_penalties: reml_state.canonical_penalties(),
-                balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,

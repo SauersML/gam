@@ -5586,7 +5586,6 @@ pub(crate) struct RemlState<'a> {
     /// This is the single canonical penalty representation — no full-width
     /// `rank × p` roots are stored separately.
     pub(crate) canonical_penalties: Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
-    pub(crate) balanced_penalty_root: Array2<f64>,
     pub(crate) reparam_invariant: ReparamInvariant,
     pub(crate) sparse_penalty_block_count: usize,
     pub(crate) p: usize,

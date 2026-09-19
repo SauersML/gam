@@ -1867,6 +1867,21 @@ pub(crate) fn spectral_summary(
     penalty: &Array2<f64>,
 ) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), BasisError> {
     let sym = symmetrize_penalty(penalty);
+    if crate::construction::is_diagonal(sym.view()) {
+        // A diagonal matrix is its own eigendecomposition: the spectrum is the
+        // diagonal and the eigenvectors are the coordinate axes, returned in the
+        // ascending order `eigh` uses. A random-effect block is `levels × levels`
+        // and diagonal, so this keeps its analysis out of the O(levels³) solver.
+        let n = sym.nrows();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| sym[[a, a]].total_cmp(&sym[[b, b]]));
+        let evals = order.iter().map(|&j| sym[[j, j]]).collect::<Array1<f64>>();
+        let mut evecs = Array2::<f64>::zeros((n, n));
+        for (col, &j) in order.iter().enumerate() {
+            evecs[[j, col]] = 1.0;
+        }
+        return Ok((sym, evals, evecs));
+    }
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
     Ok((sym, evals, evecs))
 }
@@ -2168,6 +2183,37 @@ mod atomic_penalty_record_tests {
             max_error <= tolerance,
             "canonical PSD reconstruction changed a penalty beyond roundoff: max error {max_error:e}, tolerance {tolerance:e}"
         );
+    }
+
+    #[test]
+    fn diagonal_spectral_summary_matches_dense_eigh() {
+        // Unsorted, with a repeated eigenvalue and a two-dimensional null space.
+        let diag = array![3.0, 0.0, 1.5, 3.0, 0.0, 0.25];
+        let penalty = Array2::from_diag(&diag);
+        let (sym, evals, evecs) = spectral_summary(&penalty).expect("diagonal spectrum");
+        let (dense_evals, dense_evecs) =
+            FaerEigh::eigh(&sym, Side::Lower).expect("dense eigendecomposition");
+        for (closed, dense) in evals.iter().zip(dense_evals.iter()) {
+            assert!((closed - dense).abs() <= 32.0 * f64::EPSILON * 3.0, "{evals} vs {dense_evals}");
+        }
+        assert_matrix_roundoff_equal(&evecs.t().dot(&evecs), &Array2::eye(diag.len()));
+        // Eigenvectors inside a repeated eigenvalue are only defined up to a
+        // rotation, so compare the spectral projector of each distinct value.
+        for value in [0.0, 0.25, 1.5, 3.0] {
+            let projector = |values: &Array1<f64>, vectors: &Array2<f64>| {
+                let cols: Vec<usize> = (0..values.len())
+                    .filter(|&j| (values[j] - value).abs() <= 1e-12)
+                    .collect();
+                let basis = vectors.select(Axis(1), &cols);
+                basis.dot(&basis.t())
+            };
+            assert_matrix_roundoff_equal(
+                &projector(&evals, &evecs),
+                &projector(&dense_evals, &dense_evecs),
+            );
+        }
+        let block = analyze_penalty_block(&penalty).expect("diagonal block");
+        assert_eq!((block.rank, block.nullity, block.negative_dim), (4, 2, 0));
     }
 
     #[test]

@@ -201,8 +201,8 @@ pub fn coordinate_domain(interval: Option<(f64, f64)>, family_floor: Option<f64>
 /// index `skip`, or `None` when that penalty sits alone there. A double penalty
 /// ships its bending block and its null-space ridge as two coordinates on one
 /// column range.
-fn shared_columns_companions<'a>(
-    penalties: impl IntoIterator<Item = (&'a std::ops::Range<usize>, &'a Array2<f64>)>,
+fn shared_columns_companions<'a, S: ndarray::Data<Elem = f64> + 'a>(
+    penalties: impl IntoIterator<Item = (&'a std::ops::Range<usize>, &'a ndarray::ArrayBase<S, ndarray::Ix2>)>,
     skip: usize,
     range: &std::ops::Range<usize>,
     dim: (usize, usize),
@@ -212,7 +212,7 @@ fn shared_columns_companions<'a>(
         if index != skip && other_range == range && other.dim() == dim {
             match companions.as_mut() {
                 Some(sum) => *sum += other,
-                None => companions = Some(other.clone()),
+                None => companions = Some(other.to_owned()),
             }
         }
     }
@@ -262,7 +262,9 @@ impl RangeGram {
 }
 
 /// The diagonal of `matrix` when every off-diagonal entry is exactly zero.
-fn exact_diagonal(matrix: &Array2<f64>) -> Option<Array1<f64>> {
+fn exact_diagonal<S: ndarray::Data<Elem = f64>>(
+    matrix: &ndarray::ArrayBase<S, ndarray::Ix2>,
+) -> Option<Array1<f64>> {
     gam_terms::construction::is_diagonal(matrix.view()).then(|| matrix.diag().to_owned())
 }
 
@@ -341,9 +343,9 @@ struct SharedColumnsResolvability {
 /// A diagonal Gram beside diagonal penalties is read in closed form
 /// ([`diagonal_penalty_range_gammas`]); any other pair takes the general
 /// reduction on the dense Gram.
-fn shared_columns_resolvability(
+fn shared_columns_resolvability<S: ndarray::Data<Elem = f64>>(
     gram: &RangeGram,
-    local: &Array2<f64>,
+    local: &ndarray::ArrayBase<S, ndarray::Ix2>,
     companions: Option<&Array2<f64>>,
 ) -> SharedColumnsResolvability {
     let combine = |own: Option<&Vec<f64>>, others: [Option<(f64, f64)>; 2]| {
@@ -391,6 +393,7 @@ fn shared_columns_resolvability(
         };
     }
     let gram = gram.to_dense();
+    let local = &local.to_owned();
     let own_gammas = penalty_range_gammas_from_gram(&gram, local);
     let Some(companions) = companions else {
         return SharedColumnsResolvability {

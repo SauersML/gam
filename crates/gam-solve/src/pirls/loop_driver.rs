@@ -541,7 +541,6 @@ pub struct PenaltyConfig<'a> {
     /// `rank × p` roots are stored. When the reparameterization engine needs
     /// full-width roots, they are derived on-the-fly from these block-local roots.
     pub canonical_penalties: &'a [gam_terms::construction::CanonicalPenalty],
-    pub balanced_penalty_root: Option<&'a Array2<f64>>,
     pub reparam_invariant: Option<&'a gam_terms::construction::ReparamInvariant>,
     pub p: usize,
     pub coefficient_lower_bounds: Option<&'a Array1<f64>>,

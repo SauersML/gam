@@ -44,11 +44,11 @@ mod tests {
     ) -> CanonicalPenalty {
         let block_dim = col_range.len();
         CanonicalPenalty {
-            root: Array2::<f64>::zeros((0, block_dim)),
+            root: Array2::<f64>::zeros((0, block_dim)).into_shared(),
             col_range,
             total_dim,
             nullity: 0,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(block_dim),
             positive_eigenvalues,
             op: None,

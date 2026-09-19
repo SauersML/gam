@@ -6,7 +6,7 @@ use faer::{Accum, Mat, MatRef, Par, Side};
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerQr, FaerSvd};
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_linalg::utils::KahanSum;
-use ndarray::{Array1, Array2, ArrayView2, ArrayViewMut2, s};
+use ndarray::{Array1, Array2, ArcArray2, ArrayView2, ArrayViewMut2, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -118,7 +118,9 @@ impl PenaltyMatrix {
     }
 }
 
-pub(crate) fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {
+pub(crate) fn array_to_faer<S: ndarray::Data<Elem = f64>>(
+    array: &ndarray::ArrayBase<S, ndarray::Ix2>,
+) -> Mat<f64> {
     let (rows, cols) = array.dim();
     Mat::from_fn(rows, cols, |i, j| array[[i, j]])
 }
@@ -896,7 +898,12 @@ fn kronecker_eigenvalues(decomps: &[KroneckerFactorDecomp], block_dim: usize) ->
 pub struct CanonicalPenalty {
     /// Square root matrix: S_k = root^T * root.
     /// Shape: `rank x block_dim` for block-local, `rank x p` for dense.
-    pub root: Array2<f64>,
+    ///
+    /// Shared (copy-on-write) storage: every outer evaluation's
+    /// reparameterization carries the canonical penalties forward, and a
+    /// random-effect block's root is `levels × levels`, so an owned root would
+    /// be deep-copied on each of those clones.
+    pub root: ArcArray2<f64>,
     /// Column range in the global coefficient vector [start..end).
     /// For dense penalties this is `0..p`.
     pub col_range: std::ops::Range<usize>,
@@ -906,8 +913,9 @@ pub struct CanonicalPenalty {
     pub nullity: usize,
     /// The symmetrized block-local penalty matrix (block_dim × block_dim).
     /// Cached at construction time to avoid recomputing root^T * root
-    /// in hot paths (penalty assembly, trace products).
-    pub local: Array2<f64>,
+    /// in hot paths (penalty assembly, trace products). Shared storage for the
+    /// same reason as `root`.
+    pub local: ArcArray2<f64>,
     /// Block-local prior mean used to center this penalty.
     pub prior_mean: Array1<f64>,
     /// Positive eigenvalues of the local penalty matrix (length = rank).
@@ -964,11 +972,11 @@ impl CanonicalPenalty {
         let local = root.t().dot(&root);
         let positive_eigenvalues = Vec::new(); // not needed for TK paths
         Self {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity: 0,
-            local,
+            local: local.into_shared(),
             prior_mean,
             positive_eigenvalues,
             op: None,
@@ -979,7 +987,7 @@ impl CanonicalPenalty {
     /// For dense penalties (col_range = 0..p), returns the root unchanged.
     pub fn full_width_root(&self) -> Array2<f64> {
         if self.col_range.start == 0 && self.col_range.end == self.total_dim {
-            return self.root.clone();
+            return self.root.to_owned();
         }
         let rank = self.root.nrows();
         let mut full = Array2::<f64>::zeros((rank, self.total_dim));
@@ -1005,14 +1013,14 @@ impl CanonicalPenalty {
 
     /// Return a reference to the cached local penalty matrix.
     /// Shape: `block_dim x block_dim`.
-    pub fn local_ref(&self) -> &Array2<f64> {
+    pub fn local_ref(&self) -> &ArcArray2<f64> {
         &self.local
     }
 
     /// Return an owned copy of the local penalty matrix.
     /// Prefer `local_ref()` when a reference suffices.
     pub fn local_penalty(&self) -> Array2<f64> {
-        self.local.clone()
+        self.local.to_owned()
     }
 
     /// Accumulate lambda * S_k into a pre-allocated `p x p` target matrix.
@@ -1170,13 +1178,13 @@ impl CanonicalPenalty {
         };
         let local = root.t().dot(&root);
         Ok(Some(Self {
-            root,
+            root: root.into_shared(),
             col_range,
             total_dim: self.total_dim,
             // The projection can only remove curvature, so the block's nullity
             // can only grow; the honest floor is what it already declared.
             nullity: self.nullity,
-            local,
+            local: local.into_shared(),
             prior_mean,
             positive_eigenvalues,
             op: None,
@@ -1188,14 +1196,14 @@ impl CanonicalPenalty {
         use gam_problem::PenaltyCoordinate;
         if self.is_block_local() {
             PenaltyCoordinate::from_block_root_with_mean(
-                self.root.clone(),
+                self.root.to_owned(),
                 self.col_range.start,
                 self.col_range.end,
                 self.total_dim,
                 self.prior_mean.clone(),
             )
         } else {
-            PenaltyCoordinate::from_dense_root_with_mean(self.root.clone(), self.prior_mean.clone())
+            PenaltyCoordinate::from_dense_root_with_mean(self.root.to_owned(), self.prior_mean.clone())
         }
     }
 }
@@ -1451,11 +1459,11 @@ pub fn canonicalize_penalty_spec(
         let mut local_sym = local_matrix.to_owned();
         symmetrize_in_place(&mut local_sym);
         return Ok(Some(CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range,
             total_dim: p,
             nullity: 0,
-            local: local_sym,
+            local: local_sym.into_shared(),
             prior_mean,
             positive_eigenvalues: vec![*scale; block_dim],
             op,
@@ -1477,11 +1485,11 @@ pub fn canonicalize_penalty_spec(
         let mut local_sym = local_matrix.to_owned();
         symmetrize_in_place(&mut local_sym);
         return Ok(Some(CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range,
             total_dim: p,
             nullity,
-            local: local_sym,
+            local: local_sym.into_shared(),
             prior_mean,
             positive_eigenvalues,
             op,
@@ -1562,11 +1570,11 @@ pub fn canonicalize_penalty_spec(
     // (negative-curvature directions are excluded from both, as above).
     let local = root.t().dot(&root);
     Ok(Some(CanonicalPenalty {
-        root,
+        root: root.into_shared(),
         col_range,
         total_dim: p,
         nullity: classes.nullity(),
-        local,
+        local: local.into_shared(),
         prior_mean,
         positive_eigenvalues,
         op,
@@ -1784,11 +1792,11 @@ fn canonicalize_penalty_spec_at_frozen_rank(
     }
     let local = root.t().dot(&root);
     Ok(Some(CanonicalPenalty {
-        root,
+        root: root.into_shared(),
         col_range,
         total_dim: p,
         nullity: block_dim - frozen_rank,
-        local,
+        local: local.into_shared(),
         prior_mean,
         positive_eigenvalues,
         op,
@@ -1802,164 +1810,8 @@ fn canonicalize_penalty_spec_at_frozen_rank(
 /// allocating an O(p²) workspace whose eigendecomposition would dominate the
 /// solve. ResourcePolicy threading is the long-term home for this cap (the
 /// resource_serialize agent is widening ResourcePolicy coverage); until that
-/// lands, both overlapping branches share this single constant so they can't
-/// drift apart.
+/// lands, the overlapping branch of the reparameterization reads it from here.
 pub(crate) const OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P: usize = 4096;
-
-/// Creates a balanced penalty root from canonical penalties.
-///
-/// When all penalties have non-overlapping col_ranges, the balanced sum is
-/// block-diagonal and eigendecomposition is done per-block at O(Σ p_k³)
-/// instead of the global O(p³). Falls back to the global path when penalties
-/// overlap.
-pub fn create_balanced_penalty_root_from_canonical(
-    penalties: &[CanonicalPenalty],
-    p: usize,
-) -> Result<Array2<f64>, EstimationError> {
-    if penalties.is_empty() {
-        return Ok(Array2::zeros((0, p)));
-    }
-
-    // Group penalties by col_range.
-    let mut block_groups: BTreeMap<(usize, usize), Vec<&CanonicalPenalty>> = BTreeMap::new();
-    for cp in penalties {
-        if cp.rank() == 0 {
-            continue;
-        }
-        let key = (cp.col_range.start, cp.col_range.end);
-        block_groups.entry(key).or_default().push(cp);
-    }
-
-    if block_groups.is_empty() {
-        return Ok(Array2::zeros((0, p)));
-    }
-
-    // Check for overlapping ranges.
-    let ranges: Vec<(usize, usize)> = block_groups.keys().copied().collect();
-    let mut overlapping = false;
-    for i in 1..ranges.len() {
-        if ranges[i].0 < ranges[i - 1].1 {
-            overlapping = true;
-            break;
-        }
-    }
-
-    if overlapping {
-        if p > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
-            return Err(EstimationError::LayoutError(format!(
-                "overlapping penalty root would require dense {}x{} eigendecomposition; \
-                 large-model dense fallback is disabled. Keep penalties structured or \
-                 extend the overlapping-penalty solver path",
-                p, p
-            )));
-        }
-        // Fallback: accumulate into p × p and eigendecompose globally, under
-        // the ONE balanced rule the reparameterization split and the
-        // criterion's rank hint share (gam#2454).
-        let s_balanced = balanced_penalty_sum(
-            penalties
-                .iter()
-                .filter(|cp| cp.rank() != 0)
-                .map(|cp| (cp.local_ref().view(), cp.col_range.clone())),
-            p,
-        );
-        let (eigenvalues, eigenvectors) =
-            robust_eigh(&s_balanced, Side::Lower, "balanced penalty matrix")?;
-        let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-        let tolerance = balanced_penalty_rank_tolerance(max_eig);
-        let penalty_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-        if penalty_rank == 0 {
-            return Ok(Array2::zeros((0, p)));
-        }
-        let mut eb = Array2::zeros((p, penalty_rank));
-        let mut col_idx = 0;
-        for (i, &eigenval) in eigenvalues.iter().enumerate() {
-            if eigenval > tolerance {
-                let sqrt_ev = eigenval.sqrt();
-                let evec = eigenvectors.column(i);
-                eb.column_mut(col_idx).assign(&(&evec * sqrt_ev));
-                col_idx += 1;
-            }
-        }
-        return Ok(eb.t().to_owned());
-    }
-
-    // Non-overlapping: eigendecompose per block at O(Σ p_k³).
-    struct BlockRoot {
-        col_range: Range<usize>,
-        root: Array2<f64>, // rank_b × block_dim
-    }
-    // Materialize the BTreeMap order first. Rayon preserves Vec collection
-    // order for indexed parallel iterators, so assembly below remains stable by
-    // ascending column range while independent block eigendecompositions run in
-    // parallel.
-    let ordered_blocks: Vec<((usize, usize), Vec<&CanonicalPenalty>)> =
-        block_groups.into_iter().collect();
-    let block_roots: Vec<BlockRoot> = ordered_blocks
-        .into_par_iter()
-        .map(
-            |((start, end), cps)| -> Result<Option<BlockRoot>, EstimationError> {
-                let block_dim = end - start;
-                // The block's balanced sum under the same shared rule as the
-                // dense fallback above and the reparameterization split.
-                let s_balanced_local = balanced_penalty_sum(
-                    cps.iter()
-                        .map(|cp| (cp.local_ref().view(), 0..block_dim)),
-                    block_dim,
-                );
-
-                let (eigenvalues, eigenvectors) =
-                    robust_eigh(&s_balanced_local, Side::Lower, "balanced penalty block")?;
-                let max_eig = eigenvalues.iter().fold(0.0f64, |max, &val| max.max(val));
-                let tolerance = balanced_penalty_rank_tolerance(max_eig);
-                let block_rank = eigenvalues.iter().filter(|&&ev| ev > tolerance).count();
-
-                if block_rank == 0 {
-                    return Ok(None);
-                }
-
-                let mut root = Array2::zeros((block_rank, block_dim));
-                let mut row_idx = 0;
-                for (i, &eigenval) in eigenvalues.iter().enumerate() {
-                    if eigenval > tolerance {
-                        let sqrt_ev = eigenval.sqrt();
-                        let evec = eigenvectors.column(i);
-                        root.row_mut(row_idx).assign(&(&evec * sqrt_ev));
-                        row_idx += 1;
-                    }
-                }
-
-                Ok(Some(BlockRoot {
-                    col_range: start..end,
-                    root,
-                }))
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    let total_rank: usize = block_roots.iter().map(|br| br.root.nrows()).sum();
-
-    if total_rank == 0 {
-        return Ok(Array2::zeros((0, p)));
-    }
-
-    // Assemble global balanced root: total_rank × p
-    let mut eb = Array2::zeros((total_rank, p));
-    let mut row_offset = 0;
-    for br in &block_roots {
-        let rank_b = br.root.nrows();
-        eb.slice_mut(s![
-            row_offset..(row_offset + rank_b),
-            br.col_range.start..br.col_range.end
-        ])
-        .assign(&br.root);
-        row_offset += rank_b;
-    }
-
-    Ok(eb)
-}
 
 /// Lambda-independent reparameterization invariants derived from penalty structure.
 /// Relative cut of the balanced penalty spectrum below which a direction is
@@ -2241,9 +2093,7 @@ pub fn precompute_reparam_invariant_from_canonical(
     }
 
     if overlapping {
-        // Mirror the dense-fallback guard from
-        // `create_balanced_penalty_root_from_canonical`. Without this, large-scale-
-        // scale models with overlapping penalties allocated a full
+        // Without this guard, large-scale models with overlapping penalties allocated a full
         // p_total × p_total workspace and ran an O(p³) eigendecomposition
         // before any solver code saw the problem size.
         if p_total > OVERLAPPING_PENALTY_DENSE_FALLBACK_MAX_P {
@@ -3546,11 +3396,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..p,
                     total_dim: p,
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(p),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -3955,11 +3805,11 @@ mod tests {
         // A trivially valid root: zero rank. The diagnostic doesn't read root.
         let root = Array2::<f64>::zeros((0, block_dim));
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range,
             total_dim,
             nullity: 0,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(block_dim),
             positive_eigenvalues: Vec::new(),
             op: None,

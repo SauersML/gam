@@ -846,29 +846,7 @@ impl HessianFactorization for SparseCholeskyOperator {
             let block = root.t().dot(&root);
             return self.trace_logdet_block_local(&block, 1.0, start, end);
         };
-        // tr(H⁻¹ RᵀR) = Σ_r r H⁻¹ rᵀ over the rows r of the root, each row
-        // contracted on its own support. A pair (j, k) inside one row's support
-        // is a nonzero of `RᵀR`, hence of `H`, so its `H⁻¹` entry is on the
-        // selected-inverse pattern. A random-effect ridge root (one nonzero
-        // per row) costs one lookup per level instead of forming `RᵀR`.
-        let mut support: Vec<(usize, f64)> = Vec::new();
-        let mut trace = 0.0;
-        for row in root.outer_iter() {
-            support.clear();
-            support.extend(
-                row.iter()
-                    .enumerate()
-                    .filter(|&(_, &value)| value != 0.0)
-                    .map(|(col, &value)| (start + col, value)),
-            );
-            for (a, &(j, r_j)) in support.iter().enumerate() {
-                trace += r_j * r_j * taka.get(j, j);
-                for &(k, r_k) in &support[a + 1..] {
-                    trace += 2.0 * r_j * r_k * taka.get(j, k);
-                }
-            }
-        }
-        trace
+        taka.trace_root_gram(root, start)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
