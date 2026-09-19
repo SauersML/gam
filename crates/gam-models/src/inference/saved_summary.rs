@@ -491,7 +491,6 @@ fn predictor_block_smooth_terms(
     // off the fit inside that walk, which is where `fd998d957` put them.
     let rows = gam_solve::estimate::smooth_term_summary_rows(
         &design,
-        spec,
         fit,
         whitening_gram_full,
         predictor.offset,
@@ -1642,7 +1641,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()

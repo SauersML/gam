@@ -3325,11 +3325,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
         &[marginal_terms.clone(), slope_terms.clone()],
         kappa_options_ref,
         &setup,
-        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         Some(walk_signals),
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], provenance| {

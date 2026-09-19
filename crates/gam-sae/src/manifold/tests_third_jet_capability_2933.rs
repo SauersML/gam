@@ -51,6 +51,17 @@ impl SaeBasisSecondJet for SecondOrderOnlyPeriodic {
             .second_jet_dyn(coords)
             .ok_or_else(|| "TestPeriodicEvaluator exposes its second jet".to_string())?
     }
+
+    fn jet_ball_bound(
+        &self,
+        center: ndarray::ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<crate::basis::SaeBasisJetBallCapability, String> {
+        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "SecondOrderOnlyPeriodic is a third-jet capability test basis and declares no bound \
+             on the ball of radius {radius} around {center}"
+        )))
+    }
 }
 
 /// The same periodic basis falsely certifying a zero third jet. It is the
@@ -136,6 +147,17 @@ impl SaeBasisSecondJet for AffineLine {
             return Err(format!("AffineLine: expected latent_dim 1, got {}", coords.ncols()));
         }
         Ok(Array4::<f64>::zeros((coords.nrows(), 2, 1, 1)))
+    }
+
+    fn jet_ball_bound(
+        &self,
+        center: ndarray::ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<crate::basis::SaeBasisJetBallCapability, String> {
+        Ok(crate::basis::SaeBasisJetBallCapability::Unavailable(format!(
+            "AffineLine is a third-jet capability test basis and declares no bound \
+             on the ball of radius {radius} around {center}"
+        )))
     }
 }
 

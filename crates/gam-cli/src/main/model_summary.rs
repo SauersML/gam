@@ -169,7 +169,6 @@ pub(crate) fn build_model_summary(
     // Gram, because it holds the real training design.
     let smooth_terms = smooth_term_summary_rows(
         design,
-        spec,
         fit,
         whitening_gram_full,
         SummaryBlockOffset::default(),

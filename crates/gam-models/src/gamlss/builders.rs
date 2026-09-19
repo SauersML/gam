@@ -2395,7 +2395,6 @@ pub(crate) fn fit_binomial_mean_wiggle(
         wiggle_degree: spec.wiggle_degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
 
     // Build the de-aliased warp block at a frozen index.  The identifiable
@@ -2557,19 +2556,11 @@ pub(crate) fn fit_binomial_mean_wiggle(
         // and it is not reconstructible from the saved-frame states (#2748).
         let accepted_frozen_warp_design = std::sync::Arc::clone(&bda);
         fam.frozen_warp_design = Some(bda);
-        // Every pass after the first is a CONTINUATION of the previous pass's
-        // solve: one seed (the warm ρ the blocks carry) and no screening
-        // cascade, so the frozen-index map is single-valued. See the
-        // `continuation` field for the n=1000 basin flip this removes (#2748).
-        fam.continuation = _outer > 0;
-        let pass_options = if _outer > 0 {
-            let mut continuation_options = options.clone();
-            continuation_options.screen_initial_rho = false;
-            continuation_options
-        } else {
-            options.clone()
-        };
-        let fit = fit_custom_family(&fam, &blocks, &pass_options).map_err(|e| e.to_string())?;
+        // Every pass after the first continues from the warm ρ the blocks carry.
+        // The outer search enters from that one start, so the frozen-index map
+        // is single-valued: no multi-start winner can flip between two inner
+        // optima as the index moves (the n=1000 basin flip of #2748).
+        let fit = fit_custom_family(&fam, &blocks, options).map_err(|e| e.to_string())?;
         let mean_state = fit
             .block_states
             .get(BinomialMeanWiggleFamily::BLOCK_ETA)
@@ -2880,10 +2871,6 @@ pub(crate) trait LocationScaleFamilyBuilder {
         false
     }
 
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GeneralizedLinear
-    }
-
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         Ok(Array1::zeros(0))
     }
@@ -3064,11 +3051,9 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 &[mean_terms, noise_terms],
                 kappa_options,
                 &joint_setup,
-                builder.exact_spatial_seed_risk_profile(),
                 analytic_joint_derivatives_available,
                 analytic_joint_derivatives_available,
                 gamlss_disable_fixed_point,
-                None,
                 None,
                 outer_policy,
                 // The final coefficient fit: the solver's error is carried whole
@@ -3384,10 +3369,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         true
     }
 
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GaussianLocationScale
-    }
-
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -3507,10 +3488,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
 
     fn exact_spatial_joint_supported(&self) -> bool {
         true
-    }
-
-    fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::GaussianLocationScale
     }
 
     fn require_exact_spatial_joint(&self) -> bool {
@@ -4511,11 +4488,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         // (#2748): the two are different functions, only this one is convex, and
         // only this one makes the declared ψ-derivative layout complete.
         frozen_warp_design: Some(std::sync::Arc::clone(&frozen_warp_basis)),
-        continuation: false,
     };
-    let screening_cap = Arc::new(AtomicUsize::new(0));
-    let mut outer_options = options.clone();
-    outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
+    let outer_options = options.clone();
     struct MeanWiggleOuterState {
         pub(crate) warm_cache: Option<crate::custom_family::CustomFamilyWarmStart>,
         pub(crate) last_eval: Option<(
@@ -4672,6 +4646,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // they rebuild the spatial basis and penalties at each outer proposal.
     let analytic_outer_hessian_available = true;
     let problem = gam_solve::rho_optimizer::OuterProblem::new(theta_dim)
+        .with_problem_size(
+            y.len(),
+            baseline_design.design.ncols() + frozen_warp_basis.ncols(),
+        )
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
             DeclaredHessianForm::Either
@@ -4686,17 +4664,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         .with_max_iter(options.outer_max_iter)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 2,
-            risk_profile: crate::seeding::SeedRiskProfile::GeneralizedLinear,
-            num_auxiliary_trailing: theta_dim - rho_dim,
-            ..Default::default()
-        })
-        .with_screening_cap(Arc::clone(&screening_cap))
-        // The seed lattice reads its anchor in the outer coordinate, log λ
-        // (#1340); an exp(ρ₀) anchor clamps to the domain's upper face (#2902
-        // row 9).
+        // The start is read in the outer coordinate, log λ (#1340); an exp(ρ₀)
+        // anchor clamps to the domain's upper face (#2902 row 9).
         .with_heuristic_log_lambdas(theta0.to_vec());
 
     let eval_outer = |state: &mut MeanWiggleOuterState,
@@ -4752,7 +4721,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         })
     };
 
-    let mut obj = problem.build_objective_with_screening_proxy(
+    let mut obj = problem.build_objective_with_eval_order(
         MeanWiggleOuterState {
             warm_cache: None,
             last_eval: None,
@@ -4807,27 +4776,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)
         }),
-        // Seed-screening ranking proxy (#969). The cost closure above
-        // hard-errors on a non-converged inner solve — correct for
-        // line-search costs, but under the screening cap (wired into the
-        // outer options and installed by the cascade) the inner solve is
-        // truncated BY DESIGN, so screening through it rejects every seed
-        // — the all-seeds-rejected front-door genus. Screening only RANKS
-        // candidates: the truncated solve's penalized objective is the
-        // ranking signal; convergence is demanded of the selected seed's
-        // full-budget fit, not of capped probes.
-        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
-            if let Some((cached_theta, cached_cost, _, _, cached_warm)) = &state.last_eval
-                && cached_theta == theta
-            {
-                state.warm_cache = Some(cached_warm.clone());
-                return Ok(*cached_cost);
-            }
-            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
-                .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
-            state.warm_cache = Some(eval.warm_start);
-            Ok(eval.objective)
-        },
     );
 
     let outer = problem

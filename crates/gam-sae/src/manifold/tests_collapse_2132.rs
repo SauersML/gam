@@ -202,11 +202,6 @@ fn fit_circle_dictionary(
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(12)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("circle dictionary fit must not abort");
     objective

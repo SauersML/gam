@@ -143,9 +143,9 @@ fn end_thread_allocation_measurement() -> (u64, u64) {
 
 const GRID_NODES: usize = 65;
 
-struct MFixture {
-    family: BernoulliMarginalSlopeFamily,
-    primary: PrimarySlices,
+pub(super) struct MFixture {
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) primary: PrimarySlices,
 }
 
 /// Deterministic 65-node grid over [−2.6, 2.6] with a normalized bell-shaped
@@ -222,13 +222,13 @@ fn mfixture(is_score_warp: bool) -> MFixture {
     MFixture { family, primary }
 }
 
-struct MPoint {
-    q: f64,
-    b: f64,
-    beta: Array1<f64>,
+pub(super) struct MPoint {
+    pub(super) q: f64,
+    pub(super) b: f64,
+    pub(super) beta: Array1<f64>,
 }
 
-fn mpoint(fx: &MFixture) -> MPoint {
+pub(super) fn mpoint(fx: &MFixture) -> MPoint {
     let basis_dim = fx.primary.total - 2;
     let beta = Array1::from_shape_fn(basis_dim, |i| {
         let center = 0.5 * (basis_dim.saturating_sub(1) as f64);
@@ -284,7 +284,6 @@ fn measure_branch(is_score_warp: bool) {
         intercept,
         m_a,
         intercept_fast_path: false,
-        degree9_cells: None,
     };
     let grid = fx
         .family
@@ -370,7 +369,6 @@ fn measure_branch(is_score_warp: bool) {
         intercept: cold_intercept,
         m_a: cold_m_a,
         intercept_fast_path: false,
-        degree9_cells: None,
     };
     let mut cold_scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
     let cold_value = fx
@@ -484,7 +482,7 @@ use super::flex_row_program::BmsFlexRowProgram;
 use gam_math::paired_timing::{SpeedGate, paired_interleaved};
 
 /// Uniform deviation knots over the `mruntime` span for a chosen knot count.
-fn tier_knots(n_knots: usize) -> Array1<f64> {
+pub(super) fn tier_knots(n_knots: usize) -> Array1<f64> {
     Array1::from_iter(
         (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
     )
@@ -515,7 +513,7 @@ fn tier_runtime() -> (DeviationRuntime, usize) {
 /// Build the forced-`GlobalEmpirical` single-row fixture at a caller-supplied
 /// deviation runtime (mirrors `mfixture`, which is pinned to `mruntime`, but
 /// lets this cell target a fixed-K tier width).
-fn build_fixture_with_runtime(is_score_warp: bool, runtime: DeviationRuntime) -> MFixture {
+pub(super) fn build_fixture_with_runtime(is_score_warp: bool, runtime: DeviationRuntime) -> MFixture {
     let grid = mgrid();
     let basis_dim = runtime.basis_dim();
     let policy = gam_runtime::resource::ResourcePolicy::default_library();

@@ -55,7 +55,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -3634,6 +3633,8 @@ mod flex_verify_932_tests;
 // timing is eprintln-only per the SPEC ban on wall-clock correctness budgets.
 #[cfg(test)]
 mod flex_measure_932_tests;
+#[cfg(test)]
+mod third_trace_2998_tests;
 // gam#2768 unit gates on the shared latent-measure decision and the conditional
 // location-scale calibration it escalates to. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it.
@@ -3647,6 +3648,10 @@ mod psi_axis_contractions_979_tests;
 // `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod multistart_member_2359_tests;
+// gam#3022: the rigid row kernel's per-row tensor tables. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod rigid_row_tensors_3022_tests;
 pub(crate) mod row_primary_hessian;
 mod second_correction_traces;
 

@@ -4133,9 +4133,7 @@ fn wilkinson_roundoff(magnitude: f64, operations: usize) -> f64 {
     if magnitude == 0.0 {
         return underflow;
     }
-    // IEEE-754 binary64 unit roundoff under round-to-nearest.
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let ku = next_up(operation_count * unit_roundoff);
+    let ku = next_up(operation_count * crate::roundoff::UNIT_ROUNDOFF);
     if !(ku < 1.0) {
         return f64::INFINITY;
     }

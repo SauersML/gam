@@ -110,11 +110,6 @@ fn planted_circle_fit_returns_with_analytic_certificate() {
     let n_params = seed.len();
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("the healthy planted-circle fit must converge through the bridge");
     // #2235/#2241 — a certified conclusion always names WHICH certificate
