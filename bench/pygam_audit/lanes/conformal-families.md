@@ -20,7 +20,7 @@ Fix (Rust owns the logic; Python and CLI only marshal; parity across all three):
    Commit the result table under bench/pygam_audit/conformal_coverage.md.
 Coordinate: conformal-honest-rho (core certificate, full_conformal.rs internals), predict-interval-hygiene (Student-t posterior intervals), predict-transport (the output format of predict; agree on columns for set-valued output), model-payload, pv-instruments.
 Acceptance:
-- Python and Rust tests show interval="conformal" works for binomial, Poisson, NB, Gamma, and Gaussian with an offset, and gives coverage >= 1 - alpha - 2*MCSE in a seeded Monte Carlo.
+- Python and Rust tests show interval="conformal" works for binomial, Poisson, NB, Gamma, and Gaussian with an offset, and gives coverage within 2*MCSE of 1 - alpha (two-sided) in a seeded Monte Carlo; over-coverage beyond the 1/(n+1) granularity is a bug, and discrete families randomize ties (seeded) so the set is exact rather than conservative.
 - A CLI parity test shows the same sets from `gam predict --conformal`.
 - The benchmark table exists, and gamfit full conformal hits nominal coverage in every cell where pyGAM misses.
 - All route tests fail at HEAD, where only Gaussian identity is supported.

@@ -132,8 +132,11 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
 - `terms.py` LinearTerm/FactorTerm default `penalties='l2'`, `lam=0.6`. Demo `d02` (B): the fitted slope
   in original units for x rescaled by 1 / 0.01 / 0.001 is 0.5001 / 0.0368 / 0.0004 (OLS 0.5007). A unit
   change in a covariate changes the fit.
-- gamfit: parametric terms are unpenalised. already-better. (If shrinkage of factors is ever wanted it
-  must be a random effect with REML-estimated variance, not a fixed ridge.)
+- The slop is the fixed, unselected λ=0.6 ridge on raw coefficients, which is not scale-invariant. The
+  principled default still penalizes (a prior toward no effect, so the null is recoverable): a
+  REML-selected, scale-invariant penalty on the function (sum-to-zero contrasts for factors), with only
+  the intercept unpenalised. gamfit's unpenalised parametric terms are a gap against that default, not
+  already-better.
 
 ### P13 No identifiability constraints  — med — already-better
 - pyGAM builds each s() with a full B-spline basis plus an intercept; demo `d02` (I): s(0)+s(1)
@@ -192,10 +195,10 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
   and it warns "using 10.92 of 11 edf", but nothing acts on it. In `d09` this is the only row where
   pyGAM-gridsearch beats gamfit (0.0518 vs 0.1421). This is "papering over solver issues" (SPEC).
 - Fix: (a) fix the flat-direction stall itself — when the null-space penalty's ρ runs to +∞ (flat REML
-  in that coordinate) treat it as a converged boundary (profile it out / fix at the bound with a
-  certificate) rather than capping k; (b) default k from a principled rule (e.g. min(n_unique−1,
-  max(10, c·n^{1/5}))... or better: keep a generous default (k≈20–30, penalty makes excess k harmless)
-  and let the existing `basis_check` drive automatic k-doubling until the adequacy test passes.
+  in that coordinate) handle it by its analytic ρ→∞ limit (the term projected onto its null space), with stationarity
+  certified on the reduced face, rather than capping k; (b) derive the default k from the data so the
+  basis is rich enough that REML, not k, controls smoothness (the penalty makes excess k harmless), with
+  no hand-picked constants or caps. `basis_check` stays a diagnostic; it does not drive a refit loop.
   Files: `crates/gam-terms/src/term_builder.rs` (delete the cap), `crates/gam-solve/src/rho_optimizer/*`
   (boundary handling for flat ρ), basis-adequacy code (the `basis_check` backend). Size: M–L.
 
@@ -227,12 +230,12 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
 
 ### G4 `smooth_significance` returns four p-values, one of them anti-conservative  — med — gap (SPEC "delete unnecessary options")
 - Fields `p_value_conditional`, `p_value_bound`, `p_value_uncorrected`, `p_value_corrected`. A user must
-  pick; three of the four are not the recommended test. Calibration (d04, 100 null reps): `p_value_corrected` has size 0.060 at 5% and 0.000 at 1% (fine,
-  slightly conservative at 1%). `p_value_conditional` has size **0.140** at 5% and 0.030 at 1%. That is
+  pick; three of the four are not the recommended test. Calibration (d04, 100 null reps): `p_value_corrected` has size 0.060 at 5% and 0.000 at 1% (conservative
+  at 1%, which is a calibration bug to check with KS on the full range and size at several α with more reps). `p_value_conditional` has size **0.140** at 5% and 0.030 at 1%. That is
   anti-conservative, about 4 Monte Carlo SE above nominal (binomial P(X≥14 | 100, 0.05) ≈ 5e-4). An
   exposed field that nearly triples the type-I error is a trap, not an option.
-  Fix: return one `p_value` (the calibrated, smoothing-corrected one) plus statistic/ref-df; move the
-  others behind a diagnostics object or delete. Files: gam-inference smooth test, pyffi payload,
+  Fix: return one `p_value` (the calibrated, smoothing-corrected one) plus statistic/ref-df; delete the
+  others. Files: gam-inference smooth test, pyffi payload,
   `gamfit/_model.py`. Size: S.
 
 ### G5 Magic seed lattices and screening budget in the outer optimiser  — med — gap
@@ -242,10 +245,9 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
   capped-inner-iteration REML proxy with a seed budget of 2 and hard-coded multipliers.
 - Not a violation of "REML only" (a certified derivative-based optimisation follows), but it is grid-
   like pre-selection with unexplained constants, and it is the kind of machinery that hides the G1
-  stall. Fix: a single deterministic, data-derived start (e.g. ρ₀ from the EDF-matching rule
-  tr(A)=k/2 per penalty, or the Fellner–Schall fixed-point iterate, which is derivative-based) followed
-  by the Newton/trust-region REML; delete the lattices and the screening proxy, or at minimum derive
-  every constant from the problem scale. Files: `seeding.rs`, `rho_optimizer/seed_screening.rs`. Size: M.
+  stall. Fix: a single deterministic start derived from the problem itself (e.g. the Fellner–Schall
+  fixed-point iterate, which is derivative-based and constant-free) followed by the Newton/trust-region
+  REML; delete the lattices and the screening proxy. Files: `seeding.rs`, `rho_optimizer/seed_screening.rs`. Size: M.
 
 ### G6 Magic cost gates / tolerance floors in inference code  — low — gap
 - `crates/gam-solve/src/rho_uncertainty.rs:14–16`: `DEFAULT_SAMPLE_COUNT=32`, `MAX_AUTO_RHO_DIM=4`,
@@ -277,11 +279,11 @@ installed `Model.evidence` property). Evidence cites repo file:line; demos use t
 
 "Do not copy" list: P1 fixed λ default; P2 GCV/UBRE, γ=1.4, λ grid; P3 shared λ; P6 √φ scale; P7 weight
 handling / exposure as weights; P8 naive Wald p-values; P10 bootstrap-by-gridsearch; P11 soft 1e9
-constraint penalties; P12 ridge on parametric terms; P13 no identifiability; P14 non-converged fits
+constraint penalties; P12 fixed, unselected ridge on raw parametric coefficients; P13 no identifiability; P14 non-converged fits
 returned; P15 coefficient-difference penalty; P16 jitter constants; P17 bisection/derivative-free
 search; P18 uniform range knots; P4/P5 unchecked formulas.
 
-"Principled replacement" list (gamfit work): G1 remove knot cap, fix flat-ρ boundary, basis_check-driven k;
+"Principled replacement" list (gamfit work): G1 remove knot cap, analytic ρ→∞ limit for flat ρ, data-derived k (basis_check a diagnostic); P12 REML-selected function penalty on parametric/factor terms;
 G2 WPS-corrected AIC in Rust payload, delete pyffi scoring; G4 single calibrated p-value; G5 single
 derivative-based start instead of seed lattices; G6 analytic Vc without cost gates; G3 expose φ̂;
 G7/G8/G9 cleanup.

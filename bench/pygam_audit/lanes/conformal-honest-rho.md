@@ -9,7 +9,7 @@ Fix (principled, no grid, no hand box, no wall-clock budget):
 3. Delete the "grid-checked Lipschitz" wording and the probe-count diagnostics once they are gone. The frozen_rho_certified column becomes a certificate kind: exact_frozen, honest_refit, or refused:<reason>.
 Coordinate: conformal-families (wires this core into predict for more families; agree on the result type first and keep route wiring out of this lane), pv-instruments (owns conformal p-value validity tests), model-payload (the n-sized substrate; do not re-add eager persistence).
 Acceptance:
-- A seeded Monte Carlo (>= 2000 reps, MCSE reported; n in {20, 50, 200}; misspecified mean, heavy tails, heteroscedastic noise) shows marginal coverage >= 1 - alpha - 2*MCSE at alpha in {0.1, 0.05} for EVERY row class, with no rows excluded.
+- A seeded Monte Carlo (>= 2000 reps, MCSE reported; n in {20, 50, 200}; misspecified mean, heavy tails, heteroscedastic noise) shows marginal coverage within 2*MCSE of 1 - alpha (two-sided) at alpha in {0.1, 0.05} for EVERY row class, with no rows excluded; over-coverage beyond the 1/(n+1) granularity is a bug, like under-coverage.
 - An independent oracle test brute-forces the honest set on small n (explicit augmented REML refits on a fine z grid; tests may grid) and asserts the returned set equals it up to breakpoint tolerance.
 - A grep test asserts no probe-grid certificate remains in full_conformal.rs.
 - Cost is reported: the median extra refits per test row. The typical Gaussian case must still be one factorization.
