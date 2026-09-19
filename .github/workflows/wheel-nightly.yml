@@ -78,6 +78,9 @@ permissions:
 jobs:
   wheel:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+      smoke_matrix: ${{ steps.smoke-matrix.outputs.matrix }}
     steps:
       - name: Resolve the exact commit to build
         id: target
@@ -117,6 +120,15 @@ jobs:
           fi
           echo "Preflighting immutable runtime ${checked_out_sha}."
           scripts/ban_scanner.sh .
+
+      - name: Plan the installed-wheel smoke matrix
+        id: smoke-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(python3 scripts/wheel_smoke.py matrix --families linux-x86_64)
+          echo "$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       - name: Build manylinux_2_28 x86_64 wheel
         uses: PyO3/maturin-action@v1
@@ -180,3 +192,39 @@ jobs:
             dist/gam
             dist/RUNTIME_PROVENANCE.txt
           retention-days: 14
+
+  # The same installed-wheel gate pypi-wheels.yml runs before an upload
+  # (scripts/wheel_smoke.py), on every rolling build, so an undeclared
+  # dependency or missing package file is caught on the push that adds it
+  # rather than at the next PyPI release. It installs into an empty venv from
+  # a directory with no package checkout, on every advertised Python version.
+  smoke:
+    name: Smoke py${{ matrix.python }} (${{ matrix.resolution }})
+    needs: wheel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.wheel.outputs.smoke_matrix) }}
+    env:
+      RESOLUTION: ${{ matrix.resolution }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.wheel.outputs.sha }}
+          path: smoke-src
+          sparse-checkout: |
+            scripts/wheel_smoke.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: gamfit-runtime-${{ needs.wheel.outputs.sha }}
+          path: runtime
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the wheel into a fresh venv and exercise it
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          python smoke-src/scripts/wheel_smoke.py run --wheel-dir runtime --resolution "$RESOLUTION"

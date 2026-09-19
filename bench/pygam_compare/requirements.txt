@@ -1,0 +1,6 @@
+# Bench-only dependencies of bench/pygam_compare. NOT runtime dependencies of
+# gamfit: never add these to pyproject.toml. pyGAM is installed from PyPI, not
+# vendored. Pinned so a baseline stays comparable across runs; bump the pin
+# and regenerate bench/pygam_compare/baseline/ together.
+pygam==0.12.0
+psutil>=5.9
