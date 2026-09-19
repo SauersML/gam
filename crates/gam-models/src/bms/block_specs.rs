@@ -3039,7 +3039,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `warm_start_from` resumes the outer search that `fit_custom_family` owns on
     // the driver's fast path; a fit that also searches length-scale or auxiliary
     // coordinates runs the driver's own search, which the point does not describe.
-    if options.required_warm_start.is_some()
+    if options.warm_start.is_some()
         && !(setup.auxiliary_dim() == 0
             && (!kappa_options_ref.enabled || setup.log_kappa_dim() == 0))
     {

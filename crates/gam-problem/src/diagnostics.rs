@@ -630,7 +630,10 @@ impl KktRefusalDiagnosis {
                 "check whether the named block has a near-separated or weakly identified \
                  direction despite a well-conditioned penalized Hessian; in marginal-slope \
                  fits this often indicates marginal/slope coupling rather than a \
-                 Matérn/Duchon polynomial-nullspace failure"
+                 Matérn/Duchon polynomial-nullspace failure; when the active set pins no \
+                 row, no constraint owns the residual, so also check the objective along \
+                 the step for a jump or kink: trials rejected by the same objective \
+                 increase at every trust radius mark a discontinuity, not a multiplier"
             }
             KktRefusalDiagnosis::ActiveSetIncomplete => {
                 "check whether the named block's linear constraints need an additional \

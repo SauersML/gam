@@ -472,15 +472,18 @@ pub(crate) fn materialize_survival<'a>(
     } else {
         parse_link_choice(link_name, config.flexible_link)?
     };
-    // Only the location-scale likelihood fits the anchored link deviation a
-    // `flexible(...)` link asks for; another likelihood would drop it.
+    // Only the location-scale and marginal-slope likelihoods fit the anchored link
+    // deviation a `flexible(...)` link asks for, the one `linkwiggle(...)` gives them;
+    // another likelihood would drop it.
     if link_choice.as_ref().is_some_and(|choice| {
         matches!(choice.mode, gam_terms::inference::formula_dsl::LinkMode::Flexible)
-    }) && survival_mode != SurvivalLikelihoodMode::LocationScale
-    {
+    }) && !matches!(
+        survival_mode,
+        SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+    ) {
         return Err(WorkflowError::InvalidConfig {
             reason: format!(
-                "survival flexible(...) links are supported only with survival_likelihood='location-scale'; got '{}'",
+                "survival flexible(...) links are supported only with survival_likelihood='location-scale' or 'marginal-slope'; got '{}'",
                 config.resolved_survival_likelihood()
             ),
         });
@@ -604,10 +607,16 @@ pub(crate) fn materialize_survival<'a>(
         marginal_slope_deviation_routing,
         marginal_slope_base_link,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let base_link = super::marginal_slope::resolve_marginal_slope_base_link(
+        let (base_link, link_choice) = super::marginal_slope::resolve_marginal_slope_link(
             parsed.linkspec.as_ref(),
+            config.link.as_deref(),
+            config.flexible_link,
             "survival marginal-slope",
         )?;
+        // A flexible link, however it was asked for, is the main formula's default link
+        // deviation, the one `linkwiggle()` gives; an explicit `linkwiggle(...)` wins.
+        let main_linkwiggle =
+            effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
         if let Some(ls_formula) = config.slope_formula.as_deref() {
             let default_z_column = marginal_z_column_name.expect("z column present when no recipe");
             let (_, ls_parsed) =
@@ -669,7 +678,7 @@ pub(crate) fn materialize_survival<'a>(
                 specs.first().cloned(),
                 Some(specs),
                 route_marginal_slope_deviation_blocks(
-                    parsed.linkwiggle.as_ref(),
+                    main_linkwiggle.as_ref(),
                     ls_parsed.linkwiggle.as_ref(),
                 )?,
                 Some(base_link),
@@ -689,7 +698,7 @@ pub(crate) fn materialize_survival<'a>(
                 Some(z),
                 Some(termspec.clone()),
                 Some(vec![termspec.clone()]),
-                route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
+                route_marginal_slope_deviation_blocks(main_linkwiggle.as_ref(), None)?,
                 Some(base_link),
             )
         }
@@ -709,9 +718,9 @@ pub(crate) fn materialize_survival<'a>(
     let marginal_slope_link_dev = marginal_slope_deviation_routing.link_dev;
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        if parsed.linkwiggle.is_some() {
+        if marginal_slope_link_dev.is_some() {
             inference_notes.push(
-                "survival marginal-slope routes formula-level linkwiggle(...) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
+                "survival marginal-slope routes its link deviation (formula-level linkwiggle(...) or a flexible link) into its anchored internal link-deviation block while keeping the probit survival base link".to_string(),
             );
         }
         if marginal_slope_score_warp.is_some() {
