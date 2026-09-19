@@ -600,6 +600,15 @@ fn sigma_step_to_rho_domain(
     }
 }
 
+/// Whether every coordinate of `rho` lies in the ρ box, bounds included. A
+/// non-finite coordinate is outside it. An empty box (no ρ block was bounded)
+/// restricts nothing.
+fn rho_within_domain(rho: &Array1<f64>, bounds: &(Array1<f64>, Array1<f64>)) -> bool {
+    rho.iter()
+        .zip(bounds.0.iter().zip(bounds.1.iter()))
+        .all(|(value, (lo, hi))| *value >= *lo && *value <= *hi)
+}
+
 impl<'a> RemlState<'a> {
     /// Integrate the sampler's declared density, including the distribution
     /// prior and precision-to-log-precision Jacobian, rather than treating
@@ -970,6 +979,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
+        rho_domain: &(Array1<f64>, Array1<f64>),
         allow_escalation: bool,
         n_samples: Option<usize>,
     ) -> (
@@ -1013,7 +1023,19 @@ impl<'a> RemlState<'a> {
         let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
-            &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+            &|rho| {
+                // The criterion's support is the box the outer arm searched ρ
+                // in (#2412, #2812): a draw outside it is not a model, so its
+                // importance weight is zero and there is nothing to evaluate. A
+                // railed coordinate has a near-flat outer curvature, so the
+                // Gaussian proposal puts draws hundreds of units past the rail,
+                // where λ ≈ e^±600 leaves a constrained inner solve with no
+                // valid minimum to report after a full failed search.
+                if !rho_within_domain(rho, rho_domain) {
+                    return None;
+                }
+                self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
+            },
             n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
@@ -1643,6 +1665,25 @@ impl<'a> RemlState<'a> {
             }
         }
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod rho_domain_membership_tests {
+    use super::rho_within_domain;
+    use ndarray::array;
+
+    #[test]
+    fn a_draw_past_a_rail_or_non_finite_is_outside_the_rho_box() {
+        let bounds = (array![-16.0, -16.0], array![20.0, 20.0]);
+        assert!(rho_within_domain(&array![0.0, 3.0], &bounds));
+        // The rails themselves are in the box: a railed ρ̂ is a model.
+        assert!(rho_within_domain(&array![-16.0, 20.0], &bounds));
+        // The draws a near-flat railed coordinate produces.
+        assert!(!rho_within_domain(&array![-600.0, 3.0], &bounds));
+        assert!(!rho_within_domain(&array![0.0, 600.0], &bounds));
+        assert!(!rho_within_domain(&array![f64::NAN, 0.0], &bounds));
+        assert!(!rho_within_domain(&array![0.0, f64::INFINITY], &bounds));
     }
 }
 
