@@ -1,7 +1,6 @@
 //! End-to-end CLI coverage of the formula DSL surface: intercept removal
-//! (`0 + x`), backtick-quoted column names, patsy's `C()` refused with a
-//! pointer to `factor()`, the `domain=[a, b]` spline option, and strict option
-//! parsing. Each case goes
+//! (`0 + x`), backtick-quoted column names, `C()` as a factor alias, the
+//! `domain=[a, b]` spline option, and strict option parsing. Each case goes
 //! through `gam fit` / `gam predict` exactly as a user would.
 
 use std::path::Path;
@@ -119,7 +118,7 @@ fn zero_plus_x_is_least_squares_through_the_origin() {
 }
 
 #[test]
-fn backtick_column_names_fit_through_the_cli_and_patsy_c_points_to_factor() {
+fn backtick_column_names_and_c_alias_fit_through_the_cli() {
     let (x, y) = linear_rows();
     let mut csv = String::from("y,dose (mg),site-id\n");
     for (i, (xi, yi)) in x.iter().zip(&y).enumerate() {
@@ -128,23 +127,9 @@ fn backtick_column_names_fit_through_the_cli_and_patsy_c_points_to_factor() {
         csv.push_str(&format!("{},{xi},{site}\n", yi + shift));
     }
     let scratch = tempfile::tempdir().expect("scratch directory");
-    let fitted = fit_and_predict(scratch.path(), &csv, "y ~ `dose (mg)` + factor(`site-id`)");
+    let fitted = fit_and_predict(scratch.path(), &csv, "y ~ `dose (mg)` + C(`site-id`)");
     assert_eq!(fitted.len(), x.len());
     assert!(fitted.iter().all(|v| v.is_finite()));
-
-    let data = scratch.path().join("train.csv");
-    let model = scratch.path().join("patsy.gam");
-    let refused = gam(&[
-        "fit",
-        path_str(&data),
-        "y ~ `dose (mg)` + C(`site-id`)",
-        "--out",
-        path_str(&model),
-    ]);
-    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
-    let error = stderr(&refused);
-    assert!(error.contains("factor(`site-id`)"), "{error}");
-    assert!(error.contains("group(`site-id`)"), "{error}");
 }
 
 #[test]

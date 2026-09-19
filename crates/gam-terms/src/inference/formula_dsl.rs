@@ -1626,18 +1626,14 @@ mod tests {
     }
 
     #[test]
-    fn patsy_c_is_refused_with_a_pointer_to_factor() {
-        for (formula, column) in [("y ~ C(x2) + x", "x2"), ("y ~ x + C(`site id`)", "`site id`")] {
-            let message = parse_formula(formula)
-                .expect_err("C() is not a term function")
-                .to_string();
-            assert!(message.contains(&format!("factor({column})")), "{formula}: {message}");
-            assert!(message.contains(&format!("group({column})")), "{formula}: {message}");
-        }
-        // Lowercase `c()` is R's vector constructor, an unknown term function
-        // whose error lists the supported ones.
+    fn patsy_c_is_an_alias_for_factor() {
+        let c = parse_formula("y ~ C(g) + x").expect("C() parses");
+        let f = parse_formula("y ~ factor(g) + x").expect("factor() parses");
+        assert_eq!(format!("{:?}", c.terms), format!("{:?}", f.terms));
+        assert!(!random_effect_lenient_unseen("y ~ C(g)"));
+        // Lowercase `c()` is R's vector constructor, not patsy's C().
         let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
-        assert!(err.to_string().contains("factor()"), "{err}");
+        assert!(err.to_string().contains("C()"), "{err}");
     }
 }
 
@@ -3251,19 +3247,15 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
     // the plain-variable handling below is the answer, so there is no error here
     // to report.
     if let Ok(call) = parse_function_call(raw) {
+        // patsy's `C(g)` is the same fixed categorical factor as `factor(g)`.
+        // Only the capitalised spelling is the alias: a lower-case `c(...)` is
+        // R's vector constructor, which only ever appears inside option values.
+        let name = if call.name == "C" {
+            "factor".to_string()
+        } else {
+            call.name.to_ascii_lowercase()
+        };
         let (vars, mut options) = split_call_args(&call);
-        // `factor()` is the one categorical-level spelling; patsy's `C(g)` is
-        // refused with a pointer to it rather than kept as a second name for
-        // the same term. Only the capitalised spelling is patsy's: a lower-case
-        // `c(...)` is R's vector constructor and is an unknown term below.
-        if call.name == "C" {
-            let args = vars.join(", ");
-            return Err(format!(
-                "unknown term function `C` in '{raw}'; write factor({args}) for a \
-                 categorical level effect, or group({args}) for a random effect"
-            ));
-        }
-        let name = call.name.to_ascii_lowercase();
         match name.as_str() {
             "constrain" | "constraint" | "box" => {
                 if vars.len() != 1 {
@@ -3794,7 +3786,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/periodic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), t2(), ti(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/periodic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), t2(), ti(), fs(), sz(), group()/re()/factor()/C(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

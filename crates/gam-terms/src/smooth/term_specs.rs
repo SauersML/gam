@@ -1273,7 +1273,7 @@ pub struct TermCollectionSpec {
 /// every other term is centred against it. A formula that removes the
 /// intercept (`0 + …`, `… - 1`) hands the level to one term, in this order:
 ///
-/// 1. the first fixed factor block (`+ g`, `factor(g)`, or the main
+/// 1. the first fixed factor block (`+ g`, `factor(g)`, `C(g)`, or the main
 ///    effect of a factor `by=`), which already spans the constant with its
 ///    full dummy coding and is made unpenalized, giving the cell-means model;
 /// 2. else the first pure-indicator interaction (`g:h`), which keeps every
