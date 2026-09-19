@@ -4053,6 +4053,7 @@ dependencies = [
  "ndarray 0.17.2",
  "npyz 0.9.1",
  "num-dual",
+ "opt",
  "pest",
  "pest_derive",
  "rand 0.10.2",

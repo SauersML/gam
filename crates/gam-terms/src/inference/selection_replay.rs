@@ -186,8 +186,8 @@ const SMOOTH_LR_SELECTION_DRAWS: usize = 4096;
 /// Fewer than the one-dimensional path's, and the reason is arithmetic rather
 /// than a different accuracy target: a common-scale draw is ONE certified 1-D
 /// search over a criterion diagonalized once per term, and a multi-scale draw is
-/// a sweep of them, each over an [`AxisSlice`] whose diagonalizing basis has to
-/// be re-derived at the draw's current point. The standard error it leaves is
+/// a joint trust-region Newton descent that refactors an `r × r` pair of
+/// factorizations at every step it tries. The standard error it leaves is
 /// measured and published per query — a coarser replay that says how coarse it
 /// is beats a finer one nobody can afford to run.
 const SMOOTH_LR_MULTISCALE_DRAWS: usize = 2048;
@@ -282,12 +282,6 @@ struct SelectionGeometry {
     /// its triangular factor a pseudo-determinant rather than an approximation
     /// to one.
     range_roots: Vec<Array2<f64>>,
-    /// `rank(Σ_{j≠i} Wᵀ S_j W)` for each component `i`, from the same UNIT
-    /// stacked roots and the same bar as `rank`. The other `rank −
-    /// complement_rank[i]` directions of `range(T)` are reached by component `i`
-    /// alone, and an [`AxisSlice`] prices them as exact linear terms rather than
-    /// asking a floating-point cosine whether it is zero.
-    complement_rank: Vec<usize>,
 }
 
 /// The criterion and the statistic at one `t`, WITHOUT an eigenbasis.
@@ -441,27 +435,6 @@ impl SelectionGeometry {
         }
         let range_roots: Vec<Array2<f64>> =
             roots.iter().map(|root| root.dot(&range_basis)).collect();
-        // Which directions a component reaches alone is structural, so it is read
-        // off the λ-free roots once, at the bar that decided `rank`.
-        let mut complement_rank = Vec::with_capacity(roots.len());
-        for axis in 0..roots.len() {
-            let others: Vec<Array2<f64>> = roots
-                .iter()
-                .enumerate()
-                .filter(|&(component, _)| component != axis)
-                .map(|(_, root)| root.clone())
-                .collect();
-            let rows = others.iter().map(|root| root.nrows()).sum::<usize>();
-            if rows == 0 {
-                complement_rank.push(0);
-                continue;
-            }
-            let complement = stack_roots(&others, &vec![0.0; others.len()], rows.max(dimension));
-            let (_, singular, _) =
-                gam_linalg::faer_ndarray::FaerSvd::svd(&complement, false, false)
-                    .map_err(|_| GeometryRefused)?;
-            complement_rank.push(singular.iter().filter(|&&value| value > bar).count());
-        }
         Ok(Self {
             roots,
             log_lambda: log_lambda.to_vec(),
@@ -470,7 +443,6 @@ impl SelectionGeometry {
             stacked_rows: stacked_rows.max(dimension),
             range_basis,
             range_roots,
-            complement_rank,
         })
     }
 
@@ -678,6 +650,236 @@ impl SelectionFactor {
             data += projected[row] * projected[row] - whitened[row] * whitened[row];
         }
         norm_squared - data
+    }
+
+    /// The draw's criterion at the point last [`Self::refactor`]ed, with its exact
+    /// gradient and Hessian in `ρ = ln t` over EVERY scale, and the rounding bands
+    /// a Newton-decrement certificate is decided against.
+    ///
+    /// # The derivatives are read off the two factorizations already formed
+    ///
+    /// With `C_j = e^{ρ̂_j + ρ_j} Uᵀ S̃_j U` the part of `C` scale `j` owns,
+    /// `∂C/∂ρ_j = C_j` and `∂C_j/∂ρ_k = δ_jk C_j`. Write `M = QR` and
+    /// `[M; I] = Q̃R̃` for the two reductions, `Q_j` and `Q̃_j` for the rows of each
+    /// thin factor that block `j` occupies, and
+    ///
+    /// ```text
+    /// G_j = Q_jᵀQ_j,   G̃_j = Q̃_jᵀQ̃_j,   w = R̃⁻ᵀv,   y_j = G̃_j w.
+    /// ```
+    ///
+    /// Then `C_j = RᵀG_jR = R̃ᵀG̃_jR̃`, so `C⁻¹C_j = R⁻¹G_jR` and
+    /// `(I + C)⁻¹C_j = R̃⁻¹G̃_jR̃`, and the criterion
+    /// `log|I + C| − log|C| + ‖v‖² − vᵀ(I + C)⁻¹v` differentiates to
+    ///
+    /// ```text
+    /// g_j  = tr G̃_j − tr G_j + w·y_j,
+    /// H_jk = δ_jk g_j − ⟨G̃_j, G̃_k⟩ + ⟨G_j, G_k⟩ − 2 y_j·y_k.
+    /// ```
+    ///
+    /// Every quantity is an inner product of rows of an orthonormal factor, so it
+    /// inherits the row-graded accuracy the reductions were ordered for (see the
+    /// type's doc) and never touches an assembled `C` or an inverse of `R`.
+    ///
+    /// # Bands
+    ///
+    /// Each entry is an accumulation over the reductions' `rows · r` rounded
+    /// operations (the Householder backward-error bound, Higham Thm 19.4), so every
+    /// band is [`gam_linalg::roundoff::accumulation_band`] at that depth over the
+    /// absolute sum of the entry's own summands. The Hessian's band is charged to
+    /// the Frobenius norm of the matrix of those sums, which bounds its spectral
+    /// norm.
+    fn jet(
+        &self,
+        geometry: &SelectionGeometry,
+        projected: &[f64],
+    ) -> Option<opt::SecondOrderSample> {
+        let rank = self.rank;
+        let components = geometry.range_roots.len();
+        if projected.len() != rank {
+            return None;
+        }
+        let stacked_q = householder_thin_q(&self.stacked);
+        let bordered_q = householder_thin_q(&self.bordered);
+        let whitened =
+            gam_linalg::triangular::forward_substitution_lower_vector(&self.factor, projected);
+        // Each block's rows sit where `refactor` put them.
+        let mut stacked_start = vec![0usize; components];
+        let mut bordered_start = vec![0usize; components];
+        let (mut stacked_row, mut bordered_row) = (0usize, 0usize);
+        for &block in &self.order {
+            if block == components {
+                bordered_row += rank;
+                continue;
+            }
+            stacked_start[block] = stacked_row;
+            bordered_start[block] = bordered_row;
+            stacked_row += geometry.range_roots[block].nrows();
+            bordered_row += geometry.range_roots[block].nrows();
+        }
+        let gram = |orthonormal: &Array2<f64>, start: usize, rows: usize| {
+            let block = orthonormal.slice(ndarray::s![start..start + rows, ..]);
+            block.t().dot(&block)
+        };
+        let mut plain = Vec::with_capacity(components);
+        let mut bordered = Vec::with_capacity(components);
+        let mut mapped = Vec::with_capacity(components);
+        for component in 0..components {
+            let rows = geometry.range_roots[component].nrows();
+            plain.push(gram(&stacked_q, stacked_start[component], rows));
+            let own = gram(&bordered_q, bordered_start[component], rows);
+            mapped.push(own.dot(&whitened));
+            bordered.push(own);
+        }
+
+        let mut value = self.offset;
+        let mut magnitude = 0.0_f64;
+        for index in 0..rank {
+            value += projected[index] * projected[index] - whitened[index] * whitened[index];
+            magnitude += 2.0
+                * (self.diagonal[index].abs().ln().abs()
+                    + self.bordered_diagonal[index].abs().ln().abs())
+                + projected[index] * projected[index]
+                + whitened[index] * whitened[index];
+        }
+        let depth = self.bordered.nrows() * rank;
+        let mut gradient = Array1::<f64>::zeros(components);
+        let mut gradient_band = Array1::<f64>::zeros(components);
+        let mut diagonal_sum = vec![0.0_f64; components];
+        for component in 0..components {
+            let own_trace = bordered[component].diag().sum();
+            let plain_trace = plain[component].diag().sum();
+            let quadratic = whitened.dot(&mapped[component]);
+            gradient[component] = own_trace - plain_trace + quadratic;
+            diagonal_sum[component] = own_trace + plain_trace + quadratic.abs();
+            gradient_band[component] =
+                gam_linalg::roundoff::accumulation_band(depth, diagonal_sum[component]);
+        }
+        let frobenius = |left: &Array2<f64>, right: &Array2<f64>| {
+            left.iter()
+                .zip(right.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+        };
+        let mut hessian = Array2::<f64>::zeros((components, components));
+        let mut hessian_sums = 0.0_f64;
+        for row in 0..components {
+            for column in row..components {
+                let own = frobenius(&bordered[row], &bordered[column]);
+                let base = frobenius(&plain[row], &plain[column]);
+                let coupling = mapped[row].dot(&mapped[column]);
+                let mut entry = -own + base - 2.0 * coupling;
+                let mut sum = own.abs() + base.abs() + 2.0 * coupling.abs();
+                if row == column {
+                    entry += gradient[row];
+                    sum += diagonal_sum[row];
+                }
+                hessian[[row, column]] = entry;
+                hessian[[column, row]] = entry;
+                let copies = if row == column { 1.0 } else { 2.0 };
+                hessian_sums += copies * sum * sum;
+            }
+        }
+        let finite = value.is_finite()
+            && gradient.iter().all(|entry| entry.is_finite())
+            && hessian.iter().all(|entry| entry.is_finite());
+        finite.then(|| opt::SecondOrderSample {
+            value,
+            gradient,
+            hessian: Some(hessian),
+            decrement_bands: Some(opt::DecrementBands {
+                objective: gam_linalg::roundoff::accumulation_band(depth, magnitude),
+                gradient: gradient_band,
+                hessian: gam_linalg::roundoff::accumulation_band(depth, hessian_sums.sqrt()),
+            }),
+        })
+    }
+}
+
+/// One draw's multi-scale criterion as a function of its OPEN scales, for
+/// [`opt::NewtonTrustRegion`]. A scale whose window is empty stays at the fitted
+/// point, `ln t = 0`.
+struct MultiscaleCriterion<'a> {
+    geometry: &'a SelectionGeometry,
+    factor: &'a mut SelectionFactor,
+    coordinates: &'a [f64],
+    open: &'a [usize],
+    point: Vec<f64>,
+}
+
+impl MultiscaleCriterion<'_> {
+    /// Factor the geometry at the full point `x` names. A point the reductions
+    /// refuse — a scale that overflows, a column that collapses — is outside the
+    /// criterion's domain, which the trust region answers by shrinking.
+    fn factor_at(&mut self, x: &Array1<f64>) -> Result<(), opt::ObjectiveEvalError> {
+        for (slot, &axis) in self.open.iter().enumerate() {
+            self.point[axis] = x[slot];
+        }
+        if self.factor.refactor(self.geometry, &self.point) {
+            Ok(())
+        } else {
+            Err(opt::ObjectiveEvalError::recoverable(
+                "the selection criterion cannot be factored at this point",
+            ))
+        }
+    }
+}
+
+impl opt::ZerothOrderObjective for MultiscaleCriterion<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, opt::ObjectiveEvalError> {
+        self.factor_at(x)?;
+        let norm_squared = self.coordinates.iter().map(|value| value * value).sum();
+        Ok(self.factor.score(self.coordinates, norm_squared).0)
+    }
+}
+
+impl opt::FirstOrderObjective for MultiscaleCriterion<'_> {
+    fn eval_grad(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<opt::FirstOrderSample, opt::ObjectiveEvalError> {
+        let sample = opt::SecondOrderObjective::eval_hessian(self, x)?;
+        Ok(opt::FirstOrderSample {
+            value: sample.value,
+            gradient: sample.gradient,
+        })
+    }
+}
+
+impl opt::SecondOrderObjective for MultiscaleCriterion<'_> {
+    fn eval_hessian(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Result<opt::SecondOrderSample, opt::ObjectiveEvalError> {
+        self.factor_at(x)?;
+        let full = self
+            .factor
+            .jet(self.geometry, self.coordinates)
+            .ok_or_else(|| {
+                opt::ObjectiveEvalError::recoverable(
+                    "the selection criterion's derivatives are not finite at this point",
+                )
+            })?;
+        let open = self.open;
+        let restrict = |full: &Array1<f64>| Array1::from_iter(open.iter().map(|&axis| full[axis]));
+        let hessian = full.hessian.as_ref().map(|hessian| {
+            Array2::from_shape_fn((open.len(), open.len()), |(row, column)| {
+                hessian[[open[row], open[column]]]
+            })
+        });
+        let bands = full
+            .decrement_bands
+            .as_ref()
+            .map(|bands| opt::DecrementBands {
+                objective: bands.objective,
+                gradient: restrict(&bands.gradient),
+                hessian: bands.hessian,
+            });
+        Ok(opt::SecondOrderSample {
+            value: full.value,
+            gradient: restrict(&full.gradient),
+            hessian,
+            decrement_bands: bands,
+        })
     }
 }
 
@@ -1147,9 +1349,9 @@ impl SmoothLrSelectionDecline {
 /// moves together, `T(t) = t·T(1)`, so `ν_j = eig T(1)`, `c_j` are the draw's
 /// coordinates in that eigenbasis, `r` is the structural rank, `const` is
 /// `Σ_{j<r} ln ν_j` and there is no `μ` (the log-determinant runs over EVERY
-/// direction: an unpenalized one has `ν = 0` and carries `ln 1 = 0`). On an
-/// [`AxisSlice`] only one scale moves, and `μ` carries the directions that scale
-/// shares with the others through `log|T(u)|₊`. With `g = s(1 − s)` for either
+/// direction: an unpenalized one has `ν = 0` and carries `ln 1 = 0`). A
+/// criterion whose pseudo-determinant is itself a moving spectrum carries it as
+/// `μ`, subtracted share by share. With `g = s(1 − s)` for either
 /// spectrum every derivative is closed form,
 ///
 /// ```text
@@ -1635,212 +1837,6 @@ impl DiagonalCriterion<'_> {
     }
 }
 
-/// One draw's multi-scale criterion along ONE scale's coordinate, with every
-/// other scale held at the draw's current point, in the diagonal form
-/// [`DiagonalCriterion`] certifies.
-///
-/// # The slice is exact, not a local model
-///
-/// In the range basis, with `u` the moving coordinate,
-/// `C(u) = B + e^u A`, `A = λ̂_i Uᵀ S̃_i U` and `B` the other scales at their
-/// current `t_j`. The criterion is `vᵀDv + log|I + C| − log|C|` with
-/// `D = (I + C)⁻¹C` (see [`SelectionFactor`]), and each half diagonalizes in `u`:
-///
-/// * **Data and `log|I + C|`.** `I + B = LLᵀ` and `L⁻¹AL⁻ᵀ = V diag(ν) Vᵀ`, so
-///   `I + C(u) = LV(I + e^u ν)VᵀLᵀ`. With `h = VᵀL⁻¹v`,
-///   `vᵀDv = const + Σ_j h_j² s_j(u)` and
-///   `log|I + C(u)| = log|I + B| + Σ_j ln(1 + e^u ν_j)`. `B` does not move along
-///   the slice, so the absolute error of an assembled `I + B` is common to every
-///   value the slice returns and cancels from each change it is asked about. So
-///   `I + B` is assembled and `ν` is read off the singular values of
-///   `L⁻¹(A's root)ᵀ`.
-/// * **`log|C|₊`.** Here the conditioning is the whole problem (#2644), so it is
-///   taken from the stacked scaled ROOTS at the current point `x = u_i`,
-///   `M = [B's roots; e^{x/2}·A's root] = QR`, never from an assembled sum. With
-///   `Q = [Q_B; Q_A]` orthonormal, `C(u) = Rᵀ(Q_BᵀQ_B + e^{u−x} Q_AᵀQ_A)R`, and
-///   `Q_BᵀQ_B + Q_AᵀQ_A = I` gives the two blocks common eigenvectors with
-///   eigenvalues `c_k²` and `s_k² = 1 − c_k²` — the cosine–sine decomposition of
-///   `Q`. So `log|C(u)| = log|C(x)| + Σ_k ln(c_k² + e^{u−x} s_k²)`: a direction
-///   with `c = 0` only `A` reaches and contributes `u` exactly (it is counted into
-///   `r`), one with `s = 0` contributes nothing, and every other one is
-///   `ln c_k² + ln(1 + e^u μ_k)` with `μ_k = e^{−x} s_k²/c_k²`.
-///
-/// `c_k` and `s_k` are the singular values of their own blocks, paired by order
-/// (cosines ascending against sines descending), and of each pair the SMALLER
-/// member is the one read from its block: a singular value carries an absolute
-/// error of `ε‖Q‖ = ε`, so the small member keeps digits that `1 − (large)²` would
-/// not. Which directions have `c = 0` is not decided by that arithmetic: it is
-/// `rank − complement_rank[i]`, read once per term off the λ-free roots.
-struct AxisSlice {
-    /// `h_j²`, the draw's squared coordinates in `A`'s basis against `I + B`.
-    squares: Vec<f64>,
-    /// `ν_j`, the spectrum of `A` against `I + B`.
-    generalized: Vec<f64>,
-    /// Directions of `range(C)` only `A` reaches.
-    rank: usize,
-    /// `μ_k`, the directions `A` shares with `B`.
-    occam: Vec<f64>,
-}
-
-impl AxisSlice {
-    /// The slice of the criterion along scale `axis` through `log_t`, for the draw
-    /// whose coordinates in the range basis are `coordinates`. `None` when a
-    /// factorization refuses or a scale overflows: the point cannot be priced.
-    fn new(
-        geometry: &SelectionGeometry,
-        log_t: &[f64],
-        axis: usize,
-        coordinates: &[f64],
-    ) -> Option<Self> {
-        let rank = geometry.rank;
-        if log_t.len() != geometry.range_roots.len()
-            || axis >= log_t.len()
-            || coordinates.len() != rank
-        {
-            return None;
-        }
-        let mut hessian = Array2::<f64>::eye(rank);
-        let mut other_rows = 0usize;
-        for (component, root) in geometry.range_roots.iter().enumerate() {
-            if component == axis {
-                continue;
-            }
-            let scale = (geometry.log_lambda[component] + log_t[component]).exp();
-            if !scale.is_finite() {
-                return None;
-            }
-            hessian.scaled_add(scale, &root.t().dot(root));
-            other_rows += root.nrows();
-        }
-        let lower = gam_linalg::triangular::cholesky_factor_in_place(
-            hessian.view(),
-            gam_linalg::triangular::CholeskyGuard::FiniteStrict,
-        )?;
-        let own_scale = (0.5 * geometry.log_lambda[axis]).exp();
-        if !own_scale.is_finite() {
-            return None;
-        }
-        let own = geometry.range_roots[axis].mapv(|value| own_scale * value);
-        let own_rows = own.nrows();
-        let mut squares = Vec::with_capacity(own_rows);
-        let mut generalized = Vec::with_capacity(own_rows);
-        if own_rows > 0 {
-            let whitened =
-                gam_linalg::triangular::forward_substitution_lower_matrix(&lower, own.t());
-            let mapped =
-                gam_linalg::triangular::forward_substitution_lower_vector(&lower, coordinates);
-            let (left, singular, _) =
-                gam_linalg::faer_ndarray::FaerSvd::svd(&whitened, true, false).ok()?;
-            let left = left?;
-            for (mode, &sigma) in singular.iter().enumerate() {
-                if !(sigma.is_finite() && sigma >= 0.0) {
-                    return None;
-                }
-                let projection = left.column(mode).dot(&mapped);
-                squares.push(projection * projection);
-                generalized.push(sigma * sigma);
-            }
-        }
-
-        let stacked_rows = other_rows + own_rows;
-        if stacked_rows < rank {
-            return None;
-        }
-        let mut stacked = Array2::<f64>::zeros((stacked_rows, rank));
-        let mut offset = 0usize;
-        for (component, root) in geometry.range_roots.iter().enumerate() {
-            if component == axis {
-                continue;
-            }
-            let scale = (0.5 * (geometry.log_lambda[component] + log_t[component])).exp();
-            stacked
-                .slice_mut(ndarray::s![offset..offset + root.nrows(), ..])
-                .assign(&root.mapv(|value| scale * value));
-            offset += root.nrows();
-        }
-        let current = (0.5 * log_t[axis]).exp();
-        if !current.is_finite() {
-            return None;
-        }
-        stacked
-            .slice_mut(ndarray::s![offset.., ..])
-            .assign(&own.mapv(|value| current * value));
-        let mut diagonal = vec![0.0_f64; rank];
-        householder_triangularize(&mut stacked, &mut diagonal)?;
-        let orthonormal = householder_thin_q(&stacked);
-        let mut sines = if own_rows > 0 {
-            gam_linalg::faer_ndarray::FaerSvd::svd(
-                &orthonormal.slice(ndarray::s![other_rows.., ..]),
-                false,
-                false,
-            )
-            .ok()?
-            .1
-            .to_vec()
-        } else {
-            Vec::new()
-        };
-        let mut cosines = if other_rows > 0 {
-            gam_linalg::faer_ndarray::FaerSvd::svd(
-                &orthonormal.slice(ndarray::s![..other_rows, ..]),
-                false,
-                false,
-            )
-            .ok()?
-            .1
-            .to_vec()
-        } else {
-            Vec::new()
-        };
-        sines.sort_by(|a, b| b.total_cmp(a));
-        sines.resize(rank, 0.0);
-        cosines.sort_by(|a, b| a.total_cmp(b));
-        let mut paired_cosines = vec![0.0_f64; rank.saturating_sub(cosines.len())];
-        paired_cosines.extend(cosines);
-
-        let reached_alone = rank.checked_sub(geometry.complement_rank[axis])?;
-        let mut linear = reached_alone;
-        let mut occam = Vec::with_capacity(rank - reached_alone);
-        let inverse_current = (-log_t[axis]).exp();
-        for mode in reached_alone..rank {
-            let (sine, cosine) = (sines[mode], paired_cosines[mode]);
-            let (sine_squared, cosine_squared) = if sine <= cosine {
-                (sine * sine, 1.0 - sine * sine)
-            } else {
-                (1.0 - cosine * cosine, cosine * cosine)
-            };
-            if !(sine_squared > 0.0) {
-                continue;
-            }
-            if !(cosine_squared > 0.0) {
-                linear += 1;
-                continue;
-            }
-            let scaled = inverse_current * sine_squared / cosine_squared;
-            if !scaled.is_finite() {
-                return None;
-            }
-            occam.push(scaled);
-        }
-        Some(Self {
-            squares,
-            generalized,
-            rank: linear,
-            occam,
-        })
-    }
-
-    fn criterion(&self) -> DiagonalCriterion<'_> {
-        DiagonalCriterion {
-            squares: &self.squares,
-            generalized: &self.generalized,
-            rank: self.rank,
-            occam: &self.occam,
-            constant: 0.0,
-        }
-    }
-}
-
 /// The λ̂-selection replay, or the named reason there is none.
 ///
 /// This is an enum rather than an `Option` so that a consumer cannot read
@@ -2127,20 +2123,23 @@ impl SmoothLrSelectionReplay {
     /// soon as one `λ̂` rails, which for a null-true double-penalty smooth is the
     /// normal state and not a corner case.
     ///
-    /// # Each draw's selection is a coordinatewise CERTIFIED descent
+    /// # Each draw's selection is a certified joint Newton minimum
     ///
-    /// No basis diagonalizes `m` penalties against the information at once, but
-    /// one scale at a time does: with every other scale held at the draw's current
-    /// point, the criterion along scale `i` is exactly an [`AxisSlice`], and its
-    /// certified global minimum over that axis's window comes from the same
-    /// [`DiagonalCriterion`] search the common-scale lane uses. See
-    /// [`Self::select_draw`] for the sweep and why it terminates without a budget.
+    /// The criterion is smooth in `ρ = ln t` and its gradient and Hessian are
+    /// exact inner products of the two factorizations that already price it
+    /// ([`SelectionFactor::jet`]). Each draw's selection is therefore the
+    /// box-constrained trust-region Newton descent of [`opt::NewtonTrustRegion`]
+    /// over the open scales jointly, stopped by the Newton-decrement certificate
+    /// on those derivatives' rounding bands. See [`Self::select_draw`].
     ///
-    /// This replaces a `441`-point bracket grid followed by a compass descent
-    /// capped at `96` criterion evaluations per draw, which kept the best point a
-    /// capped draw had reached (#2902: SPEC rules 18, 19 and 22). A draw whose
-    /// slice cannot be priced or certified declines the whole replay rather than
-    /// being sampled partially.
+    /// This replaces, first, a `441`-point bracket grid followed by a compass
+    /// descent capped at `96` criterion evaluations per draw (#2902: SPEC rules
+    /// 18, 19 and 22), and then a coordinatewise sweep of certified 1-D global
+    /// searches. The sweep moved one scale at a time along a valley that couples
+    /// them, and on a tensor-product `te(x, z)` beside a factor it spent more than
+    /// sixty sweeps of `~140 ms` each on a single draw. A draw whose selection
+    /// cannot be priced or certified declines the whole replay rather than being
+    /// sampled partially.
     fn generate_multiscale(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
@@ -2200,10 +2199,13 @@ impl SmoothLrSelectionReplay {
                 }
                 coordinates[column] = projection;
             }
-            Self::select_draw(geometry, log_scale_windows, &coordinates, &mut selected)?;
-            if !factor.refactor(geometry, &selected) {
-                return Err(SmoothLrSelectionDecline::SelectionUnresolved);
-            }
+            Self::select_draw(
+                geometry,
+                log_scale_windows,
+                &coordinates,
+                &mut factor,
+                &mut selected,
+            )?;
             Ok((factor.score(&coordinates, norm_squared).1, conditional))
         };
         let mut selection_sample = vec![0.0_f64; draws];
@@ -2230,58 +2232,77 @@ impl SmoothLrSelectionReplay {
         })
     }
 
-    /// One draw's multi-scale selection, written into `selected`.
+    /// One draw's multi-scale selection, written into `selected`, with `factor`
+    /// left factored there.
     ///
     /// The draw starts at the fitted point, clamped into each open window, and
-    /// sweeps the open axes in order. An axis moves to the certified global
-    /// minimum of its [`AxisSlice`] only when that lowers the slice's criterion by
-    /// more than both points' forward-error bands, so a move is never a rounding
-    /// artefact. The descent stops at the first sweep that moves nothing: every
-    /// axis is then at its own global minimum through the point, which is a
-    /// stationary point of the box-constrained criterion. Every accepted move
-    /// lowers a criterion that is bounded below on the box by more than its own
-    /// rounding, so the sweep terminates without an iteration budget.
+    /// [`opt::NewtonTrustRegion`] descends the criterion over the open scales
+    /// jointly, inside their windows, on its exact gradient and Hessian. It stops
+    /// only when the Newton decrement over the free scales is certified below the
+    /// criterion's own rounding band: the point is then a stationary point of the
+    /// box-constrained criterion to working precision, a scale at its wall counted
+    /// free only while the gradient points back into the window. There is no
+    /// iteration budget. The trust region accepts only steps that lower the
+    /// criterion, which is bounded below on the box, so it cannot cycle.
+    ///
+    /// Every other end of the descent — a radius that collapses without a
+    /// certificate, a point the factorizations cannot price — is
+    /// `SelectionUnresolved`, never the best point reached.
+    ///
+    /// The selection is a deterministic function of the draw, and the observation
+    /// goes through the same function, so the replay's law is the law of the
+    /// statistic the row publishes whichever stationary point the descent ends at.
     fn select_draw(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         coordinates: &[f64],
+        factor: &mut SelectionFactor,
         selected: &mut [f64],
     ) -> Result<(), SmoothLrSelectionDecline> {
+        use SmoothLrSelectionDecline::{NoPenaltyComponents, SelectionUnresolved};
         if selected.len() != log_scale_windows.len() {
-            return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
+            return Err(NoPenaltyComponents);
         }
-        for (slot, &(low, high)) in selected.iter_mut().zip(log_scale_windows) {
-            *slot = if high > low { 0.0_f64.clamp(low, high) } else { 0.0 };
+        let mut open = Vec::with_capacity(selected.len());
+        for (axis, (slot, &(low, high))) in selected.iter_mut().zip(log_scale_windows).enumerate() {
+            *slot = if high > low {
+                open.push(axis);
+                0.0_f64.clamp(low, high)
+            } else {
+                0.0
+            };
         }
-        loop {
-            let mut moved = false;
-            for (axis, &(low, high)) in log_scale_windows.iter().enumerate() {
-                if !(high > low) {
-                    continue;
-                }
-                let slice = AxisSlice::new(geometry, selected, axis, coordinates)
-                    .ok_or(SmoothLrSelectionDecline::SelectionUnresolved)?;
-                let criterion = slice.criterion();
-                let candidate = criterion
-                    .select(low, high)
-                    .map_err(|_| SmoothLrSelectionDecline::SelectionUnresolved)?;
-                let (
-                    Some(([at_candidate, ..], candidate_band)),
-                    Some(([at_incumbent, ..], incumbent_band)),
-                ) = (criterion.jet(candidate), criterion.jet(selected[axis]))
-                else {
-                    return Err(SmoothLrSelectionDecline::SelectionUnresolved);
-                };
-                if at_candidate < at_incumbent - (candidate_band + incumbent_band) {
-                    selected[axis] = candidate;
-                    moved = true;
-                }
+        if !open.is_empty() {
+            let lower = Array1::from_iter(open.iter().map(|&axis| log_scale_windows[axis].0));
+            let upper = Array1::from_iter(open.iter().map(|&axis| log_scale_windows[axis].1));
+            let start = Array1::from_iter(open.iter().map(|&axis| selected[axis]));
+            let bounds = opt::Bounds::new(lower, upper, 0.0).map_err(|_| SelectionUnresolved)?;
+            let unbounded = opt::MaxIterations::new(usize::MAX).map_err(|_| SelectionUnresolved)?;
+            let criterion = MultiscaleCriterion {
+                geometry,
+                factor: &mut *factor,
+                coordinates,
+                open: &open,
+                point: selected.to_vec(),
+            };
+            let solution = opt::NewtonTrustRegion::new(start, criterion)
+                .with_bounds(bounds)
+                .with_profile(opt::Profile::Deterministic)
+                .with_max_iterations(unbounded)
+                .run()
+                .map_err(|_| SelectionUnresolved)?;
+            for (slot, &axis) in open.iter().enumerate() {
+                selected[axis] = solution.final_point[slot];
             }
-            if !moved {
-                return Ok(());
-            }
+        }
+        // The descent's last evaluation may have been a rejected trial.
+        if factor.refactor(geometry, selected) {
+            Ok(())
+        } else {
+            Err(SelectionUnresolved)
         }
     }
+
     /// The observation's statistic under the replay's own selection, given
     /// its statistic `conditional` at the fitted `λ̂`: `conditional` carried by
     /// the quadratic model's ratio `W_q(t*; z)/W_q(1; z)` of the observed
@@ -2683,11 +2704,9 @@ fn wald_selection_test(
                     &geometry,
                     log_scale_windows,
                     &coordinates,
+                    &mut factor,
                     &mut selected,
                 )?;
-                if !factor.refactor(&geometry, &selected) {
-                    return Err(SelectionUnresolved);
-                }
                 Ok(factor.wald(&coordinates, norm_squared))
             };
             let statistic = select(observed, norm_squared)?;
@@ -2830,9 +2849,9 @@ fn split_mix64(state: u64) -> u64 {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        AxisSlice, DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
-        SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
-        SmoothLrSelectionReplay, split_mix64, wald_conditional_tail,
+        DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream, SelectionFactor,
+        SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline, SmoothLrSelectionReplay,
+        split_mix64, wald_conditional_tail,
     };
     use ndarray::Array2;
 
@@ -3705,67 +3724,11 @@ mod selection_replay_tests {
             .collect()
     }
 
-    /// #2902: an axis slice is the multi-scale criterion along its axis, exactly.
-    ///
-    /// The slice prices `log|I + C|` from an assembled `I + B` and `log|C|₊` from
-    /// the cosine–sine decomposition of the stacked roots, so it is checked
-    /// against [`SelectionFactor`]'s route on a dense information with two dense
-    /// components, at separations up to the box's width: every change of the
-    /// slice's value along its axis must be the same change of the criterion.
-    #[test]
-    fn an_axis_slice_is_the_criterion_along_its_axis_2902() {
-        let (information, bending, ridge, draw) = dense_pair();
-        let norm_squared: f64 = draw.iter().map(|value| value * value).sum();
-        for separation in [0.0_f64, 18.0, 40.0] {
-            let geometry = SelectionGeometry::whiten(
-                &information,
-                &[bending.clone(), ridge.clone()],
-                &[0.5 * separation, -0.5 * separation],
-            )
-            .expect("geometry");
-            let coordinates = range_coordinates(&geometry, &draw);
-            let mut factor = SelectionFactor::new(&geometry);
-            for point in [[0.0_f64, 0.0], [-2.5, 1.75], [3.0, -4.0]] {
-                for axis in 0..2 {
-                    let slice = AxisSlice::new(&geometry, &point[..], axis, &coordinates)
-                        .expect("an axis slice at a priced point");
-                    let criterion = slice.criterion();
-                    let slice_anchor = criterion.jet(point[axis]).expect("slice jet").0[0];
-                    assert!(factor.refactor(&geometry, &point[..]));
-                    let anchor = factor.score(&coordinates, norm_squared).0;
-                    for offset in [-9.0_f64, -1.5, 2.0, 6.0] {
-                        let mut moved = point;
-                        moved[axis] += offset;
-                        let slice_value = criterion.jet(moved[axis]).expect("slice jet").0[0];
-                        assert!(factor.refactor(&geometry, &moved[..]));
-                        let value = factor.score(&coordinates, norm_squared).0;
-                        let slice_change = slice_value - slice_anchor;
-                        let change = value - anchor;
-                        assert!(
-                            (slice_change - change).abs()
-                                <= 1e-7 * (1.0 + value.abs().max(anchor.abs())),
-                            "separation {separation}, point {point:?}, axis {axis}, offset \
-                             {offset}: the slice moves by {slice_change}, the criterion by {change}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// #2902: each draw's multi-scale selection is the criterion's minimum along
-    /// every axis through it, and on a separable pair over the whole box.
-    ///
-    /// This is the claim [`SmoothLrSelectionReplay::select_draw`] makes, checked
-    /// through the canonical evaluator at points the descent never visited. On the
-    /// SEPARABLE pair — unit information, a bending penalty on four directions and
-    /// a ridge on the other two, at the separation a null-true smooth reaches — the
-    /// criterion is a sum of one function per scale, so a coordinatewise minimum is
-    /// the global one and no probe anywhere in the box may undercut it. On the
-    /// COUPLED dense pair only probes along each axis through the selection are
-    /// held to it, which is what a coordinatewise minimum is.
-    #[test]
-    fn multiscale_selection_is_a_coordinatewise_certified_minimum_2902() {
+    /// The separable pair — unit information, a bending penalty on four
+    /// directions and a ridge on the other two, at the separation a null-true
+    /// smooth reaches — and the coupled dense pair: the two fixtures the
+    /// multi-scale selection is checked on.
+    fn separable_and_coupled() -> (SelectionGeometry, SelectionGeometry) {
         let q = 6;
         let mut bending = Array2::<f64>::zeros((q, q));
         let mut ridge = Array2::<f64>::zeros((q, q));
@@ -3780,22 +3743,133 @@ mod selection_replay_tests {
             SelectionGeometry::whiten(&Array2::eye(q), &[bending, ridge], &[12.0, -12.0])
                 .expect("separable geometry");
         let (information, dense_bending, dense_ridge, _) = dense_pair();
-        let coupled = SelectionGeometry::whiten(
-            &information,
-            &[dense_bending, dense_ridge],
-            &[9.0, -9.0],
-        )
-        .expect("coupled geometry");
-        let windows = [(-42.0_f64, 18.0_f64), (-18.0, 42.0)];
-        let mut state = 0x2902_0004_u64;
-        let mut uniform = move || {
-            state = split_mix64(state);
-            (state >> 11) as f64 / (1u64 << 53) as f64
-        };
-        for (label, geometry, whole_box) in [
-            ("separable", &separable, true),
-            ("coupled", &coupled, false),
+        let coupled =
+            SelectionGeometry::whiten(&information, &[dense_bending, dense_ridge], &[9.0, -9.0])
+                .expect("coupled geometry");
+        (separable, coupled)
+    }
+
+    /// #2902: the factor route's gradient and Hessian are the criterion's.
+    ///
+    /// Checked against the eigen route's spectrum in closed form, not against
+    /// differences of the value. Under a COMMON shift `ρ + u·1` every eigenvalue
+    /// of `T` scales by `e^u`, so with `s_j = e_j/(1 + e_j)` and `c_j` the draw's
+    /// eigen-coordinates
+    ///
+    /// ```text
+    /// Σ_j g_j   = Σ_j c_j² s_j(1 − s_j) + Σ_j s_j − rank,
+    /// Σ_jk H_jk = Σ_j c_j² s_j(1 − s_j)(1 − 2s_j) + Σ_j s_j(1 − s_j),
+    /// ```
+    ///
+    /// on either fixture. On the SEPARABLE pair every eigen-direction belongs to
+    /// one scale, so the same sums restricted to a scale's own directions (and
+    /// its own rank) are that scale's `g_j` and `H_jj`, and `H_01 = 0`.
+    #[test]
+    fn the_criterion_jet_is_the_closed_form_derivative_2902() {
+        let (separable, coupled) = separable_and_coupled();
+        let (_, _, _, dense_draw) = dense_pair();
+        let separable_draw: Vec<f64> = (0..6)
+            .map(|index| ((index as f64 + 1.0) * 1.3).cos() + 0.4)
+            .collect();
+        for (label, geometry, draw, per_axis) in [
+            ("separable", &separable, &separable_draw, true),
+            ("coupled", &coupled, &dense_draw, false),
         ] {
+            let coordinates = range_coordinates(geometry, draw);
+            let mut factor = SelectionFactor::new(geometry);
+            for log_t in [[0.0_f64, 0.0], [-2.5, 1.75], [3.0, -4.0], [-8.0, 6.0]] {
+                assert!(
+                    factor.refactor(geometry, &log_t),
+                    "{label} {log_t:?}: refused"
+                );
+                let jet = factor.jet(geometry, &coordinates).expect("finite jet");
+                let hessian = jet.hessian.clone().expect("a Hessian");
+                let evaluated = geometry.at(&log_t).expect("eigen route");
+                // Per scale (index 0, 1) and over both (index 2):
+                // `(Σ c²g + Σ s, Σ c²g(1 − 2s) + Σ g, owned rank)`.
+                let mut first = [0.0_f64; 3];
+                let mut second = [0.0_f64; 3];
+                let mut owned = [0usize; 3];
+                for column in 0..geometry.dimension {
+                    let eigenvalue = evaluated.eigenvalues[column];
+                    let share = eigenvalue / (1.0 + eigenvalue);
+                    let spread = share * (1.0 - share);
+                    let coordinate: f64 = (0..geometry.dimension)
+                        .map(|row| draw[row] * evaluated.basis[[row, column]])
+                        .sum();
+                    let square = coordinate * coordinate;
+                    let reach: Vec<f64> = geometry
+                        .roots
+                        .iter()
+                        .map(|root| {
+                            root.dot(&evaluated.basis.column(column))
+                                .iter()
+                                .map(|value| value * value)
+                                .sum()
+                        })
+                        .collect();
+                    let axis = usize::from(reach[1] > reach[0]);
+                    let structural = column < geometry.rank;
+                    for slot in [axis, 2] {
+                        first[slot] += square * spread + share;
+                        second[slot] += square * spread * (1.0 - 2.0 * share) + spread;
+                        owned[slot] += usize::from(structural);
+                    }
+                }
+                let close = |analytic: f64, closed: f64| {
+                    (analytic - closed).abs() <= 1e-8 * (1.0 + closed.abs())
+                };
+                let total_gradient = jet.gradient.sum();
+                let total_hessian = hessian.sum();
+                let common_first = first[2] - owned[2] as f64;
+                assert!(
+                    close(total_gradient, common_first),
+                    "{label} {log_t:?}: Σg = {total_gradient} vs closed form {common_first}"
+                );
+                assert!(
+                    close(total_hessian, second[2]),
+                    "{label} {log_t:?}: ΣH = {total_hessian} vs closed form {}",
+                    second[2]
+                );
+                if per_axis {
+                    for axis in 0..2 {
+                        let closed = first[axis] - owned[axis] as f64;
+                        assert!(
+                            close(jet.gradient[axis], closed),
+                            "{label} {log_t:?}: g_{axis} = {} vs closed form {closed}",
+                            jet.gradient[axis]
+                        );
+                        assert!(
+                            close(hessian[[axis, axis]], second[axis]),
+                            "{label} {log_t:?}: H_{axis}{axis} = {} vs closed form {}",
+                            hessian[[axis, axis]],
+                            second[axis]
+                        );
+                    }
+                    assert!(
+                        hessian[[0, 1]].abs() <= 1e-8 * (1.0 + second[2].abs()),
+                        "{label} {log_t:?}: separable scales couple, H_01 = {}",
+                        hessian[[0, 1]]
+                    );
+                }
+            }
+        }
+    }
+
+    /// #2902: each draw's multi-scale selection is a certified stationary point
+    /// of the box-constrained criterion, and a local minimum of it.
+    ///
+    /// This is the claim [`SmoothLrSelectionReplay::select_draw`] makes, checked
+    /// at the point it returns through the jet and the canonical evaluator. With a
+    /// scale at its wall held only while its gradient points out of the window,
+    /// the Newton decrement over the free scales must certify against the
+    /// criterion's rounding bands, and no probe in a small box around the
+    /// selection may undercut it.
+    #[test]
+    fn multiscale_selection_is_a_certified_box_stationary_point_2902() {
+        let (separable, coupled) = separable_and_coupled();
+        let windows = [(-42.0_f64, 18.0_f64), (-18.0, 42.0)];
+        for (label, geometry) in [("separable", &separable), ("coupled", &coupled)] {
             let mut factor = SelectionFactor::new(geometry);
             let mut stream = SelectionDrawStream::new(geometry.dimension, 48);
             let mut draw = vec![0.0_f64; geometry.dimension];
@@ -3808,37 +3882,60 @@ mod selection_replay_tests {
                     geometry,
                     &windows,
                     &coordinates,
+                    &mut factor,
                     &mut selected,
                 )
-                .expect("a certified multi-scale selection");
-                let mut value_at = |point: &[f64]| {
-                    assert!(
-                        factor.refactor(geometry, point),
-                        "{label}: the evaluator refused the probe {point:?}"
-                    );
-                    factor.score(&coordinates, norm_squared).0
-                };
-                let at_selected = value_at(selected.as_slice());
-                let tolerance = 1e-8 * (1.0 + at_selected.abs());
-                let mut probes: Vec<[f64; 2]> = vec![[0.0, 0.0]];
-                for _ in 0..24 {
-                    let along = [
-                        windows[0].0 + (windows[0].1 - windows[0].0) * uniform(),
-                        windows[1].0 + (windows[1].1 - windows[1].0) * uniform(),
-                    ];
-                    probes.push([along[0], selected[1]]);
-                    probes.push([selected[0], along[1]]);
-                    if whole_box {
-                        probes.push(along);
+                .unwrap_or_else(|decline| {
+                    panic!("{label} draw {index}: no certified selection ({decline:?})")
+                });
+                let jet = factor.jet(geometry, &coordinates).expect("finite jet");
+                let hessian = jet.hessian.clone().expect("a Hessian");
+                let bands = jet.decrement_bands.clone().expect("bands");
+                // A scale is held by its wall exactly when the descent direction
+                // `−g` leaves the window there.
+                let active: Vec<bool> = (0..2)
+                    .map(|axis| {
+                        let (low, high) = windows[axis];
+                        let slope = jet.gradient[axis];
+                        (selected[axis] == low && slope > 0.0)
+                            || (selected[axis] == high && slope < 0.0)
+                    })
+                    .collect();
+                let verdict =
+                    opt::newton_decrement_verdict(&hessian, &jet.gradient, Some(&active), &bands);
+                assert!(
+                    verdict.is_certified(),
+                    "{label} draw {index}: the selection {selected:?} (held {active:?}) is not a \
+                     certified box-stationary point: {verdict:?}"
+                );
+                let at_selected = factor.score(&coordinates, norm_squared).0;
+                let tolerance = 1e-10 * (1.0 + at_selected.abs());
+                for step in [1e-3_f64, 1e-1] {
+                    for (d0, d1) in [
+                        (1.0, 0.0),
+                        (-1.0, 0.0),
+                        (0.0, 1.0),
+                        (0.0, -1.0),
+                        (1.0, 1.0),
+                        (1.0, -1.0),
+                        (-1.0, 1.0),
+                        (-1.0, -1.0),
+                    ] {
+                        let probe = [
+                            (selected[0] + step * d0).clamp(windows[0].0, windows[0].1),
+                            (selected[1] + step * d1).clamp(windows[1].0, windows[1].1),
+                        ];
+                        assert!(
+                            factor.refactor(geometry, &probe),
+                            "{label}: the evaluator refused the probe {probe:?}"
+                        );
+                        let at_probe = factor.score(&coordinates, norm_squared).0;
+                        assert!(
+                            at_selected <= at_probe + tolerance,
+                            "{label} draw {index}: the selection {selected:?} (V={at_selected}) \
+                             is undercut at {probe:?} (V={at_probe})"
+                        );
                     }
-                }
-                for probe in probes {
-                    let at_probe = value_at(&probe[..]);
-                    assert!(
-                        at_selected <= at_probe + tolerance,
-                        "{label} draw {index}: the selection {selected:?} (V={at_selected}) is \
-                         undercut at {probe:?} (V={at_probe})"
-                    );
                 }
             }
         }

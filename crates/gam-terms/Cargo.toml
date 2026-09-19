@@ -24,6 +24,7 @@ log = "0.4.29"
 memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 npyz = "0.9.1"
+opt.workspace = true
 pest = "2.8.6"
 pest_derive = "2.8.6"
 rayon = "1.12.0"
