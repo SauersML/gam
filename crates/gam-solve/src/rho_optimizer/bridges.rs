@@ -128,12 +128,13 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// used `on_step_accepted` to drive the inner-PIRLS cap. This wires the
     /// same signal to the guard, which is the place it is load-bearing.
     ///
-    /// `None` leaves the pre-#2613 fold-every-eval behaviour, which is what the
-    /// routes without a cost-stall guard want anyway (they never fold).
-    pub(crate) accepted_steps: Option<Arc<AcceptedStepLedger>>,
+    /// The ledger is mandatory (#3018): folding every evaluation when none was
+    /// wired was a second behaviour that only unit-test literals reached, and a
+    /// test that means "every evaluation is accepted" says so by pushing the
+    /// accepts itself.
+    pub(crate) accepted_steps: Arc<AcceptedStepLedger>,
     /// First-order evaluations made since the last accepted step, oldest first.
-    /// Drained by [`Self::drain_accepted_steps`]. Empty whenever
-    /// `accepted_steps` is `None`.
+    /// Drained by [`Self::drain_accepted_steps`].
     pub(crate) pending_first_order: Vec<PendingOuterEval>,
     /// `(ρ, cost)` of the last iterate known to be accepted — the seed, then
     /// each accepted step. The reference point for reconciling
@@ -2058,19 +2059,10 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                 projected_grad_norm,
                 inner_converged,
             };
-            match self.accepted_steps.is_some() {
-                true => {
-                    if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
-                        self.pending_first_order.remove(0);
-                    }
-                    self.pending_first_order.push(sample);
-                }
-                // No accept signal wired (a caller that built the bridge
-                // directly, e.g. a unit test): every gradient eval is folded,
-                // which is the pre-#2613 behaviour and is safe on any driver
-                // that really does call `eval_grad` once per accepted step.
-                false => self.fold_accepted_iterate(&sample)?,
+            if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
+                self.pending_first_order.remove(0);
             }
+            self.pending_first_order.push(sample);
         }
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2121,14 +2113,10 @@ impl OuterFirstOrderBridge<'_> {
     /// observes it — an observer cannot stop `opt::Bfgs`, an error is the only
     /// in-band way.
     fn drain_accepted_steps(&mut self) -> Result<(), ObjectiveEvalError> {
-        let Some(ledger) = self.accepted_steps.clone() else {
-            return Ok(());
-        };
-        if self.cost_stall.is_none() {
-            return Ok(());
-        }
-        let steps = ledger.drain();
-        if steps.is_empty() {
+        // Drained on every route so the observer's pushes never accumulate
+        // where no guard reads them.
+        let steps = self.accepted_steps.drain();
+        if self.cost_stall.is_none() || steps.is_empty() {
             return Ok(());
         }
         let mut outcome = Ok(());
@@ -3462,10 +3450,10 @@ pub(crate) struct OuterAcceptObserver {
     /// Trajectory census (#2735), read by the runner after the solver returns.
     /// `None` on routes whose summary does not report one.
     pub(crate) census: Option<Arc<OuterStepCensus>>,
-    /// Accepted-outer-step ledger shared with [`OuterFirstOrderBridge`], which
-    /// drains it to decide which of its own evaluations were accepted iterates
-    /// (#2613). `None` on routes with no cost-stall guard.
-    pub(crate) accepted_steps: Option<Arc<AcceptedStepLedger>>,
+    /// Accepted-outer-step ledger shared with the route's bridge, which drains
+    /// it to decide which of its own evaluations were accepted iterates
+    /// (#2613, #3017). Every route that installs the observer drains one (#3018).
+    pub(crate) accepted_steps: Arc<AcceptedStepLedger>,
 }
 
 /// What a trust-region trajectory actually did, counted as `opt` reported it.
@@ -3586,13 +3574,11 @@ impl OptimizerObserver for OuterAcceptObserver {
         if let Some(feedback) = self.feedback.as_ref() {
             feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(ledger) = self.accepted_steps.as_ref() {
-            ledger.push(AcceptedOuterStep {
-                iter: info.iter,
-                step_norm: info.step_norm,
-                actual_decrease: info.actual_decrease,
-            });
-        }
+        self.accepted_steps.push(AcceptedOuterStep {
+            iter: info.iter,
+            step_norm: info.step_norm,
+            actual_decrease: info.actual_decrease,
+        });
         if let Some(census) = self.census.as_ref() {
             census.observe(info, true);
         }
