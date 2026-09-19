@@ -249,6 +249,137 @@ fn structural_rank_from_canonical_penalties(
     )
     .map_err(|error| format!("PenaltyPseudologdet structural rank: {error}"))
 }
+
+/// The components among `indices` that carry weight at `lambdas` — the key of
+/// a cached structural rank, which is λ-free given this set.
+fn active_components(indices: impl Iterator<Item = usize>, lambdas: &[f64]) -> Vec<usize> {
+    indices
+        .filter(|&k| k < lambdas.len() && lambdas[k] > 0.0)
+        .collect()
+}
+
+/// A penalty component's λ-free square root: the eigenpairs of its UNIT block
+/// above that block's own positive threshold. `S_k ≈ Σ_j ev_j v_j v_jᵀ` over
+/// these pairs, so `λ S_k` contributes the rows `√(λ·ev_j)·v_jᵀ` to the stacked
+/// roots of [`PenaltyPseudologdet::eigensystem_from_scaled_roots`].
+#[derive(Clone, Debug)]
+pub(crate) struct UnitRoot {
+    evals: Vec<f64>,
+    /// `block × evals.len()`: column `j` is the eigenvector of `evals[j]`.
+    evecs: Array2<f64>,
+}
+
+impl UnitRoot {
+    fn of(local: ndarray::ArrayView2<'_, f64>) -> Result<Self, String> {
+        let (unit_evals, unit_evecs) = local
+            .eigh(Side::Lower)
+            .map_err(|e| format!("PenaltyPseudologdet component eigendecomposition failed: {e}"))?;
+        let unit_threshold = super::reml_outer_engine::positive_eigenvalue_threshold(
+            unit_evals
+                .as_slice()
+                .expect("eigh returns a freshly allocated contiguous eigenvalue array"),
+        );
+        let kept: Vec<usize> = (0..unit_evals.len())
+            .filter(|&idx| unit_evals[idx] > unit_threshold)
+            .collect();
+        let mut evecs = Array2::<f64>::zeros((local.nrows(), kept.len()));
+        for (j, &idx) in kept.iter().enumerate() {
+            evecs.column_mut(j).assign(&unit_evecs.column(idx));
+        }
+        Ok(Self {
+            evals: kept.iter().map(|&idx| unit_evals[idx]).collect(),
+            evecs,
+        })
+    }
+}
+
+/// The cached unit roots of a component list: component `i` is penalty
+/// `penalty_of[i]` of `spectra`'s list. Read lazily, so a component whose λ is
+/// zero, or a block the diagonal fast path serves, never takes an eigh.
+#[derive(Clone, Copy)]
+pub(crate) struct UnitRoots<'a> {
+    spectra: &'a PenaltyUnitSpectra,
+    penalty_of: &'a [usize],
+}
+
+/// Where a cached structural rank was taken: one disjoint block of the
+/// block-factored path, or the whole coefficient space of the overlapping one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RankScope {
+    Block { start: usize, end: usize },
+    Whole,
+}
+
+/// The λ-free half of [`PenaltyPseudologdet::from_penalties`] for one fixed
+/// penalty list, computed once and reused at every λ.
+///
+/// Every outer evaluation factors `Σ λ_k S_k` afresh, but only the stacked-root
+/// SVD depends on λ: each component's unit eigendecomposition and each block's
+/// structural rank (a function of which components are active, never of their
+/// weights) are the same at every evaluation. Recomputing them was a third of a
+/// small tensor-product fit. The spectra hold the penalty list they were built
+/// from, so they can only ever be read against that list.
+#[derive(Debug)]
+pub(crate) struct PenaltyUnitSpectra {
+    penalties: std::sync::Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
+    roots: Vec<std::sync::OnceLock<UnitRoot>>,
+    ranks: std::sync::Mutex<Vec<(RankScope, Vec<usize>, usize)>>,
+}
+
+impl PenaltyUnitSpectra {
+    pub(crate) fn new(
+        penalties: std::sync::Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
+    ) -> Self {
+        let roots = (0..penalties.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        Self {
+            penalties,
+            roots,
+            ranks: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether these spectra were built from exactly this penalty list.
+    pub(crate) fn serves(
+        &self,
+        penalties: &std::sync::Arc<Vec<gam_terms::construction::CanonicalPenalty>>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.penalties, penalties)
+    }
+
+    fn unit_root(&self, k: usize) -> Result<&UnitRoot, String> {
+        if let Some(root) = self.roots[k].get() {
+            return Ok(root);
+        }
+        let root = UnitRoot::of(self.penalties[k].local.view())?;
+        Ok(self.roots[k].get_or_init(|| root))
+    }
+
+    fn structural_rank(
+        &self,
+        scope: RankScope,
+        active: Vec<usize>,
+        compute: impl FnOnce() -> Result<usize, String>,
+    ) -> Result<usize, String> {
+        let lookup = |ranks: &[(RankScope, Vec<usize>, usize)]| {
+            ranks
+                .iter()
+                .find(|(s, a, _)| *s == scope && *a == active)
+                .map(|&(_, _, rank)| rank)
+        };
+        if let Some(rank) = lookup(&self.ranks.lock().expect("rank cache lock poisoned")) {
+            return Ok(rank);
+        }
+        let rank = compute()?;
+        let mut ranks = self.ranks.lock().expect("rank cache lock poisoned");
+        if lookup(&ranks).is_none() {
+            ranks.push((scope, active, rank));
+        }
+        Ok(rank)
+    }
+}
+
 /// Result of a penalty pseudo-logdet computation.
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
@@ -326,6 +457,27 @@ impl PenaltyPseudologdet {
         lambdas: &[f64],
         p_total: usize,
     ) -> Result<Self, String> {
+        Self::from_penalties_with_spectra(penalties, lambdas, p_total, None)
+    }
+
+    /// [`Self::from_penalties`] over the penalty list `spectra` was built
+    /// from, reading each component's unit root and each block's structural
+    /// rank from `spectra` instead of recomputing them. The result is
+    /// bit-identical to [`Self::from_penalties`] on the same inputs.
+    pub(crate) fn from_penalty_spectra(
+        spectra: &PenaltyUnitSpectra,
+        lambdas: &[f64],
+        p_total: usize,
+    ) -> Result<Self, String> {
+        Self::from_penalties_with_spectra(&spectra.penalties, lambdas, p_total, Some(spectra))
+    }
+
+    fn from_penalties_with_spectra(
+        penalties: &[gam_terms::construction::CanonicalPenalty],
+        lambdas: &[f64],
+        p_total: usize,
+        spectra: Option<&PenaltyUnitSpectra>,
+    ) -> Result<Self, String> {
         if penalties.is_empty() {
             return Ok(Self {
                 w_factor: Array2::zeros((0, 0)),
@@ -342,7 +494,7 @@ impl PenaltyPseudologdet {
 
         if disjoint {
             // Block-factored path: assemble and eigendecompose per-block.
-            Self::from_penalties_block_factored(penalties, lambdas, p_total)
+            Self::from_penalties_block_factored(penalties, lambdas, p_total, spectra)
         } else {
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
@@ -351,8 +503,16 @@ impl PenaltyPseudologdet {
                     cp.accumulate_weighted(&mut s_total, lambdas[k]);
                 }
             }
-            let structural_rank =
-                structural_rank_from_canonical_penalties(penalties, lambdas, p_total)?;
+            let compute_rank =
+                || structural_rank_from_canonical_penalties(penalties, lambdas, p_total);
+            let structural_rank = match spectra {
+                Some(spectra) => spectra.structural_rank(
+                    RankScope::Whole,
+                    active_components(0..penalties.len(), lambdas),
+                    compute_rank,
+                )?,
+                None => compute_rank()?,
+            };
             // #2299/#2316-adjacent: the hinted split must see the spectrum at
             // ROOT scale (stacked scaled square roots), not the assembled
             // matrix's squared conditioning — see
@@ -366,9 +526,14 @@ impl PenaltyPseudologdet {
                         (lambda, cp.local.view(), cp.col_range.clone())
                     })
                     .collect();
+            let indices: Vec<usize> = (0..penalties.len()).collect();
             Self::from_scaled_components_with_rank_hint(
                 &s_total,
                 &components,
+                spectra.map(|spectra| UnitRoots {
+                    spectra,
+                    penalty_of: &indices,
+                }),
                 None,
                 Some(structural_rank),
             )
@@ -379,10 +544,11 @@ impl PenaltyPseudologdet {
     ///
     /// The total logdet is the sum of per-block logdets. The W-factor is
     /// block-diagonal (embedded in p_total space).
-    pub(crate) fn from_penalties_block_factored(
+    fn from_penalties_block_factored(
         penalties: &[gam_terms::construction::CanonicalPenalty],
         lambdas: &[f64],
         p_total: usize,
+        spectra: Option<&PenaltyUnitSpectra>,
     ) -> Result<Self, String> {
         use ndarray::s;
 
@@ -451,13 +617,26 @@ impl PenaltyPseudologdet {
         }
 
         let process_block = |bd: &BlockData| -> Result<BlockResult, String> {
-            let structural_rank = structural_rank_from_components(
-                bd.parts
-                    .iter()
-                    .filter(|&&(_, lambda)| lambda > 0.0)
-                    .map(|&(k, _)| penalties[k].local.view()),
-                bd.end - bd.start,
-            )?;
+            let compute_rank = || {
+                structural_rank_from_components(
+                    bd.parts
+                        .iter()
+                        .filter(|&&(_, lambda)| lambda > 0.0)
+                        .map(|&(k, _)| penalties[k].local.view()),
+                    bd.end - bd.start,
+                )
+            };
+            let structural_rank = match spectra {
+                Some(spectra) => spectra.structural_rank(
+                    RankScope::Block {
+                        start: bd.start,
+                        end: bd.end,
+                    },
+                    active_components(bd.parts.iter().map(|&(k, _)| k), lambdas),
+                    compute_rank,
+                )?,
+                None => compute_rank()?,
+            };
             // Root-scale spectrum for the hinted split (see
             // `eigensystem_from_scaled_roots`): the assembled block's eigh
             // cannot resolve a structurally-positive mode once the block's λ
@@ -468,9 +647,14 @@ impl PenaltyPseudologdet {
                 .iter()
                 .map(|&(k, lambda)| (lambda, penalties[k].local.view(), 0..block_width))
                 .collect();
+            let indices: Vec<usize> = bd.parts.iter().map(|&(k, _)| k).collect();
             let block_pld = Self::from_scaled_components_with_rank_hint(
                 &bd.local,
                 &components,
+                spectra.map(|spectra| UnitRoots {
+                    spectra,
+                    penalty_of: &indices,
+                }),
                 None,
                 Some(structural_rank),
             )?;
@@ -687,6 +871,7 @@ impl PenaltyPseudologdet {
         Self::from_scaled_components_with_rank_hint(
             &s_total,
             &components,
+            None,
             ridge_hint,
             Some(structural_rank),
         )
@@ -782,14 +967,17 @@ impl PenaltyPseudologdet {
     /// Each component root is taken from the eigh of its UNIT matrix (a
     /// λ-free, well-scaled problem thresholded on its own spectrum), placed
     /// into the stacked matrix at `col_range`.
+    /// `unit_roots`, when given, supplies those roots precomputed (see
+    /// [`PenaltyUnitSpectra`]); the rows built from them are the same bits.
     fn eigensystem_from_scaled_roots(
         components: &[(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)],
+        unit_roots: Option<UnitRoots<'_>>,
         ridge: Option<f64>,
         p_dim: usize,
     ) -> Result<(Array1<f64>, Array2<f64>), String> {
         // Collect scaled root rows.
         let mut rows: Vec<Array1<f64>> = Vec::new();
-        for (lambda, local, col_range) in components {
+        for (component, (lambda, local, col_range)) in components.iter().enumerate() {
             if !(lambda.is_finite() && *lambda >= 0.0) {
                 return Err(format!(
                     "PenaltyPseudologdet scaled-root eigensystem requires finite λ ≥ 0, got {lambda}"
@@ -805,23 +993,21 @@ impl PenaltyPseudologdet {
                     local.ncols()
                 ));
             }
-            let (unit_evals, unit_evecs) = local.eigh(Side::Lower).map_err(|e| {
-                format!("PenaltyPseudologdet component eigendecomposition failed: {e}")
-            })?;
-            let unit_threshold = super::reml_outer_engine::positive_eigenvalue_threshold(
-                unit_evals
-                    .as_slice()
-                    .expect("eigh returns a freshly allocated contiguous eigenvalue array"),
-            );
-            for (idx, &ev) in unit_evals.iter().enumerate() {
-                if ev > unit_threshold {
-                    let scale = (lambda * ev).sqrt();
-                    let mut row = Array1::<f64>::zeros(p_dim);
-                    for (li, gi) in col_range.clone().enumerate() {
-                        row[gi] = scale * unit_evecs[[li, idx]];
-                    }
-                    rows.push(row);
+            let computed;
+            let root = match &unit_roots {
+                Some(roots) => roots.spectra.unit_root(roots.penalty_of[component])?,
+                None => {
+                    computed = UnitRoot::of(*local)?;
+                    &computed
                 }
+            };
+            for (j, &ev) in root.evals.iter().enumerate() {
+                let scale = (lambda * ev).sqrt();
+                let mut row = Array1::<f64>::zeros(p_dim);
+                for (li, gi) in col_range.clone().enumerate() {
+                    row[gi] = scale * root.evecs[[li, j]];
+                }
+                rows.push(row);
             }
         }
         if let Some(r) = ridge
@@ -880,9 +1066,13 @@ impl PenaltyPseudologdet {
     ///
     /// `s_total` must be the assembled `Σ λ_k S_k (+ ridge·I)` over the same
     /// components; it feeds only the full-rank Cholesky value fast path.
+    ///
+    /// `unit_roots`, when given, supplies each component's [`UnitRoot`] from
+    /// the cache in place of the eigendecomposition taken here.
     pub(crate) fn from_scaled_components_with_rank_hint(
         s_total: &Array2<f64>,
         components: &[(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)],
+        unit_roots: Option<UnitRoots<'_>>,
         ridge: Option<f64>,
         rank_hint: Option<usize>,
     ) -> Result<Self, String> {
@@ -900,7 +1090,8 @@ impl PenaltyPseudologdet {
         if components.iter().all(|(_, local, _)| gam_terms::construction::is_diagonal(*local)) {
             return Self::from_diagonal_components(components, ridge, rank_hint, p_dim);
         }
-        let (evals, evecs) = Self::eigensystem_from_scaled_roots(components, ridge, p_dim)?;
+        let (evals, evecs) =
+            Self::eigensystem_from_scaled_roots(components, unit_roots, ridge, p_dim)?;
         Self::from_eigensystem(s_total, evals, evecs, ridge, rank_hint, SpectrumScale::Root)
     }
 
@@ -1259,6 +1450,7 @@ impl PenaltyPseudologdet {
             let block_pld = Self::from_scaled_components_with_rank_hint(
                 &local,
                 &components,
+                None,
                 ridge,
                 Some(structural_rank),
             )?;
@@ -2403,7 +2595,8 @@ mod tests {
                 .collect();
         let rank = structural_rank_from_canonical_penalties(&penalties, &lambdas, p_total).unwrap();
         let (evals, evecs) =
-            PenaltyPseudologdet::eigensystem_from_scaled_roots(&components, None, p_total).unwrap();
+            PenaltyPseudologdet::eigensystem_from_scaled_roots(&components, None, None, p_total)
+                .unwrap();
         let generic = PenaltyPseudologdet::from_eigensystem(
             &s_total,
             evals,
@@ -2819,6 +3012,113 @@ mod tests {
                 lambdas[0],
                 lambdas[1],
             );
+        }
+    }
+
+    fn block_penalty(
+        local: Array2<f64>,
+        col_range: std::ops::Range<usize>,
+        p_total: usize,
+    ) -> gam_terms::construction::CanonicalPenalty {
+        let root = psd_component_root(local.view()).unwrap();
+        let width = col_range.len();
+        gam_terms::construction::CanonicalPenalty {
+            nullity: width - root.nrows(),
+            root: root.into_shared(),
+            col_range,
+            total_dim: p_total,
+            local: local.into_shared(),
+            prior_mean: Array1::zeros(width),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }
+    }
+
+    fn assert_same_bits(cached: &PenaltyPseudologdet, fresh: &PenaltyPseudologdet) {
+        let bits = |a: &Array2<f64>| a.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(cached.rank, fresh.rank);
+        assert_eq!(cached.value.to_bits(), fresh.value.to_bits());
+        assert_eq!(bits(&cached.w_factor), bits(&fresh.w_factor));
+        assert_eq!(cached.w_factor.dim(), fresh.w_factor.dim());
+        assert_eq!(
+            cached
+                .inv_evals_sq
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            fresh
+                .inv_evals_sq
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cached.u_null.as_ref().map(bits),
+            fresh.u_null.as_ref().map(bits)
+        );
+        assert_eq!(cached.block_spans.len(), fresh.block_spans.len());
+    }
+
+    /// The λ-free spectra serve every λ with the same bits as a fresh
+    /// factorization, and take each component's eigh and each (block, active
+    /// set)'s structural rank exactly once however many λ they serve.
+    #[test]
+    fn penalty_unit_spectra_reuse_is_bit_identical_and_computed_once() {
+        let q = dense_orthogonal(4);
+        let q3 = dense_orthogonal(3);
+        let p_total = 9;
+        // A tensor-like block of two rank-deficient penalties sharing cols
+        // 0..4, a lone smooth on 5..8, and uncovered columns 4 and 8.
+        let disjoint = vec![
+            block_penalty(rotated_penalty(&q, &[3.0, 1.0, 0.5, 0.0]), 0..4, p_total),
+            block_penalty(
+                rotated_penalty(&q.t().to_owned(), &[0.0, 2.0, 0.0, 1.0]),
+                0..4,
+                p_total,
+            ),
+            block_penalty(rotated_penalty(&q3, &[4.0, 0.25, 0.0]), 5..8, p_total),
+        ];
+        // Overlapping spans take the whole-space route.
+        let overlapping = vec![
+            block_penalty(rotated_penalty(&q, &[3.0, 1.0, 0.5, 0.0]), 0..4, 6),
+            block_penalty(rotated_penalty(&q, &[0.0, 2.0, 0.7, 1.0]), 2..6, 6),
+        ];
+        let lambda_sets = [
+            vec![1.0, 1.0, 1.0],
+            vec![1e-6, 3e5, 0.2],
+            vec![0.0, 2.5, 7.0],
+            vec![12.0_f64.exp(), (-11.0_f64).exp(), 1.0],
+        ];
+        for (list, p_dim, distinct_ranks) in [(disjoint, p_total, 3), (overlapping, 6, 2)] {
+            let spectra = PenaltyUnitSpectra::new(std::sync::Arc::new(list.clone()));
+            let mut root_addresses = Vec::new();
+            for pass in 0..2 {
+                for lambdas in &lambda_sets {
+                    let lambdas = &lambdas[..list.len()];
+                    let cached =
+                        PenaltyPseudologdet::from_penalty_spectra(&spectra, lambdas, p_dim)
+                            .unwrap();
+                    let fresh = PenaltyPseudologdet::from_penalties(&list, lambdas, p_dim).unwrap();
+                    assert_same_bits(&cached, &fresh);
+                }
+                let addresses: Vec<*const UnitRoot> = spectra
+                    .roots
+                    .iter()
+                    .map(|root| {
+                        root.get().expect("every component was active at some λ") as *const _
+                    })
+                    .collect();
+                if pass == 0 {
+                    root_addresses = addresses;
+                } else {
+                    assert_eq!(addresses, root_addresses, "a unit root was recomputed");
+                }
+                assert_eq!(
+                    spectra.ranks.lock().unwrap().len(),
+                    distinct_ranks,
+                    "one structural rank per (block, active set)"
+                );
+            }
         }
     }
 }

@@ -5,7 +5,7 @@
 //!
 //! A seed's start value is an upper bound on the minimum of the basin it drains
 //! into, never a lower bound, so no comparison of start values can prove a seed
-//! dominated. With no valid lower bound on a basin, every generated seed is
+//! dominated. With no valid lower bound on a basin, every declared start is
 //! searched. Each seed is its own complete, certified outer run on a lane: a task
 //! of the caller's Rayon pool when the caller runs inside one, else its own OS
 //! thread submitting to the global pool (the topology race's pattern for
@@ -194,23 +194,44 @@ where
 }
 
 impl OuterProblem {
-    /// Whether the seed policy is a full multistart: it generates more than one
-    /// seed and its budget covers every one of them. A policy that generates a
-    /// single seed is a single start whatever its budget.
-    pub fn searches_every_seed(&self) -> bool {
-        self.seed_config.max_seeds > 1 && self.seed_config.seed_budget >= self.seed_config.max_seeds
+    /// The starts a multistart searches, in seed order: `leading` (a joined warm
+    /// start) when given, then this problem's own derived start
+    /// ([`outer_start_point`](crate::rho_optimizer::run_plan::outer_start_point)),
+    /// then one start per level of `additional_levels`, every coordinate at that
+    /// level. Each is projected into the search box and exact duplicates are
+    /// dropped, so a level beyond a face lands on that face.
+    pub fn multistart_seeds(
+        &self,
+        leading: Option<Array1<f64>>,
+        additional_levels: &[f64],
+    ) -> Result<Vec<Array1<f64>>, EstimationError> {
+        let config = self.config();
+        let model_domain_bounds = outer_model_domain_bounds_template(&config, self.n_params);
+        let bounds = outer_search_bounds_template(&config, self.n_params);
+        let own = crate::rho_optimizer::run_plan::outer_start_point(
+            &config,
+            self.n_params,
+            &model_domain_bounds,
+        )?;
+        let mut seeds: Vec<Array1<f64>> = Vec::with_capacity(2 + additional_levels.len());
+        for start in leading.into_iter().chain(std::iter::once(own)).chain(
+            additional_levels
+                .iter()
+                .map(|&level| Array1::from_elem(self.n_params, level)),
+        ) {
+            let projected = project_to_bounds(&start, Some(&bounds));
+            if !seeds.contains(&projected) {
+                seeds.push(projected);
+            }
+        }
+        Ok(seeds)
     }
 
-    /// The seeds the cascade would search, in cascade order.
-    pub fn outer_seeds(&self, context: &str) -> Result<Vec<Array1<f64>>, EstimationError> {
-        outer_seed_cascade(&self.config(), self.n_params, context)
-    }
-
-    /// Search every seed the cascade would generate, each by `run_seed`, and
+    /// Search every start of [`Self::multistart_seeds`], each by `run_seed`, and
     /// pick the winner among the certified runs.
     ///
-    /// `run_seed(index, problem, lane)` receives this problem restricted to that
-    /// one seed (`with_sole_seed`) and without a cache session, which belongs to
+    /// `run_seed(index, problem, lane)` receives this problem started at that one
+    /// seed (`with_initial_rho`) and without a cache session, which belongs to
     /// one search, and the memory lane the search runs on. It builds its own
     /// objective, runs it (normally through [`OuterProblem::run_certified`]) and
     /// returns the outcome with whatever state the caller needs from the winner.
@@ -229,6 +250,7 @@ impl OuterProblem {
     /// one more seed.
     pub fn run_certified_multistart<R, Run>(
         &self,
+        additional_levels: &[f64],
         context: &str,
         serial_available_bytes: u64,
         working_set_bytes: usize,
@@ -245,6 +267,7 @@ impl OuterProblem {
     {
         self.run_certified_multistart_on(
             gam_runtime::resource::MemoryGovernor::global(),
+            additional_levels,
             context,
             serial_available_bytes,
             working_set_bytes,
@@ -256,6 +279,7 @@ impl OuterProblem {
     pub(crate) fn run_certified_multistart_on<R, Run>(
         &self,
         governor: &gam_runtime::resource::MemoryGovernor,
+        additional_levels: &[f64],
         context: &str,
         serial_available_bytes: u64,
         working_set_bytes: usize,
@@ -280,7 +304,7 @@ impl OuterProblem {
             .as_ref()
             .filter(|warm_start| warm_start.same_inputs)
         {
-            let mut resume = self.clone().with_sole_seed(warm_start.theta.clone());
+            let mut resume = self.clone().with_initial_rho(warm_start.theta.clone());
             resume.cache_session = None;
             resume.cache_mirror_sessions.clear();
             resume.resume_only = true;
@@ -300,32 +324,27 @@ impl OuterProblem {
                 super::RESUME_DECLINED,
             ));
         }
-        // On other inputs the point joins this argmin as one more seed, so the
-        // winner is taken over a superset of the cold seeds and its V is at most
-        // the cold winner's, within the tie envelope. It enters as a caller
-        // candidate, so it is projected into this fit's search box and
-        // deduplicated like every other seed.
+        // On other inputs the point joins this argmin as one more start, so the
+        // winner is taken over a superset of the cold starts and its V is at most
+        // the cold winner's, within the tie envelope. It is projected into this
+        // fit's search box and deduplicated like every other start.
         let cold = self.without_warm_start();
         let joined = warm_start
             .as_ref()
             .filter(|warm_start| !warm_start.same_inputs);
-        let seeds = match joined {
-            Some(warm_start) => {
-                let mut with_warm = cold.clone();
-                with_warm
-                    .initial_rho_candidates
-                    .insert(0, warm_start.theta.clone());
-                warm_start.record(gam_model_api::WarmStartOutcome::JoinedMultistart);
-                with_warm.outer_seeds(context)?
-            }
-            None => cold.outer_seeds(context)?,
-        };
-        // One sole-seed problem per seed, without the cache session, which belongs
+        let seeds = cold.multistart_seeds(
+            joined.map(|warm_start| warm_start.theta.clone()),
+            additional_levels,
+        )?;
+        if let Some(warm_start) = joined {
+            warm_start.record(gam_model_api::WarmStartOutcome::JoinedMultistart);
+        }
+        // One problem per seed, started there, without the cache session, which belongs
         // to one search. The joined point's inner mode seeds only its own run.
         let problems = seeds
             .iter()
             .map(|seed| {
-                let mut problem = cold.clone().with_sole_seed(seed.clone());
+                let mut problem = cold.clone().with_initial_rho(seed.clone());
                 problem.cache_session = None;
                 problem.cache_mirror_sessions.clear();
                 problem.warm_start =
@@ -397,7 +416,7 @@ impl OuterProblem {
         let concurrency = gam_runtime::parallel::install(|| {
             let concurrency = seeds.len().min(rayon::current_num_threads().max(1));
             log::debug!(
-                "[OUTER] {context}: multistart searches all {} generated seeds on {concurrency} \
+                "[OUTER] {context}: multistart searches all {} starts on {concurrency} \
                  lanes ({working_set_bytes} bytes predicted per search, {} remaining in the \
                  memory budget, {serial_available_bytes} bytes available before launch)",
                 seeds.len(),

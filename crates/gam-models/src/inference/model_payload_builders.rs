@@ -1517,7 +1517,20 @@ fn record_input_fingerprint(payload: &mut FittedModelPayload, input_fingerprint:
 /// An automatic `.` term is expanded against `dataset` first, so the payload
 /// stores (and `model.formula` shows) the formula that was actually fitted, and
 /// the expansion's notes lead the payload's inference notes.
+///
+/// The fit runs on a worker of the process pool
+/// ([`gam_runtime::parallel::install`]), so its parallel loops start where they
+/// run: on a one-thread pool they run in place and never hand work across
+/// threads.
 pub fn fit_formula_to_payload(
+    formula: String,
+    dataset: &EncodedDataset,
+    fit_config: &FitConfig,
+) -> Result<FittedModelPayload, WorkflowError> {
+    gam_runtime::parallel::install(|| fit_formula_to_payload_here(formula, dataset, fit_config))
+}
+
+fn fit_formula_to_payload_here(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,

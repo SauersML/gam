@@ -76,7 +76,7 @@ pub(crate) fn load_datasetwith_model_schema(
     path: &Path,
     model: &SavedModel,
 ) -> Result<Dataset, String> {
-    load_datasetwith_model_schema_extra(path, model, &[])
+    load_datasetwith_model_schema_extra(path, model, &[]).map_err(String::from)
 }
 
 /// Load a dataset for a *post-fit diagnostic* command (diagnose / sample /
@@ -95,7 +95,7 @@ pub(crate) fn load_datasetwith_model_schema_for_diagnostics(
     model: &SavedModel,
 ) -> Result<Dataset, String> {
     let extras = model.diagnostic_extra_columns()?;
-    load_datasetwith_model_schema_extra(path, model, &extras)
+    load_datasetwith_model_schema_extra(path, model, &extras).map_err(String::from)
 }
 
 /// Load a new-data file against a fitted model's schema, keeping only the
@@ -113,8 +113,10 @@ pub(crate) fn load_datasetwith_model_schema_extra(
     path: &Path,
     model: &SavedModel,
     extra_required: &[String],
-) -> Result<Dataset, String> {
-    let schema = model.require_data_schema()?;
+) -> CliResult<Dataset> {
+    let schema = model
+        .require_data_schema()
+        .map_err(|err| CliError::from(err.to_string()))?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
     let mut requested: Vec<String> = model
@@ -122,5 +124,15 @@ pub(crate) fn load_datasetwith_model_schema_extra(
         .into_iter()
         .collect::<Vec<_>>();
     requested.extend(extra_required.iter().cloned());
-    load_dataset_auto_with_schema_projected(path, schema, policy, &requested).map_err(String::from)
+    // The typed `DataError` keeps its advice through `?`: a NaN cell or an
+    // unseen level names its column, row and remedy on the `help:` line.
+    let dataset = load_dataset_auto_with_schema_projected(path, schema, policy, &requested)?;
+    if let Some(unseen) = model
+        .unseen_numeric_factor_levels(&dataset.headers, dataset.values.view())
+        .into_iter()
+        .next()
+    {
+        return Err(unseen.into());
+    }
+    Ok(dataset)
 }

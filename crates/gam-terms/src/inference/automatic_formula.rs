@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use gam_data::{ColumnKindTag, EncodedDataset, canonical_level_bits};
 
-use super::formula_dsl::{AUTOMATIC_REST_TERM, formula_rhs_terms};
+use super::formula_dsl::{AUTOMATIC_REST_TERM, FormulaDslError, formula_rhs_terms};
 
 /// Distinct values at which a numeric column identifies a curvature direction
 /// beyond the intercept and slope: the dimension of the second-order
@@ -119,14 +119,17 @@ pub fn automatic_column_term(dataset: &EncodedDataset, column_index: usize) -> A
 }
 
 /// Whether `formula`'s right-hand side contains the automatic `.` term.
-pub fn formula_has_automatic_term(formula: &str) -> Result<bool, String> {
+///
+/// This is the first parse a fit makes, so a formula that does not parse fails
+/// here, and it fails as the parser's error.
+pub fn formula_has_automatic_term(formula: &str) -> Result<bool, FormulaDslError> {
     let (_, terms) = formula_rhs_terms(formula)?;
     Ok(terms.iter().any(|term| term.trim() == AUTOMATIC_REST_TERM))
 }
 
 /// `formula` with the `.` term removed (an empty right-hand side becomes the
 /// intercept `1`). Its columns are the ones the expansion must not re-add.
-pub fn formula_without_automatic_term(formula: &str) -> Result<String, String> {
+pub fn formula_without_automatic_term(formula: &str) -> Result<String, FormulaDslError> {
     let (response, terms) = formula_rhs_terms(formula)?;
     let explicit: Vec<&str> = terms
         .iter()
