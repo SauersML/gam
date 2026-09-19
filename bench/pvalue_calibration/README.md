@@ -145,9 +145,11 @@ stalling the whole plan. Neither is a solver budget, and nothing inside gamfit
 ever sees them.
 
 Each worker prints each rep as soon as it finishes, so a chunk the safety net
-kills still keeps its finished reps. Every seed it did not finish is recorded
-with status `timeout`, `memcap` or `crash` and the stderr tail. The report
-counts those seeds as unusable.
+kills still keeps its finished reps. The rep it died on is recorded with status
+`timeout`, `memcap` or `crash` and the stderr tail, and the report counts it as
+a rejection. The seeds queued after it never started, so the driver runs them
+in a continuation chunk instead of blaming them for the rep that killed the
+chunk.
 
 ## CI
 
@@ -158,8 +160,9 @@ step). It contains:
   when any gamfit surface is flagged anti-conservative (counting every rep
   without a p-value as a rejection), when a rep that fitted lacks an expected
   surface, or when a row lacks a power;
-- tests that pin the harness's own rules on hand-built records: resume,
-  safety-net records, seeding, the verdict bound, and unusable-rep accounting;
+- tests that pin the harness's own rules on hand-built records or a stand-in
+  worker: resume, safety-net records (only the killed rep is charged, and the
+  seeds after it run), seeding, the verdict bound, and unusable-rep accounting;
 - a test that `docs/pvalues.md`'s table equals the one generated from the
   committed baseline.
 

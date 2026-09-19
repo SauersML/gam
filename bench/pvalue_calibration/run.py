@@ -93,7 +93,16 @@ def run_chunk(
     memcap_mb: float,
     cwd: str,
 ) -> list[dict[str, Any]]:
-    """Run one policed worker over ``range(start, stop)``; one record per seed."""
+    """Run one policed worker over ``range(start, stop)``.
+
+    The worker runs its seeds in order and prints one ``RESULT`` line per
+    finished seed. Returns one record per finished seed, then, if the worker
+    stopped early, one record for the seed it died on, carrying the safety
+    net's status (``timeout``/``memcap``) or ``crash``. Seeds after that one
+    were never started, so they get no record here: ``run_plan`` runs them in
+    a continuation chunk rather than blaming them for the seed that killed the
+    chunk.
+    """
     cmd = [
         sys.executable,
         str(WORKER),
@@ -110,12 +119,13 @@ def run_chunk(
         if line.startswith("RESULT "):
             rec = json.loads(line[len("RESULT ") :])
             by_seed[int(rec["seed"])] = rec
-    # A seed with no RESULT line is the rep the chunk died on, or one after it.
     lost = "crash" if run.status == "ok" else run.status
     out: list[dict[str, Any]] = []
     for seed in range(start, stop):
         rec = by_seed.get(seed)
-        if rec is None:
+        died_here = rec is None
+        if died_here:
+            # The first seed with no RESULT line is the rep the chunk died on.
             rec = dict(
                 family=cell.family,
                 n=cell.n,
@@ -133,6 +143,8 @@ def run_chunk(
             chunk_peak_threads=run.peak_threads,
         )
         out.append(rec)
+        if died_here:
+            break
     return out
 
 
@@ -193,22 +205,26 @@ def run_plan(
 
         def one(chunk: tuple[Cell, int, int]) -> None:
             cell, start, stop = chunk
-            recs = run_chunk(
-                cell, start, stop, plan.libs, plan.timeout_s, memcap_mb, cwd
-            )
-            with lock:
-                for rec in recs:
-                    fh.write(json.dumps(rec) + "\n")
-                fh.flush()
-                records.extend(recs)
-                if progress:
-                    statuses = sorted({r["status"] for r in recs})
-                    print(
-                        f"[{cell.key} seeds {start}-{stop - 1}] {','.join(statuses)} "
-                        f"{recs[0]['chunk_wall_s']:.1f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+            # A chunk that died leaves its later seeds unstarted; each pass
+            # records at least one seed, so this ends after at most stop-start.
+            while start < stop:
+                recs = run_chunk(
+                    cell, start, stop, plan.libs, plan.timeout_s, memcap_mb, cwd
+                )
+                with lock:
+                    for rec in recs:
+                        fh.write(json.dumps(rec) + "\n")
+                    fh.flush()
+                    records.extend(recs)
+                    if progress:
+                        statuses = sorted({r["status"] for r in recs})
+                        print(
+                            f"[{cell.key} seeds {start}-{recs[-1]['seed']}] "
+                            f"{','.join(statuses)} {recs[0]['chunk_wall_s']:.1f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                start = int(recs[-1]["seed"]) + 1
 
         # list() re-raises the first exception a chunk's thread hit.
         list(pool.map(one, chunks))

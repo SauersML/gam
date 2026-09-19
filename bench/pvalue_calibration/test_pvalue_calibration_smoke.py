@@ -71,10 +71,44 @@ def test_ci_plan_is_calibrated(tmp_path: Path) -> None:
     assert "## Calibration" in (out / "report.md").read_text()
 
 
-def test_chunk_killed_by_safety_net_records_every_seed(tmp_path: Path) -> None:
+def test_chunk_killed_by_safety_net_records_the_seed_it_died_on(tmp_path: Path) -> None:
     recs = run_chunk(Cell("gaussian", 60, "smooth"), 3, 6, ("gamfit",), 0.0, 1e9, str(tmp_path))
-    assert [r["seed"] for r in recs] == [3, 4, 5]
-    assert {r["status"] for r in recs} == {"timeout"}
+    assert [(r["seed"], r["status"]) for r in recs] == [(3, "timeout")]
+
+
+# Stands in for worker.py: finishes every seed at once except ``HANG``, which
+# runs until the safety net kills it.
+FAKE_WORKER = """
+import json, sys, time
+family, n, null, start, stop = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+for seed in range(start, stop):
+    if seed == {hang}:
+        time.sleep(3600)
+    rec = dict(family=family, n=n, null=null, seed=seed, status="ok",
+               expected_surfaces={{"gamfit": ["wald"]}},
+               p={{"null": {{"gamfit.wald": 0.5}}, "alt": {{"gamfit.wald": 0.001}}}},
+               missing={{}}, errors={{}})
+    print("RESULT " + json.dumps(rec), flush=True)
+"""
+
+
+def test_seeds_after_a_killed_rep_are_run_not_blamed(tmp_path: Path, monkeypatch: Any) -> None:
+    # One rep that outlives the safety net must be the only rep charged with
+    # it: the seeds queued behind it in the same chunk never started, and
+    # recording them as timeouts would count them as rejections.
+    from . import run as run_mod
+
+    fake = tmp_path / "fake_worker.py"
+    fake.write_text(FAKE_WORKER.format(hang=4))
+    monkeypatch.setattr(run_mod, "WORKER", fake)
+    cell = Cell("gaussian", 60, "smooth")
+    plan = Plan("t", "", (cell,), reps=8, chunk=8, timeout_s=5.0, libs=("gamfit",))
+    recs = run_mod.run_plan(plan, tmp_path / "out", jobs=1, memcap_mb=1e9, progress=False)
+    status = {r["seed"]: r["status"] for r in recs}
+    assert status == {0: "ok", 1: "ok", 2: "ok", 3: "ok", 4: "timeout", 5: "ok", 6: "ok", 7: "ok"}
+    # A resume finds nothing left to run.
+    again = run_mod.run_plan(plan, tmp_path / "out", jobs=1, memcap_mb=1e9, progress=False)
+    assert len(again) == plan.reps
 
 
 def test_pending_chunks_resume_only_missing_seeds() -> None:
