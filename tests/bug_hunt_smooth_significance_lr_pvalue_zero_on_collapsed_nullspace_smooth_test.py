@@ -97,8 +97,7 @@ def _lr_record(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
         "edf": edf,
         "W": float(rec["statistic_lr"]),
         "ref_df": float(rec["ref_df"]),
-        "p_corrected": float(rec["p_value_corrected"]),
-        "p_uncorrected": float(rec["p_value_uncorrected"]),
+        "p_value": float(rec["p_value"]),
     }
 
 
@@ -122,9 +121,9 @@ def test_collapsed_nullspace_smooth_lr_pvalue_is_not_falsely_significant() -> No
             continue
         checked += 1
         # A chi-square statistic below 1.0 is non-significant under any
-        # reasonable reference d.f. (chi^2_1.sf(1.0) = 0.317); the corrected and
-        # uncorrected p-values must both exceed ALPHA.
-        if rec["p_corrected"] < ALPHA or rec["p_uncorrected"] < ALPHA:
+        # reasonable reference d.f. (chi^2_1.sf(1.0) = 0.317); the published
+        # p-value must exceed ALPHA.
+        if rec["p_value"] < ALPHA:
             offenders.append({"seed": float(seed), **rec})
 
     assert checked >= 6, (
@@ -139,7 +138,7 @@ def test_collapsed_nullspace_smooth_lr_pvalue_is_not_falsely_significant() -> No
         "(seed, edf, W, ref_df, p): "
         + "; ".join(
             f"(seed={int(o['seed'])}, edf={o['edf']:.4f}, W={o['W']:.4g}, "
-            f"ref_df={o['ref_df']:.3g}, p_corr={o['p_corrected']:.3g})"
+            f"ref_df={o['ref_df']:.3g}, p_corr={o['p_value']:.3g})"
             for o in offenders
         )
         + ". See smooth_term_lr_inference_forspec in "
@@ -154,9 +153,9 @@ def test_collapsed_nullspace_smooth_lr_pvalue_is_not_falsely_significant() -> No
     xp = rng.uniform(0.0, 1.0, 300)
     yp = np.sin(8.0 * xp) + 0.3 * rng.standard_normal(300)
     rec = _lr_record(xp, yp)
-    assert rec["p_corrected"] < 1e-3, (
+    assert rec["p_value"] < 1e-3, (
         "power control: a strong wiggly smooth was not flagged significant "
-        f"(W={rec['W']:.3g}, edf={rec['edf']:.3f}, p={rec['p_corrected']:.3g}); "
+        f"(W={rec['W']:.3g}, edf={rec['edf']:.3f}, p={rec['p_value']:.3g}); "
         "the LR significance test has lost power"
     )
 

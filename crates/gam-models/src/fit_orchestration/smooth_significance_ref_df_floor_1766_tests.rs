@@ -96,7 +96,7 @@ fn flat_null_smooth_ref_df_floored_and_not_significant_1766() {
         let (ref_df, w, p) = (
             report.ref_df,
             report.statistic_lr,
-            report.p_value_corrected,
+            report.p_value,
         );
         let provenance = &report.ref_df_provenance;
         // `ref_df` must sit inside Wood's analytic band `[edf, 2·edf]` and the
@@ -154,7 +154,7 @@ fn strong_signal_smooth_still_flagged_1766() {
     let (ref_df, w, p) = (
         report.ref_df,
         report.statistic_lr,
-        report.p_value_corrected,
+        report.p_value,
     );
     assert!(
         ref_df > 1.0,

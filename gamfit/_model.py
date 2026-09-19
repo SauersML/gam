@@ -568,14 +568,26 @@ class Model:
         ``reference_residual_df``/``reference_deterministic_offset`` (the
         estimated-scale channel above, ``None`` off the profiled Gaussian),
         ``bartlett_factor``
-        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
-        ``p_value_corrected`` (the magic-by-default value), ``material`` (the
-        n-too-small-here diagnostic — ``True`` when the correction moves the
-        Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr"`` when the family carries
-        closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
-        null refit converged, else ``"none"`` (the uncorrected reference stands,
-        never weakened).
+        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value``,
+        ``selection``, ``material`` (the n-too-small-here diagnostic — ``True``
+        when the correction moves the Bartlett factor or the p-value by more
+        than 10%), and ``correction_provenance`` —
+        ``"lawley_lr_estimated_lambda"`` when the family carries closed-form
+        cumulant jets (gaussian / poisson / binomial / gamma), the null refit
+        converged and the fit published :math:`\\mathrm{Cov}(\\hat\\rho)`,
+        ``"lawley_lr_fixed_lambda"`` when only the fixed-:math:`\\lambda` factor
+        was available, else ``"none"`` (the uncorrected reference stands, never
+        weakened).
+
+        ``p_value`` is the term's one p-value: the tail of :math:`W^*` under the
+        reference above with the :math:`\\hat\\lambda`-selection replay applied,
+        so the smoothing parameter is priced as *chosen* rather than given.
+        ``selection`` is ``"replayed"`` when that replay was applied, else the
+        reason it was not (``"no_penalty_components"``, ``"no_information"``,
+        ``"window_closed"`` — a term with nothing to select, whose conditional
+        law already is its selection law). No uncorrected or conditional
+        p-value is offered alongside it: both price :math:`\\hat\\lambda` as
+        known and are anti-conservative under the null.
 
         Needs the training ``data`` for the per-term null refits, exactly as
         :meth:`curvature` does. Returns an empty list when the model has no

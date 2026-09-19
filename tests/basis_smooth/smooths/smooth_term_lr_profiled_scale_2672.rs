@@ -362,11 +362,11 @@ fn the_published_tail_matches_a_direct_simulation_of_its_own_law() {
         // Invert `c = expm1((w − B)/n)` to get the statistic this ratio is the
         // threshold for, so the reference is asked in the units it takes.
         let statistic = scale.observations * ratio.ln_1p() + scale.deterministic_offset;
-        let published = reference.conditional_tail_probability(statistic);
+        let (published, bound) = reference.conditional_tail_with_bound(statistic);
         let counted =
             sample.iter().filter(|(q, v)| q - ratio * v > 0.0).count() as f64 / DRAWS as f64;
         let standard_error = (counted * (1.0 - counted) / DRAWS as f64).sqrt();
-        let bar = 4.0 * standard_error + report.p_value_bound;
+        let bar = 4.0 * standard_error + bound;
         eprintln!(
             "[2672-simulation] c={ratio:.6e} W={statistic:.6} published={published:.6} \
              counted={counted:.6} |Δ|={:.3e} bar={bar:.3e}",
@@ -376,8 +376,7 @@ fn the_published_tail_matches_a_direct_simulation_of_its_own_law() {
             (published - counted).abs() <= bar,
             "at c = {ratio:.6e} the reference reports {published} and a direct simulation of \
              its own law counts {counted} ({DRAWS} draws, s.e. {standard_error:.3e}); the \
-             report certifies {}",
-            report.p_value_bound
+             reference certifies {bound:.3e}"
         );
     }
 }

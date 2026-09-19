@@ -604,25 +604,35 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
         "bartlett_factor_conditional",
         "rho_variation_shift",
         "statistic_corrected",
-        "p_value_uncorrected",
-        "p_value_corrected",
+        "p_value",
+        "selection",
         "material",
         "correction_provenance",
     ):
         assert key in row, f"smooth_significance row missing '{key}'"
+    # One p-value, not a menu: the uncorrected and fixed-lambda conditional
+    # tails price lambda-hat as known and are anti-conservative under the null.
+    for key in (
+        "p_value_uncorrected",
+        "p_value_corrected",
+        "p_value_conditional",
+        "p_value_bound",
+    ):
+        assert key not in row, f"smooth_significance row still carries '{key}'"
+    assert 0.0 <= row["p_value"] <= 1.0
     # Poisson carries closed-form Lawley jets, so the correction auto-applies.
     assert row["correction_provenance"] == "lawley_lr_estimated_lambda"
     # The corrected statistic is the raw LR divided by the Bartlett factor.
     assert row["statistic_corrected"] == pytest.approx(
         row["statistic_lr"] / row["bartlett_factor"], rel=1e-9
     )
-    # `material` is a bool and is consistent with the 10% rule it documents.
+    # `material` is a bool and is consistent with the 10% rule it documents:
+    # a Bartlett factor more than 10% from one is material by itself (the
+    # p-value arm of the rule is checked against the reference in the Rust
+    # size-calibration harness, which can evaluate the uncorrected tail).
     assert isinstance(row["material"], bool)
-    factor_move = abs(row["bartlett_factor"] - 1.0)
-    p_lo = min(row["p_value_uncorrected"], row["p_value_corrected"])
-    p_hi = max(row["p_value_uncorrected"], row["p_value_corrected"])
-    p_move = (p_hi - p_lo) / max(p_hi, np.finfo(float).tiny)
-    assert row["material"] == bool(factor_move > 0.10 or p_move > 0.10)
+    if abs(row["bartlett_factor"] - 1.0) > 0.10:
+        assert row["material"]
 
 
 def test_glm_full_conformal_bernoulli_reaches_python_and_covers():

@@ -407,26 +407,29 @@ impl SelectionGeometry {
     /// Whiten the term's λ-free penalty components by the Schur-complemented
     /// information and factor each into its own root.
     ///
-    /// Returns `None` when the information has no identified direction, a
-    /// decomposition refuses, or the components leave nothing penalized —
-    /// in every case the caller has nothing to replay.
+    /// Declines with `NoInformation` when the information has no identified
+    /// direction and `NoPenaltyComponents` when the whitened components leave
+    /// nothing penalized — in both cases there is nothing to replay. A
+    /// decomposition that refuses, or a factor that is non-finite or
+    /// inconsistent in shape, is `GeometryRefused`.
     fn whiten(
         whitener: &Array2<f64>,
         unit_penalties: &[Array2<f64>],
         log_lambda: &[f64],
-    ) -> Option<Self> {
+    ) -> Result<Self, SmoothLrSelectionDecline> {
+        use SmoothLrSelectionDecline::{GeometryRefused, NoInformation, NoPenaltyComponents};
         if unit_penalties.is_empty() || unit_penalties.len() != log_lambda.len() {
-            return None;
+            return Err(NoPenaltyComponents);
         }
         let dimension = whitener.ncols();
         if dimension == 0 || whitener.nrows() == 0 {
-            return None;
+            return Err(NoInformation);
         }
 
         let mut roots = Vec::with_capacity(unit_penalties.len());
         for penalty in unit_penalties {
             if penalty.nrows() != whitener.nrows() || penalty.ncols() != whitener.nrows() {
-                return None;
+                return Err(GeometryRefused);
             }
             // `Wᵀ S W` is symmetric as a mathematical object and its two
             // triangles differ only by summation order — but
@@ -436,12 +439,12 @@ impl SelectionGeometry {
             // every real fit.
             let whitened = symmetrized(whitener.t().dot(penalty).dot(whitener));
             if whitened.iter().any(|value| !value.is_finite()) {
-                return None;
+                return Err(GeometryRefused);
             }
-            roots.push(psd_root(&whitened)?);
+            roots.push(psd_root(&whitened).ok_or(GeometryRefused)?);
         }
         if roots.iter().all(|root| root.nrows() == 0) {
-            return None;
+            return Err(NoPenaltyComponents);
         }
         let stacked_rows = roots.iter().map(|root| root.nrows()).sum::<usize>();
         // `range(Σ_i S̃_i)` is what `log|T|₊` runs over, and it is `t`-free. Taken
@@ -450,20 +453,21 @@ impl SelectionGeometry {
         // sum unreadable is not present here at all.
         let unit = stack_roots(&roots, &vec![0.0; roots.len()], stacked_rows.max(dimension));
         let (_, unit_singular, unit_right) =
-            gam_linalg::faer_ndarray::FaerSvd::svd(&unit, false, true).ok()?;
+            gam_linalg::faer_ndarray::FaerSvd::svd(&unit, false, true)
+                .map_err(|_| GeometryRefused)?;
         let unit_largest = unit_singular.iter().copied().fold(0.0_f64, f64::max);
         let bar = unit_largest * (dimension as f64) * f64::EPSILON * 100.0;
         let rank = unit_singular.iter().filter(|&&value| value > bar).count();
         if rank == 0 {
-            return None;
+            return Err(NoPenaltyComponents);
         }
         // The same decomposition that decided the rank also names the subspace:
         // the leading `rank` right singular vectors of the UNIT stack span
         // `range(Σ_i S̃_i)`. Deciding the two from one object is what stops them
         // disagreeing about which directions are structural.
-        let unit_right = unit_right?;
+        let unit_right = unit_right.ok_or(GeometryRefused)?;
         if unit_right.nrows() < rank || unit_right.ncols() != dimension {
-            return None;
+            return Err(GeometryRefused);
         }
         let mut range_basis = Array2::<f64>::zeros((dimension, rank));
         for column in 0..rank {
@@ -490,10 +494,11 @@ impl SelectionGeometry {
             }
             let complement = stack_roots(&others, &vec![0.0; others.len()], rows.max(dimension));
             let (_, singular, _) =
-                gam_linalg::faer_ndarray::FaerSvd::svd(&complement, false, false).ok()?;
+                gam_linalg::faer_ndarray::FaerSvd::svd(&complement, false, false)
+                    .map_err(|_| GeometryRefused)?;
             complement_rank.push(singular.iter().filter(|&&value| value > bar).count());
         }
-        Some(Self {
+        Ok(Self {
             roots,
             log_lambda: log_lambda.to_vec(),
             dimension,
@@ -891,8 +896,9 @@ pub enum SmoothLrSelectionDecline {
     /// decomposition's own noise floor, so there is no basis in which the block
     /// is standard normal. A term the penalty has absorbed entirely.
     NoInformation,
-    /// The whitening or a component's root refused: `Ĩ_jj` has no identified
-    /// direction, a decomposition failed, or the components span nothing.
+    /// The whitening or a component's root refused: a decomposition failed or
+    /// produced a non-finite or inconsistent factor. A REFUSAL — see
+    /// [`Self::is_refusal`].
     GeometryRefused,
     /// Every scale's window is closed — the fit is railed against both walls of
     /// the solver's `ρ` box at once, so there was no `λ` it could have chosen
@@ -900,12 +906,13 @@ pub enum SmoothLrSelectionDecline {
     WindowClosed,
     /// The fitted point `ln t = 0` could not be evaluated, so there is no
     /// conditional arm to pair the selection with. Refused whole rather than
-    /// sampled partial.
+    /// sampled partial. A REFUSAL — see [`Self::is_refusal`].
     GridRefused,
     /// A draw's certified global minimization of its criterion could not resolve
     /// the criterion's stationary structure, the criterion was not evaluable
     /// inside the window, or an axis slice of it could not be priced, so that
-    /// draw has no selection. Refused whole rather than sampled partial.
+    /// draw has no selection. Refused whole rather than sampled partial. A
+    /// REFUSAL — see [`Self::is_refusal`].
     SelectionUnresolved,
 }
 
@@ -919,6 +926,29 @@ impl SmoothLrSelectionDecline {
             SmoothLrSelectionDecline::WindowClosed => "window_closed",
             SmoothLrSelectionDecline::GridRefused => "grid_refused",
             SmoothLrSelectionDecline::SelectionUnresolved => "selection_unresolved",
+        }
+    }
+
+    /// Whether this decline is a failure of the replay rather than a fact about
+    /// the fit.
+    ///
+    /// `NoPenaltyComponents`, `NoInformation` and `WindowClosed` say there was
+    /// no `λ` the fit could have chosen differently, so the conditional law IS
+    /// the selection law and the reference is complete without a replay. The
+    /// other three say a `λ̂` WAS chosen and the replay that prices the choice
+    /// could not be computed. Reading the conditional tail there is the
+    /// fixed-`λ` p-value this driver exists not to publish, and it is not a
+    /// harmless approximation: on a null term the penalty has absorbed, it
+    /// produced `p = 0.0005`. So a refused replay publishes no p-value at all,
+    /// and the label says why.
+    pub fn is_refusal(self) -> bool {
+        match self {
+            SmoothLrSelectionDecline::NoPenaltyComponents
+            | SmoothLrSelectionDecline::NoInformation
+            | SmoothLrSelectionDecline::WindowClosed => false,
+            SmoothLrSelectionDecline::GeometryRefused
+            | SmoothLrSelectionDecline::GridRefused
+            | SmoothLrSelectionDecline::SelectionUnresolved => true,
         }
     }
 }
@@ -960,18 +990,59 @@ struct DiagonalCriterion<'a> {
     constant: f64,
 }
 
-/// Range of `f` over the share interval `[lo, hi]`, from its endpoints and the
-/// listed stationary points that fall inside it.
-fn share_polynomial_range(lo: f64, hi: f64, f: impl Fn(f64) -> f64, stationary: &[f64]) -> (f64, f64) {
-    let (at_lo, at_hi) = (f(lo), f(hi));
+/// `(s, 1 − s)` for the share `s = x / (1 + x)` of `x = e^u ν`, each to a few
+/// ulps RELATIVE.
+///
+/// The complement is `1 / (1 + x)`, never `1 − s`: near `s = 1` the subtraction
+/// keeps only an absolute `ε`, and every share polynomial carries the factor
+/// `1 − s`. The forward-error bands the certified search reads are Higham
+/// accumulation bounds over summands taken as relatively accurate, so a summand
+/// that is not breaks them. On a Bernoulli null the slice `C″` at the two ends of
+/// a `1.4e-8`-wide cell came out `2.4e-16` apart — the `ε` of a share near one —
+/// against a certified `|C‴|·width` of `1.1e-17` and a band of `8e-19`, so the
+/// second-order enclosure was empty and the draw's selection was refused
+/// (`selection_unresolved`, one null draw in ten at `n = 100`).
+fn share_pair(scaled: f64) -> (f64, f64) {
+    let denominator = 1.0 + scaled;
+    (scaled / denominator, 1.0 / denominator)
+}
+
+/// Range of `f(s, 1 − s)` over the share interval from `lo` to `hi` (each a
+/// [`share_pair`]), from its endpoints and the listed stationary shares that
+/// fall inside it.
+fn share_polynomial_range(
+    lo: (f64, f64),
+    hi: (f64, f64),
+    f: impl Fn(f64, f64) -> f64,
+    stationary: &[f64],
+) -> (f64, f64) {
+    let (at_lo, at_hi) = (f(lo.0, lo.1), f(hi.0, hi.1));
     let mut range = (at_lo.min(at_hi), at_lo.max(at_hi));
     for &point in stationary {
-        if lo <= point && point <= hi {
-            let value = f(point);
+        if lo.0 <= point && point <= hi.0 {
+            let value = f(point, 1.0 - point);
             range = (range.0.min(value), range.1.max(value));
         }
     }
     range
+}
+
+/// The share polynomials of [`DiagonalCriterion`] in `(s, c = 1 − s)`:
+/// `g = s(1 − s) = sc`, `g(1 − 2s) = sc(c − s)` and
+/// `g(1 − 6s + 6s²) = sc(1 − 6sc)`. Written in the pair they are relatively
+/// accurate wherever `sc` is, and each is bounded in magnitude by its
+/// absolute-value evaluation — `sc` for the first two (`|c − s| ≤ c + s = 1`),
+/// `sc(1 + 6sc)` for the third — which is what the bands are charged with.
+fn share_spread(s: f64, c: f64) -> f64 {
+    s * c
+}
+
+fn share_skew(s: f64, c: f64) -> f64 {
+    s * c * (c - s)
+}
+
+fn share_torsion(s: f64, c: f64) -> f64 {
+    s * c * (1.0 - 6.0 * s * c)
 }
 
 impl DiagonalCriterion<'_> {
@@ -991,29 +1062,28 @@ impl DiagonalCriterion<'_> {
             if !scaled.is_finite() {
                 return None;
             }
-            let share = scaled / (1.0 + scaled);
-            let spread = share * (1.0 - share);
+            let (share, complement) = share_pair(scaled);
+            let spread = share_spread(share, complement);
+            let skew = share_skew(share, complement);
             let log_term = scaled.ln_1p();
             value += square * share + log_term;
             magnitude += (square * share).abs() + log_term.abs();
             first += square * spread + share;
-            second += square * spread * (1.0 - 2.0 * share) + spread;
-            third += square * spread * (1.0 - 6.0 * share + 6.0 * share * share)
-                + spread * (1.0 - 2.0 * share);
+            second += square * skew + spread;
+            third += square * share_torsion(share, complement) + skew;
         }
         for &mu in self.occam {
             let scaled = t * mu;
             if !scaled.is_finite() {
                 return None;
             }
-            let share = scaled / (1.0 + scaled);
-            let spread = share * (1.0 - share);
+            let (share, complement) = share_pair(scaled);
             let log_term = scaled.ln_1p();
             value -= log_term;
             magnitude += log_term.abs();
             first -= share;
-            second -= spread;
-            third -= spread * (1.0 - 2.0 * share);
+            second -= share_spread(share, complement);
+            third -= share_skew(share, complement);
         }
         let band = gam_linalg::roundoff::accumulation_band(
             4 * self.squares.len() + 3 * self.occam.len() + 2,
@@ -1149,9 +1219,10 @@ impl DiagonalCriterion<'_> {
         let (mut third_lo, mut third_hi) = (0.0_f64, 0.0_f64);
         let (mut first_magnitude, mut second_magnitude, mut third_magnitude) =
             (rank, 0.0_f64, 0.0_f64);
-        let spread = |s: f64| s * (1.0 - s);
-        let skew = |s: f64| s * (1.0 - s) * (1.0 - 2.0 * s);
-        let torsion = |s: f64| s * (1.0 - s) * (1.0 - 6.0 * s + 6.0 * s * s);
+        let (spread, skew, torsion) = (share_spread, share_skew, share_torsion);
+        // The absolute-value evaluations of the three share polynomials over a
+        // share range whose largest `sc` is `spread_max` (see [`share_spread`]).
+        let modulus = |spread_max: f64| (spread_max, spread_max * (1.0 + 6.0 * spread_max));
         let mut nu_order: Vec<usize> = (0..self.generalized.len())
             .filter(|&index| self.generalized[index] > 0.0)
             .collect();
@@ -1174,14 +1245,15 @@ impl DiagonalCriterion<'_> {
             if !(scaled_a.is_finite() && scaled_b.is_finite()) {
                 return None;
             }
-            let share_lo = scaled_a / (1.0 + scaled_a);
-            let share_hi = scaled_b / (1.0 + scaled_b);
+            let (pair_a, pair_b) = (share_pair(scaled_a), share_pair(scaled_b));
+            let (share_lo, share_hi) = (pair_a.0, pair_b.0);
             let (spread_lo, spread_hi) =
-                share_polynomial_range(share_lo, share_hi, spread, &spread_stationary);
+                share_polynomial_range(pair_a, pair_b, spread, &spread_stationary);
             let (skew_lo, skew_hi) =
-                share_polynomial_range(share_lo, share_hi, skew, &skew_stationary);
+                share_polynomial_range(pair_a, pair_b, skew, &skew_stationary);
             let (torsion_lo, torsion_hi) =
-                share_polynomial_range(share_lo, share_hi, torsion, &torsion_stationary);
+                share_polynomial_range(pair_a, pair_b, torsion, &torsion_stationary);
+            let (skew_modulus, torsion_modulus) = modulus(spread_hi);
             first_lo += square * spread_lo;
             first_hi += square * spread_hi;
             second_lo += square * skew_lo;
@@ -1196,10 +1268,9 @@ impl DiagonalCriterion<'_> {
                 third_lo += skew_lo;
                 third_hi += skew_hi;
             }
-            first_magnitude += square * spread_hi.abs().max(spread_lo.abs()) + share_hi.abs();
-            second_magnitude += square * skew_hi.abs().max(skew_lo.abs()) + spread_hi.abs();
-            third_magnitude +=
-                square * torsion_hi.abs().max(torsion_lo.abs()) + skew_hi.abs().max(skew_lo.abs());
+            first_magnitude += square * spread_hi + share_hi;
+            second_magnitude += square * skew_modulus + spread_hi;
+            third_magnitude += square * torsion_modulus + skew_modulus;
         }
         // The Occam spectrum enters with a MINUS sign, so an unpaired share range
         // subtracts crosswise: its largest share lowers the derivative's floor.
@@ -1208,12 +1279,12 @@ impl DiagonalCriterion<'_> {
             if !(scaled_a.is_finite() && scaled_b.is_finite()) {
                 return None;
             }
-            let share_lo = scaled_a / (1.0 + scaled_a);
-            let share_hi = scaled_b / (1.0 + scaled_b);
+            let (pair_a, pair_b) = (share_pair(scaled_a), share_pair(scaled_b));
+            let (share_lo, share_hi) = (pair_a.0, pair_b.0);
             let (spread_lo, spread_hi) =
-                share_polynomial_range(share_lo, share_hi, spread, &spread_stationary);
+                share_polynomial_range(pair_a, pair_b, spread, &spread_stationary);
             let (skew_lo, skew_hi) =
-                share_polynomial_range(share_lo, share_hi, skew, &skew_stationary);
+                share_polynomial_range(pair_a, pair_b, skew, &skew_stationary);
             if !mu_paired[index] {
                 first_lo -= share_hi;
                 first_hi -= share_lo;
@@ -1222,23 +1293,24 @@ impl DiagonalCriterion<'_> {
                 third_lo -= skew_hi;
                 third_hi -= skew_lo;
             }
-            first_magnitude += share_hi.abs();
-            second_magnitude += spread_hi.abs().max(spread_lo.abs());
-            third_magnitude += skew_hi.abs().max(skew_lo.abs());
+            first_magnitude += share_hi;
+            second_magnitude += spread_hi;
+            third_magnitude += modulus(spread_hi).0;
         }
-        let share = |scaled: f64| scaled / (1.0 + scaled);
         for index in 0..pairs {
             let (nu, mu) = (self.generalized[nu_order[index]], self.occam[mu_order[index]]);
-            let (nu_lo, nu_hi) = (share(t_a * nu), share(t_b * nu));
-            let (mu_lo, mu_hi) = (share(t_a * mu), share(t_b * mu));
+            let (nu_a, nu_b) = (share_pair(t_a * nu), share_pair(t_b * nu));
+            let (mu_a, mu_b) = (share_pair(t_a * mu), share_pair(t_b * mu));
+            let (nu_lo, nu_hi) = (nu_a.0, nu_b.0);
+            let (mu_lo, mu_hi) = (mu_a.0, mu_b.0);
             let (nu_spread_lo, nu_spread_hi) =
-                share_polynomial_range(nu_lo, nu_hi, spread, &spread_stationary);
+                share_polynomial_range(nu_a, nu_b, spread, &spread_stationary);
             let (mu_spread_lo, mu_spread_hi) =
-                share_polynomial_range(mu_lo, mu_hi, spread, &spread_stationary);
-            let (nu_skew_lo, nu_skew_hi) = share_polynomial_range(nu_lo, nu_hi, skew, &skew_stationary);
-            let (mu_skew_lo, mu_skew_hi) = share_polynomial_range(mu_lo, mu_hi, skew, &skew_stationary);
+                share_polynomial_range(mu_a, mu_b, spread, &spread_stationary);
+            let (nu_skew_lo, nu_skew_hi) = share_polynomial_range(nu_a, nu_b, skew, &skew_stationary);
+            let (mu_skew_lo, mu_skew_hi) = share_polynomial_range(mu_a, mu_b, skew, &skew_stationary);
             let gap = nu.ln() - mu.ln();
-            let (span_lo, span_hi) = (share(t_a * nu.min(mu)), share(t_b * nu.max(mu)));
+            let (span_lo, span_hi) = (share_pair(t_a * nu.min(mu)), share_pair(t_b * nu.max(mu)));
             let (_, spread_max) =
                 share_polynomial_range(span_lo, span_hi, spread, &spread_stationary);
             let (skew_min, skew_max) =
@@ -1604,10 +1676,12 @@ impl SmoothLrSelectionReplay {
     /// independently inside that box.
     ///
     /// Declines — with a reason — when the term has no penalized direction
-    /// (nothing to select), the geometry could not be whitened, or every window
-    /// is empty (the fit is railed against both walls), in which case the
-    /// conditional law IS the selection law and the caller should use it
-    /// unmodified.
+    /// (nothing to select) or every window is empty (the fit is railed against
+    /// both walls), in which case the conditional law IS the selection law and
+    /// the caller should use it unmodified; and when the geometry or a draw's
+    /// selection could not be computed, which is a REFUSAL
+    /// ([`SmoothLrSelectionDecline::is_refusal`]) and leaves the term with no
+    /// p-value.
     fn generate(
         whitener: &Array2<f64>,
         unit_penalties: &[Array2<f64>],
@@ -1622,9 +1696,9 @@ impl SmoothLrSelectionReplay {
         if whitener.ncols() == 0 {
             return SmoothLrSelection::Declined(SmoothLrSelectionDecline::NoInformation);
         }
-        let Some(geometry) = SelectionGeometry::whiten(whitener, unit_penalties, log_lambda)
-        else {
-            return SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused);
+        let geometry = match SelectionGeometry::whiten(whitener, unit_penalties, log_lambda) {
+            Ok(geometry) => geometry,
+            Err(reason) => return SmoothLrSelection::Declined(reason),
         };
         Self::from_geometry(
             &geometry,
@@ -2344,14 +2418,6 @@ const SMOOTH_LR_TAIL_ROUNDOFF_FLOOR: f64 = 1e-13;
 const SMOOTH_LR_TAIL_COARSEST: f64 = 1e-3;
 
 impl SmoothLrReferenceDf {
-    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
-    /// replay held out. This is the tail `Self::tail_probability_with_bound`
-    /// reports when nothing was selected, and it is the reference the replay
-    /// corrects.
-    pub fn conditional_tail_probability(&self, statistic: f64) -> f64 {
-        self.conditional_tail_with_bound(statistic).0
-    }
-
     /// `P(W > statistic)` under this reference, with the certified absolute
     /// bound the quadrature achieved on it.
     ///
@@ -2389,10 +2455,16 @@ impl SmoothLrReferenceDf {
     /// coarser would add some. The achieved bound is returned rather than
     /// assumed, so a consumer can see the accuracy instead of inheriting it.
     pub fn tail_probability_with_bound(&self, statistic: f64) -> (f64, f64) {
-        let (conditional, bound) = self.conditional_tail_with_bound(statistic);
-        let Some(replay) = self.selection.replay() else {
-            return (conditional, bound);
+        let replay = match &self.selection {
+            SmoothLrSelection::Replayed(replay) => replay,
+            SmoothLrSelection::Declined(reason) if reason.is_refusal() => {
+                return (f64::NAN, f64::NAN);
+            }
+            SmoothLrSelection::Declined(_) => {
+                return self.conditional_tail_with_bound(statistic);
+            }
         };
+        let (conditional, bound) = self.conditional_tail_with_bound(statistic);
         if !conditional.is_finite() {
             return (conditional, bound);
         }
@@ -2464,7 +2536,16 @@ impl SmoothLrReferenceDf {
             .collect()
     }
 
-    fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
+    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
+    /// replay held out — and its certified truncation bound. This is the tail
+    /// [`Self::tail_probability_with_bound`] reports when nothing was selected,
+    /// and it is the law the replay corrects.
+    ///
+    /// It is a building block of the reference, not a p-value: read against a
+    /// fitted `λ̂` it prices the smoothing parameter as given and is
+    /// anti-conservative, which is why [`SmoothTermLrInference`] does not
+    /// publish it.
+    pub fn conditional_tail_with_bound(&self, statistic: f64) -> (f64, f64) {
         if !statistic.is_finite() {
             return (f64::NAN, f64::NAN);
         }
@@ -2577,14 +2658,25 @@ pub struct SmoothTermLrInference {
     pub rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     pub statistic_corrected: f64,
-    /// Uncorrected tail probability `P(χ²_ν > W/g)` under the null law's own
-    /// two-moment reference.
-    pub p_value_uncorrected: f64,
-    /// Corrected tail probability `P(χ²_ν > W*/g)`; equals the uncorrected value
-    /// when no correction was applied. Dividing the statistic by `c` and scaling
+    /// The term's p-value: `P(W > W*)` under [`Self::ref_df_provenance`] — the
+    /// statistic's own null law with the λ̂-selection replay applied
+    /// ([`SmoothLrReferenceDf::tail_probability_with_bound`]), read at the
+    /// Bartlett-corrected statistic. Dividing the statistic by `c` and scaling
     /// every spectral weight by `c` are the same operation on this reference, so
     /// the Bartlett correction composes without a second convention.
-    pub p_value_corrected: f64,
+    ///
+    /// This is the only p-value the report publishes. The fixed-`λ` conditional
+    /// tail and the uncorrected tail it replaces are anti-conservative under the
+    /// null (they price `λ̂` as given and drop the `O(1/n)` mean shift), so they
+    /// are not offered as alternatives; the reference is published whole, so a
+    /// consumer who wants to see how the correction moved the answer can still
+    /// evaluate it at `statistic_lr`.
+    ///
+    /// NaN when there is no answer to publish: the statistic itself is NaN (a
+    /// null refit refused), or `λ̂` was chosen but its selection replay refused
+    /// ([`SmoothLrSelectionDecline::is_refusal`]; the reason is in
+    /// `ref_df_provenance.selection`). A fixed-`λ` tail is never substituted.
+    pub p_value: f64,
     /// Whether the second-order correction is **material** (#939 deliverable 4):
     /// the per-test diagnostic "is `n` too small for first-order inference
     /// *here*?". `true` when a correction was applied and it moves the result by
@@ -2593,30 +2685,8 @@ pub struct SmoothTermLrInference {
     /// p-value change `|p* − p| / max(p, p*, ε)`. `false` when `correction` is
     /// [`SmoothLrCorrection::None`] (no correction was applied).
     pub material: bool,
-    /// Which statistic the corrected p-value is built from.
+    /// Which statistic the p-value is built from.
     pub correction: SmoothLrCorrection,
-    /// The CONDITIONAL tail of the corrected statistic — the p-value the
-    /// fixed-`λ` law alone would report, before the λ̂-selection replay moves it
-    /// (#2672).
-    ///
-    /// Published so the correction is visible rather than folded in:
-    /// `p_value_corrected − p_value_conditional` is exactly what treating `λ̂` as
-    /// chosen rather than given is worth on this fit, and it is the quantity a
-    /// reader should be shown if they are going to be asked to accept it. Equal
-    /// to `p_value_corrected` when no selection was possible.
-    pub p_value_conditional: f64,
-    /// Certified absolute accuracy of the two published p-values — the larger of
-    /// the two truncation bounds the tail quadrature achieved (#2672).
-    ///
-    /// `0.0` on the closed-form lanes (a degraded reference, or a spectrum whose
-    /// weights are all equal) because there is no truncation to bound. On the
-    /// Imhof lane it is what the sweep reached against the accuracy
-    /// [`SmoothLrReferenceDf::tail_probability_with_bound`] derived from the
-    /// fit's own convergence tolerance, so a consumer reads the accuracy rather
-    /// than inheriting it. A value large enough to matter means the quadrature
-    /// hit its panel backstop, which is a statement about the spectrum's spread
-    /// and not a defect in the p-value's derivation.
-    pub p_value_bound: f64,
 }
 
 /// The materiality threshold for [`SmoothTermLrInference::material`] (#939
@@ -2744,9 +2814,22 @@ pub fn smooth_term_lr_inference_forspec(
     let s_lambda = weighted_blockwise_penalty_sum(&full.design.penalties, lambdas, p_total);
     let rho_penalty_components =
         fitted_rho_penalty_components(&full.design.penalties, lambdas, p_total)?;
-    let rho_covariance = full.fit.artifacts.rho_covariance.as_ref().filter(|cov| {
-        cov.nrows() == rho_penalty_components.len() && cov.ncols() == rho_penalty_components.len()
-    });
+    // One `ρ` per penalty component is an invariant of the fit, so a covariance
+    // of any other shape is a defect upstream — not a reason to quietly price
+    // the Bartlett factor as if `λ̂` were fixed.
+    let rho_covariance = full.fit.artifacts.rho_covariance.as_ref();
+    if let Some(cov) = rho_covariance
+        && (cov.nrows() != rho_penalty_components.len()
+            || cov.ncols() != rho_penalty_components.len())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "smooth_term_lr_inference: rho covariance is {}x{} but the fit has {} penalty \
+             components",
+            cov.nrows(),
+            cov.ncols(),
+            rho_penalty_components.len()
+        )));
+    }
     // Full design as a dense n×p array for the Lawley pair-matrix reduction.
     let full_design_dense = full.design.design.to_dense();
     let influence = full.fit.coefficient_influence();
@@ -3040,8 +3123,9 @@ pub fn smooth_term_lr_inference_forspec(
         }
         let ref_df_provenance = reference.clone();
 
-        let (p_uncorrected, mut p_bound) = reference.tail_probability_with_bound(statistic_lr);
-        let mut p_conditional = reference.conditional_tail_probability(statistic_lr);
+        // The uncorrected tail is read only to judge how far the correction
+        // moved the answer (`material`); it is not published as a p-value.
+        let (p_uncorrected, _) = reference.tail_probability_with_bound(statistic_lr);
 
         // Magic Bartlett correction: only when the LR statistic is finite, the
         // family has closed-form jets, n is in the resolvable regime, and the
@@ -3112,11 +3196,7 @@ pub fn smooth_term_lr_inference_forspec(
                     // the same operation on this reference — the law is exactly
                     // scale-equivariant — so the correction composes with the
                     // scaled reference without a second convention.
-                    let (corrected, corrected_bound) =
-                        reference.tail_probability_with_bound(statistic_corrected);
-                    p_corrected = corrected;
-                    p_conditional = reference.conditional_tail_probability(statistic_corrected);
-                    p_bound = p_bound.max(corrected_bound);
+                    p_corrected = reference.tail_probability_with_bound(statistic_corrected).0;
                 }
             }
         }
@@ -3153,12 +3233,9 @@ pub fn smooth_term_lr_inference_forspec(
             bartlett_factor_conditional,
             rho_variation_shift,
             statistic_corrected,
-            p_value_uncorrected: p_uncorrected,
-            p_value_corrected: p_corrected,
+            p_value: p_corrected,
             material,
             correction,
-            p_value_conditional: p_conditional,
-            p_value_bound: p_bound,
         });
     }
     Ok(out)
@@ -3328,8 +3405,14 @@ fn lr_null_reference(
         null_dim,
         source,
         // The degraded lanes do not have the spectrum, so they cannot have the
-        // geometry the replay is built from either.
-        selection: SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused),
+        // geometry the replay is built from either. That is only harmless when
+        // nothing was selected; a penalized term that lands here had its `λ̂`
+        // chosen and no way to price the choice, which is a refusal.
+        selection: SmoothLrSelection::Declined(if term_penalties.is_empty() {
+            SmoothLrSelectionDecline::NoPenaltyComponents
+        } else {
+            SmoothLrSelectionDecline::GeometryRefused
+        }),
         statistic_resolution,
         // Completed by the caller once the null refit has produced the second
         // residual degrees of freedom `B` needs (#2672).
@@ -3813,7 +3896,7 @@ mod profiled_scale_reference_tests {
             edf: mean,
             null_dim: 0,
             source: SmoothLrReferenceSource::NullSpectrum,
-            selection: SmoothLrSelection::Declined(SmoothLrSelectionDecline::GeometryRefused),
+            selection: SmoothLrSelection::Declined(SmoothLrSelectionDecline::NoPenaltyComponents),
             statistic_resolution: 0.0,
             profiled_scale,
         }
@@ -3885,6 +3968,48 @@ mod profiled_scale_reference_tests {
         assert!(just_above < 1.0 && just_above > 0.999, "{just_above}");
     }
 
+    /// A `λ̂` that WAS chosen but whose selection replay refused has no p-value.
+    ///
+    /// The tail used to fall through to the conditional (fixed-`λ`) law on ANY
+    /// decline. On a Bernoulli null term the penalty had absorbed, the
+    /// multiscale replay refused (`selection_unresolved`) and that fall-through
+    /// published `p = 0.0005`. A decline that says nothing was selectable keeps
+    /// the conditional tail, which is then the whole law.
+    #[test]
+    fn a_refused_selection_replay_publishes_no_p_value() {
+        let statistic = 3.0;
+        let declines = [
+            SmoothLrSelectionDecline::NoPenaltyComponents,
+            SmoothLrSelectionDecline::NoInformation,
+            SmoothLrSelectionDecline::GeometryRefused,
+            SmoothLrSelectionDecline::WindowClosed,
+            SmoothLrSelectionDecline::GridRefused,
+            SmoothLrSelectionDecline::SelectionUnresolved,
+        ];
+        for decline in declines {
+            let mut subject = reference(vec![1.0_f64, 0.6, 0.2], None);
+            subject.selection = SmoothLrSelection::Declined(decline);
+            let (conditional, _) = subject.conditional_tail_with_bound(statistic);
+            assert!(conditional.is_finite() && conditional > 0.0 && conditional < 1.0);
+            let (published, bound) = subject.tail_probability_with_bound(statistic);
+            if decline.is_refusal() {
+                assert!(
+                    published.is_nan() && bound.is_nan(),
+                    "{}: a refused replay must publish NaN, got p={published}",
+                    decline.label()
+                );
+            } else {
+                assert_eq!(
+                    published,
+                    conditional,
+                    "{}: with nothing selectable the conditional law is the law",
+                    decline.label()
+                );
+            }
+        }
+        assert!(SmoothLrSelectionDecline::SelectionUnresolved.is_refusal());
+        assert!(!SmoothLrSelectionDecline::WindowClosed.is_refusal());
+    }
 }
 
 #[cfg(test)]
@@ -4092,6 +4217,52 @@ mod selection_replay_tests {
         criterion
             .select(-6.0, 6.0)
             .expect("the second-order enclosure certifies the cancelling slice");
+    }
+
+    /// A slice whose shares all sit on a plateau — within `~1e-9` of one, or at
+    /// `~1e-3` — the shape of a Bernoulli null draw's axis slice near its
+    /// minimum: `C′` and `C″` are `~4e-3`, so the enclosure's forward-error band
+    /// is `~1e-18`. Across a `2⁻²⁴`-wide cell a share near one moves by about one
+    /// ulp, and every share polynomial carries `1 − s`: taken as the
+    /// subtraction, that ulp moves `C″` between the cell's ends by `~ε`, far
+    /// more than `|C‴|·width` plus the band, so the second-order enclosure came
+    /// out empty on about half of these cells and the draw's selection was
+    /// refused. Every narrow cell must stay evaluable and must contain the jet.
+    #[test]
+    fn a_saturated_share_keeps_the_curvature_enclosure_consistent() {
+        let generalized = [1.0e9_f64, 3.0e9, 1.0e-3];
+        let occam = [2.0e9_f64];
+        let squares = [2.0_f64, 1.5, 0.7];
+        // Two saturated generalized shares less one saturated Occam share: the
+        // rank cancels them, and `C′` is the unsaturated share's `~4e-3`.
+        let criterion = DiagonalCriterion {
+            squares: &squares,
+            generalized: &generalized,
+            rank: 1,
+            occam: &occam,
+            constant: 0.0,
+        };
+        let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
+        let width = 2.0_f64.powi(-24);
+        for index in 0..64 {
+            let cell_lo = -1.0 + 2.0 * index as f64 / 64.0;
+            let cell_hi = cell_lo + width;
+            let (first_range, second_range) =
+                criterion.derivative_ranges(cell_lo, cell_hi).unwrap_or_else(|| {
+                    panic!("the narrow cell [{cell_lo}, {cell_hi}] has an empty enclosure")
+                });
+            for u in [cell_lo, 0.5 * (cell_lo + cell_hi), cell_hi] {
+                let [_, first, second, _] = jet(u);
+                assert!(
+                    first_range.lo <= first && first <= first_range.hi,
+                    "C' {first} at u={u} escapes {first_range:?} on [{cell_lo}, {cell_hi}]"
+                );
+                assert!(
+                    second_range.lo <= second && second <= second_range.hi,
+                    "C'' {second} at u={u} escapes {second_range:?} on [{cell_lo}, {cell_hi}]"
+                );
+            }
+        }
     }
 
     /// The geometry a bare generalized spectrum corresponds to: unit
@@ -4389,7 +4560,7 @@ mod selection_replay_tests {
                 &[penalty.clone(), penalty],
                 &[0.0, 0.0],
             )
-            .is_none()
+            .is_err()
         );
     }
 
@@ -4399,9 +4570,15 @@ mod selection_replay_tests {
     /// the textbook chi-square.
     #[test]
     fn nothing_to_select_means_no_replay() {
-        assert!(SelectionGeometry::whiten(&Array2::eye(3), &[], &[]).is_none());
-        assert!(
-            SelectionGeometry::whiten(&Array2::eye(2), &[Array2::zeros((2, 2))], &[0.0]).is_none()
+        assert_eq!(
+            SelectionGeometry::whiten(&Array2::eye(3), &[], &[]).err(),
+            Some(SmoothLrSelectionDecline::NoPenaltyComponents)
+        );
+        assert_eq!(
+            SelectionGeometry::whiten(&Array2::eye(2), &[Array2::zeros((2, 2))], &[0.0]).err(),
+            Some(SmoothLrSelectionDecline::NoPenaltyComponents),
+            "a component that whitens to nothing penalizes nothing: a fact about the fit, \
+             not a refusal"
         );
         let geometry = diagonal(&spectrum());
         for window in [(4.0_f64, -4.0_f64), (f64::NAN, 1.0)] {
@@ -4830,9 +5007,11 @@ mod selection_replay_tests {
                 &[bending.clone(), ridge.clone()],
                 &[0.5 * separation, -0.5 * separation],
             )
-            .unwrap_or_else(|| {
+            .unwrap_or_else(|reason| {
                 panic!(
-                    "the geometry refused a dense fit at separation {separation} —                      that is a silent `no replay` on every real model"
+                    "the geometry refused a dense fit at separation {separation} ({}) — \
+                     that is a silent `no replay` on every real model",
+                    reason.label()
                 )
             });
             let replay = SmoothLrSelectionReplay::from_geometry(

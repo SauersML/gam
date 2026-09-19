@@ -439,3 +439,15 @@ default-filter = 'package(gam-sae) and not test(/(^|::)zz/) and test(/^manifold:
 [[profile.default.overrides]]
 filter = 'test(=inner_fit_core_scaling::inner_fit_core_scaling)'
 threads-required = 'num-test-threads'
+
+# The single smooth-term p-value calibration study fits `y ~ s(x) + s(z)` and
+# runs both terms' λ̂-selection replays on each of 200 null and 40 alternative
+# replicates per family. Its Bernoulli cell's replay cost is heavy-tailed: on 48
+# null seeds at n = 100 the median replicate took 3 s and the slowest more than
+# 15 min on four cores, so the null cell needs ~40 min of a four-core runner.
+# It takes the whole pool (the replicates are the parallelism) and a budget
+# that lets the size verdict assert; terminate-after = 6 still kills a hang.
+[[profile.default.overrides]]
+filter = 'test(/smooth_term_lr_single_p_value_calibration::/)'
+slow-timeout = { period = "600s", terminate-after = 6 }
+threads-required = 'num-test-threads'

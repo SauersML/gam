@@ -1,5 +1,32 @@
 ## Unreleased
 
+- **`smooth_significance` publishes one calibrated p-value per term.** Each row used to
+  carry `p_value_uncorrected`, `p_value_corrected`, `p_value_conditional` and
+  `p_value_bound`, and they disagreed under the null. The conditional (fixed-`λ`) tail
+  treats the REML `λ̂` as given instead of chosen from the same data, and on
+  `y ~ s(x) + s(z)` with a null `z` it rejected at 0.075–0.105 (Gaussian) and
+  0.30 (binomial, n = 100) against a nominal 0.05. The rows now carry a single
+  `p_value`, taken from the Bartlett-corrected statistic with the λ̂-selection replay
+  applied. `statistic_lr`, `statistic_corrected` and the full reference (`reference_*`,
+  `selection`) are still published. When `λ̂` was chosen but the selection replay could
+  not be computed (`selection` is `geometry_refused`, `grid_refused` or
+  `selection_unresolved`), `p_value` is NaN. Before this change such rows silently
+  published the conditional tail, which gave a null binomial term `p = 0.0005`. A
+  `rho_covariance` whose shape does not match the fit's penalty components is now an
+  error; before, the estimated-`λ` Bartlett factor was dropped without notice.
+  **Migration:** read `p_value`, in the Rust report, the pyffi rows and
+  `gamfit` alike.
+- **The λ̂-selection replay no longer refuses Bernoulli draws whose penalty shares
+  saturate.** The certified search enclosed the criterion's slope and curvature through
+  the shares `s = x/(1+x)` and their complements, and computed the complement as `1 − s`.
+  Near `s = 1` that difference keeps only an absolute `ε`, so across a narrow cell the
+  endpoint curvatures differed by `~ε` while the enclosure's rounding band assumed
+  relatively exact summands and was `~1e-18`. The two enclosures did not intersect and the
+  replay stopped with `selection_unresolved`: 5 of 48 null binomial draws at n = 100, each
+  publishing a NaN p-value. The complement is now `1/(1+x)`, exact to one rounding, and the
+  share polynomials are written in `(s, 1 − s)`. Of the same 48 draws, 47 replayed without
+  a refusal and one was still searching when stopped after 17 min: the replay's cost is
+  heavy-tailed on Bernoulli fits, a separate defect this does not fix.
 - **Sphere points must be unit-norm to f64 precision** (#2469). Unit-sphere points were
   accepted within `1e-6` of `‖p‖² = 1` by `SphereManifold` (and so by `stiefel(k=1)` and
   `grassmann(k=1)`), and the `"sphere"` response geometry and `sphere_frechet_mean`

@@ -1069,15 +1069,13 @@ struct SmoothTermLrRow {
     /// function of the two fits' residual degrees of freedom and of nothing
     /// random. `None` alongside `reference_residual_df`.
     reference_deterministic_offset: Option<f64>,
-    /// The CONDITIONAL tail of the corrected statistic: what the fixed-`λ` law
-    /// alone reports, before the λ̂-selection replay moves it.
-    /// `p_value_corrected − p_value_conditional` is what treating `λ̂` as chosen
-    /// rather than given is worth on this fit.
-    p_value_conditional: f64,
-    /// Certified absolute accuracy of the two p-values below: the tail
-    /// quadrature's truncation bound plus twice the selection replay's own
-    /// Monte-Carlo standard error. `0.0` on the closed-form lanes.
-    p_value_bound: f64,
+    /// Whether the reference prices `λ̂` as chosen: `"replayed"` when the
+    /// λ̂-selection replay was applied, else the reason it was not (a term with
+    /// nothing to select — `"no_penalty_components"`, `"no_information"`,
+    /// `"window_closed"` — has a conditional law that IS its selection law;
+    /// `"geometry_refused"`, `"grid_refused"` and `"selection_unresolved"` are
+    /// refusals, and the term's `p_value` is then NaN).
+    selection: &'static str,
     /// Lawley LR Bartlett factor `c = 1 + Δε/d` (1.0 when uncorrected).
     bartlett_factor: f64,
     /// Fixed-λ conditional Lawley factor when the applied factor also includes
@@ -1087,10 +1085,11 @@ struct SmoothTermLrRow {
     rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     statistic_corrected: f64,
-    /// Uncorrected p-value `P(χ²_d > W)`.
-    p_value_uncorrected: f64,
-    /// Corrected p-value `P(χ²_d > W*)` — the magic-by-default reported value.
-    p_value_corrected: f64,
+    /// The term's p-value: the tail of the Bartlett-corrected statistic `W*`
+    /// under the reference above, with the λ̂-selection replay applied. The only
+    /// p-value the report carries; NaN when the statistic is NaN or `selection`
+    /// names a refusal.
+    p_value: f64,
     /// `true` when the correction is **material** (#939 deliverable 4): it moves
     /// the Bartlett factor or the p-value by more than 10% — the diagnostic that
     /// `n` is too small for first-order inference on this term. `false` when no
@@ -1303,14 +1302,15 @@ fn smooth_term_lr_inference_dataset_json_impl(
                 .profiled_scale
                 .as_ref()
                 .map(|scale| scale.deterministic_offset),
-            p_value_conditional: r.p_value_conditional,
-            p_value_bound: r.p_value_bound,
+            selection: match r.ref_df_provenance.selection.decline() {
+                None => "replayed",
+                Some(reason) => reason.label(),
+            },
             bartlett_factor: r.bartlett_factor,
             bartlett_factor_conditional: r.bartlett_factor_conditional,
             rho_variation_shift: r.rho_variation_shift,
             statistic_corrected: r.statistic_corrected,
-            p_value_uncorrected: r.p_value_uncorrected,
-            p_value_corrected: r.p_value_corrected,
+            p_value: r.p_value,
             material: r.material,
             correction_provenance: r.correction.label(),
         })
