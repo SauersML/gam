@@ -4,7 +4,8 @@
 `gamfit.fit`:
 
 - `GAMRegressor` (inherits `RegressorMixin`) — continuous responses.
-- `GAMClassifier` (inherits `ClassifierMixin`) — binary classification.
+- `GAMClassifier` (inherits `ClassifierMixin`) — binary and multiclass
+  classification.
 
 Install with `pip install gamfit[sklearn]`.
 
@@ -29,13 +30,15 @@ r2    = est.score(X, y)       # r2_score
 
 ```text
 GAMRegressor(
-    formula: str,
+    formula: str | None = None,
     family: str = "auto",
     offset: str | None = None,
     config: dict[str, Any] | None = None,
 )
 ```
 
+`formula=None` fits the automatic formula `y ~ .`, built by the engine from
+the feature schema; the formula actually fitted is `formula_` after `fit`.
 All four arguments are surfaced as `get_params()` keys, so they work with
 `GridSearchCV` and related utilities. Per-row weights are data, not a
 hyperparameter: pass them as `fit(X, y, sample_weight=w)`.
@@ -93,19 +96,20 @@ hard  = est.predict(X)         # (n,), highest-probability class label
 acc   = est.score(X, y)        # accuracy
 ```
 
-`classes_` is the sorted pair of labels observed at fit time. The wrapper
-encodes `classes_[1]` as the positive class before fitting, so string
-labels and non-`{0, 1}` binary labels round-trip. `predict_proba()` clips
-the positive-class probability to `[0, 1]` and stacks
-`[P(classes_[0]), P(classes_[1])]`. `predict()` returns
+`classes_` is the sorted labels observed at fit time. With two classes the
+wrapper encodes `classes_[1]` as the positive class and fits the
+binomial-logit GAM, so string labels and non-`{0, 1}` binary labels
+round-trip; `predict_proba()` clips the positive-class probability to
+`[0, 1]` and stacks `[P(classes_[0]), P(classes_[1])]`. With three or more
+classes (or `family="multinomial"`) it fits one joint multinomial-logit GAM,
+and `predict_proba()` returns the `(n, K)` class probabilities with column `j`
+aligned to `classes_[j]`. `predict()` returns
 `classes_[argmax(predict_proba(X), axis=1)]`.
 
 `score(X, y, sample_weight=None)` is accuracy, as for every scikit-learn
 classifier; use `scoring="roc_auc"` in `cross_val_score` / `GridSearchCV`
-for AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
-`brier`, `logloss`, `nagelkerke_r2`, and `ece`. Only binary targets are
-supported: the estimator declares `classifier_tags.multi_class = False`
-and rejects a multiclass `y` with a `ValueError`.
+for AUC. For a binary model, `metrics(X, y)` returns the full panel: `auc`,
+`pr_auc`, `brier`, `logloss`, `nagelkerke_r2`, and `ece`.
 
 Like `GAMRegressor`, `GAMClassifier` also inherits the pass-through helpers
 `summary()`, `check(X)`, and `report(path)` from the shared base estimator,

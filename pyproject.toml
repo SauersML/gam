@@ -76,7 +76,7 @@ cuda = [
   "nvidia-cusparse-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
   "nvidia-nvjitlink-cu12>=12.0,<13; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
-pandas = ["pandas>=2.0", "pyarrow>=14"]
+pandas = ["pandas>=2.0"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.6"]
 all = [
@@ -91,17 +91,22 @@ all = [
 [dependency-groups]
 test = [
   "pytest>=8",
+  "mypy>=2.3",
   "pandas>=2.0",
   "pyarrow>=14",
+  "polars>=1",
   "matplotlib>=3.8",
   "scikit-learn>=1.6",
 ]
 type = [
-  "mypy>=1.18",
+  "mypy>=2.3",
   "pandas>=2.0",
   "pandas-stubs",
   "pyarrow>=14",
+  "pyarrow-stubs",
   "polars>=1",
+  "jax>=0.4",
+  "safetensors",
   "matplotlib>=3.8",
   "scikit-learn>=1.6",
   "scikit-learn-stubs",
@@ -130,6 +135,7 @@ testpaths = ["tests"]
 # ordinary failures: SPEC.md forbids XFAIL/XPASS masking.
 markers = [
   "slow: test is too slow for the default CI Python-API job (run explicitly or locally)",
+  "static_typing: mypy --strict over gamfit; needs the `type` dependency group plus torch",
 ]
 
 [tool.mypy]
