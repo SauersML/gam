@@ -4530,5 +4530,16 @@
     },
     "reason": "SPEC R25 (bic-removal M2): the topology lifecycle selector's BIC score kind is deleted with its plumbing. bic_score computed deviance + p log(n), a large-sample surrogate for the evidence that the REML, LAML and TK kinds already compute; the Bic variant, the candidate deviance field that only fed it, the pyffi ScoreKind::Bic decode and the Python 'bic' literal go with it.",
     "evidence": "source_removal_guard.py and public_api_census.py, run against this base, each report exactly this one identity. git grep -w bic_score finds no occurrence under crates, src or tests at the head tree. cargo test -p gam-solve --lib topology_selector passes 23 tests, including typed_lifecycle_disagreement_compares_only_evidence_families."
+  },
+  {
+    "base": "c7b5c31a8c3800355aab61d8d26b57afd92ae25a",
+    "removed": {
+      "crates/gam-models/src/bms/row_kernel.rs::fourth_full_cache": 1,
+      "crates/gam-models/src/bms/row_kernel.rs::third_full_cache": 1,
+      "crates/gam-models/src/bms/row_primary_hessian.rs::build_row_exact_context_with_stats_and_cell_cache": 1,
+      "crates/gam-models/src/row_kernel.rs::validate_row_kernel_cache_lengths": 1
+    },
+    "reason": "#3022 and #2998: the rigid BMS row kernel builds each row's derivative tensors once and hands the same tensors to every consumer, so the per-row third/fourth full-tensor caches (RigidThirdFull, RigidFourthFull, their get/insert helpers and the third_full_cache/fourth_full_cache accessors) and the cache-length validator that policed them (validate_row_kernel_cache_lengths with its test) have no remaining purpose. The empirical third directional trace is contracted in factored form through gam-math jet_trace, whose cost does not depend on the flex width, so the fixed-width third-trace dispatch (empirical_fixed_third_trace_dispatch, empirical_fixed_third_trace_from_plan) is deleted. The degree-9 cell cache flag is gone, so build_row_exact_context_with_stats_and_cell_cache is renamed build_row_exact_context.",
+    "evidence": "source_removal_guard.py and public_api_census.py run against base c7b5c31a8c report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. cargo test -p gam-models --lib third_trace_2998 rigid_row_tensors_3022 multistart_member_2359 flex_measure_932 passes 10 of 10, including rigid_kernel_tables_match_direct_row_builds_3022, concurrent_row_sweeps_build_each_row_once_3022, a_failed_row_build_reaches_its_readers_3022 and factored_third_trace_matches_per_axis_contraction_2998 at widths 4, 8, 12, 18 and 20."
   }
 ]
