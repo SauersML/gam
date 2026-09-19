@@ -3538,6 +3538,95 @@ pub(crate) fn single_block_simplified_newton_corrections<
     })
 }
 
+/// The IFT predictor of a certified single-block coefficient mode (gam#2973): the mode `β̂` at the
+/// log-smoothing `from` moved to `to` along its tangent, `β̂ + Σ_k Δρ_k dβ̂/dρ_k` with
+/// `dβ̂/dρ_k = −(H + S_λ)⁻¹ λ_k S_k β̂`.
+///
+/// `curvature` is the exact-Newton working set the mode's own solve ended on, so `H` is the
+/// curvature that solve certified at `β̂`, and `S_λ` is the penalty at `from`. The step is the
+/// block's update step ([`ExactNewtonBlockUpdater::step_for_rhs`]) with right-hand side
+/// `−Σ_k Δρ_k λ_k S_k β̂`: the stabilized solve and the linear constraints are the ones the
+/// Newton-region test that judges the predictor uses, and on an active face the step is the
+/// face's one-sided tangent. Forming it needs no evaluation of the family and no outer pricing.
+pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    from: &[Array1<f64>],
+    to: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+    mode_beta: &[Array1<f64>],
+    curvature: &BlockWorkingSet,
+    active_set: Option<&[usize]>,
+) -> Result<Vec<Array1<f64>>, CustomFamilyError> {
+    if !single_block_newton_region_probe_applies(family, specs, options) {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "the IFT predictor covers a single-block solve with no joint penalty, \
+                     Jeffreys term or Hessian-vector workspace (gam#2973)"
+                .to_string(),
+        });
+    }
+    let (Some(spec), Some(from), Some(to), Some(mode_beta)) =
+        (specs.first(), from.first(), to.first(), mode_beta.first())
+    else {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "the IFT predictor needs one block's spec, smoothing pair and mode".to_string(),
+        });
+    };
+    if from.len() != spec.penalties.len() || to.len() != spec.penalties.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "IFT predictor: log-smoothing lengths {} and {} do not match penalties {}",
+                from.len(),
+                to.len(),
+                spec.penalties.len()
+            ),
+        });
+    }
+    let BlockWorkingSet::ExactNewton { gradient, hessian } = curvature else {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "the IFT predictor needs the mode's exact-Newton curvature".to_string(),
+        });
+    };
+    let p = spec.design.ncols();
+    let lambdas = exact_lambdas_from_log_strengths(from, "IFT predictor log strength")?;
+    let mut s_lambda = Array2::<f64>::zeros((p, p));
+    let mut tangent_direction = Array2::<f64>::zeros((p, p));
+    for (k, s) in spec.penalties.iter().enumerate() {
+        s.add_scaled_to(lambdas[k], &mut s_lambda);
+        let delta = to[k] - from[k];
+        if delta != 0.0 {
+            s.add_scaled_to(delta * lambdas[k], &mut tangent_direction);
+        }
+    }
+    let mut states = buildblock_states(family, specs)?;
+    if mode_beta.len() != states[0].beta.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "IFT predictor: the mode has {} coefficients, the block {}",
+                mode_beta.len(),
+                states[0].beta.len()
+            ),
+        });
+    }
+    states[0].beta.assign(mode_beta);
+    refresh_all_block_etas(family, specs, &mut states)?;
+    let constraints = family.block_linear_constraints(&states, 0, spec)?;
+    let step = ExactNewtonBlockUpdater { gradient, hessian }.step_for_rhs(
+        &BlockUpdateContext {
+            family,
+            states: &states,
+            spec,
+            block_idx: 0,
+            s_lambda: &s_lambda,
+            options,
+            linear_constraints: constraints.as_ref(),
+            cached_active_set: active_set,
+        },
+        -tangent_direction.dot(mode_beta),
+    )?;
+    Ok(vec![family.post_update_block_beta(&states, 0, spec, step.beta_new_raw)?])
+}
+
 /// Refuse a workspace-source family whose declared dense joint curvature carries a
 /// non-finite entry at the spec seed state (gam#1088, #979).
 ///
@@ -3760,7 +3849,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // plateau-flat-objective convergence certificate in the inner-cycle
     // body now handles that case directly, so the cap stays fixed at the
     // baseline for the lifetime of this outer call.
-    let inner_max_cycles = capped_inner_max_cycles(options, inner_max_cycles_base);
+    let inner_max_cycles = inner_max_cycles_base.max(1);
     // Each block's assembled penalty matrix depends only on that block's
     // penalties and smoothing parameters. Build these setup matrices in
     // parallel, but keep the coordinate-descent and line-search loops below
@@ -3891,7 +3980,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 None
             };
             let mut cached_mode_acceptable = true;
-            let mut certified_workspace = cached.joint_workspace.clone();
+            let mut certified_workspace = None;
             if has_joint_exacthessian {
                 match exact_joint_mode_curvature_certificate(
                     family,

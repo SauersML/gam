@@ -48,15 +48,16 @@ use crate::estimate::summary::{
 };
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
+use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
 use gam_terms::inference::smooth_test::{
     SmoothTestInput, SmoothTestScale, wood_smooth_test,
 };
-use gam_terms::smooth::{ShapeSpec, TermCollectionDesign, TermCollectionSpec};
+use gam_terms::smooth::{ShapeSpec, TermCollectionDesign};
 use ndarray::Array2;
 
 /// Build the smooth/random-effect rows of a model summary.
 ///
-/// `design` and `spec` describe the term structure being presented — the real
+/// `design` describes the term structure being presented — the real
 /// training design on the in-process path, the frozen-basis replay on the
 /// persisted one. `fit` owns every fitted quantity, including both inputs to
 /// the Wald reference distribution. `whitening_gram` is the Wood (2013)
@@ -66,11 +67,13 @@ use ndarray::Array2;
 /// covariance, which is the documented behaviour for a persisted model whose
 /// Gram was not serialized.
 ///
-/// Random-effect rows carry EDF only: they are boundary variance-component
-/// tests, and a naive coefficient Wald `χ²` on them is anti-conservative.
+/// Random-effect rows do not use the Wald test: their null `σ²_b = 0` is on the
+/// boundary, where a coefficient Wald `χ²` has no valid reference. They carry
+/// the variance-component score test the fit recorded in
+/// `FitArtifacts::random_effect_tests` (exact spectral reference; see
+/// `gam_terms::inference::random_effect_test`), or its typed absence.
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
-    spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
     whitening_gram: Option<&Array2<f64>>,
 ) -> Vec<SmoothTermSummary> {
@@ -126,26 +129,11 @@ pub fn smooth_term_summary_rows(
         })
         .count();
 
-    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
-        // The design's RE-penalty loop skips a block when EITHER it is
-        // unpenalised OR its coefficient range is empty
-        // (`design_construction.rs` `range.is_empty() || !penalized` →
-        // `continue`), so such a term owns NO entry in the flat
-        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout. A factor `by=`
-        // smooth injects exactly such an UNPENALISED treatment-coded factor
-        // main-effect block, and a penalised RE term with zero kept groups is
-        // the empty-range case. Advancing the cursor by a fixed 1 (the #1368
-        // defect) slides it one block past every RE/smooth term that follows, so
-        // the trailing smooth's `cursor..+k` window runs off the end of
-        // `penalty_block_trace`, `per_term_edf` returns 0, the Wood test is
-        // skipped, and ref_df/chi_sq/p_value collapse to 0/None. Mirror BOTH
-        // design conditions.
-        let penalized = spec
-            .random_effect_terms
-            .get(re_idx)
-            .map(|term| term.penalized)
-            .unwrap_or(true);
-        let k_pen = usize::from(penalized && !range.is_empty());
+    for (name, range) in design.random_effect_ranges.iter() {
+        // Every random-effect block owns exactly one ridge in the flat
+        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout, placed after
+        // the linear ridges and before the smooths in the design's order.
+        let k_pen = 1;
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
@@ -153,21 +141,47 @@ pub fn smooth_term_summary_rows(
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k_pen);
         let lambdas = term_lambdas(fit, penalty_cursor, k_pen);
         penalty_cursor += k_pen;
-        // Random-effect smooths are variance-component tests on the boundary; a
-        // naive coefficient Wald χ² p-value is anti-conservative, so only EDF is
-        // reported.
+        // The variance component's null is on the boundary, so the row reports
+        // the score test the fit recorded for this exact term — matched by name
+        // AND coefficient range, so a replayed design whose layout drifted from
+        // the training one finds no record rather than a neighbour's.
+        let recorded = fit
+            .artifacts
+            .random_effect_tests
+            .iter()
+            .find(|record| record.term == *name && record.coefficient_range == *range)
+            .map(|record| &record.outcome);
+        let (ref_df, chi_sq, pvalue, pvalue_unavailable) = match recorded {
+            Some(RandomEffectTestOutcome::Tested(test)) => {
+                (test.reference_df, Some(test.statistic), Some(test.p_value), None)
+            }
+            Some(RandomEffectTestOutcome::Unavailable { reason }) => (
+                edf.max(0.0),
+                None,
+                None,
+                Some(SmoothPValueUnavailable::RandomEffect(*reason)),
+            ),
+            None => (
+                edf.max(0.0),
+                None,
+                None,
+                Some(SmoothPValueUnavailable::RandomEffectTestNotRecorded),
+            ),
+        };
         rows.push(SmoothTermSummary {
             name: name.clone(),
             edf,
-            ref_df: edf.max(0.0),
-            chi_sq: None,
+            ref_df,
+            chi_sq,
+            // The score statistic's reference is its own boundary law, not the
+            // χ²/F `smooth_statistic` names, so there is no such statistic.
             statistic: None,
-            pvalue: None,
+            pvalue,
             continuous_order: None,
             basis_note: None,
             edf_rank_bound,
             lambdas,
-            pvalue_unavailable: None,
+            pvalue_unavailable,
         });
     }
 

@@ -129,7 +129,14 @@ Or `cargo build --release`. The binary is `./target/release/gam`.
 Python:
 
 ```python
+import numpy as np
 import gamfit
+
+rng = np.random.default_rng(0)
+x, site = rng.uniform(0, 10, 300), rng.choice(["A", "B", "C"], 300)
+train = {"x": x, "site": site, "y": np.sin(x) + (site == "B") + rng.normal(0, 0.3, 300)}
+test = {"x": np.array([2.5, 7.5]), "site": np.array(["A", "C"])}
+
 model = gamfit.fit(train, "y ~ s(x) + group(site)")
 preds = model.predict(test, interval=0.95)
 ```
@@ -151,6 +158,16 @@ Surface smooths in arbitrary dimension, with optional per-axis length
 scales:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame(rng.uniform(-1, 1, (300, 6)), columns=["x1", "x2", "x3", "x4", "space", "time"])
+df["y"] = np.sin(3 * df.x1) + df.x2 * df.x3 + np.cos(3 * df.space * df.time) + rng.normal(0, 0.2, 300)
+df[["pc1", "pc2", "pc3", "pc4"]] = df[["x1", "x2", "x3", "x4"]].to_numpy() * [1, 2, 5, 10]
+df["z"] = np.exp(-(df.x1**2 + df.x2**2 + df.x3**2 + df.x4**2)) + rng.normal(0, 0.1, 300)
+
 gamfit.fit(df, "y ~ matern(x1, x2, x3, nu=5/2)")
 gamfit.fit(df, "y ~ duchon(x1, x2, x3, x4, centers=80)")
 gamfit.fit(df, "y ~ te(space, time, k=10)")
@@ -164,6 +181,16 @@ so a fit on `theta ∈ [0, 2π)` has no seam at 0 / 2π, and an `S²` fit
 has no pole artefacts.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame(rng.uniform(0, 2 * np.pi, (400, 3)), columns=["theta", "u", "v"])
+df["h"], df["x"] = rng.uniform(0, 1, 400), rng.uniform(0, 1, 400)
+df["lat"], df["lon"] = rng.uniform(-1.4, 1.4, 400), rng.uniform(-np.pi, np.pi, 400)
+df["y"] = np.sin(df.theta) + np.cos(df.v) + np.sin(df.lat) * np.cos(df.lon) + df.x ** 2 + rng.normal(0, 0.2, 400)
+
 gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
 gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[2*pi, None])")
 gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")
@@ -219,6 +246,13 @@ CDF of `logit(U)`, `U ~ Beta(a, b)`, standardized to logit's location and
 scale, so its `(epsilon, log_delta)` move only skew and tails.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age = rng.uniform(20, 80, 600)
+df = {"age": age, "case": (rng.uniform(size=600) < 1 / (1 + np.exp(-(age - 50) / 8))).astype(float)}
+
 gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
                  " + linkwiggle(internal_knots=6)")
 ```
@@ -232,6 +266,15 @@ whose slope surface is insensitive to Stage-1 calibration error); no
 `z_column` is materialised by hand.
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame(rng.normal(size=(600, 3)), columns=["pc1", "pc2", "pc3"]).assign(family_id=np.arange(600) // 2)
+df["pgs"] = 0.5 * df.pc1 + rng.normal(size=600)
+df["case"] = (rng.normal(size=600) < -0.3 + 0.8 * (df.pgs - 0.5 * df.pc1) + 0.3 * df.pc2).astype(int)
+
 gamfit.fit(
     df,
     "case ~ matern(pc1, pc2, pc3)",
@@ -254,6 +297,16 @@ marginal-slope, and latent-Gaussian frailty (`latent`,
 with on-demand `S(t)`, `h(t)`, `H(t)` on any time grid:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+age, bmi = rng.uniform(30, 80, 400), rng.normal(25, 4, 400)
+t = 15 * rng.weibull(1.5, 400) * np.exp(-(age - 55) / 20 - (bmi - 25) / 10)
+df = pd.DataFrame({"entry": 0.0, "exit": np.minimum(t, 25), "event": (t < 25) * 1.0, "age": age, "bmi": bmi})
+train_df, test_df = df.iloc[:300], df.iloc[300:]
+
 model = gamfit.fit(train_df, "Surv(entry, exit, event) ~ s(age) + bmi")
 pred = model.predict(test_df)
 S = pred.survival_at([1, 5, 10, 20])
@@ -286,6 +339,14 @@ posterior conditional on the fitted smoothing parameters. Predictive
 bands are computed in row chunks.
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train, test = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}, {"x": np.linspace(0, 10, 5)}
+model = gamfit.fit(train, "y ~ s(x)")
+
 posterior = model.sample(train, seed=42)
 bands = posterior.predict(test, level=0.95)
 ```
@@ -293,6 +354,13 @@ bands = posterior.predict(test, level=0.95)
 Interval-bounded coefficients with an optional Beta prior:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+age, prop = rng.uniform(20, 70, 300), rng.uniform(0, 1, 300)
+df = {"age": age, "prop": prop, "y": 0.02 * age + 0.6 * prop + rng.normal(0, 0.2, 300)}
+
 gamfit.fit(df,
     "y ~ age + bounded(prop, min=0, max=1, target=0.5, strength=3)")
 ```
@@ -301,6 +369,13 @@ Shape-constrained smooths. A smooth can be required to be monotone or
 convex/concave:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+dose, x = rng.uniform(0, 1, 300), rng.uniform(-1, 1, 300)
+df = {"dose": dose, "x": x, "y": np.sqrt(dose) + x ** 2 + rng.normal(0, 0.1, 300)}
+
 gamfit.fit(df, "y ~ s(dose, shape=monotone_increasing)")
 gamfit.fit(df, "y ~ s(x, shape=convex)")
 ```
@@ -310,6 +385,14 @@ Difference smooths. `by=` factor smooths fit one curve per group, and
 between two groups (with an optional simultaneous band):
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"x": rng.uniform(0, 10, 400), "group": rng.choice(["control", "treated"], 400)})
+df["y"] = np.sin(df.x) + 0.5 * (df.group == "treated") * np.cos(df.x) + rng.normal(0, 0.3, 400)
+
 model = gamfit.fit(df, "y ~ s(x, by=group)")
 diff = model.difference_smooth(data=df, group="group", view="x",
                                simultaneous=True)
@@ -319,6 +402,14 @@ Dispersion (location-scale) GAMLSS. A second formula models the scale /
 variance for Gamma, Beta, negative-binomial, and Tweedie:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 1, 400)
+shape = np.exp(1 + 2 * x)                     # the noise shrinks as x grows
+df = {"x": x, "y": rng.gamma(shape, np.exp(np.sin(3 * x)) / shape)}
+
 gamfit.fit(df, "y ~ s(x)", family="gamma", noise_formula="s(x)")
 ```
 
@@ -330,6 +421,16 @@ split-conformal band for any standard family, like
 holds no per-row training data, so full conformal takes the rows again:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+data = pd.DataFrame({"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)})
+df, held_out, test = data.iloc[:200], data.iloc[200:], pd.DataFrame({"x": [2.0, 5.0, 8.0]})
+model = gamfit.fit(df, "y ~ s(x)")
+
 model.predict(test, interval="conformal", training_data=df, conformal_level=0.9)
 model.predict(test, interval="conformal", calibration=held_out, conformal_level=0.9)
 ```
@@ -346,6 +447,19 @@ matrices, the Grassmann and Stiefel manifolds, and the hyperbolic
 the responses:
 
 ```python
+import numpy as np
+import pandas as pd
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 4, 300)
+sand = 0.2 + 0.08 * np.sin(x) + rng.normal(0, 0.01, 300)
+silt = 0.3 + 0.08 * np.cos(x) + rng.normal(0, 0.01, 300)
+normal = np.column_stack([np.sin(x), np.cos(x), 0.4 + rng.normal(0, 0.05, 300)])
+normal /= np.linalg.norm(normal, axis=1, keepdims=True)  # unit vectors on the sphere
+df = pd.DataFrame({"x": x, "sand": sand, "silt": silt, "clay": 1 - sand - silt})
+df[["nx", "ny", "nz"]] = normal
+
 gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=["sand", "silt", "clay"])
 gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=["nx", "ny", "nz"])
 ```
@@ -355,6 +469,14 @@ corrected for smoothing-parameter selection (`gam compare` prints the same
 document from saved models).
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model_a, model_b = gamfit.fit(df, "y ~ x"), gamfit.fit(df, "y ~ s(x)")
+
 gamfit.compare_models([model_a, model_b])
 ```
 
@@ -371,7 +493,14 @@ frozen fitted-model modules are available under `gamfit.torch` and
 scikit-learn wrappers:
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 300)})
+y = np.sin(X["x"].to_numpy()) + rng.normal(0, 0.3, 300)
+
 est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 ```
 

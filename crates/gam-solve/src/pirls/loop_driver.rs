@@ -54,7 +54,6 @@ use crate::active_set;
 use crate::estimate::EstimationError;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use faer::sparse::{SparseColMat, Triplet};
-use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use gam_math::probability::standard_normal_quantile;
 use gam_problem::{
@@ -186,6 +185,7 @@ pub(crate) fn exact_lambdas_from_rho(rho: LogSmoothingParamsView<'_>) -> Array1<
 
 pub(super) fn default_beta_guess_external(
     p: usize,
+    response: &ResponseFamily,
     link_function: LinkFunction,
     y: ArrayView1<f64>,
     priorweights: ArrayView1<f64>,
@@ -264,6 +264,7 @@ pub(super) fn default_beta_guess_external(
                     // if these are ever reached unexpectedly.
                     LinkFunction::Log
                     | LinkFunction::Identity
+                    | LinkFunction::Sqrt
                     | LinkFunction::Inverse
                     | LinkFunction::InverseSquared => (prevalence / (1.0 - prevalence)).ln(),
                 };
@@ -289,6 +290,22 @@ pub(super) fn default_beta_guess_external(
                 beta[intercept_col] = weighted_sum / totalweight;
             }
         }
+        LinkFunction::Log if matches!(response, ResponseFamily::Binomial) => {
+            // Relative-risk regression: the intercept-only root of the
+            // Bernoulli score under `μ = exp(η)` is `η = ln p̂`. The
+            // Jeffreys-smoothed prevalence `(Σwy + ½)/(Σw + 1)` lies strictly
+            // inside (0, 1), so the seed lies strictly inside the feasible set
+            // `η < 0` even when every response is one.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                beta[intercept_col] = ((weighted_sum + 0.5) / (totalweight + 1.0)).ln();
+            }
+        }
         LinkFunction::Log => {
             // For log link, intercept = ln(weighted mean of y)
             let mut weighted_sum = 0.0;
@@ -305,6 +322,25 @@ pub(super) fn default_beta_guess_external(
                 // of an invented floor (#2469).
                 if mean_y > 0.0 {
                     beta[intercept_col] = mean_y.ln();
+                }
+            }
+        }
+        LinkFunction::Sqrt => {
+            // The intercept-only root of every variance function's score under
+            // `μ = η²` is `μ = ȳ` (weighted), i.e. `η = √ȳ`, inside the link's
+            // branch `η > 0`. A non-positive mean has no such root; the
+            // intercept keeps its zero seed and the solve reports the domain
+            // violation itself.
+            let mut weighted_sum = 0.0;
+            let mut totalweight = 0.0;
+            for (&yi, &wi) in y.iter().zip(priorweights.iter()) {
+                weighted_sum += wi * yi;
+                totalweight += wi;
+            }
+            if totalweight > 0.0 {
+                let mean_y = weighted_sum / totalweight;
+                if mean_y > 0.0 {
+                    beta[intercept_col] = mean_y.sqrt();
                 }
             }
         }
@@ -516,94 +552,6 @@ pub(super) fn assemble_pirls_result(
     })
 }
 
-/// Stack λ-weighted penalty roots from canonical penalties into a single
-/// `total_rank × p` matrix for PIRLS. Each block-local root is embedded
-/// into the full column space on-the-fly.
-pub(super) fn stack_lambdaweighted_penalty_root_canonical(
-    penalties: &[gam_terms::construction::CanonicalPenalty],
-    lambdas: &[f64],
-    p: usize,
-) -> Array2<f64> {
-    let totalrows: usize = penalties.iter().map(|cp| cp.rank()).sum();
-    if totalrows == 0 {
-        return Array2::zeros((0, p));
-    }
-    let mut e = Array2::<f64>::zeros((totalrows, p));
-    let mut row_start = 0usize;
-    for (k, cp) in penalties.iter().enumerate() {
-        let rows = cp.rank();
-        if rows == 0 {
-            continue;
-        }
-        let scale = lambdas.get(k).copied().unwrap_or(0.0).max(0.0).sqrt();
-        if scale != 0.0 {
-            // Embed block-local root (rank × block_dim) into full width (rank × p).
-            let r = &cp.col_range;
-            for row in 0..rows {
-                for col in 0..cp.block_dim() {
-                    e[[row_start + row, r.start + col]] = scale * cp.root[[row, col]];
-                }
-            }
-        }
-        row_start += rows;
-    }
-    e
-}
-
-pub(super) fn build_sparse_native_reparam_result(
-    base: ReparamResult,
-    penalties: &[gam_terms::construction::CanonicalPenalty],
-    lambdas: &[f64],
-    p: usize,
-) -> ReparamResult {
-    // Map the engine penalty back into identity (original) coordinates. The
-    // The engine returns `s_transformed = Qsᵀ S Qs` (and
-    // `e_transformed = E Qs`). With sparse-native `qs = I`, round-trip that
-    // declared penalty to original coordinates so the inner solve, EDF, and
-    // REML logdet all use exactly the same matrix.
-    let qs = &base.qs;
-    let s_orig = if qs.nrows() == p && qs.ncols() == base.s_transformed.nrows() {
-        // S_orig = Qs · S_transformed · Qsᵀ
-        let qs_s = fast_ab(qs, &base.s_transformed);
-        qs_s.dot(&qs.t())
-    } else {
-        // Degenerate fallback (engine produced no transform): use the bare
-        // lambda-weighted sum. Shrinkage is zero in this branch by construction.
-        let mut s_original = Array2::<f64>::zeros((p, p));
-        for (k, cp) in penalties.iter().enumerate() {
-            let lambda_k = lambdas.get(k).copied().unwrap_or(0.0);
-            if lambda_k != 0.0 {
-                cp.accumulate_weighted(&mut s_original, lambda_k);
-            }
-        }
-        s_original
-    };
-    // E_orig = E_transformed · Qsᵀ  (so that E_origᵀ E_orig = S_orig and the EDF
-    // augmented system matches the inner Hessian).
-    let e_orig = if qs.nrows() == p && base.e_transformed.ncols() == qs.ncols() {
-        base.e_transformed.dot(&qs.t())
-    } else {
-        stack_lambdaweighted_penalty_root_canonical(penalties, lambdas, p)
-    };
-    let u_original = if base.u_truncated.nrows() == p {
-        fast_ab(&base.qs, &base.u_truncated)
-    } else {
-        Array2::<f64>::eye(p)
-    };
-    // In the sparse-native path, qs = I, so the penalties are already in the
-    // right coordinate frame. We keep them as-is in canonical_transformed.
-    let canonical_transformed: Vec<gam_terms::construction::CanonicalPenalty> = penalties.to_vec();
-    ReparamResult {
-        s_transformed: s_orig,
-        log_det: base.log_det,
-        det1: base.det1,
-        qs: Array2::<f64>::eye(p),
-        canonical_transformed,
-        e_transformed: e_orig,
-        u_truncated: u_original,
-    }
-}
-
 pub(super) fn canonical_prior_shift(
     penalties: &[gam_terms::construction::CanonicalPenalty],
     lambdas: &[f64],
@@ -662,7 +610,6 @@ pub struct PenaltyConfig<'a> {
     /// `rank × p` roots are stored. When the reparameterization engine needs
     /// full-width roots, they are derived on-the-fly from these block-local roots.
     pub canonical_penalties: &'a [gam_terms::construction::CanonicalPenalty],
-    pub balanced_penalty_root: Option<&'a Array2<f64>>,
     pub reparam_invariant: Option<&'a gam_terms::construction::ReparamInvariant>,
     pub p: usize,
     pub coefficient_lower_bounds: Option<&'a Array1<f64>>,
@@ -763,7 +710,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let link_function = config.link_function();
 
-    use gam_terms::construction::{EngineDims, stable_reparameterization_engine_canonical};
+    use gam_terms::construction::{
+        EngineDims, stable_reparameterization_engine_canonical,
+        stable_reparameterization_original_frame,
+    };
 
     // Build a cheap weighted penalty sum for the sparse-native decision
     // WITHOUT running the expensive eigendecomposition engine.
@@ -804,12 +754,19 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     } else {
         PirlsWorkspace::new(x_original.nrows(), x_original.ncols())
     };
-    let solver_decision = if cost_only_gaussian_rows.is_some() {
+    // A value-only Gaussian probe on a sparse design whose cache carries the
+    // sparse `XᵀWX` takes the same solve path as the full evaluations of that
+    // fit: the sparse solve reads only coefficient-space statistics, and the
+    // REML geometry it feeds is the sparse exact one only in these coordinates.
+    let cost_only_without_sparse_gram = cost_only_gaussian_rows.is_some()
+        && !(x_original.as_sparse().is_some()
+            && gaussian_fixed_cache.is_some_and(|cache| cache.xtwx_sparse_orig.is_some()));
+    let solver_decision = if cost_only_without_sparse_gram {
         SparsePirlsDecision {
             path: PirlsLinearSolvePath::DenseTransformed,
             reason: "gaussian_sufficient_statistics",
             p: x_original.ncols(),
-            nnz_x: 0,
+            nnz_x: None,
             nnz_xtwx_symbolic: None,
             nnz_s_lambda: 0,
             nnz_h_est: None,
@@ -844,22 +801,17 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     } else {
         None
     };
-    // Sparse-native reparameterization in identity (original) coordinates.
-    // Reusing the engine's declared penalty keeps all backends on the same
-    // penalized objective.
+    // Sparse-native reparameterization in identity (original) coordinates:
+    // the same declared penalty, log-determinant and traces as the engine,
+    // computed block by block so a random effect with thousands of levels
+    // never meets a p×p factorization or frame change.
     let sparse_native_reparam = if use_sparse_native {
-        let base = stable_reparameterization_engine_canonical(
+        Some(stable_reparameterization_original_frame(
             penalty.canonical_penalties,
             lambdas_slice,
             EngineDims::new(penalty.p, penalty.canonical_penalties.len()),
             penalty.reparam_invariant,
-        )?;
-        Some(build_sparse_native_reparam_result(
-            base,
-            penalty.canonical_penalties,
-            lambdas_slice,
-            penalty.p,
-        ))
+        )?)
     } else {
         None
     };
@@ -1301,7 +1253,12 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             last_step_halving: 0,
             max_abs_eta,
             constraint_kkt: linear_constraints.as_ref().map(|lin| {
-                compute_constraint_kkt_diagnostics(beta_transformed.as_ref(), &gradient, lin)
+                compute_constraint_kkt_diagnostics(
+                    beta_transformed.as_ref(),
+                    &gradient,
+                    score_norm + s_beta_norm,
+                    lin,
+                )
             }),
             min_penalized_deviance: if zero_iter_penalized.is_finite() {
                 zero_iter_penalized
@@ -1429,6 +1386,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         .unwrap_or_else(|| {
             Coefficients::new(default_beta_guess_external(
                 penalty.p,
+                &config.likelihood.spec.response,
                 link_function,
                 y,
                 priorweights,
@@ -1532,8 +1490,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
-        // together collapsed step halving to 3 under seed screening (where
-        // max_iterations is intentionally capped low), turning recoverable
+        // together collapsed step halving to 3 under a low outer-imposed
+        // iteration cap, turning recoverable
         // damping into spurious failures.
         max_step_halving: base_max_step_halving,
         firth_bias_reduction: firth_active,
@@ -1590,7 +1548,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // so the gain ratio compares one objective. That lock is correct *within* a
     // solve, but it pins ν to whatever η the solve started from. When the fit
     // cold-starts (the final dedicated fit at the converged ρ passes
-    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // `warm_start_beta = None`, and the first outer eval starts from a default guess),
     // that warm-start η has not yet captured the mean structure; the leftover
     // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
     // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
@@ -1631,6 +1589,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
         for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                &working_model.likelihood.spec.link,
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,

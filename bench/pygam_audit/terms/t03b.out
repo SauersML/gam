@@ -1,0 +1,22 @@
+{'truth': 'inc_step', 'seed': 0, 'pyg': np.float64(0.05375954667523549), 'gf_unc': np.float64(0.06394919221582705), 'gf_shape': nan, 'gf_shape_k20': nan}
+{'truth': 'inc_step', 'seed': 1, 'pyg': np.float64(0.03696472263335196), 'gf_unc': np.float64(0.05455182886193485), 'gf_shape': np.float64(0.06233720806587069), 'gf_shape_k20': np.float64(0.0756232470838878)}
+{'truth': 'inc_step', 'seed': 2, 'pyg': np.float64(0.04830254098931966), 'gf_unc': np.float64(0.04988497333568534), 'gf_shape': np.float64(0.08188807489332936), 'gf_shape_k20': np.float64(0.09273530404111394)}
+{'truth': 'inc_step', 'seed': 3, 'pyg': np.float64(0.019584778533761185), 'gf_unc': np.float64(0.039698717638688256), 'gf_shape': np.float64(0.06399626417929945), 'gf_shape_k20': np.float64(0.07972258610180112)}
+{'truth': 'inc_step', 'seed': 4, 'pyg': np.float64(0.06947765210701826), 'gf_unc': np.float64(0.06519349444336181), 'gf_shape': np.float64(0.09733815236995465), 'gf_shape_k20': np.float64(0.10650107826878794)}
+{'truth': 'inc_flat', 'seed': 0, 'pyg': np.float64(0.052791699282216414), 'gf_unc': np.float64(0.05232564502260238), 'gf_shape': np.float64(0.07560861393801621), 'gf_shape_k20': np.float64(0.08495275847948809)}
+{'truth': 'inc_flat', 'seed': 1, 'pyg': np.float64(0.034463014667215665), 'gf_unc': np.float64(0.03468552439373714), 'gf_shape': np.float64(0.057059494878979655), 'gf_shape_k20': np.float64(0.06626072117364278)}
+{'truth': 'inc_flat', 'seed': 2, 'pyg': np.float64(0.03510576047333001), 'gf_unc': np.float64(0.03512013477735318), 'gf_shape': np.float64(0.05895060794534562), 'gf_shape_k20': nan}
+{'truth': 'inc_flat', 'seed': 3, 'pyg': np.float64(0.03237121108314322), 'gf_unc': np.float64(0.033319464121334734), 'gf_shape': np.float64(0.0556730164693307), 'gf_shape_k20': nan}
+{'truth': 'inc_flat', 'seed': 4, 'pyg': np.float64(0.030352598884914067), 'gf_unc': np.float64(0.026568192603189232), 'gf_shape': np.float64(0.05900182889662197), 'gf_shape_k20': np.float64(0.070729509283875)}
+{'truth': 'dec_exp', 'seed': 0, 'pyg': np.float64(0.049374952899957546), 'gf_unc': np.float64(0.045089083747127306), 'gf_shape': np.float64(0.04665493788768767), 'gf_shape_k20': np.float64(0.04865681379942567)}
+{'truth': 'dec_exp', 'seed': 1, 'pyg': np.float64(0.04526422140584508), 'gf_unc': np.float64(0.018936332431022204), 'gf_shape': np.float64(0.03088777566849606), 'gf_shape_k20': np.float64(0.03581718874128224)}
+{'truth': 'dec_exp', 'seed': 2, 'pyg': np.float64(0.045027361956122426), 'gf_unc': np.float64(0.04387929375826622), 'gf_shape': nan, 'gf_shape_k20': nan}
+{'truth': 'dec_exp', 'seed': 3, 'pyg': np.float64(0.028131280298976692), 'gf_unc': np.float64(0.02210716665111519), 'gf_shape': np.float64(0.038303095986541205), 'gf_shape_k20': np.float64(0.04343522495412074)}
+{'truth': 'dec_exp', 'seed': 4, 'pyg': np.float64(0.03785912322942268), 'gf_unc': np.float64(0.03959229820992953), 'gf_shape': nan, 'gf_shape_k20': np.float64(0.04702721503797316)}
+                     seed              pyg  ...         gf_shape     gf_shape_k20
+truth                                       ...                                  
+dec_exp   2.0000 (fail 0)  0.0411 (fail 0)  ...  0.0386 (fail 2)  0.0437 (fail 1)
+inc_flat  2.0000 (fail 0)  0.0370 (fail 0)  ...  0.0613 (fail 0)  0.0740 (fail 2)
+inc_step  2.0000 (fail 0)  0.0456 (fail 0)  ...  0.0764 (fail 1)  0.0886 (fail 1)
+
+[3 rows x 5 columns]

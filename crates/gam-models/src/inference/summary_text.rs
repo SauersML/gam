@@ -15,20 +15,15 @@ use std::fmt::Write as _;
 /// The legend for the significance stars beside each p-value.
 const SIGNIF_CODES: &str = "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1";
 
-/// The smallest p-value printed as a number. A p-value lives on the unit
-/// probability scale, and `f64::EPSILON = 2^-52` is the gap between 1 and the
-/// next double: for any `p < EPSILON` the complementary probability `1 - p`
-/// rounds to exactly 1, so on that scale `p` cannot be told apart from 0. Such
-/// a p-value prints as `< EPSILON` (two significant digits, `< 2.2e-16`)
-/// rather than as digits the unit scale does not resolve.
-const P_VALUE_FLOOR: f64 = f64::EPSILON;
-
 /// Why a saved model carries no log-likelihood: `SummaryPayload::log_likelihood`
 /// is `None` only at the exact zero-dispersion boundary.
 const NO_LIKELIHOOD_AT_EXACT_FIT: &str = "exact fit: the profiled scale is zero, so no normalized density exists";
 
-/// Below this a p-value prints in scientific notation.
-const P_VALUE_SCIENTIFIC_BELOW: f64 = 1e-4;
+/// Decimal places of a p-value printed in fixed notation. A p-value too small
+/// for them to resolve prints in scientific notation instead, with no floor:
+/// every tail is computed directly (never as `1 - CDF`), so it keeps its
+/// relative accuracy far below `1e-16`.
+const P_VALUE_DECIMALS: i32 = 4;
 
 /// Render a saved model's summary as the multi-line text report.
 pub fn render_summary_text(summary: &SummaryPayload) -> String {
@@ -273,9 +268,8 @@ fn optional_number(value: Option<f64>) -> String {
 
 fn format_p_value(p: Option<f64>) -> String {
     match p {
-        Some(p) if p.is_finite() && p < P_VALUE_FLOOR => format!("< {P_VALUE_FLOOR:.1e}"),
-        Some(p) if p.is_finite() && p < P_VALUE_SCIENTIFIC_BELOW => format!("{p:.2e}"),
-        Some(p) if p.is_finite() => format!("{p:.4}"),
+        Some(p) if p.is_finite() && p < 10f64.powi(-P_VALUE_DECIMALS) => format!("{p:.2e}"),
+        Some(p) if p.is_finite() => format!("{p:.prec$}", prec = P_VALUE_DECIMALS as usize),
         _ => "NA".to_string(),
     }
 }
@@ -450,9 +444,9 @@ Estimator: penalized likelihood
 n: 100
 
 Parametric coefficients:
-           Estimate  Std. Error  t value   Pr(>|t|)
-Intercept       1.5        0.05       30  < 2.2e-16  ***
-x1            -0.25       0.125       -2     0.0484  *
+           Estimate  Std. Error  t value  Pr(>|t|)
+Intercept       1.5        0.05       30  1.00e-50  ***
+x1            -0.25       0.125       -2    0.0484  *
 
 Approximate significance of smooth terms:
          edf  Ref.df        F  p-value       lambda
@@ -479,6 +473,17 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
 
     /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
     /// label beside the table, and a certified term adds no line.
+    #[test]
+    fn a_far_tail_pvalue_prints_its_computed_value_with_no_floor() {
+        // The survival tails are accurate far below 1e-16, so the report prints
+        // the computed value; a floor would turn 1e-300 and 1e-17 into one line.
+        assert_eq!(format_p_value(Some(1.234e-300)), "1.23e-300");
+        assert_eq!(format_p_value(Some(3.0e-17)), "3.00e-17");
+        assert_eq!(format_p_value(Some(5.0e-5)), "5.00e-5");
+        assert_eq!(format_p_value(Some(0.012345)), "0.0123");
+        assert_eq!(format_p_value(Some(f64::NAN)), "NA");
+    }
+
     #[test]
     fn the_summary_names_an_uncertified_terms_edf_label_2901() {
         let mut summary = fixed_small_model();

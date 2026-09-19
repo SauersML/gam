@@ -112,7 +112,6 @@ pub(crate) use rayon::prelude::*;
 
 pub(crate) use std::cell::RefCell;
 
-pub(crate) use std::sync::atomic::AtomicUsize;
 
 pub(crate) use std::sync::Arc;
 
@@ -133,6 +132,7 @@ mod eval_sigma;
 mod family;
 mod feasibility;
 mod fit_entry;
+mod frozen_time_limit;
 mod fit_setup;
 mod flex_sensitivity;
 #[cfg(test)]
@@ -172,6 +172,7 @@ pub(crate) use family::*;
 pub(crate) use generated_regressor::*;
 pub(crate) use fit_entry::*;
 pub(crate) use fit_setup::*;
+pub use frozen_time_limit::*;
 pub(crate) use hessian::*;
 pub(crate) use joint_eval::*;
 pub use joint_latent_law::*;

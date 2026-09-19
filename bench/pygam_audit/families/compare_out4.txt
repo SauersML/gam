@@ -1,0 +1,5 @@
+
+== inv_gauss (n=600, reps=2)
+  gamfit            ERRORS (2): unsupported family
+  pygam_default     RMSE 0.2902 (sd 0.0041)  cover95 0.965  time 20.21s  ok=2
+  pygam_gridsearch  RMSE 0.1821 (sd 0.0020)  cover95 0.955  time 209.04s  ok=2

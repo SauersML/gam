@@ -33,13 +33,16 @@ GAMRegressor(
     formula: str | None = None,
     family: str = "auto",
     offset: str | None = None,
-    weights: str | None = None,
     config: dict[str, Any] | None = None,
 )
 ```
 
-All five arguments are surfaced as `get_params()` keys, so the estimator
-works with `sklearn.base.clone`, `cross_val_score` and pipelines.
+`formula=None` fits the automatic formula `y ~ .`, built by the engine from
+the feature schema; the formula actually fitted is `formula_` after `fit`.
+All four arguments are surfaced as `get_params()` keys, so the estimator
+works with `sklearn.base.clone`, `GridSearchCV`, `cross_val_score` and
+pipelines. Per-row weights are data, not a hyperparameter: pass them as
+`fit(X, y, sample_weight=w)`.
 
 ### Binding the response
 
@@ -50,7 +53,14 @@ bound to `X` under the response name implied by the formula (defaulting to
 `y`). If `y` is `None`, `X` must already contain the response.
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
+df = X.assign(y=y)
 
 GAMRegressor(formula="y ~ s(x)").fit(X, y)        # array y
 GAMRegressor(formula="y ~ s(x)").fit(df)          # df contains "y"
@@ -68,7 +78,13 @@ term is penalized and can shrink to zero. `formula_` holds the formula actually
 fitted.
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
 
 est = GAMRegressor().fit(X, y)
 print(est.formula_)            # y ~ s(x)
@@ -78,7 +94,7 @@ print(est.formula_)            # y ~ s(x)
 
 | Method | Returns | Notes |
 | --- | --- | --- |
-| `fit(X, y=None)` | `self` | Sets `model_`, `formula_`, `feature_names_in_`, `n_features_in_`. |
+| `fit(X, y=None, sample_weight=None)` | `self` | Sets `model_`, `formula_`, `n_features_in_`, and `feature_names_in_` when `X` names its columns. `sample_weight` becomes the likelihood's prior weights. |
 | `predict(X)` | `ndarray (n,)` | Predicted mean. |
 | `score(X, y, sample_weight=None)` | `float` | `r2_score`. |
 | `summary()` | `Summary` | Delegates to `model_.summary()`. |
@@ -105,14 +121,17 @@ est.fit(X, y)
 
 probs = est.predict_proba(X)   # (n, 2): [P(classes_[0]), P(classes_[1])]
 hard  = est.predict(X)         # (n,), highest-probability class label
-auc   = est.score(X, y)        # ROC AUC
+acc   = est.score(X, y)        # accuracy
 ```
 
-`classes_` is the sorted pair of labels observed at fit time. The wrapper
-encodes `classes_[1]` as the positive class before fitting, so string
-labels and non-`{0, 1}` binary labels round-trip. `predict_proba()` clips
-the positive-class probability to `[0, 1]` and stacks
-`[P(classes_[0]), P(classes_[1])]`. `predict()` returns
+`classes_` is the sorted labels observed at fit time. With two classes the
+wrapper encodes `classes_[1]` as the positive class and fits the
+binomial-logit GAM, so string labels and non-`{0, 1}` binary labels
+round-trip; `predict_proba()` clips the positive-class probability to
+`[0, 1]` and stacks `[P(classes_[0]), P(classes_[1])]`. With three or more
+classes (or `family="multinomial"`) it fits one joint multinomial-logit GAM,
+and `predict_proba()` returns the `(n, K)` class probabilities with column `j`
+aligned to `classes_[j]`. `predict()` returns
 `classes_[argmax(predict_proba(X), axis=1)]`.
 
 The modelled event is therefore the label that sorts last: with labels
@@ -140,11 +159,10 @@ print(np.allclose(est.predict_proba(X)[:, 1], model.predict(X), atol=1e-6))
 If the event you care about sorts first (for example `"case"` against
 `"control"`), recode the labels to `1`/`0` before fitting.
 
-`score(X, y, sample_weight=None)` returns AUC, not accuracy, for a binary
-model. A model with more than two classes has no single ROC curve, so its
-score is accuracy. If `sample_weight` is supplied, rows with weight `<= 0` are dropped before
-computing AUC. Use `metrics(X, y)` for the full panel: `auc`, `pr_auc`,
-`brier`, `logloss`, `nagelkerke_r2`, and `ece`.
+`score(X, y, sample_weight=None)` is accuracy, as for every scikit-learn
+classifier; use `scoring="roc_auc"` in `cross_val_score` / `GridSearchCV`
+for AUC. For a binary model, `metrics(X, y)` returns the full panel: `auc`,
+`pr_auc`, `brier`, `logloss`, `nagelkerke_r2`, and `ece`.
 
 With three or more classes (or `family="multinomial"` at any class count),
 `GAMClassifier` fits one joint multinomial-logit GAM: `K − 1` linear
@@ -177,9 +195,15 @@ delegating to the underlying `gamfit.Model` (scalar models only).
 ## Pipeline
 
 ```python
+import numpy as np
 from gamfit.sklearn import GAMRegressor
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X = rng.uniform(0, 10, (300, 2))
+y = np.sin(X[:, 0]) + 0.1 * X[:, 1] ** 2 + rng.normal(0, 0.3, 300)
+X_test = rng.uniform(0, 10, (5, 2))
 
 pipe = Pipeline([
     ("scaler", StandardScaler()),
@@ -194,10 +218,46 @@ The GAM step accepts a `pandas.DataFrame`, `polars.DataFrame`,
 sequence. Numpy arrays and 2-D row sequences use generated feature names
 `x0`, `x1`, ...
 
+## Input validation
+
+The estimators follow the scikit-learn estimator contract and pass
+`sklearn.utils.estimator_checks.check_estimator`:
+
+- Named inputs (DataFrames, Arrow tables, dicts, records) set
+  `feature_names_in_`; at `predict` the columns must match those names in
+  the same order (a response column carried over from fit is ignored).
+- Unnamed inputs are validated with `sklearn.utils.check_array` (numeric,
+  finite, dense, 2-D) and must have `n_features_in_` columns at `predict`.
+  Sparse matrices and arrays are refused with a `TypeError` naming sparse
+  input.
+- A formula that reads a column `X` does not have (for example `x0 + x1`
+  against a one-column array) is a `ValueError` naming the column and the
+  features `X` has.
+- `sample_weight` must be non-negative, one weight per row, and contain at
+  least one non-zero weight. It is the likelihood's prior weight, the same as
+  `gamfit.fit(..., weights=...)`, and may be fractional. For the binomial
+  classifier an integer weight `k` is exactly `k` repeated rows. For a
+  Gaussian regressor it is a precision (`y_i ~ N(mu_i, phi / w_i)`), so the
+  REML scale estimate counts rows, not the weight total.
+- A column-vector `y` of shape `(n, 1)` is ravelled with a
+  `DataConversionWarning`; methods called before `fit` raise
+  `NotFittedError`.
+
+`GAMRegressor` sets `regressor_tags.poor_score = True`. The formula fixes
+which columns the model reads, so scikit-learn's fixed scoring dataset (ten
+columns, one of them informative) cannot be scored against a formula written
+for other data; every other check runs unchanged.
+
 ## Cross-validation
 
 ```python
+import numpy as np
+import pandas as pd
 from gamfit.sklearn import GAMRegressor
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"x": rng.uniform(0, 10, 200)})
+y = np.sin(X["x"]) + rng.normal(0, 0.3, len(X))
 from sklearn.model_selection import cross_val_score
 
 scores = cross_val_score(

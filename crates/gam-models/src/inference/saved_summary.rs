@@ -261,10 +261,11 @@ mod whitening_gram_tests {
 ///
 /// This is marshalling, not a second summary: the table comes from
 /// `gam_solve::estimate::smooth_term_summary_rows`, the one walk of the
-/// fit's penalty layout (#2470), and `gam summary` renders this payload. Its
-/// contract is unchanged — random-effect smooths report `edf` only (their
-/// boundary variance-component test is not a Wald χ²), and penalized smooth
-/// terms get the Wood (2013) rank-truncated Wald statistic and p-value.
+/// fit's penalty layout that the in-process CLI summary also uses (#2470).
+/// Random-effect blocks get the variance-component score test the fit recorded
+/// (`FitArtifacts::random_effect_tests`, scored against its exact boundary null
+/// law, not a Wald χ²), and penalized smooth terms get the Wood (2013)
+/// rank-truncated Wald statistic and p-value.
 ///
 /// The "Mirrors `main.rs::build_model_summary`'s smooth-term loop" this
 /// sentence used to open with was accurate and was the problem: a comment
@@ -420,7 +421,7 @@ fn summary_smooth_terms(
     // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
     // off the fit inside that walk, which is where `fd998d957` put them.
     let rows =
-        gam_solve::estimate::smooth_term_summary_rows(design, spec, fit, whitening_gram_full);
+        gam_solve::estimate::smooth_term_summary_rows(&design, fit, whitening_gram_full);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
@@ -716,6 +717,12 @@ pub const NO_AIC_AT_EXACT_FIT: &str =
     "the fit interpolates the response exactly (zero dispersion), so it has no \
      normalized log-likelihood and no AIC";
 
+/// Why a fit that retained no inference record reports no AIC: both criteria
+/// charge the conditional EDF `tr(F)`, which only that record carries.
+pub const NO_AIC_WITHOUT_A_RETAINED_EDF: &str =
+    "the fit retained no inference record, so it has no conditional EDF for the AIC \
+     to charge";
+
 /// The information criteria a model summary publishes (#946, slop G2).
 ///
 /// Both AICs are formed by the single owner
@@ -792,6 +799,9 @@ fn summary_information_criteria(
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
+    if fit.edf_total().is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(NO_AIC_WITHOUT_A_RETAINED_EDF));
+    }
     let criteria = gam_solve::inference::information_criteria::information_criteria(
         fit,
         log_likelihood,
@@ -1043,8 +1053,11 @@ pub struct SummaryCoefficientRow {
 
 /// Per-smooth significance row for the FFI summary — the canonical mgcv
 /// `summary.gam` smooth-term table (`edf`, reference d.f., test statistic, and
-/// p-value). Random-effect smooths report only `edf` (their boundary
-/// variance-component test is not a Wald χ²); penalized smooth terms carry the
+/// p-value). Random-effect blocks carry the score test of their variance
+/// component `σ²_b = 0` scored against its exact finite-sample null law (the
+/// boundary null is not a Wald χ²; see
+/// `gam_terms::inference::random_effect_test`), with `ref_df` its effective
+/// d.f.; penalized smooth terms carry the
 /// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
 /// CLI's `SmoothTermSummary`.
 ///
@@ -1076,9 +1089,10 @@ pub struct SummarySmoothTermRow {
     /// is not rank-bound certified (#2901).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edf_rank_bound: Option<String>,
-    /// Why `p_value` is absent when the term has no valid reference law,
-    /// serialized as its label (`"shape_constrained"`); see
-    /// [`gam_solve::estimate::SmoothPValueUnavailable`].
+    /// Why `p_value` is absent when the term has no valid reference law
+    /// (`"shape_constrained"`), or why a random-effect block's variance-component
+    /// test could not be scored (`"random_effect_*"`), serialized as its label;
+    /// see [`gam_solve::estimate::SmoothPValueUnavailable`].
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_smooth_pvalue_unavailable"
@@ -1678,7 +1692,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()

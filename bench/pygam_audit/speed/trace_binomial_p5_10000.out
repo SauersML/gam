@@ -1,0 +1,11 @@
+fit wall=119.153 cpu=29.915
+GAM fitted model
+  Formula: y ~ s(x0) + s(x1) + s(x2) + s(x3) + s(x4)
+  Family:  Binomial Logit
+  Class:   standard
+  Training rows: 10000
+  Deviance: 11871.8
+  REML score: 6005.69
+  Effective dof: 32.1916
+  Outer iterations: 26
+  Coefficients: 56

@@ -1,4 +1,4 @@
-use ndarray::{Array2, Array3, Array4, Array5, ArrayView2};
+use ndarray::{Array2, Array3, Array4, Array5, ArrayView1, ArrayView2};
 use std::sync::Arc;
 
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
@@ -275,6 +275,156 @@ fn duchon_polynomial_column_count(
 /// `None`.
 pub trait SaeBasisSecondJet: SaeBasisEvaluator {
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String>;
+
+    /// Upper bounds on each basis column's value and its first three coordinate jets
+    /// over the closed ball `‖t − center‖₂ ≤ radius` (#2576). The support
+    /// fixed point's Newton–Kantorovich certificate builds the Lipschitz constant of
+    /// the exact Hessian from them. Every implementation declares one of the two
+    /// [`SaeBasisJetBallCapability`] states; a ball on which the basis has no finite
+    /// bound is `Unavailable`, never a large number.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String>;
+}
+
+/// Upper bounds, over a closed Euclidean ball of chart coordinates, on the norms of
+/// each basis column `φ_b: ℝ^d → ℝ` and its jets (#2576), in the evaluator's column
+/// order: `columns[b] = [sup|φ_b|, sup‖∂φ_b‖, sup‖∂²φ_b‖, sup‖∂³φ_b‖]`, the `k`-th jet
+/// measured as the Frobenius norm of its `d^k` partials, which dominates its norm as a
+/// `k`-linear form.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaeBasisJetBallBound {
+    pub columns: Vec<[f64; 4]>,
+}
+
+impl SaeBasisJetBallBound {
+    /// A bound on `‖Σ_b w_b ∂^kφ_b[u₁, …, u_k]‖` over unit `w ∈ ℝ^{m×P}` and unit
+    /// `u_i`: `(Σ_b s_{k,b}²)^{1/2}` by Cauchy–Schwarz over the columns.
+    pub fn unit_weighted(&self, order: usize) -> f64 {
+        self.columns
+            .iter()
+            .map(|column| column[order] * column[order])
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// A bound on `‖B'ᵀ∂^kφ[u₁, …, u_k]‖₂` for every decoder `B'` within Frobenius
+    /// distance `radius` of a decoder whose row norms are `row_norms`:
+    /// `Σ_b s_{k,b}‖B_b‖ + radius·(Σ_b s_{k,b}²)^{1/2}`.
+    pub fn decoder_weighted(&self, order: usize, row_norms: &[f64], radius: f64) -> f64 {
+        self.columns
+            .iter()
+            .zip(row_norms)
+            .map(|(column, norm)| column[order] * norm)
+            .sum::<f64>()
+            + radius * self.unit_weighted(order)
+    }
+}
+
+/// What an evaluator declares about [`SaeBasisJetBallBound`] on one ball (#2576),
+/// as [`SaeBasisThirdJetCapability`] does for the third jet: a missing bound is not
+/// a numerical infinity, and a consumer that needs it refuses on the stated reason.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaeBasisJetBallCapability {
+    Bounded(SaeBasisJetBallBound),
+    Unavailable(String),
+}
+
+/// `α(α−1)…(α−k+1)`, zero when `k > α`.
+fn falling_factorial(alpha: usize, k: usize) -> f64 {
+    (0..k).map(|j| alpha as f64 - j as f64).product::<f64>().max(0.0)
+}
+
+/// Per-function jet sups of one Fourier axis `[1, sin ωt, cos ωt, …, sin ωHt, cos ωHt]`,
+/// exact at every point: `(ωh)^k` for the pair of harmonic `h`, and zero past the value
+/// of the constant.
+fn fourier_axis_function_sups(harmonics: usize, omega: f64) -> Vec<[f64; 4]> {
+    let mut out = vec![[1.0, 0.0, 0.0, 0.0]];
+    for harmonic in 1..=harmonics {
+        let frequency = omega * harmonic as f64;
+        let column = [1.0, frequency, frequency.powi(2), frequency.powi(3)];
+        out.push(column);
+        out.push(column);
+    }
+    out
+}
+
+/// Per-function jet sups of one monomial axis `[1, t, …, t^degree]` over
+/// `|t| ≤ reach`: `sup|∂^k t^p| = p^{↓k} reach^{p−k}`.
+fn monomial_axis_function_sups(degree: usize, reach: f64) -> Vec<[f64; 4]> {
+    (0..=degree)
+        .map(|power| {
+            let mut column = [0.0_f64; 4];
+            for (order, entry) in column.iter_mut().enumerate() {
+                if order <= power {
+                    *entry = falling_factorial(power, order) * reach.powi((power - order) as i32);
+                }
+            }
+            column
+        })
+        .collect()
+}
+
+/// The jet sups of one tensor-product column `Π_a f_a(t_a)` from each axis factor's
+/// sups: an ordered axis tuple that meets axis `a` exactly `j_a` times is bounded by
+/// `Π_a s_{a,j_a}`, and the Frobenius norm of `∂^k` sums its square over the `d^k`
+/// tuples.
+fn tensor_column_sups(factors: &[[f64; 4]]) -> [f64; 4] {
+    let mut out = [0.0_f64; 4];
+    for (order, entry) in out.iter_mut().enumerate() {
+        *entry = ordered_axis_tuple_counts(factors.len(), order)
+            .iter()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .zip(factors)
+                    .map(|(&count, factor)| factor[count])
+                    .product::<f64>()
+                    .powi(2)
+            })
+            .sum::<f64>()
+            .sqrt();
+    }
+    out
+}
+
+/// For each of the `d^order` ordered tuples of axes, how many times it meets each axis.
+fn ordered_axis_tuple_counts(d: usize, order: usize) -> Vec<Vec<usize>> {
+    (0..d.pow(order as u32))
+        .map(|tuple| {
+            let mut counts = vec![0usize; d];
+            let mut code = tuple;
+            for _ in 0..order {
+                counts[code % d] += 1;
+                code /= d;
+            }
+            counts
+        })
+        .collect()
+}
+
+/// Validates a jet-ball request: a center of the evaluator's dimension and a
+/// finite nonnegative radius.
+fn check_jet_ball(
+    evaluator: &str,
+    center: ArrayView1<'_, f64>,
+    radius: f64,
+    dim: usize,
+) -> Result<(), String> {
+    if center.len() != dim {
+        return Err(format!(
+            "{evaluator}::jet_ball_bound: center has {} coordinates, expected {dim}",
+            center.len()
+        ));
+    }
+    if !(radius.is_finite() && radius >= 0.0) || center.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "{evaluator}::jet_ball_bound: center and radius must be finite (radius {radius})"
+        ));
+    }
+    Ok(())
 }
 
 /// Bases that expose an analytic third jet
@@ -466,6 +616,22 @@ impl SaeBasisSecondJet for PeriodicHarmonicEvaluator {
             }
         }
         Ok(h)
+    }
+
+    /// Exact at every point, so the ball does not enter: one Fourier axis of
+    /// frequency `2π`.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("PeriodicHarmonicEvaluator", center, radius, 1)?;
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound {
+            columns: fourier_axis_function_sups(
+                (self.num_basis - 1) / 2,
+                2.0 * std::f64::consts::PI,
+            ),
+        }))
     }
 }
 
@@ -825,6 +991,37 @@ impl SaeBasisSecondJet for SphericalHarmonicEvaluator {
             }
         }
         Ok(h)
+    }
+
+    /// Global, so the ball does not enter. A column `N·cos(lat)^{|m|}·Q(sin lat)·T_m(lon)`
+    /// is a trigonometric polynomial of degree `l` in `lat` and `|m|` in `lon`, bounded
+    /// on the whole plane by `B = N·‖Q‖₁`. Bernstein's inequality, one axis at a time,
+    /// bounds each mixed partial with `p` latitude and `q` longitude derivatives by
+    /// `l^p·|m|^q·B`, and the ordered axis tuples of length `k` sum those squares to
+    /// `B²·(l² + m²)^k`.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("SphericalHarmonicEvaluator", center, radius, 2)?;
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                let amplitude =
+                    column.norm * column.assoc.iter().map(|value| value.abs()).sum::<f64>();
+                let spectral =
+                    ((column.degree * column.degree + column.am * column.am) as f64).sqrt();
+                [
+                    amplitude,
+                    amplitude * spectral,
+                    amplitude * spectral.powi(2),
+                    amplitude * spectral.powi(3),
+                ]
+            })
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
     }
 }
 
@@ -1213,6 +1410,58 @@ impl SaeBasisSecondJet for AmbientSphereHarmonicEvaluator {
             }
         }
         Ok(h)
+    }
+
+    /// A column's mixed partial with `s` of its axes in `(x, y)` and `r` in `z` is
+    /// `N·Q^{(r)}(z)·∂^s A_m(x, y)` ([`Self::partial`]). On the ball, `|z| ≤ ρ_z` and
+    /// `|x + iy| ≤ ρ_w`, so `|Q^{(r)}(z)| ≤ Σ_j |q^{(r)}_j| ρ_z^j` and
+    /// `|∂^s A_m| ≤ |m|^{↓s} ρ_w^{|m|−s}` (from `∂^p_x ∂^q_y w^a = i^q a^{↓(p+q)} w^{a−p−q}`).
+    /// Of the ordered axis tuples of length `k`, `C(k, r)·2^s` have that split.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("AmbientSphereHarmonicEvaluator", center, radius, 3)?;
+        let reach_w = center[0].hypot(center[1]) + radius;
+        let reach_z = center[2].abs() + radius;
+        let binomial = |k: usize, r: usize| -> f64 {
+            falling_factorial(k, r) / falling_factorial(r, r)
+        };
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                let radial: Vec<f64> = column
+                    .assoc_derivatives
+                    .iter()
+                    .map(|coefficients| {
+                        coefficients
+                            .iter()
+                            .enumerate()
+                            .map(|(power, value)| value.abs() * reach_z.powi(power as i32))
+                            .sum::<f64>()
+                    })
+                    .collect();
+                let mut sups = [0.0_f64; 4];
+                for (order, entry) in sups.iter_mut().enumerate() {
+                    let mut squared = 0.0_f64;
+                    for r in 0..=order {
+                        let s = order - r;
+                        if s > column.am {
+                            continue;
+                        }
+                        let angular = falling_factorial(column.am, s)
+                            * reach_w.powi((column.am - s) as i32);
+                        let bound = column.norm * radial[r] * angular;
+                        squared += binomial(order, r) * 2.0_f64.powi(s as i32) * bound * bound;
+                    }
+                    *entry = squared.sqrt();
+                }
+                sups
+            })
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
     }
 }
 
@@ -1634,6 +1883,32 @@ impl SaeBasisSecondJet for TorusHarmonicEvaluator {
             }
         }
         Ok(hess)
+    }
+
+    /// Exact at every point: each column is a product of `d` Fourier factors of
+    /// frequency `2π` ([`tensor_column_sups`]), in the layout above (last axis fastest).
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        let d = self.latent_dim;
+        check_jet_ball("TorusHarmonicEvaluator", center, radius, d)?;
+        let axis = fourier_axis_function_sups(self.num_harmonics, 2.0 * std::f64::consts::PI);
+        let mut idx = vec![0usize; d];
+        let mut columns = Vec::with_capacity(self.basis_size());
+        for _ in 0..self.basis_size() {
+            let factors: Vec<[f64; 4]> = idx.iter().map(|&index| axis[index]).collect();
+            columns.push(tensor_column_sups(&factors));
+            for position in (0..d).rev() {
+                idx[position] += 1;
+                if idx[position] < self.axis_basis_size() {
+                    break;
+                }
+                idx[position] = 0;
+            }
+        }
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
     }
 }
 
@@ -2250,6 +2525,36 @@ impl SaeBasisSecondJet for QuotientSpectralEvaluator {
         }
         Ok(hessian)
     }
+
+    /// The quotient keeps the cover's columns `cover_columns`, so each keeps its cover
+    /// bound.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        match self.cover.jet_ball_bound(center, radius)? {
+            SaeBasisJetBallCapability::Bounded(cover) => {
+                if cover.columns.len() != self.cover_width {
+                    return Err(format!(
+                        "QuotientSpectralEvaluator[{}]: cover ball bound has {} columns, \
+                         expected {}",
+                        self.quotient_name,
+                        cover.columns.len(),
+                        self.cover_width
+                    ));
+                }
+                Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound {
+                    columns: self
+                        .cover_columns
+                        .iter()
+                        .map(|&column| cover.columns[column])
+                        .collect(),
+                }))
+            }
+            unavailable => Ok(unavailable),
+        }
+    }
 }
 
 impl SaeBasisThirdJet for QuotientSpectralEvaluator {
@@ -2428,6 +2733,32 @@ impl SaeBasisSecondJet for DuchonCoordinateEvaluator {
         }
         gam_terms::basis::duchon_sae_atom_second_jet(coords, self.centers.view(), self.order)
             .map_err(|err| err.to_string())
+    }
+
+    /// The kernel and polynomial columns' bounds from
+    /// [`gam_terms::basis::duchon_sae_atom_jet_ball_bound`].
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("DuchonCoordinateEvaluator", center, radius, self.centers.ncols())?;
+        match gam_terms::basis::duchon_sae_atom_jet_ball_bound(
+            center,
+            radius,
+            self.centers.view(),
+            self.order,
+        )
+        .map_err(|err| err.to_string())?
+        {
+            Some(columns) => Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound {
+                columns,
+            })),
+            None => Ok(SaeBasisJetBallCapability::Unavailable(format!(
+                "the ball of radius {radius:.3e} reaches a Duchon center, where a jet of the \
+                 polyharmonic kernel is unbounded"
+            ))),
+        }
     }
 }
 
@@ -2667,6 +2998,34 @@ impl SaeBasisSecondJet for EuclideanPatchEvaluator {
             }
         }
         Ok(hess)
+    }
+
+    /// A monomial `t^α` is the product of one monomial factor per axis, and on the
+    /// ball each coordinate obeys `|t_a| ≤ |c_a| + radius`
+    /// ([`monomial_axis_function_sups`], [`tensor_column_sups`]).
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("EuclideanPatchEvaluator", center, radius, self.latent_dim)?;
+        let axes: Vec<Vec<[f64; 4]>> = center
+            .iter()
+            .map(|value| monomial_axis_function_sups(self.max_degree, value.abs() + radius))
+            .collect();
+        let columns = self
+            .exponents
+            .iter()
+            .map(|alpha| {
+                let factors: Vec<[f64; 4]> = alpha
+                    .iter()
+                    .zip(&axes)
+                    .map(|(&power, axis)| axis[power])
+                    .collect();
+                tensor_column_sups(&factors)
+            })
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
     }
 }
 
@@ -3087,6 +3446,27 @@ impl SaeBasisSecondJet for CylinderHarmonicEvaluator {
         }
         Ok(h)
     }
+
+    /// Column `c·Ml + l` is a `2π` Fourier factor times a monomial factor whose
+    /// coordinate stays within `|t₁| ≤ |c₁| + radius` on the ball.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("CylinderHarmonicEvaluator", center, radius, 2)?;
+        let circle =
+            fourier_axis_function_sups(self.circle_harmonics, 2.0 * std::f64::consts::PI);
+        let line = monomial_axis_function_sups(self.line_degree, center[1].abs() + radius);
+        let columns = circle
+            .iter()
+            .flat_map(|&circle_factor| {
+                line.iter()
+                    .map(move |&line_factor| tensor_column_sups(&[circle_factor, line_factor]))
+            })
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
+    }
 }
 
 impl SaeBasisThirdJet for CylinderHarmonicEvaluator {
@@ -3396,6 +3776,25 @@ impl SaeBasisSecondJet for MobiusHarmonicEvaluator {
         }
         Ok(h)
     }
+
+    /// Each admitted column `(c, m)` is a double-cover Fourier factor (frequency `π`)
+    /// times the width monomial `w^m`, whose coordinate stays within
+    /// `|w| ≤ |c_w| + radius` on the ball.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("MobiusHarmonicEvaluator", center, radius, 2)?;
+        let circle = fourier_axis_function_sups(self.circle_harmonics, std::f64::consts::PI);
+        let width = monomial_axis_function_sups(self.width_degree, center[1].abs() + radius);
+        let columns = self
+            .columns
+            .iter()
+            .map(|&(c, power)| tensor_column_sups(&[circle[c], width[power]]))
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
+    }
 }
 
 impl SaeBasisThirdJet for MobiusHarmonicEvaluator {
@@ -3622,6 +4021,35 @@ impl SaeBasisSecondJet for SubspaceReducedEvaluator {
             .into_dimensionality::<ndarray::Ix4>()
             .map_err(|err| format!("SubspaceReducedEvaluator: second jet dim: {err}"))
     }
+
+    /// Reduced column `j` is `Σ_i Q_ij φ_i`, so each of its jets is bounded by
+    /// `Σ_i |Q_ij|` times the inner columns' bounds.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        let inner = match self.inner.jet_ball_bound(center, radius)? {
+            SaeBasisJetBallCapability::Bounded(bound) => bound,
+            unavailable => return Ok(unavailable),
+        };
+        self.check_inner_width(inner.columns.len(), "jet_ball_bound")?;
+        let columns = self
+            .q
+            .columns()
+            .into_iter()
+            .map(|weights| {
+                let mut sups = [0.0_f64; 4];
+                for (weight, column) in weights.iter().zip(&inner.columns) {
+                    for (entry, bound) in sups.iter_mut().zip(column) {
+                        *entry += weight.abs() * bound;
+                    }
+                }
+                sups
+            })
+            .collect();
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
+    }
 }
 
 /// F2 finite-set (discrete anchor) basis: the INDICATOR / one-hot design over a
@@ -3703,6 +4131,32 @@ impl SaeBasisSecondJet for AnchorIndicatorEvaluator {
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         let n = coords.nrows();
         Ok(Array4::<f64>::zeros((n, self.anchors, 1, 1)))
+    }
+
+    /// The design is one-hot and constant between the rounding boundaries
+    /// `t = k + ½`, `k = 0..anchors − 1`, so on a ball that meets none of them every
+    /// jet is zero and only the anchor the center snaps to is ever selected. A ball
+    /// that meets one straddles a jump and has no bound.
+    fn jet_ball_bound(
+        &self,
+        center: ArrayView1<'_, f64>,
+        radius: f64,
+    ) -> Result<SaeBasisJetBallCapability, String> {
+        check_jet_ball("AnchorIndicatorEvaluator", center, radius, 1)?;
+        let t = center[0];
+        if let Some(boundary) = (0..self.anchors.saturating_sub(1))
+            .map(|anchor| anchor as f64 + 0.5)
+            .find(|boundary| (t - boundary).abs() <= radius)
+        {
+            return Ok(SaeBasisJetBallCapability::Unavailable(format!(
+                "the ball of radius {radius:.3e} around t = {t:.6e} meets the anchor \
+                 boundary t = {boundary}, where the one-hot design jumps"
+            )));
+        }
+        // `new` admits at least two anchors, so the snapped index is a column.
+        let mut columns = vec![[0.0_f64; 4]; self.anchors];
+        columns[t.round().clamp(0.0, (self.anchors - 1) as f64) as usize][0] = 1.0;
+        Ok(SaeBasisJetBallCapability::Bounded(SaeBasisJetBallBound { columns }))
     }
 }
 
@@ -4520,5 +4974,138 @@ mod tests {
             eval.evaluate_into(&mut phi, &mut jet, coords.view())
                 .is_err()
         );
+    }
+
+    /// #2576 — every evaluator's jet ball bound dominates its own value and jets,
+    /// column for column in the evaluator's order, at 64 interior points and 64 points
+    /// on the boundary sphere of a ball, where these bases attain their sups. The jets
+    /// are the evaluators' own analytic `evaluate`, `second_jet` and `third_jet_dyn`,
+    /// measured as the Frobenius norm of their partials as the bound states them. The
+    /// evaluators round, so a sampled norm may pass a sup it attains by a few units in
+    /// its last place; `1e-12` relative covers that and no more.
+    #[test]
+    fn jet_ball_bounds_dominate_every_sampled_jet_2576() {
+        let duchon_centers = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.0, 0.0, 1.0, 0.2, 0.3, 1.1, -0.8, 0.5, 0.6, -0.9, -0.4, -0.6],
+        )
+        .unwrap();
+        let mut rng = uniform_stream(0x2576);
+        let reduction = Array2::from_shape_fn((5, 3), |_| 2.0 * rng() - 1.0);
+        let periodic: Arc<dyn SaeBasisSecondJet> =
+            Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+        let cases: Vec<(&str, Arc<dyn SaeBasisSecondJet>, Vec<f64>, f64)> = vec![
+            ("periodic", Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap()), vec![0.3], 0.2),
+            (
+                "sphere chart",
+                Arc::new(SphericalHarmonicEvaluator::new(3).unwrap()),
+                vec![0.4, 1.0],
+                0.3,
+            ),
+            (
+                "ambient sphere",
+                Arc::new(AmbientSphereHarmonicEvaluator::new(3).unwrap()),
+                vec![0.5, -0.4, 0.3],
+                0.2,
+            ),
+            ("torus", Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()), vec![0.1, 0.7], 0.2),
+            (
+                "projective plane",
+                Arc::new(QuotientSpectralEvaluator::projective_plane(2).unwrap()),
+                vec![0.4, 1.0],
+                0.3,
+            ),
+            (
+                "duchon",
+                Arc::new(DuchonCoordinateEvaluator::new(duchon_centers, 2).unwrap()),
+                vec![0.45, 0.45],
+                0.15,
+            ),
+            (
+                "euclidean patch",
+                Arc::new(EuclideanPatchEvaluator::new(2, 3).unwrap()),
+                vec![0.5, -1.2],
+                0.3,
+            ),
+            (
+                "cylinder",
+                Arc::new(CylinderHarmonicEvaluator::new(2, 2).unwrap()),
+                vec![0.2, 0.8],
+                0.25,
+            ),
+            ("mobius", Arc::new(MobiusHarmonicEvaluator::new(2, 2).unwrap()), vec![0.4, 0.3], 0.2),
+            (
+                "subspace reduced",
+                Arc::new(SubspaceReducedEvaluator::new(periodic, reduction).unwrap()),
+                vec![0.6],
+                0.1,
+            ),
+            (
+                "anchor indicator",
+                Arc::new(AnchorIndicatorEvaluator::new(4).unwrap()),
+                vec![1.2],
+                0.2,
+            ),
+        ];
+        for (name, evaluator, center, radius) in cases {
+            let dim = center.len();
+            let bound = match evaluator
+                .jet_ball_bound(ndarray::ArrayView1::from(&center), radius)
+                .unwrap()
+            {
+                SaeBasisJetBallCapability::Bounded(bound) => bound,
+                SaeBasisJetBallCapability::Unavailable(reason) => {
+                    panic!("{name}: the ball of radius {radius} declares no bound: {reason}")
+                }
+            };
+            let points = 128usize;
+            let mut coords = Array2::<f64>::zeros((points, dim));
+            for row in 0..points {
+                let direction: Vec<f64> = (0..dim).map(|_| 2.0 * rng() - 1.0).collect();
+                let norm = direction.iter().map(|value| value * value).sum::<f64>().sqrt();
+                let reach =
+                    if row % 2 == 0 { radius } else { radius * rng().powf(1.0 / dim as f64) };
+                for axis in 0..dim {
+                    coords[[row, axis]] = center[axis] + reach * direction[axis] / norm;
+                }
+            }
+            let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+            let hessian = evaluator.second_jet(coords.view()).unwrap();
+            let third = match evaluator.third_jet_dyn(coords.view()).unwrap() {
+                SaeBasisThirdJetCapability::Analytic(third) => Some(third),
+                SaeBasisThirdJetCapability::CertifiedZero => {
+                    Some(ndarray::Array5::<f64>::zeros((points, phi.ncols(), dim, dim, dim)))
+                }
+                SaeBasisThirdJetCapability::Unavailable => None,
+            };
+            assert_eq!(bound.columns.len(), phi.ncols(), "{name}: bound column count");
+            for row in 0..points {
+                for (column, sups) in bound.columns.iter().enumerate() {
+                    let frobenius = |values: ndarray::ArrayViewD<'_, f64>| {
+                        values.iter().map(|value| value * value).sum::<f64>().sqrt()
+                    };
+                    let mut sampled = [
+                        phi[[row, column]].abs(),
+                        frobenius(jet.slice(ndarray::s![row, column, ..]).into_dyn()),
+                        frobenius(hessian.slice(ndarray::s![row, column, .., ..]).into_dyn()),
+                        0.0,
+                    ];
+                    if let Some(third) = &third {
+                        sampled[3] =
+                            frobenius(third.slice(ndarray::s![row, column, .., .., ..]).into_dyn());
+                    }
+                    for order in 0..4 {
+                        assert!(
+                            sampled[order] <= sups[order] * (1.0 + 1.0e-12),
+                            "{name}: column {column}, jet order {order} at {:?}: sampled {:.6e} \
+                             exceeds the ball bound {:.6e} (center {center:?}, radius {radius})",
+                            coords.row(row).to_vec(),
+                            sampled[order],
+                            sups[order],
+                        );
+                    }
+                }
+            }
+        }
     }
 }

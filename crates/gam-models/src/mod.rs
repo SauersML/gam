@@ -48,7 +48,7 @@ pub mod quadrature {
 /// `crate::seeding` → seed-config carriers now in `gam-problem` (the `seeding`
 /// module is private there; its items are surfaced at the crate root).
 pub mod seeding {
-    pub use gam_problem::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};
+    pub use gam_problem::OrderedRhoBounds;
 }
 
 /// `crate::model_types` → fit-result / penalty-spec carriers now in `gam-solve`,
