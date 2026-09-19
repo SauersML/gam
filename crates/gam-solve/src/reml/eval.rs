@@ -990,6 +990,12 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
+        if self.block_correction_latched() {
+            crate::bail_invalid_estim!(
+                "{}",
+                crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
+            );
+        }
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(&bundle);
         match decision.strategy {
