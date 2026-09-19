@@ -320,7 +320,6 @@ pub fn information_criteria(
     fit: &UnifiedFitResult,
     log_likelihood: f64,
 ) -> Result<InformationCriteria, EstimationError> {
-    let phi = fit.dispersion_phi()?;
     let edf_conditional = fit.edf_total().ok_or_else(|| {
         EstimationError::InvalidInput(
             "information criteria require a retained conditional EDF".into(),
@@ -330,6 +329,10 @@ pub fn information_criteria(
         .likelihood_family
         .as_ref()
         .map(|spec| {
+            // A custom-family fit has no engine-level family and no scalar
+            // response dispersion; its coefficient covariance is `H⁻¹`
+            // already, so only an engine family needs φ here.
+            let phi = fit.dispersion_phi()?;
             GlmLikelihoodSpec {
                 spec: spec.clone(),
                 scale: fit.likelihood_scale,
