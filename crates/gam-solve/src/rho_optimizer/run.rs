@@ -594,6 +594,10 @@ impl OuterProblem {
         self.tolerance = tol;
         self
     }
+    /// The absolute stationarity tolerance this problem declares.
+    pub fn tolerance(&self) -> f64 {
+        self.tolerance
+    }
     pub fn with_max_iter(mut self, n: usize) -> Self {
         self.max_iter = n;
         self

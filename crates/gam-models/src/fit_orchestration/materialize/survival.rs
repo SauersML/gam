@@ -908,6 +908,16 @@ pub(crate) fn materialize_survival<'a>(
                 kappa_options: config.spatial_optimization.clone(),
             })
         };
+    let location_scale_collapses_time_warp =
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| -> Result<bool, WorkflowError> {
+            let request = build_location_scale_request(candidate)
+                .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+            crate::survival::location_scale::survival_location_scale_terms_collapse_time_warp(
+                request.data,
+                &request.spec,
+            )
+            .map_err(WorkflowError::from)
+        };
 
     let build_marginal_slope_request = || {
         let (prepared, baseline_hyper) = marginal_slope_time_state.as_ref().ok_or_else(|| {
@@ -1156,6 +1166,23 @@ pub(crate) fn materialize_survival<'a>(
             | SurvivalLikelihoodMode::MarginalSlope
     ) {
         baseline_cfg
+    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
+        && survival_mode == SurvivalLikelihoodMode::LocationScale
+        && location_scale_collapses_time_warp(&baseline_cfg)?
+    {
+        // The constant-scale fit replaces its time warp with `−log t` on the
+        // location channel (#892) and reads none of the time block's offsets,
+        // so a target's parameters do not enter its likelihood.
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "survival location-scale: baseline_target='{}' has no parameter in this \
+                 likelihood. With a constant scale and no time wiggle the fit replaces its \
+                 time warp with -log t on the location channel and reads no time offset. \
+                 Drop the target, or fit a scale (noise_formula) or a timewiggle(...) so a \
+                 warp is estimated",
+                crate::survival::construction::survival_baseline_targetname(baseline_cfg.target)
+            ),
+        });
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
         && survival_mode == SurvivalLikelihoodMode::LocationScale
     {

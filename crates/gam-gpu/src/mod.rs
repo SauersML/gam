@@ -109,6 +109,7 @@ pub enum GpuKernel {
     SparseAssembly,
     SpatialKernelOperator,
     MarginalSlopeRows,
+    SurvivalMarginalSlopeRows,
     RemlTrace,
     FinalInference,
 }
@@ -125,6 +126,7 @@ impl GpuKernel {
             Self::SparseAssembly => "sparse-assembly",
             Self::SpatialKernelOperator => "spatial-kernel-operator",
             Self::MarginalSlopeRows => "marginal-slope-rows",
+            Self::SurvivalMarginalSlopeRows => "survival-marginal-slope-rows",
             Self::RemlTrace => "reml-trace",
             Self::FinalInference => "final-inference",
         }
@@ -317,6 +319,92 @@ pub fn decide_under(
     }
 }
 
+/// What a decision asks of the device: the dispatch policy of the device this
+/// process runs on under `policy`, or `None` for a genuine absence. Production
+/// passes [`RuntimeDeviceProbe`]; a decision asks only when its answer still
+/// depends on the device, so a counting probe can pin that nothing smaller or
+/// less capable ever asks.
+pub trait DeviceProbe {
+    fn resolve(&mut self, policy: GpuPolicy) -> Result<Option<GpuDispatchPolicy>, GpuError>;
+}
+
+/// The process's CUDA runtime, probed at most once per process.
+pub struct RuntimeDeviceProbe;
+
+impl DeviceProbe for RuntimeDeviceProbe {
+    fn resolve(&mut self, policy: GpuPolicy) -> Result<Option<GpuDispatchPolicy>, GpuError> {
+        Ok(device_runtime::GpuRuntime::resolve(policy)?.map(|runtime| runtime.policy().clone()))
+    }
+}
+
+/// A row kernel's admission request.
+pub struct RowKernelAdmission {
+    pub kernel: GpuKernel,
+    /// The first capability the requested model needs that the kernel's
+    /// declaration lacks, `None` when the kernel computes the model.
+    pub missing_capability: Option<&'static str>,
+    /// Whether the kernel's backend is compiled into this build.
+    pub compiled: bool,
+    pub rows: usize,
+    /// The smallest row threshold any dispatch policy can carry for this
+    /// kernel, so fewer rows are below it on every device.
+    pub floor: usize,
+    /// This kernel's row threshold in a device's dispatch policy.
+    pub threshold: fn(&GpuDispatchPolicy) -> usize,
+}
+
+/// The one decision for a row kernel. Its stages run in the order of what they
+/// cost to evaluate — capability, build, rows against the floor every policy
+/// shares, then the device, whose own threshold is read once it is probed —
+/// and `auto`'s reason names the first stage that fails. A model the kernel
+/// does not compute, a kernel not compiled in, `off`, and an `auto` workload
+/// below the floor never probe the device. `required` bypasses the size stages
+/// and needs the device.
+pub fn decide_row_kernel(
+    policy: GpuPolicy,
+    admission: RowKernelAdmission,
+    probe: &mut impl DeviceProbe,
+) -> Result<GpuDecision, GpuError> {
+    let RowKernelAdmission {
+        kernel,
+        missing_capability,
+        compiled,
+        rows,
+        floor,
+        threshold,
+    } = admission;
+    let (eligibility, runtime_available) = if let Some(missing) = missing_capability {
+        (GpuEligibility::CapabilityMissing { missing }, false)
+    } else if !compiled {
+        (GpuEligibility::BackendNotCompiled, false)
+    } else {
+        match policy {
+            // `off` selects the CPU whatever the workload; no stage is read.
+            GpuPolicy::Off => (GpuEligibility::Eligible, false),
+            GpuPolicy::Auto if rows < floor => (GpuEligibility::WorkloadBelowThreshold, false),
+            GpuPolicy::Auto => match probe.resolve(policy)? {
+                Some(device) if rows < threshold(&device) => {
+                    (GpuEligibility::WorkloadBelowThreshold, true)
+                }
+                Some(_) => (GpuEligibility::Eligible, true),
+                None => (GpuEligibility::Eligible, false),
+            },
+            GpuPolicy::Required => match probe.resolve(policy)? {
+                Some(_) => (GpuEligibility::Eligible, true),
+                None => {
+                    return Err(GpuError::RequiredDeviceUnavailable {
+                        reason: format!(
+                            "gpu=required requested kernel '{}' and no CUDA device resolved",
+                            kernel.as_str()
+                        ),
+                    });
+                }
+            },
+        }
+    };
+    Ok(decide_under(policy, runtime_available, kernel, eligibility))
+}
+
 impl GpuDecision {
     pub fn require_supported(&self) -> Result<(), String> {
         if self.policy == GpuPolicy::Required && !self.use_gpu {
@@ -362,7 +450,7 @@ pub fn log_backend_inventory_once() {
             "none"
         };
         log::trace!(
-            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,survival-marginal-slope-rows,reml-trace,final-inference",
             global_policy().as_str(),
             compiled_backends
         );
@@ -616,5 +704,126 @@ mod policy_tests {
         let no_device = decide_under(GpuPolicy::Auto, false, kernel, GpuEligibility::Eligible);
         assert!(!no_device.use_gpu);
         assert_eq!(no_device.reason, "cpu-gpu-runtime-unavailable");
+    }
+
+    /// A device stub that records the policy of every request a decision makes
+    /// of it, and answers with a fixed device policy (or none).
+    struct CountingProbe {
+        device: Option<GpuDispatchPolicy>,
+        asked: Vec<GpuPolicy>,
+    }
+
+    impl DeviceProbe for CountingProbe {
+        fn resolve(&mut self, policy: GpuPolicy) -> Result<Option<GpuDispatchPolicy>, GpuError> {
+            self.asked.push(policy);
+            Ok(self.device.clone())
+        }
+    }
+
+    fn admission(missing_capability: Option<&'static str>, rows: usize) -> RowKernelAdmission {
+        RowKernelAdmission {
+            kernel: GpuKernel::MarginalSlopeRows,
+            missing_capability,
+            compiled: true,
+            rows,
+            floor: GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N,
+            threshold: |device| device.row_kernel_min_n,
+        }
+    }
+
+    /// gam#3000 slice 2: the row-kernel decision asks the device only when its
+    /// answer still depends on it. A model the kernel does not compute, a
+    /// kernel not compiled in, `off`, and an `auto` workload below the floor
+    /// every policy shares make no probe call at all, so none of them creates
+    /// a CUDA context; above the floor `auto` probes once and reads the
+    /// device's own threshold, and `required` probes once whatever the size.
+    #[test]
+    fn row_kernel_decision_probes_the_device_only_when_the_answer_depends_on_it_3000() {
+        let device = GpuDispatchPolicy::default();
+        let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N;
+        let device_threshold = device.row_kernel_min_n;
+        assert!(floor < device_threshold);
+        let missing = "the discrete-grid latent integral";
+        let probe_calls = |policy: GpuPolicy, admission: RowKernelAdmission| {
+            let mut probe = CountingProbe {
+                device: Some(device.clone()),
+                asked: Vec::new(),
+            };
+            let decision = decide_row_kernel(policy, admission, &mut probe)
+                .expect("the stub device never faults");
+            assert!(
+                probe.asked.iter().all(|&asked| asked == policy),
+                "{policy}: the device was probed under {:?}",
+                probe.asked
+            );
+            (decision, probe.asked.len())
+        };
+
+        for rows in [0, floor - 1, floor, device_threshold, 10 * device_threshold] {
+            for policy in [GpuPolicy::Auto, GpuPolicy::Required, GpuPolicy::Off] {
+                let (decision, calls) = probe_calls(policy, admission(Some(missing), rows));
+                assert_eq!(
+                    calls, 0,
+                    "{policy} rows={rows}: a missing capability probed"
+                );
+                assert!(!decision.use_gpu);
+                assert_eq!(decision.missing_capability, Some(missing));
+            }
+            let (decision, calls) = probe_calls(
+                GpuPolicy::Auto,
+                RowKernelAdmission {
+                    compiled: false,
+                    ..admission(None, rows)
+                },
+            );
+            assert_eq!(calls, 0, "rows={rows}: a kernel not compiled in probed");
+            assert_eq!(decision.reason, "cpu-gpu-backend-not-compiled");
+            let (decision, calls) = probe_calls(GpuPolicy::Off, admission(None, rows));
+            assert_eq!(calls, 0, "rows={rows}: off probed");
+            assert_eq!(decision.reason, "cpu-gpu-policy-off");
+        }
+
+        for rows in [0, floor - 1] {
+            let (decision, calls) = probe_calls(GpuPolicy::Auto, admission(None, rows));
+            assert_eq!(
+                calls, 0,
+                "rows={rows} is below every policy's floor, yet auto probed"
+            );
+            assert!(!decision.use_gpu);
+            assert_eq!(decision.reason, "cpu-workload-below-gpu-threshold");
+        }
+        let (between, calls) = probe_calls(GpuPolicy::Auto, admission(None, floor));
+        assert_eq!(calls, 1);
+        assert!(!between.use_gpu, "below the device's own threshold");
+        assert_eq!(between.reason, "cpu-workload-below-gpu-threshold");
+        let (above, calls) = probe_calls(GpuPolicy::Auto, admission(None, device_threshold));
+        assert_eq!(calls, 1);
+        assert!(above.use_gpu);
+        for rows in [0, floor - 1, device_threshold] {
+            let (required, calls) = probe_calls(GpuPolicy::Required, admission(None, rows));
+            assert_eq!(calls, 1, "rows={rows}");
+            assert!(required.use_gpu, "required bypasses both size stages");
+        }
+
+        let mut absent = CountingProbe {
+            device: None,
+            asked: Vec::new(),
+        };
+        let no_device = decide_row_kernel(GpuPolicy::Auto, admission(None, floor), &mut absent)
+            .expect("typed absence is not a fault under auto");
+        assert_eq!(
+            (absent.asked.as_slice(), no_device.use_gpu),
+            (&[GpuPolicy::Auto][..], false)
+        );
+        assert_eq!(no_device.reason, "cpu-gpu-runtime-unavailable");
+        let mut absent = CountingProbe {
+            device: None,
+            asked: Vec::new(),
+        };
+        assert!(matches!(
+            decide_row_kernel(GpuPolicy::Required, admission(None, floor), &mut absent),
+            Err(GpuError::RequiredDeviceUnavailable { .. })
+        ));
+        assert_eq!(absent.asked, [GpuPolicy::Required]);
     }
 }
