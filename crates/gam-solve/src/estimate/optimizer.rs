@@ -641,8 +641,11 @@ pub(crate) fn certificate_curvature_verdict_resolution(
 ///
 /// `hessian` is the matrix the certificate judged and `invariance` the
 /// criterion's exact invariance at the same ρ. The block is taken by the owners
-/// the adjudication used, off the certificate's railed face. Every other verdict
-/// publishes nothing here.
+/// the adjudication used, off the certificate's railed face. A verdict withdrawn
+/// as `CriterionUnresolvable` (#3036) publishes the same `|λ_min|`: its claim
+/// predicts no decrease the criterion resolves at any step the adjudication may
+/// take, so the matrix is unconfirmed along `v` by that much. Every other
+/// verdict publishes nothing here.
 pub(crate) fn certificate_contradicted_curvature_error(
     certificate: Option<&crate::model_types::OuterCriterionCertificate>,
     hessian: Option<&Array2<f64>>,
@@ -650,12 +653,8 @@ pub(crate) fn certificate_contradicted_curvature_error(
 ) -> Option<f64> {
     use gam_linalg::faer_ndarray::FaerEigh;
 
-    let certificate = certificate.filter(|certificate| {
-        matches!(
-            certificate.curvature,
-            crate::rho_optimizer::CurvatureEvidence::CriterionContradicted
-        )
-    })?;
+    let certificate =
+        certificate.filter(|certificate| certificate.curvature.withdrawn_by_criterion())?;
     let hessian = hessian?;
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|value| !value.is_finite()) {
@@ -1407,27 +1406,6 @@ where
                 })
                 .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-                // n-scaled absolute gradient floor for EVERY family (#1082).
-                //
-                // The REML/LAML profiled criterion is a sum over n rows
-                // (deviance / −2·loglik + the penalty/logdet terms), so it and its
-                // ∂/∂logλ gradient inherit an O(n) scale for Poisson, NB, binomial,
-                // Tweedie, beta — exactly as for Gaussian-identity. The previous gate
-                // restricted `with_objective_scale` to the Gaussian-identity arm on
-                // the (incorrect) premise that only that criterion is O(n). For a
-                // non-Gaussian tensor/cyclic/CI/badhealth fit at n≈1.5k–5k the fixed
-                // `abs = tol ≈ 1e-6` gradient floor is then orders of magnitude below
-                // the n-scaled gradient's converged residual: the relative-from-seed
-                // test declares convergence iters earlier, but the binding abs floor
-                // keeps the outer optimizer chasing sub-floor log-λ changes, paying a
-                // full inner convergence per phantom iteration until it exhausts
-                // the iteration budget — the #1082 outer-loop "cycling"
-                // timeout. Lifting the floor to ~n·1e-9 (the same calibration the
-                // spatial/custom-family outer already uses via `with_problem_size`,
-                // #1053/#1066/#1069) lets the loop terminate as soon as the relative
-                // reduction is met, for every family, while the relative-to-cost
-                // component still owns the actual convergence decision.
-                .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_bounds(rho_model_domain.0.clone(), rho_model_domain.1.clone())
                 // #2954: which of those faces are the terms' limit models, so a
@@ -1931,7 +1909,6 @@ where
                 // on every evaluation. Use it: BFGS can lose the changing
                 // link/scale coupling and stall with a nonstationary shape.
                 .with_prefer_gradient_only(false)
-                .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_psi_dim(mixture_dim + sas_dim + student_t_dim)
                 .with_barrier(
@@ -3698,12 +3675,8 @@ where
             let contradicted_curvature_error = if outer_result
                 .criterion_certificate
                 .as_ref()
-                .is_some_and(|certificate| {
-                    matches!(
-                        certificate.curvature,
-                        crate::rho_optimizer::CurvatureEvidence::CriterionContradicted
-                    )
-                }) {
+                .is_some_and(|certificate| certificate.curvature.withdrawn_by_criterion())
+            {
                 certificate_contradicted_curvature_error(
                     outer_result.criterion_certificate.as_ref(),
                     outer_result.final_hessian.as_ref(),

@@ -157,17 +157,15 @@ pub(crate) struct OuterConfig {
     pub(crate) tolerance: f64,
     /// Optional override for the *relative-cost-decrease* convergence stop,
     /// decoupled from `tolerance`. `outer_gradient_tolerance` normally derives
-    /// BOTH the absolute projected-gradient floor
-    /// (`max(tolerance, scale·√ε_machine)`)
+    /// BOTH the absolute projected-gradient band (`tolerance`)
     /// AND the relative-cost stop (`rel_cost = tolerance`) from the single
     /// `tolerance`. That conflation forces a caller who needs a *tight absolute
-    /// floor* (to resolve λ to the genuine REML optimum at large `n`, where the
-    /// floor is `scale·√ε_machine`) to also accept a *tight rel-cost stop*,
+    /// band* (to resolve λ to the genuine REML optimum) to also accept a *tight rel-cost stop*,
     /// which on a flat REML ridge never trips and grinds the optimizer to `max_iter` —
     /// dozens of surplus O(D·p³) Laplace-derivative outer iterations (the #1082
     /// multinomial smooth-by-factor wall-clock blow-up). When `Some(r)`, the
-    /// rel-cost stop uses `r` while the absolute floor keeps using `tolerance`
-    /// via `objective_scale`, so accuracy (absolute floor) and perf (loose
+    /// rel-cost stop uses `r` while the absolute band keeps using `tolerance`,
+    /// so accuracy (absolute floor) and perf (loose
     /// rel-cost) are selected independently. `None` preserves the legacy coupling
     /// (`rel_cost = tolerance`) for every existing path byte-for-byte.
     pub(crate) rel_cost_tolerance: Option<f64>,
@@ -256,12 +254,6 @@ pub(crate) struct OuterConfig {
     pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
     pub(crate) operator_initial_trust_radius: Option<f64>,
     pub(crate) arc_initial_regularization: Option<f64>,
-    /// Optional scale factor for the objective's natural magnitude.
-    /// Used to widen the absolute gradient-norm floor on objectives whose
-    /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
-    /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
-    /// `None` falls back to the bare `tolerance` floor.
-    pub(crate) objective_scale: Option<f64>,
     /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
     /// outer parameters (log-λ axes). Documented natural step for
     /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
@@ -445,7 +437,6 @@ impl Default for OuterConfig {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            objective_scale: None,
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
             cache_session: None,
@@ -500,7 +491,6 @@ pub struct OuterProblem {
     outer_inner_cap: Option<InnerProgressFeedback>,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
-    objective_scale: Option<f64>,
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
@@ -551,7 +541,6 @@ impl OuterProblem {
             outer_inner_cap: None,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            objective_scale: None,
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
             cache_session: None,
@@ -800,23 +789,6 @@ impl OuterProblem {
         })
     }
 
-    /// Set the objective's natural magnitude scale, used to derive an
-    /// `n`-aware absolute gradient-norm floor. When set to `Some(s)`,
-    /// the runner uses `abs_floor = max(tol, s * √ε_machine)` for the
-    /// projected-gradient convergence check.
-    ///
-    /// Rationale: a fixed `abs = tol` (e.g. 1e-6) is appropriate when the
-    /// objective and its gradient live on a unit scale, but Gaussian-
-    /// identity REML carries an O(n) likelihood constant that flows into
-    /// ∂/∂logλ. At large-scale n the floor becomes binding even when the
-    /// relative-from-seed component (`rel_initial_grad * ‖g0‖`) declared
-    /// convergence iters earlier — chasing sub-ULP changes in log-λ at
-    /// the cost of repeated k²·n·p² analytic-Hessian assemblies.
-    pub fn with_objective_scale(mut self, scale: Option<f64>) -> Self {
-        self.objective_scale = scale.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
     /// Decouple the *relative-cost-decrease* convergence stop from the
     /// absolute projected-gradient floor. By default both are derived from the
     /// single `with_tolerance` value (`abs = max(tol, scale·√ε_machine)`,
@@ -974,7 +946,6 @@ impl OuterProblem {
             outer_inner_cap: self.outer_inner_cap.clone(),
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
-            objective_scale: self.objective_scale,
             bfgs_step_cap: self.bfgs_step_cap,
             bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
@@ -2361,11 +2332,10 @@ pub(crate) fn certificate_meets_curvature_requirement(
         // descent along it exists. Refusing here instead would refuse for the
         // ABSENCE of a measurement the route has just shown it cannot make,
         // which is the failure mode this flag's own doc block at
-        // `with_require_measured_psd` warns about one case earlier.
-        || matches!(
-            certificate.curvature,
-            CurvatureEvidence::CriterionContradicted
-        )
+        // `with_require_measured_psd` warns about one case earlier. A claim the
+        // criterion cannot resolve at any allowed step (#3036) supports the
+        // same statement: no descent along it is representable.
+        || certificate.curvature.withdrawn_by_criterion()
 }
 
 pub(crate) fn certificate_hessian_is_psd_off_railed_above_gradient_floor(
@@ -2518,6 +2488,53 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
+/// Whether a negative-curvature claim is falsifiable by any step the
+/// adjudication may take (#3036).
+///
+/// At a stationary point the claim `vᵀHv = λ_min < 0` predicts
+/// `V(ρ ± αv) − V(ρ) ≈ ½λ_min α²` for every step `α ≤ α_max`. It is falsifiable
+/// iff the largest step predicts a decrease the criterion can represent,
+/// `½|λ_min|·α_max² > objective_resolution`; its falsifiable range is then
+/// `[α_min, α_max]` with `α_min = sqrt(2·objective_resolution/|λ_min|)`.
+/// Otherwise no allowed step can produce a decrease the criterion resolves, and
+/// no probe outcome — a decrease under the resolution, a rise, or a failed
+/// evaluation — can confirm or falsify the claim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum NegativeCurvatureClaim {
+    /// The claim can be falsified by steps from `α_max` down to `alpha_min`.
+    Resolvable { alpha_min: f64 },
+    /// Even the largest step predicts only `predicted_at_largest`, which the
+    /// criterion's resolution does not exceed.
+    Unresolvable { predicted_at_largest: f64 },
+}
+
+/// Classify a negative-curvature claim against the criterion's resolution
+/// ([`NegativeCurvatureClaim`]). `None` when the inputs carry no claim to judge:
+/// `λ_min` not a finite negative number, `α_max` not a finite positive step, or
+/// no finite positive resolution.
+pub(crate) fn negative_curvature_claim(
+    lambda_min: f64,
+    alpha_max: f64,
+    objective_resolution: f64,
+) -> Option<NegativeCurvatureClaim> {
+    if !(lambda_min.is_finite() && lambda_min < 0.0)
+        || !(alpha_max.is_finite() && alpha_max > 0.0)
+        || !(objective_resolution.is_finite() && objective_resolution > 0.0)
+    {
+        return None;
+    }
+    let predicted_at_largest = 0.5 * lambda_min.abs() * alpha_max * alpha_max;
+    Some(if predicted_at_largest > objective_resolution {
+        NegativeCurvatureClaim::Resolvable {
+            alpha_min: (2.0 * objective_resolution / lambda_min.abs()).sqrt(),
+        }
+    } else {
+        NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest,
+        }
+    })
+}
+
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2552,6 +2569,18 @@ pub(crate) enum SaddleAdjudication {
         objective_resolution: f64,
         /// Best objective seen, against the baseline it had to beat.
         best_seen_cost: f64,
+    },
+    /// The claim's falsifiable range is empty (#3036): even the largest step
+    /// predicts a decrease `½|λ_min|·α_max²` the criterion cannot resolve, so no
+    /// trial could confirm or falsify it and none was evaluated. A curvature the
+    /// criterion cannot resolve cannot refuse the point.
+    Unresolvable {
+        /// The eigenvalue in dispute on the judged sub-block.
+        lambda_min: f64,
+        /// `½|λ_min|·α_max²`, the claim's prediction at its largest step.
+        predicted_at_largest: f64,
+        /// The resolution that prediction does not exceed.
+        objective_resolution: f64,
     },
     /// The adjudication could not be run: no eigen-resolvable negative
     /// direction, nothing left to search after rails and invariance, an
@@ -2767,15 +2796,39 @@ pub(crate) fn adjudicate_negative_curvature(
     // in either sign is a measurement of the criterion that contradicts the
     // matrix; stopping earlier would only have been a statement about the
     // ladder.
+    //
+    // When `α_min ≥ α_max` that range is EMPTY (#3036): the largest step's
+    // predicted decrease `½|λ_min|·α_max²` is already under the resolution, so
+    // no trial can confirm or falsify the claim. The adjudication decides that
+    // before any trial. Probing `α_max` anyway made the verdict a function of
+    // whether two noise-level evaluations happened to succeed: they "contradict"
+    // when they evaluate and "decline" when they fail, and the declined exit
+    // refused the point on a curvature its criterion cannot resolve.
     let lambda_min = eigenvalues[min_idx];
-    let alpha_min = if objective_resolution.is_finite() && objective_resolution > 0.0 {
-        (2.0 * objective_resolution / lambda_min.abs()).sqrt().min(1.0)
-    } else {
+    let alpha_max = 1.0_f64;
+    let alpha_min = match negative_curvature_claim(lambda_min, alpha_max, objective_resolution) {
+        Some(NegativeCurvatureClaim::Resolvable { alpha_min }) => alpha_min,
+        Some(NegativeCurvatureClaim::Unresolvable {
+            predicted_at_largest,
+        }) => {
+            log::debug!(
+                "[CERTIFICATE] {context}: the reported negative curvature is UNRESOLVABLE by the \
+                 criterion: lambda_min={lambda_min:.6e} on the judged sub-block predicts at most \
+                 ½|λ_min|α_max² = {predicted_at_largest:.3e} at the largest step \
+                 α_max={alpha_max}, which does not exceed the criterion's resolution \
+                 {objective_resolution:.3e}. No trial was evaluated (#3036)."
+            );
+            return SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                objective_resolution,
+            };
+        }
         // No usable resolution: keep the historical five-rung ladder's reach.
-        0.0625
+        None => 0.0625,
     };
     let mut escape_step_scales: Vec<f64> = Vec::new();
-    let mut alpha = 1.0_f64;
+    let mut alpha = alpha_max;
     loop {
         escape_step_scales.push(alpha);
         // `f64::EPSILON` is where halving stops changing `ρ + αv` at all — a
@@ -3196,18 +3249,26 @@ fn expand_confirmed_descent(
 /// inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StationarityBoundSource {
-    /// The band the ENGINE declared before it saw the judged point:
-    /// `outer_engine_gradient_band(config)` -- the arithmetic floor
-    /// `max(tolerance, scale·√ε)`, widened by the DECLARED-scale rung
-    /// `τ·(1 + |scale|)`. A function of the declared problem and nothing else.
+    /// The caller's declared absolute band `config.tolerance`, used where the
+    /// judged route published no per-coordinate gradient parts to derive the
+    /// Theorem 9 band from (#2954). A function of the declared problem only: no
+    /// row count, no objective offset.
     SolverBand,
-    /// The CERTIFICATE's point-anchored widening `τ·(1 + |cost_at_point|)`,
-    /// reported when it strictly exceeds [`Self::SolverBand`] (#2688). A
-    /// different anchor and therefore a different quantity: the engine band is
-    /// sealed at run start, this one moves with wherever the search stopped
-    /// (#2613). Both were `solver-band` until #2688, so a `N× over bound` ratio
-    /// could not be read as a ratio against a resolution standard.
-    CertificateScoreRelative,
+    /// The per-coordinate Theorem 9 band (#2954): coordinate `j` certifies iff
+    /// `|Pĝ_j| ≤ τ_j − ε_j`, with `τ_j = tolerance·(1 + s_j)` the resolution of
+    /// the coordinate's own gradient scale `s_j = ½·rank_j + |½λ_jβ̂ᵀS_jβ̂|` and
+    /// `ε_j` the rounding band of the evaluated gradient parts. Both are
+    /// O(rank), never O(n), so the band is invariant to row count and to any
+    /// additive offset in the criterion. A pass proves `|Pg_j| ≤ τ_j` for the
+    /// exact gradient.
+    CoordinateBand,
+    /// The same test on a coordinate whose rounding band exceeds half its
+    /// resolution, `2ε_j > τ_j` (#2954, fp-error-analysis §6.3). No computed
+    /// component can prove `|Pg_j| ≤ τ_j` there, so the band is `ε_j`, the
+    /// narrowest the arithmetic resolves: a pass proves `|Pg_j| ≤ 2ε_j`, the
+    /// attainable resolution, and this label says the requested `τ_j` was out
+    /// of the arithmetic's reach. Not the derived standard.
+    ArithmeticLimited,
     /// `|Pg|·√(τ/Δpred)` = `√(2·h·τ)` (#2253/#2249/#2015/#2091) -- the only rung
     /// with a derivation from the criterion's own resolution.
     CurvatureResolvability,
@@ -3235,9 +3296,9 @@ pub(crate) enum StationarityBoundSource {
     /// certified this and the caller would not" -- a distinction that matters
     /// because the second is not a defect in the fit.
     CallerRequirement,
-    /// `|Pg|·√((band_f − band_λ²)/(½λ̂²))` (#2954): the Newton-decrement verdict
+    /// `|Pg|·√((band_f − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict
     /// on rounding bands only, rendered as a gradient bound along the measured
-    /// direction. It certifies iff `½λ̂² + band_λ² ≤ band_f`, so no caller
+    /// direction. It certifies iff `λ̂² + band_λ² ≤ band_f`, so no caller
     /// tolerance and no scale anchor enters, and it may TIGHTEN every rung above.
     NewtonDecrement,
     /// The decrement verdict was taken and could not certify anything: its own
@@ -3263,7 +3324,8 @@ impl StationarityBoundSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::SolverBand => "solver-band",
-            Self::CertificateScoreRelative => "certificate-score-relative",
+            Self::CoordinateBand => "coordinate-band",
+            Self::ArithmeticLimited => "arithmetic-limited",
             Self::CurvatureResolvability => "curvature-resolvability",
             Self::GradientReproducibility => "gradient-reproducibility",
             Self::FixedPointResidual => "fixed-point-residual",
@@ -3287,7 +3349,10 @@ impl StationarityBoundSource {
         // made the tiering invisible in the first place.
         matches!(
             self,
-            Self::CurvatureResolvability | Self::NewtonDecrement | Self::NewtonDecrementUndecided
+            Self::CurvatureResolvability
+                | Self::CoordinateBand
+                | Self::NewtonDecrement
+                | Self::NewtonDecrementUndecided
         )
     }
 
@@ -4218,15 +4283,18 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             );
         }
     }
-    // Anchored at the criterion value of the point being JUDGED, which is what
-    // the mgcv `magic` rule means and what the solver's own band deliberately
-    // no longer does (#2613): see `outer_stationarity_band_at`.
+    // #2954: the band is the per-coordinate Theorem 9 band of THIS evaluation's
+    // gradient parts, `|Pĝ_j| ≤ max(ε_j, τ_j − ε_j)`, charged at the coordinate's own
+    // O(rank) scale. The criterion value at the point used to anchor a widening
+    // `τ·(1 + |V|)` here (#2613), which grew with the row count and with any
+    // additive offset in V, neither of which the gradient's resolution depends
+    // on.
     //
     // #2688: the band and its rung arrive TOGETHER. This used to be followed by
     // `let mut bound_source = SolverBand;`, so the engine's declared band, the
     // point-anchored widening and the caller's cap -- three quantities, one of
     // which is not a defect in the fit -- all reported one label.
-    let band_at_point = outer_stationarity_band_and_rung_at(config, evaluation.cost);
+    let band_at_point = outer_certificate_band_at(config, &projected_gradient, &terminal_evidence);
     let solver_bound = band_at_point.bound;
     let mut bound_source = band_at_point.source;
     if bound_source == StationarityBoundSource::CallerRequirement {
@@ -4272,7 +4340,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // none is selected by how the search exited.
     let mut stationarity_bound = solver_bound;
     // #2568/#2688 -- the caller's requirement is applied once, inside
-    // `outer_stationarity_band_and_rung_at`, which labels the band it capped
+    // `outer_certificate_band_at`, which labels the band it capped
     // (audited just above). A second cap used to sit here for a bound that a
     // widening between the two pushed back past the requirement; the only such
     // widening was the probe-noise rung, and with it deleted (#2817) nothing
@@ -5354,6 +5422,30 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 // them beside a withdrawn verdict is exactly the #2550
                 // misdirection.
                 certificate.curvature = CurvatureEvidence::CriterionContradicted;
+                certificate.curvature_floor = None;
+                result.criterion_certificate = Some(certificate.clone());
+                curvature_requirement_met = certificate_meets_curvature_requirement(
+                    &certificate,
+                    config.require_measured_psd,
+                    fidelity,
+                );
+            }
+            SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                objective_resolution,
+            } => {
+                log::debug!(
+                    "[CERTIFICATE] {context}: WITHDRAWING the curvature verdict — \
+                     lambda_min={lambda_min:.6e} predicts at most {predicted_at_largest:.3e} at \
+                     the adjudication's largest step, which the criterion's resolution \
+                     {objective_resolution:.3e} does not resolve. The certificate records \
+                     `criterion-unresolvable`, NOT a PSD claim (#3036)."
+                );
+                // Withdrawn exactly as a contradicted verdict is, and for the
+                // same reason: the floor's fields describe a negative direction
+                // the criterion cannot represent at any step it may take.
+                certificate.curvature = CurvatureEvidence::CriterionUnresolvable;
                 certificate.curvature_floor = None;
                 result.criterion_certificate = Some(certificate.clone());
                 curvature_requirement_met = certificate_meets_curvature_requirement(
@@ -7605,11 +7697,13 @@ pub(crate) fn run_outer(
     // #2613 removed the anchor desync itself. The solver's band
     // (`outer_gradient_tolerance`) is now a function of the declared problem
     // and of nothing else, and this certificate's band
-    // (`outer_stationarity_band_at`) is floored at it, so
-    // `certificate_bound >= solver_bound` holds identically — a point the
-    // solver legitimately converged at CANNOT be refused here for being above
-    // its band. `certificate_band_never_undercuts_the_solver_band_2613` gates
-    // that invariant directly.
+    // (`outer_certificate_band_at`, #2954) gives coordinate `j` the band
+    // `τ_j − ε_j ≥ tolerance` whenever its rounding `ε_j` is below the
+    // requested resolution `tolerance·s_j` of its own scale, so a point the
+    // solver legitimately converged at is not refused here for being above
+    // its band. Where rounding exceeds that resolution the band is the
+    // arithmetic's own `ε_j`, labelled `arithmetic-limited`, rather than the
+    // solver's band borrowed.
     //
     // What the retry still covers is a different desync with the same shape: a
     // FIDELITY one. Search-time evaluations may run under the inner-PIRLS cap,
@@ -8681,33 +8775,9 @@ fn certify_reseed_admitted(previous_certified_value: Option<f64>, certified_valu
     })
 }
 
-/// The user-requested outer precision, expressed relative to the criterion's
-/// magnitude — the mgcv `magic` rule `‖g‖ ≤ τ·(1 + |V|)`.
-///
-/// This is a CONVERGENCE tolerance, not a resolution floor: at the default
-/// `τ = 1e-5` it sits ~670× above the arithmetic floor `√ε`. What it needs from
-/// the caller is `|V|`, and the whole content of #2613 is *which* `|V|`.
-#[inline]
-pub(crate) fn outer_cost_relative_tolerance(config: &OuterConfig) -> f64 {
-    config.rel_cost_tolerance.unwrap_or(config.tolerance)
-}
-
-/// The arithmetic resolution of the declared objective scale.
-///
-/// A matrix-factorization REML/LAML score cannot resolve relative perturbations
-/// below the forward-error scale √ε. Requiring a smaller absolute residual made
-/// gradient-only / operator-curvature objectives impossible to certify unless
-/// an unrelated Hessian or probe-noise rescue happened to be available (#2269).
-#[inline]
-fn outer_arithmetic_gradient_floor(config: &OuterConfig) -> f64 {
-    config
-        .objective_scale
-        .map(|scale| config.tolerance.max(scale * f64::EPSILON.sqrt()))
-        .unwrap_or(config.tolerance)
-}
-
 /// The stationarity band handed to the SOLVER, and to the cost-stall guard's
-/// stationarity gate.
+/// stationarity gate: the caller's absolute `tolerance`, capped by a caller
+/// requirement.
 ///
 /// It is a function of the DECLARED problem and of nothing else. `opt` resolves
 /// a `GradientTolerance` exactly once, at run start, against the seed cost —
@@ -8725,40 +8795,20 @@ fn outer_arithmetic_gradient_floor(config: &OuterConfig) -> f64 {
 /// not a stationarity test: two seeds converging to the same optimum must reach
 /// the same verdict.
 ///
-/// So the cost-relative term is anchored on `objective_scale` — a property of
-/// the data (`n_obs` on the routes that set it), fixed for the whole fit. On
-/// those routes this is magnitude-preserving, because a REML/LAML score is a
-/// sum over `n` rows and `1 + |V| = O(n)` is what `1 + scale` already says.
-///
-/// When no scale is declared, gam does not know the criterion's magnitude, and
-/// the honest band is the absolute tolerance the caller asked for. It does NOT
-/// silently substitute a trajectory point for the thing it does not know. The
-/// consequence — an outer loop that keeps stepping past the point a
-/// score-relative band would have stopped at — is bounded by the cost-stall
-/// guard, which judges a stall's claim by the certificate's band at the BEST
-/// iterate's value (`CostStallGuard::stationarity_band`, #2817).
-///
-/// The certificate keeps the point-anchored form, which is what mgcv means:
-/// see [`outer_stationarity_band_and_rung_at`].
+/// #2954: the band no longer grows with the row count. The REML/LAML
+/// ρ-gradient `½[λ_k tr(H⁻¹S_k) − rank(S_k) + λ_k β̂ᵀS_kβ̂]` is a difference of
+/// terms bounded by `rank(S_k)` and the penalty energy, not a sum over rows, so
+/// the `n·√ε` floor and the declared-scale rung `τ·(1 + n)` it replaced charged
+/// the gradient a resolution it does not have: at `n = 490` the floor was
+/// `7.3e-6` and at `n = 300,000` the declared band was `6.0`, so a seed
+/// certified in zero iterations. The certificate's per-coordinate band
+/// ([`outer_certificate_band_at`]) is at least `τ_j − ε_j = tolerance +
+/// (tolerance·s_j − ε_j)`, so at least this one wherever the rounding `ε_j`
+/// stays below `tolerance·s_j`, the case at every rank-bearing coordinate short
+/// of a criterion the arithmetic cannot resolve.
 pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
-    let mut abs = outer_engine_gradient_band(config);
-    // #2568 -- a caller's requirement is the one input to this band that may
-    // TIGHTEN it. Everything above widens: the arithmetic floor and the
-    // scale-relative rung both exist to stop the optimizer chasing digits the
-    // criterion cannot resolve. A caller asking for `|Pg| <= 1e-3` on a fit
-    // whose sealed band is `1.0` is asking the search to keep working, so the
-    // requirement enters HERE and not only at the certificate -- surfacing the
-    // number without letting it drive the search moves the disappointment later
-    // without changing the answer.
-    //
-    // `min`, never `max`: a requirement looser than the engine's own band is not
-    // a request for anything, and honouring it would let a caller *weaken* a
-    // standard the engine derived from the criterion's resolution.
-    if let Some(required) = config.required_projected_gradient_norm {
-        abs = abs.min(required);
-    }
     GradientTolerance {
-        abs,
+        abs: outer_stationarity_band_and_rung(config).bound,
         rel_initial_grad: None,
         // Never delegated: `opt`'s only anchor is the seed. See above.
         rel_cost: None,
@@ -8766,32 +8816,18 @@ pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientToleranc
     }
 }
 
-/// The engine's own declared band, BEFORE any caller requirement caps it.
-///
-/// Split out of [`outer_gradient_tolerance`] for #2688: a rung cannot tell
-/// "the engine decided this" from "the caller decided this" out of a number in
-/// which the two have already been `min`-ed together.
-fn outer_engine_gradient_band(config: &OuterConfig) -> f64 {
-    let mut abs = outer_arithmetic_gradient_floor(config);
-    if let Some(scale) = config.objective_scale {
-        abs = abs.max(outer_cost_relative_tolerance(config) * (1.0 + scale));
-    }
-    abs
-}
-
 /// A certificate band together with the rung that produced it (#2688).
 ///
-/// The band is decided three ways and every one of them used to reach the call
-/// site as a bare `f64` that was then labelled `SolverBand` unconditionally.
-/// Returning the pair is the invariant [`StationarityBound::from_ladder`]
-/// already enforces one level up, pushed down to where the number is decided,
-/// so no `SolverBand` literal is left at the call site for a fourth branch to
-/// drift past.
+/// The band is decided several ways and every one of them used to reach the
+/// call site as a bare `f64` that was then labelled `SolverBand`
+/// unconditionally. Returning the pair is the invariant
+/// [`StationarityBound::from_ladder`] already enforces one level up, pushed
+/// down to where the number is decided.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CertificateBandAt {
     /// The band the certificate applies.
     pub(crate) bound: f64,
-    /// Which of the three inputs produced [`Self::bound`].
+    /// Which input produced [`Self::bound`].
     pub(crate) source: StationarityBoundSource,
     /// What the ENGINE would have applied with no caller requirement, reported
     /// beside `bound` so a reader can judge whether the requirement was
@@ -8801,52 +8837,16 @@ pub(crate) struct CertificateBandAt {
     pub(crate) engine_source: StationarityBoundSource,
 }
 
-/// The stationarity band a CERTIFICATE applies at the point it is judging.
+/// Apply the caller's `|Pg|` requirement (#2568) to an engine band.
 ///
-/// Same formula, correct anchor: `cost_at_point` is the criterion value of the
-/// candidate optimum, which is what the mgcv `magic` rule means by `f₀` and
-/// what every consumer of a certificate reads the bound as. Unlike the solver's
-/// band this one is resolved per point, so it costs nothing to anchor it right.
-///
-/// Floored at the SOLVER's band by construction. A certificate tighter than the
-/// threshold the optimizer was told to reach manufactures the "solver claimed
-/// convergence, certificate refused" family out of nothing but a disagreement
-/// between two spellings of one tolerance: the solver stops exactly where it
-/// was asked to and the certificate then declares the stop illegitimate. The
-/// certificate may be LOOSER — that is what the score-relative widening is for
-/// — but never stricter.
-/// The value is bit-for-bit what this returned before #2688:
-/// `min(max(engine, score_relative), required)` is the same number as the old
-/// `min(max(min(engine, required), score_relative), required)`, the inner `min`
-/// being dominated by the outer one in every ordering of the three. What
-/// changed is that the caller now also learns WHICH of the three it got.
-pub(crate) fn outer_stationarity_band_and_rung_at(
+/// `min`, never `max`: a requirement looser than the engine's own band is not
+/// a request for anything, and honouring it would let a caller *weaken* a
+/// standard the engine derived. Strict `<`, and the rung says so (#2688).
+fn cap_at_caller_requirement(
     config: &OuterConfig,
-    cost_at_point: f64,
+    engine_bound: f64,
+    engine_source: StationarityBoundSource,
 ) -> CertificateBandAt {
-    let engine_band = outer_engine_gradient_band(config);
-    // A non-finite criterion value anchors nothing, so the declared band stands.
-    let score_relative = if cost_at_point.is_finite() {
-        outer_cost_relative_tolerance(config) * (1.0 + cost_at_point.abs())
-    } else {
-        f64::NEG_INFINITY
-    };
-    // Strict `>`: on a tie the widening added nothing and must not claim the rung.
-    let (engine_bound, engine_source) = if score_relative > engine_band {
-        (
-            score_relative,
-            StationarityBoundSource::CertificateScoreRelative,
-        )
-    } else {
-        (engine_band, StationarityBoundSource::SolverBand)
-    };
-    // #2568 -- the score-relative widening above is what produced the saturated
-    // `bound = 1.000e0`, so a caller requirement that did not survive it would
-    // be defeated by exactly the case it was introduced for. Cap after widening.
-    // This does NOT manufacture the "solver claimed convergence, certificate
-    // refused" family warned about above: `outer_gradient_tolerance` is floored
-    // at the same requirement, so the solver was told to reach the number the
-    // certificate now applies. #2688 -- strict `<`, and the rung says so.
     match config.required_projected_gradient_norm {
         Some(required) if required < engine_bound => CertificateBandAt {
             bound: required,
@@ -8861,6 +8861,157 @@ pub(crate) fn outer_stationarity_band_and_rung_at(
             engine_source,
         },
     }
+}
+
+/// The band a stationarity test applies where no evaluation's gradient parts
+/// are in hand: the caller's absolute `tolerance`, capped by a caller
+/// requirement. No criterion value enters, so the band is the same at every
+/// point and at every row count (#2954).
+pub(crate) fn outer_stationarity_band_and_rung(config: &OuterConfig) -> CertificateBandAt {
+    cap_at_caller_requirement(
+        config,
+        config.tolerance,
+        StationarityBoundSource::SolverBand,
+    )
+}
+
+/// One gradient coordinate's Theorem 9 band (#2954): the statistical
+/// tolerance `τ_j`, the rigorous rounding bound `ε_j` of the computed `ĝ_j`, and
+/// the band `τ_j − ε_j` a computed component must clear.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CoordinateBand {
+    pub(crate) tau: f64,
+    pub(crate) epsilon: f64,
+}
+
+impl CoordinateBand {
+    /// `max(ε_j, τ_j − ε_j)`. Where `2ε_j ≤ τ_j` it is `τ_j − ε_j`, and
+    /// `|ĝ_j| ≤ τ_j − ε_j` implies `|g_j| ≤ τ_j` for the exact gradient. Where
+    /// `2ε_j > τ_j` an exact stationary point's computed component may sit
+    /// anywhere in `[−ε_j, ε_j]`, beyond `τ_j − ε_j`, so that band would refuse
+    /// stationary points; `ε_j` is the narrowest band every one of them clears,
+    /// and a pass proves `|g_j| ≤ 2ε_j`.
+    pub(crate) fn band(self) -> f64 {
+        self.epsilon.max(self.tau - self.epsilon)
+    }
+
+    /// `2ε_j > τ_j`: the arithmetic cannot certify `τ_j` itself.
+    pub(crate) fn is_arithmetic_limited(self) -> bool {
+        2.0 * self.epsilon > self.tau
+    }
+}
+
+/// The per-coordinate Theorem 9 bands of the gradient an evaluation published
+/// its parts for (#2954), `None` for a coordinate it published none for.
+///
+/// * `τ_j = tolerance·(1 + s_j)` with `s_j = ½·rank(S_j) + |fixed_beta_j|`, the
+///   magnitudes `∂V/∂ρ_j = ½[λ_j tr(H⁻¹S_j) − rank(S_j) + λ_j β̂ᵀS_jβ̂]` is a
+///   difference of: `λ_j tr(H⁻¹S_j) ≤ rank(S_j)`, and `fixed_beta_j` is the
+///   penalty-energy channel `½λ_jβ̂ᵀS_jβ̂`. The caller's `tolerance` is relative
+///   to the scale of the terms the component is formed from, which is set by
+///   the penalty's rank and the fitted function's roughness, never by `n`.
+/// * `ε_j = γ_m·(|fixed_beta_j| + |logdet_h_j| + |logdet_s_j| + |kkt_j|)`, the
+///   rounding of the four additive channels the component is summed from, at
+///   the u-based growth `γ_m` over the sequential count `m = n + p²` the
+///   Newton-decrement bands charge (`outer_decrement_bands`).
+///
+/// `None` overall when the route declares no problem size: there is no
+/// formation count to charge `ε_j` at.
+pub(crate) fn outer_coordinate_bands(
+    config: &OuterConfig,
+    coordinates: usize,
+    evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
+) -> Option<Vec<Option<CoordinateBand>>> {
+    let size = &config.problem_size;
+    let (Some(n_obs), Some(p_coefficients)) = (size.n_obs, size.p_coefficients) else {
+        return None;
+    };
+    let growth = gam_linalg::roundoff::accumulation_growth(n_obs + p_coefficients * p_coefficients);
+    Some(
+        (0..coordinates)
+            .map(|k| {
+                let part = evidence.parts.iter().find(|part| part.index == k)?;
+                let kkt = part.total - (part.fixed_beta + part.logdet_h + part.logdet_s);
+                let scale = 0.5 * part.rank as f64 + part.fixed_beta.abs();
+                let band = CoordinateBand {
+                    tau: config.tolerance * (1.0 + scale),
+                    epsilon: growth
+                        * (part.fixed_beta.abs()
+                            + part.logdet_h.abs()
+                            + part.logdet_s.abs()
+                            + kkt.abs()),
+                };
+                (band.tau.is_finite() && band.epsilon.is_finite()).then_some(band)
+            })
+            .collect(),
+    )
+}
+
+/// The stationarity band a CERTIFICATE applies at the point it is judging,
+/// from the gradient parts of the evaluation that measured `projected_gradient`
+/// (#2954, Theorem 9 of the convergence theory's floating-point analysis).
+///
+/// Coordinate `j` certifies iff `|(Pĝ)_j| ≤ max(ε_j, τ_j − ε_j)`
+/// ([`CoordinateBand`]); a coordinate the evaluation published no parts for is
+/// held to the caller's absolute `tolerance`. A pass implies
+/// `|(Pg)_j| ≤ max(τ_j, 2ε_j)` for the exact gradient. The per-coordinate test
+/// is rendered as the scalar gauge the certificate compares `‖Pĝ‖₂` against,
+///
+/// ```text
+/// bound = ‖Pĝ‖₂ / max_j (|(Pĝ)_j| / b_j),
+/// ```
+///
+/// which `‖Pĝ‖₂` clears exactly when every coordinate clears its own `b_j`. A
+/// coordinate whose projected component is exactly zero (held on its face, or
+/// genuinely stationary) constrains nothing. At `Pĝ = 0` the bound is the
+/// smallest band.
+///
+/// [`StationarityBoundSource::ArithmeticLimited`] labels a bound set by a
+/// coordinate with `2ε_j > τ_j`: the verdict there is at the arithmetic's
+/// resolution `2ε_j`, not at the requested `τ_j`, and the label says so.
+///
+/// Without a declared problem size there is no rounding to charge and the
+/// declared band ([`outer_stationarity_band_and_rung`]) stands.
+pub(crate) fn outer_certificate_band_at(
+    config: &OuterConfig,
+    projected_gradient: &Array1<f64>,
+    evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
+) -> CertificateBandAt {
+    let Some(bands) = outer_coordinate_bands(config, projected_gradient.len(), evidence) else {
+        return outer_stationarity_band_and_rung(config);
+    };
+    if bands.iter().all(Option::is_none) {
+        return outer_stationarity_band_and_rung(config);
+    }
+    let band_of = |band: Option<CoordinateBand>| band.map_or(config.tolerance, CoordinateBand::band);
+    let norm = projected_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let source_of = |band: Option<CoordinateBand>| match band {
+        Some(band) if band.is_arithmetic_limited() => StationarityBoundSource::ArithmeticLimited,
+        _ => StationarityBoundSource::CoordinateBand,
+    };
+    // The binding coordinate: the largest `|(Pĝ)_j| / b_j`. Every band is
+    // positive (`max(ε_j, τ_j − ε_j) ≥ τ_j/2`), so the ratio is finite.
+    let mut binding: Option<(f64, Option<CoordinateBand>)> = None;
+    for (&component, &band) in projected_gradient.iter().zip(bands.iter()) {
+        if component == 0.0 {
+            continue;
+        }
+        let ratio = component.abs() / band_of(band);
+        if binding.is_none_or(|(worst, _)| ratio > worst) {
+            binding = Some((ratio, band));
+        }
+    }
+    let Some((ratio, band)) = binding else {
+        let (smallest, band) = bands.iter().fold(
+            (f64::INFINITY, None),
+            |(smallest, chosen), &band| {
+                let b = band_of(band);
+                if b < smallest { (b, band) } else { (smallest, chosen) }
+            },
+        );
+        return cap_at_caller_requirement(config, smallest, source_of(band));
+    };
+    cap_at_caller_requirement(config, norm / ratio, source_of(band))
 }
 
 pub(crate) fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
@@ -9430,6 +9581,10 @@ mod criterion_curvature_ladder_2748_tests;
 #[cfg(test)]
 #[path = "saddle_adjudication_evaluable_trials_2665_tests.rs"]
 mod saddle_adjudication_evaluable_trials_2665_tests;
+
+#[cfg(test)]
+#[path = "saddle_adjudication_unresolvable_3036_tests.rs"]
+mod saddle_adjudication_unresolvable_3036_tests;
 
 #[cfg(test)]
 #[path = "canonical_checkpoint_order_tests.rs"]

@@ -90,42 +90,7 @@ pub(crate) fn outer_decrement_bands(
         .map(|value| value * value)
         .sum::<f64>()
         .sqrt();
-    let criterion = evidence.criterion;
-    // A `log|H_β|` channel whose factor derives no forward error would be
-    // charged nothing for it, so the verdict is not taken there.
-    if criterion.is_some_and(|criterion| criterion.logdet_h != 0.0)
-        && evidence.inner_factor.is_none()
-    {
-        return Err(DecrementVerdictNotTaken::NoLogdetForwardError);
-    }
-    // An inner mode whose residual the evaluation cannot form carries an error
-    // the band would charge nothing for, so the verdict is not taken there.
-    let Some(inner_residual) = evidence
-        .inner_residual
-        .map(|charge| charge.energy.abs())
-        .filter(|energy| energy.is_finite())
-    else {
-        return Err(DecrementVerdictNotTaken::NoInnerResidual);
-    };
-    let objective_band = ObjectiveBand {
-        channels: criterion.map_or_else(
-            || gam_linalg::roundoff::accumulation_growth(1) * cost.abs(),
-            |criterion| {
-                growth
-                    * (criterion.fixed_beta.abs()
-                        + criterion.logdet_h.abs()
-                        + criterion.logdet_s.abs()
-                        + criterion.kkt.abs())
-            },
-        ),
-        factor: criterion
-            .filter(|criterion| criterion.logdet_h != 0.0)
-            .zip(evidence.inner_factor)
-            .map(|(_, factor)| 0.5 * factor.logdet_forward_error.abs())
-            .filter(|band| band.is_finite())
-            .unwrap_or(0.0),
-        inner_residual,
-    };
+    let objective_band = outer_objective_band(config, cost, evidence)?;
     // A band past the objective resolution the certificate itself asserts would
     // read any decrease as noise, so the verdict is not taken there.
     let resolution = super::run::outer_rel_cost_floor(config) * (1.0 + cost.abs());
@@ -143,16 +108,75 @@ pub(crate) fn outer_decrement_bands(
     Ok((bands, objective_band))
 }
 
+/// The error `band_f` the evaluated `V` carries, by term (#2954), formed from
+/// the evaluation's own [`CertificateEvidence`] exactly as
+/// [`outer_decrement_bands`] forms it, without the gradient and Hessian bands or
+/// the certificate's resolvability test.
+///
+/// This is the band a comparison of two evaluated values needs (#3018): two
+/// values differ resolvably exactly when they are further apart than the sum of
+/// their bands. The count `m = n + p²` is needed only to charge published
+/// channels; a route that publishes none is charged `γ_1·|V|`. `Err` names why
+/// no band can be formed: channels on a route that declares no size, a nonzero
+/// `log|H_β|` channel whose factor derives no forward error, or no inner residual.
+pub(crate) fn outer_objective_band(
+    config: &OuterConfig,
+    cost: f64,
+    evidence: &CertificateEvidence,
+) -> Result<ObjectiveBand, DecrementVerdictNotTaken> {
+    let criterion = evidence.criterion;
+    // A `log|H_β|` channel whose factor derives no forward error would be
+    // charged nothing for it, so no band is formed there.
+    if criterion.is_some_and(|criterion| criterion.logdet_h != 0.0)
+        && evidence.inner_factor.is_none()
+    {
+        return Err(DecrementVerdictNotTaken::NoLogdetForwardError);
+    }
+    // An inner mode whose residual the evaluation cannot form carries an error
+    // the band would charge nothing for, so no band is formed there.
+    let Some(inner_residual) = evidence
+        .inner_residual
+        .map(|charge| charge.energy.abs())
+        .filter(|energy| energy.is_finite())
+    else {
+        return Err(DecrementVerdictNotTaken::NoInnerResidual);
+    };
+    let channels = match criterion {
+        None => gam_linalg::roundoff::accumulation_growth(1) * cost.abs(),
+        Some(criterion) => {
+            let size = &config.problem_size;
+            let (Some(n_obs), Some(p_coefficients)) = (size.n_obs, size.p_coefficients) else {
+                return Err(DecrementVerdictNotTaken::NoProblemSize);
+            };
+            gam_linalg::roundoff::accumulation_growth(n_obs + p_coefficients * p_coefficients)
+                * (criterion.fixed_beta.abs()
+                    + criterion.logdet_h.abs()
+                    + criterion.logdet_s.abs()
+                    + criterion.kkt.abs())
+        }
+    };
+    Ok(ObjectiveBand {
+        channels,
+        factor: criterion
+            .filter(|criterion| criterion.logdet_h != 0.0)
+            .zip(evidence.inner_factor)
+            .map(|(_, factor)| 0.5 * factor.logdet_forward_error.abs())
+            .filter(|band| band.is_finite())
+            .unwrap_or(0.0),
+        inner_residual,
+    })
+}
+
 /// The Newton-decrement stationarity verdict at a point whose curvature is in
 /// hand, decided against the bands [`outer_decrement_bands`] forms (#2954):
-/// [`opt::newton_decrement_verdict`] certifies iff `½λ̂² + band_λ² ≤ band_f`.
+/// [`opt::newton_decrement_verdict`] certifies iff `λ̂² + band_λ² ≤ band_f`.
 ///
 /// Every gradient standard the certificate used to apply grew with `n`: the
 /// arithmetic floor `n·√ε`, the declared-scale rung `τ·(1 + n)`, the
 /// point-anchored widening `τ·(1 + |V|)`, and the curvature rung's decrement
 /// tolerance `rel_cost_floor·(1 + |V|)`. At `n = 300,000` the declared band was
-/// `6.0` and a seed certified in zero iterations. The decrement is the decrease a
-/// Newton step would still buy, in the criterion's own units, so it needs no
+/// `6.0` and a seed certified in zero iterations. The decrement bounds the decrease
+/// left to the minimum, in the criterion's own units, so it needs no
 /// scale anchor; judged at the arithmetic's resolution it is independent of
 /// `outer_tol` too.
 ///
@@ -278,7 +302,7 @@ pub(crate) struct OuterDecrementDecision {
 /// A certificate records a gradient bound beside `|Pg|`, so the verdict is
 /// rendered as the gradient norm along the measured direction at which the
 /// decrement reaches the objective band with the measured rounding held fixed:
-/// `|Pg|·√((band_f − band_λ²)/(½λ̂²))`. It clears `|Pg|` exactly when the verdict
+/// `|Pg|·√((band_f − band_λ²)/λ̂²)`. It clears `|Pg|` exactly when the verdict
 /// certifies and falls strictly below it on `DecrementAboveTolerance`. A verdict
 /// that cannot decide publishes `0`, so the point refuses unless large-step
 /// flatness removes its flat coordinates and a second verdict certifies.
@@ -291,11 +315,10 @@ pub(crate) fn decrement_stationarity_bound(
 ) -> Option<(f64, StationarityBoundSource)> {
     let along_direction = |evidence: &opt::DecrementEvidence| {
         let headroom = evidence.band_f - evidence.band_lambda_sq;
-        let half_decrement = 0.5 * evidence.lambda_sq;
         if !(headroom > 0.0) {
             0.0
-        } else if half_decrement > 0.0 {
-            projected_grad_norm * (headroom / half_decrement).sqrt()
+        } else if evidence.lambda_sq > 0.0 {
+            projected_grad_norm * (headroom / evidence.lambda_sq).sqrt()
         } else {
             projected_grad_norm
         }
