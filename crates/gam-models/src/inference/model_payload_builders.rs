@@ -2514,13 +2514,11 @@ fn payload_for_joint_expectile(
         noise_formula: Some(noise_formula),
         ..fit_config.clone()
     };
-    let response_scale = joint.location_scale.response_scale;
     let mut payload = payload_for_gaussian_location_scale(
         formula,
         dataset,
         &location_scale_config,
         joint.location_scale,
-        response_scale,
     )?;
     payload.family = JOINT_EXPECTILE_FAMILY_TAG.to_string();
     payload.estimator = FittedEstimator::ExpectileLocationScale {
