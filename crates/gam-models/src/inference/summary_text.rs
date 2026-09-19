@@ -620,9 +620,9 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
         let text = render_summary_text(&summary);
         let expected = "\
 Parametric coefficients:
-           Estimate  Std. Error  t value  Pr(>|t|)
-Intercept       1.5        0.05       30   < 2e-16  ***
-x1            -0.25       0.125       NA        NA
+           Estimate  Std. Error  t value   Pr(>|t|)
+Intercept       1.5        0.05       30  < 2.2e-16  ***
+x1            -0.25       0.125       NA         NA
   x1: the coefficient is bounded, so the null can sit on the constraint boundary where the normal reference does not hold; no p-value is reported
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
 

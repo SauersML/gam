@@ -320,10 +320,17 @@ fn fractional_rank_test(
         whole
     };
     let p_value = fractional_rank_sf(statistic, rank, residual_df).probability;
+    // With an estimated scale the law is `rank·F` at an integer rank, so the
+    // F-scale statistic `p_value` is the tail of is `T/rank`.
+    let reference_statistic = match residual_df {
+        Some(_) => statistic / rank,
+        None => statistic,
+    };
     (statistic.is_finite() && p_value.is_finite()).then_some(SmoothTestResult {
         statistic,
         ref_df: rank,
         p_value,
+        reference_statistic,
     })
 }
 
