@@ -277,3 +277,55 @@ python covariance_ablation.py analyze results/vc200.jsonl
 python boundary_toy.py
 ./build.sh test --test inference sbc_wood_smooth_test_family_size_curve -- --nocapture
 ```
+
+## The λ̂-selection Wald law
+
+The summary row no longer reads `wood_smooth_test`. It whitens the tested
+block (`lr_tested_block`) to the profiled score `u = Dᵀβ̂/σ̂`, which is
+`N(0, I)` under the null, and publishes `W = uᵀ(I + T(t̂))⁻¹u`. Here `t̂` is
+chosen for the observation by the same lane and the same certified REML
+`select` that the λ̂-selection replay
+(`crates/gam-terms/src/inference/selection_replay.rs`) applies to every null
+draw. The observation and the draws therefore pass through one map
+`u ↦ W(t̂(u))`, and the p-value is the exact conditional tail of `W(0)` plus
+the replay's paired selection shift (`tail_shift_at`), whose Monte-Carlo
+standard error is published with it. At estimated scale each draw's radius is
+mapped to the law of `z/s`, `s² = χ²_ν/ν`, through the exact Beta quantile
+map. The only atom is the null law's own: a term with no identified direction
+has `W ≡ 0` and publishes `p = 1`. A replay that refuses publishes no p-value
+(`pvalue_unavailable = "selection_refused"`).
+
+`ref_df` is now `Σ_k 1/(1 + e_k)` at `λ̂`, the null mean of `W(0)` at known
+scale. The p-value does not read it. A term that REML shrank onto its null
+space reports about its edf, below one; the `ref_df ≥ 1` floor the old
+`χ²(ref_df)` reference needed (#1360) is gone, and the gate checks only that
+`ref_df` is finite and non-negative.
+
+### Gate results
+
+`tests/inference/misc/sbc_wood_smooth_test_family_size_curve.rs`, same design
+as above (n = 200, 200 seeded replications per family). The gate is
+two-sided: the Kolmogorov distance from U(0, 1) must stay inside its
+three-sigma DKW radius, and the size at α ∈ {.10, .05, .01} inside
+`α ± 3·√(α(1−α)/m)`. A fit that publishes no p-value fails it. At the base
+(`wood_smooth_test` at `λ̂`) it fails in all seven families, e.g. Beta
+D = 0.425. On this branch:
+
+| family | usable fits | size @ .10 | size @ .05 | size @ .01 | KS D (DKW radius) |
+|---|---|---|---|---|---|
+| gaussian | 200 | .100 | .050 | .005 | .052 (.129) |
+| poisson | 200 | .125 | .065 | .020 | .040 (.129) |
+| binomial | 200 | .095 | .050 | .015 | .056 (.129) |
+| gamma | 200 | .145 | .055 | .010 | .104 (.129) |
+| negative-binomial | 195 | .118 | .062 | .021 | .091 (.130) |
+| tweedie(p=1.5) | 195 | .092 | .041 | .010 | .057 (.130) |
+| beta | 200 | .100 | .055 | .020 | .087 (.129) |
+
+Every replicate that fitted published a p-value. The five negative-binomial
+and five Tweedie losses are `fit_from_formula` errors, raised before the
+summary is built (see "Out of lane" above for the Tweedie outer-optimizer
+certification failures).
+
+Pooled over the seven families (1390 fits), the size is .111 at .10
+(z = 1.3), .054 at .05 (z = 0.7) and .014 at .01 (z = 1.7). The largest single
+excursion is gamma at .10: .145, 2.1 MCSE above nominal, one of 21 cells.
