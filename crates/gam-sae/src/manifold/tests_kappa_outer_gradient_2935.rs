@@ -36,7 +36,7 @@ const KAPPA: f64 = 0.3;
 /// coordinate then collapses onto the origin within 40 inner iterations, the
 /// data-supported reduction keeps only the constant column, and κ no longer moves
 /// the criterion.
-fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(super) fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 24usize;
     let p = 3usize;
     let coords = Array2::from_shape_fn((n, 2), |(row, axis)| {
@@ -96,15 +96,15 @@ fn curvature_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-fn arrow_norm(vector: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_norm(vector: &SaeArrowVector) -> f64 {
     (vector.t.dot(&vector.t) + vector.beta.dot(&vector.beta)).sqrt()
 }
 
-fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_dot(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
     x.t.dot(&y.t) + x.beta.dot(&y.beta)
 }
 
-fn arrow_max(vector: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_max(vector: &SaeArrowVector) -> f64 {
     vector
         .t
         .iter()
@@ -112,7 +112,7 @@ fn arrow_max(vector: &SaeArrowVector) -> f64 {
         .fold(0.0_f64, |acc, value| acc.max(value.abs()))
 }
 
-fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
+pub(super) fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
     assert_eq!(x.t.len(), y.t.len(), "coordinate blocks share one layout");
     assert_eq!(x.beta.len(), y.beta.len(), "decoder blocks share one layout");
     x.t.iter()
@@ -121,7 +121,7 @@ fn arrow_gap(x: &SaeArrowVector, y: &SaeArrowVector) -> f64 {
         .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
 }
 
-fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: f64) -> SaeArrowVector {
+pub(super) fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: f64) -> SaeArrowVector {
     SaeArrowVector {
         t: (&plus.t - &minus.t) / (2.0 * step),
         beta: (&plus.beta - &minus.beta) / (2.0 * step),
@@ -129,12 +129,12 @@ fn arrow_scaled_difference(plus: &SaeArrowVector, minus: &SaeArrowVector, step: 
 }
 
 /// `(4·fine − coarse)/3` and `|coarse − fine|`.
-fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
+pub(super) fn richardson(coarse: f64, fine: f64) -> (f64, f64) {
     ((4.0 * fine - coarse) / 3.0, (coarse - fine).abs())
 }
 
 /// The inner stationarity residual `(g_t, g_β)` at the term's coordinates and decoder.
-fn inner_gradient(
+pub(super) fn inner_gradient(
     term: &SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
@@ -154,7 +154,7 @@ fn inner_gradient(
 
 /// The term moved by `scale·step` in the arrow layout: row-major coordinates and the
 /// basis-major decoder of the single atom.
-fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
+pub(super) fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeManifoldTerm {
     let mut moved = term.clone();
     let coords = moved.assignment.coords[0].as_matrix();
     let coordinate_step =
@@ -174,7 +174,7 @@ fn displaced(term: &SaeManifoldTerm, step: &SaeArrowVector, scale: f64) -> SaeMa
 }
 
 /// The dense route's converged anchor, checked to keep every penalized column.
-fn converged_anchor(
+pub(super) fn converged_anchor(
     term: SaeManifoldTerm,
     target: &Array2<f64>,
     rho: SaeManifoldRho,
