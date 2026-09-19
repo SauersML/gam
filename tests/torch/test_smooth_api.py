@@ -1,5 +1,6 @@
 """Public smooth, fit, and GAM torch API smoke tests."""
 
+import numpy as np
 import pytest
 
 gt = pytest.importorskip("gamfit.torch")
@@ -374,6 +375,36 @@ def test_gam_frozen_eval_rejects_points_block_count_mismatch(block_count):
         match=rf"{block_count} points tensors for 2 smooths",
     ):
         model([torch.zeros(4)] * block_count)
+
+
+def test_fit_and_frozen_forward_split_a_non_list_points_sequence_alike():
+    # gam#3117: fit() used to copy any non-list/tuple sequence to every smooth
+    # while the frozen forward split it per smooth.
+    import collections
+
+    t, y = _inputs()
+    smooths = [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)]
+    ref = gt.fit([t, t], y, smooths)
+    res = gt.fit(collections.deque([t, t]), y, smooths)
+    for a, b in zip(res.coefficients, ref.coefficients, strict=True):
+        torch.testing.assert_close(a, b)
+    model = gt.GAM(smooths)
+    model.freeze(collections.deque([t, t]), y)
+    torch.testing.assert_close(model(collections.deque([t, t])), model([t, t]))
+
+
+@pytest.mark.parametrize("bad", ["ndarray", "entry"])
+def test_fit_and_frozen_forward_refuse_non_tensor_points_alike(bad):
+    t, y = _inputs()
+    smooths = [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)]
+    pts = np.stack([t.numpy(), t.numpy()]) if bad == "ndarray" else [t, t.numpy()]
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        gt.fit(pts, y, smooths)
+    model = gt.GAM(smooths)
+    model._install_frozen_coefficients([torch.zeros(6, 1), torch.zeros(7, 1)])
+    model.eval()
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        model(pts)
 
 
 @pytest.mark.parametrize("block_count", [1, 3])
