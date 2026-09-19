@@ -79,13 +79,86 @@ def _sample(procs: list[psutil.Process]) -> tuple[float, int]:
     return rss, threads
 
 
+@dataclasses.dataclass(frozen=True)
+class Policed:
+    """What one policed worker subprocess left behind.
+
+    ``status`` is ``"ok"`` when the process exited on its own (whatever its
+    return code), else the safety net that killed it: ``"timeout"`` or
+    ``"memcap"``. ``stdout`` holds everything the worker printed before it
+    exited or was killed, so a worker that streams one ``RESULT`` line per unit
+    of work keeps the units it finished.
+    """
+
+    status: str
+    returncode: int | None
+    stdout: str
+    stderr: str
+    wall_s: float
+    peak_tree_rss_mb: float
+    peak_threads: int
+
+
+def police(cmd: list[str], cwd: str, timeout_s: float, memcap_mb: float) -> Policed:
+    """Run ``cmd`` under the pinned thread env and the harness safety net.
+
+    The process tree's RSS and thread count are sampled every ``POLL_S``; the
+    whole tree is killed the first time its RSS exceeds ``memcap_mb`` or its
+    wall time exceeds ``timeout_s``. Output goes to unnamed temporary files
+    rather than pipes, so a worker that prints a lot never blocks on a full
+    pipe while the driver is polling. Shared with ``bench/pvalue_calibration``.
+    """
+    env = dict(os.environ)
+    env.update(THREAD_ENV)
+    env.pop("PYTHONPATH", None)
+    t0 = time.perf_counter()
+    with (
+        tempfile.TemporaryFile("w+") as out,
+        tempfile.TemporaryFile("w+") as err,
+    ):
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env, stdout=out, stderr=err, text=True
+        )
+        ps = psutil.Process(proc.pid)
+        peak_tree_rss = 0.0
+        peak_threads = 0
+        status = "ok"
+        while proc.poll() is None:
+            rss, threads = _sample(_tree(ps))
+            peak_tree_rss = max(peak_tree_rss, rss)
+            peak_threads = max(peak_threads, threads)
+            elapsed = time.perf_counter() - t0
+            if rss > memcap_mb:
+                status = "memcap"
+            elif elapsed > timeout_s:
+                status = "timeout"
+            if status != "ok":
+                for p in reversed(_tree(ps)):
+                    try:
+                        p.kill()
+                    except psutil.Error:
+                        pass
+                break
+            time.sleep(POLL_S)
+        proc.wait()
+        wall = time.perf_counter() - t0
+        out.seek(0)
+        err.seek(0)
+        return Policed(
+            status=status,
+            returncode=proc.returncode,
+            stdout=out.read(),
+            stderr=err.read(),
+            wall_s=wall,
+            peak_tree_rss_mb=peak_tree_rss,
+            peak_threads=peak_threads,
+        )
+
+
 def run_rep(
     lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
-    env = dict(os.environ)
-    env.update(THREAD_ENV)
-    env.pop("PYTHONPATH", None)
     cmd = [
         sys.executable,
         str(WORKER),
@@ -96,36 +169,11 @@ def run_rep(
         str(seed),
     ]
     load_start = os.getloadavg()
-    t0 = time.perf_counter()
-    proc = subprocess.Popen(
-        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    ps = psutil.Process(proc.pid)
-    peak_tree_rss = 0.0
-    peak_threads = 0
-    status = "ok"
-    while proc.poll() is None:
-        rss, threads = _sample(_tree(ps))
-        peak_tree_rss = max(peak_tree_rss, rss)
-        peak_threads = max(peak_threads, threads)
-        elapsed = time.perf_counter() - t0
-        if rss > memcap_mb:
-            status = "memcap"
-        elif elapsed > timeout_s:
-            status = "timeout"
-        if status != "ok":
-            for p in reversed(_tree(ps)):
-                try:
-                    p.kill()
-                except psutil.Error:
-                    pass
-            break
-        time.sleep(POLL_S)
-    stdout, stderr = proc.communicate()
-    wall = time.perf_counter() - t0
+    run = police(cmd, cwd, timeout_s, memcap_mb)
+    status = run.status
     rec: dict[str, Any] = {}
     if status == "ok":
-        for line in stdout.splitlines():
+        for line in run.stdout.splitlines():
             if line.startswith("RESULT "):
                 rec = json.loads(line[len("RESULT ") :])
         if not rec:
@@ -139,15 +187,15 @@ def run_rep(
         design=cell.design,
         seed=seed,
         status=status,
-        returncode=proc.returncode,
-        proc_wall_s=wall,
-        peak_tree_rss_mb=peak_tree_rss,
-        peak_threads=peak_threads,
+        returncode=run.returncode,
+        proc_wall_s=run.wall_s,
+        peak_tree_rss_mb=run.peak_tree_rss_mb,
+        peak_threads=run.peak_threads,
         load_start=list(load_start),
         load_end=list(os.getloadavg()),
     )
     if status != "ok":
-        rec["stderr_tail"] = stderr[-2000:]
+        rec["stderr_tail"] = run.stderr[-2000:]
     return rec
 
 

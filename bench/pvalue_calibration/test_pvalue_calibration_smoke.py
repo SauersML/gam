@@ -1,0 +1,171 @@
+"""Regression + contract tests for the p-value calibration harness.
+
+``test_ci_plan_is_calibrated`` runs the real ``ci`` plan end to end (a few
+cells, 200 fixed seeds each, policed worker subprocesses) and fails when any
+gamfit p-value surface rejects its true null more often than a valid p-value
+can. The tolerance is not hand-picked: it is the upper quantile of the
+rejection count's own sampling law, ``Binomial(R, a)``, at family-wise
+false-alarm rate ``report.FALSE_ALARM`` (see ``report.reject_bound``).
+
+The other tests pin the harness's own rules on hand-built records, so a report
+that stopped flagging an anti-conservative row, or started dropping reps that
+produced no p-value, fails here rather than quietly flattering gamfit.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from . import report
+from .plans import PLANS, Cell, Plan
+from .run import pending_chunks, run_chunk
+from .worker import alt_delta, expected_surfaces, make_data
+
+BENCH_DIR = Path(__file__).resolve().parent.parent
+REPO_ROOT = BENCH_DIR.parent
+BASELINE = Path(__file__).resolve().parent / "baseline" / "quick"
+
+
+def test_ci_plan_is_calibrated(tmp_path: Path) -> None:
+    out = tmp_path / "ci"
+    proc = subprocess.run(
+        [sys.executable, "-m", "pvalue_calibration.run", "ci", "--out", str(out), "--quiet"],
+        cwd=BENCH_DIR,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    records = [json.loads(ln) for ln in (out / "records.jsonl").read_text().splitlines()]
+    plan = PLANS["ci"]
+    assert len(records) == len(plan.cells) * plan.reps
+    for rec in records:
+        assert rec["status"] == "ok", rec
+        assert not rec["missing"], (rec["key"], rec["seed"], rec["missing"])
+        for hyp in ("null", "alt"):
+            for lib, surfaces in rec["expected_surfaces"].items():
+                for s in surfaces:
+                    assert f"{lib}.{s}" in rec["p"][hyp], (rec["key"], hyp, lib, s)
+    table = report.rows(records)
+    assert table and all(r.usable == plan.reps for r in table)
+    flagged = [(r.cell, r.surface, a, r.rejections) for r, a in report.anti_conservative(table)]
+    assert not flagged, flagged
+    # Every row has a power under its matched alternative.
+    assert all(r.power is not None for r in table)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["thread_env"]["RAYON_NUM_THREADS"] == "1"
+    assert "safety net" in meta["safety_net"]
+    assert "## Calibration" in (out / "report.md").read_text()
+
+
+def test_chunk_killed_by_safety_net_records_every_seed(tmp_path: Path) -> None:
+    recs = run_chunk(Cell("gaussian", 60, "smooth"), 3, 6, ("gamfit",), 0.0, 1e9, str(tmp_path))
+    assert [r["seed"] for r in recs] == [3, 4, 5]
+    assert {r["status"] for r in recs} == {"timeout"}
+
+
+def test_pending_chunks_resume_only_missing_seeds() -> None:
+    cell = Cell("gaussian", 60, "smooth")
+    plan = Plan("t", "", (cell,), reps=10, chunk=4, timeout_s=1.0)
+    assert [(s, e) for _, s, e in pending_chunks(plan, set())] == [(0, 4), (4, 8), (8, 10)]
+    done = {(cell.key, s) for s in (0, 1, 5, 9)}
+    assert [(s, e) for _, s, e in pending_chunks(plan, done)] == [(2, 5), (6, 9)]
+    everything = {(cell.key, s) for s in range(10)}
+    assert list(pending_chunks(plan, everything)) == []
+
+
+def test_datasets_are_seeded_and_null_has_no_effect() -> None:
+    a = make_data("poisson", 200, "smooth", 7, "null")
+    b = make_data("poisson", 200, "smooth", 7, "null")
+    np.testing.assert_array_equal(a["y"], b["y"])
+    c = make_data("poisson", 200, "smooth", 8, "null")
+    assert not np.array_equal(a["y"], c["y"])
+    # Same-seed null and alternative use independent streams.
+    alt = make_data("poisson", 200, "smooth", 7, "alt")
+    assert not np.array_equal(a["x2"], alt["x2"])
+    # The matched alternative has the same noncentrality at every n.
+    assert np.isclose(alt_delta("gaussian", 200) ** 2 * 200, alt_delta("gaussian", 5000) ** 2 * 5000)
+
+
+def _records(cell: str, null_p: list[float | None], surface: str = "gamfit.wald") -> list[dict[str, Any]]:
+    lib, s = surface.split(".")
+    out = []
+    for seed, p in enumerate(null_p):
+        rec: dict[str, Any] = {
+            "key": cell,
+            "seed": seed,
+            "status": "ok",
+            "expected_surfaces": {lib: [s]},
+            "p": {"null": {}, "alt": {surface: 0.001}},
+            "missing": {},
+            "errors": {},
+        }
+        if p is None:
+            rec["missing"][f"null.{lib}.{s}"] = "p_value=None"
+        else:
+            rec["p"]["null"][surface] = p
+        out.append(rec)
+    return out
+
+
+def test_uniform_p_values_are_valid() -> None:
+    p = list((np.arange(500) + 0.5) / 500)
+    table = report.rows(_records("gaussian/n=200/smooth", p))
+    assert report.anti_conservative(table) == []
+    assert "| valid |" in report.calibration_table(_records("gaussian/n=200/smooth", p))
+
+
+def test_anti_conservative_p_values_are_flagged() -> None:
+    # Size 0.10 at the 0.05 level over 500 reps is ~5 MCSE above nominal.
+    p = [0.02] * 50 + [0.5] * 450
+    recs = _records("gaussian/n=200/smooth", p)
+    flagged = report.anti_conservative(report.rows(recs))
+    assert {a for _, a in flagged} == {0.05}
+    assert "**ANTI-CONSERVATIVE** at 0.05" in report.calibration_table(recs)
+
+
+def test_conservative_p_values_are_never_flagged() -> None:
+    # A point mass at 1 (a boundary-shrunk term) is conservative, hence valid.
+    recs = _records("gaussian/n=200/smooth", [1.0] * 500)
+    assert report.anti_conservative(report.rows(recs)) == []
+
+
+def test_missing_p_value_is_unusable_not_dropped() -> None:
+    recs = _records("gaussian/n=200/smooth", [0.5, None, 0.7])
+    (row,) = report.rows(recs)
+    assert (row.reps, row.usable) == (3, 2)
+    text = report.render(recs, {})
+    assert "1 unusable" in text
+    assert "null.gamfit.wald: 1x" in text
+    none = _records("gaussian/n=200/smooth", [None, None])
+    assert "**NO P-VALUE**" in report.calibration_table(none)
+
+
+def test_tolerance_is_the_binomial_quantile() -> None:
+    # The bound tightens as reps grow, in MCSE units it stays put.
+    for reps in (200, 500, 2000):
+        bound = report.reject_bound(reps, 0.05, 1)
+        z = (bound / reps - 0.05) / np.sqrt(0.05 * 0.95 / reps)
+        assert 2.5 < z < 3.6, (reps, z)
+
+
+def test_pygam_has_no_surface_without_a_counterpart() -> None:
+    assert expected_surfaces("pygam", "negbin", "smooth") == ()
+    assert expected_surfaces("pygam", "gaussian", "ti") == ()
+    assert expected_surfaces("pygam", "gaussian", "re") == ()
+    assert expected_surfaces("pygam_gs", "poisson", "smooth") == ("wald",)
+
+
+def test_docs_table_is_generated_from_the_committed_baseline() -> None:
+    records, meta = report.load([BASELINE])
+    page = (REPO_ROOT / "docs" / "pvalues.md").read_text()
+    assert report.splice_docs(page, report.docs_block(records, meta)) == page, (
+        "docs/pvalues.md is stale; regenerate it with "
+        "python -m bench.pvalue_calibration.report "
+        "bench/pvalue_calibration/baseline/quick --docs docs/pvalues.md"
+    )

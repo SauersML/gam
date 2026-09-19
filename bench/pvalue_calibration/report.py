@@ -1,0 +1,341 @@
+"""Render calibration records as a report, and the table in docs/pvalues.md.
+
+    python -m bench.pvalue_calibration.report DIR [DIR ...] --out report.md
+    python -m bench.pvalue_calibration.report DIR --docs docs/pvalues.md [--check]
+
+One row per (cell, library surface). For the null draws it gives the size at
+0.10 / 0.05 / 0.01 with its Monte Carlo standard error
+``sqrt(size * (1 - size) / R)``, the Kolmogorov-Smirnov distance of the null
+p-values from Uniform(0, 1), and the fraction of reps that produced a usable
+p-value at all. For the matched-alternative draws it gives the power at 0.05.
+
+A p-value is valid when ``P(p <= a) <= a`` under its null. The verdict tests
+exactly that, one-sidedly, at each level: with ``R`` usable null reps a valid
+p-value rejects at most ``Binomial(R, a)`` times, so a row is
+**ANTI-CONSERVATIVE** at ``a`` when its rejection count exceeds that law's
+upper ``1 - FALSE_ALARM / m`` quantile, ``m`` being the number of
+(row, level) checks in the report. The tolerance is the sampling law of the
+count itself (``a + ~z * MCSE``), not a hand-picked band, and the Bonferroni
+split keeps the chance that a calibrated harness flags anything at all at or
+below ``FALSE_ALARM`` however large the grid. A conservative p-value
+(size below nominal, or a point mass at 1) is valid and never flagged; it
+shows up in the KS column and in the power.
+
+A row whose usable count is below its rep count lists the reasons in
+"Unusable reps". A missing p-value is a defect of that surface, never a skip.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+from scipy import stats
+
+Record = dict[str, Any]
+
+LEVELS: tuple[float, ...] = (0.10, 0.05, 0.01)
+POWER_LEVEL = 0.05
+# Chance that a fully calibrated harness run flags one or more rows. It is the
+# CI false-alarm rate of the smoke test: one spurious red run in a thousand.
+FALSE_ALARM = 1e-3
+
+DOCS_BEGIN = "<!-- BEGIN pvalue_calibration table (generated; do not edit) -->"
+DOCS_END = "<!-- END pvalue_calibration table -->"
+
+SURFACE_LABEL = {
+    "gamfit.wald": "gamfit Wald (`summary`)",
+    "gamfit.lr": "gamfit LR (`smooth_significance`)",
+    "gamfit.coef": "gamfit coefficient",
+    "pygam.wald": "pyGAM, fixed lam",
+    "pygam_gs.wald": "pyGAM, gridsearch",
+}
+
+
+@dataclass(frozen=True)
+class Row:
+    cell: str
+    surface: str
+    reps: int
+    usable: int
+    rejections: tuple[int, ...]
+    ks_d: float | None
+    ks_p: float | None
+    power: float | None
+    power_usable: int
+
+    def size(self, i: int) -> float | None:
+        return self.rejections[i] / self.usable if self.usable else None
+
+    def mcse(self, i: int) -> float | None:
+        s = self.size(i)
+        return None if s is None else math.sqrt(s * (1 - s) / self.usable)
+
+
+def reject_bound(usable: int, level: float, checks: int) -> int:
+    """Largest rejection count a valid p-value reaches except with prob FALSE_ALARM / checks."""
+    return int(stats.binom.ppf(1.0 - FALSE_ALARM / checks, usable, level))
+
+
+def _cell_sort(cell: str) -> tuple[Any, ...]:
+    family, n, null = cell.split("/")
+    return (int(n.removeprefix("n=")), family, null)
+
+
+def rows(records: Iterable[Record]) -> list[Row]:
+    by: dict[tuple[str, str], list[Record]] = {}
+    for rec in records:
+        key = rec.get("key") or f"{rec['family']}/n={rec['n']}/{rec['null']}"
+        surfaces = {
+            f"{lib}.{s}"
+            for lib, ss in (rec.get("expected_surfaces") or {}).items()
+            for s in ss
+        }
+        # A rep lost to the safety net has no expected_surfaces; count it
+        # against every surface the cell's other reps expect.
+        by.setdefault((key, ""), []).append(rec)
+        for s in surfaces:
+            by.setdefault((key, s), [])
+    out: list[Row] = []
+    for (key, surface), _ in sorted(by.items(), key=lambda kv: (_cell_sort(kv[0][0]), kv[0][1])):
+        if not surface:
+            continue
+        recs = by[(key, "")]
+        null_p = [
+            r["p"]["null"][surface]
+            for r in recs
+            if surface in ((r.get("p") or {}).get("null") or {})
+        ]
+        alt_p = [
+            r["p"]["alt"][surface]
+            for r in recs
+            if surface in ((r.get("p") or {}).get("alt") or {})
+        ]
+        arr = np.asarray(null_p, dtype=float)
+        ks = stats.kstest(arr, "uniform") if len(arr) else None
+        out.append(
+            Row(
+                cell=key,
+                surface=surface,
+                reps=len(recs),
+                usable=len(arr),
+                rejections=tuple(int(np.sum(arr <= a)) for a in LEVELS),
+                ks_d=None if ks is None else float(ks.statistic),
+                ks_p=None if ks is None else float(ks.pvalue),
+                power=(
+                    float(np.mean(np.asarray(alt_p) <= POWER_LEVEL)) if alt_p else None
+                ),
+                power_usable=len(alt_p),
+            )
+        )
+    return out
+
+
+def anti_conservative(table: list[Row]) -> list[tuple[Row, float]]:
+    """Every (row, level) whose rejection count no valid p-value reaches."""
+    checks = sum(1 for r in table if r.usable) * len(LEVELS)
+    flagged = []
+    for r in table:
+        if not r.usable:
+            continue
+        for i, a in enumerate(LEVELS):
+            if r.rejections[i] > reject_bound(r.usable, a, checks):
+                flagged.append((r, a))
+    return flagged
+
+
+def _size(r: Row, i: int) -> str:
+    s, e = r.size(i), r.mcse(i)
+    if s is None or e is None:
+        return "-"
+    return f"{s:.3f} ± {e:.3f}"
+
+
+def _table(header: list[str], body: list[list[str]]) -> list[str]:
+    lines = ["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"]
+    lines += ["| " + " | ".join(row) + " |" for row in body]
+    return lines
+
+
+def calibration_table(records: list[Record]) -> str:
+    """The generated block of docs/pvalues.md, also the core of report.md."""
+    table = rows(records)
+    flagged = anti_conservative(table)
+    bad = {(r.cell, r.surface): [] for r, _ in flagged}
+    for r, a in flagged:
+        bad[(r.cell, r.surface)].append(a)
+    body = []
+    for r in table:
+        if not r.usable:
+            verdict = "**NO P-VALUE**"
+        elif (r.cell, r.surface) in bad:
+            verdict = "**ANTI-CONSERVATIVE** at " + ", ".join(
+                f"{a:g}" for a in bad[(r.cell, r.surface)]
+            )
+        else:
+            verdict = "valid"
+        if r.usable < r.reps:
+            verdict += f"; {r.reps - r.usable} unusable"
+        body.append(
+            [
+                r.cell,
+                SURFACE_LABEL.get(r.surface, r.surface),
+                f"{r.usable}/{r.reps}",
+                _size(r, 0),
+                _size(r, 1),
+                _size(r, 2),
+                "-" if r.ks_d is None else f"{r.ks_d:.3f} ({r.ks_p:.2g})",
+                "-" if r.power is None else f"{r.power:.3f}",
+                verdict,
+            ]
+        )
+    checks = sum(1 for r in table if r.usable) * len(LEVELS)
+    lines = [
+        f"{len(table)} rows, {checks} size checks, family-wise false-alarm rate "
+        f"{FALSE_ALARM:g} (Bonferroni: each check at {FALSE_ALARM / max(checks, 1):.2g}).",
+        "",
+        *_table(
+            [
+                "cell",
+                "surface",
+                "usable",
+                "size@0.10",
+                "size@0.05",
+                "size@0.01",
+                "KS D (p)",
+                "power@0.05",
+                "verdict",
+            ],
+            body,
+        ),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def unusable(records: list[Record]) -> list[str]:
+    """One line per (cell, surface, reason) with its count and example seeds."""
+    reasons: dict[tuple[str, str, str], list[int]] = {}
+    for rec in records:
+        key = rec.get("key") or f"{rec['family']}/n={rec['n']}/{rec['null']}"
+        seed = int(rec["seed"])
+        if rec.get("status") not in ("ok", "error"):
+            reasons.setdefault((key, "*", f"rep {rec['status']}"), []).append(seed)
+            continue
+        for where, why in (rec.get("missing") or {}).items():
+            first = why.splitlines()[0][:160]
+            reasons.setdefault((key, where, first), []).append(seed)
+        for where, tb in (rec.get("errors") or {}).items():
+            last = [ln for ln in tb.strip().splitlines() if ln.strip()][-1][:160]
+            reasons.setdefault((key, where, last), []).append(seed)
+    return [
+        f"- `{key}` {where}: {len(seeds)}x, seeds {seeds[:5]}: {why}"
+        for (key, where, why), seeds in sorted(
+            reasons.items(), key=lambda kv: (_cell_sort(kv[0][0]), kv[0][1])
+        )
+    ]
+
+
+def render(records: list[Record], meta: dict[str, Any] | None = None) -> str:
+    meta = meta or {}
+    runs = meta.get("invocations") or []
+    head = runs[-1] if runs else {}
+    lines = [
+        "# p-value calibration report",
+        "",
+        f"- plan: `{meta.get('plan', '?')}`; records: {len(records)}",
+        f"- git sha: `{head.get('git_sha')}`; host: `{head.get('host')}` "
+        f"({head.get('nproc')} CPUs); jobs: {head.get('jobs')}",
+        f"- versions: {', '.join(meta.get('lib_versions') or []) or '?'}",
+        f"- {meta.get('safety_net', '')}",
+        "",
+        "## Calibration",
+        "",
+        calibration_table(records),
+        "## Anti-conservative",
+        "",
+    ]
+    flagged = anti_conservative(rows(records))
+    if flagged:
+        for r, a in flagged:
+            i = LEVELS.index(a)
+            lines.append(
+                f"- `{r.cell}` {r.surface}: {r.rejections[i]}/{r.usable} "
+                f"rejections at {a:g} (size {r.size(i):.3f}); a valid p-value "
+                f"exceeds {reject_bound(r.usable, a, sum(1 for x in rows(records) if x.usable) * len(LEVELS))} "
+                "only with the stated false-alarm probability"
+            )
+    else:
+        lines.append("None.")
+    lines += ["", "## Unusable reps", ""]
+    lines += unusable(records) or ["None."]
+    return "\n".join(lines) + "\n"
+
+
+def splice_docs(page: str, block: str) -> str:
+    pattern = re.compile(re.escape(DOCS_BEGIN) + r".*?" + re.escape(DOCS_END), re.S)
+    if not pattern.search(page):
+        raise ValueError(f"page has no {DOCS_BEGIN!r} ... {DOCS_END!r} block")
+    return pattern.sub(lambda _: f"{DOCS_BEGIN}\n\n{block}\n{DOCS_END}", page)
+
+
+def docs_block(records: list[Record], meta: dict[str, Any]) -> str:
+    runs = meta.get("invocations") or []
+    head = runs[-1] if runs else {}
+    return (
+        f"Plan `{meta.get('plan')}` at git `{(head.get('git_sha') or '?')[:12]}`, "
+        f"{', '.join(meta.get('lib_versions') or [])}.\n\n"
+        + calibration_table(records)
+    )
+
+
+def load(paths: Iterable[Path]) -> tuple[list[Record], dict[str, Any]]:
+    records: list[Record] = []
+    meta: dict[str, Any] = {}
+    for p in paths:
+        rp = p / "records.jsonl"
+        records += [json.loads(ln) for ln in rp.read_text().splitlines() if ln.strip()]
+        mp = p / "meta.json"
+        if mp.exists():
+            meta = json.loads(mp.read_text())
+    return records, meta
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    ap.add_argument("dirs", nargs="+", type=Path, help="run output directories")
+    ap.add_argument("--out", type=Path, help="write report.md here (default: stdout)")
+    ap.add_argument("--docs", type=Path, help="rewrite the generated block of this page")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="with --docs: exit 1 if the page's block is not what the records give",
+    )
+    args = ap.parse_args(argv)
+    records, meta = load(args.dirs)
+    if args.docs is not None:
+        page = args.docs.read_text()
+        new = splice_docs(page, docs_block(records, meta))
+        if args.check:
+            if new != page:
+                print(f"{args.docs} is stale; regenerate it with --docs", file=sys.stderr)
+                return 1
+            return 0
+        args.docs.write_text(new)
+        return 0
+    text = render(records, meta)
+    if args.out is None:
+        sys.stdout.write(text)
+    else:
+        args.out.write_text(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
