@@ -79,8 +79,15 @@ Why the number is withheld:
   inside the cone and has no active set. Its λ is selected by REML on the same
   data. Neither reference applies.
 
-`basis_check` is unaffected: it tests structure outside the term's column span,
-which the cone does not restrict.
+`basis_check` still reports for these terms. It tests structure outside the
+term's column span, which the cone does not restrict: its score is built from
+enrichment columns made orthogonal (in the working weights) to the whole
+design, so for a Gaussian identity fit the score equals the enrichment
+projection of `y` and does not depend on the shape term's coefficients at all.
+The fit enters only through the dispersion estimate, as it does for an
+unconstrained term. For other families the score uses the fitted mean, which
+is consistent under the null for the truncated posterior mean as it is for the
+unconstrained one.
 
 ## basis_check() — is the basis big enough?
 
