@@ -29,12 +29,22 @@ pytest.importorskip("gamfit._rust")
 import gamfit
 
 
-def _data(seed: int, n: int = 200) -> pd.DataFrame:
+# A truth inside each shape's cone. The withheld p-value is a property of the
+# term's shape, not of the data, so the case does not need a flat truth; a flat
+# truth mostly ends in the outer-search refusal on the cone apex instead.
+_TRUTH = {
+    "monotone_increasing": lambda x: x,
+    "monotone_decreasing": lambda x: -x,
+    "convex": lambda x: (x - 0.5) ** 2,
+    "concave": lambda x: -((x - 0.5) ** 2),
+}
+
+
+def _data(shape: str, seed: int, n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(0.0, 1.0, n)
     x2 = rng.uniform(0.0, 1.0, n)
-    # x2 is flat: the shape term's null is true, the case the reference fails on.
-    y = np.sin(2.0 * np.pi * x1) + rng.normal(0.0, 0.3, n)
+    y = np.sin(2.0 * np.pi * x1) + _TRUTH[shape](x2) + rng.normal(0.0, 0.3, n)
     return pd.DataFrame({"x1": x1, "x2": x2, "y": y})
 
 
@@ -42,12 +52,13 @@ def _data(seed: int, n: int = 200) -> pd.DataFrame:
     "shape", ["monotone_increasing", "monotone_decreasing", "convex", "concave"]
 )
 def test_shape_constrained_pvalue_is_withheld_with_a_typed_reason(shape: str) -> None:
-    df = _data(seed=11)
+    df = _data(shape, seed=7)
     model = gamfit.fit(df, f"y ~ s(x1) + s(x2, shape={shape})")
 
+    shaped_name = f"s(x2, shape={shape})"
     rows = {row["name"]: row for row in model.summary().smooth_terms}
-    assert set(rows) == {"s(x1)", "s(x2)"}, rows
-    free, shaped = rows["s(x1)"], rows["s(x2)"]
+    assert set(rows) == {"s(x1)", shaped_name}, rows
+    free, shaped = rows["s(x1)"], rows[shaped_name]
     assert free.get("p_value") is not None, free
     assert "p_value_unavailable" not in free, free
     assert shaped.get("p_value") is None, shaped
@@ -58,10 +69,10 @@ def test_shape_constrained_pvalue_is_withheld_with_a_typed_reason(shape: str) ->
     lr = model.smooth_significance(df)
     assert [row["term_idx"] for row in lr] == sorted(row["term_idx"] for row in lr)
     by_name = {row["name"]: row for row in lr}
-    assert set(by_name) == {"s(x1)", "s(x2)"}, lr
+    assert set(by_name) == {"s(x1)", shaped_name}, lr
     assert by_name["s(x1)"].get("p_value_corrected") is not None, by_name["s(x1)"]
     assert "p_value_unavailable" not in by_name["s(x1)"], by_name["s(x1)"]
-    withheld = by_name["s(x2)"]
+    withheld = by_name[shaped_name]
     assert withheld["p_value_unavailable"] == "shape_constrained", withheld
     assert "shape-constrained" in withheld["explanation"], withheld
     assert set(withheld) == {"name", "term_idx", "p_value_unavailable", "explanation"}, withheld
