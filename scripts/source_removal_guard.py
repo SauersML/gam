@@ -220,6 +220,34 @@ def source_words(root, revision, names):
     return Counter({run.decode(): count for run, count in words.items()})
 
 
+def changed_paths(root, base, head):
+    """Each changed Rust file as (base path, head path), the same path unless it was renamed.
+
+    `diff --name-only` under git's default rename detection printed only a renamed
+    file's head path, so its base declarations were never read: c7768c15c2 renamed
+    empirical_intercept_bracket_tests.rs, dropped two of its tests, and passed.
+    Renames are requested explicitly instead of inherited from configuration, and a
+    renamed file's base declarations are compared with what it declares where it now
+    lives. A rename git does not detect is a deletion plus an addition, which refuses
+    every guarded item of the old path; a copy removes nothing, so its new path is an
+    addition.
+    """
+    fields = git(root, "diff", "--name-status", "-z", "--find-renames", base, head,
+                 "--", "crates", "src", "tests").split(b"\0")
+    pairs, i = [], 0
+    while i < len(fields) - 1:
+        status = fields[i][:1]
+        if status in (b"R", b"C"):
+            old, new, i = fields[i + 1], fields[i + 2], i + 3
+            old = new if status == b"C" else old
+        else:
+            old = new = fields[i + 1]
+            i += 2
+        if old.endswith(b".rs") or new.endswith(b".rs"):
+            pairs.append((old.decode(), new.decode()))
+    return pairs
+
+
 def changed_inventory(root, base, head):
     """Inventory only changed Rust files, then query removed private names globally.
 
@@ -227,13 +255,16 @@ def changed_inventory(root, base, head):
     turn a cheap policy gate into a runtime gate. Git already provides the
     exact candidate set; global source queries are needed only for private
     names that actually lost a declaration, and one pass counts all of them.
+    An identity carries its base path, including when the file was renamed.
     """
-    paths = git(root, "diff", "--name-only", "-z", base, head, "--", "crates", "src", "tests").split(b"\0")
-    paths = [path.decode() for path in paths if path.endswith(b".rs")]
+    pairs = changed_paths(root, base, head)
 
-    def at(revision):
+    def at(revision, side):
         found = {}
-        for path in paths:
+        for pair in pairs:
+            path, identity_path = pair[side], pair[0]
+            if not path.endswith(".rs"):
+                continue
             try:
                 source = subprocess.check_output(
                     ["git", "-C", str(root), "show", f"{revision}:{path}"],
@@ -246,11 +277,11 @@ def changed_inventory(root, base, head):
                 match = ITEM.match(line)
                 if not match:
                     continue
-                key = f"{path}:{match['kind']}:{match['name']}"
+                key = f"{identity_path}:{match['kind']}:{match['name']}"
                 public, test_scoped = bool(match["vis"]), number in tests
                 held = found.get(key)
                 if held is None:
-                    found[key] = {"path": path, "line": number, "kind": match["kind"],
+                    found[key] = {"path": identity_path, "line": number, "kind": match["kind"],
                                   "name": match["name"], "public": public,
                                   "test_scoped": test_scoped, "declarations": 1}
                 else:
@@ -260,7 +291,7 @@ def changed_inventory(root, base, head):
                     held["test_scoped"] = held["test_scoped"] or test_scoped
         return found
 
-    before, after = at(base), at(head)
+    before, after = at(base, 0), at(head, 1)
     # Public and test-scoped removals are guarded outright and need no count. A
     # placeholder count for them would also overwrite a private homonym's real
     # count, letting that private item's callers go unseen.

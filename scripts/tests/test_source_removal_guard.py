@@ -159,6 +159,39 @@ class SourceRemovalGuard(unittest.TestCase):
             self.assertEqual(words["orphan"], 1, "the declaration itself is the only occurrence")
             self.assertEqual(guard.removals(before, after, words), [])
 
+    def test_a_renamed_file_is_compared_with_its_new_path_2818(self):
+        # c7768c15c2 renamed empirical_intercept_bracket_tests.rs and dropped two of
+        # its tests. `diff --name-only` listed only the new path, so the old one was
+        # never read and the guard passed it. diff.renames=false here proves the
+        # pairing does not come from configuration.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            subprocess.run(["git", "-C", directory, "config", "diff.renames", "false"], check=True)
+            kept = "".join(f"#[test]\nfn kept_{i}() {{\n    assert_eq!({i}, {i});\n}}\n" for i in range(12))
+            base = commit(root, {"crates/demo/src/bracket_tests.rs": kept + "#[test]\nfn dropped() {\n    assert_eq!(12, 12);\n}\n"})
+            renamed = commit(root, {"crates/demo/src/bracket_tests.rs": None, "crates/demo/src/solve_tests.rs": kept})
+            before, after, words = guard.changed_inventory(root, base, renamed)
+            blocked = [f"{x['path']}:{x['kind']}:{x['name']}" for x in guard.removals(before, after, words)]
+            self.assertEqual(blocked, ["crates/demo/src/bracket_tests.rs:fn:dropped"])
+            moved = commit(root, {"crates/demo/src/solve_tests.rs": None, "crates/other/src/solve_tests.rs": kept})
+            before, after, words = guard.changed_inventory(root, renamed, moved)
+            self.assertEqual(len(before), 12, "the old path is read")
+            self.assertEqual(guard.removals(before, after, words), [], "a pure move removes nothing")
+
+    def test_a_pub_fn_deleted_inside_a_moved_file_is_refused_2818(self):
+        # Git's default rename detection is on here, the configuration under which
+        # `diff --name-only` hid the old path.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            kept = "".join(f"pub fn kept_{i}() -> usize {{\n    {i}\n}}\n" for i in range(12))
+            base = commit(root, {"crates/demo/src/model.rs": kept + "pub fn dropped() -> usize {\n    12\n}\n"})
+            head = commit(root, {"crates/demo/src/model.rs": None, "crates/other/src/model.rs": kept})
+            before, after, words = guard.changed_inventory(root, base, head)
+            blocked = [f"{x['path']}:{x['kind']}:{x['name']}" for x in guard.removals(before, after, words)]
+            self.assertEqual(blocked, ["crates/demo/src/model.rs:fn:dropped"])
+
     def test_inline_format_captures_are_uses_but_escaped_braces_are_text_2818(self):
         source = ('pub const REFERENCE_ENV_MISSING: &str = "REFERENCE_ENV_MISSING";\n'
                   'fn report(tool: &str) -> String {\n'
