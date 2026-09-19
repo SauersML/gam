@@ -870,6 +870,13 @@ pub fn deviance_eta_row_on_measure(
     // name its half-deviance as a plain product of finite factors, take the
     // product — one rounding instead of three. `weight` is `log_weight`'s
     // exponentiated twin, the first of those factors.
+    if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
+        let (half_deviance, eta_score) = generic_edm_deviance_row(cell, row, y, eta, weight)?;
+        return Ok(DevianceEtaRow {
+            half_deviance,
+            eta_score,
+        });
+    }
     let reciprocal_link = reciprocal_power_link(inverse_link);
     let (half_deviance, eta_score) = match &likelihood.spec.response {
         ResponseFamily::Gaussian if reciprocal_link.is_some() => {
@@ -933,57 +940,61 @@ pub fn deviance_eta_row_on_measure(
             // out of this family branch prevents one row object from silently
             // changing the reporting estimand while preserving the scaled
             // Gaussian likelihood geometry.
-            let (residual_sign, residual_log_abs) = signed_log_difference(y, eta);
-            // `exp(log_weight + 2·ln|r| − ln 2)` is the worst of the four:
-            // doubling the log DOUBLES its rounding error before the `exp`
-            // adds its own. At `y = 1e200, η = 0, w = 1e-300` the exact
-            // half-deviance is `5e99` and this lands 6.6e-14 above it, against
-            // a 3e-14 bound. Interleave the weight with the square instead —
-            // `0.5·(w·r)·r` — so the product never forms `r²` on its own; when
-            // that still overflows (`y = MAX, η = −MAX`) the log route is
-            // exactly the fallback it was written to be.
-            let direct_half = (residual_sign != 0.0)
-                .then(|| y - eta)
-                .filter(|residual| residual.is_finite())
-                .map(|residual| 0.5 * (weight * residual) * residual)
-                .and_then(representable_half);
-            let half = if residual_sign == 0.0 {
-                0.0
+            // For finite `y, η` the residual is exactly zero only when `y == η`
+            // (an overflowing difference is infinite, never zero), so this is
+            // the zero case of `signed_log_difference` without its logarithm.
+            let residual = y - eta;
+            if residual == 0.0 {
+                (0.0, 0.0)
             } else {
-                match direct_half {
-                    Some(value) => value,
-                    None => finite_signed_from_log(
-                        row,
-                        "Gaussian half-deviance",
-                        eta,
-                        1.0,
-                        log_weight + 2.0 * residual_log_abs - std::f64::consts::LN_2,
-                    )?,
+                // `exp(log_weight + 2·ln|r| − ln 2)` is the worst of the four:
+                // doubling the log DOUBLES its rounding error before the `exp`
+                // adds its own. At `y = 1e200, η = 0, w = 1e-300` the exact
+                // half-deviance is `5e99` and this lands 6.6e-14 above it,
+                // against a 3e-14 bound. Interleave the weight with the square
+                // instead — `0.5·(w·r)·r` — so the product never forms `r²` on
+                // its own; when that still overflows (`y = MAX, η = −MAX`) the
+                // log route is exactly the fallback it was written to be.
+                let finite_residual = residual.is_finite().then_some(residual);
+                let direct_half = finite_residual
+                    .map(|residual| 0.5 * (weight * residual) * residual)
+                    .and_then(representable_half);
+                // Same treatment for the score channel, `−w·r`: the log route
+                // reaches a two-factor product through three roundings, and the
+                // same fixture contracts it to 3e-14 at `−1e-100`.
+                let direct_score = finite_residual
+                    .map(|residual| -(weight * residual))
+                    .filter(|value| value.is_finite() && *value != 0.0);
+                match (direct_half, direct_score) {
+                    // The common row: both channels are plain products, and
+                    // `ln|y − η|` is needed by neither.
+                    (Some(half), Some(score)) => (half, score),
+                    (direct_half, direct_score) => {
+                        let (residual_sign, residual_log_abs) = signed_log_difference(y, eta);
+                        let half = match direct_half {
+                            Some(value) => value,
+                            None => finite_signed_from_log(
+                                row,
+                                "Gaussian half-deviance",
+                                eta,
+                                1.0,
+                                log_weight + 2.0 * residual_log_abs - std::f64::consts::LN_2,
+                            )?,
+                        };
+                        let score = match direct_score {
+                            Some(value) => value,
+                            None => finite_signed_from_log(
+                                row,
+                                "Gaussian eta score",
+                                eta,
+                                -residual_sign,
+                                log_weight + residual_log_abs,
+                            )?,
+                        };
+                        (half, score)
+                    }
                 }
-            };
-            // Same treatment for the score channel, `−w·r`: the log route
-            // reaches a two-factor product through three roundings, and the
-            // same fixture contracts it to 3e-14 at `−1e-100`.
-            let direct_score = (residual_sign != 0.0)
-                .then(|| y - eta)
-                .filter(|residual| residual.is_finite())
-                .map(|residual| -(weight * residual))
-                .filter(|value| value.is_finite() && *value != 0.0);
-            let score = if residual_sign == 0.0 {
-                0.0
-            } else {
-                match direct_score {
-                    Some(value) => value,
-                    None => finite_signed_from_log(
-                        row,
-                        "Gaussian eta score",
-                        eta,
-                        -residual_sign,
-                        log_weight + residual_log_abs,
-                    )?,
-                }
-            };
-            (half, score)
+            }
         }
         ResponseFamily::Poisson => {
             if !valid_count_response(y) {
@@ -2060,6 +2071,7 @@ fn omitted_log_likelihood_row(
     eta: f64,
     prior_weight: f64,
     response: &ResponseFamily,
+    inverse_link: &InverseLink,
     deviance: DevianceEtaRow,
 ) -> Result<f64, EstimationError> {
     if prior_weight == 0.0 {
@@ -2084,6 +2096,19 @@ fn omitted_log_likelihood_row(
         | ResponseFamily::Gamma
         | ResponseFamily::InverseGaussian
         | ResponseFamily::Tweedie { .. } => Ok(-deviance.half_deviance),
+        // Off the log link `η` is not `ln μ`: `w (y ln μ − μ)` is the negated
+        // half-deviance plus the response-only `w (y ln y − y)`.
+        ResponseFamily::Poisson
+            if !matches!(inverse_link, InverseLink::Standard(StandardLink::Log)) =>
+        {
+            stable_finite_signed_sum(
+                &[
+                    weighted_unit("Poisson saturated log-likelihood", xlogy(y, y) - y)?,
+                    -deviance.half_deviance,
+                ],
+                "Poisson log-likelihood row",
+            )
+        }
         ResponseFamily::Poisson => {
             if y == 0.0 {
                 finite_signed_from_log(row, "Poisson log-likelihood", eta, -1.0, log_weight + eta)
@@ -2195,6 +2220,7 @@ fn eta_log_likelihood_geometry_omitting_constants(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_rows[i],
         )
     })?;
@@ -2269,6 +2295,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
             eta[i],
             priorweights[i],
             &likelihood.spec.response,
+            inverse_link,
             deviance_row,
         )
     })?;
@@ -2318,6 +2345,67 @@ pub(crate) fn pirls_data_log_kernel_from_eta(
             priorweights,
         )
     }
+}
+
+/// Deviance and data log-kernel from ONE row pass, for a likelihood whose eta
+/// log-measure scale is zero (Bernoulli/binomial, Poisson, NB, Beta, ...).
+///
+/// `calculate_deviance_from_eta` evaluates each row at log-measure scale zero,
+/// and the log-kernel pass evaluates the same row at
+/// [`eta_log_measure_scale`]. When that scale is zero the two row evaluations
+/// are the same computation, so this pass evaluates it once and feeds both
+/// reductions; each sum runs over the same summands in the same order as the
+/// two-pass path, so both values are bit-identical to it. Returns `None` for a
+/// profiled Gaussian, for Tweedie (whose response validation lives in
+/// `loglik_deviance`) and for a non-zero scale; the caller keeps the two-pass
+/// path there.
+pub(crate) fn unit_measure_deviance_and_log_kernel_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<Option<(f64, f64)>, EstimationError> {
+    if matches!(likelihood.spec.response, ResponseFamily::Tweedie { .. })
+        || matches!(
+            likelihood.resolved_scale(),
+            Ok(gam_problem::ResolvedLikelihoodScale::ProfiledGaussian)
+        )
+    {
+        return Ok(None);
+    }
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    if eta_log_measure_scale(likelihood)? != 0.0 {
+        return Ok(None);
+    }
+    let rows = super::par_certified_rows(y.len(), |i| {
+        let deviance_row = deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            0.0,
+        )?;
+        let log_likelihood = omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            inverse_link,
+            deviance_row,
+        )?;
+        Ok((deviance_row.half_deviance, log_likelihood))
+    })?;
+    let (half_values, log_likelihood_rows): (Vec<f64>, Vec<f64>) = rows.into_iter().unzip();
+    let deviance = 2.0 * stable_finite_signed_sum(&half_values, "deviance half-sum")?;
+    if !deviance.is_finite() {
+        crate::bail_invalid_estim!("deviance reduction exceeded f64 range");
+    }
+    let log_kernel = stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")?;
+    Ok(Some((deviance, log_kernel)))
 }
 
 #[inline]
@@ -2565,7 +2653,15 @@ fn full_log_likelihood_row(
         return tweedie_exact_series_loglik_from_eta(row, y, eta, weight, *p, -log_measure_scale);
     }
     let omitted =
-        omitted_log_likelihood_row(row, y, eta, weight, &likelihood.spec.response, deviance)?;
+        omitted_log_likelihood_row(
+            row,
+            y,
+            eta,
+            weight,
+            &likelihood.spec.response,
+            &likelihood.spec.link,
+            deviance,
+        )?;
     let normalizer = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
             let log_phi = likelihood.resolved_gaussian_log_phi().map_err(|error| {

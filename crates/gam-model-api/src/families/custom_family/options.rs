@@ -9,7 +9,6 @@ use gam_problem::{ParameterBlockSpec, ParameterBlockState};
 use ndarray::Array1;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 // Moved to `gam-problem` (#1521 CustomFamily-cone inversion): the neutral,
 // dependency-free outer-objective + exact-derivative-order capability enums now
@@ -521,9 +520,6 @@ pub struct BlockwiseFitOptions {
     pub use_outer_hessian: bool,
     /// If false, skip post-fit joint covariance assembly.
     pub compute_covariance: bool,
-    /// Shared cap engaged during seed screening so cost-only evaluations can
-    /// stop inner iterations early without affecting the full solve.
-    pub screening_max_inner_iterations: Option<Arc<AtomicUsize>>,
     /// Optional line-search objective ceiling for lazy log-likelihood-only
     /// evaluations. Families whose per-row log-likelihood contributions are
     /// non-positive may stop once the partial negative log-likelihood is already
@@ -599,50 +595,6 @@ pub struct BlockwiseFitOptions {
     /// `ParameterBlockSpec.penalties`. The per-block path is unchanged.
     /// `None` preserves legacy behaviour for every existing caller.
     pub joint_penalties: Option<Arc<crate::JointPenaltyBundle>>,
-    /// Whether the outer smoothing optimizer screens the explicit
-    /// `initial_rho` seed through the seed-screening cascade before the
-    /// solver starts.
-    ///
-    /// **Default `true`** — the general path benefits from ranking the
-    /// initial seed against the generated exploration seeds via cheap
-    /// capped proxy fits.
-    ///
-    /// A caller sets this `false` when `initial_rho` is already the correct,
-    /// identified optimum for its regime so that re-screening it adds only
-    /// cost. The survival location-scale constant-scale (parametric-AFT)
-    /// path uses this: its time-warp ρ seed is pinned AT the inner ρ box
-    /// bound (the affine-baseline limit), where the REML/LAML profile is a
-    /// dead-flat unidentified ridge. Running the screening cascade there
-    /// drives each proxy fit (and, when every capped stage collapses to
-    /// non-finite cost, the uncapped final stage) into a full inner solve on
-    /// the near-singular flat Hessian — the source of the multi-minute
-    /// no-iteration-log stall (#736, #735, #721). Skipping screening lets the
-    /// already-correct seed flow straight to the outer solver, which certifies
-    /// box-constraint stationarity at iteration 0. Genuinely flexible regimes
-    /// (smooth scale / spatial) leave this `true` and keep full screening.
-    pub screen_initial_rho: bool,
-    /// Set ONLY while the inner solve is invoked from the seed-screening proxy
-    /// (`custom_family_seed_screening_proxy_labeled`), which RANKS candidate
-    /// seeds by their penalized objective and never produces the final fit.
-    ///
-    /// When `true`, the inner joint-Newton skips the full per-axis
-    /// Jeffreys/Firth curvature (`custom_family_joint_jeffreys_term`'s
-    /// `for k in 0..p` directional-derivative loop, O(p · per-axis-Hdot) per
-    /// cycle), keeping ONLY the cheap value-only Jeffreys term
-    /// (`custom_family_joint_jeffreys_value`, one reduced-info eigendecomposition)
-    /// in the screening score. The per-axis gradient/curvature is what the inner
-    /// Newton step needs to *converge* a near-separating fit; the screening proxy
-    /// is capped and only ranks, so it does not need step convergence — it needs
-    /// a finite, separation-aware score cheaply. For a K-block coupled family
-    /// (Dirichlet/multinomial) each per-axis directional derivative is itself
-    /// O(K²·n·p), so running the full term for every cascade candidate over the
-    /// joint width `p` is the wrong cost class and made the coupled fit
-    /// non-completing during screening alone (gam#729/#808). The actual fit
-    /// (after a seed is selected) runs with this `false`, so the load-bearing
-    /// Firth curvature is fully present where it matters.
-    ///
-    /// **Default `false`** — only the screening proxy sets it `true`.
-    pub seed_screening: bool,
 }
 
 /// Default maximum coefficient cycles for a custom-family fit.
@@ -677,8 +629,6 @@ impl Default for BlockwiseFitOptions {
             // analytic dense or operator representation is implemented.
             use_outer_hessian: true,
             compute_covariance: false,
-            screening_max_inner_iterations: None,
-            seed_screening: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: true,
@@ -687,7 +637,6 @@ impl Default for BlockwiseFitOptions {
             persistent_warm_start_store: None,
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
-            screen_initial_rho: true,
         }
     }
 }

@@ -8,11 +8,12 @@
 //! other reports a different scale, a different covariance, and a different
 //! criterion for the same data, which is how #2595 stayed invisible for a week.
 //!
-//! The shared quantity is Wilkinson's accumulated-roundoff growth factor. A
+//! The shared quantity is Wilkinson's accumulated-roundoff growth factor, read
+//! from its one owner [`gam_linalg::roundoff::accumulation_growth`]. A
 //! floating-point sum of `k` operations carries a relative error bounded by
 //!
 //! ```text
-//!     γ_k = k·ε / (1 − k·ε),      ε = f64::EPSILON
+//!     γ_k = k·u / (1 − k·u),      u = f64::EPSILON / 2
 //! ```
 //!
 //! so a linear predictor `η_i = Σ_j x_ij β_j (+ offset)` formed from `p` terms
@@ -21,16 +22,7 @@
 //! arithmetic. This is a derived bound, not a tuned threshold: it moves with the
 //! model width and the data scale and has no free parameter.
 
-/// Wilkinson's growth factor `γ_k = k·ε/(1 − k·ε)` for a sum of `operations`
-/// floating-point operations.
-///
-/// `None` when `k·ε ≥ 1` — a model so wide that the accumulated bound exceeds
-/// the operands themselves, where no residual can be certified as roundoff and
-/// the caller must not treat any fit as exact.
-pub(crate) fn roundoff_growth_factor(operations: usize) -> Option<f64> {
-    let relative = (operations as f64) * f64::EPSILON;
-    (relative < 1.0).then(|| relative / (1.0 - relative))
-}
+use gam_linalg::roundoff::accumulation_growth;
 
 /// Is a weighted residual sum of squares indistinguishable from zero?
 ///
@@ -53,9 +45,13 @@ pub fn weighted_residual_is_at_roundoff_floor(
     if !weighted_rss.is_finite() || weighted_rss < 0.0 {
         return false;
     }
-    let Some(gamma) = roundoff_growth_factor(terms) else {
+    // An infinite growth factor (`k·u ≥ 1`) is a model so wide that the
+    // accumulated bound exceeds the operands themselves: no residual can be
+    // certified as roundoff, so no fit is treated as exact.
+    let gamma = accumulation_growth(terms);
+    if !gamma.is_finite() {
         return false;
-    };
+    }
     let mut budget = 0.0_f64;
     for (weight, scale) in weights.into_iter().zip(operand_scales) {
         if !(weight.is_finite() && weight >= 0.0) || !scale.is_finite() {
@@ -72,17 +68,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn growth_factor_is_monotone_and_matches_the_closed_form() {
-        let one = roundoff_growth_factor(1).expect("k=1 is representable");
-        let ten = roundoff_growth_factor(10).expect("k=10 is representable");
-        assert!(one < ten);
-        assert!((one - f64::EPSILON / (1.0 - f64::EPSILON)).abs() <= f64::EPSILON * 1e-3);
-    }
-
-    #[test]
-    fn growth_factor_refuses_a_width_that_saturates_the_bound() {
-        // k·ε ≥ 1 means the accumulated bound is no smaller than the operands.
-        assert_eq!(roundoff_growth_factor(usize::MAX), None);
+    fn a_width_that_saturates_the_bound_certifies_nothing() {
+        // k·u ≥ 1 means the accumulated bound is no smaller than the operands,
+        // so even an exactly zero residual is not certified as roundoff.
+        assert!(!weighted_residual_is_at_roundoff_floor(
+            0.0,
+            vec![1.0; 4],
+            vec![1.0; 4],
+            usize::MAX
+        ));
     }
 
     #[test]

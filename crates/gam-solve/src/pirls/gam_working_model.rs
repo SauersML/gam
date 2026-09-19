@@ -202,6 +202,15 @@ impl<'a> GamWorkingModel<'a> {
                 self.priorweights,
             )
         } else {
+            if let Some(objective) = unit_measure_deviance_and_log_kernel_from_eta(
+                self.y,
+                &self.workspace.eta_buf,
+                &self.likelihood,
+                &self.link_kind,
+                self.priorweights,
+            )? {
+                return Ok(objective);
+            }
             let deviance = self.likelihood.loglik_deviance(
                 self.y,
                 &self.workspace.eta_buf,
@@ -1191,7 +1200,12 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         ) && !self.gamma_shape_locked
         {
             let shape =
-                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
+                estimate_gamma_shape_from_eta(
+                &self.likelihood.spec.link,
+                self.y,
+                &self.workspace.eta_buf,
+                self.priorweights,
+            )?;
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
             self.gamma_shape_locked = true;
         }

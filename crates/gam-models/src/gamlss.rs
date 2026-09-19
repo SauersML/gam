@@ -106,7 +106,6 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 
 use std::hash::{Hash, Hasher};
 
-use std::sync::atomic::AtomicUsize;
 
 use std::sync::{Arc, Mutex};
 

@@ -1,9 +1,13 @@
 //! #2953: a certified optimum that an evaluated state beats is declined (#2596, #2627), and
 //! when nothing certifies in its place the refusal reports it instead of losing it.
 //!
-//! Every fixture is flat to roundoff at the neutral seed ρ = 0, so that seed certifies in zero
+//! Every fixture is flat to roundoff at ρ = 0, so a search started there certifies in zero
 //! iterations at a flat top, while a search started below it stops lower without certifying.
-//! The plan runner declines the flat top and continues from the state that beat it.
+//! Each fixture runs that capped search first and then the search from the flat top, carrying
+//! the capped stop as the lowest state an earlier search evaluated, as a later plan attempt
+//! carries it. With one start per search, a carried state is what a certified optimum is
+//! judged against. The plan runner declines the flat top and continues from the state that
+//! beat it.
 //! - A softplus knee over a gently curved slope: the continuation cannot certify, and the fit
 //!   refuses with `DominanceUnresolved`.
 //! - A Gaussian well: a budget one iteration short of the unbounded search lets the
@@ -24,7 +28,7 @@ use ndarray::array;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Off the integer seed lattice, so no generated seed starts at the centre.
+/// Off every start the fixtures search from.
 const CENTER: f64 = -3.5;
 const WIDTH: f64 = 0.5;
 const DEPTH: f64 = 10.0;
@@ -39,22 +43,43 @@ fn well_derivative(x: f64) -> f64 {
     -well_value(x) * (x - CENTER) / (WIDTH * WIDTH)
 }
 
-/// Search the well from `WELL_START` under `max_iter`, the neutral seed next in the cascade,
-/// against a cache of its own so no run resumes another's checkpoint.
-fn run_well(max_iter: usize, label: &str) -> Result<OuterResult, EstimationError> {
+/// Search `problem` from its declared start under its budget, which stops without certifying,
+/// then search it again from the flat top at ρ = 0 carrying that stop as the lowest state an
+/// earlier search evaluated.
+fn search_flat_top_carrying_the_capped_stop(
+    problem: &OuterProblem,
+    objective: &mut dyn OuterObjective,
+    label: &str,
+) -> Result<OuterResult, EstimationError> {
+    let config = problem.config();
+    let capability = primary_capability_for_config(objective.capability(), &config, label);
+    let the_plan = plan(&capability);
+    let stop = match run_outer_with_plan(objective, &config, label, &capability, &the_plan, false)?
+    {
+        PlanRunOutcome::Exhausted(stop) => stop,
+        _ => {
+            return Err(EstimationError::InvalidInput(format!(
+                "{label}: fixture precondition: the capped search from the declared start must \
+                 stop without certifying"
+            )));
+        }
+    };
+    let mut flat_top = config;
+    flat_top.initial_rho = Some(Array1::zeros(stop.rho.len()));
+    flat_top.carried_checkpoint = Some(stop);
+    run_outer(objective, &flat_top, label)
+}
+
+/// Search the well from `WELL_START` under `max_iter`, against a cache of its own so no run
+/// resumes another's checkpoint. With `from_flat_top`, that search is the capped stop the search
+/// from the flat top carries.
+fn run_well(max_iter: usize, from_flat_top: bool, label: &str) -> Result<OuterResult, EstimationError> {
     let (_cache_dir, session) = tmp_cache_session(label);
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-6.0], array![6.0])
         .with_initial_rho(array![WELL_START])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(max_iter)
         .with_cache_session(session);
     let mut objective = problem.build_objective(
@@ -71,7 +96,11 @@ fn run_well(max_iter: usize, label: &str) -> Result<OuterResult, EstimationError
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    problem.run(&mut objective, label)
+    if from_flat_top {
+        search_flat_top_carrying_the_capped_stop(&problem, &mut objective, label)
+    } else {
+        problem.run(&mut objective, label)
+    }
 }
 
 // The refusal fixture: a softplus knee with a gentle curvature below it,
@@ -119,8 +148,8 @@ fn slope_derivative(x: f64) -> f64 {
     logistic(-(x - KNEE) / KNEE_WIDTH) * (SLOPE - SLOPE_CURVATURE * knee_depth(x))
 }
 
-/// Search the slope from `SLOPE_START` under `max_iter`, the neutral seed next in the cascade,
-/// against a cache of its own.
+/// Search the slope from `SLOPE_START` under `max_iter`, then from the flat top carrying that
+/// stop.
 fn run_slope(max_iter: usize, label: &str) -> Result<OuterResult, EstimationError> {
     let (_cache_dir, session) = tmp_cache_session(label);
     let problem = OuterProblem::new(1)
@@ -128,13 +157,6 @@ fn run_slope(max_iter: usize, label: &str) -> Result<OuterResult, EstimationErro
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-50.0], array![6.0])
         .with_initial_rho(array![SLOPE_START])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(max_iter)
         .with_cache_session(session);
     let mut objective = problem.build_objective(
@@ -151,7 +173,7 @@ fn run_slope(max_iter: usize, label: &str) -> Result<OuterResult, EstimationErro
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    problem.run(&mut objective, label)
+    search_flat_top_carrying_the_capped_stop(&problem, &mut objective, label)
 }
 
 #[test]
@@ -176,7 +198,7 @@ fn a_declined_certified_optimum_is_reported_when_nothing_certifies_in_its_place_
         panic!("expected the typed dominated-plateau refusal, got {error}");
     };
     assert_eq!(kind, DominanceRefusalKind::DominanceUnresolved);
-    // The declined optimum is the neutral seed, certified where the knee is flat to roundoff.
+    // The declined optimum is the flat top, certified where the knee is flat to roundoff.
     assert_eq!(plateau_rho, vec![0.0]);
     assert_eq!(plateau_value.to_bits(), slope_value(0.0).to_bits());
     // The checkpoint the terminal certificate refused is on the slope, off the declared bound.
@@ -211,7 +233,7 @@ fn a_declined_certified_optimum_is_reported_when_nothing_certifies_in_its_place_
 fn a_continuation_that_certifies_publishes_after_the_decline_2953() {
     // The same search without a binding budget certifies the centre, and its iteration count
     // sizes a budget that stops the first search one iteration short of it.
-    let calibration = run_well(200, "dominated plateau calibration #2953")
+    let calibration = run_well(200, false, "dominated plateau calibration #2953")
         .expect("an unbounded search from inside the well certifies its centre");
     let unbounded_iterations = calibration.iterations;
     assert!(
@@ -220,7 +242,7 @@ fn a_continuation_that_certifies_publishes_after_the_decline_2953() {
          {unbounded_iterations}"
     );
     let budget = unbounded_iterations - 1;
-    let published = run_well(budget, "dominated plateau continuation #2953").unwrap_or_else(
+    let published = run_well(budget, true, "dominated plateau continuation #2953").unwrap_or_else(
         |error| {
             panic!(
                 "the search continued from the state that beat the declined optimum must \
@@ -233,12 +255,11 @@ fn a_continuation_that_certifies_publishes_after_the_decline_2953() {
         "the published optimum must be the well's centre; rho={:?}",
         published.rho
     );
-    // The first search stopped at `budget` iterations and the neutral seed took none, so a
-    // larger ledger is the continuation's own work.
+    // The carried stop's iterations were counted by the search that made it, and the flat
+    // top certified in none, so any iteration on the ledger is the continuation's own work.
     assert!(
-        published.iterations > budget,
-        "the published fit must come from the continuation, not the budget-capped first search: \
-         {} iteration(s) against a budget of {budget}",
+        published.iterations > 0,
+        "the published fit must come from the continuation, not the flat top: {} iteration(s)",
         published.iterations
     );
 }
@@ -310,13 +331,6 @@ fn ridge_problem(max_iter: usize, label: &str) -> (tempfile::TempDir, OuterProbl
         .with_fallback_policy(FallbackPolicy::Disabled)
         .with_bounds(array![-6.0, -6.0], array![6.0, 6.0])
         .with_initial_rho(array![WELL_START, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(max_iter)
         .with_cache_session(session);
     (cache_dir, problem)
@@ -408,9 +422,12 @@ fn a_declined_optimum_beaten_by_an_unescapable_strict_saddle_is_reported_by_kind
         Some(ArmedRefusal::TrialPoint),
         Arc::clone(&armed_refusals)
     );
-    let error = problem
-        .run(&mut objective, "ridge saddle refusal #2953")
-        .expect_err("a strict saddle whose escape cannot run must not publish");
+    let error = search_flat_top_carrying_the_capped_stop(
+        &problem,
+        &mut objective,
+        "ridge saddle refusal #2953",
+    )
+    .expect_err("a strict saddle whose escape cannot run must not publish");
     let EstimationError::DominatedCertifiedPlateau {
         kind,
         plateau_rho,
@@ -476,9 +493,9 @@ fn a_fatal_failure_of_the_saddle_escape_search_propagates_as_it_is_2953() {
         ridge_problem(unbounded_iterations - 1, "ridge fatal escape #2953");
     let mut objective =
         ridge_objective!(problem, Some(ArmedRefusal::Fatal), Arc::clone(&armed_refusals));
-    let error = problem
-        .run(&mut objective, "ridge fatal escape #2953")
-        .expect_err("a fatal evaluation failure must stop the fit");
+    let error =
+        search_flat_top_carrying_the_capped_stop(&problem, &mut objective, "ridge fatal escape #2953")
+            .expect_err("a fatal evaluation failure must stop the fit");
     assert!(
         error.is_fatal_outer_evaluation() && error.to_string().contains(ARMED_MARKER),
         "the escape search's fatal failure must be the refusal, not an older certification \
@@ -531,8 +548,8 @@ fn reentry_refusal(state: &mut ReentryState, rho: &Array1<f64>) -> Result<(), Es
     Ok(())
 }
 
-/// The well from `REENTRY_START` under `max_iter`, the neutral seed next in the cascade, with
-/// its analytic curvature declared. `prefer_gradient_only` makes the first attempt BFGS, and
+/// The well from `REENTRY_START` under `max_iter`, with its analytic curvature
+/// declared. `prefer_gradient_only` makes the first attempt BFGS, and
 /// `fallback` decides whether ARC on the declared curvature follows it (#2898).
 fn reentry_problem(
     max_iter: usize,
@@ -548,13 +565,6 @@ fn reentry_problem(
         .with_fallback_policy(fallback)
         .with_bounds(array![-6.0], array![6.0])
         .with_initial_rho(array![REENTRY_START])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(max_iter)
         .with_cache_session(session);
     (cache_dir, problem)
@@ -619,9 +629,12 @@ fn a_checkpoint_that_cannot_be_re_evaluated_still_declines_the_optimum_it_beats_
         "re-entry refusal #2953",
     );
     let mut objective = reentry_objective!(problem, usize::MAX, Arc::clone(&refusals));
-    let error = problem
-        .run(&mut objective, "re-entry refusal #2953")
-        .expect_err(
+    let error = search_flat_top_carrying_the_capped_stop(
+        &problem,
+        &mut objective,
+        "re-entry refusal #2953",
+    )
+    .expect_err(
             "a certified optimum that a stored checkpoint beats must not publish because the \
              checkpoint cannot be re-evaluated",
         );
@@ -695,9 +708,12 @@ fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() 
         "re-entry continuation #2953",
     );
     let mut objective = reentry_objective!(problem, 1, Arc::clone(&refusals));
-    let published = problem
-        .run(&mut objective, "re-entry continuation #2953")
-        .unwrap_or_else(|error| {
+    let published = search_flat_top_carrying_the_capped_stop(
+        &problem,
+        &mut objective,
+        "re-entry continuation #2953",
+    )
+    .unwrap_or_else(|error| {
             panic!(
                 "the ARC attempt certifies the well's centre, below the refused checkpoint, and \
                  must publish: {error}"
@@ -714,17 +730,22 @@ fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() 
         "the BFGS attempt's dominance re-evaluation must have been the one refusal"
     );
     let Some(record) = published.dominated_plateau.as_ref() else {
-        panic!("the BFGS attempt's declined optimum must ride on the published result");
+        panic!("a declined optimum must ride on the published result");
     };
-    assert_eq!(record.plateau_rho.to_vec(), vec![0.0]);
+    // Both attempts start on the flat top and certify it there, and both are declined: the
+    // BFGS attempt on the checkpoint it could not re-evaluate, the ARC attempt on the same
+    // checkpoint re-evaluated. The lower of the two declined optima rides on the result, which
+    // is the ARC attempt's, whose first step moved it a little way down the flat top's residual
+    // slope.
     assert!(
-        matches!(
-            &record.continuation,
-            DominanceContinuationStop::Failed { error }
-                if error.contains("re-evaluating the checkpoint at its own rho was refused")
-        ),
-        "the BFGS attempt must have declined on the checkpoint it could not re-evaluate: {}",
-        record.continuation
+        record.plateau_rho[0].abs() < WIDTH
+            && record.plateau_value.to_bits() == well_value(record.plateau_rho[0]).to_bits()
+            && record.gap > DEPTH / 2.0,
+        "the declined optimum must be the flat top, a well's depth above the checkpoint: rho \
+         {:?} value {:e} gap {:e}",
+        record.plateau_rho,
+        record.plateau_value,
+        record.gap,
     );
 }
 
@@ -732,10 +753,11 @@ fn a_later_attempt_that_certifies_below_the_refused_checkpoint_publishes_2953() 
 // under a shallow bowl centred at the neutral seed, so the flat top is a genuine local minimum that
 // every certificate accepts. The objective refuses once, as an infeasible trial, a derivative
 // evaluation at a point it evaluated before its latest reset; value-only evaluations always price.
-// So the dominance re-evaluation of the checkpoint prices it, and the continuation's first step from
-// that checkpoint is refused. The continuation's cascade then certifies the bowl's minimum: the very
-// optimum it was started to replace. Below `SECOND_ORDER_EDGE` every second-order evaluation is
-// refused as well, so an ARC attempt cannot search the well either.
+// So the dominance re-evaluation of the checkpoint prices it, and the continuation's start at that
+// checkpoint is refused. The continuation carries the checkpoint as the state it is judged against,
+// so its stop is that checkpoint and never the bowl's minimum: the very optimum it was started to
+// replace. Below `SECOND_ORDER_EDGE` every second-order evaluation is refused as well, so an ARC
+// attempt cannot search the well either.
 
 /// The bowl's curvature: small against the well's, so the well's centre stays far below the bowl's
 /// minimum, and positive, so the bowl's minimum certifies at every order.
@@ -881,7 +903,7 @@ fn run_continuation_fixture(
         Arc::clone(&reentry_refusals),
         Arc::clone(&second_order_refusals)
     );
-    let outcome = problem.run(&mut objective, label);
+    let outcome = search_flat_top_carrying_the_capped_stop(&problem, &mut objective, label);
     Ok(ContinuationRun {
         outcome,
         reentry_refusals: reentry_refusals.load(Ordering::Relaxed),
@@ -901,12 +923,13 @@ fn a_continuation_cannot_publish_the_optimum_it_was_started_to_replace_2953() {
     let run = run_continuation_fixture(FallbackPolicy::Disabled, "continuation dominance #2953")
         .expect("the continuation fixture's calibration certifies the well's centre");
     let error = run.outcome.expect_err(
-        "the continuation re-certified the bowl's minimum it was started to replace, and that \
-         minimum must not publish over the state the continuation started from",
+        "the bowl's minimum the continuation was started to replace must not publish over the \
+         state the continuation started from",
     );
     let EstimationError::DominatedCertifiedPlateau {
         plateau_rho,
         incumbent_rho,
+        incumbent_value,
         continuation,
         ..
     } = error
@@ -922,13 +945,19 @@ fn a_continuation_cannot_publish_the_optimum_it_was_started_to_replace_2953() {
         "the checkpoint that beat the bowl's minimum must be the capped search's, inside the \
          well; rho={incumbent_rho:?}"
     );
-    assert!(
-        continuation.starts_with("declined another certified optimum at objective"),
-        "the continuation must have declined the bowl's minimum it certified again: {continuation}"
+    // The continuation's start was refused, so the state it stopped at is the checkpoint it
+    // carried, not anything it could have reached by leaving it.
+    assert_eq!(
+        continuation,
+        DominanceContinuationStop::Exhausted {
+            final_value: incumbent_value
+        }
+        .to_string(),
+        "the continuation must stop at the checkpoint it started from"
     );
     assert_eq!(
         run.reentry_refusals, 1,
-        "the continuation's first step from the checkpoint must have been the one re-entry refusal"
+        "the continuation's start at the checkpoint must have been the one re-entry refusal"
     );
 }
 

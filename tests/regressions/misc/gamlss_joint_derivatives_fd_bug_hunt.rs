@@ -152,7 +152,6 @@ fn gamlss_joint_derivatives_match_finite_difference() {
                 wiggle_degree: 3,
                 policy: ResourcePolicy::default_library(),
                 frozen_warp_design: Some(std::sync::Arc::new(z.clone())),
-                continuation: false,
             }),
             vec![spec("eta", &x), spec("wiggle", &z)],
             array![0.05, 0.02],

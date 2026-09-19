@@ -2255,7 +2255,6 @@ pub(crate) fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
         // convergence criterion to be reached deterministically.
         inner_max_cycles: 48,
         inner_tol: 1e-4,
-        outer_max_iter: 3,
         outer_tol: 1e-4,
         ..BlockwiseFitOptions::default()
     }
@@ -4208,7 +4207,6 @@ impl Zz2155Problem {
         wiggle_degree: degree,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         frozen_warp_design: None,
-        continuation: false,
     };
     let mut frozen_eta = eta0.clone();
     let mut beta_eta = beta_eta0.clone();
