@@ -141,6 +141,9 @@ scores = cross_val_score(
 )
 ```
 
+`n_jobs=-1` runs the folds in parallel processes, each with its own full-width
+thread pool; see [Threads](threads.md) for how that shares the CPUs.
+
 ## Grid search
 
 ```python

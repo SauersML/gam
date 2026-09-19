@@ -143,5 +143,6 @@ nav:
     - Exceptions: exceptions.md
     - Cookbook: cookbook.md
     - GPU acceleration: gpu_acceleration.md
+    - Threads: threads.md
     - REML scaling: reml_scaling.md
   - Changelog: changelog.md
