@@ -140,6 +140,39 @@ def test_import_gamfit_does_not_load_research_modules_or_matplotlib() -> None:
     assert out.stdout.strip() == ""
 
 
+def test_every_module_imports_first_in_a_fresh_interpreter() -> None:
+    # A facade re-exporting a private module that imports the facade back only
+    # breaks when the private module is the first one imported.
+    probe = (
+        "import importlib, sys\n"
+        "try:\n"
+        "    importlib.import_module(sys.argv[1])\n"
+        "except ImportError as exc:\n"
+        "    missing = exc if isinstance(exc, ModuleNotFoundError) else exc.__cause__\n"
+        "    if not (isinstance(missing, ModuleNotFoundError)\n"
+        "            and missing.name.split('.')[0] in {'jax', 'torch'}):\n"
+        "        raise\n"
+    )
+    modules = sorted(
+        f"gamfit.{path.stem}" for path in PACKAGE_DIR.glob("*.py") if path.stem != "__init__"
+    )
+    procs = {
+        name: subprocess.Popen(
+            [sys.executable, "-c", probe, name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for name in modules
+    }
+    failures = {}
+    for name, proc in procs.items():
+        _, err = proc.communicate()
+        if proc.returncode != 0:
+            failures[name] = err.strip().splitlines()[-1]
+    assert not failures
+
+
 def test_plot_is_a_submodule_that_imports_without_matplotlib(monkeypatch: typing.Any) -> None:
     for name in [m for m in sys.modules if m == "matplotlib" or m.startswith("matplotlib.")]:
         monkeypatch.delitem(sys.modules, name)

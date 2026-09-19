@@ -18,7 +18,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
-from . import topology
 from ._api import fit
 from ._binding import rust_module
 from ._compare import _extract_reml_score_raw
@@ -567,6 +566,9 @@ def _default_candidates(feature_dim: int) -> list[_Candidate]:
 
 
 def _default_topology_candidate(name: str, feature_dim: int) -> _Candidate:
+    # `gamfit.topology` re-exports this module, so it is bound at call time.
+    from . import topology
+
     if name == "euclidean":
         return _Candidate("euclidean", topology.EuclideanPatch(d=feature_dim, name="x"))
     if name == "circle":
