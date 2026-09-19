@@ -7,7 +7,7 @@
 //! not.
 
 use super::*;
-use crate::inference::full_conformal::GaussianRemlRhoResponse;
+use crate::inference::full_conformal::test_support::GaussianRemlRhoResponse;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, StudentT, Uniform};
