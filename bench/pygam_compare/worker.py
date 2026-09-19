@@ -261,12 +261,14 @@ class GamfitAdapter(Adapter):
 
     def model_info(self) -> dict[str, Any]:
         summ = self.model.summary()
-        conv = getattr(summ, "convergence", None)
+        conv = json.loads(json.dumps(summ.convergence, default=str))
         return {
             "edf": None if summ.edf_total is None else float(summ.edf_total),
             "ncoef": None if summ.coefficients is None else len(summ.coefficients),
-            "iterations": summ.iterations,
-            "convergence": json.loads(json.dumps(conv, default=str)),
+            "outer_iterations": conv.get("outer_iterations"),
+            "inner_iterations": conv.get("inner_iterations"),
+            "certified": conv.get("certified"),
+            "convergence": conv,
         }
 
 
