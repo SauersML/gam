@@ -1001,6 +1001,101 @@ fn tensor_k_accepts_square_bracket_per_margin_list() {
     );
 }
 
+#[test]
+fn tensor_margin_sizes_split_the_budget_and_respect_each_margin_support() {
+    // Two continuous margins: the mgcv-like 7 x 7 pilot, then a doubled budget
+    // split as evenly as integers allow.
+    assert_eq!(tensor_margin_sizes(&[200, 200], 49), vec![7, 7]);
+    let doubled = tensor_margin_sizes(&[200, 200], 98);
+    assert_eq!(doubled.iter().product::<usize>(), 90);
+    assert!(doubled.iter().all(|&k| k == 9 || k == 10), "{doubled:?}");
+    // `te(season, hour)`: the 4-level margin cannot take its geometric share,
+    // so the headroom goes to `hour` until it too reaches its 24 values.
+    assert_eq!(tensor_margin_sizes(&[4, 24], 49), vec![4, 12]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 96), vec![4, 24]);
+    assert_eq!(tensor_margin_sizes(&[4, 24], 10_000), vec![4, 24]);
+}
+
+fn tensor_spec_for(ds: &Dataset, formula: &str) -> (Vec<usize>, TensorBSplineSpec) {
+    let parsed = parse_formula(formula).expect("parse tensor formula");
+    let mut notes = Vec::new();
+    let terms = build_termspec(&parsed.terms, ds, &ds.column_map(), &mut notes)
+        .expect("build tensor termspec");
+    let SmoothBasisSpec::TensorBSpline { feature_cols, spec } = &terms.smooth_terms[0].basis else {
+        panic!("{formula} must lower to TensorBSpline");
+    };
+    (feature_cols.clone(), spec.clone())
+}
+
+#[test]
+fn only_the_unsized_default_te_is_owned_by_the_adaptive_workflow() {
+    let ds = continuous_dataset(
+        &["y", "x", "z"],
+        (0..400)
+            .map(|i| {
+                let x = i as f64 / 399.0;
+                let z = ((i * 7) % 400) as f64 / 399.0;
+                vec![x.sin() + z.cos(), x, z]
+            })
+            .collect(),
+    );
+    let (_, default_te) = tensor_spec_for(&ds, "y ~ te(x, z)");
+    assert!(default_te.adaptive);
+    assert_eq!(adaptive_tensor_basis_dim(&default_te), Some(49));
+    for pinned in [
+        "y ~ te(x, z, k=7)",
+        "y ~ te(x, z, k=[7, 7])",
+        "y ~ te(x, z, bs=c('cr','cr'))",
+        "y ~ te(x, z, degree=[3, 3])",
+        "y ~ ti(x, z)",
+        "y ~ t2(x, z)",
+    ] {
+        let (_, spec) = tensor_spec_for(&ds, pinned);
+        assert!(
+            !spec.adaptive,
+            "{pinned} pins its basis and must not be regrown"
+        );
+        assert_eq!(adaptive_tensor_basis_dim(&spec), None, "{pinned}");
+    }
+}
+
+#[test]
+fn resizing_an_adaptive_te_rebuilds_its_quantile_cr_margins() {
+    let ds = continuous_dataset(
+        &["y", "season", "hour"],
+        (0..960)
+            .map(|i| {
+                let season = (i % 4) as f64 + 1.0;
+                let hour = ((i / 4) % 24) as f64;
+                vec![season + hour, season, hour]
+            })
+            .collect(),
+    );
+    let (cols, mut spec) = tensor_spec_for(&ds, "y ~ te(season, hour)");
+    let (total, caps) =
+        adaptive_tensor_resolution(&cols, &spec, ds.values.view()).expect("adaptive te");
+    assert_eq!((total, caps.clone()), (48, vec![4, 24]));
+    resize_adaptive_tensor_margins(&cols, &mut spec, ds.values.view(), 96).expect("resize");
+    assert!(spec.adaptive, "a regrown te keeps its adaptive provenance");
+    let dims: Vec<usize> = spec
+        .marginalspecs
+        .iter()
+        .map(|margin| match &margin.knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
+            other => panic!("default te margins are cr, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(dims, vec![4, 24]);
+    let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.marginalspecs[1].knotspec else {
+        unreachable!()
+    };
+    let expected = crate::basis::select_cr_knots(ds.values.column(2), 24).expect("cr knots");
+    assert_eq!(
+        knots, &expected,
+        "regrown margin re-places its value-knots at data quantiles"
+    );
+}
+
 /// #1776 / #1752: a bare doubly-cyclic tensor `te(x, z, bs=c('cc','cc'))`
 /// with NO explicit `period=` must build — each cyclic margin wraps on its
 /// own observed `[min, max]` data span (mirroring mgcv's `bs="cc"` and the

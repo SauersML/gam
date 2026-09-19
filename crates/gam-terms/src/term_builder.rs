@@ -3989,7 +3989,8 @@ pub(crate) fn build_smooth_basis(
                 validate_spline_degree(&format!("degree[{axis}]"), axis_degree(axis))?;
             }
             let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
-            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+            let small_data_floor = ds.values.nrows() <= 32 && smooth_coordinate_count >= 5;
+            if small_data_floor {
                 for (axis, k) in k_list.iter_mut().enumerate() {
                     *k = (*k).min(axis_degree(axis) + 2);
                 }
@@ -3997,10 +3998,11 @@ pub(crate) fn build_smooth_basis(
             if k_inferred {
                 inference_notes.inform(format!(
                     "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
-                     (dimension-aware tensor budget: total ∏k kept near the mgcv-te default \
-                     and within the data support, distributed geometrically across margins and \
-                     capped per margin by each column's resolution). \
-                     Override with k=<int> or k=[k0,k1,...].",
+                     (starting tensor budget: total ∏k near the mgcv-te default and within \
+                     the data support, distributed geometrically across margins and capped per \
+                     margin by each column's distinct values; a formula-default te() then \
+                     grows while its converged fit is saturated or fails the basis-adequacy \
+                     test). Override with k=<int> or k=[k0,k1,...].",
                     k_list,
                     vars.join(",")
                 ));
@@ -4282,6 +4284,20 @@ pub(crate) fn build_smooth_basis(
             // shrinkable by default, so REML can recover an unsupported surface
             // as zero. Explicit `double_penalty=false` remains the MLE opt-out.
             let tensor_double_penalty = smooth_double_penalty;
+            // The workflow owns the resolution of a `te(...)` nobody sized: the
+            // per-margin `k` was inferred, every margin is the default cr
+            // margin family, and nothing (degree, penalty order, knot
+            // placement, domain, period, t2 decomposition) pins the knot sets.
+            let adaptive = k_inferred
+                && !small_data_floor
+                && matches!(kind, SmoothKind::Te)
+                && type_opt.as_str() != "t2"
+                && per_axis_bs.iter().all(Option::is_none)
+                && requested_degrees.iter().all(Option::is_none)
+                && requested_penalty_orders.iter().all(Option::is_none)
+                && requested_knot_placement.is_none()
+                && domains.iter().all(Option::is_none)
+                && !periodic_axes.iter().any(|&p| p);
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: canon_cols,
                 spec: TensorBSplineSpec {
@@ -4305,6 +4321,7 @@ pub(crate) fn build_smooth_basis(
                     } else {
                         TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
                     },
+                    adaptive,
                 },
             })
         }
@@ -4721,83 +4738,90 @@ pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -
     (default_internal + degree + 1).min(CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1))
 }
 
-/// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
+/// Pilot per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
 ///
-/// The 1-D heuristic [`heuristic_knots_for_column`] is calibrated for an
-/// *additive* margin: a well-resolved column asks for the lean univariate
-/// default (≈12 basis functions, the mgcv-like cap of 8 internal knots; see
-/// gam#1680), which is sensible for a single `s(x)` term.
-/// A tensor product, however, multiplies the per-margin sizes:
-/// `p = ∏_d k_d`. Reusing the 1-D rule per margin makes `p` explode with the
-/// tensor dimension — a 3-D `te(x,y,z)` at the 1-D ceiling of 12/margin is
-/// `12³ ≈ 1728` columns, and every REML evaluation pays an O(p³) dense
-/// penalty reparameterization (the full-tensor sum-to-zero constraint is not
-/// Kronecker-factorable), turning model selection over tensor candidates into
-/// a multi-minute single-threaded stall (gam#813). It also requests far more
-/// coefficients than the data can identify whenever `p ≫ n`.
+/// A tensor product multiplies the per-margin sizes, `p = ∏_d k_d`, so reusing
+/// the lean 1-D default per margin makes `p` explode with the tensor dimension
+/// (a 3-D `te(x,y,z)` at 12/margin is `12³ ≈ 1728` columns, each REML
+/// evaluation paying an O(p³) dense penalty reparameterization; gam#813). The
+/// pilot therefore budgets the *total* column count — mgcv's small `te`
+/// default (`7²`, `5³`, `4^d`), never beyond a fraction of `n` — and splits it
+/// geometrically across the margins with [`tensor_margin_sizes`].
 ///
-/// mgcv's `te(...)` uses a small per-margin default (`k = 5`, i.e. `5^d`).
-/// We match that spirit while staying data-adaptive: budget the *total* tensor
-/// column count `p_target` and distribute it geometrically across the margins
-/// so `∏ k_d ≈ p_target`, never asking a margin for more functions than its
-/// own unique values (and the data set) can support.
+/// This is only the *starting* resolution of the formula default `te(...)`:
+/// like the default `s(x)`, the standard formula workflow regrows the margins
+/// from a doubled total budget whenever the converged fit's own adequacy
+/// evidence says the pilot is too coarse (see
+/// [`TensorBSplineSpec::adaptive`] and [`resize_adaptive_tensor_margins`]).
 fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
     let d = cols.len().max(1);
-    let degree = DEFAULT_BSPLINE_DEGREE;
-    let min_k = degree + 2; // smallest margin that carries a roughness penalty
     let n = ds.values.nrows();
-
-    // Per-margin 1-D ceiling: never request more basis functions than the
-    // margin's own resolution (unique values) supports. This caps each axis
-    // independently before the joint budget is applied.
-    let per_margin_cap: Vec<usize> = cols
-        .iter()
-        .map(|&c| heuristic_knots_for_column(ds.values.column(c)).max(min_k))
-        .collect();
-
-    // Total-basis budget. A tensor with ∏k ≫ n coefficients is rank-deficient
-    // and pure REML cost; cap the product at a generous fraction of n while
-    // honoring mgcv's small default for the common small-d case. The budget
-    // grows with n but the geometric split below keeps each margin modest.
-    //   d=2 → up to ~7²=49 (mgcv-`te`-like), d=3 → ~5³=125, larger d shrinks
-    // per-margin further so the product never blows past the data support.
+    let min_k = tensor_margin_min_k();
     let mgcv_like_per_margin = match d {
         2 => 7usize,
         3 => 5usize,
         _ => 4usize,
     };
-    let mgcv_like_total = (mgcv_like_per_margin as f64).powi(d as i32);
-    let data_budget = (n as f64) * 0.8;
+    let mgcv_like_total = mgcv_like_per_margin.saturating_pow(d as u32);
+    let data_budget = ((n as f64) * 0.8) as usize;
     let p_target = mgcv_like_total
-        .max(min_k.pow(d as u32) as f64)
+        .max(min_k.saturating_pow(d as u32))
         .min(data_budget);
-
-    // Geometric per-margin target so ∏k ≈ p_target, then clamp each margin to
-    // its own 1-D resolution cap and the difference-penalty floor.
-    let geo_per_margin = p_target.powf(1.0 / d as f64).round() as usize;
-    let unclamped: Vec<usize> = per_margin_cap
+    let caps: Vec<usize> = cols
         .iter()
-        .map(|&cap| geo_per_margin.clamp(min_k, cap))
+        .map(|&c| tensor_margin_support(ds.values.column(c)))
         .collect();
+    tensor_margin_sizes(&caps, p_target)
+}
 
-    // The per-margin clamps can pull some axes below `geo_per_margin` (a
-    // low-resolution column), leaving headroom in the joint budget. Redistribute
-    // that headroom to the margins that can still grow, so the realized ∏k stays
-    // close to p_target instead of systematically under-shooting it.
-    let mut k_list = unclamped;
+/// Smallest default tensor margin that carries a roughness penalty beyond its
+/// null space: a cubic margin with one interior degree of freedom.
+fn tensor_margin_min_k() -> usize {
+    DEFAULT_BSPLINE_DEGREE + 2
+}
+
+/// The largest basis a default tensor margin on `col` can identify: one
+/// function per distinct covariate value (a cr margin places one value-knot per
+/// function, and a function observed at `u` distinct values has at most `u`
+/// identifiable values), floored at the 2-function linear margin every tensor
+/// axis carries.
+pub(crate) fn tensor_margin_support(col: ArrayView1<'_, f64>) -> usize {
+    unique_count_column(col).max(2)
+}
+
+/// Per-margin basis sizes `k_d` whose product stays within `budget`, each
+/// margin inside `[min(min_k, cap_d), cap_d]` (`cap_d` is the margin's
+/// identifiable support, [`tensor_margin_support`]).
+///
+/// The budget is split geometrically (the integer `d`-th root), then any
+/// headroom left by a margin whose support is below the geometric share goes
+/// to the margins that can still grow, one function at a time toward the axis
+/// with the most remaining support, while `∏ k_d ≤ budget`. The only way the
+/// product exceeds the budget is the per-margin floor, which a tensor margin
+/// cannot go below.
+pub fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
+    let d = caps.len().max(1);
+    let min_k = tensor_margin_min_k();
+    let product = |k: &[usize]| -> usize { k.iter().fold(1usize, |p, &k| p.saturating_mul(k)) };
+    let mut geo = ((budget.max(1) as f64).powf(1.0 / d as f64).round() as usize).max(1);
+    while geo > 1 && geo.saturating_pow(d as u32) > budget {
+        geo -= 1;
+    }
+    while (geo + 1).saturating_pow(d as u32) <= budget {
+        geo += 1;
+    }
+    let mut k_list: Vec<usize> = caps
+        .iter()
+        .map(|&cap| geo.min(cap).max(min_k.min(cap)))
+        .collect();
     loop {
-        let product: f64 = k_list.iter().map(|&k| k as f64).product();
-        if product >= p_target {
-            break;
-        }
-        // Grow the axis with the most remaining headroom (cap − current),
-        // breaking ties toward the largest cap. Stop when none can grow.
+        let current = product(&k_list);
         let Some(idx) = k_list
             .iter()
-            .zip(per_margin_cap.iter())
+            .zip(caps.iter())
             .enumerate()
-            .filter(|&(_, (k, cap))| k < cap)
-            .max_by_key(|&(_, (k, cap))| (cap - k, *cap))
+            .filter(|&(_, (&k, &cap))| k < cap && current / k * (k + 1) <= budget)
+            .max_by_key(|&(_, (&k, &cap))| (cap - k, cap))
             .map(|(i, _)| i)
         else {
             break;
@@ -4805,6 +4829,90 @@ fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
         k_list[idx] += 1;
     }
     k_list
+}
+
+/// Realized basis dimension of one tensor margin.
+fn tensor_margin_dim(margin: &BSplineBasisSpec) -> Option<usize> {
+    match &margin.knotspec {
+        BSplineKnotSpec::NaturalCubicRegression { knots } => Some(knots.len()),
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        } => Some(num_internal_knots + margin.degree + 1),
+        _ => None,
+    }
+}
+
+/// Total basis dimension `∏ k_d` of a formula-default (`adaptive`) tensor
+/// smooth, or `None` when the spec is not one the adaptive workflow owns.
+pub fn adaptive_tensor_basis_dim(spec: &TensorBSplineSpec) -> Option<usize> {
+    if !spec.adaptive {
+        return None;
+    }
+    spec.marginalspecs.iter().try_fold(1usize, |total, margin| {
+        Some(total.saturating_mul(tensor_margin_dim(margin)?))
+    })
+}
+
+/// Total basis dimension `∏ k_d` and per-margin identifiable support of a
+/// formula-default (`adaptive`) tensor smooth on `data`, or `None` when the
+/// spec is not one the adaptive workflow owns.
+///
+/// A data-quantile cr margin can grow to its covariate's distinct-value count;
+/// a low-cardinality margin that fell back to the linear B-spline stays at its
+/// realized size.
+pub fn adaptive_tensor_resolution(
+    feature_cols: &[usize],
+    spec: &TensorBSplineSpec,
+    data: ndarray::ArrayView2<'_, f64>,
+) -> Option<(usize, Vec<usize>)> {
+    let total = adaptive_tensor_basis_dim(spec)?;
+    if feature_cols.len() != spec.marginalspecs.len() {
+        return None;
+    }
+    let mut caps = Vec::with_capacity(feature_cols.len());
+    for (&col, margin) in feature_cols.iter().zip(spec.marginalspecs.iter()) {
+        if col >= data.ncols() {
+            return None;
+        }
+        let dim = tensor_margin_dim(margin)?;
+        caps.push(match margin.knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { .. } => {
+                tensor_margin_support(data.column(col)).max(dim)
+            }
+            _ => dim,
+        });
+    }
+    Some((total, caps))
+}
+
+/// Regrow a formula-default tensor smooth to the total basis `budget`: margin
+/// sizes are re-derived by [`tensor_margin_sizes`] from the margins'
+/// identifiable support and each data-quantile cr margin re-places its
+/// value-knots at the new size. Fixed (low-cardinality) margins keep their
+/// realized size. A spec the adaptive workflow does not own is untouched.
+pub fn resize_adaptive_tensor_margins(
+    feature_cols: &[usize],
+    spec: &mut TensorBSplineSpec,
+    data: ndarray::ArrayView2<'_, f64>,
+    budget: usize,
+) -> Result<(), String> {
+    let Some((_, caps)) = adaptive_tensor_resolution(feature_cols, spec, data) else {
+        return Ok(());
+    };
+    let sizes = tensor_margin_sizes(&caps, budget);
+    for ((&col, margin), k) in feature_cols
+        .iter()
+        .zip(spec.marginalspecs.iter_mut())
+        .zip(sizes)
+    {
+        if let BSplineKnotSpec::NaturalCubicRegression { knots } = &mut margin.knotspec
+            && k != knots.len()
+        {
+            *knots =
+                crate::basis::select_cr_knots(data.column(col), k).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
