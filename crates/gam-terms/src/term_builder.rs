@@ -375,6 +375,35 @@ pub(crate) fn marginal_slope_z_alias_is_live(col_map: &HashMap<String, usize>, z
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
 
+/// The fixed categorical factor a bare categorical `+ g` or an explicit
+/// `factor(g)` lowers to: R's `factor()` convention — treatment coding (L-1
+/// columns against the reference level, which the intercept absorbs), no
+/// penalty and so no smoothing parameter, and an unseen level at predict is a
+/// schema mismatch rather than a silent fold onto the reference (#2102/#2137).
+fn fixed_factor_term(name: &str, feature_col: usize) -> RandomEffectTermSpec {
+    RandomEffectTermSpec {
+        name: name.to_string(),
+        feature_col,
+        drop_first_level: true,
+        penalized: false,
+        frozen_levels: None,
+        lenient_unseen: false,
+    }
+}
+
+/// A categorical column cannot be the argument of a term that treats its
+/// input as a numeric axis: the category codes would be read as positions on
+/// a line, silently fitting an arbitrary order. Point the user at the
+/// categorical spellings instead.
+fn categorical_in_numeric_term_error(term: &str, column: &str) -> TermBuilderError {
+    TermBuilderError::incompatible_config(format!(
+        "{term} treats its arguments as numeric axes, but column '{column}' is \
+         categorical; use factor({column}) for a fixed categorical effect, \
+         group({column}) for a random effect, or s(x, {column}, bs=\"fs\") for a \
+         per-level smooth of a numeric x"
+    ))
+}
+
 pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
@@ -430,6 +459,9 @@ pub fn build_termspec(
                     .to_string()
                 })?;
                 if *explicit {
+                    if matches!(auto_kind, ColumnKindTag::Categorical) {
+                        return Err(categorical_in_numeric_term_error("linear()", name));
+                    }
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
                         feature_col: col,
@@ -464,22 +496,13 @@ pub fn build_termspec(
                         ColumnKindTag::Categorical => {
                             if coefficient_min.is_some() || coefficient_max.is_some() {
                                 return Err(TermBuilderError::incompatible_config(format!(
-                                    "coefficient constraints are not supported for categorical auto-random-effect term '{name}'; use group({name}) or an unconstrained numeric term"
+                                    "coefficient constraints are not supported for categorical factor term '{name}'; use an unconstrained numeric term"
                                 )));
                             }
-                            random_terms.push(RandomEffectTermSpec {
-                                name: name.clone(),
-                                feature_col: col,
-                                drop_first_level: false,
-                                penalized: true,
-                                frozen_levels: None,
-                                // A BARE categorical main effect (`+ g`) is a FIXED
-                                // parametric factor. Although it is auto-promoted to
-                                // a penalized random block above, an *unseen* level
-                                // at predict must raise a schema mismatch rather than
-                                // be mapped to the factor's centering point (#2102).
-                                lenient_unseen: false,
-                            });
+                            // A BARE categorical main effect (`+ g`) is a FIXED
+                            // parametric factor, the same term `factor(g)` spells
+                            // out explicitly.
+                            random_terms.push(fixed_factor_term(name, col));
                         }
                     }
                 }
@@ -519,10 +542,7 @@ pub fn build_termspec(
                     frozen_function_mass: None,
                 });
             }
-            ParsedTerm::RandomEffect {
-                name,
-                lenient_unseen,
-            } => {
+            ParsedTerm::RandomEffect { name } => {
                 let col = resolve_col(col_map, name)?;
                 random_terms.push(RandomEffectTermSpec {
                     name: name.clone(),
@@ -530,15 +550,15 @@ pub fn build_termspec(
                     drop_first_level: false,
                     penalized: true,
                     frozen_levels: None,
-                    // Unseen-level policy is fixed by the wrapper the user wrote
-                    // (`formula_dsl`): a genuine random effect
-                    // (`group(g)`/`re(g)`/`s(g, bs="re")`) shrinks a held-out
-                    // group to the population mean and so tolerates unseen
-                    // levels; a fixed `factor(g)`, like a bare `+ g` categorical
-                    // main effect, must reject an unseen level rather than
-                    // collapse onto the centering point (#2137/#2102).
-                    lenient_unseen: *lenient_unseen,
+                    // A genuine random effect (`group(g)`/`re(g)`/`s(g,
+                    // bs="re")`) shrinks a held-out group to the population
+                    // mean and so tolerates unseen levels (#2137/#2102).
+                    lenient_unseen: true,
                 });
+            }
+            ParsedTerm::Factor { name } => {
+                let col = resolve_col(col_map, name)?;
+                random_terms.push(fixed_factor_term(name, col));
             }
             ParsedTerm::Smooth {
                 label,
@@ -610,21 +630,20 @@ pub fn build_termspec(
                     })? {
                         ColumnKindTag::Categorical => {
                             let levels = encoded_levels_for_column(ds, ColIdx::new(by_col));
-                            // A penalized random block for this factor already
-                            // owns its full level offsets when EITHER an explicit
-                            // `group(factor)` appears, OR a *bare* categorical
-                            // `+ factor` does — the latter is auto-promoted to a
-                            // penalized random-effect block (see the
-                            // `ParsedTerm::Linear` / `ColumnKindTag::Categorical`
-                            // arm above, `penalized: true`). Both representations
-                            // carry the same per-level offsets, so #1457: the
-                            // `by=` branch must NOT additionally add its own
-                            // unpenalized treatment-coded main effect, which would
-                            // double-represent the factor (two `g` design blocks +
-                            // a spurious extra smoothing parameter).
-                            let penalized_group_owner_present =
+                            // The factor's level offsets are already owned when
+                            // the formula carries an explicit main effect for it:
+                            // a random effect `group(factor)`, a fixed
+                            // `factor(factor)`, or a *bare* categorical `+ factor`
+                            // (the same fixed factor; see the `ParsedTerm::Linear`
+                            // / `ColumnKindTag::Categorical` arm above). #1457:
+                            // the `by=` branch must NOT additionally add its own
+                            // main effect, which would double-represent the
+                            // factor (two `g` design blocks, and for a penalized
+                            // block a spurious extra smoothing parameter).
+                            let main_effect_owner_present =
                                 terms.iter().any(|other| match other {
-                                    ParsedTerm::RandomEffect { name, .. } => name == &by_name,
+                                    ParsedTerm::RandomEffect { name }
+                                    | ParsedTerm::Factor { name } => name == &by_name,
                                     ParsedTerm::Linear {
                                         name,
                                         explicit: false,
@@ -637,17 +656,15 @@ pub fn build_termspec(
                                     _ => false,
                                 });
                             // Add the factor main effect for a standalone
-                            // factor-by smooth, unless the same factor already has
-                            // an explicit `group(factor)` term OR a bare categorical
-                            // `+ factor` that was auto-promoted to a penalized
-                            // random block (#1457), which already owns the level
-                            // offsets. The main effect is that same penalized
-                            // full-level block, the one a bare `+ factor` lowers
-                            // to: its REML variance can shrink every offset to the
-                            // null (SPEC rules 12, 14), where an unpenalized
-                            // treatment-coded effect could never be removed.
+                            // factor-by smooth, unless the formula already names
+                            // one for the same factor (#1457). The implicit main
+                            // effect is a penalized full-level block: the user did
+                            // not ask for a fixed factor, and its REML variance can
+                            // shrink every offset to the null (SPEC rules 12, 14).
+                            // A user who wants the unpenalized treatment-coded
+                            // main effect writes `s(x, by=g) + g` (mgcv's form).
                             if !random_terms.iter().any(|rt| rt.name == by_name)
-                                && !penalized_group_owner_present
+                                && !main_effect_owner_present
                             {
                                 random_terms.push(RandomEffectTermSpec {
                                     name: by_name.clone(),
@@ -655,9 +672,9 @@ pub fn build_termspec(
                                     drop_first_level: false,
                                     penalized: true,
                                     frozen_levels: None,
-                                    // A FIXED factor main effect, like a bare `+ g`:
-                                    // an unseen level is out of contract and must
-                                    // raise, not center (#2102).
+                                    // An unseen level of the `by=` factor has no
+                                    // level smooth either, so it is out of
+                                    // contract and must raise, not center (#2102).
                                     lenient_unseen: false,
                                 });
                             }
@@ -768,16 +785,17 @@ pub fn build_termspec(
                 // forms stay correct.
                 //
                 // A main effect for var V is a `Linear`/`BoundedLinear`/
-                // `RandomEffect` ParsedTerm whose referenced name is V (an
-                // auto-detected categorical `Linear` becomes a RandomEffect main
-                // effect; either spelling counts). We only treat such standalone
+                // `RandomEffect`/`Factor` ParsedTerm whose referenced name is V
+                // (an auto-detected categorical `Linear` becomes a fixed-factor
+                // main effect; either spelling counts). We only treat such standalone
                 // main-effect terms as parents — not V appearing inside another
                 // interaction.
                 let main_effect_present = |target: &str| -> bool {
                     terms.iter().any(|other| match other {
                         ParsedTerm::Linear { name, .. }
                         | ParsedTerm::BoundedLinear { name, .. }
-                        | ParsedTerm::RandomEffect { name, .. } => name == target,
+                        | ParsedTerm::RandomEffect { name }
+                        | ParsedTerm::Factor { name } => name == target,
                         _ => false,
                     })
                 };
@@ -2448,6 +2466,19 @@ pub(crate) fn build_smooth_basis(
 
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
+
+    // Only the factor-smooth family (fs/sz/re) consumes a categorical column
+    // as a grouping factor. Every other smooth places its inputs on numeric
+    // axes, where category codes would silently fit an arbitrary level order.
+    if !matches!(type_opt.as_str(), "fs" | "sz" | "re")
+        && let Some((var, _)) = vars.iter().zip(cols.iter()).find(|(_, col)| {
+            matches!(ds.column_kinds.get(**col), Some(ColumnKindTag::Categorical))
+        })
+    {
+        return Err(
+            categorical_in_numeric_term_error(&format!("a '{type_opt}' smooth"), var).to_string(),
+        );
+    }
 
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         if type_opt == "re" {

@@ -1341,25 +1341,37 @@ pub(crate) const fn default_pca_chunk_size() -> usize {
     4096
 }
 
-/// Random-effects term specification.
+/// Categorical-term specification: a random effect or a fixed factor.
 ///
 /// The selected feature column is interpreted as a categorical grouping variable.
-/// The term contributes a one-hot dummy block with an identity penalty on group
-/// coefficients, equivalent to i.i.d. Gaussian random effects.
+/// Two materializations share this spec:
+///
+/// * a **random effect** (`group(g)`/`re(g)`/`s(g, bs="re")`): a full one-hot
+///   block (`drop_first_level == false`) under an identity ridge whose strength
+///   is REML-estimated (`penalized == true`), equivalent to i.i.d. Gaussian
+///   random effects;
+/// * a **fixed factor** (`factor(g)` or a bare categorical `+ g`): a
+///   treatment-coded block — L-1 columns against a reference level absorbed by
+///   the intercept (`drop_first_level == true`) — with no penalty and hence no
+///   smoothing parameter (`penalized == false`), R's `factor()` convention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// If true, drop the lexicographically first group level to use treatment coding.
-    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
+    /// If true, use treatment coding: the levels are ordered by value and the
+    /// first (the smallest code — for a string factor the first label in
+    /// natural sort order) is the reference level with no column.
+    /// If false, keep all levels (full one-hot block, identifiable under ridge).
     pub drop_first_level: bool,
     /// If true, add a ridge penalty and estimate this block as a random effect.
     /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
     /// fixed categorical main effect.  The default preserves older saved models.
     #[serde(default = "default_random_effect_penalized")]
     pub penalized: bool,
-    /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
-    /// When present, prediction uses exactly these columns to avoid design drift.
+    /// Optional level vocabulary captured at fit time. When present, prediction
+    /// uses exactly these levels to avoid design drift. With treatment coding
+    /// (`drop_first_level`) the first entry is the reference level, which is
+    /// part of the vocabulary but owns no column; see [`Self::column_levels`].
     #[serde(default)]
     pub frozen_levels: Option<Vec<u64>>,
     /// Whether an *unseen* level of this grouping column is tolerated at predict
@@ -1368,10 +1380,9 @@ pub struct RandomEffectTermSpec {
     ///
     /// Only a genuine random effect — `group(g)`/`re(g)`/`s(g, bs="re")` — is
     /// lenient: the held-out-group policy is a deliberate contract. A FIXED
-    /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
-    /// materialized as a penalized one-hot block, must raise on an
-    /// out-of-vocabulary level at predict rather than being silently mapped to
-    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
+    /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — must
+    /// raise on an out-of-vocabulary level at predict rather than being
+    /// silently mapped to the reference level (#2102/#2137). `factor(g)` originally shared
     /// the `group()`/`re()` parse arm and so wrongly inherited the lenient policy
     /// (#2137). For a string factor the typed schema encode rejects the unseen
     /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
@@ -1380,6 +1391,29 @@ pub struct RandomEffectTermSpec {
     /// models serialized before this field existed.
     #[serde(default = "default_random_effect_lenient_unseen")]
     pub lenient_unseen: bool,
+}
+
+impl RandomEffectTermSpec {
+    /// The frozen levels that own a design column, in column order: the whole
+    /// vocabulary for a one-hot block, the vocabulary minus its reference
+    /// level for a treatment-coded one. `None` before the term is frozen.
+    pub fn column_levels(&self) -> Option<&[u64]> {
+        let levels = self.frozen_levels.as_deref()?;
+        Some(if self.drop_first_level {
+            levels.get(1..).unwrap_or(&[])
+        } else {
+            levels
+        })
+    }
+
+    /// The treatment-coded reference level (no column), if any.
+    pub fn reference_level(&self) -> Option<u64> {
+        if self.drop_first_level {
+            self.frozen_levels.as_ref()?.first().copied()
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) fn default_random_effect_penalized() -> bool {
@@ -4179,9 +4213,12 @@ impl SpatialLengthScaleOptimizationOptions {
 pub struct RandomEffectBlock {
     pub name: String,
     /// O(n) group-label vector: group_ids\[i\] = column index in [0, num_groups).
-    /// `None` if the observation's level is not in the kept set.
+    /// `None` if the observation's level owns no column (a treatment-coded
+    /// reference level, or an unseen level of a lenient random effect).
     pub group_ids: Vec<Option<usize>>,
     pub num_groups: usize,
+    /// The level vocabulary to freeze into `RandomEffectTermSpec::frozen_levels`
+    /// (including a treatment-coded reference level).
     pub kept_levels: Vec<u64>,
 }
 
@@ -6477,6 +6514,12 @@ pub fn build_random_effect_block(
         );
     }
 
+    // `kept_levels` is the term's persisted level vocabulary. For a full
+    // one-hot block (`!drop_first_level`) every level owns a column. For a
+    // treatment-coded fixed factor (`drop_first_level`) the vocabulary is
+    // sorted by value and its first entry is the reference level: it is part
+    // of the vocabulary (so it is a *seen* level at predict) but owns no
+    // column — its rows load only on the intercept.
     let kept_levels: Vec<u64> = if let Some(levels) = spec.frozen_levels.as_ref() {
         if levels.is_empty() {
             crate::bail_invalid_basis!(
@@ -6503,51 +6546,63 @@ pub fn build_random_effect_block(
         if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let start_idx = if spec.drop_first_level && levels.len() > 1 {
-            1usize
-        } else {
-            0usize
-        };
-        levels[start_idx..].to_vec()
+        if spec.drop_first_level {
+            // Order by value so the reference is the smallest code: for a
+            // string factor that is the first label in natural sort order
+            // (codes are assigned in that order), for a numeric-coded factor
+            // the smallest value — R's `factor()` baseline in both cases,
+            // independent of row order.
+            levels.sort_by(|a, b| f64::from_bits(*a).total_cmp(&f64::from_bits(*b)));
+        }
+        levels
+    };
+    let column_levels: &[u64] = if spec.drop_first_level {
+        &kept_levels[1..]
+    } else {
+        &kept_levels
     };
 
-    if kept_levels.is_empty() {
+    if column_levels.is_empty() {
         crate::bail_invalid_basis!(
-            "random-effect term '{}' drops all levels; keep at least one level",
+            "categorical term '{}' has a single level, so its treatment-coded block has no \
+             columns (the level is aliased with the intercept); drop the term or supply data \
+             with at least two levels",
             spec.name
         );
     }
 
-    let q = kept_levels.len();
-    let mut level_to_col = BTreeMap::<u64, usize>::new();
-    for (idx, &bits) in kept_levels.iter().enumerate() {
-        if level_to_col.insert(bits, idx).is_some() {
+    let q = column_levels.len();
+    let mut vocabulary = BTreeSet::<u64>::new();
+    for &bits in &kept_levels {
+        if !vocabulary.insert(bits) {
             crate::bail_invalid_basis!(
                 "random-effect term '{}' has duplicate frozen level bits {bits}",
                 spec.name
             );
         }
     }
+    let level_to_col: BTreeMap<u64, usize> = column_levels
+        .iter()
+        .enumerate()
+        .map(|(idx, &bits)| (bits, idx))
+        .collect();
     // A FIXED categorical factor (`factor(g)` or a bare `+ g`; `lenient_unseen
     // == false`) must reject an out-of-vocabulary level rather than silently
-    // encode it as an all-zero dummy row that collapses onto the factor's
+    // encode it as an all-zero dummy row that collapses onto the reference or
     // centering point (#2137/#2102). For a *string* factor the typed schema
     // encode rejects the unseen level before we get here; a *numeric-coded*
     // `factor(year)` column, however, reaches Rust as a plain numeric column
     // with no categorical schema, so the operator that owns the frozen level
-    // vocabulary is the enforcement point that closes the same gap. Only when
-    // the full one-hot block is kept (`!drop_first_level`) does an absent level
-    // unambiguously mean "unseen" — with treatment coding the dropped baseline
-    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
+    // vocabulary is the enforcement point that closes the same gap. The
+    // vocabulary includes a treatment-coded factor's reference level, so
+    // "unseen" means "not in the vocabulary" for either coding. `frozen_levels`
     // presence marks the predict/frozen context; at fit the vocabulary is
     // derived from this very data, so no row is unseen.
-    let strict_unseen =
-        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    let strict_unseen = !spec.lenient_unseen && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
-        let group_id = level_to_col.get(&bits).copied();
-        if strict_unseen && group_id.is_none() {
+        if strict_unseen && !vocabulary.contains(&bits) {
             crate::bail_invalid_basis!(
                 "unseen level '{}' in fixed factor column '{}' at row {}; the factor's levels \
                  were fixed at fit time and an out-of-vocabulary level cannot be predicted \
@@ -6558,7 +6613,7 @@ pub fn build_random_effect_block(
                 spec.name
             );
         }
-        group_ids.push(group_id);
+        group_ids.push(level_to_col.get(&bits).copied());
     }
 
     Ok(RandomEffectBlock {

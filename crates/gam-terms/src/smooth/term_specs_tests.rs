@@ -551,12 +551,17 @@ mod random_effect_signed_zero_tests {
     // ---- #2137: fixed factor (`factor(g)`) strict-unseen enforcement --------
 
     fn fixed_factor_spec() -> RandomEffectTermSpec {
-        // A numeric-coded `factor(year)`: full one-hot (`drop_first_level=false`),
-        // FIXED (`lenient_unseen=false`), vocabulary pinned at fit.
-        let mut s = spec();
-        s.name = "year".to_string();
-        s.lenient_unseen = false;
-        s
+        // A numeric-coded `factor(year)` exactly as the term builder lowers it:
+        // treatment-coded (`drop_first_level`), unpenalized, strict on unseen
+        // levels. Its frozen vocabulary includes the reference level.
+        RandomEffectTermSpec {
+            name: "year".to_string(),
+            feature_col: 0,
+            drop_first_level: true,
+            penalized: false,
+            frozen_levels: None,
+            lenient_unseen: false,
+        }
     }
 
     #[test]
@@ -564,7 +569,8 @@ mod random_effect_signed_zero_tests {
         // The numeric-coded `factor(year)` gap (#2137): the column reaches the
         // operator as plain numbers (no categorical schema to pre-filter it), so
         // the operator that owns the frozen vocabulary must reject an unseen
-        // code rather than encode an all-zero (centering-point) row.
+        // code rather than encode an all-zero row that silently collapses onto
+        // the reference level.
         let mut s = fixed_factor_spec();
         s.frozen_levels = Some(vec![2000.0_f64.to_bits(), 2001.0_f64.to_bits()]);
         let data = array![[2000.0_f64], [1999.0]];
@@ -584,27 +590,51 @@ mod random_effect_signed_zero_tests {
 
     #[test]
     fn fixed_factor_accepts_seen_numeric_levels_at_predict() {
-        // Control: every seen level still resolves; strictness rejects only the
-        // genuinely out-of-vocabulary code.
+        // Every vocabulary level resolves, including the reference level: it
+        // is SEEN (so it is not rejected) but owns no column (`None`), so its
+        // rows load only on the intercept.
         let mut s = fixed_factor_spec();
         s.frozen_levels = Some(vec![2000.0_f64.to_bits(), 2001.0_f64.to_bits()]);
         let data = array![[2001.0_f64], [2000.0]];
         let block = build_random_effect_block(data.view(), &s).unwrap();
-        assert_eq!(block.group_ids[0], Some(1));
-        assert_eq!(block.group_ids[1], Some(0));
+        assert_eq!(block.num_groups, 1);
+        assert_eq!(block.group_ids[0], Some(0));
+        assert_eq!(block.group_ids[1], None, "the reference level has no column");
     }
 
     #[test]
-    fn fixed_factor_at_fit_time_derives_vocabulary_and_never_false_rejects() {
+    fn fixed_factor_at_fit_time_is_treatment_coded_on_the_smallest_level() {
         // At FIT (`frozen_levels=None`) the vocabulary is derived from this very
-        // data, so no row is unseen — the strict guard must not fire even though
-        // the factor is strict.
-        let mut s = fixed_factor_spec();
-        s.frozen_levels = None;
-        let data = array![[2000.0_f64], [2001.0], [2002.0], [2000.0]];
+        // data, so no row is unseen. The block has L-1 columns, the reference
+        // is the smallest level regardless of row order, and the remaining
+        // columns follow value order.
+        let s = fixed_factor_spec();
+        let data = array![[2002.0_f64], [2000.0], [2001.0], [2002.0]];
         let block = build_random_effect_block(data.view(), &s)
             .expect("fit-time build must not reject its own levels");
-        assert_eq!(block.num_groups, 3);
+        assert_eq!(block.num_groups, 2, "three levels give two columns");
+        assert_eq!(
+            block.kept_levels,
+            vec![
+                2000.0_f64.to_bits(),
+                2001.0_f64.to_bits(),
+                2002.0_f64.to_bits()
+            ],
+            "the frozen vocabulary is the full value-sorted level set"
+        );
+        assert_eq!(block.group_ids, vec![Some(1), None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn fixed_factor_with_a_single_level_is_rejected() {
+        // One level is aliased with the intercept: a treatment-coded block has
+        // no column to carry it, which must be a typed error, not a 0-wide
+        // block.
+        let s = fixed_factor_spec();
+        let data = array![[3.0_f64], [3.0]];
+        let err = build_random_effect_block(data.view(), &s)
+            .expect_err("a single-level factor has no treatment-coded columns");
+        assert!(format!("{err}").contains("single level"), "{err}");
     }
 
     #[test]

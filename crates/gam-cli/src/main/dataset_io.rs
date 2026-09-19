@@ -14,8 +14,9 @@ pub(crate) fn load_dataset_projected(
 ///
 /// Only roles that are factors *regardless of the data's values* are included:
 ///
-/// * `group(g)` / `factor(g)` / `re(g)` random-effect terms
-///   ([`ParsedTerm::RandomEffect`]) — a grouping factor by construction.
+/// * `group(g)` / `re(g)` random-effect terms ([`ParsedTerm::RandomEffect`])
+///   and `factor(g)` fixed factors ([`ParsedTerm::Factor`]) — a grouping
+///   factor by construction.
 /// * a categorical / multinomial **response** column, when `response_is_categorical`.
 ///
 /// Deliberately EXCLUDED so a genuinely-continuous integer covariate is never
@@ -31,7 +32,7 @@ pub(crate) fn load_dataset_projected(
 fn collect_categorical_role_columns(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
     for term in terms {
         match term {
-            ParsedTerm::RandomEffect { name, .. } => {
+            ParsedTerm::RandomEffect { name } | ParsedTerm::Factor { name } => {
                 out.insert(name.clone());
             }
             ParsedTerm::SlopeSurface { terms, .. } => {

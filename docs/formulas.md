@@ -116,10 +116,22 @@ population mean, so a level seen only at prediction time is tolerated.
 
 `factor(g)`, by contrast, is a **fixed** categorical factor — the same fixed
 main effect as a bare `+ g`, but with categorical encoding forced even when the
-column is numeric (so `factor(year)` treats `year` as levels, not a slope). Like
-any fixed factor, a level that never appeared in training is a schema mismatch:
-`predict` raises and `check()` reports it, rather than silently returning the
-factor's centering point (#2137).
+column is numeric (so `factor(year)` treats `year` as levels, not a slope). A
+fixed factor is treatment-coded like R's `factor()`: an `L`-level factor adds
+`L-1` unpenalized columns, one per non-reference level, and has no smoothing
+parameter, so its coefficients are the unshrunk contrasts against the reference
+level. The reference is the first level in natural sort order for a string
+column and the smallest value for a numeric one; its effect is carried by the
+intercept. A factor with a single level is aliased with the intercept and is
+refused. Like any fixed factor, a level that never appeared in training is a
+schema mismatch: `predict` raises and `check()` reports it, rather than
+silently folding it onto the reference level (#2137).
+
+None of `factor()`, `group()` or `re()` takes options, so `factor(g, foo=1)` is
+an error rather than an ignored typo. A categorical column is refused inside a
+term that reads its inputs as numeric axes (`s()`, `linear()`, `te()`,
+`thinplate()`, `matern()`, cyclic smooths, …); use `factor(g)`, `group(g)` or a
+factor smooth such as `s(x, g, bs="fs")` instead.
 
 ## Univariate smooths {#univariate-smooths}
 
