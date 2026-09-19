@@ -152,12 +152,13 @@ fn covariate_constant_slope_survival_fit_passes_seed_validation_2930() {
     fit_and_report("smooth", "Surv(time, event) ~ s(x, k=5)", &data, &config);
 }
 
-/// gam#2945: a learned Gaussian frailty σ moves the priced completion, whose explicit σ derivative
-/// is not derived, so such a fit has neither an exact outer gradient nor a curvature certificate. It
-/// is refused once, by name, before the smoothing search: not on every value+gradient evaluation,
-/// and not after the search at the curvature guard.
+/// gam#2945: a learned Gaussian frailty σ moves the armed Jeffreys objective's priced completion,
+/// whose explicit σ derivative is not derived, so an armed fit with a learned σ is refused by name
+/// (`survival_arming_route_2995.rs` pins that refusal). gam#2995: nothing here separates, so the
+/// fit never arms, and the unarmed objective with a learned σ has its exact derivatives: it fits,
+/// and publishes no arming evidence.
 #[test]
-fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
+fn covariate_constant_slope_learned_sigma_fits_unarmed_2945() {
     use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
 
     super::initialize_cpu_fitting();
@@ -172,13 +173,15 @@ fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
         },
         ..constant_slope_config()
     };
-    let message = match fit_from_formula("Surv(time, event) ~ x", &data, &config) {
-        Ok(_) => panic!("a learned frailty σ with the armed Jeffreys completion must be refused"),
-        Err(error) => error.to_string(),
+    let result = fit_from_formula("Surv(time, event) ~ x", &data, &config)
+        .unwrap_or_else(|error| panic!("an unarmed fit with a learned σ must fit: {error}"));
+    let FitResult::SurvivalMarginalSlope(fit) = result else {
+        panic!("expected a SurvivalMarginalSlope fit result");
     };
     assert!(
-        message.contains("a learned Gaussian frailty σ with the armed Jeffreys completion is refused"),
-        "the refusal must name its reason, got: {message}"
+        fit.fit.artifacts.jeffreys_arming_evidence.is_none(),
+        "nothing separates, so no evidence arms: {:?}",
+        fit.fit.artifacts.jeffreys_arming_evidence
     );
 }
 
