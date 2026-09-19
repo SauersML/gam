@@ -79,8 +79,16 @@ very main effect that was erasing it -- because the ``by=`` envelope is what put
 Observed: ``summary().smooth_terms == []`` whenever a categorical main effect is
 in the formula.
 
-Expected: the smooth rows are present and equal to the ones the identical
-``group(...)`` spelling reports.
+Expected: the smooth rows are present and equal to the ones the same model
+reports when spelled without a categorical main effect.
+
+Since ``factor(g)`` and a bare ``g`` became a FIXED treatment-coded effect
+(``L-1`` unpenalized columns, no smoothing parameter; pyGAM audit F1), they are
+no longer the same model as the penalized ``group(g)`` spelling above. The
+reference for the fixed spellings is therefore the same fixed-effect model
+written by hand: one unpenalized 0/1 indicator per non-reference level, entered
+as ``linear(..., double_penalty=false)``. That spelling carries no categorical
+column at all, so it cannot hit the replay bug, and it is the same fit.
 """
 
 from __future__ import annotations
@@ -109,6 +117,22 @@ def _data() -> dict[str, Any]:
     }
 
 
+# The five levels are g0..g4; g0 sorts first and is the treatment reference.
+_LEVELS = [f"g{i}" for i in range(5)]
+_INDICATOR_FORMULA = (
+    "y ~ "
+    + " + ".join(f"linear(d_{level}, double_penalty=false)" for level in _LEVELS[1:])
+    + " + s(x)"
+)
+
+
+def _indicator_summary() -> Any:
+    data = _data()
+    for level in _LEVELS[1:]:
+        data[f"d_{level}"] = (data["g"] == level).astype(float)
+    return gamfit.fit(data, _INDICATOR_FORMULA, family="gaussian").summary()
+
+
 def _summary(formula: str) -> Any:
     return gamfit.fit(_data(), formula, family="gaussian").summary()
 
@@ -134,16 +158,21 @@ def test_reference_group_spelling_reports_the_smooth_row() -> None:
 
 def test_the_two_spellings_are_the_same_fit() -> None:
     """Premise: this is one model, so any summary difference is a reporting bug."""
-    a = _summary("y ~ s(x) + group(g)")
+    a = _indicator_summary()
     b = _summary("y ~ factor(g) + s(x)")
-    assert b.edf_total == pytest.approx(a.edf_total, rel=1e-12)
-    assert b.deviance == pytest.approx(a.deviance, rel=1e-12)
-    np.testing.assert_allclose(np.asarray(b.lambdas), np.asarray(a.lambdas), rtol=1e-10)
-    for name in ("g", "s(x)"):
-        expected = _row(a, name)
-        actual = _row(b, name)
-        assert expected is not None and actual is not None
-        _assert_same_inference_row(actual, expected)
+    assert b.edf_total == pytest.approx(a.edf_total, rel=1e-10)
+    assert b.deviance == pytest.approx(a.deviance, rel=1e-10)
+    np.testing.assert_allclose(np.asarray(b.lambdas), np.asarray(a.lambdas), rtol=1e-8)
+    expected = _row(a, "s(x)")
+    actual = _row(b, "s(x)")
+    assert expected is not None and actual is not None
+    _assert_same_inference_row(actual, expected)
+    # The fixed factor's own row carries the EDF of its L-1 unpenalized
+    # columns and, like every categorical row, no Wald statistic.
+    factor_row = _row(b, "g")
+    assert factor_row is not None
+    assert factor_row["edf"] == pytest.approx(len(_LEVELS) - 1, rel=1e-8)
+    assert factor_row.get("chi_sq") is None
 
 
 @pytest.mark.parametrize(
@@ -156,7 +185,7 @@ def test_the_two_spellings_are_the_same_fit() -> None:
     ],
 )
 def test_smooth_row_survives_a_categorical_main_effect(formula: str) -> None:
-    reference = _row(_summary("y ~ s(x) + group(g)"), "s(x)")
+    reference = _row(_indicator_summary(), "s(x)")
     assert reference is not None
 
     summary = _summary(formula)

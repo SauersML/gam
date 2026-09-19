@@ -11,8 +11,9 @@ categorical factor (R ``factor()`` / patsy ``C()`` convention), not a
 random-effect alias: like a bare ``+ g`` categorical main effect (#2102), an
 unseen level is a schema mismatch that must raise. The unseen policy is now
 carried on ``ParsedTerm::RandomEffect`` and set by the wrapper the user wrote —
-``factor()`` strict, ``group()``/``re()``/``s(bs="re")`` lenient — so seen-level
-fits stay identical while only the held-out-level policy differs.
+``factor()`` strict, ``group()``/``re()``/``s(bs="re")`` lenient. ``factor()``
+has since become its own unpenalized treatment-coded fixed effect (pyGAM audit
+F1), so on seen levels it matches the bare ``+ g`` spelling, not ``group()``.
 
 ``docs/exceptions.md`` requires that an unseen categorical level either raise
 from ``predict`` or be reported by ``check`` as a non-``ok`` issue.
@@ -119,15 +120,19 @@ def test_numeric_coded_factor_predict_and_check_flag_unseen_code() -> None:
     assert abs(float(np.asarray(m.predict(seen)).ravel()[0]) - 5.0) < 0.6
 
 
-def test_factor_and_group_agree_on_seen_levels() -> None:
-    """The fix must ONLY change the unseen-level policy: on seen levels
-    ``factor(g)`` and ``group(g)`` share the penalized-categorical block and so
-    must predict identically."""
+def test_factor_and_bare_categorical_agree_on_seen_levels() -> None:
+    """On seen levels the two fixed-factor spellings are one model. Since
+    ``factor(g)`` became an unpenalized treatment-coded fixed effect (pyGAM
+    audit F1) it is no longer the penalized ``group(g)`` block, so the
+    reference is the bare ``+ g`` spelling and, for this saturated Gaussian
+    fit, the per-level sample means themselves."""
     df = _make()
     m_factor = gamfit.fit(df, "y ~ factor(g)")
-    m_group = gamfit.fit(df, "y ~ group(g)")
+    m_bare = gamfit.fit(df, "y ~ g")
 
     seen = pd.DataFrame({"g": ["a", "b", "c"]})
     pf = np.asarray(m_factor.predict(seen)).ravel()
-    pg = np.asarray(m_group.predict(seen)).ravel()
-    np.testing.assert_allclose(pf, pg, rtol=1e-6, atol=1e-6)
+    pb = np.asarray(m_bare.predict(seen)).ravel()
+    np.testing.assert_allclose(pf, pb, rtol=1e-10, atol=1e-10)
+    means = df.groupby("g")["y"].mean().loc[["a", "b", "c"]].to_numpy()
+    np.testing.assert_allclose(pf, means, rtol=1e-8, atol=1e-8)
