@@ -2676,8 +2676,8 @@ mod tests {
         let rho = array![0.0];
         let root = array![[0.0, 0.0]];
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            local: root.t().dot(&root),
-            root,
+            local: root.t().dot(&root).into_shared(),
+            root: root.into_shared(),
             col_range: 0..2,
             total_dim: 2,
             nullity: 2,
@@ -2712,7 +2712,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 2,
                 coefficient_lower_bounds: None,
