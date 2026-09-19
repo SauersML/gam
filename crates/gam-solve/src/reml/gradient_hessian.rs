@@ -3713,8 +3713,11 @@ impl<'a> RemlState<'a> {
     /// `ρ[j] ↔ canonical_penalties[j]` for the leading smoothing coordinates (the
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
-    /// Returns `None` (caller keeps `base`) when the pilot fit at `base` or the
-    /// design Gram is unavailable, or the Gram's width does not match `p`.
+    /// Returns `None` (no candidate) when the pilot fit at `base` or the design
+    /// Gram is unavailable, or the Gram's width does not match `p`. The pilot is
+    /// the cached P-IRLS solve the caller's own `compute_cost(&base)` runs, so a
+    /// pilot that fails also fails the base cost, and the caller's scored-seed
+    /// record reports it there; this candidate adds no second verdict on it.
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
@@ -3941,8 +3944,6 @@ impl<'a> RemlState<'a> {
             None => vec![0; expected_len],
         };
 
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
 
@@ -3959,7 +3960,6 @@ impl<'a> RemlState<'a> {
             weights,
             offset: offset.to_owned(),
             canonical_penalties,
-            balanced_penalty_root,
             reparam_invariant,
             sparse_penalty_block_count,
             p,
@@ -4041,8 +4041,6 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
         let sparse_penalty_block_count =
@@ -4050,7 +4048,6 @@ impl<'a> RemlState<'a> {
 
         self.x = x.into();
         self.canonical_penalties = canonical_penalties;
-        self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
         self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.p = p;
@@ -4133,12 +4130,12 @@ impl<'a> RemlState<'a> {
     /// — but for a spatial smooth ψ ALSO moves the penalty matrix `S(ψ)` (the
     /// Duchon/Matérn Hilbert scale is built as a function of the length scale).
     /// `reset_surface` is the only place the canonical penalty surface
-    /// (`balanced_penalty_root` / `reparam_invariant` / `sparse_penalty_block_count`)
+    /// (`reparam_invariant` / `sparse_penalty_block_count`)
     /// is rebuilt, and the fast path skips it — so without this the inner solve
     /// would pair `XᵀWX(ψ_new)` with the STALE `S(ψ_old)` and converge to the
     /// wrong β̂ / κ-optimum. This re-keys `S(ψ_new)` from the supplied canonical
     /// penalties (a k×k object built from the basis centers, not the data rows,
-    /// so the refresh stays n-free) and re-runs exactly the three k-space penalty
+    /// so the refresh stays n-free) and re-runs exactly the two k-space penalty
     /// derivations `reset_surface` runs — nothing design- or n-shaped.
     ///
     /// It does NOT touch `self.x`, the Gaussian-fixed Gram cache, or the
@@ -4168,15 +4165,12 @@ impl<'a> RemlState<'a> {
             );
         }
         let p = self.p;
-        let balanced_penalty_root =
-            create_balanced_penalty_root_from_canonical(&canonical_penalties, p)?;
         let reparam_invariant =
             precompute_reparam_invariant_from_canonical(&canonical_penalties, p)?;
         let sparse_penalty_block_count =
             sparse_penalty_block_count_from_canonical(canonical_penalties.as_ref(), p)?;
 
         self.canonical_penalties = canonical_penalties;
-        self.balanced_penalty_root = balanced_penalty_root;
         self.reparam_invariant = reparam_invariant;
         self.sparse_penalty_block_count = sparse_penalty_block_count;
         self.nullspace_dims = nullspace_dims;
@@ -4270,8 +4264,8 @@ impl<'a> RemlState<'a> {
         // routed dense logged nothing, so `penalized_hessian_too_dense` (a
         // density genuinely measured above the threshold) could not be told from
         // `design_not_sparse`, `constraints_present`,
-        // `penalty_blocks_not_separable`, `firth_bias_reduction_active` or
-        // `sparse_stats_failed` — four of which never measure a density at all.
+        // `firth_bias_reduction_active` or `sparse_stats_failed` — none of
+        // which measures a density at all.
         // "Which side of SPARSE_HESSIAN_MAX_DENSITY does this design land on"
         // was therefore unanswerable from a log for exactly the shapes where it
         // decides the cost. Report the decision itself, with the threshold it
@@ -5906,10 +5900,6 @@ impl<'a> RemlState<'a> {
         &self.x
     }
 
-    pub(crate) fn balanced_penalty_root(&self) -> &Array2<f64> {
-        &self.balanced_penalty_root
-    }
-
     /// Return a Gaussian-Identity `XᵀWX` / `XᵀW(y−offset)` cache when the
     /// outer-loop preconditions for the Identity short-circuit hold, building
     /// it lazily on the first call.  Returns `None` otherwise — callers must
@@ -6422,11 +6412,6 @@ impl<'a> RemlState<'a> {
                 "sparse exact geometry requires sparse original design".to_string(),
             )
         })?;
-        self.sparse_penalty_block_count.ok_or_else(|| {
-            EstimationError::InvalidInput(
-                "sparse exact geometry requires block-separable penalties".to_string(),
-            )
-        })?;
 
         let lambdas =
             Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
@@ -6526,6 +6511,7 @@ impl<'a> RemlState<'a> {
                 SparseExactEvalData {
                     factor,
                     takahashi,
+                    hessian: Arc::new(sparse_system.h_sparse),
                     logdet_h: sparse_system.logdet_h,
                     logdet_s_pos,
                     penalty_rank,
@@ -6984,7 +6970,6 @@ impl<'a> RemlState<'a> {
             };
             let penalty = pirls::PenaltyConfig {
                 canonical_penalties: &self.canonical_penalties,
-                balanced_penalty_root: Some(&self.balanced_penalty_root),
                 reparam_invariant: Some(&self.reparam_invariant),
                 p: self.p,
                 coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
@@ -7102,7 +7087,6 @@ impl<'a> RemlState<'a> {
                 };
                 let penalty_cold = pirls::PenaltyConfig {
                     canonical_penalties: &self.canonical_penalties,
-                    balanced_penalty_root: Some(&self.balanced_penalty_root),
                     reparam_invariant: Some(&self.reparam_invariant),
                     p: self.p,
                     coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),
@@ -7830,7 +7814,6 @@ impl<'a> RemlState<'a> {
         };
         let penalty = pirls::PenaltyConfig {
             canonical_penalties: &self.canonical_penalties,
-            balanced_penalty_root: Some(&self.balanced_penalty_root),
             reparam_invariant: Some(&self.reparam_invariant),
             p: self.p,
             coefficient_lower_bounds: self.coefficient_lower_bounds.as_ref(),

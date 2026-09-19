@@ -555,15 +555,33 @@ def scale_z(record: dict[str, Any]) -> float | None:
     return float(np.log(scale / phi) / se)
 
 
+def _refused_constant_response(record: dict[str, Any]) -> bool:
+    """Whether the rep's draw has a constant response (a binomial at the edge
+    regime can draw no events at all) and the fit refused it as an invalid
+    configuration. There the maximum-likelihood mean sits on the boundary, so
+    the typed refusal is the correct outcome, not a failure."""
+    if record.get("error_types", {}).get("fit") != "InvalidConfigurationError":
+        return False
+    label, design = str(record.get("family")), str(record.get("design", ""))
+    if label not in CASE_BY_LABEL or not is_fuzz_design(design):
+        return False
+    regime = design[len(DESIGN_PREFIX) :]
+    y = draw(label, int(record["n"]), regime, int(record["seed"])).train["y"]
+    return bool(np.ptp(y) == 0.0)
+
+
 def failure_cause(record: dict[str, Any]) -> str | None:
     """The failure cause of one fuzz record, or ``None`` for a clean fit.
 
-    A rep fails when it hung (hit the harness safety net), crashed, raised in
+    A typed refusal of a constant response is correct, not a failure. A rep
+    fails when it hung (hit the harness safety net), crashed, raised in
     any phase, did not certify its optimum, predicted a non-finite value,
     reported a non-finite or non-positive scale, or reported a scale more
     than :data:`SCALE_Z_MAX` standard errors from the truth.
     """
     status = record.get("status")
+    if status == "error" and _refused_constant_response(record):
+        return None
     if status in ("timeout", "memcap", "crash") or str(status).startswith("not_run"):
         return str(status)
     if status == "error":

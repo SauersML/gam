@@ -148,7 +148,7 @@ mod tests {
         Ok((
             op.pirls_hat_diag(),
             op.jeffreys_logdet(),
-            op.pirls_firth_score_shift(),
+            op.pirls_jeffreys_eta_score(),
         ))
     }
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
@@ -220,7 +220,7 @@ mod tests {
         );
 
         for link in [&cloglog, &mixture] {
-            let (hat, logdet, shift) = compute_jeffreys_pirls_diagnostics(
+            let (hat, logdet, score) = compute_jeffreys_pirls_diagnostics(
                 link,
                 x.view(),
                 eta.view(),
@@ -228,7 +228,7 @@ mod tests {
             )
             .expect("supported Firth inverse link");
             assert_eq!(hat.len(), x.nrows());
-            assert_eq!(shift.len(), x.nrows());
+            assert_eq!(score.len(), x.nrows());
             assert!(
                 logdet.is_finite(),
                 "Jeffreys logdet must stay finite for {link:?}"
@@ -238,8 +238,8 @@ mod tests {
                 "hat diagonal must stay finite and non-negative for {link:?}: {hat:?}"
             );
             assert!(
-                shift.iter().all(|value| value.is_finite()),
-                "Firth score shift must stay finite for {link:?}: {shift:?}"
+                score.iter().all(|value| value.is_finite()),
+                "Jeffreys eta-score must stay finite for {link:?}: {score:?}"
             );
         }
     }
@@ -296,16 +296,16 @@ mod tests {
                     .expect("factored weighted operator");
                 let hat_f = op_f.pirls_hat_diag();
                 let logdet_f = op_f.jeffreys_logdet();
-                let shift_f = op_f.pirls_firth_score_shift();
-                let (hat_o, logdet_o, shift_o) =
+                let score_f = op_f.pirls_jeffreys_eta_score();
+                let (hat_o, logdet_o, score_o) =
                     compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
                         .expect("oracle weighted diagnostics");
                 assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
                 for i in 0..x.nrows() {
                     assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
                     assert_relative_eq!(
-                        shift_f[i],
-                        shift_o[i],
+                        score_f[i],
+                        score_o[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -317,7 +317,7 @@ mod tests {
                     .expect("factored unweighted operator");
                 let hat_fu = op_fu.pirls_hat_diag();
                 let logdet_fu = op_fu.jeffreys_logdet();
-                let shift_fu = op_fu.pirls_firth_score_shift();
+                let score_fu = op_fu.pirls_jeffreys_eta_score();
                 let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
                     .expect("full unweighted operator");
                 assert_relative_eq!(
@@ -327,7 +327,7 @@ mod tests {
                     max_relative = 1e-12
                 );
                 let hat_ou = op_u.pirls_hat_diag();
-                let shift_ou = op_u.pirls_firth_score_shift();
+                let score_ou = op_u.pirls_jeffreys_eta_score();
                 for i in 0..x.nrows() {
                     assert_relative_eq!(
                         hat_fu[i],
@@ -336,8 +336,8 @@ mod tests {
                         max_relative = 1e-12
                     );
                     assert_relative_eq!(
-                        shift_fu[i],
-                        shift_ou[i],
+                        score_fu[i],
+                        score_ou[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -1233,8 +1233,8 @@ mod tests {
             .map(|root| {
                 let rank = root.nrows();
                 CanonicalPenalty {
-                    local: root.t().dot(&root),
-                    root,
+                    local: root.t().dot(&root).into_shared(),
+                    root: root.into_shared(),
                     col_range: 0..p,
                     total_dim: p,
                     nullity: p - rank,
@@ -1296,7 +1296,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p,
                 coefficient_lower_bounds: None,
@@ -1317,7 +1316,7 @@ mod tests {
     #[test]
     pub(crate) fn sparse_native_reparam_preserves_declared_penalty() {
         use gam_terms::construction::{
-            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+            CanonicalPenalty, EngineDims, stable_reparameterization_original_frame,
         };
         use ndarray::array;
 
@@ -1325,16 +1324,13 @@ mod tests {
         let root = array![[1.0, 0.0]];
         let canonical = vec![CanonicalPenalty::from_dense_root(root, p)];
         let lambdas = [3.0f64];
-        let base = stable_reparameterization_engine_canonical(
+        let result = stable_reparameterization_original_frame(
             &canonical,
             &lambdas,
             EngineDims::new(p, canonical.len()),
             None,
         )
         .expect("declared penalty must reparameterize");
-        let result = super::loop_driver::build_sparse_native_reparam_result(
-            base, &canonical, &lambdas, p,
-        );
 
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for (actual, expected) in gram.iter().zip(result.s_transformed.iter()) {
@@ -1397,11 +1393,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -1434,7 +1430,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -1535,11 +1530,11 @@ mod tests {
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
         let r = array![[1.0]];
         let canonical = vec![gam_terms::construction::CanonicalPenalty {
-            root: r.clone(),
+            root: r.clone().into_shared(),
             col_range: 0..r.ncols(),
             total_dim: r.ncols(),
             nullity: 0,
-            local: r.t().dot(&r),
+            local: r.t().dot(&r).into_shared(),
             prior_mean: Array1::zeros(r.ncols()),
             positive_eigenvalues: Vec::new(),
             op: None,
@@ -1574,7 +1569,6 @@ mod tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 1,
                     coefficient_lower_bounds: None,
@@ -2590,11 +2584,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2627,7 +2621,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -2689,30 +2682,6 @@ mod tests {
         assert_relative_eq!(inv_shape, log_shape, max_relative = 1e-6);
     }
 
-    /// A binomial proportion `k/w` stored as `fl(k/w)` does not satisfy
-    /// `w·y == k` exactly (`1/49·49 = 0.9999999999999999`); the success count
-    /// is recovered exactly and a non-proportion is still refused.
-    #[test]
-    pub(crate) fn binomial_success_count_recovers_rounded_proportions() {
-        let mut inexact = 0usize;
-        for w in 1..=2000u32 {
-            let w = f64::from(w);
-            for k in [0.0, 1.0, w - 1.0, w, (w / 3.0).floor(), (0.7 * w).floor()] {
-                let y = k / w;
-                if w * y != k {
-                    inexact += 1;
-                }
-                assert_eq!(super::super::binomial_success_count(w, y), Some(k), "k={k} w={w}");
-            }
-        }
-        assert!(inexact > 0, "the grid must exercise a proportion whose product misses k");
-        assert_ne!(49.0 * (1.0 / 49.0), 1.0);
-        assert_eq!(super::super::binomial_success_count(49.0, 1.0 / 49.0), Some(1.0));
-        assert_eq!(super::super::binomial_success_count(10.0, 0.25), None);
-        assert_eq!(super::super::binomial_success_count(2.5, 0.4), None);
-        assert_eq!(super::super::binomial_success_count(10.0, 1.5), None);
-    }
-
     #[test]
     pub(crate) fn poisson_cache_rehydration_preserves_log_derivatives() {
         let x = array![[1.0], [1.0], [1.0], [1.0]];
@@ -2726,11 +2695,11 @@ mod tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -2763,7 +2732,6 @@ mod tests {
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
-                balanced_penalty_root: None,
                 reparam_invariant: None,
                 p: 1,
                 coefficient_lower_bounds: None,
@@ -4248,11 +4216,11 @@ mod root_cause_tests {
             .map(|r| {
                 let local = r.t().dot(r);
                 gam_terms::construction::CanonicalPenalty {
-                    root: r.clone(),
+                    root: r.clone().into_shared(),
                     col_range: 0..r.ncols(),
                     total_dim: r.ncols(),
                     nullity: 0,
-                    local,
+                    local: local.into_shared(),
                     prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
@@ -4286,7 +4254,6 @@ mod root_cause_tests {
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
-                    balanced_penalty_root: None,
                     reparam_invariant: None,
                     p: 2,
                     coefficient_lower_bounds: None,
@@ -4351,11 +4318,11 @@ mod root_cause_tests {
                 .map(|r| {
                     let local = r.t().dot(r);
                     gam_terms::construction::CanonicalPenalty {
-                        root: r.clone(),
+                        root: r.clone().into_shared(),
                         col_range: 0..r.ncols(),
                         total_dim: r.ncols(),
                         nullity: 0,
-                        local,
+                        local: local.into_shared(),
                         prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
@@ -4389,7 +4356,6 @@ mod root_cause_tests {
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,
-                        balanced_penalty_root: None,
                         reparam_invariant: None,
                         p: 3,
                         coefficient_lower_bounds: None,
@@ -4765,6 +4731,43 @@ mod reporting_loglikelihood_tests {
             "omitting − full must equal Σ ln Γ(y+1) = {dropped}; got {}",
             omitting - total
         );
+    }
+
+    // A fractional binomial prior weight (a scikit-learn `sample_weight` on 0/1
+    // labels) is a weighted Bernoulli log-mass, w·[y ln μ + (1−y) ln(1−μ)]:
+    // the continuous `ln C(w, wy)` normalizer vanishes for a 0/1 response, and
+    // for a proportion it is the lnΓ continuation of the integer coefficient.
+    #[test]
+    fn binomial_full_loglik_accepts_fractional_prior_weights() {
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.4];
+        let mu = array![0.3, 0.8, 0.55, 0.1, 0.35];
+        let w = array![0.5, 2.25, 1.0, 3.7, 2.5];
+        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
+        let pw = evaluation.pointwise();
+        for row in 0..y.len() {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let log_coefficient = ln_gamma(wi + 1.0)
+                - ln_gamma(wi * yi + 1.0)
+                - ln_gamma(wi * (1.0 - yi) + 1.0);
+            let expected =
+                log_coefficient + wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - expected).abs() < 1e-10,
+                "row {row} (w={wi}, y={yi}): {} vs {expected}",
+                pw[row]
+            );
+        }
+        let bernoulli_rows = [0, 1, 2, 3];
+        for row in bernoulli_rows {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let weighted_log_mass = wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - weighted_log_mass).abs() < 1e-12,
+                "row {row}: a 0/1 response carries no normalizer at w={wi}"
+            );
+        }
     }
 
     // ---- #1582: Poisson and NB(θ→∞) report the SAME log-likelihood on the same

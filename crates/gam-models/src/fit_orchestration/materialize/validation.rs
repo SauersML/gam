@@ -213,6 +213,51 @@ pub(super) fn reject_flexible_link_for_nonbinomial(
     Ok(())
 }
 
+/// Refuse a fit whose positive-weight rows cannot exceed the unpenalized
+/// dimension the formula already fixes, before the family is inferred or any
+/// basis is built.
+///
+/// REML/LAML estimate the smoothing parameters from the `n − M_p` residual
+/// contrasts the unpenalized directions cannot absorb, so an identified fit
+/// needs `n > M_p` (the full gate, once the penalties exist, is
+/// `reject_prefit_unidentifiable_unpenalized_space` in gam-solve). The formula
+/// alone already fixes part of `M_p`: the model intercept is one unpenalized
+/// direction unless the formula drops it. Parametric and smooth terms may or
+/// may not add more depending on their penalties, so they are left to that
+/// later gate. Checking this lower bound first makes a one-row fit report the
+/// row count rather than whatever the one row happens to trip next — an
+/// auto-inferred binomial family calling `y = [1]` degenerate, or a smooth
+/// calling its single covariate value constant.
+pub(super) fn reject_too_few_rows_for_formula(
+    parsed: &ParsedFormula,
+    weights: ArrayView1<'_, f64>,
+) -> Result<(), WorkflowError> {
+    let has_intercept = !parsed
+        .terms
+        .iter()
+        .any(|term| matches!(term, ParsedTerm::NoIntercept));
+    let unpenalized_lower_bound = usize::from(has_intercept);
+    let n_observations = weights.iter().filter(|&&weight| weight > 0.0).count();
+    if n_observations > unpenalized_lower_bound {
+        return Ok(());
+    }
+    let rows = if n_observations == 1 { "row" } else { "rows" };
+    let directions = if has_intercept {
+        "the intercept is an unpenalized coefficient direction (M_p >= 1)"
+    } else {
+        "a model needs at least one observation"
+    };
+    Err(WorkflowError::InvalidData {
+        column: parsed.response.clone(),
+        problem: format!(
+            "has {n_observations} positive-weight {rows}: too few rows to fit this model. \
+             REML estimates the smoothing parameters from the n - M_p residual contrasts the \
+             unpenalized directions cannot absorb, and {directions}, so the fit needs more than \
+             {unpenalized_lower_bound} positive-weight row(s). Add observations."
+        ),
+    })
+}
+
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {

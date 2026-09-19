@@ -6,9 +6,12 @@ Each cell below failed before its root-cause fix and must now be clean under
 * gamma(inverse): the dispersion profile evaluated the shape and phi at
   ``exp(eta)`` whatever the link, so on the inverse link the fitted scale sat
   hundreds of standard errors off the truth.
-* binomial-trials: the exact-integer success check tested ``fl(w * y)``,
-  which is not an integer for most proportions ``k / w`` (``439 / 1000 * 1000
-  = 439.00000000000006``), so every almost-deterministic binomial refused.
+* binomial-trials: the fully-normalized log-likelihood required ``fl(w * y)``
+  to be an exact integer, which most stored proportions ``k / w`` miss by an
+  ulp (``439 / 1000 * 1000 = 439.00000000000006``), so every
+  almost-deterministic binomial refused. main now evaluates the continuous
+  normalizer ``ln C(w, w y)`` for any finite positive weight; the cells stay
+  as its regression fixtures.
 * inverse-gaussian (canonical link): the smoothing-parameter seed read the
   prior weights, not the Fisher working weights ``mu^3 / 4``, so it was not
   equivariant under a change of response units and, in small units, landed on
