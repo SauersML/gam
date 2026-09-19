@@ -349,7 +349,7 @@ fn smoothing_rule(t: f64, v: f64) -> TrapezoidAxis {
         .fold(0.0, f64::max);
     TrapezoidAxis::least_count(strip, 2.0 * PI * strip / aliasing_nats, |axis| {
         (0..SILU_TABLE_ORDERS).any(|order| {
-            smoothing_tail(t, root_v, axis.last_node(), order) > 0.5 * f64::EPSILON * scale[order]
+            smoothing_tail(t, root_v, axis.last_node(), order) > crate::roundoff::UNIT_ROUNDOFF * scale[order]
         })
     })
 }
@@ -602,7 +602,7 @@ fn pair_rule(coordinates: &PairCoordinates) -> PairRule {
     let mut aliasing_nats = 0.0f64;
     for (mass_row, scale_row) in strip_mass.iter().zip(&scale) {
         for (mass, entry_scale) in mass_row.iter().zip(scale_row) {
-            let theta = 0.5 * f64::EPSILON * entry_scale / mass;
+            let theta = crate::roundoff::UNIT_ROUNDOFF * entry_scale / mass;
             let nats = if two_axes {
                 2.0 * ((1.0 + theta).sqrt() + 1.0).ln() - theta.ln()
             } else {
@@ -830,7 +830,7 @@ fn hermite_rule(b: f64, v: f64, orders: usize) -> TrapezoidAxis {
         hermite_tails(b, v, orders, axis)
             .iter()
             .zip(&ln_scales)
-            .any(|(tail, ln_scale)| *tail > 0.5 * f64::EPSILON * ln_scale.exp())
+            .any(|(tail, ln_scale)| *tail > crate::roundoff::UNIT_ROUNDOFF * ln_scale.exp())
     })
 }
 

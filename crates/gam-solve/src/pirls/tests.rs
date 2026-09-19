@@ -1143,6 +1143,9 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::DenseTransformed);
         assert_eq!(decision.reason, "design_not_sparse");
+        // The dense route never counts the design's nonzeros, and says so.
+        assert_eq!(decision.nnz_x, None);
+        assert!(decision.format_fields(decision.path_str()).contains("nnz_x=na"));
     }
 
     #[test]
@@ -1166,7 +1169,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 300);
+        assert_eq!(decision.nnz_x, Some(300));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(300));
         assert_eq!(decision.nnz_h_est, Some(300));
         assert!(decision.density_h_est.expect("density") < 0.01);
@@ -1183,7 +1186,7 @@ mod tests {
         let decision = should_use_sparse_native_pirls(&mut workspace, &x, &s, None, None);
         assert_eq!(decision.path, PirlsLinearSolvePath::SparseNative);
         assert_eq!(decision.reason, "sparse_native_eligible");
-        assert_eq!(decision.nnz_x, 64);
+        assert_eq!(decision.nnz_x, Some(64));
         assert_eq!(decision.nnz_xtwx_symbolic, Some(64));
         assert_eq!(decision.nnz_h_est, Some(64));
         assert!(decision.density_h_est.expect("density") < 0.05);

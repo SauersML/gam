@@ -79,20 +79,6 @@ pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
 
 pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
 
-/// Near-stationary acceptance tolerance for a stalled line search in the reduced
-/// parametric-AFT direct MLE. When the Newton ascent direction admits no
-/// Armijo-sufficient step — i.e. `ℓ` can no longer be increased to numerical
-/// precision — AND the half-Newton-decrement `½·gᵀH⁻¹g` is below this bound, the
-/// iterate IS the numerical MLE and is accepted rather than reported as a
-/// convergence failure (gam#2112). A decrement above this bound at a stalled line
-/// search signals a genuinely wrong curvature model (not an MLE) and stays a hard
-/// error. The bound is generous relative to the primary objective tolerance
-/// (≈`1e-7`): a remaining gap of `1e-4` nats is a Mahalanobis distance of only
-/// `√(2·1e-4) ≈ 0.014` standard errors from the optimum, so it accepts a fully
-/// converged fit while still separating it from a real optimizer breakdown, whose
-/// decrement is orders of magnitude larger.
-pub(crate) const REDUCED_AFT_NEWTON_STALL_TOL: f64 = 1e-4;
-
 /// Relative ridge added to the normal-equations diagonal of the structural
 /// time-coefficient warm-start least squares (× the largest diagonal of XᵀX,
 /// floored at 1). Stabilizes the best-effort guess against a rank-deficient

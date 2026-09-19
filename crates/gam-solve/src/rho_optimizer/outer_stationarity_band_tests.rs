@@ -16,22 +16,23 @@
 //!   * [`outer_gradient_tolerance`] — the SOLVER's band — is a function of
 //!     the declared problem and of nothing else, so every seed of one fit
 //!     reaches the same verdict;
-//!   * [`outer_stationarity_band_and_rung_at`] — the CERTIFICATE's band — is
-//!     anchored at the point being judged, which is what mgcv `magic` means.
+//!   * the CERTIFICATE's band ([`outer_certificate_band_at`]) takes no
+//!     criterion value at all since #2954: it is the per-coordinate Theorem 9
+//!     band of the evaluation's gradient parts, and without parts it is the
+//!     declared tolerance.
 //!
 //! Every number below is evaluated from #2392's criterion rather than
 //! transcribed from the issue, so the fixture cannot drift away from the
 //! defect it pins; the issue's printed values appear only as cross-checks.
-use super::{
-    OuterConfig, outer_cost_relative_tolerance, outer_gradient_tolerance,
-    outer_stationarity_band_and_rung_at,
-};
+use super::{OuterConfig, outer_certificate_band_at, outer_gradient_tolerance};
+use crate::estimate::outer_eval_capture::CertificateEvidence;
+use ndarray::array;
 
-/// The band alone. These tests compare bands to each other; #2688 moved the
-/// rung into the production return type on purpose, so the value-only form
-/// lives here rather than beside the thing it was extracted from.
-fn outer_stationarity_band_at(config: &OuterConfig, cost_at_point: f64) -> f64 {
-    outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+/// The removed rule, `tolerance·(1 + |V|)`, reproduced here only so the
+/// fixture can show the vacuous threshold it produced. No production function
+/// computes it any more (#2954).
+fn removed_cost_anchored_band(config: &OuterConfig, cost_at_point: f64) -> f64 {
+    config.tolerance * (1.0 + cost_at_point.abs())
 }
 
 /// #2392's gradient-only criterion `V(ρ) = A·(−q + ½q²)`, `q = e^{ρ★−ρ}`,
@@ -68,9 +69,8 @@ fn assert_close(actual: f64, expected: f64, what: &str) {
     );
 }
 
-/// The `#2392` recovery's config: `OuterProblem::new(1)` declares no
-/// objective scale, so `objective_scale` is `None` and `tolerance` is the
-/// default the caller asked for.
+/// The `#2392` recovery's config: `OuterProblem::new(1)`, so `tolerance` is
+/// the default the caller asked for.
 fn recovery_config() -> OuterConfig {
     OuterConfig::default()
 }
@@ -86,10 +86,9 @@ fn the_fixture_reproduces_every_number_the_issue_printed() {
         1.792_396_548_924e13,
         "the lattice seed's criterion",
     );
-    // The old solver band IS the certificate's formula evaluated at the
-    // seed — which is exactly the defect, so the certificate helper
-    // reproduces the removed rule when handed a trajectory point.
-    let seed_anchored_band = outer_stationarity_band_at(&config, poisoned_seed_cost);
+    // The old solver band IS the removed certificate formula evaluated at
+    // the seed — which is exactly the defect.
+    let seed_anchored_band = removed_cost_anchored_band(&config, poisoned_seed_cost);
     assert_close(
         seed_anchored_band,
         1.792_397e8,
@@ -105,7 +104,7 @@ fn the_fixture_reproduces_every_number_the_issue_printed() {
     // the same formula, anchored eight orders lower, which is why the
     // disagreement read as a certificate bug.
     assert_close(
-        outer_stationarity_band_at(&config, criterion(CHECKPOINT_RHO)),
+        removed_cost_anchored_band(&config, criterion(CHECKPOINT_RHO)),
         4.997_764e-2,
         "the certificate bound at the checkpoint",
     );
@@ -149,8 +148,7 @@ fn the_wrong_rail_no_longer_clears_the_solver_band() {
     let config = recovery_config();
     let wrong_rail_gradient = gradient_norm(WRONG_RAIL_RHO);
     // Under the removed rule the rail passed by twelve orders.
-    let seed_anchored_band =
-        outer_stationarity_band_at(&config, criterion(POISONED_SEED_RHO));
+    let seed_anchored_band = removed_cost_anchored_band(&config, criterion(POISONED_SEED_RHO));
     assert!(
         wrong_rail_gradient < seed_anchored_band,
         "fixture must reproduce the vacuous pass this issue is about",
@@ -167,52 +165,23 @@ fn the_wrong_rail_no_longer_clears_the_solver_band() {
 }
 
 #[test]
-fn a_declared_scale_preserves_the_band_a_criterion_at_that_scale_would_give() {
-    // A REML/LAML score is a sum over `n` rows, so a fit that declares
-    // `objective_scale = n` is declaring `|V| = O(n)`. The solver band must
-    // therefore equal the point-anchored band of a criterion at that scale:
-    // this is the property that makes the change magnitude-PRESERVING rather
-    // than a deletion of the cost-relative term.
-    let scale = 1_200.0;
-    let config = OuterConfig {
-        objective_scale: Some(scale),
-        ..OuterConfig::default()
-    };
-    let band = outer_gradient_tolerance(&config).abs;
-    assert_eq!(band, outer_stationarity_band_at(&config, -scale));
-    assert_close(
-        band,
-        outer_cost_relative_tolerance(&config) * (1.0 + scale),
-        "the declared-scale band",
-    );
-    // And it is emphatically NOT the arithmetic resolution floor alone.
-    // Dropping `rel_cost` and leaning on `scale·√ε` leaves a band ~670×
-    // tighter at the default tolerance, which no real fit can satisfy.
-    let arithmetic_floor = config.tolerance.max(scale * f64::EPSILON.sqrt());
-    assert!(
-        band > arithmetic_floor * 100.0,
-        "the band must not collapse onto the arithmetic floor: {band:.6e} vs {arithmetic_floor:.6e}",
-    );
-}
-
-#[test]
-fn the_certificate_band_follows_the_point_it_judges() {
+fn the_certificate_band_takes_no_criterion_value_2954() {
+    // #2954 removed the point anchor: the certificate's band is a function of
+    // the evaluation's gradient parts, never of `V`. With none published (this
+    // fixture's gradient-only objective publishes none) it is the declared
+    // tolerance at EVERY point of the fit, the checkpoint and the poisoned
+    // seed alike, which is also the solver's band.
     let config = recovery_config();
     let solver_band = outer_gradient_tolerance(&config).abs;
-    // The certificate's band moves with the candidate optimum's criterion...
-    let at_checkpoint = outer_stationarity_band_at(&config, criterion(CHECKPOINT_RHO));
-    let at_optimum = outer_stationarity_band_at(&config, criterion(RHO_STAR));
-    assert!(
-        at_checkpoint > solver_band && at_optimum > solver_band,
-        "a certificate at a criterion of magnitude ≫1 must exceed the bare tolerance",
-    );
-    // ...while the solver's does not move at all. Naming the two separately
-    // is what makes "one formula, two anchors" impossible to write by
-    // accident: neither function takes the other's anchor.
-    assert_ne!(at_checkpoint, at_optimum);
-    // A non-finite criterion carries no magnitude, so the certificate falls
-    // back to the arithmetic floor rather than propagating a NaN bound.
-    for cost in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        assert_eq!(outer_stationarity_band_at(&config, cost), config.tolerance);
+    let evidence = CertificateEvidence::default();
+    for rho in [POISONED_SEED_RHO, CHECKPOINT_RHO, RHO_STAR, WRONG_RAIL_RHO] {
+        let band = outer_certificate_band_at(&config, &array![gradient_norm(rho)], &evidence);
+        assert_eq!(
+            band.bound, solver_band,
+            "the certificate band at ρ={rho} (V={:.3e}) must not move with V",
+            criterion(rho),
+        );
     }
+    // The wrong rail fails it, where the removed anchor passed it.
+    assert!(gradient_norm(WRONG_RAIL_RHO) > solver_band);
 }
