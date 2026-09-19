@@ -136,6 +136,24 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Return, per coefficient, the forward-error bound the row terms behind
+    /// [`Self::joint_gradient_evaluation`]'s gradient carry from forming the
+    /// predictors they are evaluated at.
+    ///
+    /// [`Self::joint_gradient_accumulation`] bands the sum of the computed terms.
+    /// Each term is itself a function of `η = Xβ`, whose computed value is off by
+    /// that product's rounding, and the term inherits the error through its
+    /// derivative in `η`. Where a term is a large multiple of a small difference,
+    /// as `(y − μ)/σ²` is at a high signal-to-noise ratio, that inherited error
+    /// exceeds the sum's. The engine adds it to the accumulation band, so it is
+    /// read only where the accumulation is measured.
+    ///
+    /// `Ok(None)` means the workspace does not measure it; `Err` reports
+    /// evaluation failure.
+    fn joint_gradient_formation_bands(&self) -> Result<Option<Array1<f64>>, String> {
+        Ok(None)
+    }
+
     /// Whether `hessian_matvec` / `hessian_matvec_into` will return `Some`.
     /// A cheap synchronisation-free flag consulted by
     /// `exact_newton_joint_hessian_source_from_workspace` to decide whether

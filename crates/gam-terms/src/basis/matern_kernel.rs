@@ -50,6 +50,67 @@ fn thin_plate_augmented_center_strategy(
     }
 }
 
+/// Refuse a cold thin-plate basis that cannot bend across the bulk of its data.
+///
+/// The polyharmonic kernel `r^(2m−d)` is global: its realized columns carry
+/// the whole covariate span `D`, while structure inside the bulk of the rows
+/// varies at the bulk's own width `w`. The reparameterization keeps a bending
+/// direction only above the numerical-rank floor `K·ε` of the metric it
+/// diagonalizes, so a direction varying at scale `h` survives only when
+/// `(h/D)^p > K·ε`, with `p = 2m−d` for the knot-Gram metric and `p = 2(2m−d)`
+/// for the realized data metric `(KZ)ᵀ(KZ)`, which squares it. Losing the finest
+/// directions of a dense basis is ordinary; losing directions while an axis's
+/// interquartile width is itself at or below that resolvable scale means no
+/// retained direction can bend inside the middle half of the rows, and the
+/// "fit" is a straight line across the bulk set by a few outlying rows. That is
+/// refused, not fit. An axis whose middle half has no width has nothing there
+/// to resolve and is not a failure.
+fn ensure_thin_plate_bulk_resolvable(
+    data: ArrayView2<'_, f64>,
+    available: usize,
+    retained: usize,
+    metric_power: usize,
+) -> Result<(), BasisError> {
+    if retained >= available || data.nrows() < 2 {
+        return Ok(());
+    }
+    let diameter = data
+        .axis_iter(Axis(1))
+        .map(|column| {
+            let (lo, hi) = column
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            (hi - lo) * (hi - lo)
+        })
+        .sum::<f64>()
+        .sqrt();
+    let resolvable = diameter * ((available as f64) * f64::EPSILON).powf(1.0 / metric_power as f64);
+    for (axis, column) in data.axis_iter(Axis(1)).enumerate() {
+        let mut values = column.to_vec();
+        values.sort_by(f64::total_cmp);
+        let quantile = |p: f64| {
+            let pos = p * (values.len() - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
+        };
+        let bulk_width = quantile(0.75) - quantile(0.25);
+        if bulk_width > 0.0 && bulk_width <= resolvable {
+            return Err(BasisError::ThinPlateBulkUnresolvable {
+                term: None,
+                axis,
+                bulk_fraction: bulk_width / diameter,
+                resolvable_fraction: resolvable / diameter,
+                retained,
+                available,
+                spans: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Generic thin-plate builder returning design + penalty list.
 pub fn build_thin_plate_basis(
     data: ArrayView2<'_, f64>,
@@ -208,7 +269,17 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
     }
+    let bending_order = 2 * thin_plate_penalty_order(data.ncols()) - data.ncols();
     let (design, identifiability_transform, mut candidates, radial_reparam_meta) = if use_lazy {
+        if spec.radial_reparam.is_none() {
+            // Knot-Gram metric `Zᵀ K_CC Z`.
+            ensure_thin_plate_bulk_resolvable(
+                data,
+                internal_kernel_transform.ncols(),
+                radial_reparam.ncols(),
+                bending_order,
+            )?;
+        }
         let poly_block = thin_plate_polynomial_block(data);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
@@ -291,6 +362,15 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
             spec.radial_reparam.as_ref(),
             workspace,
         )?;
+        if spec.radial_reparam.is_none() {
+            // Realized data metric `(KZ)ᵀ(KZ)`, which squares the kernel's range.
+            ensure_thin_plate_bulk_resolvable(
+                data,
+                internal_kernel_transform.ncols(),
+                tps.num_kernel_basis,
+                2 * bending_order,
+            )?;
+        }
         let identifiability_transform = thin_plate_identifiability_transform_from_design(
             tps.basis.view(),
             tps.num_kernel_basis,
@@ -4789,3 +4869,5 @@ mod matern_basis_size_tests {
 
 #[cfg(test)]
 mod thin_plate_workspace_equivalence_regression_tests;
+#[cfg(test)]
+mod thin_plate_outlier_span_tests;

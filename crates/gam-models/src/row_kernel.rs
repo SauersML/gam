@@ -351,9 +351,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row path; overrides return `None` only for row sets they explicitly
     /// decline.
     ///
-    /// `rows == RowSet::All` is the only case an override should claim; under a
-    /// subsample / non-unit-weight `RowSet` the override must return `None` so
-    /// the generic Horvitz-Thompson per-row path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn directional_derivative_dense_override(
         &self,
         rows: &RowSet,
@@ -386,14 +388,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row third tensor is INDEPENDENT of the swept axis, so it is built once
     /// and each axis closed with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs. The
     /// default declines this batched optimization, so the dispatcher runs the
-    /// exact generic per-axis path bit-for-bit. Overrides should claim only the
-    /// full-data unit-weight
-    /// `RowSet::All` case; under a subsample / non-unit-weight `RowSet` return
-    /// `None` so the generic Horvitz-Thompson per-row path runs per axis.
+    /// exact generic per-axis path bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)` reduced in
-    /// deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_directional_derivative(self, rows, e_a)` up to reassociation
+    /// of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn directional_derivative_all_axes_dense_override(
         &self,
@@ -433,9 +437,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// BLAS-3 products. The default returns the exact generic per-row path;
     /// overrides return `None` only for row sets they explicitly decline and
     /// surface failures from an algorithm they did select through `Err`.
-    /// Overrides should claim only the full-data unit-weight `RowSet::All` case;
-    /// under a subsample / non-unit-weight `RowSet` return `None` so the generic
-    /// HT path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn hessian_dense_override(
         &self,
         rows: &RowSet,
@@ -472,14 +478,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// swept axis, so it can be hoisted out of the `p`-loop and each axis closed
     /// with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs reading the shared cached
     /// fourth tensor. The default returns `None`, preserving the exact generic
-    /// per-axis path for every other kernel bit-for-bit. Overrides should claim
-    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
-    /// non-unit-weight `RowSet` return `None` so the generic Horvitz-Thompson
-    /// per-row path runs per axis.
+    /// per-axis path for every other kernel bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_second_directional_derivative(self, rows, d_beta_u,
-    /// e_a)` reduced in deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_second_directional_derivative(self, rows, d_beta_u, e_a)` up
+    /// to reassociation of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn second_directional_derivative_all_axes_dense_override(
         &self,
@@ -1249,6 +1257,41 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// `J·F` for walk positions `[start, end)` of `rows`, one output row per
+/// position. Under `RowSet::All` a position is its row, so this is exactly
+/// [`RowKernel::jacobian_action_matrix_rows`]; under a subsample each run of
+/// consecutive stored rows is one row-range block, so a kernel's structured
+/// GEMM path still serves the gathered rows.
+fn row_set_jacobian_tile<const P: usize, R: RowKernel<P> + ?Sized>(
+    kern: &R,
+    rows: &RowSet,
+    factor: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    let RowSet::Subsample { rows: stored, .. } = rows else {
+        return kern.jacobian_action_matrix_rows(factor, start, end);
+    };
+    let positions = &stored[start..end];
+    let mut tile = Array2::<f64>::zeros((positions.len(), P * factor.ncols()));
+    let mut run_start = 0;
+    while run_start < positions.len() {
+        let mut run_end = run_start + 1;
+        while run_end < positions.len() && positions[run_end].index == positions[run_end - 1].index + 1 {
+            run_end += 1;
+        }
+        let first = positions[run_start].index;
+        let block = kern.jacobian_action_matrix_rows(factor, first, first + run_end - run_start);
+        if block.dim() != (run_end - run_start, tile.ncols()) {
+            // Surface the kernel's wrong shape through the caller's tile check.
+            return block;
+        }
+        tile.slice_mut(s![run_start..run_end, ..]).assign(&block);
+        run_start = run_end;
+    }
+    tile
+}
+
 /// Why [`all_axes_symmetric_tensor_pullback`] refused its inputs.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AllAxesPullbackError {
@@ -1267,8 +1310,10 @@ pub(crate) enum AllAxesPullbackError {
 /// axis: `Hdot[e_a] = Σ_i J_iᵀ T_i[J_i e_a] J_i` for every canonical axis `e_a`,
 /// with `J_i` the row's Jacobian from [`RowKernel::jacobian_action_matrix_rows`].
 /// Higher information derivatives first contract their fixed directions into
-/// `tensors`, so every order shares this one assembly. The result is
-/// bit-identical at every thread count.
+/// `tensors`, so every order shares this one assembly. `tensors` holds one
+/// tensor per walk position of `rows`, each pulled back at that position's row
+/// and scaled by its Horvitz–Thompson weight, so every `RowSet` is handled. The
+/// result is bit-identical at every thread count.
 ///
 /// Two contracts, which the assembly does not check:
 /// - Each `tensors[i]` must be FULLY symmetric in `(α, β, γ)`. Only one
@@ -1280,6 +1325,7 @@ pub(crate) enum AllAxesPullbackError {
 ///   caller adds the terms carrying the primaries' own second derivatives.
 pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P> + ?Sized>(
     kern: &R,
+    rows: &RowSet,
     tensors: &[[[[f64; P]; P]; P]],
 ) -> Result<Vec<Array2<f64>>, AllAxesPullbackError> {
     use faer::Accum;
@@ -1295,7 +1341,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
     const ALL_AXES_PULLBACK_ACCUMULATOR_BYTES: usize = 256 << 20;
 
     let p = kern.n_coefficients();
-    let n = gam_math::jet_tower::RowProgram::n_rows(kern);
+    let n = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(kern));
     if tensors.len() != n {
         return Err(AllAxesPullbackError::TensorRowCount {
             tensors: tensors.len(),
@@ -1338,7 +1384,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
             for tile_index in group * n_tiles / n_groups..(group + 1) * n_tiles / n_groups {
                 let start = tile_index * tile;
                 let end = (start + tile).min(n);
-                let jacobian = kern.jacobian_action_matrix_rows(identity.view(), start, end);
+                let jacobian = row_set_jacobian_tile(kern, rows, identity.view(), start, end);
                 if jacobian.dim() != (end - start, P * p) {
                     return Err(AllAxesPullbackError::TileShape {
                         got: jacobian.dim(),
@@ -1362,6 +1408,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                 for local in 0..end - start {
                     let row = &jacobian_flat[local * P * p..][..P * p];
                     let tensor = &tensors[start + local];
+                    let weight = rows.row_at(start + local).1;
                     let primary_rows: [&[f64]; P] =
                         std::array::from_fn(|primary| &row[primary * p..][..p]);
                     for beta in 0..P {
@@ -1372,7 +1419,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                                 for alpha in 0..P {
                                     sum += tensor[alpha][beta][gamma] * primary_rows[alpha][a];
                                 }
-                                *value = sum;
+                                *value = weight * sum;
                             }
                         }
                     }

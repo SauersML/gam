@@ -1558,7 +1558,7 @@ pub(super) fn pirls_soft_acceptance(
 /// It used to be
 /// `max(primal_feasibility, dual_feasibility, complementarity, stationarity)`,
 /// and that scalar was handed to [`WorkingState::certifies_kkt`], whose two
-/// bounds — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — are both derived FOR A
+/// bounds at the time — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — were both derived FOR A
 /// GRADIENT: the first from "score components are `O(√n)`", the second from the
 /// penalized gradient's own natural magnitude. Only two of the four channels are
 /// gradient-space quantities:

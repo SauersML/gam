@@ -8,12 +8,17 @@ Usage: worker.py LIB FAMILY N DESIGN SEED
           positive-continuous family of the ``positive_*`` plans (see
           ``POSITIVE_FAMILIES``)
   DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
-          | by (see ``make_data``) | fz<case>
+          | by (see ``make_data``) | fz<case> | ff-<regime>
 
 A ``fz<case>`` design is a convergence-fuzz case (``fuzz_terms.py``): a seeded
 term structure — tensor, ``ti``, ``by=``, factor, random-effect, cyclic, 2-D
 isotropic, shape-constrained and concurvity terms — fitted with gamfit only
 on the gaussian, binomial and poisson families; see :func:`run_fuzz`.
+
+An ``ff-<regime>`` design is a family-convergence-fuzz cell
+(``fuzz_families.py``): FAMILY is then a fuzz family label (every family and
+link gamfit supports, e.g. ``gamma(inverse)``, ``binomial-trials(cauchit)``)
+and the data sit at an edge of the family's support; gamfit only.
 
 Prints exactly one ``RESULT {json}`` line on stdout. The driver (``run.py``)
 launches this script with a pinned thread environment and a scratch working
@@ -54,8 +59,9 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 if __package__:
-    from . import fuzz_terms
+    from . import fuzz_families, fuzz_terms
 else:  # run as a script by run.py: this directory is sys.path[0]
+    import fuzz_families  # type: ignore[no-redef]
     import fuzz_terms  # type: ignore[no-redef]
 
 LIBS = ("gamfit", "pygam", "pygam_gs")
@@ -567,6 +573,10 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
         if lib != "gamfit":
             raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
         return run_fuzz(family, n, design, seed)
+    if fuzz_families.is_fuzz_design(design):
+        if lib != "gamfit":
+            raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
+        return fuzz_families.run(family, n, design, seed)
     X, y, _, w = make_data(n, design, family, seed)
     Xt, yt, mut, wt = make_data(n, design, family, seed + TEST_SEED_OFFSET)
     out: dict[str, Any] = {"base_rss_mb": rss_peak_mb()}

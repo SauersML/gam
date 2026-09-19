@@ -23,7 +23,7 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests a distribution-free conformal band: with `training_data` the exact full-conformal set for an eligible Gaussian-identity fit, or with `calibration` the split-conformal band. On standard GLMs and the location-scale families this populates `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper`; the transformation-normal and Bernoulli marginal-slope classes retain their class-specific `std_error` / `mean_lower` / `mean_upper` names. On supported single-event survival modes it populates `survival_se` and `eta_se`. On competing-risks survival it populates SE/lower/upper arrays for every cause-specific hazard, survival, cumulative hazard, CIF, overall survival, and eta surface. |
+| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests a distribution-free conformal band: with `training_data` the exact full-conformal set for an eligible Gaussian-identity fit, or with `calibration` the split-conformal band. On standard GLMs and the location-scale families this populates `linear_predictor_standard_error` (the posterior SD of η), `posterior_mean_standard_error` (the posterior SD of the response, `√Var[g⁻¹(η)]` from the same η integral as `posterior_mean`, never the delta method), and `posterior_mean_lower` / `posterior_mean_upper` (the inverse link of the η credible quantiles); the transformation-normal and Bernoulli marginal-slope classes retain their class-specific `std_error` / `mean_lower` / `mean_upper` names. On supported single-event survival modes it populates `survival_se` and `eta_se`. On competing-risks survival it populates SE/lower/upper arrays for every cause-specific hazard, survival, cumulative hazard, CIF, overall survival, and eta surface. |
 | `conformal_level` | `0.9` | Marginal coverage for `interval="conformal"`. Ignored for numeric Wald intervals. |
 | `calibration` | `None` | Held-out labeled calibration table for the split-conformal band; `interval="conformal"` only. It must include the response column. |
 | `training_data` | `None` | Labeled rows (normally the training table) for the exact full-conformal set; `interval="conformal"` only, exclusive with `calibration`. It must include the response column. |
@@ -47,8 +47,8 @@ For model-based intervals, a dict-shaped result also carries the scalar
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale posterior means. Table form has `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`; adds `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper` when `interval` is set. |
-| Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale posterior means, on the same estimand-explicit schema as a standard fit: table form has `linear_predictor_plugin`, `mean_plugin`, `posterior_mean`, and `noise_scale` (the fitted scale channel); adds `posterior_mean_standard_error`, `posterior_mean_lower`, `posterior_mean_upper` when `interval` is set. |
+| Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale posterior means. Table form has `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`; adds `linear_predictor_standard_error`, `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper` when `interval` is set. |
+| Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale posterior means, on the same estimand-explicit schema as a standard fit: table form has `linear_predictor_plugin`, `mean_plugin`, `posterior_mean`, and `noise_scale` (the fitted scale channel); adds `linear_predictor_standard_error`, `posterior_mean_standard_error`, `posterior_mean_lower`, `posterior_mean_upper` when `interval` is set. |
 | Transformation-normal | 1-D `numpy.ndarray` | Per-row response-scale conditional mean `E[Y|x]` (issue #1612). |
 | Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. Table form has `mean`; with `interval=` it also includes `linear_predictor`, `std_error`, `mean_lower`, and `mean_upper`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
@@ -86,7 +86,8 @@ model = gamfit.fit(train_df, "y ~ s(x)")
 
 preds = model.predict(test_df, interval=0.95)
 # columns: linear_predictor_plugin, mean_plugin, posterior_mean,
-#          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
+#          linear_predictor_standard_error, posterior_mean_standard_error,
+#          posterior_mean_lower, posterior_mean_upper
 
 pred_dict = model.predict(test_df, interval=0.95, return_type="dict")
 mu = pred_dict["posterior_mean"]       # mapping access
@@ -148,13 +149,19 @@ limit:
 --calibration FILE) --level L` runs the same routes; exactly one of the two
 labeled tables is required.
 
-With `training_data` it is the exact full-conformal set at the fitted (frozen)
-smoothing parameters, for a Gaussian-identity model fitted without prior
-weights, offsets, or a link wiggle. The saved model keeps only the `p x p`
-frozen penalty `S_lambda`, never per-row training data, so the labeled rows
-(normally the training table, response column included) are passed again at
-predict time. The output adds `frozen_rho_certified`: the finite-sample
-coverage theorem holds on rows where it is 1.
+With `training_data` it is the full-conformal set of the fit that re-selects
+the smoothing strength by REML on the labeled rows plus the candidate test row,
+for a Gaussian-identity model fitted without prior weights, offsets, or a link
+wiggle. The test row is treated exactly like a training row, so the
+finite-sample coverage theorem holds. The saved model keeps only the `p x p`
+frozen penalty `S_lambda` and its smoothing-parameter count, never per-row
+training data, so the labeled rows (normally the training table, response
+column included) are passed again at predict time. The output adds
+`conformal_certificate`: `0` (exact_frozen, nothing to re-select) or `1`
+(honest_refit) where the guarantee holds, and a negative code for a typed
+refusal (`-1` several smoothing parameters, `-2` a model saved without the
+count, `-3` to `-6` a degenerate criterion or refit), where the row carries the
+frozen-smoothing set with no finite-sample guarantee.
 
 ```python
 import numpy as np

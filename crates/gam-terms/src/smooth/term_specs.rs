@@ -66,6 +66,58 @@ pub(crate) fn rewrite_thin_plate_knots_error(
     }
 }
 
+/// Put the unresolvable-bulk thin-plate refusal in the term's own units: name
+/// the smooth and, for each covariate, the full range the centres had to span
+/// next to the interquartile range where the bulk of the rows sit, so the
+/// outlying span is visible and the remedy is actionable.
+pub(crate) fn name_thin_plate_outlier_span(
+    err: BasisError,
+    termname: &str,
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+) -> BasisError {
+    let BasisError::ThinPlateBulkUnresolvable {
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        ..
+    } = err
+    else {
+        return err;
+    };
+    let spans = feature_cols
+        .iter()
+        .filter(|&&col| col < data.ncols() && data.nrows() > 0)
+        .map(|&col| {
+            let mut values: Vec<f64> = data.column(col).iter().copied().collect();
+            values.sort_by(f64::total_cmp);
+            let quantile = |p: f64| {
+                let pos = p * (values.len() - 1) as f64;
+                let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+                values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
+            };
+            crate::basis::CovariateSpan {
+                column: col,
+                min: values[0],
+                lower_quartile: quantile(0.25),
+                upper_quartile: quantile(0.75),
+                max: values[values.len() - 1],
+            }
+        })
+        .collect();
+    BasisError::ThinPlateBulkUnresolvable {
+        term: Some(termname.to_string()),
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        spans,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
     None,
@@ -5465,77 +5517,63 @@ fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
 /// first, while their coordinates stay independent on the chart's null space.
 /// That reproduces both cases and needs no record of which chart produced a
 /// frozen transform.
+/// Orthonormal basis of `{γ : Zγ ∈ span(F)}` for an injective chart `Z` and an
+/// orthonormal frame `F`.
 ///
-/// The blocks are built on an orthonormal frame of the chart's range, not on
-/// the chart's own coordinates. A frozen chart saved before the collection
-/// gauge became orthonormal composes the identifiability basis with a spectral
-/// whitener, whose column scales span as many decades as the penalty spectrum,
-/// so a relative rank cutoff on the primary in those coordinates reports
-/// spurious null directions and the blocks can never cover them. With `Z = U Σ Vᵀ` the frame `U` spans the same functions,
-/// coordinates map by `c_U = Σ Vᵀ c_Z`, and each ridge factor `E` in `U` is `E Σ
-/// Vᵀ` in `Z`. For an orthonormal chart (every chart the fit builds itself)
-/// this is an identity, because the ridges depend on the null space only
-/// through its projector.
+/// `Z = UΣVᵀ` moves the question onto the orthonormal `U`, where the singular
+/// values of `(I − FFᵀ)U` are sines of principal angles between two subspaces.
+/// A direction the chart keeps inside `span(F)` has angle zero up to roundoff,
+/// so a machine-precision rank cutoff decides it however the chart scales its
+/// coordinates. `γ = VΣ⁻¹u` maps each such `u` back to the chart.
+fn chart_preimage_of_span(
+    chart: &Array2<f64>,
+    frame: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::{FaerSvd, rrqr_nullspace_basis};
+    if chart.nrows() != frame.nrows() {
+        crate::bail_dim_basis!(
+            "tensor chart has {} rows but the null frame has {}",
+            chart.nrows(),
+            frame.nrows()
+        );
+    }
+    let width = chart.ncols();
+    if frame.ncols() == 0 || width == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let (left, singular, right_t) = chart.svd(true, true).map_err(BasisError::LinalgError)?;
+    let (Some(left), Some(right_t)) = (left, right_t) else {
+        crate::bail_invalid_basis!("tensor chart SVD returned no singular vectors");
+    };
+    if singular.len() < width || singular.iter().take(width).any(|&s| !(s > 0.0)) {
+        crate::bail_invalid_basis!(
+            "tensor identifiability chart is not injective ({} columns)",
+            width
+        );
+    }
+    let left = left.slice(s![.., ..width]).to_owned();
+    let projected = &left - &frame.dot(&frame.t().dot(&left));
+    // `rrqr_nullspace_basis(a)` spans `null(aᵀ)`.
+    let (angle_null, _) =
+        rrqr_nullspace_basis(&projected.t().to_owned(), 1.0).map_err(BasisError::LinalgError)?;
+    if angle_null.ncols() == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let scaled = Array2::from_shape_fn(angle_null.dim(), |(row, col)| {
+        angle_null[[row, col]] / singular[row]
+    });
+    let preimage = right_t.slice(s![..width, ..]).t().dot(&scaled);
+    let (basis, _, _) = preimage.svd(true, false).map_err(BasisError::LinalgError)?;
+    let Some(basis) = basis else {
+        crate::bail_invalid_basis!("tensor chart null SVD returned no singular vectors");
+    };
+    Ok(basis.slice(s![.., ..preimage.ncols()]).to_owned())
+}
+
 fn tensor_null_function_block_ridges(
     normalized_marginal_penalties: &[(Array2<f64>, f64)],
     marginal_function_grams: &[Array2<f64>],
     chart: Option<&Array2<f64>>,
-    chart_primary: &ConstructiveQuadratic,
-) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
-    use gam_linalg::faer_ndarray::FaerSvd;
-    let Some(z) = chart else {
-        return tensor_null_function_block_ridges_in_frame(
-            normalized_marginal_penalties,
-            marginal_function_grams,
-            None,
-            chart_primary,
-        );
-    };
-    let (frame, singular, right_t) = z.svd(true, true).map_err(BasisError::LinalgError)?;
-    let (Some(frame), Some(right_t)) = (frame, right_t) else {
-        return Err(BasisError::LinalgError(
-            gam_linalg::faer_ndarray::FaerLinalgError::SvdNoConvergence {
-                context: "tensor null blocks: chart singular vectors were not returned",
-            },
-        ));
-    };
-    if numerical_rank(z)? != z.ncols() {
-        crate::bail_invalid_basis!(
-            "tensor null blocks: the {}x{} coefficient chart is rank deficient",
-            z.nrows(),
-            z.ncols()
-        );
-    }
-    // `c_U = Σ Vᵀ c_Z` and its inverse `c_Z = V Σ⁻¹ c_U`.
-    let to_frame = Array2::from_diag(&singular).dot(&right_t);
-    let from_frame = right_t
-        .t()
-        .dot(&Array2::from_diag(&singular.mapv(f64::recip)));
-    let frame_primary = ConstructiveQuadratic::from_energy_factor(
-        fast_ab(chart_primary.factor(), &from_frame),
-        "tensor primary penalty on the chart frame",
-    )?;
-    tensor_null_function_block_ridges_in_frame(
-        normalized_marginal_penalties,
-        marginal_function_grams,
-        Some(&frame),
-        &frame_primary,
-    )?
-    .into_iter()
-    .map(|ridge| {
-        ConstructiveQuadratic::from_energy_factor(
-            fast_ab(ridge.factor(), &to_frame),
-            "tensor null-function block ridge",
-        )
-    })
-    .collect()
-}
-
-fn tensor_null_function_block_ridges_in_frame(
-    normalized_marginal_penalties: &[(Array2<f64>, f64)],
-    marginal_function_grams: &[Array2<f64>],
-    chart: Option<&Array2<f64>>,
-    chart_primary: &ConstructiveQuadratic,
 ) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
     use gam_linalg::faer_ndarray::FaerEigh;
     let margins = normalized_marginal_penalties.len();
@@ -5545,12 +5583,9 @@ fn tensor_null_function_block_ridges_in_frame(
             marginal_function_grams.len()
         );
     }
-    let Some(chart_null) = crate::basis::constructive_nullspace_basis(chart_primary)? else {
-        return Ok(Vec::new());
-    };
-
     // Per margin: the constant frame and the trend frame, each orthonormal.
     let mut margin_frames = Vec::<[Array2<f64>; 2]>::with_capacity(margins);
+    let mut joint_null = Array2::<f64>::eye(1);
     for ((penalty, _), gram) in normalized_marginal_penalties
         .iter()
         .zip(marginal_function_grams)
@@ -5564,6 +5599,7 @@ fn tensor_null_function_block_ridges_in_frame(
             .map(|(idx, _)| idx)
             .collect();
         let null = analysis.eigenvectors.select(Axis(1), &null_idx);
+        joint_null = kronecker_product(&joint_null, &null);
         let width = penalty.nrows();
         let ones = Array1::<f64>::from_elem(width, 1.0);
         let constant_energy = ones.dot(&penalty.dot(&ones)) / width as f64;
@@ -5592,6 +5628,20 @@ fn tensor_null_function_block_ridges_in_frame(
             null.dot(&constant_coords).insert_axis(Axis(1)),
             null.dot(&trend_coords),
         ]);
+    }
+    // Both decompositions penalize every tensor direction with a penalized
+    // factor, so the joint null is `⊗_j null(S_j)` by construction, and in the
+    // chart it is the preimage of that span. Reading it off the chart
+    // primary's spectrum instead fails once the chart is not orthonormal: the
+    // collection gauge whitens against the design Gram, which spreads the
+    // primary's eigenvalues until a spectral cutoff counts penalized
+    // directions as null.
+    let chart_null = match chart {
+        Some(z) => chart_preimage_of_span(z, &joint_null)?,
+        None => joint_null,
+    };
+    if chart_null.ncols() == 0 {
+        return Ok(Vec::new());
     }
 
     // Blocks `⊗_j frames[j][bit j]`, with their Gram images `⊗_j G_j frames[j][bit j]`.
@@ -6200,21 +6250,10 @@ pub(crate) fn build_tensor_bspline_basis(
         // The null-function ridges are built in the coefficient chart the fit
         // uses, after identifiability, because the chart decides which null
         // blocks remain free (see `tensor_null_function_block_ridges`).
-        let physical_primary_terms = candidates
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .matrix
-                    .scaled(candidate.normalization_scale, "physical tensor primary penalty")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let chart_primary =
-            ConstructiveQuadratic::sum(&physical_primary_terms, "joint tensor primary penalty")?;
         for ridge in tensor_null_function_block_ridges(
             &normalized_marginal_penalties,
             &marginal_function_grams,
             z_opt.as_ref(),
-            &chart_primary,
         )? {
             let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
             candidates.push(PenaltyCandidate {
@@ -8310,7 +8349,8 @@ pub fn build_single_local_smooth_term(
                 spec_local.identifiability = SpatialIdentifiability::None;
             }
             let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
-                rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
+                let err = rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec);
+                name_thin_plate_outlier_span(err, &term.name, data, feature_cols)
             })?;
             // Inject the input scale into metadata; also restore the user's
             // original length_scale (not the σ_geom-compensated one) so a

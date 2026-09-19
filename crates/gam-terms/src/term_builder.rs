@@ -33,6 +33,7 @@ use crate::smooth::{
     TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
+use gam_problem::ErrorCategory;
 use gam_problem::types::ColIdx;
 
 /// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
@@ -117,6 +118,35 @@ pub enum TermBuilderError {
     /// Term-collection-stage formula error — a node that the caller was
     /// supposed to resolve upstream reached the builder.
     MalformedFormula { reason: String },
+    /// A term that needs a numeric coordinate (`s(...)`, `te(...)`, the
+    /// continuous operand of `fs`/`sz`, an explicit `linear(...)`) names a
+    /// categorical column. Fitting it would smooth over the arbitrary level
+    /// codes, so the term is refused at formula resolution and the categorical
+    /// alternatives are named instead.
+    CategoricalCoordinate {
+        /// The term as written in the formula.
+        term: String,
+        /// The categorical column the term names.
+        column: String,
+        /// The number of levels the column carries.
+        level_count: usize,
+        /// The first cell whose text is not a number, when the column is
+        /// categorical because of one: a stray string in an otherwise numeric
+        /// column is the common way this happens by accident.
+        first_non_numeric: Option<NonNumericCell>,
+    },
+    /// A data-layer failure met while resolving the terms' columns, carried
+    /// whole so its category and text reach the front end unchanged.
+    Data(DataError),
+}
+
+/// A categorical cell whose text does not parse as a number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonNumericCell {
+    /// The cell's text.
+    pub value: String,
+    /// The 1-based data row holding it.
+    pub row: usize,
 }
 
 impl std::fmt::Display for TermBuilderError {
@@ -128,6 +158,40 @@ impl std::fmt::Display for TermBuilderError {
             | TermBuilderError::UnsupportedFeature { reason }
             | TermBuilderError::DegenerateData { reason }
             | TermBuilderError::MalformedFormula { reason } => f.write_str(reason),
+            TermBuilderError::Data(source) => std::fmt::Display::fmt(source, f),
+            TermBuilderError::CategoricalCoordinate {
+                term,
+                column,
+                level_count,
+                first_non_numeric,
+            } => {
+                write!(
+                    f,
+                    "term `{term}` uses column '{column}' as a numeric coordinate, but '{column}' \
+                     is categorical ({level_count} levels"
+                )?;
+                if let Some(cell) = first_non_numeric {
+                    write!(
+                        f,
+                        "; first non-numeric value '{}' at row {}",
+                        cell.value, cell.row
+                    )?;
+                }
+                write!(
+                    f,
+                    "), so the term would be fit over arbitrary level codes. For a per-level \
+                     effect use factor({column}) (fixed) or group({column}) (random); for a smooth \
+                     that varies by level use s(x, by={column}), fs(x, {column}) or sz(x, {column}); \
+                     for a random-effect smooth use s({column}, bs=\"re\")"
+                )?;
+                if first_non_numeric.is_some() {
+                    write!(
+                        f,
+                        ". If '{column}' is meant to be numeric, fix or remove its non-numeric values"
+                    )?;
+                }
+                Ok(())
+            }
             // Delegate to the canonical `DataError::ColumnNotFound` formatter
             // so a single source of truth defines the human text. The
             // intermediate `DataError` constructed here owns its strings only
@@ -153,8 +217,6 @@ impl std::fmt::Display for TermBuilderError {
     }
 }
 
-impl std::error::Error for TermBuilderError {}
-
 impl From<TermBuilderError> for String {
     fn from(err: TermBuilderError) -> String {
         err.to_string()
@@ -176,9 +238,8 @@ impl From<String> for TermBuilderError {
 /// Typed lift from data-layer errors. `DataError::ColumnNotFound` becomes
 /// `TermBuilderError::ColumnNotFound` field-for-field — no stringification,
 /// no information loss — so the FFI boundary downstream can dispatch on
-/// the typed variant. Other `DataError` variants degrade into
-/// `MissingColumn` since they describe column-resolution-time failures
-/// without a dedicated structured destination.
+/// the typed variant. Other `DataError` variants are carried whole in
+/// `Data`, so their category survives.
 impl From<DataError> for TermBuilderError {
     fn from(err: DataError) -> Self {
         match err {
@@ -195,17 +256,61 @@ impl From<DataError> for TermBuilderError {
                 similar,
                 tsv_hint,
             },
-            DataError::SchemaMismatch { reason }
-            | DataError::ParseError { reason }
-            | DataError::EncodingFailure { reason }
-            | DataError::EmptyInput { reason }
-            | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
-            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
-                reason: cell.to_string(),
-            },
+            other @ (DataError::SchemaMismatch { .. }
+            | DataError::ParseError { .. }
+            | DataError::EncodingFailure { .. }
+            | DataError::EmptyInput { .. }
+            | DataError::InvalidValue { .. }
+            | DataError::InvalidCell { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
+        }
+    }
+}
+
+impl TermBuilderError {
+    /// The user-facing category every front end classifies this failure by.
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::ColumnNotFound { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidOption { .. }
+            | Self::UnsupportedFeature { .. }
+            | Self::MalformedFormula { .. }
+            | Self::CategoricalCoordinate { .. } => ErrorCategory::Formula,
+            Self::DegenerateData { .. } => ErrorCategory::Data,
+            // The column-kind table disagreeing with the column map it was
+            // built alongside.
+            Self::MissingColumn { .. } => ErrorCategory::Internal,
+            Self::Data(source) => source.error_category(),
+        }
+    }
+
+    /// The `Enum::Variant` name a front end prints beside the message.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::MissingColumn { .. } => "TermBuilderError::MissingColumn",
+            Self::ColumnNotFound { .. } => "TermBuilderError::ColumnNotFound",
+            Self::IncompatibleConfig { .. } => "TermBuilderError::IncompatibleConfig",
+            Self::InvalidOption { .. } => "TermBuilderError::InvalidOption",
+            Self::UnsupportedFeature { .. } => "TermBuilderError::UnsupportedFeature",
+            Self::DegenerateData { .. } => "TermBuilderError::DegenerateData",
+            Self::MalformedFormula { .. } => "TermBuilderError::MalformedFormula",
+            Self::CategoricalCoordinate { .. } => "TermBuilderError::CategoricalCoordinate",
+            Self::Data(source) => source.variant_name(),
+        }
+    }
+}
+
+impl std::error::Error for TermBuilderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Renders exactly its source, so it is transparent to the chain.
+            Self::Data(source) => std::error::Error::source(source),
+            _ => None,
         }
     }
 }
@@ -386,19 +491,6 @@ pub(crate) fn marginal_slope_z_alias_is_live(
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
 
-/// A categorical column cannot be the argument of a term that treats its
-/// input as a numeric axis: the category codes would be read as positions on
-/// a line, silently fitting an arbitrary order. Point the user at the
-/// categorical spellings instead.
-fn categorical_in_numeric_term_error(term: &str, column: &str) -> TermBuilderError {
-    TermBuilderError::incompatible_config(format!(
-        "{term} treats its arguments as numeric axes, but column '{column}' is \
-         categorical; use factor({column}) for a categorical level effect, \
-         group({column}) for a random effect, or s(x, {column}, bs=\"fs\") for a \
-         per-level smooth of a numeric x"
-    ))
-}
-
 pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
@@ -492,11 +584,15 @@ pub fn build_termspec(
                     TermBuilderError::missing_column(format!(
                         "internal column-kind lookup failed for '{name}'"
                     ))
-                    .to_string()
                 })?;
                 if *explicit {
-                    if matches!(auto_kind, ColumnKindTag::Categorical) {
-                        return Err(categorical_in_numeric_term_error("linear()", name));
+                    if auto_kind == ColumnKindTag::Categorical {
+                        return Err(categorical_coordinate_error(
+                            format!("linear({name})"),
+                            name,
+                            col,
+                            ds,
+                        ));
                     }
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
@@ -562,7 +658,6 @@ pub fn build_termspec(
                     TermBuilderError::missing_column(format!(
                         "internal column-kind lookup failed for '{name}'"
                     ))
-                    .to_string()
                 })?;
                 if !matches!(auto_kind, ColumnKindTag::Continuous | ColumnKindTag::Binary) {
                     return Err(TermBuilderError::incompatible_config(format!(
@@ -654,6 +749,14 @@ pub fn build_termspec(
                     let by_col = resolve_col(col_map, by_name)?;
                     inject_by_level_sizing_rows(&mut inner_options, ds, by_col);
                 }
+                reject_categorical_smooth_coordinates(
+                    label,
+                    *kind,
+                    &smooth_vars,
+                    &cols,
+                    &inner_options,
+                    ds,
+                )?;
                 let inner_basis = build_smooth_basis(
                     *kind,
                     &smooth_vars,
@@ -897,7 +1000,6 @@ pub fn build_termspec(
                         TermBuilderError::missing_column(format!(
                             "internal column-kind lookup failed for '{var}'"
                         ))
-                        .to_string()
                     })?;
                     match kind {
                         ColumnKindTag::Continuous | ColumnKindTag::Binary => numeric_cols.push(col),
@@ -1979,11 +2081,12 @@ fn is_tensor_k_axis_option_key(key: &str) -> bool {
 
 /// Parse a per-margin basis dimension list (`k=<scalar>`, `k=[k0, k1, ...]`,
 /// or axis aliases like `k_x=...` / `k_0=...`). A scalar is broadcast across
-/// all axes; `None` returns the heuristic from the data column.
+/// all axes; `None` returns the default sizes for `sizing_rows` rows.
 fn parse_tensor_k_list(
     options: &BTreeMap<String, String>,
     cols: &[usize],
     ds: &Dataset,
+    sizing_rows: usize,
 ) -> Result<(Vec<usize>, bool), String> {
     let mut axis_values = vec![None; cols.len()];
     let mut saw_axis_alias = false;
@@ -2031,7 +2134,7 @@ fn parse_tensor_k_list(
         ));
     }
     let Some(raw) = raw else {
-        let inferred = heuristic_tensor_margin_knots(cols, ds);
+        let inferred = heuristic_tensor_margin_knots(cols, ds, sizing_rows);
         return Ok((inferred, true));
     };
     let entries = split_list_option(raw);
@@ -2374,6 +2477,98 @@ pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
     bracketed && !parse_option_list(trimmed).is_empty()
 }
 
+/// The `(continuous, factor)` operand indices of a two-variable `fs`/`sz`/`re`
+/// factor smooth. `fs`/`sz` need a categorical operand and prefer the second
+/// (`fs(x, g)`); `re` prefers the first, following mgcv's random-slope
+/// spelling `s(g, x, bs="re")`, and treats the first operand as the grouping
+/// variable when neither is categorical. `None` when `fs`/`sz` has no
+/// categorical operand.
+fn factor_smooth_operands(type_name: &str, cols: [usize; 2], ds: &Dataset) -> Option<(usize, usize)> {
+    let categorical =
+        cols.map(|col| matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical)));
+    if type_name == "re" {
+        Some(if !categorical[0] && categorical[1] { (0, 1) } else { (1, 0) })
+    } else if categorical[1] {
+        Some((0, 1))
+    } else if categorical[0] {
+        Some((1, 0))
+    } else {
+        None
+    }
+}
+
+/// Refuse a smooth that would use a categorical column as a numeric
+/// coordinate.
+///
+/// A categorical column holds level codes whose order and spacing are
+/// arbitrary, so a smooth over it is meaningless. The only smooths that take
+/// a categorical operand are the factor smooths (`fs`, `sz`, `re`), and only
+/// in their factor slot; a categorical `by=` is removed from `vars` before
+/// this runs and stays valid.
+fn reject_categorical_smooth_coordinates(
+    term: &str,
+    kind: SmoothKind,
+    vars: &[String],
+    cols: &[usize],
+    options: &BTreeMap<String, String>,
+    ds: &Dataset,
+) -> Result<(), TermBuilderError> {
+    let type_name = resolve_smooth_type_name(kind, cols.len(), options);
+    let factor_slot = match cols {
+        [first, second] if matches!(type_name.as_str(), "fs" | "sz" | "re") => {
+            factor_smooth_operands(&type_name, [*first, *second], ds).map(|(_, factor)| factor)
+        }
+        _ => None,
+    };
+    for (idx, (var, &col)) in vars.iter().zip(cols).enumerate() {
+        if Some(idx) != factor_slot
+            && matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical))
+        {
+            return Err(categorical_coordinate_error(term.to_string(), var, col, ds));
+        }
+    }
+    Ok(())
+}
+
+/// The [`TermBuilderError::CategoricalCoordinate`] refusal for `column`,
+/// naming the first cell whose text is not a number when there is one.
+fn categorical_coordinate_error(
+    term: String,
+    column: &str,
+    col: usize,
+    ds: &Dataset,
+) -> TermBuilderError {
+    let levels = ds
+        .schema
+        .columns
+        .get(col)
+        .map(|schema_column| schema_column.levels.as_slice())
+        .unwrap_or(&[]);
+    let first_non_numeric = ds
+        .values
+        .column(col)
+        .iter()
+        .enumerate()
+        .find_map(|(row, &code)| {
+            let level = levels.get(level_code_index(code)?)?;
+            level.trim().parse::<f64>().is_err().then(|| NonNumericCell {
+                value: level.clone(),
+                row: row + 1,
+            })
+        });
+    TermBuilderError::CategoricalCoordinate {
+        term,
+        column: column.to_string(),
+        level_count: levels.len(),
+        first_non_numeric,
+    }
+}
+
+/// The level index a categorical cell encodes, or `None` for a missing cell.
+fn level_code_index(code: f64) -> Option<usize> {
+    (code.is_finite() && code >= 0.0 && code.fract() == 0.0).then_some(code as usize)
+}
+
 pub fn resolve_smooth_type_name(
     kind: SmoothKind,
     n_cols: usize,
@@ -2599,19 +2794,6 @@ pub(crate) fn build_smooth_basis(
     let smooth_double_penalty = option_bool(options, "double_penalty")?.unwrap_or(true);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
 
-    // Only the factor-smooth family (fs/sz/re) consumes a categorical column
-    // as a grouping factor. Every other smooth places its inputs on numeric
-    // axes, where category codes would silently fit an arbitrary level order.
-    if !matches!(type_opt.as_str(), "fs" | "sz" | "re")
-        && let Some((var, _)) = vars.iter().zip(cols.iter()).find(|(_, col)| {
-            matches!(ds.column_kinds.get(**col), Some(ColumnKindTag::Categorical))
-        })
-    {
-        return Err(
-            categorical_in_numeric_term_error(&format!("a '{type_opt}' smooth"), var).to_string(),
-        );
-    }
-
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         if type_opt == "re" {
             validate_random_effect_smooth_options(options)?;
@@ -2624,29 +2806,13 @@ pub(crate) fn build_smooth_basis(
                 type_opt
             ));
         }
-        let kinds = cols
-            .iter()
-            .map(|&c| ds.column_kinds.get(c).copied())
-            .collect::<Vec<_>>();
-        let (cont_idx, group_idx) = if type_opt == "re" {
-            // mgcv random-slope examples are often s(g, x, bs="re").
-            match (kinds[0], kinds[1]) {
-                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
-                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
-                _ => (1usize, 0usize),
-            }
-        } else {
-            match (kinds[0], kinds[1]) {
-                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
-                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
-                _ => {
-                    return Err(format!(
-                        "{} factor-smooth requires one categorical factor variable",
-                        type_opt
-                    ));
-                }
-            }
-        };
+        let (cont_idx, group_idx) =
+            factor_smooth_operands(&type_opt, [cols[0], cols[1]], ds).ok_or_else(|| {
+                format!(
+                    "{} factor-smooth requires one categorical factor variable",
+                    type_opt
+                )
+            })?;
         let c = cols[cont_idx];
         let (minv, maxv) = col_minmax(ds.values.column(c))?;
         let degree = if type_opt == "re" {
@@ -4008,7 +4174,7 @@ pub(crate) fn build_smooth_basis(
             for axis in 0..dim {
                 validate_spline_degree(&format!("degree[{axis}]"), axis_degree(axis))?;
             }
-            let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
+            let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds, sizing_rows)?;
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 for (axis, k) in k_list.iter_mut().enumerate() {
                     *k = (*k).min(axis_degree(axis) + 2);
@@ -4017,10 +4183,10 @@ pub(crate) fn build_smooth_basis(
             if k_inferred {
                 inference_notes.inform(format!(
                     "Automatically set per-margin basis sizes {:?} for tensor smooth '{}' \
-                     (dimension-aware tensor budget: total ∏k kept near the mgcv-te default \
-                     and within the data support, distributed geometrically across margins and \
-                     capped per margin by each column's resolution). \
-                     Override with k=<int> or k=[k0,k1,...].",
+                     (the default basis dimension of a smooth of this many covariates on \
+                     this many rows, distributed geometrically across margins and capped per \
+                     margin by each column's distinct values; the penalty sets the \
+                     smoothness). Override with k=<int> or k=[k0,k1,...].",
                     k_list,
                     vars.join(",")
                 ));
@@ -4728,83 +4894,77 @@ pub(crate) fn default_cyclic_basis_dim(default_internal: usize, degree: usize) -
     (default_internal + degree + 1).min(CYCLIC_DEFAULT_BASIS_DIM.max(degree + 1))
 }
 
-/// Per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
+/// Default per-margin basis sizes for a tensor-product smooth (`te`/`ti`/`t2`).
 ///
-/// The 1-D heuristic [`heuristic_knots_for_column`] is calibrated for an
-/// *additive* margin: a well-resolved column asks for the lean univariate
-/// default (≈12 basis functions, the mgcv-like cap of 8 internal knots; see
-/// gam#1680), which is sensible for a single `s(x)` term.
-/// A tensor product, however, multiplies the per-margin sizes:
-/// `p = ∏_d k_d`. Reusing the 1-D rule per margin makes `p` explode with the
-/// tensor dimension — a 3-D `te(x,y,z)` at the 1-D ceiling of 12/margin is
-/// `12³ ≈ 1728` columns, and every REML evaluation pays an O(p³) dense
-/// penalty reparameterization (the full-tensor sum-to-zero constraint is not
-/// Kronecker-factorable), turning model selection over tensor candidates into
-/// a multi-minute single-threaded stall (gam#813). It also requests far more
-/// coefficients than the data can identify whenever `p ≫ n`.
+/// A tensor smooth of `d` covariates is a `d`-dimensional smooth, so its total
+/// column count `p = ∏_d k_d` is the same default basis dimension every other
+/// `d`-covariate smooth on these rows receives ([`default_num_centers`]); the
+/// roughness penalty, not the basis size, then sets the smoothness. The budget
+/// is split geometrically across the margins by [`tensor_margin_sizes`], each
+/// margin capped by the distinct values of its covariate
+/// ([`tensor_margin_support`]), so a low-cardinality margin hands its unused
+/// share to the margins that can resolve more. The product never exceeds the
+/// distinct coordinate rows: a tensor surface is identified only at the
+/// locations the data occupy, so repeated rows sharpen those values without
+/// adding columns the data can pin down.
+fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset, sizing_rows: usize) -> Vec<usize> {
+    let caps: Vec<usize> = cols
+        .iter()
+        .map(|&c| tensor_margin_support(ds.values.column(c)))
+        .collect();
+    let budget = default_num_centers(sizing_rows, cols.len().max(1))
+        .min(count_unique_coordinate_rows(ds.values.view(), cols));
+    tensor_margin_sizes(&caps, budget)
+}
+
+/// Smallest default tensor margin that carries a roughness penalty beyond its
+/// null space: a cubic margin with one interior degree of freedom.
+fn tensor_margin_min_k() -> usize {
+    DEFAULT_BSPLINE_DEGREE + 2
+}
+
+/// The largest basis a default tensor margin on `col` can identify: one
+/// function per distinct covariate value (a cr margin places one value-knot per
+/// function, and a function observed at `u` distinct values has at most `u`
+/// identifiable values), floored at the 2-function linear margin every tensor
+/// axis carries.
+pub(crate) fn tensor_margin_support(col: ArrayView1<'_, f64>) -> usize {
+    unique_count_column(col).max(2)
+}
+
+/// Per-margin basis sizes `k_d` whose product stays within `budget`, each
+/// margin inside `[min(min_k, cap_d), cap_d]` (`cap_d` is the margin's
+/// identifiable support, [`tensor_margin_support`]).
 ///
-/// mgcv's `te(...)` uses a small per-margin default (`k = 5`, i.e. `5^d`).
-/// We match that spirit while staying data-adaptive: budget the *total* tensor
-/// column count `p_target` and distribute it geometrically across the margins
-/// so `∏ k_d ≈ p_target`, never asking a margin for more functions than its
-/// own unique values (and the data set) can support.
-fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
-    let d = cols.len().max(1);
-    let degree = DEFAULT_BSPLINE_DEGREE;
-    let min_k = degree + 2; // smallest margin that carries a roughness penalty
-    let n = ds.values.nrows();
-
-    // Per-margin 1-D ceiling: never request more basis functions than the
-    // margin's own resolution (unique values) supports. This caps each axis
-    // independently before the joint budget is applied.
-    let per_margin_cap: Vec<usize> = cols
+/// The budget is split geometrically (the integer `d`-th root), then any
+/// headroom left by a margin whose support is below the geometric share goes
+/// to the margins that can still grow, one function at a time toward the axis
+/// with the most remaining support, while `∏ k_d ≤ budget`. The only way the
+/// product exceeds the budget is the per-margin floor, which a tensor margin
+/// cannot go below.
+pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
+    let d = caps.len().max(1);
+    let min_k = tensor_margin_min_k();
+    let product = |k: &[usize]| -> usize { k.iter().fold(1usize, |p, &k| p.saturating_mul(k)) };
+    let mut geo = ((budget.max(1) as f64).powf(1.0 / d as f64).round() as usize).max(1);
+    while geo > 1 && geo.saturating_pow(d as u32) > budget {
+        geo -= 1;
+    }
+    while (geo + 1).saturating_pow(d as u32) <= budget {
+        geo += 1;
+    }
+    let mut k_list: Vec<usize> = caps
         .iter()
-        .map(|&c| heuristic_knots_for_column(ds.values.column(c)).max(min_k))
+        .map(|&cap| geo.min(cap).max(min_k.min(cap)))
         .collect();
-
-    // Total-basis budget. A tensor with ∏k ≫ n coefficients is rank-deficient
-    // and pure REML cost; cap the product at a generous fraction of n while
-    // honoring mgcv's small default for the common small-d case. The budget
-    // grows with n but the geometric split below keeps each margin modest.
-    //   d=2 → up to ~7²=49 (mgcv-`te`-like), d=3 → ~5³=125, larger d shrinks
-    // per-margin further so the product never blows past the data support.
-    let mgcv_like_per_margin = match d {
-        2 => 7usize,
-        3 => 5usize,
-        _ => 4usize,
-    };
-    let mgcv_like_total = (mgcv_like_per_margin as f64).powi(d as i32);
-    let data_budget = (n as f64) * 0.8;
-    let p_target = mgcv_like_total
-        .max(min_k.pow(d as u32) as f64)
-        .min(data_budget);
-
-    // Geometric per-margin target so ∏k ≈ p_target, then clamp each margin to
-    // its own 1-D resolution cap and the difference-penalty floor.
-    let geo_per_margin = p_target.powf(1.0 / d as f64).round() as usize;
-    let unclamped: Vec<usize> = per_margin_cap
-        .iter()
-        .map(|&cap| geo_per_margin.clamp(min_k, cap))
-        .collect();
-
-    // The per-margin clamps can pull some axes below `geo_per_margin` (a
-    // low-resolution column), leaving headroom in the joint budget. Redistribute
-    // that headroom to the margins that can still grow, so the realized ∏k stays
-    // close to p_target instead of systematically under-shooting it.
-    let mut k_list = unclamped;
     loop {
-        let product: f64 = k_list.iter().map(|&k| k as f64).product();
-        if product >= p_target {
-            break;
-        }
-        // Grow the axis with the most remaining headroom (cap − current),
-        // breaking ties toward the largest cap. Stop when none can grow.
+        let current = product(&k_list);
         let Some(idx) = k_list
             .iter()
-            .zip(per_margin_cap.iter())
+            .zip(caps.iter())
             .enumerate()
-            .filter(|&(_, (k, cap))| k < cap)
-            .max_by_key(|&(_, (k, cap))| (cap - k, *cap))
+            .filter(|&(_, (&k, &cap))| k < cap && current / k * (k + 1) <= budget)
+            .max_by_key(|&(_, (&k, &cap))| (cap - k, cap))
             .map(|(i, _)| i)
         else {
             break;

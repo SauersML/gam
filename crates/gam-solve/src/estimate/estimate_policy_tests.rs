@@ -2256,7 +2256,7 @@ fn cubature_pirls_uses_lambda_search_frozen_beta_precision_2632() {
         .store(frozen_phi.to_bits(), Ordering::Relaxed);
 
     let result = state
-        .execute_pirls_stateless_for_cubature(&array![0.0], None)
+        .execute_pirls_stateless_for_test(&array![0.0])
         .expect("the Beta cubature sigma-point fit must converge");
     let (realized_phi, estimated) = match result
         .likelihood

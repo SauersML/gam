@@ -339,18 +339,18 @@ fn terminal_certification_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "certification-baseline")
         .expect("baseline outer run");
-    let diagnosed =
-        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
+    let certified_result =
+        run_outer(&mut certified, &config, "certification-run").expect("certified outer run");
 
-    assert_eq!(baseline.rho, diagnosed.rho);
+    assert_eq!(baseline.rho, certified_result.rho);
     assert_eq!(
         baseline.final_value.to_bits(),
-        diagnosed.final_value.to_bits()
+        certified_result.final_value.to_bits()
     );
-    assert_eq!(baseline.iterations, diagnosed.iterations);
-    assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
+    assert_eq!(baseline.iterations, certified_result.iterations);
+    assert_eq!(baseline.final_grad_norm, certified_result.final_grad_norm);
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -6335,7 +6335,7 @@ mod run_plan_stopped_run_2953_tests;
 /// custom-family effective-df ceiling once emitted an upper bound below
 /// `rho_lower_bound`, inverting the box, and `f64::clamp(min, max)` with
 /// `min > max` then panicked inside `project_to_bounds` and escaped as an opaque
-/// "panicked inside Rust boundary" `GamError` across the FFI. The projection no
+/// "panicked inside Rust boundary" `GamfitError` across the FFI. The projection no
 /// longer panics, so an inverted box would instead place seeds outside it; the
 /// runner rejects any such box up front, before a seed is projected against it.
 #[test]

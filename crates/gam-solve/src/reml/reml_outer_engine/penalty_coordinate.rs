@@ -87,6 +87,14 @@ pub struct PenaltyLogdetDerivs {
 pub struct PenaltySubspaceTrace {
     pub u_s: Array2<f64>,
     pub h_proj_inverse: Array2<f64>,
+    /// The eigenpairs of the priced precision this kernel drops, from the same
+    /// eigendecomposition as `u_s`: an orthonormal `p × d` basis and its `d`
+    /// eigenvalues. `K = M⁺` is a spectral function of `M`, so its derivative
+    /// couples every kept eigenpair to every dropped one (see
+    /// [`Self::pseudo_inverse_rotation`]); a kernel that keeps every eigenpair
+    /// carries `d = 0`.
+    pub dropped_basis: Array2<f64>,
+    pub dropped_eigenvalues: Array1<f64>,
     /// The additive scalar that turns the operator's own `logdet()` into the
     /// pseudo-log-determinant THIS kernel is the derivative kernel of (#2765).
     ///
@@ -123,6 +131,83 @@ impl PenaltySubspaceTrace {
         } else {
             operator_bound
         }
+    }
+}
+
+/// The kept–dropped part of the Fréchet derivative of a kept-spectrum
+/// pseudo-inverse along one precision drift, `L·U_Dᵀ + U_D·Lᵀ` (see
+/// [`PenaltySubspaceTrace::pseudo_inverse_rotation`]).
+#[derive(Clone, Debug)]
+pub struct PseudoInverseRotation<'a> {
+    left: Array2<f64>,
+    dropped_basis: &'a Array2<f64>,
+}
+
+impl PseudoInverseRotation<'_> {
+    /// The rotation applied to `v`.
+    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.left.dot(&self.dropped_basis.t().dot(v)) + self.dropped_basis.dot(&self.left.t().dot(v))
+    }
+
+    /// The rotation applied to every column of `v`.
+    pub fn apply_columns(&self, v: &Array2<f64>) -> Array2<f64> {
+        self.left.dot(&self.dropped_basis.t().dot(v)) + self.dropped_basis.dot(&self.left.t().dot(v))
+    }
+}
+
+impl PenaltySubspaceTrace {
+    /// The part of `D(M⁺)[Ṁ]` that `−K·Ṁ·K` omits, given `Ṁ·U_D`.
+    ///
+    /// `K = U_K Σ_K⁻¹ U_Kᵀ` is the spectral function `f(M)` with `f(σ) = 1/σ` on the kept
+    /// eigenpairs and `0` on the dropped ones. On a stratum where the kept set is fixed its
+    /// derivative is the Daleckii–Krein form `U (F ∘ UᵀṀU) Uᵀ` with the divided differences
+    /// `F_ij = (f(σ_i) − f(σ_j))/(σ_i − σ_j)`: `−1/(σ_iσ_j)` between two kept eigenpairs, which is
+    /// `−K·Ṁ·K`, `1/(σ_i(σ_i − σ_j))` between kept `i` and dropped `j`, and `0` between two dropped
+    /// ones. The kept–dropped block is this rotation, `L·U_Dᵀ + U_D·Lᵀ` with
+    /// `L = U_K (F ∘ U_KᵀṀU_D)`. It vanishes when the kernel drops nothing, and is not small
+    /// when a dropped eigenvalue is: an indefinite precision's negative eigenvalue enters
+    /// through `σ_i − σ_j` (gam#2952).
+    pub fn pseudo_inverse_rotation(
+        &self,
+        rate_on_dropped: &Array2<f64>,
+    ) -> Result<PseudoInverseRotation<'_>, String> {
+        let (p, _) = self.u_s.dim();
+        if rate_on_dropped.dim() != (p, self.dropped_eigenvalues.len()) {
+            return Err(format!(
+                "pseudo-inverse rotation: the drift on the dropped basis is {:?}, expected ({p}, {})",
+                rate_on_dropped.dim(),
+                self.dropped_eigenvalues.len()
+            ));
+        }
+        let coupling = self.u_s.t().dot(rate_on_dropped) * &self.kept_dropped_divided_differences()?;
+        Ok(PseudoInverseRotation {
+            left: self.u_s.dot(&coupling),
+            dropped_basis: &self.dropped_basis,
+        })
+    }
+
+    /// `F_ij = 1/(σ_i(σ_i − σ_j))` for kept `i` and dropped `j`: the divided difference of
+    /// `f(σ) = 1/σ` on the kept side and `0` on the dropped side, `r × d`.
+    fn kept_dropped_divided_differences(&self) -> Result<Array2<f64>, String> {
+        let (p, r) = self.u_s.dim();
+        let d = self.dropped_eigenvalues.len();
+        if self.dropped_basis.dim() != (p, d) || self.h_proj_inverse.dim() != (r, r) {
+            return Err(format!(
+                "kept-dropped divided differences: dropped basis {:?} and reduced kernel {:?} \
+                 against p = {p}, r = {r}, d = {d}",
+                self.dropped_basis.dim(),
+                self.h_proj_inverse.dim()
+            ));
+        }
+        if d > 0
+            && (0..r).any(|i| (0..r).any(|j| i != j && self.h_proj_inverse[[i, j]] != 0.0))
+        {
+            return Err("kept-dropped divided differences need the spectral kernel diag(1/σ)".to_string());
+        }
+        Ok(Array2::from_shape_fn((r, d), |(i, j)| {
+            let kept = 1.0 / self.h_proj_inverse[[i, i]];
+            1.0 / (kept * (kept - self.dropped_eigenvalues[j]))
+        }))
     }
 }
 
