@@ -280,7 +280,9 @@ pub struct ResolvedBasisLocations {
 /// Resolve a basis-evaluation helper's knots or centers on `t`.
 ///
 /// An omitted size takes the formula front door's default for the same kind
-/// on the same data, so `bspline_basis(x)` has the columns of `s(x)` and
+/// on the same data, so `bspline_basis(x)` has the columns of the pilot basis
+/// `s(x)` starts from (a formula fit may refine that pilot from its own
+/// adequacy evidence; a bare basis has no fit to refine from) and
 /// `duchon_basis(x)` the centers of `duchon(x)`:
 ///
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the

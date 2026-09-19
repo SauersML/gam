@@ -313,26 +313,21 @@ impl<'a> RemlState<'a> {
             );
             return Ok(zero());
         }
-        // A Firth fit's posterior carries the Jeffreys prior ½ log|I(β)|, and its
-        // mode solves S β̂ = ∇ℓ(β̂) + ∇½ log|I(β̂)|. `Gam784BlockTarget` integrates
-        // the flat-prior posterior −ℓ + ½ βᵀSβ and reduces its remainder through
-        // the flat-prior mode condition S β̂ = ∇ℓ(β̂), so on a Firth fit its value
-        // omits the Jeffreys remainder and its gradient channels are not the
-        // derivative of that value. Under (quasi-)separation, the case Firth
-        // exists for, the flat-prior posterior it integrates is improper along
-        // the separating direction: no Gauss–Hermite order resolves it, so the
-        // order search raised orders until the fit ground to a halt on a
-        // perfectly separated step, and on a quasi-separated one the spliced
-        // gradient left the outer search stalled at |g| = 0.23. The Firth
-        // criterion's own higher-order term is the Tierney–Kadane refinement of
-        // the same Jeffreys objective (`tierney_kadane_terms`), so the
-        // correction is declined — value and gradient together — whenever the
-        // Jeffreys term is armed.
+        // Firth/Jeffreys fits: the integrand `Gam784BlockTarget::excess` is the
+        // remainder of the PLAIN penalized likelihood about its mode, but under
+        // Firth β̂ is the mode of the Jeffreys-penalized objective. The plain
+        // remainder then keeps a linear term (∇Φ(β̂) ≠ 0), omits the Jeffreys
+        // change Φ(β̂+δ)−Φ(β̂), and subtracts only XᵀWX while the draws are
+        // scaled by `h_total`, which carries −H_Φ. On separated data that
+        // mis-targeted Δ_b is orders of magnitude above 1/n_eff and drags the
+        // criterion off the certified Laplace surface, so the outer search it
+        // is spliced into cannot certify. Decline — value and gradient
+        // together — until the Jeffreys term is integrated.
         if reml_robust_jeffreys_link(&self.config).is_some() {
             log::debug!(
-                "[#784] block-local fallback declined before the skewness diagnostic: the \
-                 Jeffreys (Firth) prior is armed and the block target integrates the \
-                 flat-prior posterior"
+                "[#784] block-local fallback declined before the skewness diagnostic: \
+                 Firth/Jeffreys bias reduction is active and the block target \
+                 integrates the plain penalized likelihood, not the Jeffreys-penalized one"
             );
             return Ok(zero());
         }

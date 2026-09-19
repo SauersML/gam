@@ -246,7 +246,15 @@ pub(super) fn solve_penalized_least_squares_implicit(
     // When design is sparse and we are in original coordinates (qs = None),
     // assemble the penalized Hessian in sparse format and solve with sparse
     // Cholesky.  This avoids O(p²) dense X'WX and O(p³) dense factorization.
+    //
+    // A cache whose rows are a stale reference (a design-moving ψ tensor) and
+    // that carries no sparse `XᵀWX` is served by the dense branch from its
+    // coefficient-space Gram: assembling from those rows would evaluate the
+    // wrong ψ.
+    let rows_stale_without_sparse_gram = gaussian_fixed_cache
+        .is_some_and(|c| c.row_prediction_is_stale && c.xtwx_sparse_orig.is_none());
     if transform.is_none()
+        && !rows_stale_without_sparse_gram
         && let Some(x_sparse) = x_original.as_sparse()
     {
         let PirlsPenalty::Dense { s_transformed, .. } = penalty;
@@ -270,11 +278,16 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 precomputed_xtwx,
             )?)?;
 
-        // 2. RHS = X'W(z - offset) + S_λ μ.
-        let mut wz = z.to_owned();
-        wz -= &offset;
-        wz *= &weights_owned;
-        let mut rhs = x_original.transpose_vector_multiply(&wz);
+        // 2. RHS = X'W(z - offset) + S_λ μ. The Gaussian cache already holds
+        //    `XᵀW(y − offset)`, so a cached solve never walks the rows.
+        let mut rhs = if let Some(cache) = gaussian_fixed_cache {
+            cache.xtwy_orig.clone()
+        } else {
+            let mut wz = z.to_owned();
+            wz -= &offset;
+            wz *= &weights_owned;
+            x_original.transpose_vector_multiply(&wz)
+        };
         rhs += penalty.linear_shift();
 
         // 3. Sparse Cholesky solve (factor reused from step 1)
@@ -345,7 +358,6 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 }
                 PirlsWorkspace::add_dense_xtwx_signed(
                     &weights_owned,
-                    &mut workspace.weighted_x_chunk,
                     x_dense.as_ref(),
                     &mut workspace.hessian_buf,
                 );
