@@ -36,6 +36,11 @@ impl crate::matrix::FactorizedSystem for SparseExactFactor {
 }
 
 impl SparseExactFactor {
+    /// Stored nonzeros of the Cholesky factor `L`, which fixes the cost of
+    /// one triangular solve pair (`≈ 4·nnz(L)` flops).
+    pub fn factor_nnz(&self) -> usize {
+        self.simplicial.l_values.len()
+    }
 }
 
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.

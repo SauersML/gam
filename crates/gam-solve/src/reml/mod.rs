@@ -4506,6 +4506,9 @@ pub(crate) struct SparseRemlDecision {
 pub(crate) struct SparseExactEvalData {
     pub(crate) factor: Arc<SparseExactFactor>,
     pub(crate) takahashi: Option<Arc<gam_linalg::sparse_exact::TakahashiInverse>>,
+    /// The upper-triangular penalized Hessian `factor` factors, so trace
+    /// kernels can read its sparsity pattern.
+    pub(crate) hessian: Arc<faer::sparse::SparseColMat<usize, f64>>,
     pub(crate) logdet_h: f64,
     pub(crate) logdet_s_pos: f64,
     pub(crate) penalty_rank: usize,

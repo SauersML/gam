@@ -6447,6 +6447,7 @@ impl<'a> RemlState<'a> {
                 SparseExactEvalData {
                     factor,
                     takahashi,
+                    hessian: Arc::new(sparse_system.h_sparse),
                     logdet_h: sparse_system.logdet_h,
                     logdet_s_pos,
                     penalty_rank,

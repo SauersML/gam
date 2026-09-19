@@ -5615,6 +5615,123 @@ pub(crate) fn sparse_takahashi_block_root_traces_match_dense_reference() {
 }
 
 #[test]
+pub(crate) fn sparse_block_root_logdet_cross_matches_dense_reference() {
+    let embedded = |p: usize, root: &Array2<f64>, start: usize| {
+        let mut full = Array2::<f64>::zeros((p, p));
+        let end = start + root.ncols();
+        full.slice_mut(ndarray::s![start..end, start..end])
+            .assign(&root.t().dot(root));
+        full
+    };
+    fn drift(root: &Array2<f64>, start: usize, scale: f64) -> BlockRootDrift<'_> {
+        BlockRootDrift {
+            root: root.view(),
+            start,
+            end: start + root.ncols(),
+            scale,
+        }
+    }
+    let sparse_operator = |h: &Array2<f64>, with_hessian: bool| {
+        let h_sparse = gam_linalg_test_support::dense_to_upper_csc(h);
+        let factor = std::sync::Arc::new(
+            gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap(),
+        );
+        let op = SparseCholeskyOperator::new(factor, 0.0, h.nrows());
+        if with_hessian {
+            op.with_hessian(std::sync::Arc::new(h_sparse))
+        } else {
+            op
+        }
+    };
+
+    // Levels [0, 4) carry a ridge root (one nonzero per row, diagonal Gram);
+    // `level_subset` weights levels 1..3 unevenly; `coupling_root` spans the
+    // two fixed columns and has a full Gram.
+    let ridge_root = array![
+        [0.0, 1.3, 0.0, 0.0],
+        [0.7, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 2.0],
+        [0.0, 0.0, 0.9, 0.0],
+    ];
+    let level_subset = array![[0.0, 1.9], [0.4, 0.0], [0.0, 0.5]];
+    let coupling_root = array![[0.6, -0.4], [0.2, 0.9], [1.1, 0.3]];
+    let last_level = array![[1.4]];
+
+    // `H_GG` diagonal (the random-effect shape), `H_GG` with one level-level
+    // coupling, and a last level that nothing couples to (`N = ∅`).
+    let h = random_effect_shaped_hessian();
+    let mut h_coupled_levels = h.clone();
+    h_coupled_levels[[0, 1]] = 0.2;
+    h_coupled_levels[[1, 0]] = 0.2;
+    let mut h_isolated_level = h.clone();
+    for col in 4..6 {
+        h_isolated_level[[3, col]] = 0.0;
+        h_isolated_level[[col, 3]] = 0.0;
+    }
+
+    let cases: [(&Array2<f64>, (&Array2<f64>, usize), (&Array2<f64>, usize), bool); 6] = [
+        (&h, (&ridge_root, 0), (&ridge_root, 0), true),
+        (&h, (&ridge_root, 0), (&level_subset, 1), true),
+        (&h, (&level_subset, 1), (&level_subset, 1), true),
+        (&h, (&ridge_root, 0), (&coupling_root, 4), false),
+        (&h_coupled_levels, (&ridge_root, 0), (&level_subset, 1), false),
+        (&h_isolated_level, (&last_level, 3), (&last_level, 3), true),
+    ];
+    for (hessian, (root_a, start_a), (root_b, start_b), schur_applies) in cases {
+        let p = hessian.nrows();
+        let dense = DenseSpectralOperator::from_symmetric(hessian).unwrap();
+        let reference = dense.trace_hinv_product_cross(
+            &embedded(p, root_a, start_a),
+            &embedded(p, root_b, start_b),
+        );
+        let a = drift(root_a, start_a, 1.0);
+        let b = drift(root_b, start_b, 1.0);
+        let sparse = sparse_operator(hessian, true);
+
+        let h_sparse = gam_linalg_test_support::dense_to_upper_csc(hessian);
+        let schur = DiagonalBlockSchur::plan(&h_sparse, &a, &b);
+        assert_eq!(schur.is_some(), schur_applies);
+        if let Some(schur) = schur {
+            assert_relative_eq!(
+                schur.trace(&sparse),
+                reference,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+        assert_relative_eq!(
+            sparse.trace_hinv_block_root_cross_by_rows(&a, &b),
+            reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+
+        // The dispatched logdet cross carries both scales and the sign, with
+        // and without the Hessian pattern, and agrees with the default that
+        // materializes both drifts.
+        let (scale_a, scale_b) = (1.7, 0.3);
+        let a = drift(root_a, start_a, scale_a);
+        let b = drift(root_b, start_b, scale_b);
+        for op in [sparse, sparse_operator(hessian, false)] {
+            assert_relative_eq!(
+                op.trace_logdet_hessian_cross_block_roots(a, b),
+                -scale_a * scale_b * reference,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+        let default_path = DenseCholeskyOperator::from_positive_definite(hessian).unwrap();
+        assert!(!default_path.contracts_block_root_drifts());
+        assert_relative_eq!(
+            default_path.trace_logdet_hessian_cross_block_roots(a, b),
+            -scale_a * scale_b * reference,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+    }
+}
+
+#[test]
 pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
     let dense = DenseMatrixHyperOperator {
         matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
