@@ -11,7 +11,7 @@ pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
