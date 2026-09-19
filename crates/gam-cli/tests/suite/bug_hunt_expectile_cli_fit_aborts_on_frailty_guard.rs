@@ -84,6 +84,13 @@ fn expectile_cli_fit_does_not_abort_on_standard_frailty_guard() {
         serde_json::json!({"estimator_kind": "expectile", "tau": 0.5}),
         "CLI persistence must retain the expectile target instead of erasing it into Gaussian"
     );
+    // The fit line reports the estimator, the same string Python's
+    // `family_name` returns, not the Gaussian working likelihood.
+    assert!(
+        stdout.contains("family=Expectile(tau=0.5)"),
+        "the CLI fit line must name the expectile estimator, not the Gaussian working \
+         family.\nstdout: {stdout}"
+    );
 
     let generated = tempfile::Builder::new()
         .suffix(".csv")

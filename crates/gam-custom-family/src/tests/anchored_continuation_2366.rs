@@ -417,7 +417,7 @@ fn double_well_options() -> BlockwiseFitOptions {
         outer_score_subsample: None,
         auto_outer_subsample: false,
         cache_session: None,
-        required_warm_start: None,
+        warm_start: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
@@ -868,4 +868,369 @@ fn the_fit_records_which_rule_selected_its_mode_2661() {
             .is_err(),
         "an unrecorded rule is refused"
     );
+}
+
+/// The tilted double well's stationary points at `rho`, in closed form: the real roots of
+/// `4β³ + (λ − 4)β + c = 0` with `λ = e^ρ`, ascending. Below the shallow well's fold there are
+/// three (the deep minimum, the barrier, the shallow minimum); above it only the deep minimum.
+fn double_well_stationary_points_2973(rho: f64) -> Vec<f64> {
+    let lambda = rho.exp();
+    let p = (lambda - 4.0) / 4.0;
+    let q = TILT / 4.0;
+    if 4.0 * p * p * p + 27.0 * q * q < 0.0 {
+        let radius = 2.0 * (-p / 3.0).sqrt();
+        let angle = ((3.0 * q / (2.0 * p)) * (-3.0 / p).sqrt()).acos() / 3.0;
+        let mut roots: Vec<f64> = (0..3)
+            .map(|k| radius * (angle - 2.0 * std::f64::consts::PI * f64::from(k) / 3.0).cos())
+            .collect();
+        roots.sort_by(f64::total_cmp);
+        roots
+    } else {
+        let shift = (q * q / 4.0 + p * p * p / 27.0).sqrt();
+        vec![(-q / 2.0 + shift).cbrt() + (-q / 2.0 - shift).cbrt()]
+    }
+}
+
+/// Whether `beta` is the shallow minimum at `rho`: the closed form has three stationary points
+/// there and `beta` is nearest the largest.
+fn is_shallow_mode_2973(rho: f64, beta: f64) -> bool {
+    let points = double_well_stationary_points_2973(rho);
+    points.len() == 3
+        && points
+            .iter()
+            .enumerate()
+            .min_by(|left, right| (beta - left.1).abs().total_cmp(&(beta - right.1).abs()))
+            .is_some_and(|(index, _)| index == 2)
+}
+
+/// Whether `beta` is the deep minimum at `rho`: nearest the smallest stationary point.
+fn is_deep_mode_2973(rho: f64, beta: f64) -> bool {
+    double_well_stationary_points_2973(rho)
+        .iter()
+        .enumerate()
+        .min_by(|left, right| (beta - left.1).abs().total_cmp(&(beta - right.1).abs()))
+        .is_some_and(|(index, _)| index == 0)
+}
+
+/// #2973: the Newton-region contraction test is Kantorovich's `h ≤ ½` read through Deuflhard's
+/// computational estimate `[h₀] = 2Θ`. `Θ = ¼` is the last contraction it admits, with root
+/// radius `2‖Δ⁰‖`; a stationary predictor is `Θ = 0` with radius `‖Δ⁰‖ = 0`; a non-finite
+/// correction measures nothing.
+#[test]
+fn the_newton_region_test_is_kantorovich_h_at_most_one_half_2973() {
+    let at_bound = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: 0.25,
+    };
+    assert!(at_bound.in_newton_region(), "Θ = ¼ is h = ½, inside the Newton region");
+    assert_eq!(at_bound.root_radius(), Some(2.0), "at h = ½ the root radius is 2‖Δ⁰‖");
+    let past = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: 0.25 + f64::EPSILON,
+    };
+    assert!(!past.in_newton_region(), "Θ above ¼ is outside the Newton region");
+    assert_eq!(past.root_radius(), None);
+    let stationary = NewtonRegionContraction {
+        first_correction: 0.0,
+        second_correction: 0.0,
+    };
+    assert_eq!(stationary.contraction_factor(), Some(0.0));
+    assert_eq!(stationary.root_radius(), Some(0.0));
+    let unmeasured = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: f64::NAN,
+    };
+    assert_eq!(unmeasured.contraction_factor(), None, "a non-finite correction measures nothing");
+    assert!(!unmeasured.in_newton_region());
+}
+
+/// #2973 pin 1: the shallow branch is followed to its fold, and the continuation declines past
+/// it.
+///
+/// From the shallow mode at ρ = 0.5, continuation to ρ = 0.9 and 0.97 publishes the closed
+/// form's shallow minimum. ρ = 1.2 lies past the fold at `ρ_fold = ln(4 − 3c^{2/3}) ≈ 0.97666`,
+/// where the shallow well no longer exists, so the continuation refuses as `FoldReached`, with
+/// its last certified point between the start and the fold. The warm-start-only rule published
+/// the deep mode at ρ = 1.2 instead (census 1334963: β = −0.5528 from β = 0.4775).
+#[test]
+fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let rho_fold = (4.0 - 3.0 * TILT.powf(2.0 / 3.0)).ln();
+    let start = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![0.5],
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("the derivative-bearing evaluation at the shallow start");
+    assert!(start.inner_converged, "the shallow start converges");
+    let start_beta = start.warm_start.block_beta[0][0];
+    assert!(
+        is_shallow_mode_2973(0.5, start_beta),
+        "a seed at +2 starts in the shallow well; got {start_beta}"
+    );
+    for target in [0.9, 0.97] {
+        match continue_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &gam_problem::RhoPrior::Flat,
+            &start.warm_start,
+            &array![target],
+            EvalMode::ValueAndGradient,
+        ) {
+            Ok(continuation) => {
+                let beta = continuation.eval.warm_start.block_beta[0][0];
+                assert!(
+                    continuation.eval.inner_converged,
+                    "the continued evaluation at rho={target} converges"
+                );
+                assert!(
+                    is_shallow_mode_2973(target, beta),
+                    "the shallow branch exists at rho={target}, so the continuation publishes it; \
+                     got beta={beta} after {} sub-step attempts",
+                    continuation.attempts
+                );
+            }
+            Err(refusal) => panic!(
+                "the shallow branch exists at rho={target}, so the continuation must reach it: \
+                 {refusal}"
+            ),
+        }
+    }
+    // The Newton-region test at the IFT predictor for `to`, from the certified shallow mode at
+    // `from`: the mode's coefficient, the predictor, and the two corrections.
+    let predicted_step = |from: f64, to: f64| {
+        let mode = match continue_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &gam_problem::RhoPrior::Flat,
+            &start.warm_start,
+            &array![from],
+            EvalMode::ValueAndGradient,
+        ) {
+            Ok(continuation) => continuation.eval.warm_start,
+            Err(refusal) => panic!("the shallow branch exists at rho={from}: {refusal}"),
+        };
+        let tangent = mode
+            .cached_inner
+            .as_ref()
+            .and_then(|cached| cached.rho_mode_responses.clone())
+            .expect("a continued derivative-bearing evaluation files its IFT tangent");
+        let predictor_beta = mode.block_beta[0][0] - (to - from) * tangent[[0, 0]];
+        let predictor = crate::assembly::ConstrainedWarmStart {
+            rho: array![to],
+            block_beta: vec![array![predictor_beta]],
+            active_sets: mode.active_sets.clone(),
+            cached_inner: None,
+        };
+        let test = newton_region_contraction(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &array![to],
+            &predictor,
+        )
+        .expect("the Newton-region test runs at the predictor");
+        let theta = test
+            .contraction
+            .contraction_factor()
+            .map_or_else(|| "unmeasured".to_string(), |theta| format!("{theta:.6e}"));
+        eprintln!(
+            "[2973 predicted step] rho {from} -> {to} from beta={:.6e}: predictor beta={predictor_beta:.6e}, \
+             Newton correction {:.6e}, simplified correction {:.6e}, contraction {theta}",
+            mode.block_beta[0][0],
+            test.contraction.first_correction,
+            test.contraction.second_correction,
+        );
+        (test.contraction, theta)
+    };
+    // Gate 1336821's failing step: from the certified shallow mode at 0.85 the tangent predicts
+    // past the fold at 1.2. The Newton correction jumps the barrier (to β ≈ −1.96), and the
+    // simplified correction, with the curvature of the predictor, does not contract.
+    let (fold_step, fold_theta) = predicted_step(0.85, 1.2);
+    assert!(
+        !fold_step.in_newton_region(),
+        "the predictor past the fold is outside the Newton region of any root the corrector \
+         reaches; contraction {fold_theta}"
+    );
+    // A step the frozen curvature must refuse and a re-read curvature would admit: from 0.8 the
+    // tangent predicts at 1.37, the Newton correction lands in the deep basin, and in the closed
+    // form the simplified correction contracts by 2.6 while a second Newton step at the deep
+    // point would read 0.185.
+    let (jump_step, jump_theta) = predicted_step(0.8, 1.37);
+    assert!(
+        !jump_step.in_newton_region(),
+        "a first correction that jumps the barrier is outside the Newton region with the \
+         curvature frozen at the predictor; contraction {jump_theta}"
+    );
+    match continue_branch(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &gam_problem::RhoPrior::Flat,
+        &start.warm_start,
+        &array![1.2],
+        EvalMode::ValueAndGradient,
+    ) {
+        Ok(continuation) => panic!(
+            "past the fold at rho={rho_fold} the shallow branch does not exist, so the \
+             continuation must decline; it published beta={}",
+            continuation.eval.warm_start.block_beta[0][0]
+        ),
+        Err(refusal) => {
+            eprintln!("[2973 fold] {refusal}");
+            let BranchContinuationRefusal::FoldReached {
+                last_certified_rho,
+                tangent_refusals,
+                ..
+            } = &refusal
+            else {
+                panic!("the continuation must decline at the fold, not with: {refusal}");
+            };
+            assert!(
+                last_certified_rho[0] > 0.5 && last_certified_rho[0] < rho_fold,
+                "the last certified point lies on the shallow branch between the start and the \
+                 fold at {rho_fold}; got {}",
+                last_certified_rho[0]
+            );
+            // Near the fold the mode response is unresolved and the tangent evaluation refuses
+            // the point (the envelope-gradient tripwire, gate i2-b1-land3); those sub-steps are
+            // halved and never published, and the decline still follows at the fold.
+            assert!(
+                *tangent_refusals >= 1,
+                "the approach to the fold halves at least one sub-step whose tangent evaluation \
+                 refused the point; got {tangent_refusals}"
+            );
+        }
+    }
+}
+
+/// #2973 pin 2: a walk that tries to cross the fold publishes one branch per θ.
+///
+/// Census 1334963's scripted walk: `CustomOuterState` driven as the fit's closures drive it, from
+/// a shallow starting incumbent through ρ = 0.5, 0.9, 1.2, 0.9, 0.5, every evaluated trial
+/// accepted, now through the rule the closures apply, [`evaluate_on_branch`]. The trial at 1.2
+/// is refused, a rejected trial that records nothing, so every θ the walk visits publishes the
+/// shallow branch. Under the warm-start-only rule the 1.2 trial published the deep mode, was
+/// accepted, and the return visits to 0.9 and 0.5 published the deep mode too.
+#[test]
+fn a_walk_that_tries_to_cross_the_fold_publishes_one_branch_per_theta_2973() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut state = CustomOuterState::new_with_cold_signal(
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&accepted),
+    );
+    let mut published: Vec<(f64, f64)> = Vec::new();
+    let mut refused: Vec<f64> = Vec::new();
+    for theta in [0.5, 0.9, 1.2, 0.9, 0.5] {
+        state.adopt_accepted_steps();
+        let point = array![theta];
+        let result = evaluate_on_branch(
+            &family,
+            &specs,
+            &options,
+            &layout,
+            &point,
+            state.warm_start_for(&point),
+            &gam_problem::RhoPrior::Flat,
+            EvalMode::ValueAndGradient,
+        );
+        match result {
+            Ok(eval) => {
+                assert!(eval.inner_converged, "the evaluation at rho={theta} converges");
+                published.push((theta, eval.warm_start.block_beta[0][0]));
+                state.record_first_order_mode(eval.warm_start.clone());
+                accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(error) => {
+                assert!(
+                    error.is_trial_point_infeasible(),
+                    "a branch that ends is a rejected trial, not a fit failure: {error}"
+                );
+                refused.push(theta);
+            }
+        }
+    }
+    assert_eq!(
+        refused,
+        vec![1.2],
+        "only the trial past the fold is refused; published {published:?}"
+    );
+    for (theta, beta) in &published {
+        assert!(
+            is_shallow_mode_2973(*theta, *beta),
+            "every evaluation of the walk publishes its shallow branch; rho={theta} gave \
+             beta={beta} (published {published:?})"
+        );
+    }
+}
+
+/// #2973 pin 3, the negative control: the deep branch has no fold, so its continuation certifies
+/// from ρ = −6 to ρ = 18. Census 1288798's leading-order fold radius τ* predicted folds on this
+/// branch 0.13–0.3 away near ρ ≈ 1.6; the contraction test measures the corrector instead.
+#[test]
+fn the_deep_branch_continues_across_every_rho_2973() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(-2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let start = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![-6.0],
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("the derivative-bearing evaluation at the deep start");
+    assert!(start.inner_converged, "the deep start converges");
+    assert!(
+        is_deep_mode_2973(-6.0, start.warm_start.block_beta[0][0]),
+        "a seed at -2 starts in the deep well"
+    );
+    match continue_branch(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &gam_problem::RhoPrior::Flat,
+        &start.warm_start,
+        &array![18.0],
+        EvalMode::ValueAndGradient,
+    ) {
+        Ok(continuation) => {
+            let beta = continuation.eval.warm_start.block_beta[0][0];
+            assert!(
+                is_deep_mode_2973(18.0, beta),
+                "the deep branch continues to rho=18; got beta={beta}"
+            );
+        }
+        Err(refusal) => panic!("the deep branch has no fold, so it must continue: {refusal}"),
+    }
 }
