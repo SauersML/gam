@@ -360,6 +360,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -498,6 +499,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -561,6 +563,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -3416,6 +3419,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
         BSplineKnotSpec::Automatic {
             num_internal_knots,
             placement,
+            adaptive,
         } => {
             let requested_interior = num_internal_knots
                 .unwrap_or_else(|| default_internal_knot_count_for_data(n, spec.degree));
@@ -3442,6 +3446,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(eff_interior),
                 placement: *placement,
+                adaptive: *adaptive,
             };
             (shrunk_spec, Some(note))
         }

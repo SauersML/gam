@@ -33,7 +33,11 @@ from gamfit._binding import rust_module
 
 
 def _formula_default_open_dim(t: typing.Any) -> int:
-    """``s(x)``'s default cubic basis dimension: ``clamp(unique/4, 4, 8) + 4``."""
+    """``s(x)``'s pilot cubic basis dimension: ``clamp(unique/4, 4, 8) + 4``.
+
+    The formula fit may grow this pilot through its adaptive resolution loop;
+    a bare basis constructor has no fit to refine from and keeps it.
+    """
     unique = len(np.unique(np.asarray(t, dtype=float)))
     return min(max(unique // 4, 4), 8) + 4
 

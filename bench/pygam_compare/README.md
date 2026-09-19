@@ -55,6 +55,8 @@ These are the plans (see `plans.py`):
 | `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
 | `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
 | `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
+| `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
+| `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
 
 The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
 heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
@@ -65,6 +67,14 @@ Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
 It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
 scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
 absolute numbers.
+
+The `threads` and `oversubscribe` plans measure parallelism rather than compare
+libraries. A cell's `threads` sets every pool variable listed under **Threads**
+below (`auto` unsets them all, so each pool sizes itself to the host);
+`concurrency` K runs K identical processes at once, which is what `joblib` or
+`n_jobs=-1` does, and records the batch wall time. The report then adds a
+thread-scaling table (speedup over one thread) and a process fan-out table
+(throughput of the batch against the same process run alone).
 
 Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
 
@@ -81,9 +91,10 @@ scratch dir, so the installed wheel is imported instead of the source tree's
 `./gamfit`. Within a cell the libraries are interleaved rep by rep, so drift in
 host load hits all of them alike.
 
-**Threads.** `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
-`MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and `NUMEXPR_NUM_THREADS` are all
-set to 1. The comparison is single-core against single-core.
+**Threads.** `RAYON_NUM_THREADS`, `MATMUL_NUM_THREADS`, `OMP_NUM_THREADS`,
+`OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` and
+`NUMEXPR_NUM_THREADS` are all set to 1. The comparison is single-core against single-core. Only the
+`threads` and `oversubscribe` cells change this.
 
 **Time.** Each phase is timed as both wall time (`perf_counter`) and process
 CPU time (`process_time`). The phases are import, one cold fit, a warm refit
