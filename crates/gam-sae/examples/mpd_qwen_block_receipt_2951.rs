@@ -8,7 +8,17 @@
 //! Every native stage, band and comparison is the owner's; this file assembles
 //! views, and writes what the owner returned.
 //!
-//! The exit status is non-zero when a setting's certified stage does not agree, when
+//! The norm stage is the layer's `post_attention_layernorm`, the source's `Qwen3RMSNorm`,
+//! run by the driver on the harvested pre-norm rows. Its source normalizes in float32 inside
+//! a float64 module, as the manifest records from the installed source, so the receipt
+//! declares [`ExternalRmsNormProgram::Binary32Internal`] and [`rms_norm_stage`] takes that
+//! program's band. That band's rsqrt step is two correctly rounded operations, so the receipt
+//! also requires the driver's check that `torch.rsqrt` returned exactly `1 / torch.sqrt` at the
+//! stage's float32 arguments. Its control declares the same stage `Binary64` and must be refuted: a
+//! binary64 band cannot hold the float32 evaluation, so the declared program is load-bearing.
+//!
+//! The exit status is non-zero when a setting's certified stage or the norm stage does not
+//! agree, when the norm stage's binary64 control is not refuted, when
 //! a refuting control does not report `refutes` on every stage it names, when an
 //! identity control's two settings executed different binary64 values at any stage,
 //! or when a distinct control's two settings executed the same values at every stage.
@@ -24,8 +34,8 @@
 use gam_sae::parameter_decomposition::apply::FactorView;
 use gam_sae::parameter_decomposition::occurrence::PositionScope;
 use gam_sae::parameter_decomposition::receipts::{
-    EditedRead, ExternalExecution, FactoredEditViews, MeasuredDiscrepancy, StageAgreement,
-    SwigluBlockReceipt, SwigluBlockReceiptInputs, swiglu_block_receipt,
+    EditedRead, ExternalExecution, ExternalRmsNormProgram, FactoredEditViews, MeasuredDiscrepancy,
+    StageAgreement, SwigluBlockReceipt, SwigluBlockReceiptInputs, rms_norm_stage, swiglu_block_receipt,
 };
 use memmap2::Mmap;
 use ndarray::{Array1, Array2};
@@ -455,6 +465,66 @@ fn control_held(
     }
 }
 
+/// The norm stage's receipt and its binary64 control, from the manifest's `norm` record.
+fn norm_receipt(manifest: &Value, run: &Run) -> Result<(Value, bool), String> {
+    let norm = manifest.get("norm").ok_or("manifest names no norm stage")?;
+    let (class, internal) = (text(norm, "class")?, text(norm, "internal_dtype")?);
+    let rsqrt_is_reciprocal_sqrt = norm
+        .get("rsqrt_is_reciprocal_sqrt")
+        .and_then(Value::as_bool)
+        .ok_or("the norm record names no rsqrt_is_reciprocal_sqrt")?;
+    let program = match (class, internal, rsqrt_is_reciprocal_sqrt) {
+        ("Qwen3RMSNorm", "float32", true) => ExternalRmsNormProgram::Binary32Internal,
+        _ => {
+            return Err(format!(
+                "no declared band program for a {class} that normalizes in {internal} \
+                 (rsqrt_is_reciprocal_sqrt: {rsqrt_is_reciprocal_sqrt})"
+            ));
+        }
+    };
+    let epsilon = norm
+        .get("epsilon")
+        .and_then(Value::as_f64)
+        .ok_or("the norm record names no epsilon")?;
+    let gain = vector(Path::new(text(norm, "gain")?))?;
+    let array = |key: &str| -> Result<&Array2<f64>, String> {
+        let id = text(norm, key)?;
+        run.matrices
+            .get(id)
+            .ok_or_else(|| format!("the norm stage's {key} {id:?} is not an exported array"))
+    };
+    let (inputs, output) = (array("inputs")?, array("output")?);
+    let execution = ExternalExecution {
+        dtype: text(norm, "dtype")?,
+        device: text(norm, "device")?,
+        tf32_matmul: run.tf32_matmul,
+    };
+    let receipt = |program| {
+        rms_norm_stage(execution, program, epsilon, gain.view(), inputs.view(), output.view())
+            .map_err(|refusal| format!("the norm stage refused: {refusal}"))
+    };
+    let certified = receipt(program)?;
+    let binary64 = receipt(ExternalRmsNormProgram::Binary64)?;
+    let passed = certified.agrees && binary64.refutes;
+    println!(
+        "[norm] {class} internal={internal} agrees={} binary64_control_refutes={}",
+        certified.agrees, binary64.refutes
+    );
+    Ok((
+        json!({
+            "class": class,
+            "internal_dtype": internal,
+            "rsqrt_is_reciprocal_sqrt": rsqrt_is_reciprocal_sqrt,
+            "program": format!("{program:?}"),
+            "epsilon": epsilon,
+            "stage": stage(&certified),
+            "binary64_control": stage(&binary64),
+            "passed": passed,
+        }),
+        passed,
+    ))
+}
+
 fn run() -> Result<bool, String> {
     let args: Vec<String> = std::env::args().collect();
     let run_dir = flag(&args, "--run")?;
@@ -492,6 +562,9 @@ fn run() -> Result<bool, String> {
             "end_to_end": measured(&receipt.end_to_end_measured),
         }));
     }
+
+    let (norm_report, norm_passed) = norm_receipt(&manifest, &run)?;
+    passed &= norm_passed;
 
     let controls = declaration
         .get("controls")
@@ -532,6 +605,7 @@ fn run() -> Result<bool, String> {
         "external_execution": {"dtype": run.dtype, "device": run.device, "tf32_matmul": run.tf32_matmul},
         "stage_columns": STAGES,
         "settings": setting_reports,
+        "norm": norm_report,
         "controls": control_reports,
         "passed": passed,
     });

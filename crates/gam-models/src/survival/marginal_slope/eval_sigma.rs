@@ -233,9 +233,9 @@ impl SurvivalMarginalSlopeFamily {
             .map(|opt| opt.unwrap_or(0.0));
             return total;
         }
-        // True fast path: K=1 uses the packed lowering of the canonical row
-        // program; K>1 uses the covariance-aware vector likelihood.
-        let guard = self.derivative_guard;
+        // True fast path: a shared slope reads the canonical row program's value
+        // in its frame; K>1 on the time-constant frame uses the covariance-aware
+        // vector likelihood.
         let probit_scale = self.probit_frailty_scale();
         let score_dim = self.score_dim();
         gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
@@ -251,36 +251,8 @@ impl SurvivalMarginalSlopeFamily {
                 for idx in range {
                     let weighted = row_iter[idx];
                     let i = weighted.index;
-                    // The value the trust region scores a trial on must be the
-                    // value of the frame whose gradient and Hessian proposed
-                    // the step (`compute_row_primary_gradient_hessian_uncached`
-                    // dispatches on the same flag). The time-constant closed
-                    // form below reads ONE slope value and a zero rate; on the
-                    // follow-up-varying frame the row's `η′₁` carries
-                    // `q·c′ + b′ᵀz`, so that form is a different likelihood,
-                    // one in which the slope's variation is invisible — which
-                    // is what "the slope can't vary" looks like from outside
-                    // (gam#2765).
-                    if self.slope_is_follow_up_varying() {
-                        let inputs = rigid_row_inputs(
-                            self,
-                            block_states,
-                            i,
-                            "survival marginal-slope value-only row",
-                        )?;
-                        let primaries = rigid_row_kernel_primaries::<
-                            DYNAMIC_SLOPE_PRIMARIES,
-                            DynamicSlopeGeometry,
-                        >(self, block_states, i)?;
-                        let nll = rigid_row_value::<
-                            DYNAMIC_SLOPE_PRIMARIES,
-                            DynamicSlopeGeometry,
-                        >(&primaries, &inputs)?;
-                        ll -= weighted.weight * nll;
-                        continue;
-                    }
-                    let q_geom = self.row_dynamic_q_values(i, block_states)?;
-                    if score_dim > 1 {
+                    if score_dim > 1 && !self.slope_is_follow_up_varying() {
+                        let q_geom = self.row_dynamic_q_values(i, block_states)?;
                         ll -= weighted.weight
                             * self.row_neglog_rigid_vector_value(
                                 i,
@@ -294,37 +266,30 @@ impl SurvivalMarginalSlopeFamily {
                             )?;
                         continue;
                     }
-                    if self.anchored_law_active() {
+                    // The value the trust region scores a trial on must be the
+                    // value of the likelihood whose gradient and Hessian
+                    // proposed the step, so it takes the frame dispatch, the
+                    // primaries and the row inputs of
+                    // `compute_row_primary_gradient_hessian_uncached`. A row
+                    // input set built here by hand is a second likelihood: the
+                    // time-constant closed form read one slope value and a zero
+                    // rate on the follow-up-varying frame (gam#2765), and
+                    // `1ᵀΣ1 = 1` where the kernel reads the conditional score
+                    // covariance `Var(z | a)` (gam#2766). The trust ratio then
+                    // compares two likelihoods: a backtracking trial keeps a
+                    // gap from the incumbent that does not shrink with the step,
+                    // and the inner solve stalls at its radius floor (gam#2952).
+                    let nll = in_slope_frame!(self, P, Frame, {
                         let inputs = rigid_row_inputs(
                             self,
                             block_states,
                             i,
                             "survival marginal-slope value-only row",
                         )?;
-                        let primaries = rigid_row_kernel_primaries::<
-                            STATIC_SLOPE_PRIMARIES,
-                            AnchoredStaticSlopeGeometry,
-                        >(self, block_states, i)?;
-                        let nll = rigid_row_value::<
-                            STATIC_SLOPE_PRIMARIES,
-                            AnchoredStaticSlopeGeometry,
-                        >(&primaries, &inputs)?;
-                        ll -= weighted.weight * nll;
-                        continue;
-                    }
-                    let g = block_states[2].eta[i];
-                    let (nll, _, _) = row_primary_closed_form(
-                        q_geom.q0,
-                        q_geom.q1,
-                        q_geom.qd1,
-                        g,
-                        self.z[[i, 0]],
-                        self.weights[i],
-                        self.entry_weight(i),
-                        self.event[i],
-                        guard,
-                        probit_scale,
-                    )?;
+                        let primaries =
+                            rigid_row_kernel_primaries::<P, Frame>(self, block_states, i)?;
+                        rigid_row_value::<P, Frame>(&primaries, &inputs)?
+                    });
                     ll -= weighted.weight * nll;
                 }
                 Ok(ll)
