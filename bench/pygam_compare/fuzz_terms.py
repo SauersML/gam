@@ -331,8 +331,14 @@ def _message_head(trace: str) -> str:
     """The exception line of a recorded traceback with numbers masked, so
     reps that fail the same way at different values group together."""
     lines = [ln for ln in trace.strip().splitlines() if ln.strip()]
-    last = lines[-1] if lines else ""
-    return _NUMBER.sub("#", last)[:160]
+    # The engine's typed errors end with ``variant:`` / ``category:`` lines;
+    # the exception line itself is the first line after the frames.
+    variant = next((ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("variant:")), "")
+    frames_end = max((i for i, ln in enumerate(lines) if ln.startswith("  ")), default=-1)
+    head = lines[frames_end + 1] if frames_end + 1 < len(lines) else ""
+    head = head.split(": ", 1)[1] if ": " in head else head
+    text = f"[{variant}] {head}" if variant else head
+    return _NUMBER.sub("#", text)[:110]
 
 
 def failure_cause(rec: dict[str, Any]) -> str | None:

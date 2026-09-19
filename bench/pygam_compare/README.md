@@ -50,8 +50,30 @@ These are the plans (see `plans.py`):
 | `n1e4_core` | n=1e4, all families × {`p1`, `p5`, `te`} | 3 |
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `fuzz_terms` | gamfit only: 120 seeded term-structure cases × n ∈ {50, 500, 5000} × all families (1080 fits) | 1 |
+| `fuzz_terms_quick` | gamfit only: the fixed cases in `FUZZ_QUICK_CASES`, which cover every term kind, × n ∈ {50, 500} × all families (a 0-failure regression test) | 1 |
 
-Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
+Overrides: `--reps`, `--timeout`, `--memcap-mb`, `--only-libs gamfit,pygam_gs`
+and `--shard I/K`, which runs every K-th cell starting at cell I, so K shards
+started side by side cover the plan between them.
+
+### Convergence fuzz over term structure
+
+The `fuzz_terms*` plans draw their formulas from `fuzz_terms.py`. A case number
+fixes the term structure: tensor products with two or three margins, `ti`,
+factor and numeric `by=` smooths (including empty and singleton levels), fixed
+factors with rare levels, random intercepts with 5 to 2000 levels, cyclic,
+2-D isotropic, shape-constrained and concurvity terms. The seed draws the data.
+To triage one or more run directories by failure cause, term kind, family and n:
+
+```bash
+python -m pygam_compare.fuzz_terms RUN_DIR [RUN_DIR ...]
+```
+
+A rep counts as a failure if it raised, hung, did not certify its optimum or
+predicted a non-finite value. For each cause the table names one example rep as
+`FAMILY N DESIGN SEED`, so `python bench/pygam_compare/worker.py gamfit FAMILY N
+DESIGN SEED` reruns it in isolation.
 
 To regenerate the docs page from committed baselines:
 
@@ -131,6 +153,9 @@ tail and the traceback of the failed phase.
 
 - `bench/pygam_compare/test_pygam_compare_smoke.py` runs the `smoke` plan end to
   end and pins the verdict rules. It runs in `python-contracts.yml` (bench step).
+- `bench/pygam_compare/test_fuzz_terms_quick.py` runs the `fuzz_terms_quick`
+  plan and requires every fit to be clean. It also checks that the quick cases
+  cover every term kind.
 - `.github/workflows/pygam-compare.yml` is optional. It runs on manual dispatch
   (with a `plan` input, default `quick`) and weekly, never per PR. It uploads
   `records.jsonl`, `meta.json` and `report.md` as an artifact and writes the
