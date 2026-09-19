@@ -277,7 +277,7 @@ pub fn build_bspline_basis_1d(
         let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
             if let Some(chunk) = auto_chunk {
-                log::info!(
+                log::debug!(
                     "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
                     data.len(),
                     num_basis,
@@ -360,6 +360,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -400,7 +401,7 @@ pub fn build_bspline_basis_1d(
             "streaming B-spline roughness",
         )?;
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
-        log::info!(
+        log::debug!(
             "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.len(),
             p_raw,
@@ -498,6 +499,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -561,6 +563,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
+                ..
             } => {
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
@@ -2100,7 +2103,7 @@ pub fn filter_penalty_candidates(
         let kronecker_factors =
             validated_kronecker_factors(kronecker_factors, &analysis.sym_penalty);
         if let Some(reason) = dropped_reason {
-            log::debug!(
+            log::trace!(
                 "Dropped inactive penalty block source={:?} original_index={} reason={:?}",
                 source,
                 original_index,
@@ -2114,7 +2117,7 @@ pub fn filter_penalty_candidates(
             });
         } else {
             let null_basis = nullspace_basis_from_block(&analysis);
-            log::debug!(
+            log::trace!(
                 "Retained penalty block source={:?} original_index={} rank={} nullity={} has_op={} has_null_basis={}",
                 source,
                 original_index,
@@ -3404,7 +3407,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Generate knotspec");
+            log::debug!("B-spline {note} on Generate knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Generate {
@@ -3416,6 +3419,7 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
         BSplineKnotSpec::Automatic {
             num_internal_knots,
             placement,
+            adaptive,
         } => {
             let requested_interior = num_internal_knots
                 .unwrap_or_else(|| default_internal_knot_count_for_data(n, spec.degree));
@@ -3436,12 +3440,13 @@ pub(crate) fn maybe_auto_shrink_bspline_spec(
                 eff_deg = eff_degree,
                 eff_ki = eff_interior,
             );
-            log::info!("B-spline {note} on Automatic knotspec");
+            log::debug!("B-spline {note} on Automatic knotspec");
             let mut shrunk_spec = spec.clone();
             shrunk_spec.degree = eff_degree;
             shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(eff_interior),
                 placement: *placement,
+                adaptive: *adaptive,
             };
             (shrunk_spec, Some(note))
         }

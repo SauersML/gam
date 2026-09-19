@@ -641,8 +641,8 @@ fn build_duchon_basis_uncached(
         frozen_radial_reparam = Some(v.clone());
     }
     let (design, identifiability_transform) = if use_lazy {
-        // log::info! — deliberate memory-saving choice, not an anomaly.
-        log::info!(
+        // log::debug! — deliberate memory-saving choice, not an anomaly.
+        log::debug!(
             "Duchon basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
             data.nrows(),
             base_cols,
@@ -2184,7 +2184,7 @@ fn select_thin_plate_knot_rows(
         );
     }
     if selected.len() < num_knots {
-        log::warn!(
+        log::debug!(
             "[thin-plate] requested {num_knots} distinct knots but the data contain only {} \
              geometrically distinct selectable points; reducing the basis to {} knots",
             selected.len(),

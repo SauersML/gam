@@ -2124,7 +2124,7 @@ pub(super) fn block_birth_evidence_margin(
         Ok(value) if value.is_finite() && value > 0.0 => value,
         Ok(_) => return Ok(None),
         Err(error) => {
-            log::debug!(
+            log::trace!(
                 "block birth {block} has no positive-definite evidence certificate: {error}"
             );
             return Ok(None);
@@ -2491,7 +2491,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         polar_failures = step.polar_failures;
         let next_ev = step.next.explained_variance;
         state = step.next;
-        log::debug!(
+        log::trace!(
             "[block-sparse epoch {}/{}] ev={:.9} ev_residual={:.3e} gamma_residual={:.3e} \
              frame_residual={:.3e} births={} polar={}",
             epochs_run,
@@ -2551,7 +2551,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
     } else {
         "2-non-converged"
     };
-    log::info!(
+    log::debug!(
         "[block-sparse terminal] arm={arm} epochs={epochs_run}/{max_epochs} ev={ev:.9} \
          ev_residual={ev_residual:.3e} gamma_residual={gamma_residual:.3e} \
          frame_residual={frame_residual:.3e} routing_residual={routing_residual:.3e} \

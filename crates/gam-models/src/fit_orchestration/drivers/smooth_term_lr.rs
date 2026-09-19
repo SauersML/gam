@@ -2560,7 +2560,7 @@ pub fn smooth_term_lr_unavailable_forspec(
         .iter()
         .enumerate()
         .filter_map(|(term_idx, term)| {
-            gam_solve::estimate::smooth_pvalue_unavailable(term.shape).map(|reason| {
+            gam_solve::estimate::smooth_pvalue_unavailable(&term.shape).map(|reason| {
                 SmoothTermLrUnavailable {
                     name: term.name.clone(),
                     term_idx,
@@ -2876,7 +2876,7 @@ pub fn smooth_term_lr_inference_forspec(
             .unwrap_or((0, 0));
         // Shape-constrained smooths have no calibrated LR reference; they are
         // reported by `smooth_term_lr_unavailable_forspec` instead.
-        if gam_solve::estimate::smooth_pvalue_unavailable(design_term.shape).is_some() {
+        if gam_solve::estimate::smooth_pvalue_unavailable(&design_term.shape).is_some() {
             continue;
         }
         // Shifted into the GLOBAL coefficient layout — see `smooth_start` above.

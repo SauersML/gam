@@ -39,7 +39,7 @@ impl LoopProgress {
     /// Advance the progress counter by `delta` and, if at least
     /// `interval` of wall time has passed since the last claimed print,
     /// invoke `emit(progress, elapsed_secs)` exactly once across all
-    /// threads. The closure typically issues a `log::info!`.
+    /// threads. The closure typically issues a `log::debug!`.
     ///
     /// Every call is a read-modify-write of the one counter all workers share
     /// plus a clock read, so it belongs once per chunk of work, never once per

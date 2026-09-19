@@ -6,7 +6,7 @@
 //!
 //! The family-level pre-filter in `survival_marginal_slope.rs` and
 //! `bernoulli_marginal_slope.rs` previously dropped score_warp_dev /
-//! link_dev blocks silently (via a `log::warn!` side message) when
+//! link_dev blocks silently (via a `log::debug!` side message) when
 //! `install_compiled_flex_block_into_runtime` returned `FullyAliased`.
 //! After the architectural change those blocks are kept with their
 //! original designs and the unified audit (`canonicalize_for_identifiability_with_operating_scalars`

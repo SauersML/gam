@@ -118,6 +118,7 @@ pub(crate) use smoothing_correction::{
 // survival lanes (#2346, #2912).
 pub use smoothing_correction::{
     EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
+    invert_identified_rho_hessian_off_railed,
 };
 pub use smooth_term_summary::{smooth_pvalue_unavailable, smooth_term_summary_rows};
 pub use summary::{
@@ -132,6 +133,8 @@ mod inner_residual_charge_2954_tests;
 #[cfg(test)]
 mod ridge_continuity_tests;
 #[cfg(test)]
+mod wide_design_reml_derivatives_tests;
+#[cfg(test)]
 mod continuous_order_tests;
 #[cfg(test)]
 mod estimate_policy_tests;
@@ -145,5 +148,7 @@ mod gaussian_high_edf_scale_tests;
 mod gaussian_observation_interval_calibration_tests;
 #[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
+#[cfg(test)]
+mod many_smoothing_parameter_correction_tests;
 #[cfg(test)]
 mod constrained_marginal_truncation_2705_tests;

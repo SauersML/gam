@@ -100,7 +100,22 @@ where
         && penalty_coefficient_lower_bounds.is_none()
         && penalty_linear_constraints_original.is_none()
     {
-        use crate::gpu::pirls_dispatch_wire::{GpuGaussianPlsInput, try_gpu_gaussian_pls_dispatch};
+        use crate::gpu::pirls_dispatch_wire::{
+            GpuGaussianPlsInput, try_gpu_gaussian_pls_admit, try_gpu_gaussian_pls_dispatch,
+        };
+        // Admission runs before the input is assembled, as in
+        // `try_pirls_loop_gpu`: the transformed-design operator and the owned
+        // `ReparamResult` copy are only built for a fit the device will take.
+        match try_gpu_gaussian_pls_admit(&config.likelihood) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => {
+                return Some(Err(EstimationError::RemlOptimizationFailed(format!(
+                    "GPU Gaussian PLS runtime: Gaussian PLS admission runtime resolution \
+                     failed: {error}"
+                ))));
+            }
+        }
         if let Some(cache) = gaussian_fixed_cache {
             let PirlsPenalty::Dense {
                 s_transformed,

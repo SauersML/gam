@@ -12,6 +12,7 @@ mod configured_rho_prior_reaches_criterion_2463;
 mod cyclic_bspline_first_derivative_periodicity_breaks;
 mod cyclic_bspline_second_derivative_periodicity_breaks;
 mod cyclic_duchon_torus_containment;
+mod default_bspline_resolution_grows_with_n;
 mod difference_smooth_formula;
 mod double_penalty_retains_linear_trend_1371;
 mod duchon_ard_quality;

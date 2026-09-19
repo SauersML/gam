@@ -13,8 +13,8 @@ use super::{WorkingDerivativeBuffersMut, working_deriv_slices, working_slices};
 use crate::estimate::EstimationError;
 use ndarray::{Array1, ArrayView1};
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator,
+    ParallelIterator,
 };
 
 /// Family-specific Fisher working weight, before multiplication by the row's
@@ -24,8 +24,9 @@ pub(super) enum WorkingWeight {
     PoissonIdentity,
     /// Gamma(shape): `shape`, independent of `eta`.
     Constant { factor: f64 },
-    /// Tweedie(p, phi): `mu^(2-p) / phi`.
-    TweediePower { p: f64, phi: f64 },
+    /// Power variance `V(mu) = mu^p` with dispersion `phi`: `mu^(2-p) / phi`.
+    /// Tweedie uses `1 < p < 2`; the inverse Gaussian is `p = 3`.
+    PowerVariance { p: f64, phi: f64 },
     /// Negative-binomial(theta): `mu * theta / (theta + mu)`.
     NegativeBinomial { theta: f64 },
 }
@@ -44,7 +45,7 @@ pub(super) struct LogLinkRule {
     pub curvature: WorkingCurvature,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ExactLogLinkRow {
     mu: f64,
     weight: f64,
@@ -52,7 +53,7 @@ struct ExactLogLinkRow {
     d: f64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct ExactLogLinkWorkingRow {
     geometry: ExactLogLinkRow,
     z: f64,
@@ -75,7 +76,7 @@ fn unit_weight(weight: &WorkingWeight, mu: f64) -> f64 {
     match *weight {
         WorkingWeight::PoissonIdentity => mu,
         WorkingWeight::Constant { factor } => factor,
-        WorkingWeight::TweediePower { p, phi } => mu.powf(2.0 - p) / phi,
+        WorkingWeight::PowerVariance { p, phi } => mu.powf(2.0 - p) / phi,
         WorkingWeight::NegativeBinomial { theta } => {
             if theta >= mu {
                 mu / (1.0 + mu / theta)
@@ -162,21 +163,18 @@ fn certify_working_rows(
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
 ) -> Result<Vec<ExactLogLinkWorkingRow>, EstimationError> {
-    let rows: Vec<Result<ExactLogLinkWorkingRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let geometry = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
-            let z = if geometry.weight == 0.0 {
-                eta[i]
-            } else {
-                exact_working_response(i, eta[i], y[i], geometry.mu)?
-            };
-            Ok(ExactLogLinkWorkingRow { geometry, z })
-        })
-        .collect();
-    // Scan in row order so multiple bad rows always report the smallest index.
-    // Output buffers remain untouched unless the entire batch is certified.
-    rows.into_iter().collect()
+    // Certified rows land directly in their slots; the smallest bad row is
+    // reported. Output buffers remain untouched unless the entire batch is
+    // certified.
+    super::par_certified_rows(eta.len(), |i| {
+        let geometry = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
+        let z = if geometry.weight == 0.0 {
+            eta[i]
+        } else {
+            exact_working_response(i, eta[i], y[i], geometry.mu)?
+        };
+        Ok(ExactLogLinkWorkingRow { geometry, z })
+    })
 }
 
 fn certify_curvature_rows(
@@ -184,11 +182,9 @@ fn certify_curvature_rows(
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
 ) -> Result<Vec<ExactLogLinkRow>, EstimationError> {
-    let rows: Vec<Result<ExactLogLinkRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| exact_log_link_row(rule, i, eta[i], priorweights[i]))
-        .collect();
-    rows.into_iter().collect()
+    super::par_certified_rows(eta.len(), |i| {
+        exact_log_link_row(rule, i, eta[i], priorweights[i])
+    })
 }
 
 /// Write exact log-link `mu`, Fisher weights, working responses, and optional
