@@ -197,7 +197,6 @@ fn build_term_collection_design_inner_with_policy_and_plan(
         data,
         &spec.linear_terms,
         &spec.smooth_terms,
-        level_carrier_smooth(spec),
         demand,
     )?;
 
@@ -479,15 +478,6 @@ pub fn term_collection_has_global_intercept(spec: &TermCollectionSpec) -> bool {
     matches!(spec.level, ModelLevel::Intercept) && !term_collection_has_anchored_bspline(spec)
 }
 
-/// The smooth that carries the constant level of a no-intercept model, if one
-/// was chosen (see [`ModelLevel`]).
-fn level_carrier_smooth(spec: &TermCollectionSpec) -> Option<usize> {
-    match spec.level {
-        ModelLevel::NoIntercept { level_smooth } => level_smooth,
-        ModelLevel::Intercept => None,
-    }
-}
-
 /// Whether any smooth term carries an anchored B-spline endpoint (one *or* two
 /// sided). Such a term fixes the function's absolute level through its endpoint
 /// pin, so it becomes the model's level gauge: the global intercept is
@@ -715,17 +705,11 @@ pub fn build_term_prediction_columns(
             }
         }
     }
-    let level = match spec.level {
-        ModelLevel::NoIntercept { level_smooth } => ModelLevel::NoIntercept {
-            level_smooth: level_smooth.and_then(|idx| new_index[idx]),
-        },
-        ModelLevel::Intercept => ModelLevel::Intercept,
-    };
     let reduced = TermCollectionSpec {
         linear_terms: spec.linear_terms.clone(),
         random_effect_terms: Vec::new(),
         smooth_terms,
-        level,
+        level: spec.level,
     };
     let design = build_term_collection_prediction_design(data, &reduced)?;
     let range = design
@@ -1726,7 +1710,6 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
-    level_smooth: Option<usize>,
     demand: SmoothPenaltyDemand,
 ) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
@@ -1887,9 +1870,6 @@ fn apply_global_smooth_identifiability(
                         || factor_by_level_gate(termspec).is_some())
             }
         };
-        // The level-carrying smooth of a no-intercept model keeps its
-        // constant, so the constant column stays out of its block; a block
-        // left with no column is no block at all.
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -1897,9 +1877,7 @@ fn apply_global_smooth_identifiability(
                 data,
                 linear_terms,
                 termspec,
-                level_smooth != Some(idx),
             )?)
-            .filter(|block| block.ncols() > 0)
         };
         // The replay's own owner blocks, named by the chart rather than
         // re-derived: which owners bound is decided by a cross-residual on the
@@ -2337,7 +2315,6 @@ fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     termspec: &SmoothTermSpec,
-    include_constant: bool,
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
@@ -2389,13 +2366,10 @@ fn build_parametric_constraint_block_for_term(
         }
     }
 
-    let lead = usize::from(include_constant);
-    let mut c = Array2::<f64>::zeros((n, lead + parametric_cols.len()));
-    if include_constant {
-        c.column_mut(0).fill(1.0);
-    }
+    let mut c = Array2::<f64>::zeros((n, 1 + parametric_cols.len()));
+    c.column_mut(0).fill(1.0);
     for (j, &feature_col) in parametric_cols.iter().enumerate() {
-        c.column_mut(j + lead).assign(&data.column(feature_col));
+        c.column_mut(j + 1).assign(&data.column(feature_col));
     }
     Ok(c)
 }

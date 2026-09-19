@@ -497,6 +497,7 @@ fn continuation_corrector_builds_only_the_coefficient_product_2714() {
         &rho,
         gam_problem::RhoPrior::Flat,
         laplace_ready,
+        EvalMode::ValueOnly,
     )
     .expect("endpoint criterion from ordinary mode");
     assert_eq!(
@@ -512,6 +513,7 @@ fn continuation_corrector_builds_only_the_coefficient_product_2714() {
         &rho,
         gam_problem::RhoPrior::Flat,
         coefficient_mode,
+        EvalMode::ValueOnly,
     )
     .expect("endpoint criterion from continuation-owned mode");
     assert_eq!(
@@ -1024,12 +1026,12 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
             Ok(continuation) => continuation.eval.warm_start,
             Err(refusal) => panic!("the shallow branch exists at rho={from}: {refusal}"),
         };
-        let tangent = mode
-            .cached_inner
-            .as_ref()
-            .and_then(|cached| cached.rho_mode_responses.clone())
-            .expect("a continued derivative-bearing evaluation files its IFT tangent");
-        let predictor_beta = mode.block_beta[0][0] - (to - from) * tangent[[0, 0]];
+        // The closed-form IFT tangent of the tilted double well: stationarity is
+        // 4β³ − 4β + c + λβ = 0, so dβ/dρ = −λβ / (12β² − 4 + λ).
+        let beta = mode.block_beta[0][0];
+        let lambda = from.exp();
+        let tangent = -lambda * beta / (12.0 * beta * beta - 4.0 + lambda);
+        let predictor_beta = beta + (to - from) * tangent;
         let predictor = crate::assembly::ConstrainedWarmStart {
             rho: array![to],
             block_beta: vec![array![predictor_beta]],
@@ -1095,9 +1097,7 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
         Err(refusal) => {
             eprintln!("[2973 fold] {refusal}");
             let BranchContinuationRefusal::FoldReached {
-                last_certified_rho,
-                tangent_refusals,
-                ..
+                last_certified_rho, ..
             } = &refusal
             else {
                 panic!("the continuation must decline at the fold, not with: {refusal}");
@@ -1108,16 +1108,71 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
                  fold at {rho_fold}; got {}",
                 last_certified_rho[0]
             );
-            // Near the fold the mode response is unresolved and the tangent evaluation refuses
-            // the point (the envelope-gradient tripwire, gate i2-b1-land3); those sub-steps are
-            // halved and never published, and the decline still follows at the fold.
+            // The branch is followed to its fold, not abandoned short of it: the last certified
+            // point is within 1e-3 of the closed-form fold (measured 9.766626e-1 against
+            // 9.76663e-1).
             assert!(
-                *tangent_refusals >= 1,
-                "the approach to the fold halves at least one sub-step whose tangent evaluation \
-                 refused the point; got {tangent_refusals}"
+                rho_fold - last_certified_rho[0] < 1e-3,
+                "the continuation stops {} short of the fold at {rho_fold}",
+                rho_fold - last_certified_rho[0]
             );
         }
     }
+}
+
+/// #2973: a continuation predicts along the IFT tangent of the certified mode, formed from the
+/// curvature that mode's own solve ended on. On the tilted double well the stationarity condition
+/// is `4β³ − 4β + c + λβ = 0`, so `dβ̂/dρ = −λβ̂ / (12β̂² − 4 + λ)`, and the predictor from the deep
+/// mode at ρ = 0 to ρ = 0.3 must be `β̂ + 0.3·dβ̂/dρ` to rounding. A predictor that dropped the
+/// tangent, flipped its sign, or read it per λ instead of per ρ fails here.
+#[test]
+fn the_ift_predictor_is_the_closed_form_tangent_2973() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let specs = [double_well_spec(-2.0)];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let certified = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![0.0],
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueOnly,
+    )
+    .expect("the deep mode at rho=0")
+    .warm_start;
+    let beta = certified.block_beta[0][0];
+    assert!(
+        is_deep_mode_2973(0.0, beta),
+        "a seed at -2 certifies the deep mode; got {beta}"
+    );
+    let curvature = certified
+        .cached_inner
+        .as_ref()
+        .and_then(|cached| cached.terminal_working_sets.as_deref())
+        .and_then(|sets| sets.first())
+        .expect("the certified mode files its terminal exact-Newton working set");
+    let predictor = single_block_ift_predictor(
+        &family,
+        &specs,
+        &[array![0.0]],
+        &[array![0.3]],
+        &options,
+        &certified.block_beta,
+        curvature,
+        None,
+    )
+    .expect("the IFT predictor forms at a certified mode")[0][0];
+    let lambda = 0.0_f64.exp();
+    let expected = beta + 0.3 * (-lambda * beta / (12.0 * beta * beta - 4.0 + lambda));
+    assert!(
+        (predictor - expected).abs() <= 1e-12 * (1.0 + beta.abs()),
+        "the IFT predictor {predictor} is not the closed-form tangent predictor {expected}"
+    );
 }
 
 /// #2973 pin 2: a walk that tries to cross the fold publishes one branch per θ.

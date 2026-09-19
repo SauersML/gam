@@ -499,7 +499,6 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
         active_constraints: None,
         terminal_working_sets: None,
         terminal_likelihood_score: None,
-        rho_mode_responses: None,
         // #2615: the smoothing state the persisted mode was solved at, so the
         // inner solve can decide reuse against the state itself rather than
         // against the record's optimizer-coordinate `rho`. #2612: the

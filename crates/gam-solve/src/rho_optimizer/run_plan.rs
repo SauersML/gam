@@ -1598,6 +1598,9 @@ pub(crate) fn run_outer_with_plan(
                     );
                     let unprogressing_stop: Arc<Mutex<Option<CostStallExit>>> =
                         Arc::new(Mutex::new(None));
+                    // The observer reports each ratio-test decision here, and the
+                    // bridge folds only the accepted trials into the guard (#3017).
+                    let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
                     let bridge_obj = OuterOperatorBridge {
                         obj,
                         layout,
@@ -1609,6 +1612,7 @@ pub(crate) fn run_outer_with_plan(
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
                         unprogressing_stop: Arc::clone(&unprogressing_stop),
+                        accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
                     };
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
@@ -1653,7 +1657,7 @@ pub(crate) fn run_outer_with_plan(
                     let census = Arc::new(OuterStepCensus::default());
                     solver = solver.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
+                        accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&census)),
                     });
                     if let Some(r) = sanitized_operator_trust_restart_radius(
@@ -1883,6 +1887,9 @@ pub(crate) fn run_outer_with_plan(
 
                     let last_objective_error: Arc<Mutex<Option<ObjectiveEvalError>>> =
                         Arc::new(Mutex::new(None));
+                    // See the matrix-free route: only accepted trials reach the
+                    // guard (#3017).
+                    let accepted_steps: Arc<AcceptedStepLedger> = Arc::default();
                     let objective = RetainingObjective::new(
                         OuterSecondOrderBridge {
                         obj,
@@ -1910,6 +1917,14 @@ pub(crate) fn run_outer_with_plan(
                         // (`with_model_decrement_tolerance` above); this is the
                         // dense route's half of the same repair.
                         curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
+                        accepted_trials: AcceptedTrialGate::new(Arc::clone(&accepted_steps)),
+                        // #2954 — and on the rung it judges on. Where the route
+                        // declares its size the certificate decides on the
+                        // Newton-decrement verdict on rounding bands, not on
+                        // `floor·(1 + |V|)`; without the config the loop kept
+                        // stopping on the older rung at points the certificate
+                        // then refused.
+                        decrement_verdict_config: Some(config),
                         },
                         Arc::clone(&last_objective_error),
                     );
@@ -1934,7 +1949,7 @@ pub(crate) fn run_outer_with_plan(
                     let arc_census = Arc::new(OuterStepCensus::default());
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
+                        accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&arc_census)),
                     });
                     // On the exact-Hessian ARC route, forbid `opt`'s
@@ -2496,7 +2511,7 @@ pub(crate) fn run_outer_with_plan(
                                 cost_stall: Some(cost_stall_guard),
                                 cost_stall_bounds: Some((lo.clone(), hi.clone())),
                                 consecutive_probe_refusals: 0,
-                                accepted_steps: Some(Arc::clone(&accepted_steps)),
+                                accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
                                 incumbent: Some((stratum_start.clone(), stratum_eval.cost)),
                                 stratum_rank,
@@ -2645,7 +2660,7 @@ pub(crate) fn run_outer_with_plan(
                         // guard is present on every BFGS seed.
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
                             feedback: config.outer_inner_cap.clone(),
-                            accepted_steps: Some(Arc::clone(&accepted_steps)),
+                            accepted_steps: Arc::clone(&accepted_steps),
                             // BFGS reports no trust radius, so a region census would
                             // be a column of `None`s; its own non-convergence
                             // reporting is the line-search failure path.

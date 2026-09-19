@@ -150,7 +150,6 @@ fn fit_at_rho(
         },
         PenaltyConfig {
             canonical_penalties: penalties,
-            balanced_penalty_root: None,
             reparam_invariant: None,
             p,
             coefficient_lower_bounds: None,

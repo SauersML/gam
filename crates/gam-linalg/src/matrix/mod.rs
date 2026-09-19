@@ -5692,6 +5692,30 @@ impl DesignMatrix {
         }
     }
 
+    /// The design restricted to `cols` (in that order), as a design of the
+    /// same storage class: a sparse design stays sparse — its kept columns'
+    /// stored entries are copied verbatim — and a dense or operator-backed
+    /// design yields the dense block [`Self::extract_columns`] returns.
+    pub fn select_columns(&self, cols: &[usize]) -> Result<DesignMatrix, String> {
+        match self {
+            Self::Dense(_) => Ok(DesignMatrix::from(self.extract_columns(cols))),
+            Self::Sparse(sp) => {
+                let (symbolic, values) = sp.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                let mut triplets = Vec::new();
+                for (k, &j) in cols.iter().enumerate() {
+                    for idx in col_ptr[j]..col_ptr[j + 1] {
+                        triplets.push(Triplet::new(row_idx[idx], k, values[idx]));
+                    }
+                }
+                SparseColMat::try_new_from_triplets(sp.nrows(), cols.len(), &triplets)
+                    .map(DesignMatrix::from)
+                    .map_err(|error| format!("column-restricted sparse design: {error:?}"))
+            }
+        }
+    }
+
     /// Returns a reference to the inner dense array if this is a `Dense` variant.
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
@@ -6590,6 +6614,36 @@ mod tests {
 
         assert_eq!(got, dense.select(Axis(1), &cols));
         assert_eq!(lazy.apply_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn select_columns_keeps_the_storage_class_and_the_entries() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            3,
+            4,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(2, 0, -2.0),
+                Triplet::new(1, 1, 3.0),
+                Triplet::new(0, 2, 0.5),
+                Triplet::new(1, 3, -1.5),
+                Triplet::new(2, 3, 4.0),
+            ],
+        )
+        .expect("sparse matrix");
+        let design = DesignMatrix::from(sparse);
+        let ledger = ledger_read_guard();
+        assert_eq!(*ledger, (), "ledger read guard is held for this test");
+        let full = design.to_dense();
+        let cols = [3, 0, 2];
+        let selected = design.select_columns(&cols).expect("select columns");
+        assert!(selected.is_sparse(), "a sparse design stays sparse");
+        assert_eq!(selected.to_dense(), full.select(Axis(1), &cols));
+
+        let dense = DesignMatrix::from(full.clone());
+        let selected = dense.select_columns(&cols).expect("select columns");
+        assert!(!selected.is_sparse());
+        assert_eq!(selected.to_dense(), full.select(Axis(1), &cols));
     }
 
     #[test]

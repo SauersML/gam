@@ -592,7 +592,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Python objects and then reparsing their string representations. This class
 /// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
 /// requested row for the few metadata helpers that still consume text.
-#[pyclass(name = "_EncodedTable", frozen, skip_from_py_object)]
+#[pyclass(module = "gamfit._rust", name = "_EncodedTable", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncodedTable {
     dataset: EncodedDataset,
@@ -1511,7 +1511,15 @@ fn fit_table(
     // driver and persistence envelope; route it here on the same predicate the
     // CLI uses, so callers read the model kind off the returned bytes
     // (`saved_model_kind`) instead of re-deriving it from the family name.
-    let fit_config = parse_fit_config(config_json.as_deref()).map_err(py_value_error)?;
+    // A refused configuration is an `InvalidConfigurationError` here exactly as
+    // it is once the fit runs (`fit_dataset_impl`), not a bare `GamError`.
+    let fit_config = parse_fit_config(config_json.as_deref())
+        .map_err(|reason| {
+            workflow_error_to_pyerr(
+                py,
+                gam::families::fit_orchestration::WorkflowError::InvalidConfig { reason },
+            )
+        })?;
     if fit_config
         .family
         .as_deref()
@@ -1861,17 +1869,20 @@ fn ctn_required_fit_columns(formula: String, config_json: String) -> PyResult<Ve
 
 #[pyfunction]
 fn required_model_columns(model: PyRef<'_, PyFittedModel>, observed_score: bool) -> PyResult<Option<Vec<String>>> {
-    let mut model = model.model.as_ref().clone();
+    let model = model.model.as_ref();
     // Outcome models without an embedded CTN retain their existing table
     // ingestion contract, including intercept-only row-count inputs.
     if !observed_score && model.score_transform.is_none() {
         return Ok(None);
     }
-    if observed_score {
-        if let Some(transform) = model.score_transform.as_ref() {
-            model = FittedModel::from_payload((**transform).clone());
+    let transformed;
+    let model = match model.score_transform.as_ref() {
+        Some(transform) if observed_score => {
+            transformed = FittedModel::from_payload((**transform).clone());
+            &transformed
         }
-    }
+        _ => model,
+    };
     let mut columns = model.prediction_required_columns().map_err(py_value_error)?;
     if observed_score {
         let response = response_column_name(&model.formula)
@@ -1879,6 +1890,51 @@ fn required_model_columns(model: PyRef<'_, PyFittedModel>, observed_score: bool)
         columns.insert(response);
     }
     Ok(Some(columns.into_iter().collect()))
+}
+
+/// Column names a positional (NumPy) prediction array of `width` columns
+/// binds to.
+///
+/// A model fitted from a positional array reads the synthetic sequence
+/// `x0..x{width-1}`, so that sequence is used whenever it covers every column
+/// the model reads. A model fitted from a named table binds the array to its
+/// predictor columns in training-table order (the order the sklearn wrapper
+/// reports as `feature_names_in_`), and only when the width equals their
+/// count; any other width is a `SchemaMismatchError` naming the expected
+/// columns, never a guessed binding.
+#[pyfunction]
+fn positional_prediction_headers(
+    model: PyRef<'_, PyFittedModel>,
+    width: usize,
+) -> PyResult<Vec<String>> {
+    let model = model.model.as_ref();
+    let required = model.prediction_required_columns().map_err(py_value_error)?;
+    let synthetic: Vec<String> = (0..width).map(|index| format!("x{index}")).collect();
+    if required.iter().all(|name| synthetic.contains(name)) {
+        return Ok(synthetic);
+    }
+    let predictors: Vec<String> = model
+        .payload()
+        .training_headers
+        .iter()
+        .flatten()
+        .filter(|name| required.contains(name.as_str()))
+        .cloned()
+        .collect();
+    if predictors.len() == required.len() && predictors.len() == width {
+        return Ok(predictors);
+    }
+    Err(SchemaMismatchError::new_err(format!(
+        "a positional array binds to the model's {} predictor column(s) {:?} in \
+         training-table order, but the input has {width} column(s); pass a table \
+         with named columns or an array of matching width",
+        required.len(),
+        if predictors.len() == required.len() {
+            predictors
+        } else {
+            required.into_iter().collect()
+        },
+    )))
 }
 
 fn transformation_score_encoded_table_impl(
@@ -3888,7 +3944,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     enum ScoreKind {
         Reml,
         Laml,
-        Bic,
         Tk,
     }
     #[derive(Deserialize)]
@@ -3931,7 +3986,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             name: String,
             raw_reml: LifecycleFloat,
             laml: Option<LifecycleFloat>,
-            deviance: Option<LifecycleFloat>,
             null_dim: Option<LifecycleFloat>,
             null_space_logdet: Option<LifecycleFloat>,
             effective_dim: LifecycleFloat,
@@ -3962,7 +4016,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     let score_kind = match request.score_kind {
         ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
         ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
-        ScoreKind::Bic => gam::solver::TopologySelectionScoreKind::Bic,
         ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
     };
     let score_scale = match request.score_scale {
@@ -3978,7 +4031,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                 name,
                 raw_reml,
                 laml,
-                deviance,
                 null_dim,
                 null_space_logdet,
                 effective_dim,
@@ -3989,7 +4041,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                     name,
                     raw_reml: raw_reml.decode()?,
                     laml: laml.map(LifecycleFloat::decode).transpose()?,
-                    deviance: deviance.map(LifecycleFloat::decode).transpose()?,
                     null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
                     null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
                     effective_dim: effective_dim.decode()?,

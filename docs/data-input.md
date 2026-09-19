@@ -101,7 +101,7 @@ else the training kind, else `dict`. Override with `return_type=`:
 | --- | --- |
 | `None` | Tabular path only: input kind for pandas/polars/numpy/pyarrow inputs, else training kind, else `dict`. |
 | `"dict"` | `PredictionResult`, a `dict[str, list]` with attribute access to prediction columns. |
-| `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
+| `"numpy"` | Structured `numpy.ndarray` of shape `(n_samples,)` with one named field per prediction column, the same names as the DataFrame result. |
 | `"pandas"` | `pandas.DataFrame`. |
 | `"polars"` | `polars.DataFrame`. |
 | `"pyarrow"` | `pyarrow.Table`. |
@@ -110,9 +110,16 @@ else the training kind, else `dict`. Override with `return_type=`:
 pred = model.predict(test_df, return_type="dict")
 pred["posterior_mean"]
 pred.posterior_mean
-model.predict(test_df, return_type="numpy")
+table = model.predict(test_df, interval=0.95, return_type="numpy")
+table["posterior_mean_lower"]
 model.predict(test_df, return_type="pandas")
 ```
+
+A positional NumPy array passed to `predict` for a model fitted on a named
+table binds to the model's predictor columns in training-table order when its
+width equals their count; any other width raises
+`gamfit.errors.SchemaMismatchError` naming the expected columns. A model fitted
+on an array keeps reading its columns as `x0`, `x1`, ….
 
 ## Array-returning model classes
 
