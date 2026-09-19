@@ -69,6 +69,8 @@ jobs:
   # Validate the immutable source commit before the matrix fans out.
   gate:
     runs-on: ubuntu-24.04
+    outputs:
+      smoke_matrix: ${{ steps.smoke-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,6 +95,19 @@ jobs:
 
       - name: Verify release-cache policy
         run: python3 -m unittest discover -s scripts/tests -p test_release_cache.py -v
+
+      # The families this scope builds, each on the Python versions the trove
+      # classifiers advertise (see scripts/wheel_smoke.py).
+      - name: Plan the installed-wheel smoke matrix
+        id: smoke-matrix
+        shell: bash
+        env:
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          matrix=$(python3 scripts/wheel_smoke.py matrix --scope "$SCOPE")
+          echo "$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       # Resolve metadata once before the matrix fans out. Running without
       # --locked is deliberate in this ephemeral checkout: Cargo can reveal the
@@ -372,6 +387,63 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # A wheel that builds is not a wheel that works (PKG-08). Every built wheel
+  # is installed into an empty virtualenv with only the runtime requirements
+  # its own metadata declares, binaries only, from a directory that holds no
+  # package checkout, and then imported, fitted, predicted, summarised and
+  # saved/loaded. That catches missing package data, undeclared or dev-only
+  # dependencies, and extensions that do not load on their platform, before
+  # anything reaches PyPI. The floor Python lane installs the lowest declared
+  # requirement versions, so the numpy lower bound is tested too.
+  smoke:
+    name: Smoke ${{ matrix.family }} py${{ matrix.python }} (${{ matrix.resolution }})
+    needs: [gate, linux, musllinux, macos, windows]
+    # Builders a narrower scope skipped are absent from the matrix; any builder
+    # that failed or was cancelled stops the smoke test and hence the upload.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.gate.outputs.smoke_matrix) }}
+    env:
+      PYTHON_VERSION: ${{ matrix.python }}
+      RESOLUTION: ${{ matrix.resolution }}
+    steps:
+      # Only the smoke script: the package sources are never on disk, let
+      # alone importable, so only the installed wheel can satisfy `import`.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: smoke-src
+          sparse-checkout: |
+            scripts/wheel_smoke.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.family }}
+          path: wheelhouse
+      - uses: actions/setup-python@v5
+        if: ${{ !matrix.musl }}
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the wheel into a fresh venv and exercise it
+        if: ${{ !matrix.musl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install uv
+          python smoke-src/scripts/wheel_smoke.py run --wheel-dir wheelhouse --resolution "$RESOLUTION"
+      # A glibc runner cannot load a musllinux extension: run under Alpine.
+      - name: Install the wheel into a fresh venv and exercise it (Alpine)
+        if: ${{ matrix.musl }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -e RESOLUTION -v "$GITHUB_WORKSPACE:/w" -w /w "python:${PYTHON_VERSION}-alpine" sh -euc '
+            python -m pip install --root-user-action=ignore uv
+            python smoke-src/scripts/wheel_smoke.py run --wheel-dir wheelhouse --resolution "$RESOLUTION"
+          '
+
   release:
     name: Upload to PyPI
     needs:
@@ -380,6 +452,7 @@ jobs:
       - macos
       - windows
       - sdist
+      - smoke
     # Full releases are atomic platform sets: every advertised wheel family must
     # succeed. A cancelled job is not a deliverable and must never be treated like
     # an intentional skip. Only a manually selected narrower scope may accept the
@@ -389,6 +462,7 @@ jobs:
         always() &&
         needs.linux.result == 'success' &&
         needs.sdist.result == 'success' &&
+        needs.smoke.result == 'success' &&
         (
           (
             github.event.inputs.scope == 'x86' &&
@@ -422,10 +496,14 @@ jobs:
           merge-multiple: true
       - name: Show what will be uploaded
         run: ls -la dist
+      - name: Install twine
+        run: python -m pip install --upgrade twine
+      # PyPI renders the long description and validates the metadata only at
+      # upload time; refuse the whole set here, before any file is uploaded.
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
       - name: Upload to PyPI via twine
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          python -m pip install --upgrade twine
-          python -m twine upload --verbose --skip-existing --non-interactive dist/*
+        run: python -m twine upload --verbose --skip-existing --non-interactive dist/*
