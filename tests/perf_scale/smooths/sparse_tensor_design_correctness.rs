@@ -193,7 +193,7 @@ fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -298,7 +298,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

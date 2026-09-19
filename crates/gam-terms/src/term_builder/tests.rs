@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::basis::{OperatorPenaltySpec, PenaltySource};
+use crate::smooth::ShapeConstraint;
 use crate::inference::formula_dsl::parse_formula;
 use gam_data::{DataSchema, SchemaColumn};
 use ndarray::{Array1, Array2, array};
@@ -664,7 +665,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
             frozen_parametric_residualization: None,
             name: "spatial".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

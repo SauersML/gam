@@ -11,14 +11,14 @@ use ndarray::{Array2, ArrayView1};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy,
-    ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, DuchonSpectralBasis, MaternBasisSpec,
-    MaternIdentifiability, MaternLengthScale, MaternNu, MeasureJetBasisSpec,
-    MeasureJetIdentifiability, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod,
-    SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
-    ThinPlateBasisSpec, auto_spatial_center_strategy, count_unique_coordinate_rows,
-    default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec,
+    ConstantCurvatureIdentifiability, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, DuchonSpectralBasis, MaternBasisSpec, MaternIdentifiability,
+    MaternLengthScale, MaternNu, MeasureJetBasisSpec, MeasureJetIdentifiability,
+    OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
+    SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
+    auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
+    default_spatial_center_strategy, default_spherical_harmonic_degree,
     select_r_uniform_subsample_centers, thin_plate_penalty_order,
 };
 use crate::inference::formula_dsl::{
@@ -28,9 +28,9 @@ use crate::inference::formula_dsl::{
 };
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
-    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeSpec, SmoothBasisSpec,
+    SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition,
+    TensorBSplineSpec, TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
 use gam_problem::types::ColIdx;
@@ -255,7 +255,10 @@ impl TermBuilderError {
 /// than rely on string-classification of human prose. Internal callers that
 /// still flow `Result<_, String>` get byte-identical text via
 /// `From<DataError> for String`.
-pub(crate) fn resolve_col(col_map: &HashMap<String, usize>, name: &str) -> Result<usize, DataError> {
+pub(crate) fn resolve_col(
+    col_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<usize, DataError> {
     col_map
         .get(name)
         .copied()
@@ -367,7 +370,10 @@ pub(crate) const MARGINAL_SLOPE_Z_ALIAS: &str = "z";
 /// own real `z` column keeps it and the alias is inert — writing `z` there means
 /// that column, which is legitimate. The alias is live only when `z_column`
 /// exists and `z` does not, and only then does `z` silently denote the score.
-pub(crate) fn marginal_slope_z_alias_is_live(col_map: &HashMap<String, usize>, z_column: &str) -> bool {
+pub(crate) fn marginal_slope_z_alias_is_live(
+    col_map: &HashMap<String, usize>,
+    z_column: &str,
+) -> bool {
     col_map.contains_key(z_column) && !col_map.contains_key(MARGINAL_SLOPE_Z_ALIAS)
 }
 
@@ -570,13 +576,15 @@ pub fn build_termspec(
                 // Pop the shape constraint before `build_smooth_basis` runs so
                 // it never reaches the per-kind `validate_known_options`
                 // allow-lists (the constraint is a property of the smooth term,
-                // not of any one basis kind). Basis-incompatible requests still
-                // fail loudly downstream via `shape_supports_basis`.
-                let shape = match inner_options.remove("shape") {
-                    None => ShapeConstraint::None,
-                    Some(raw) => crate::smooth::parse_shape_constraint(&raw)
-                        .map_err(TermBuilderError::invalid_option)?,
-                };
+                // not of any one basis kind). Its text is parsed now but its
+                // meaning (one conjunction vs. one entry per `te()` margin) is
+                // resolved once the basis is known. Basis-incompatible requests
+                // still fail loudly downstream via `validate_shape_request`.
+                let shape_expr = inner_options
+                    .remove("shape")
+                    .map(|raw| crate::smooth::parse_shape_expr(&raw))
+                    .transpose()
+                    .map_err(TermBuilderError::invalid_option)?;
                 // A categorical by= expands into per-level blocks below; size
                 // the inner basis's n-scaling defaults from the smallest
                 // level's rows, not the pooled count (see
@@ -594,6 +602,14 @@ pub fn build_termspec(
                     inference_notes,
                     smooth_coordinate_count,
                 )?;
+                let shape = match &shape_expr {
+                    None => ShapeSpec::None,
+                    Some(expr) => crate::smooth::resolve_shape_spec(
+                        expr,
+                        crate::smooth::shape_tensor_margin_count(&inner_basis),
+                    )
+                    .map_err(TermBuilderError::invalid_option)?,
+                };
                 // `bs="sz"` deliberately stays typed as `SmoothBasisSpec::FactorSmooth
                 // { Sz }` (#1403, owner-confirmed in #1887): the `FactorSumToZero`
                 // envelope is the *legacy, mis-typed* representation. `build_factor_smooth`
@@ -697,8 +713,10 @@ pub fn build_termspec(
                             // `identifiability=` still wins. A binary
                             // by-variable is a factor in disguise and keeps
                             // the factor convention (`s(x, by=g) + g`).
-                            if matches!(ds.column_kinds.get(by_col), Some(ColumnKindTag::Continuous))
-                                && !options.contains_key("identifiability")
+                            if matches!(
+                                ds.column_kinds.get(by_col),
+                                Some(ColumnKindTag::Continuous)
+                            ) && !options.contains_key("identifiability")
                             {
                                 crate::smooth::keep_constant_in_numeric_by_smooth(&mut inner_basis);
                             }
@@ -1407,9 +1425,8 @@ fn reject_unconsumable_radial_period_declaration(
         .to_string());
     }
     let any_axis_wraps = boundary_is_cyclic
-        || periodic.is_some_and(|axes| {
-            (dim == 1 && !axes.is_empty()) || axes.iter().any(Option::is_some)
-        });
+        || periodic
+            .is_some_and(|axes| (dim == 1 && !axes.is_empty()) || axes.iter().any(Option::is_some));
     if any_axis_wraps {
         return Ok(());
     }
@@ -2007,10 +2024,12 @@ fn parse_bspline_identifiability(
         | "sumtozero" => Ok(Some(BSplineIdentifiability::WeightedSumToZero {
             weights: None,
         })),
-        "linear" | "remove_linear_trend" | "remove-linear-trend" | "removelineartrend"
-        | "center_linear_orthogonal" | "center-linear-orthogonal" => {
-            Ok(Some(BSplineIdentifiability::RemoveLinearTrend))
-        }
+        "linear"
+        | "remove_linear_trend"
+        | "remove-linear-trend"
+        | "removelineartrend"
+        | "center_linear_orthogonal"
+        | "center-linear-orthogonal" => Ok(Some(BSplineIdentifiability::RemoveLinearTrend)),
         "frozen" | "frozen_transform" | "orthogonal" | "orthogonal_to_design_columns" => {
             Err(TermBuilderError::unsupported_feature(format!(
                 "B-spline identifiability '{}' is internal-only (it is minted by design freezing \
@@ -3507,8 +3526,7 @@ pub(crate) fn build_smooth_basis(
                     // `duchon(..., order=1)` formula is unaffected.
                     match length_scale {
                         None => {
-                            let (default_order, s) =
-                                crate::basis::duchon_cubic_default(cols.len());
+                            let (default_order, s) = crate::basis::duchon_cubic_default(cols.len());
                             (requested_nullspace_order.unwrap_or(default_order), s)
                         }
                         Some(_) => {
@@ -3819,8 +3837,7 @@ pub(crate) fn build_smooth_basis(
                 requested_degrees[axis].unwrap_or(DEFAULT_BSPLINE_DEGREE)
             };
             let axis_penalty_order = |axis: usize| -> usize {
-                requested_penalty_orders[axis]
-                    .unwrap_or(if axis_degree(axis) > 1 { 2 } else { 1 })
+                requested_penalty_orders[axis].unwrap_or(if axis_degree(axis) > 1 { 2 } else { 1 })
             };
             let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
@@ -3998,8 +4015,7 @@ pub(crate) fn build_smooth_basis(
                 } else if margin_wants_cr(&per_axis_bs[axis])
                     && requested_knot_placement.is_none()
                     && requested_degrees[axis].is_none_or(|d| d == CR_MARGIN_DEGREE)
-                    && requested_penalty_orders[axis]
-                        .is_none_or(|m| m == CR_MARGIN_PENALTY_ORDER)
+                    && requested_penalty_orders[axis].is_none_or(|m| m == CR_MARGIN_PENALTY_ORDER)
                     && k_axis >= 3
                 {
                     // mgcv `te()`/`ti()` default cr margin: place exactly
@@ -4310,7 +4326,10 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
 // Data-aware helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
+pub(crate) fn spatial_center_strategy_for_dimension(
+    num_centers: usize,
+    d: usize,
+) -> CenterStrategy {
     if d <= 3 {
         // In low-dimensional spatial smooths, an explicit `k` is a resolution
         // request rather than a request for marginal quantile-midpoint centers.
@@ -5130,9 +5149,7 @@ const RANDOM_EFFECT_UNSHAPEABLE_OPTION_KEYS: &[&str] = &[
 ///
 /// Refuses the basis-shaping keys with a message that names the flavour that
 /// does honour them, then falls through to the ordinary spelling check.
-fn validate_random_effect_smooth_options(
-    options: &BTreeMap<String, String>,
-) -> Result<(), String> {
+fn validate_random_effect_smooth_options(options: &BTreeMap<String, String>) -> Result<(), String> {
     if let Some(key) = RANDOM_EFFECT_UNSHAPEABLE_OPTION_KEYS
         .iter()
         .find(|key| options.contains_key(**key))

@@ -94,7 +94,7 @@ mod matern_nfree_rekey_topology_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         }

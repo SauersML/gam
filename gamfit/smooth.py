@@ -32,6 +32,25 @@ ShapeConstraintLiteral = Literal[
     "concave",
 ]
 
+# A shape request: one atom, a conjunction of atoms (``["monotone_increasing",
+# "concave"]``), or for a tensor product one entry per margin, each entry an
+# atom, ``None`` or a conjunction (``["monotone_increasing", None]``).
+ShapeConstraintSpec = ShapeConstraintLiteral | Sequence[Any]
+
+
+def shape_constraint_text(value: Any) -> str:
+    """Render a shape request as formula-DSL text (``"[a, [b, c]]"``).
+
+    Only marshals: the grammar, its meaning for the term it is attached to,
+    and every error live in Rust (``gam_terms::smooth::parse_shape_expr`` /
+    ``resolve_shape_spec``).
+    """
+    if value is None:
+        return "none"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(shape_constraint_text(v) for v in value) + "]"
+    return str(value)
+
 
 def _smooth_kind_name(cls: type) -> str:
     """Map a ``Smooth`` subclass to its canonical Rust ``kind`` discriminator.
@@ -100,30 +119,31 @@ class Smooth(_BasisDescriptor):
         explicitly enable or disable the null-space shrinkage penalty.
     shape_constraint : optional shape constraint on the fitted function.
         One of ``None`` / ``"none"`` (unconstrained, the default),
-        ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
+        ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere),
         ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
-        or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
-        the inner solver as joint linear inequalities ``A·β ≥ b`` on the
-        coefficient vector (the constraint matrix ``A`` is generated from
-        the basis on a dense 1D grid spanning the data range, so the
-        inequality at the grid points implies the constraint on the
-        smooth function under standard B-spline / radial-basis density
-        arguments). The solver is an active-set / interior-point method;
-        when the constraint is active at the cert exit the outer REML
-        score uses the tangent-projected LAML formulation so the smoothing
-        parameter is selected over the working subspace. This mirrors
-        mgcv's ``scop=...`` argument and the ``scam`` R library's shape-
-        constrained smooths. Currently restricted to univariate 1D smooths
-        (B-splines and thin-plate / Duchon with a single feature axis);
-        a multivariate spec on a constrained smooth will be rejected with
-        a clear error from the Rust core. Spherical-harmonic and tensor
-        smooths reject all non-``None`` shape constraints.
+        or ``"concave"`` (f''(x) ≤ 0), or a list of those imposed jointly
+        (``["monotone_increasing", "concave"]``). Contradictory pairs (both
+        monotone directions, or convex with concave) are rejected because
+        they force a constant or an affine function. A tensor-product smooth
+        takes one entry per margin in margin order, each an atom, ``None`` or
+        a list: ``["monotone_increasing", None]`` makes the surface
+        non-decreasing along the first margin at every value of the second.
+        The constraint is the exact B-spline control-polygon cone
+        ``A·β ≥ 0``, so it certifies the shape on the whole domain, not on a
+        grid; when constraints are active at convergence the outer REML
+        score uses the tangent-projected LAML formulation. With a numeric
+        ``by`` the cone is imposed on ``f``, so the term ``z·f(x)`` has the
+        stated shape in ``x`` only where ``z ≥ 0`` (the mirrored shape where
+        ``z < 0``). This mirrors mgcv's ``scop=...`` argument and the
+        ``scam`` R library. Only open B-spline bases and tensor products of
+        them carry the exact cone; other bases reject non-``None`` shapes
+        with a clear error from the Rust core.
     """
 
     name: str | None = None
     by: Any | None = None
     double_penalty: bool | None = None
-    shape_constraint: ShapeConstraintLiteral | None = None
+    shape_constraint: ShapeConstraintSpec | None = None
     _gamfit_topology_dim: int | None = field(default=None, init=False, repr=False)
     _gamfit_tensor_k: tuple[int, int] | None = field(default=None, init=False, repr=False)
     _gamfit_tensor_periods: tuple[str | None, str | None] | None = field(
@@ -162,7 +182,7 @@ class Smooth(_BasisDescriptor):
         if self.name is not None:
             out["name"] = str(self.name)
         if self.shape_constraint is not None:
-            out["shape_constraint"] = str(self.shape_constraint)
+            out["shape_constraint"] = shape_constraint_text(self.shape_constraint)
         # Emit ``double_penalty`` only when the user explicitly pins it.
         # ``None`` means "defer to the Rust/formula default", which keeps the
         # descriptor bridge bit-identical to the formula DSL while preserving
@@ -641,7 +661,7 @@ class Pca(Smooth):
         name: str | None = None,
         by: Any | None = None,
         double_penalty: bool = False,
-        shape_constraint: ShapeConstraintLiteral | None = None,
+        shape_constraint: ShapeConstraintSpec | None = None,
     ) -> None:
         self.name = name
         self.by = by

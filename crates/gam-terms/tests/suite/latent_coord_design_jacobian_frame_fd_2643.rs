@@ -90,7 +90,7 @@ fn fresh_spec() -> TermCollectionSpec {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     }

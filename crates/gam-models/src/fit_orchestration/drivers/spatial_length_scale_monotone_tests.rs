@@ -137,7 +137,7 @@ mod spatial_length_scale_monotone_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };
@@ -258,7 +258,7 @@ mod spatial_length_scale_monotone_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };
@@ -313,7 +313,7 @@ mod spatial_length_scale_monotone_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };

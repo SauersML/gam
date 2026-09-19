@@ -80,7 +80,7 @@ fn curvature_term(name: &str) -> SmoothTermSpec {
                 identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
         frozen_parametric_residualization: None,
     }
@@ -104,7 +104,7 @@ fn owner_spline_term(name: &str) -> SmoothTermSpec {
                 boundary_conditions: Default::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
         frozen_parametric_residualization: None,
     }
@@ -425,7 +425,7 @@ fn an_unfrozen_matern_smooth_is_orthogonalized_at_no_cost_2747() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
         frozen_parametric_residualization: None,
     };

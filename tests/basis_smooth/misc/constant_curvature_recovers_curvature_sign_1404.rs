@@ -158,7 +158,7 @@ fn fitted_kappa(data: &Array2<f64>, ell_ref: f64, kappa_true: f64) -> f64 {
                 feature_cols: vec![0, 1],
                 spec,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

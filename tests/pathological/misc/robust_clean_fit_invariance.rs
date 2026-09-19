@@ -124,7 +124,7 @@ fn build_clean_cohort(n: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec)
                 boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 

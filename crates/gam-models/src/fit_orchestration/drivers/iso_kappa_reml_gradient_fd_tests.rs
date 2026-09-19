@@ -395,7 +395,7 @@ fn build_iso_kappa_fixture(
             frozen_parametric_residualization: None,
             name: "variant_1d".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1082,7 +1082,7 @@ fn iso_kappa_matern_2d_psi_fd_step_sweep_diagnostic() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1439,7 +1439,7 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1968,7 +1968,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2229,7 +2229,7 @@ fn zz_measure_monotone_fixture_through_checkable_evaluator_2454() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2508,7 +2508,7 @@ fn rho_gradient_part_ladder_family_2454(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -3286,7 +3286,7 @@ fn a_root_priced_rho_gradient_matches_its_value_2959() {
                     boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -3454,7 +3454,7 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

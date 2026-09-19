@@ -143,7 +143,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 

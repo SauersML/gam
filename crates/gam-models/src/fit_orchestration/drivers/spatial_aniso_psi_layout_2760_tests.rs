@@ -68,7 +68,7 @@ mod spatial_aniso_psi_layout_2760_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         }

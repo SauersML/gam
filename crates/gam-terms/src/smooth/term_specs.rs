@@ -7,8 +7,12 @@ pub use error::SmoothError;
 use input_standardization::estimate_isotropic_scale;
 
 use shape_constraints::{
-    bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
-    shape_supports_basis, shape_uses_box_reparameterization,
+    ShapeRealization, bspline_first_derivative_control_spans, box_lower_bounds_local,
+    plan_shape_realization, replicate_shape_constraints_over_levels, validate_shape_request,
+};
+pub use shape_constraints::{
+    ShapeExpr, ShapeSet, ShapeSpec, parse_shape_expr, parse_shape_spec, resolve_shape_spec,
+    shape_expr_from_json, shape_tensor_margin_count,
 };
 
 pub(crate) fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -139,10 +143,12 @@ pub(crate) const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
 /// `shape=<kind>` option understood by the formula DSL.
 ///
 /// `constraints` pairs the smooth-term text as it appears in the formula
-/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a shape-constraint
-/// spelling accepted by [`parse_shape_constraint`]; comparison is exact after
-/// whitespace removal. A `"none"` constraint is a no-op. Referencing a term not
-/// present in the formula is an error.
+/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a `shape=` value
+/// in the grammar of [`parse_shape_expr`] (an atom, a conjunction
+/// `[monotone_increasing, concave]`, or a per-margin `te()` list); comparison
+/// is exact after whitespace removal. A `"none"` constraint is a no-op.
+/// Referencing a term not present in the formula is an error. The meaning of a
+/// list is resolved against the term when the formula is built.
 ///
 /// This is the single source of truth for the `gamfit.fit(..., constraints=…)`
 /// rewrite — the Python wrapper only marshals the mapping across the FFI and
@@ -159,15 +165,15 @@ pub fn apply_shape_constraints_to_formula(
     let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
 
     // Whitespace-stripped term text -> canonical shape spelling.
-    let mut wanted: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, String> = BTreeMap::new();
     // Whitespace-stripped term text -> original key (for error labels).
     let mut originals: BTreeMap<String, String> = BTreeMap::new();
     for (key, kind_raw) in constraints {
-        let kind = parse_shape_constraint(kind_raw)?;
+        let kind = parse_shape_expr(kind_raw)?;
         let nk = strip_ws(key);
         originals.entry(nk.clone()).or_insert_with(|| key.clone());
-        if kind != ShapeConstraint::None {
-            wanted.insert(nk, kind.dsl_str());
+        if !kind.is_none() {
+            wanted.insert(nk, kind.to_string());
         }
     }
     if wanted.is_empty() {
@@ -785,7 +791,7 @@ pub enum TensorBSplinePenaltyDecomposition {
 pub struct SmoothTermSpec {
     pub name: String,
     pub basis: SmoothBasisSpec,
-    pub shape: ShapeConstraint,
+    pub shape: ShapeSpec,
     /// Joint-null absorption rotation captured at fit time. `Some(Q)` means
     /// the fitted coefficient vector lives in `γ`-coordinates with
     /// `β_raw = Q · γ`; prediction must rotate the raw-basis design via
@@ -963,7 +969,7 @@ pub struct SmoothCollectionGauge {
 pub struct SmoothTerm {
     pub name: String,
     pub coeff_range: Range<usize>,
-    pub shape: ShapeConstraint,
+    pub shape: ShapeSpec,
     /// Active local penalty identities. Numerical and semantic channels are
     /// inseparable, including after a preceding candidate is dropped.
     pub active_penalties: Vec<ActivePenalty>,
@@ -1638,7 +1644,7 @@ impl TermCollectionSpec {
             frozen_parametric_residualization: None,
                         name: st.name.clone(),
                         basis: (**inner).clone(),
-                        shape: st.shape,
+                        shape: st.shape.clone(),
                         joint_null_rotation: None,
                     };
                     TermCollectionSpec {
@@ -1978,7 +1984,7 @@ impl TermCollectionSpec {
             frozen_parametric_residualization: None,
                             name: st.name.clone(),
                             basis: (**smooth).clone(),
-                            shape: st.shape,
+                            shape: st.shape.clone(),
                             joint_null_rotation: None,
                         }],
                     };
@@ -6589,7 +6595,9 @@ pub struct LocalSmoothTermBuild {
     pub dropped_penalties: Vec<DroppedPenaltyInfo>,
     pub metadata: BasisMetadata,
     pub linear_constraints: Option<LinearInequalityConstraints>,
-    pub box_reparam: bool,
+    /// Coordinate lower bounds of the box shape chart (a single 1-D shape
+    /// atom), in this term's local coefficients.
+    pub lower_bounds: Option<Array1<f64>>,
 }
 
 #[derive(Clone)]
@@ -7214,7 +7222,7 @@ pub(crate) fn build_by_smooth_local(
             frozen_parametric_residualization: None,
         name: term.name.clone(),
         basis: (*smooth).clone(),
-        shape: term.shape,
+        shape: term.shape.clone(),
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7269,6 +7277,13 @@ pub(crate) fn build_by_smooth_local(
             let p = inner.dim;
             let q = n_levels * p;
             let n = data.nrows();
+            let (level_lower_bounds, level_linear_constraints) =
+                replicate_shape_constraints_over_levels(
+                    inner.lower_bounds.as_ref(),
+                    inner.linear_constraints.as_ref(),
+                    p,
+                    n_levels,
+                );
 
             let inner_dense = inner
                 .design
@@ -7350,8 +7365,10 @@ pub(crate) fn build_by_smooth_local(
                     levels: Some(level_bits),
                     ordered: *ordered,
                 },
-                linear_constraints: None,
-                box_reparam: false,
+                // Every level's curve carries the inner term's full shape
+                // realization on its own coefficient block.
+                linear_constraints: level_linear_constraints,
+                lower_bounds: level_lower_bounds,
             })
         }
     }
@@ -7529,7 +7546,7 @@ pub(crate) fn build_factor_smooth(
                 levels: levels.clone(),
                 frozen_global_orthogonality: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeSpec::None,
             joint_null_rotation: None,
         };
         let mut built = build_single_local_smooth_term(data, &sz_term, workspace)?;
@@ -7630,7 +7647,7 @@ pub(crate) fn build_factor_smooth(
             feature_col,
             spec: marginal_spec,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeSpec::None,
         joint_null_rotation: None,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7875,7 +7892,7 @@ pub(crate) fn build_factor_smooth(
         dropped_penalties,
         metadata,
         linear_constraints: None,
-        box_reparam: false,
+        lower_bounds: None,
     })
 }
 
@@ -7932,13 +7949,7 @@ pub fn build_single_local_smooth_term(
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
     term.basis.validate_scale_configuration()?;
-    if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
-        crate::bail_invalid_basis!(
-            "ShapeConstraint::{:?} is unsupported for term '{}'",
-            term.shape,
-            term.name
-        );
-    }
+    validate_shape_request(term)?;
     if let SmoothBasisSpec::ByVariable {
         inner,
         by_col,
@@ -7961,7 +7972,7 @@ pub fn build_single_local_smooth_term(
             frozen_parametric_residualization: None,
             name: term.name.clone(),
             basis: inner_basis,
-            shape: term.shape,
+            shape: term.shape.clone(),
             joint_null_rotation: None,
         };
         let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -7997,7 +8008,7 @@ pub fn build_single_local_smooth_term(
             }
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} is unsupported for sum-to-zero factor smooth term '{}'",
+                    "shape={} is unsupported for sum-to-zero factor smooth term '{}'",
                     term.shape,
                     term.name
                 );
@@ -8006,7 +8017,7 @@ pub fn build_single_local_smooth_term(
             frozen_parametric_residualization: None,
                 name: format!("{}::inner", term.name),
                 basis: (**inner).clone(),
-                shape: ShapeConstraint::None,
+                shape: ShapeSpec::None,
                 joint_null_rotation: None,
             };
             let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
@@ -8237,7 +8248,7 @@ pub fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
                     crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
+                        "shape={} for term '{}' on ThinPlate basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
@@ -8342,7 +8353,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::Sphere { feature_cols, spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on spherical splines",
+                    "shape={} for term '{}' is not supported on spherical splines",
                     term.shape,
                     term.name
                 );
@@ -8353,7 +8364,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::ConstantCurvature { feature_cols, spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on constant-curvature smooths",
+                    "shape={} for term '{}' is not supported on constant-curvature smooths",
                     term.shape,
                     term.name
                 );
@@ -8374,7 +8385,7 @@ pub fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on measure-jet smooths",
+                    "shape={} for term '{}' is not supported on measure-jet smooths",
                     term.shape,
                     term.name
                 );
@@ -8413,7 +8424,7 @@ pub fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
                     crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
+                        "shape={} for term '{}' on Matern basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
@@ -8461,7 +8472,7 @@ pub fn build_single_local_smooth_term(
             if term.shape != ShapeConstraint::None {
                 if feature_cols.len() != 1 {
                     crate::bail_invalid_basis!(
-                        "ShapeConstraint::{:?} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
+                        "shape={} for term '{}' on Duchon basis requires exactly 1 feature axis; found {}",
                         term.shape,
                         term.name,
                         feature_cols.len()
@@ -8570,7 +8581,7 @@ pub fn build_single_local_smooth_term(
         } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} for term '{}' is not supported on Pca basis",
+                    "shape={} for term '{}' is not supported on Pca basis",
                     term.shape,
                     term.name
                 );
@@ -8600,7 +8611,7 @@ pub fn build_single_local_smooth_term(
         SmoothBasisSpec::FactorSmooth { spec } => {
             if term.shape != ShapeConstraint::None {
                 crate::bail_invalid_basis!(
-                    "ShapeConstraint::{:?} is unsupported for factor smooth term '{}'",
+                    "shape={} is unsupported for factor smooth term '{}'",
                     term.shape,
                     term.name
                 );
@@ -8632,7 +8643,7 @@ pub fn build_single_local_smooth_term(
 
     if built.affine_offset.is_some() && term.shape != ShapeConstraint::None {
         crate::bail_invalid_basis!(
-            "non-zero endpoint anchors cannot be combined with ShapeConstraint::{:?} on term '{}': the coefficient cone constrains only the homogeneous spline and would not certify the final affine function",
+            "non-zero endpoint anchors cannot be combined with shape={} on term '{}': the coefficient cone constrains only the homogeneous spline and would not certify the final affine function",
             term.shape,
             term.name
         );
@@ -8650,89 +8661,94 @@ pub fn build_single_local_smooth_term(
         metadata = freeze_raw_spatial_metadata(metadata, design_t.ncols());
     }
 
-    let use_box_reparam =
-        term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-    if let Some((order, sign)) = shape_order_and_sign(term.shape)
-        && use_box_reparam
-    {
-        // Order 1 (monotone): the plain first-difference cone θ_{i+1}−θ_i ≥ 0 is
-        // the control-polygon monotonicity criterion, which is independent of
-        // Greville-abscissa spacing (it only fixes the *sign* of consecutive
-        // control-point gaps), so the integer-difference transform is exact.
-        //
-        // Order 2 (convex/concave): the plain second-difference cone is only
-        // correct for evenly spaced Greville abscissae. gam's B-splines are
-        // clamped (and may use quantile knots), so the abscissae are not
-        // uniform and the geometrically-correct cone is the second *divided*
-        // difference. Build the knot-span-scaled transform so γ_{≥2} ≥ 0
-        // certifies convexity of the function, not of the raw coefficient
-        // index. Periodic splines are rejected by the exact-support gate: their
-        // cyclic coefficient chart cannot use this open divided-difference cone.
-        let t = if order == 2 {
-            let (knots, degree) = match &metadata {
-                BasisMetadata::BSpline1D {
-                    knots,
-                    degree: Some(degree),
-                    periodic,
-                    ..
-                } if periodic.is_none() => (knots, *degree),
-                _ => {
+    let mut shape_lower_bounds = None;
+    let mut shape_linear_constraints = None;
+    match plan_shape_realization(term, &metadata, p_local)? {
+        ShapeRealization::Unconstrained => {}
+        // Multi-atom and per-margin tensor cones stay in the raw chart and
+        // enter the solver as the exact inequality rows `A β ≥ 0`.
+        ShapeRealization::Linear(constraints) => shape_linear_constraints = Some(constraints),
+        ShapeRealization::Box { order, sign } => {
+            shape_lower_bounds = box_lower_bounds_local(order, p_local);
+            // Order 1 (monotone): the plain first-difference cone θ_{i+1}−θ_i ≥ 0 is
+            // the control-polygon monotonicity criterion, which is independent of
+            // Greville-abscissa spacing (it only fixes the *sign* of consecutive
+            // control-point gaps), so the integer-difference transform is exact.
+            //
+            // Order 2 (convex/concave): the plain second-difference cone is only
+            // correct for evenly spaced Greville abscissae. gam's B-splines are
+            // clamped (and may use quantile knots), so the abscissae are not
+            // uniform and the geometrically-correct cone is the second *divided*
+            // difference. Build the knot-span-scaled transform so γ_{≥2} ≥ 0
+            // certifies convexity of the function, not of the raw coefficient
+            // index. Periodic splines are rejected by the exact-support gate: their
+            // cyclic coefficient chart cannot use this open divided-difference cone.
+            let t = if order == 2 {
+                let (knots, degree) = match &metadata {
+                    BasisMetadata::BSpline1D {
+                        knots,
+                        degree: Some(degree),
+                        periodic,
+                        ..
+                    } if periodic.is_none() => (knots, *degree),
+                    _ => {
+                        crate::bail_invalid_basis!(
+                            "shape-constrained convex/concave term '{}' requires realized open B-spline knot and degree metadata",
+                            term.name
+                        );
+                    }
+                };
+                let spans = bspline_first_derivative_control_spans(knots.view(), degree)?;
+                if spans.len() + 1 != p_local {
                     crate::bail_invalid_basis!(
-                        "shape-constrained convex/concave term '{}' requires realized open B-spline knot and degree metadata",
+                        "shape-constraint derivative-control span count {} does not match basis dim {} for term '{}'",
+                        spans.len(),
+                        p_local,
                         term.name
                     );
                 }
+                convex_derivative_control_transform_matrix(&spans, sign)?
+            } else {
+                cumulative_sum_transform_matrix(p_local, order, sign)
             };
-            let spans = bspline_first_derivative_control_spans(knots.view(), degree)?;
-            if spans.len() + 1 != p_local {
-                crate::bail_invalid_basis!(
-                    "shape-constraint derivative-control span count {} does not match basis dim {} for term '{}'",
-                    spans.len(),
-                    p_local,
-                    term.name
-                );
+            // Coefficient-side transform: wrap the design in an operator that
+            // applies T on the coefficient side, preserving sparsity/operator
+            // structure of the inner design.
+            let inner_dense = match design_t {
+                DesignMatrix::Dense(d) => d,
+                DesignMatrix::Sparse(sp) => gam_linalg::matrix::DenseDesignMatrix::from(
+                    sp.try_to_dense_arc("shape-constrained coefficient transform")
+                        .map_err(BasisError::InvalidInput)?,
+                ),
+            };
+            let coeff_op =
+                gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone()).map_err(
+                    |e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")),
+                )?;
+            design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
+                coeff_op,
+            )));
+            // `β = Tγ` is an invertible change of coefficient chart. Every
+            // physical quadratic functional, including the function-space
+            // null-component penalty, therefore transforms by the same congruence
+            // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
+            // would change the represented functional under this harmless chart
+            // change and violate SPEC 5.
+            for penalty in &mut penalties_t {
+                let tt_s = fast_atb(&t, &penalty.matrix);
+                penalty.matrix = fast_ab(&tt_s, &t);
+                penalty.op = None;
+                penalty.info.kronecker_factors = None;
+                // A declared structural null frame does NOT survive this chart.
+                // `null(Tᵀ S T) = T⁻¹ null(S)`, and `T` is a cumulative-sum /
+                // derivative-control transform — invertible but not orthogonal, so
+                // the image of an orthonormal frame is not orthonormal and the
+                // declaration's own contract cannot carry it. Withdraw it here
+                // rather than ship a frame that no longer spans the null space:
+                // consumers measure when nothing is declared, which is the honest
+                // fallback, whereas a stale frame is a wrong theorem.
+                penalty.info.structural_null_frame = None;
             }
-            convex_derivative_control_transform_matrix(&spans, sign)?
-        } else {
-            cumulative_sum_transform_matrix(p_local, order, sign)
-        };
-        // Coefficient-side transform: wrap the design in an operator that
-        // applies T on the coefficient side, preserving sparsity/operator
-        // structure of the inner design.
-        let inner_dense = match design_t {
-            DesignMatrix::Dense(d) => d,
-            DesignMatrix::Sparse(sp) => gam_linalg::matrix::DenseDesignMatrix::from(
-                sp.try_to_dense_arc("shape-constrained coefficient transform")
-                    .map_err(BasisError::InvalidInput)?,
-            ),
-        };
-        let coeff_op =
-            gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone()).map_err(
-                |e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")),
-            )?;
-        design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-            coeff_op,
-        )));
-        // `β = Tγ` is an invertible change of coefficient chart. Every
-        // physical quadratic functional, including the function-space
-        // null-component penalty, therefore transforms by the same congruence
-        // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
-        // would change the represented functional under this harmless chart
-        // change and violate SPEC 5.
-        for penalty in &mut penalties_t {
-            let tt_s = fast_atb(&t, &penalty.matrix);
-            penalty.matrix = fast_ab(&tt_s, &t);
-            penalty.op = None;
-            penalty.info.kronecker_factors = None;
-            // A declared structural null frame does NOT survive this chart.
-            // `null(Tᵀ S T) = T⁻¹ null(S)`, and `T` is a cumulative-sum /
-            // derivative-control transform — invertible but not orthogonal, so
-            // the image of an orthonormal frame is not orthonormal and the
-            // declaration's own contract cannot carry it. Withdraw it here
-            // rather than ship a frame that no longer spans the null space:
-            // consumers measure when nothing is declared, which is the honest
-            // fallback, whereas a stale frame is a wrong theorem.
-            penalty.info.structural_null_frame = None;
         }
     }
     // The re-filter below numbers its input from zero, and its input is this
@@ -8828,8 +8844,8 @@ pub fn build_single_local_smooth_term(
         joint_null_rotation,
         dropped_penalties: dropped_penalties_t,
         metadata,
-        linear_constraints: None,
-        box_reparam: use_box_reparam,
+        linear_constraints: shape_linear_constraints,
+        lower_bounds: shape_lower_bounds,
     })
 }
 
@@ -8893,11 +8909,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
     for (term, mut built) in planned_terms.iter().zip(local_builds.into_iter()) {
         let p_local = built.dim;
         let col_end = col_start + p_local;
-        let lb_local = if built.box_reparam {
-            shape_lower_bounds_local(term.shape, p_local)
-        } else {
-            None
-        };
+        let lb_local = built.lower_bounds.take();
 
         // Stage-2 joint-null absorption rotation. Fired *before* the
         // penalty / design / global aggregation loops below so that every
@@ -9021,7 +9033,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
             parametric_residualization: None,
             name: term.name.clone(),
             coeff_range: col_start..col_end,
-            shape: term.shape,
+            shape: term.shape.clone(),
             active_penalties: built.active_penalties,
             dropped_penalties: built.dropped_penalties,
             metadata: built.metadata,

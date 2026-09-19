@@ -367,7 +367,7 @@ fn te_xh_design_spec(
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     }

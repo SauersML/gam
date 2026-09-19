@@ -944,15 +944,19 @@ def fit(
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
         ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``; whitespace
-        differences are ignored). Values are one of ``"monotone_increasing"``,
-        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
-        ``"none"`` / ``None`` for the default unconstrained fit. Shape
+        differences are ignored). Values take the same forms as ``shape=``
+        in the formula: one of ``"monotone_increasing"``,
+        ``"monotone_decreasing"``, ``"convex"``, ``"concave"`` or ``"none"``
+        / ``None``; a list of atoms that must all hold
+        (``["monotone_increasing", "concave"]``); or, for a ``te()`` term,
+        one entry per margin (``["monotone_increasing", None]``). Shape
         constraints are enforced by the inner solver as joint linear
         inequalities ``A·β ≥ b`` on the coefficient vector; when active at
         convergence the outer REML score uses the tangent-projected LAML
         formulation. This is the same functionality exposed by mgcv's
-        ``scop=...`` argument and the ``scam`` R library. Currently restricted
-        to univariate 1D B-spline / thin-plate / Duchon smooths.
+        ``scop=...`` argument and the ``scam`` R library. Supported on
+        open-knot B-spline smooths, ``te()`` tensor products of them, and
+        either of those with ``by=`` (see ``Smooth.shape_constraint``).
 
         Example::
 
@@ -1032,9 +1036,12 @@ def fit(
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
         # Python only marshals the mapping across the FFI.
+        from .smooth import shape_constraint_text
+
         try:
             formula = rust_module().apply_shape_constraints_to_formula(
-                formula, [(str(k), str(v)) for k, v in constraints.items()]
+                formula,
+                [(str(k), shape_constraint_text(v)) for k, v in constraints.items()],
             )
         except Exception as exc:
             raise map_exception(exc) from exc

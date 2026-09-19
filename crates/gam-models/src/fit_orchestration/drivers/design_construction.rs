@@ -4476,7 +4476,7 @@ mod refit_seed_2902_tests {
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };

@@ -2450,7 +2450,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;
@@ -2625,7 +2625,7 @@ pub fn residual_cascade_fast_path(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None)
+    if !term.shape.is_none()
         || term.joint_null_rotation.is_some()
     {
         return None;

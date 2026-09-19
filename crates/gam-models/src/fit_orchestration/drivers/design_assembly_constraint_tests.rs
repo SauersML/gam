@@ -79,7 +79,7 @@ fn smooth_only_collection(basis: SmoothBasisSpec) -> TermCollectionSpec {
             frozen_parametric_residualization: None,
             name: "s".to_string(),
             basis,
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     }
@@ -173,7 +173,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
             frozen_parametric_residualization: None,
                 name: "bspline".to_string(),
                 basis: remap_test_bspline(3),
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -185,7 +185,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
                     kind: BySmoothKind::Numeric,
                     by: ByVariableSpec::Numeric,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -195,7 +195,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
                     smooth: Box::new(remap_test_bspline(6)),
                     by_kind: ByVarKind::Numeric { feature_col: 7 },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -214,7 +214,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
                         frozen_global_orthogonality: None,
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -232,7 +232,7 @@ fn remap_feature_columns_rewrites_every_index_bearing_field() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
@@ -785,7 +785,7 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -866,7 +866,7 @@ fn term_collection_design_combines_linear_and_smooth() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -915,7 +915,7 @@ fn spatial_smooth_columns_do_not_duplicate_global_intercept() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -976,7 +976,7 @@ fn spatial_smooth_drops_matching_linear_trend_columns() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1042,7 +1042,7 @@ fn spatial_option5_is_orthogonal_to_parametric_block() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1119,7 +1119,7 @@ fn thin_plate_default_identifiability_centers_against_intercept_only_without_lin
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             })
             .collect(),
@@ -1191,7 +1191,7 @@ fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -1209,7 +1209,7 @@ fn spatial_option5_does_not_overconstrain_on_nonoverlapping_linear_terms() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
@@ -1269,7 +1269,7 @@ fn overlapping_linear_term_residualizes_bspline_smooth() {
                     boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1305,7 +1305,7 @@ fn standalone_tps_keeps_centered_linear_nullspace() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let spec = TermCollectionSpec {
@@ -1347,7 +1347,7 @@ fn spatial_parametric_ownership_projects_only_explicit_linear_axes() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let linear_terms = vec![LinearTermSpec {
@@ -1404,7 +1404,7 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
                 boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let duchon_term = SmoothTermSpec {
@@ -1426,7 +1426,7 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 
@@ -1544,7 +1544,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -1565,7 +1565,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
@@ -1644,7 +1644,7 @@ fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1700,7 +1700,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1761,7 +1761,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
                 },
                 input_scale: Some(input_scale),
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1822,7 +1822,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1848,7 +1848,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1876,7 +1876,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -1953,7 +1953,7 @@ fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2006,7 +2006,7 @@ fn frozen_joint_maternspec_rebuild_keeps_adaptive_cache_in_sync() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2066,7 +2066,7 @@ fn centered_tensor_penalties_canonicalize_in_transformed_basis_width() {
                 penalty_decomposition: Default::default(),
             },
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
     let spec = TermCollectionSpec {
@@ -2175,7 +2175,7 @@ fn tensor_bspline_supports_two_periodic_margins_as_torus() {
                     penalty_decomposition: Default::default(),
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2344,7 +2344,7 @@ fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 
@@ -2418,7 +2418,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2594,7 +2594,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -2774,7 +2774,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -3138,7 +3138,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                 // `Some(vec![1.0])` pin was a gamed gate that masked the open gap.
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -3469,7 +3469,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -3490,7 +3490,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::MonotoneIncreasing,
+                shape: ShapeConstraint::MonotoneIncreasing.into(),
                 joint_null_rotation: None,
             },
         ],
@@ -3615,7 +3615,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     };
 
@@ -3758,7 +3758,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -3866,7 +3866,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4077,7 +4077,7 @@ fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4185,7 +4185,7 @@ fn a_trial_the_collection_gauge_cannot_place_refuses_instead_of_failing_2959() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4259,7 +4259,7 @@ fn duchon_terms_participate_in_kappa_optimization() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4350,7 +4350,7 @@ fn pure_duchon_scale_dimensions_seed_geometry_but_enroll_no_hyper_axis() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4394,7 +4394,7 @@ fn thin_plate_terms_anchor_length_scale_and_enroll_no_kappa_axis() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4438,7 +4438,7 @@ fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4493,7 +4493,7 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4554,7 +4554,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
             SmoothTermSpec {
@@ -4578,7 +4578,7 @@ fn from_length_scales_aniso_keeps_nonaniso_spatial_terms_scalar() {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             },
         ],
@@ -4623,7 +4623,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4697,7 +4697,7 @@ fn pure_duchon_aniso_fit_optimizes_without_introducing_hybrid_scale() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };
@@ -4834,7 +4834,7 @@ fn incremental_realizer_replays_raw_duchon_spec_in_emitted_chart_2433() {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
     };

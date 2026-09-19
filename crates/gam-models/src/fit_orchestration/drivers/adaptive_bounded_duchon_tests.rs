@@ -68,7 +68,7 @@ mod adaptive_bounded_duchon_tests {
                     boundary: OneDimensionalBoundary::Open,
                 },
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
@@ -265,7 +265,7 @@ mod adaptive_bounded_duchon_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };
@@ -355,7 +355,7 @@ mod adaptive_bounded_duchon_tests {
                         boundary_conditions: gam_terms::basis::BSplineBoundaryConditions::default(),
                     },
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };
@@ -424,7 +424,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 
@@ -496,7 +496,7 @@ mod adaptive_bounded_duchon_tests {
                 },
                 input_scale: None,
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         };
 

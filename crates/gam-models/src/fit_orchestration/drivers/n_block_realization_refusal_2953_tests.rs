@@ -40,7 +40,7 @@ mod n_block_realization_refusal_2953_tests {
                     },
                     input_scale: None,
                 },
-                shape: ShapeConstraint::None,
+                shape: ShapeConstraint::None.into(),
                 joint_null_rotation: None,
             }],
         };

@@ -838,7 +838,7 @@ fn constrained_laplace_fallback(
                 || saved_spec
                     .smooth_terms
                     .iter()
-                    .any(|term| !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None))
+                    .any(|term| !term.shape.is_none())
         })
         .unwrap_or(false);
     let has_persisted_inequality = fit
@@ -907,7 +907,7 @@ fn sample_standard(
         || saved_spec
             .smooth_terms
             .iter()
-            .any(|term| !matches!(term.shape, gam_terms::smooth::ShapeConstraint::None));
+            .any(|term| !term.shape.is_none());
     let constrained_posterior = fit
         .geometry
         .as_ref()
