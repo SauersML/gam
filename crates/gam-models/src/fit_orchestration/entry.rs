@@ -216,77 +216,16 @@ pub(crate) fn resolved_resource_policy(
 /// Parse, materialize, and fit a model in one call.
 /// Resolve the expectile levels requested by `config`, if any.
 ///
-/// Returns `Ok(Some(levels))` when `config.family` is `"expectile"` (optionally
-/// with inline levels, `"expectile(0.9)"` or `"expectile(0.1, 0.9)"`),
-/// `Ok(None)` for every other family, and `Err` when an expectile request is
-/// malformed: a level outside `(0, 1)`, levels that are not strictly
-/// increasing, or inline levels that contradict [`FitConfig::expectile_tau`].
-/// When neither spelling pins the levels, the single median level `[0.5]` (the
-/// ordinary mean fit) is the default.
+/// Thin typed-error wrapper over [`FitConfig::resolved_expectile_levels`],
+/// the one rule [`FitConfig::resolve`] also enforces: `Some(levels)` for the
+/// expectile family, `None` for every other family, and `Err` for a malformed
+/// expectile request or an `expectile_tau` given with a non-expectile family.
 pub fn expectile_levels_for_config(
     config: &FitConfig,
 ) -> Result<Option<Vec<f64>>, WorkflowError> {
-    let Some(raw) = config.family.as_deref() else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if !(lower == "expectile" || lower.starts_with("expectile(")) {
-        return Ok(None);
-    }
-    let invalid = |reason: String| WorkflowError::InvalidConfig { reason };
-    // Optional inline levels: `expectile(0.9)` or `expectile(0.1, 0.5, 0.9)`.
-    let inline_levels = if let Some(rest) = lower.strip_prefix("expectile(") {
-        let inner = rest.strip_suffix(')').ok_or_else(|| {
-            invalid(format!(
-                "expectile family levels must be written as `expectile(τ)` or \
-                 `expectile(τ₁, τ₂, …)`; got `{trimmed}`"
-            ))
-        })?;
-        let levels = inner
-            .split(',')
-            .map(|item| {
-                item.trim().parse::<f64>().map_err(|_| {
-                    invalid(format!(
-                        "expectile level `{}` is not a finite number",
-                        item.trim()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<f64>, _>>()?;
-        Some(levels)
-    } else {
-        None
-    };
-    let levels = match (inline_levels, config.expectile_tau.clone()) {
-        (Some(a), Some(b)) if a != b => {
-            return Err(invalid(format!(
-                "expectile levels given both inline (`{trimmed}`) and via expectile_tau \
-                 ({b:?}); supply exactly one"
-            )));
-        }
-        (Some(a), _) => a,
-        (None, Some(b)) => b,
-        (None, None) => vec![0.5],
-    };
-    if levels.is_empty() {
-        return Err(invalid(
-            "expectile_tau must name at least one expectile level".to_string(),
-        ));
-    }
-    for &tau in &levels {
-        if !(tau.is_finite() && tau > 0.0 && tau < 1.0) {
-            return Err(invalid(format!(
-                "expectile level τ must be finite and strictly in (0, 1); got {tau}"
-            )));
-        }
-    }
-    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(invalid(format!(
-            "expectile levels must be strictly increasing with no duplicates; got {levels:?}"
-        )));
-    }
-    Ok(Some(levels))
+    config
+        .resolved_expectile_levels()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })
 }
 
 /// Prior-weighted empirical `τ`-expectile of `z` in closed form.
@@ -1717,6 +1656,44 @@ fn try_deterministic_gaussian_standard_fit(
     deterministic_gaussian_standard_fit(request, Some(boundary))
 }
 
+/// The training table with every zero-weight row removed.
+///
+/// A prior weight of zero removes the row from the likelihood, and it must
+/// remove it from everything else the fit derives from the rows as well —
+/// knots, covariate ranges, identifiability constraints, standardization,
+/// factor levels, column kinds — so that weight zero is exactly row deletion.
+/// Every fitting entry point runs its data through this one seam. The table
+/// is borrowed unchanged when no weight column is configured or no weight is
+/// exactly zero; rows with a missing or negative weight are kept so the weight
+/// validator still reports them.
+pub fn drop_zero_weight_rows<'a>(
+    data: &'a Dataset,
+    config: &FitConfig,
+) -> Result<std::borrow::Cow<'a, Dataset>, WorkflowError> {
+    use std::borrow::Cow;
+    let Some(name) = config.weight_column.as_deref().map(str::trim) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let Some(column) = data.headers.iter().position(|header| header == name) else {
+        return Ok(Cow::Borrowed(data));
+    };
+    let weights = data.values.column(column);
+    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    if keep.len() == weights.len() {
+        return Ok(Cow::Borrowed(data));
+    }
+    if keep.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
+        });
+    }
+    data.select_rows(&keep)
+        .map(Cow::Owned)
+        .map_err(|error| WorkflowError::InvalidConfig {
+            reason: error.to_string(),
+        })
+}
+
 pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
@@ -1745,6 +1722,7 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    let data = &*drop_zero_weight_rows(data, config)?;
     let automatic = expand_automatic_fit_formula(formula, data, config)?;
     if automatic.notes.is_empty() {
         return fit_expanded_formula_with_notes(formula, data, config);
@@ -1832,8 +1810,7 @@ fn finish_adaptive_spatial_fit(
         let standard_options =
             canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
         let resolution_tol = standard_options.tol;
-        let candidates =
-            adaptive_spatial_candidates(current_standard, data.values.nrows(), resolution_tol)?;
+        let candidates = adaptive_spatial_candidates(current_standard, data, resolution_tol)?;
         if candidates.is_empty() {
             return Ok(current);
         }
@@ -1956,11 +1933,45 @@ fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
     }
 }
 
+/// The largest internal-knot count the adaptive loop may give a formula-default
+/// open B-spline `s(x)` of `degree` on `column`, starting from `current_knots`
+/// in a model that already realizes `model_coefficients` columns on `n_rows`
+/// rows. Two identifiability bounds, no tuning constant:
+///
+/// * **Data support.** A degree-`d` spline with `K` internal knots has
+///   `K + d + 1` coefficients, and a function observed at `u` distinct
+///   covariate values has at most `u` identifiable values; the interpolating
+///   (smoothing-spline) limit is `K + d + 1 = u`. This also keeps every quantile
+///   knot on its own distinct interior value (`u - d - 1 <= u - 2`).
+/// * **Design rank.** Growing the term must leave the whole model with fewer
+///   coefficients than rows (at least one residual degree of freedom): a
+///   `p >= n` design is not identified by the data at all, and in that regime
+///   the double-penalty REML surface is flat along directions the data never
+///   see.
+///
+/// Never below `current_knots`, so an already-resolved basis is never shrunk.
+fn adaptive_bspline_knot_ceiling(
+    column: ndarray::ArrayView1<'_, f64>,
+    degree: usize,
+    current_knots: usize,
+    model_coefficients: usize,
+    n_rows: usize,
+) -> usize {
+    let mut distinct: Vec<f64> = column.iter().copied().filter(|v| v.is_finite()).collect();
+    distinct.sort_by(f64::total_cmp);
+    distinct.dedup();
+    let support_knots = distinct.len().saturating_sub(degree + 1);
+    let spare_rank = n_rows.saturating_sub(1).saturating_sub(model_coefficients);
+    let rank_knots = current_knots.saturating_add(spare_rank);
+    support_knots.min(rank_knots).max(current_knots)
+}
+
 fn adaptive_spatial_candidates(
     result: &StandardFitResult,
-    n_rows: usize,
+    data: &Dataset,
     resolution_tol: f64,
 ) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
+    let n_rows = data.values.nrows();
     let term_count = result.resolvedspec.smooth_terms.len();
     if result.adaptive_spatial_terms.len() != term_count
         || result.adaptive_spatial_center_counts.len() != term_count
@@ -2021,13 +2032,32 @@ fn adaptive_spatial_candidates(
                     ),
                 ));
             }
+            // The formula-default `s(x)` B-spline is bounded by its covariate's
+            // distinct values and the design rank, not by a center-count rule.
+            let bspline = match &result.resolvedspec.smooth_terms[term_index].basis {
+                gam_terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, spec }
+                    if *feature_col < data.values.ncols() =>
+                {
+                    Some((*feature_col, spec.degree))
+                }
+                _ => None,
+            };
             // Tiny samples can force the materializer's exact polynomial floor
             // above the generic `n / 4` conditioning ceiling. The realized
             // request is already the smallest admissible basis in that case, so
             // it is also the ceiling; never report a nonsensical attempted
             // center count below the basis that just converged.
-            let ceiling_centers = gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
-                .max(current_centers);
+            let ceiling_centers = match bspline {
+                Some((feature_col, degree)) => adaptive_bspline_knot_ceiling(
+                    data.values.column(feature_col),
+                    degree,
+                    current_centers,
+                    result.design.design.ncols(),
+                    n_rows,
+                ),
+                None => gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
+                    .max(current_centers),
+            };
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
             let edf =
@@ -2045,6 +2075,11 @@ fn adaptive_spatial_candidates(
                 lacking_fit.contains(&term_index),
             ) {
                 AdaptiveCenterDecision::Certified => {}
+                // A B-spline at its ceiling already spans every identifiable
+                // direction its covariate and the design rank allow; there is no
+                // larger default basis to certify against, so the converged fit
+                // stands with its fit-time adequacy advisory.
+                AdaptiveCenterDecision::Exhausted if bspline.is_some() => {}
                 AdaptiveCenterDecision::Expand(proposed_centers) => {
                     candidates.push(AdaptiveSpatialCandidate {
                         term_index,
@@ -2121,6 +2156,41 @@ mod adaptive_spatial_resolution_tests {
         assert_eq!(
             adaptive_center_decision(187, 187, 27.7, 190, 3, 1.0e-6, true),
             AdaptiveCenterDecision::Certified
+        );
+    }
+
+    #[test]
+    fn bspline_knot_ceiling_is_the_covariate_support_when_rank_is_ample() {
+        // 50 distinct values, cubic: the interpolating limit is 50 - 4 = 46
+        // internal knots. Duplicates and non-finite rows add no support.
+        let mut values: Vec<f64> = (0..50).map(|i| i as f64 / 49.0).collect();
+        values.extend_from_slice(&[0.0, 1.0, f64::NAN, f64::INFINITY]);
+        let column = ndarray::Array1::from(values);
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 13, 10_000),
+            46
+        );
+    }
+
+    #[test]
+    fn bspline_knot_ceiling_keeps_a_residual_degree_of_freedom() {
+        // 120 rows, 4 smooths of 12 coefficients plus an intercept: 49
+        // coefficients, so one term may add at most 120 - 1 - 49 = 70 knots.
+        let column = ndarray::Array1::from_iter((0..120).map(|i| i as f64));
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 8, 49, 120),
+            78
+        );
+    }
+
+    #[test]
+    fn bspline_knot_ceiling_never_shrinks_the_current_basis() {
+        // Five distinct values support one internal knot, and the design is
+        // already square; the ceiling stays at the basis that just converged.
+        let column = ndarray::Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0, 4.0]);
+        assert_eq!(
+            super::adaptive_bspline_knot_ceiling(column.view(), 3, 4, 6, 6),
+            4
         );
     }
 }
@@ -2270,6 +2340,14 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
+    // The random-effect test needs only the design and the converged fit, so
+    // it runs whether or not the covariate frame is available.
+    standard.fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_test_records(
+            &standard.design,
+            &standard.resolvedspec,
+            &standard.fit,
+        );
     if let Some(data) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
             data.view(),

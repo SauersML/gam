@@ -421,7 +421,7 @@ jobs:
         run: |
           python -m pip install \
             'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'scipy>=1.11' \
-            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.4' requests
+            'pyarrow>=14' 'matplotlib>=3.8' 'scikit-learn>=1.6' requests
 
       - name: Run Python tests (filtered, fail-fast)
         if: ${{ github.event.inputs.py_filter != '' }}

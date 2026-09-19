@@ -31,8 +31,6 @@ pub struct PirlsWorkspace {
     pub factorization_matrix: Array2<f64>,
     // Buffer for sparse matrix scaling (avoid per-iteration allocation)
     pub weighted_xvalues: Vec<f64>,
-    // Dense chunk buffer for streaming X'WX assembly on very large n.
-    pub weighted_x_chunk: Array2<f64>,
     // Reusable p×p buffer for Hessian assembly (avoids per-iteration allocation).
     pub hessian_buf: Array2<f64>,
     // Reusable n-length buffer for X*β matvec (avoids per-iteration allocation in update).
@@ -102,7 +100,6 @@ impl PirlsWorkspace {
             perm_inv: vec![0; p],
             factorization_matrix: Array2::zeros((0, 0)),
             weighted_xvalues: Vec::new(),
-            weighted_x_chunk: Array2::zeros((0, 0).f()),
             hessian_buf: Array2::zeros((0, 0).f()),
             matvec_buf: Array1::zeros(n),
             resident_design_gram: None,
@@ -111,12 +108,10 @@ impl PirlsWorkspace {
 
     pub(super) fn add_dense_xtwx_signed(
         weights: &Array1<f64>,
-        weighted_x_scratch: &mut Array2<f64>,
         x: &Array2<f64>,
         out: &mut Array2<f64>,
     ) {
-        *out =
-            crate::estimate::reml::assembly::xt_diag_x_dense_into(x, weights, weighted_x_scratch);
+        *out = crate::estimate::reml::assembly::xt_diag_x_dense(x, weights);
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
