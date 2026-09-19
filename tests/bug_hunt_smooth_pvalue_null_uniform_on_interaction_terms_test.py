@@ -24,7 +24,13 @@ can carry. The last case keeps the varying coefficient's power: an effect
 ``z·cos(πx)`` lies mostly in the linear part ``z, z·x`` that the smooth's
 null-space penalty shrinks, and a score test that weights its directions by the
 inverse of the summed penalties all but ignores that part (it rejected 4% of
-these fits at .05, its size).
+these fits at .05, its size). A factor-level curve under a binomial response
+is the other. The level's null-space ridge charges the curve's mean slope, and
+the covariance direction of that component was the ridge's Euclidean
+pseudo-inverse, which points along the mean-slope row (a curve concentrated at
+the ends of the range) rather than along the linear null function the ridge
+shrinks. The level's linear part was nearly invisible, and a curve of amplitude
+2 was found in 7% of fits at .05.
 """
 
 import contextlib
@@ -136,4 +142,29 @@ def test_varying_coefficient_effect_in_the_penalty_null_space_is_detected():
         p = rows["s(x, by=z)"]["p_value"]
         assert p is not None, rows["s(x, by=z)"].get("p_value_unavailable")
         rejected += p <= 0.05
+    assert rejected >= 0.9 * reps, f"power {rejected}/{reps} at .05"
+
+
+def test_factor_level_curve_is_detected_under_a_binomial_response():
+    reps, rejected = 60, 0
+    for rep in range(reps):
+        rng = np.random.default_rng([zlib.crc32(b"by_factor_binomial_power"), rep])
+        n = 600
+        g = np.array(["a", "b", "c"])[rng.integers(0, 3, n)]
+        x = rng.uniform(size=n)
+        shift = np.select([g == "a", g == "b"], [0.0, 0.5], -0.5)
+        eta = shift + np.where(g == "a", 2.0 * np.sin(TAU * x), 0.0)
+        y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
+        frame = pd.DataFrame({"y": y, "x": x, "g": g})
+        with (
+            warnings.catch_warnings(),
+            contextlib.redirect_stderr(io.StringIO()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            warnings.simplefilter("ignore")
+            model = gamfit.fit(frame, "y ~ s(x, by=g)", family="binomial")
+            rows = {row["name"]: row for row in model.summary().smooth_terms}
+        row = rows["s(x, by=g):by=g[a]"]
+        assert row["p_value"] is not None, row.get("p_value_unavailable")
+        rejected += row["p_value"] <= 0.05
     assert rejected >= 0.9 * reps, f"power {rejected}/{reps} at .05"
