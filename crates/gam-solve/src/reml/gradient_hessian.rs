@@ -7143,17 +7143,15 @@ impl<'a> RemlState<'a> {
             );
         }
         // Capture the Gaussian (non-identity link) / inverse Gaussian dispersion
-        // MLE at the first converged non-screening solve's η and hold it for the
-        // rest of the search, exactly as the Tweedie φ above.
-        if !in_screening
-            && matches!(
-                resolved_likelihood_scale,
-                gam_problem::ResolvedLikelihoodScale::Dispersion {
-                    estimated: true,
-                    ..
-                }
-            )
-            && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
+        // MLE at the first converged solve's η and hold it for the rest of the
+        // search, exactly as the Tweedie φ above.
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Dispersion {
+                estimated: true,
+                ..
+            }
+        ) && self.frozen_dispersion_phi.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
