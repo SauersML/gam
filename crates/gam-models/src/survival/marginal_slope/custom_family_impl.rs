@@ -162,6 +162,32 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         self.jeffreys_armed
     }
 
+    /// gam#3003: a converged mode whose objective is not below its own
+    /// frozen-time limit (`frozen_time_limit.rs`) is not a mode of its trial
+    /// point's posterior: the infimum lies on the boundary where the baseline
+    /// time trend vanishes.
+    fn coefficient_mode_refusal(
+        &self,
+        specs: &[ParameterBlockSpec],
+        states: &[ParameterBlockState],
+        log_likelihood: f64,
+        penalty_value: f64,
+        s_lambdas: &[Array2<f64>],
+    ) -> Result<Option<String>, String> {
+        let geometry = FrozenTimeGeometry::new(self)?;
+        let verdict = frozen_time_identification(
+            self,
+            &geometry,
+            specs,
+            states,
+            s_lambdas,
+            log_likelihood,
+            penalty_value,
+        )?;
+        log::info!("[survival-marginal-slope] frozen-time certificate {verdict:?}");
+        Ok(verdict.refusal_reason())
+    }
+
     /// #808: engage the inner self-vanishing Levenberg–Marquardt μ on a
     /// full-rank-but-ill-conditioned penalized Hessian. Clustered-PC marginal +
     /// slope share a matern PC basis → `H_pen` is full rank (`nullity == 0`)

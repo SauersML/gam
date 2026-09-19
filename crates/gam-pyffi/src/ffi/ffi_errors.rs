@@ -730,6 +730,7 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         }
         EstimationError::FitResultInvariantViolated(_) => FitInvariantError::new_err(message),
         EstimationError::InverseLinkDomainViolation { .. }
+        | EstimationError::LinkFeasibilityBoundaryOptimum { .. }
         | EstimationError::PirlsRowGeometryUnrepresentable { .. }
         | EstimationError::LogStrengthDomainViolation { .. } => InvalidInputError::new_err(message),
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),

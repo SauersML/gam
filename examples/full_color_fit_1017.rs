@@ -27,7 +27,6 @@ use std::time::Instant;
 
 use gam::solver::arrow_schur::{ArrowSolveOptions, resolve_arrow_route};
 use gam::solver::rho_optimizer::OuterProblem;
-use gam::solver::seeding::SeedConfig;
 use gam::terms::{
     AnalyticPenaltyRegistry, latent::LatentManifold, sae::manifold::AssignmentMode,
     sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
@@ -187,13 +186,7 @@ fn run() -> Result<(), String> {
     // A single explicit initial state: the optimizer moves continuously in rho;
     // no seed lattice or grid is evaluated.
     let rho_dim = initial_rho_flat.len();
-    let problem = OuterProblem::new(rho_dim)
-        .with_initial_rho(initial_rho_flat)
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..SeedConfig::default()
-        });
+    let problem = OuterProblem::new(rho_dim).with_initial_rho(initial_rho_flat);
 
     let started = Instant::now();
     let outer = problem

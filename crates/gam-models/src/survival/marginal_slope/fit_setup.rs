@@ -174,14 +174,16 @@ pub(crate) fn build_marginal_blockspec(
     }
 }
 
-/// The inner coefficient fit. The solver's error is returned whole, so the fit
-/// that stops on it raises its category (#2937).
+/// The inner coefficient fit of the member `family` is. The Jeffreys arming
+/// lifecycle runs once, over the whole route, in `fit_entry` (gam#2995). The
+/// solver's error is returned whole, so the fit that stops on it raises its
+/// category (#2937).
 pub(crate) fn inner_fit(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
-    crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
+    crate::custom_family::fit_custom_family(family, blocks, options)
 }
 
 pub(crate) fn inner_fit_from_certified_outer(
