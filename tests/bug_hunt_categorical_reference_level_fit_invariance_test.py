@@ -2,14 +2,19 @@
 must not depend on the arbitrary treatment-contrast reference level.
 
 ``y ~ g + s(x)`` fits one shared penalized smooth ``s(x)`` plus a categorical main
-effect for ``g``. ``g`` is treatment-coded: one level is dropped as the reference
-(its effect folded into the global intercept) and the others enter as unpenalized
-dummy contrasts. Which level is the reference is an *arbitrary* gauge choice
-(determined in practice by the level sort order). The factor main effect is
-**unpenalized**, so its coefficient gauge carries no smoothing-parameter
-dependence; the per-group fitted means span the identical column space regardless
-of which level is dropped. The predicted value for a given physical group is a
-property of the fitted model and must be invariant to the reference-level choice.
+effect for ``g``. A bare categorical ``+ g`` lowers to the same fixed factor as
+``factor(g)``: it is treatment-coded, so the reference level (the first label in
+natural sort order) gets no column and its effect is carried by the global
+intercept, while the other levels enter as unpenalized dummy contrasts with no
+smoothing parameter. (``group(g)`` is different: a penalized random effect with a
+column for every level.) Which level is the reference is an *arbitrary* gauge
+choice. Because the contrast block is unpenalized, its coefficient gauge carries
+no smoothing-parameter dependence, and the per-group fitted means span the
+identical column space regardless of which level is dropped. The predicted value
+for a given physical group is a property of the fitted model and must be
+invariant to the reference-level choice. The fixed-factor contract itself (L-1
+columns, no lambda, unshrunk coefficients) is pinned in
+``tests/factor_fixed_effect_contract_test.py``.
 
 This is the categorical-predictor sibling of the gauge-invariance family
 (multinomial reference class #1587, simplex ALR reference #1549). Because the

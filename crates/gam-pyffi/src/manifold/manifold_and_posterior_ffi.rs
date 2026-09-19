@@ -513,7 +513,13 @@ fn coefficient_provenance_for_state(
 
     let mut col = 1 + spec.linear_terms.len();
     for term in &spec.random_effect_terms {
-        let levels = term.frozen_levels.as_deref().unwrap_or(&[]);
+        // A treatment-coded fixed factor's reference level owns no column.
+        let levels = term.column_levels().unwrap_or(&[]);
+        let (kind, source) = if term.penalized {
+            ("random_effect", "group")
+        } else {
+            ("factor", "factor")
+        };
         let block_start = col;
         for (local, bits) in levels.iter().copied().enumerate() {
             let index = col + local;
@@ -522,7 +528,7 @@ fn coefficient_provenance_for_state(
                     .unwrap_or_else(|| f64::from_bits(bits).to_string());
             if let Some(entry) = provenance.get_mut(index) {
                 entry.label = label.clone();
-                entry.source = "group".to_string();
+                entry.source = source.to_string();
                 entry.term = Some(term.name.clone());
                 entry.column = Some(term.name.clone());
                 entry.level = Some(label.clone());
@@ -537,7 +543,7 @@ fn coefficient_provenance_for_state(
         if col > block_start {
             blocks.push(TermBlock {
                 name: term.name.clone(),
-                kind: "random_effect".to_string(),
+                kind: kind.to_string(),
                 start: block_start,
                 end: col,
             });
@@ -611,8 +617,10 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     if let Some(spec) = payload.resolved_termspec.as_ref() {
         let mut col = 1 + spec.linear_terms.len();
         for re in &spec.random_effect_terms {
-            let n = re.frozen_levels.as_ref().map(|v| v.len()).unwrap_or(0);
-            random_ranges.push((col, col + n));
+            let n = re.column_levels().map_or(0, <[u64]>::len);
+            if re.penalized {
+                random_ranges.push((col, col + n));
+            }
             col += n;
         }
     }
