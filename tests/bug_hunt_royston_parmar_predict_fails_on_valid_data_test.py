@@ -13,7 +13,7 @@ user does next with a survival fit is evaluate the survival surface, exactly as
 For a genuine Royston-Parmar model this is impossible: ``model.predict(...)``
 aborts before returning anything with
 
-    GamError: survival ages must be finite and positive for baseline hazard
+    GamfitError: survival ages must be finite and positive for baseline hazard
               evaluation
 
 even though every query row carries a finite, strictly-positive ``time``. The
@@ -82,7 +82,7 @@ def test_royston_parmar_model_can_be_predicted() -> None:
     )
 
     # This is the line that currently raises
-    #   GamError: survival ages must be finite and positive for baseline hazard
+    #   GamfitError: survival ages must be finite and positive for baseline hazard
     #             evaluation
     # despite every query time being finite and strictly positive.
     prediction = model.predict(new_data)

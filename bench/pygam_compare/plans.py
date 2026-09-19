@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .fuzz_families import FAMILY_LABELS, REGIMES, fuzz_design
 from .worker import (
     BINOMIAL_FAMILIES,
     COUNT_FAMILIES,
@@ -33,6 +34,17 @@ SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
 # The Gaussian identity sweep (audit lane sweep-gaussian): every core design
 # plus a tensor-with-additive-smooth and a factor-by smooth.
 GAUSSIAN_SWEEP_DESIGNS: tuple[str, ...] = ALL_DESIGNS + EXTRA_DESIGNS
+
+# Convergence fuzz over families and links (fuzz_families.py): every family
+# label x every data regime x n in FAMILY_FUZZ_NS x FAMILY_FUZZ_REPS seeds ->
+# 19 x 8 x 3 x 3 = 1368 gamfit fits.
+FAMILY_FUZZ_NS: tuple[int, ...] = (50, 500, 5_000)
+FAMILY_FUZZ_REPS = 3
+# The quick mode: every family label at the base regime and at the edge of its
+# support, at the two smaller n, one seed. It is a 0-failure regression test
+# (test_fuzz_families_quick.py).
+FAMILY_FUZZ_QUICK_REGIMES: tuple[str, ...] = ("base", "edge", "zeros", "lowdisp")
+FAMILY_FUZZ_QUICK_NS: tuple[int, ...] = (50, 500)
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,13 @@ def _grid(
     # the same (lib, family, design) as not run instead of burning the net on
     # each one in turn.
     return tuple(Cell(f, n, d) for n in ns for f in families for d in designs)
+
+
+def _family_fuzz_grid(ns: tuple[int, ...], regimes: tuple[str, ...]) -> tuple[Cell, ...]:
+    # Ordered by n ascending for the same not-run-after-timeout rule as _grid.
+    return tuple(
+        Cell(f, n, fuzz_design(r)) for n in ns for f in FAMILY_LABELS for r in regimes
+    )
 
 
 SCALING_NS: tuple[int, ...] = (10_000, 100_000, 1_000_000)
@@ -293,6 +312,29 @@ PLANS: dict[str, Plan] = {
             cells=_grid((100_000,), CORE_DESIGNS, COUNT_FAMILIES),
             reps=1,
             timeout_s=3_600.0,
+        ),
+        Plan(
+            name="fuzz_families",
+            description=(
+                "convergence fuzz over families x links: every family label x"
+                " every support-edge regime x n in {50, 500, 5000}, gamfit only,"
+                f" {FAMILY_FUZZ_REPS} reps"
+            ),
+            cells=_family_fuzz_grid(FAMILY_FUZZ_NS, REGIMES),
+            reps=FAMILY_FUZZ_REPS,
+            timeout_s=1_800.0,
+            libs=("gamfit",),
+        ),
+        Plan(
+            name="fuzz_families_quick",
+            description=(
+                "family fuzz quick mode: every family label at the base, edge,"
+                " zeros and lowdisp regimes, n in {50, 500}, 1 rep"
+            ),
+            cells=_family_fuzz_grid(FAMILY_FUZZ_QUICK_NS, FAMILY_FUZZ_QUICK_REGIMES),
+            reps=1,
+            timeout_s=600.0,
+            libs=("gamfit",),
         ),
         Plan(
             name="threads",

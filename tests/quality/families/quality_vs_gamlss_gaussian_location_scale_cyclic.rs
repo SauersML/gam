@@ -74,7 +74,6 @@
 //! emitted for both channels so neither trade is hidden from the #1561 gate.
 
 use csv::StringRecord;
-use gam::families::sigma_link::logb_sigma_from_eta_scalar;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
@@ -264,9 +263,14 @@ fn gam_arm_scores(truth: Truth, xs: &[f64], ys: &[f64], grid_x: &[f64]) -> (f64,
 
     let gam_mu: Vec<f64> = mean_design.design.apply(&beta_mu).to_vec();
     let eta_noise: Array1<f64> = noise_design.design.apply(&beta_noise);
+    // Raw-unit σ = response_scale·sigma_floor + exp(η): the fit's own floor
+    // (recording-grid bound of the standardized response) mapped to raw units.
+    let raw_sigma_floor = fit.response_scale * fit.sigma_floor;
     let gam_log_sigma: Vec<f64> = eta_noise
         .iter()
-        .map(|&e| logb_sigma_from_eta_scalar(e).ln())
+        .map(|&e| {
+            gam::families::sigma_link::logb_sigma_from_eta_scalar(raw_sigma_floor, e).ln()
+        })
         .collect();
 
     let truth_mu: Vec<f64> = grid_x.iter().map(|&gx| truth.mu(gx)).collect();
@@ -605,13 +609,14 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
     );
 
     // gam standardizes the response internally (it fits y / sample_std(y_train)
-    // so the log-σ soft floor is scale-relative) and then maps the fitted blocks
+    // so the log-σ floor is scale-relative) and then maps the fitted blocks
     // BACK to raw response units before returning them: the Location block is
     // scaled by response_scale and the log-σ block intercept is shifted by
     // +ln(response_scale). So the returned `beta_mu` / `beta_noise` are already
-    // in response (deg F) units and the reconstruction needs NO further rescale:
+    // in response (deg F) units; only the σ floor, which sits outside the
+    // exponential, is carried by response_scale:
     //   mu_response    = X_mu @ beta_mu
-    //   sigma_response = logb_sigma(X_noise @ beta_noise)
+    //   sigma_response = response_scale·sigma_floor + exp(X_noise @ beta_noise)
 
     // ---- gam predictions at the HELD-OUT months ---------------------------
     let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
@@ -635,9 +640,10 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
 
     let gam_test_mean: Vec<f64> = mean_design.design.apply(&beta_mu).to_vec();
     let eta_noise: Array1<f64> = noise_design.design.apply(&beta_noise);
+    let raw_sigma_floor = fit.response_scale * fit.sigma_floor;
     let gam_test_sigma: Vec<f64> = eta_noise
         .iter()
-        .map(|&e| logb_sigma_from_eta_scalar(e))
+        .map(|&e| gam::families::sigma_link::logb_sigma_from_eta_scalar(raw_sigma_floor, e))
         .collect();
 
     // ---- fit the SAME model on TRAIN with gamlss, predict the SAME TEST ----

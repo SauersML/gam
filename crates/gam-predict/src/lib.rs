@@ -882,7 +882,11 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+                let sigma_floor =
+                    gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
+                        self.payload(),
+                    )
+                    .ok()?;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
@@ -1285,10 +1289,12 @@ pub struct PredictPosteriorMeanResult {
     pub eta: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
     pub mean: Array1<f64>,
-    /// Response-scale (delta-method) standard error `SE(μ̂) = |dμ/dη|·SE(η)`,
-    /// the response-scale twin of `eta_standard_error`. `Some` once confidence
-    /// bounds are assembled (it is the SE the response-scale credible band is
-    /// built from); `None` for point-only predictions. Surfaced as the
+    /// Response-scale posterior standard deviation `√Var[g⁻¹(η)]`, `η ~
+    /// N(η̂, SE(η)²)`: the response-scale twin of `eta_standard_error`, taken
+    /// from the same Gaussian η integral as the posterior-mean point (never
+    /// the delta-method `|dμ/dη̂|·SE(η)`, which collapses to zero wherever the
+    /// inverse link saturates while the posterior of μ stays wide). `Some` once
+    /// confidence bounds are assembled; `None` for point-only predictions. Surfaced as the
     /// documented response-scale `std_error` column by the FFI/CLI predict
     /// tables (#1536) so the reported SE matches the `mean`/`mean_lower`/
     /// `mean_upper` columns beside it instead of the link-scale `σ_η`.
@@ -1424,20 +1430,23 @@ pub(crate) fn enrich_posterior_mean_bounds(
     reference: IntervalReference,
     family: gam_spec::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
+    mean_standard_error: Array1<f64>,
 ) -> Result<(), EstimationError> {
     let spec = spec_from_family_link(family, link_kind);
-    // Delta-method response SE `SE(μ̂) = |dμ/dη|·SE(η)` is reported as its own
-    // uncertainty diagnostic. TransformEta bounds remain the image of the
-    // η-scale interval and never substitute this different approximation.
-    let strategy = strategy_for_spec(&spec);
-    let mut mean_se = Array1::<f64>::zeros(result.eta.len());
-    for i in 0..result.eta.len() {
-        let dmu_deta = strategy.inverse_link_jet(result.eta[i])?.d1;
-        mean_se[i] = dmu_deta.abs() * result.eta_standard_error[i];
+    if mean_standard_error.len() != result.eta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "posterior-mean response SE has {} rows but the prediction has {}",
+            mean_standard_error.len(),
+            result.eta.len()
+        )));
     }
-    // Record the response-scale SE so downstream surfaces (FFI/CLI predict
-    // tables) report it as `std_error` rather than the link-scale `σ_η` (#1536).
-    result.mean_standard_error = Some(mean_se.clone());
+    // The response-scale SE is the posterior SD `√Var[g⁻¹(η)]` from the same
+    // Gaussian η integral that produces the posterior-mean point, computed by
+    // the caller alongside `eta_standard_error`. It is recorded so downstream
+    // surfaces (FFI/CLI predict tables) report it as `std_error` rather than
+    // the link-scale `σ_η` (#1536). TransformEta bounds remain the image of the
+    // η-scale interval and never substitute this SD.
+    result.mean_standard_error = Some(mean_standard_error);
     // TransformEta bounds: transform the η endpoints through the inverse link,
     // handle non-monotone transforms, and clamp to the family support. The
     // shared engine owns this construction so it cannot drift from the
@@ -2061,8 +2070,10 @@ where
 /// `x_i^T Vb x_i + (∂f_i/∂ρ) V_ρ (∂f_i/∂ρ)^T` without recomputing or
 /// duplicating the IFT algebra at prediction time.
 ///
-/// Mean-scale SEs are delta-method approximations:
-/// Var(μ_i) ≈ (dμ/dη)^2 Var(η_i)
+/// Mean-scale SEs are the posterior SD of the response over that same
+/// Gaussian η posterior, `√Var[g⁻¹(η_i)]` with `η_i ~ N(η̂_i, Var(η_i))`, from
+/// the family's `posterior_meanvariance` integral (not the delta method
+/// `|dμ/dη|·SE(η)`, which vanishes wherever the inverse link saturates).
 ///
 /// Math note (logit family, Gaussian η posterior):
 ///
@@ -2912,13 +2923,10 @@ where
     };
     let quadctx = gam_solve::quadrature::QuadratureContext::new();
 
-    // Derivative of inverse link g^{-1}(η) used for delta-method:
-    //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
+    // Response-scale posterior variance Var[g^{-1}(η_i)] with η_i ~ N(η̂_i, Var(η_i)).
     //
-    // For logit:
-    //   g^{-1}(η)=sigmoid(η), dμ/dη=μ(1-μ).
-    // If η itself is uncertain (η ~ N(m,v)), the exact predictive mean is
-    // E[sigmoid(η)] (logistic-normal integral) as documented above.
+    // For logit this is the central second moment of the logistic-normal
+    // law whose mean is the E[sigmoid(η)] integral documented above.
     //
     // For cloglog:
     //   g^{-1}(η)=1-exp(-exp(η)), dμ/dη=exp(η)exp(-exp(η)).
@@ -3741,43 +3749,6 @@ mod tests {
         .expect("survival fit")
     }
 
-    /// #1536 control: for the identity-link Gaussian the response and link
-    /// scales coincide, so the assembled `mean_standard_error` equals
-    /// `eta_standard_error` exactly — the property that hid the bug on Gaussian.
-    #[test]
-    fn enrich_posterior_mean_bounds_response_se_equals_link_se_for_gaussian() {
-        let eta = array![1.3, -0.2];
-        let eta_se = array![0.3, 0.45];
-        let mut result = PredictPosteriorMeanResult {
-            eta: eta.clone(),
-            eta_standard_error: eta_se.clone(),
-            mean: eta.clone(),
-            mean_standard_error: None,
-            mean_lower: None,
-            mean_upper: None,
-            observation_lower: None,
-            observation_upper: None,
-            point_covariance_source: InferenceCovarianceMode::Conditional,
-            uncertainty_covariance_source: None,
-            point_covariance_provenance: None,
-        };
-        enrich_posterior_mean_bounds(
-            &mut result,
-            0.95,
-            IntervalReference::Normal,
-            gam_spec::LikelihoodSpec::gaussian_identity(),
-            None,
-        )
-        .expect("enrich posterior-mean bounds");
-        let mse = result
-            .mean_standard_error
-            .as_ref()
-            .expect("response-scale SE must be populated");
-        for i in 0..eta.len() {
-            assert!((mse[i] - eta_se[i]).abs() <= 1e-12);
-        }
-    }
-
     #[test]
     fn bernoulli_marginal_slope_point_state_emits_covariance_based_interval() {
         // Issue #1049 oracle (Rust side): with a coefficient covariance set,
@@ -4037,7 +4008,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: None,
             link_wiggle: None,
@@ -4055,7 +4026,7 @@ mod tests {
             .predict_noise_scale(&input)
             .expect("gaussian location-scale sigma")
             .expect("sigma should be returned");
-        // σ = LOGB_SIGMA_FLOOR + exp(η + offset).
+        // σ = sigma_floor + exp(η + offset).
         assert!((sigma[0] - 3.01).abs() <= 1e-12);
         assert!((sigma[1] - 5.01).abs() <= 1e-12);
         let out = predictor
@@ -4071,7 +4042,7 @@ mod tests {
         // posterior mean of σ = f + exp(η_s) is f + exp(m + v/2), strictly
         // above the plug-in σ(m). Without covariance the posterior moment
         // does not exist, so it is refused, never degraded to the plug-in.
-        let floor = gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR;
+        let floor = 0.01;
         let mut predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.3],
@@ -4108,7 +4079,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
@@ -4138,7 +4109,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: 0.01,
             response_scale: 1.0,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
