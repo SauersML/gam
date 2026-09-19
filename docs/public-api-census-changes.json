@@ -4485,7 +4485,7 @@
     "evidence": "public_api_census.py, run with base 28a216c08d and the code-only probe c70a6f4ebb, reported exactly this identity as removed (13307 public function declarations before and after, since resolve_marginal_slope_link is the replacement). git grep -c -w resolve_marginal_slope_base_link finds 0 files under crates, src and tests at the landing tree. Gate on 28a216c08d (acn112, 6 cores): the materialize tests 65 of 67, whose two failures are the location-scale tests that fail identically on unpatched base (gam#2953 comment); gamfit pins 13 of 13 on the candidate wheel, and on the base wheel every gam#2999 pin but link=probit fails (5 DID NOT RAISE, 2 coefficient-state mismatches, 1 survival fit reaching the solver); cargo build --workspace --lib and cargo check --workspace --all-targets green."
   },
   {
-    "base": "d608f329a5f8215f955a9760ab9ebda26c08fb8b",
+    "base": "55212405d72417735981c54d9def486dd101f578",
     "removed": {
       "crates/gam-terms/src/basis/bspline_eval.rs::create_difference_penalty_matrix": 1
     },
