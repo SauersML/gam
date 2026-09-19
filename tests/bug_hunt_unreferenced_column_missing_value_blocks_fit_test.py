@@ -7,7 +7,7 @@ Real-data repro (R ``datasets::airquality``, 153 rows): ``Ozone`` has 37 NAs and
 ``Temp ~ s(Wind)`` touches neither incomplete column, yet
 
     gamfit.fit(airquality_df, "Temp ~ s(Wind)")
-    -> GamError: null value at row 5, column 'Ozone'
+    -> GamfitError: null value at row 5, column 'Ozone'
 
 Projecting the frame down to the two modelled columns by hand fits all 153 rows
 (deviance 10763.32). The documented remedy in ``docs/data-input.md`` ("Drop or

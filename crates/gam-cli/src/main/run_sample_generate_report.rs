@@ -565,8 +565,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 }
 
                 // Continuous smoothness order
-                let smooth_rows =
-                    smooth_term_summary_rows(&design, &fit, fit.weighted_gram());
+                let smooth_rows = smooth_term_summary_rows(
+                    &design,
+                    &fit,
+                    fit.weighted_gram(),
+                    SummaryBlockOffset::default(),
+                );
                 for st in &smooth_rows {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {

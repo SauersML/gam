@@ -234,3 +234,84 @@ fn arc_bridge_rejected_trials_never_fill_the_stall_window_3017() {
          stop the run: {accepted:?}"
     );
 }
+
+/// A 1×1 Hessian served only as a product, so the plan runs opt's matrix-free
+/// trust region. Counts its products, which only that route forms.
+struct ScalarHessianProduct3017 {
+    curvature: f64,
+    products: Arc<AtomicUsize>,
+}
+
+impl HessianOperator for ScalarHessianProduct3017 {
+    fn dim(&self) -> usize {
+        1
+    }
+
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
+        self.products.fetch_add(1, Ordering::Relaxed);
+        out[0] = self.curvature * v[0];
+        Ok(())
+    }
+}
+
+/// `V(ρ) = k·(β·ρ⁴/4 − ρ)`: flat at `ρ₀ = 0` (`H₀ = 0`), then steep, which is
+/// what a trust region's quadratic model misjudges over the widest range of
+/// radii. Minimized at `ρ* = β^(−1/3)`.
+const K_TR_3017: f64 = 1_000.0;
+const BETA_TR_3017: f64 = 1.0e12;
+
+/// The matrix-free trust region evaluates `(f, g, Hv)` at every trial and
+/// rejects the ones its ratio test fails, as ARC does, so the same stall
+/// window cut it off (#3017).
+///
+/// With `H₀ = 0` the model is linear, so the Steihaug step runs to the
+/// boundary: `s = r`, predicted decrease `k·r`, actual `k·(r − β·r⁴/4)`. The
+/// ratio `1 − β·r³/4` stays below `η = 0.1` while `r > (3.6/β)^(1/3) = 1.53e-4`.
+/// From opt's initial radius 1, quartered per rejection, the seven trials
+/// `r = 4^(−j)`, `j = 0..=6`, are rejected: two full stall windows of
+/// `ARC_COST_STALL_WINDOW = 3` and one more. `r = 6.1e-5` is then accepted
+/// (ratio 0.943), and the run must go on to `ρ* = 1e-4`.
+#[test]
+fn rejected_trust_region_trials_do_not_fill_the_stall_window_3017() {
+    let rho_star = BETA_TR_3017.powf(-1.0 / 3.0);
+    let cost = |rho: &Array1<f64>| K_TR_3017 * (BETA_TR_3017 * rho[0].powi(4) / 4.0 - rho[0]);
+    let products = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Operator {
+            materialization: HessianMaterialization::Unavailable,
+            estimated_materialization_cost: None,
+        })
+        .with_tolerance(1.0e-3)
+        .with_initial_rho(array![0.0]);
+    let counted = Arc::clone(&products);
+    let mut obj = problem.build_objective(
+        (),
+        move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
+        move |_: &mut (), rho: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: cost(rho),
+                gradient: array![K_TR_3017 * (BETA_TR_3017 * rho[0].powi(3) - 1.0)],
+                hessian: HessianValue::Operator(Arc::new(ScalarHessianProduct3017 {
+                    curvature: K_TR_3017 * 3.0 * BETA_TR_3017 * rho[0].powi(2),
+                    products: Arc::clone(&counted),
+                })),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut obj, "tr-rejected-trials-3017")
+        .unwrap_or_else(|error| panic!("the fit must reach ρ*={rho_star:.4e}: {error}"));
+    assert!(
+        products.load(Ordering::Relaxed) > 0,
+        "an operator-only Hessian must run the matrix-free trust region"
+    );
+    let reached = result.rho[0];
+    assert!(
+        (reached / rho_star - 1.0).abs() < 1e-2,
+        "the trust region must reach ρ*={rho_star:.4e}, not stop at ρ₀=0: ρ={reached:.4e}"
+    );
+}

@@ -1,3 +1,6 @@
+mod error_category;
+pub use error_category::ErrorCategory;
+
 use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 

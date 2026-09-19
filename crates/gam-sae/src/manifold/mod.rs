@@ -549,6 +549,9 @@ mod tests_rho_structural_layout_2253;
 mod tests_crosscoder_block_fd_2231;
 
 #[cfg(test)]
+mod tests_crosscoder_block_gradient_2231;
+
+#[cfg(test)]
 mod tests_crosscoder_drift;
 
 #[cfg(test)]

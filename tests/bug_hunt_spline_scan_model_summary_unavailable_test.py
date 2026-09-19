@@ -271,6 +271,7 @@ def test_scan_predictions_intervals_and_summary_replay_exactly_after_save_load(t
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",

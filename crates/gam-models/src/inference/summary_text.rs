@@ -155,7 +155,7 @@ fn parametric_table(summary: &SummaryPayload, out: &mut String) {
         .iter()
         .map(|row| {
             [
-                row.name.clone(),
+                row_label(row.predictor, &row.name),
                 format_significant(row.estimate),
                 optional_number(row.std_error),
                 optional_number(row.statistic),
@@ -191,7 +191,7 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
         .iter()
         .map(|row| {
             [
-                row.name.clone(),
+                row_label(row.predictor, &row.name),
                 format_significant(row.edf),
                 format_significant(row.ref_df),
                 optional_number(row.statistic),
@@ -213,7 +213,7 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
     write_table(out, &header, &rows);
     for row in &summary.smooth_terms {
         if let Some(reason) = row.p_value_unavailable {
-            writeln!(out, "  {}: {}", row.name, reason.explanation())
+            writeln!(out, "  {}: {}", row_label(row.predictor, &row.name), reason.explanation())
                 .expect("writing to a String cannot fail");
         }
     }
@@ -224,12 +224,21 @@ fn smooth_table(summary: &SummaryPayload, out: &mut String) {
             writeln!(
                 out,
                 "  {}: {label}; its effective degrees of freedom are published unclamped",
-                row.name
+                row_label(row.predictor, &row.name)
             )
             .expect("writing to a String cannot fail");
         }
     }
     out.push('\n');
+}
+
+/// A term's row label, qualified by its predictor on a multi-formula fit (the
+/// Bernoulli marginal-slope marginal and slope formulas can name the same term).
+fn row_label(predictor: Option<&str>, name: &str) -> String {
+    match predictor {
+        Some(predictor) => format!("[{predictor}] {name}"),
+        None => name.to_string(),
+    }
 }
 
 /// Write an aligned table: the first column and the stars column left-aligned,
@@ -339,6 +348,7 @@ mod tests {
     fn smooth_row(name: &str, edf: f64, label: Option<&str>) -> SummarySmoothTermRow {
         SummarySmoothTermRow {
             name: name.to_string(),
+            predictor: None,
             edf,
             ref_df: 9.0,
             chi_sq: Some(41.2),
@@ -387,6 +397,7 @@ mod tests {
             parametric_terms: vec![
                 SummaryParametricTermRow {
                     name: "Intercept".to_string(),
+                    predictor: None,
                     estimate: 1.5,
                     std_error: Some(0.05),
                     statistic: Some(30.0),
@@ -394,6 +405,7 @@ mod tests {
                 },
                 SummaryParametricTermRow {
                     name: "x1".to_string(),
+                    predictor: None,
                     estimate: -0.25,
                     std_error: Some(0.125),
                     statistic: Some(-2.0),
@@ -500,6 +512,40 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
             "{text}"
         );
         assert!(!text.contains("s(x1): rank bound"), "{text}");
+    }
+
+    /// On a two-formula fit every row names its predictor, so the marginal and
+    /// slope formulas' same-named terms stay two distinguishable rows (#2997).
+    #[test]
+    fn a_multi_predictor_fit_labels_every_row_with_its_predictor_2997() {
+        let mut summary = fixed_small_model();
+        for row in &mut summary.parametric_terms {
+            row.predictor = Some("marginal");
+        }
+        summary.parametric_terms.push(SummaryParametricTermRow {
+            name: "Intercept".to_string(),
+            predictor: Some("slope"),
+            estimate: 0.6,
+            std_error: Some(0.1),
+            statistic: Some(6.0),
+            p_value: Some(1e-8),
+        });
+        let mut marginal = smooth_row("s(x)", 3.2, None);
+        marginal.predictor = Some("marginal");
+        let mut slope = smooth_row("s(x)", 2.1, Some("rank bound not certified"));
+        slope.predictor = Some("slope");
+        summary.smooth_terms = vec![marginal, slope];
+        let text = render_summary_text(&summary);
+        for label in [
+            "\n[marginal] Intercept ",
+            "\n[marginal] x1 ",
+            "\n[slope] Intercept ",
+            "\n[marginal] s(x) ",
+            "\n[slope] s(x) ",
+            "\n  [slope] s(x): rank bound not certified",
+        ] {
+            assert!(text.contains(label), "{label:?} missing from\n{text}");
+        }
     }
 
     /// The printed summary names why a shape-constrained smooth has no p-value

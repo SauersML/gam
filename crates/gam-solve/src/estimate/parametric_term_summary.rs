@@ -7,6 +7,7 @@
 //! known, Student-t on `wald_residual_degrees_of_freedom` when it is estimated
 //! — so no caller chooses it.
 
+use crate::estimate::smooth_term_summary::SummaryBlockOffset;
 use crate::estimate::summary::ParametricTermSummary;
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_math::probability::{normal_two_sided_probability, student_t_two_sided_probability};
@@ -21,17 +22,21 @@ use gam_terms::smooth::{
 /// (`UnifiedFitResult::display_coefficient_uncertainty`), so they carry one
 /// recorded covariance definition (#2296). A multi-column linear term yields one
 /// row per column, suffixed `[i]`; a constrained or bounded coefficient names
-/// its geometry in the row label.
+/// its geometry in the row label. `offset` places `design` inside the fit's
+/// coefficient layout, as for [`super::smooth_term_summary_rows`]: every index
+/// into `fit` is global, every index into `design` block-local.
 pub fn parametric_term_summary_rows(
     design: &TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
+    offset: SummaryBlockOffset,
 ) -> Vec<ParametricTermSummary> {
     let uncertainty = fit.display_coefficient_uncertainty();
     let se = uncertainty.as_ref().map(|view| &view.standard_errors);
     let scale_is_estimated = fit.likelihood_scale.wald_scale_is_estimated();
     let residual_df = fit.wald_residual_degrees_of_freedom();
-    let row = |name: String, idx: usize| {
+    let row = |name: String, local: usize| {
+        let idx = offset.coefficients + local;
         let estimate = fit.beta.get(idx).copied().unwrap_or(f64::NAN);
         let std_error = se.and_then(|s| s.get(idx).copied());
         let statistic = std_error
