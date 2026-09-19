@@ -97,7 +97,9 @@ the branch point; each later stage adds one fix (the sections below).
 
 The two partial rows (binomial 365, Poisson 439) were stopped once the p ≈ 1
 mass they showed had been traced to the Bartlett double count; the remaining
-replicates were run on the fixed build instead. The binomial and Poisson
+replicates were run on the fixed build instead. The Gaussian cell rerun on
+the fixed build is identical to its rescored row, replicate for replicate
+(`c = 1` there, so the Bartlett fix cannot move it). The binomial and Poisson
 reference laws have known scale, so the estimated-scale fix does not touch
 them.
 
