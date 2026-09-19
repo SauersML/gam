@@ -1,6 +1,6 @@
 """Public-API regression for issue #1348 — non-periodic open-knot B-spline derivative.
 
-``gamfit.bspline_basis_derivative(..., periodic=False)`` on a *uniform, open*
+``gamfit.basis.bspline_basis_derivative(..., periodic=False)`` on a *uniform, open*
 knot vector (``np.linspace(a, b, m)`` with no repeated boundary knots) used to
 evaluate the analytic derivative at a *wrapped* point in the two boundary spans,
 so the derivative was supported on disjoint columns from the value and disagreed
@@ -40,12 +40,12 @@ def test_boundary_span_derivative_support_is_subset_of_value() -> None:
     t = np.array([knots[1] - 0.25 * (knots[1] - knots[0])])
     assert t[0] < knots[degree]
 
-    value = gamfit.bspline_basis(t, knots, degree=degree, periodic=False)
+    value = gamfit.basis.bspline_basis(t, knots, degree=degree, periodic=False)
     value_cols = set(np.nonzero(np.abs(value[0]) > 1e-9)[0].tolist())
     assert value_cols
 
     for order in (1, 2):
-        deriv = gamfit.bspline_basis_derivative(
+        deriv = gamfit.basis.bspline_basis_derivative(
             t, knots, degree=degree, order=order, periodic=False
         )
         deriv_cols = set(np.nonzero(np.abs(deriv[0]) > 1e-9)[0].tolist())
@@ -65,10 +65,10 @@ def test_full_range_first_derivative_matches_value_central_difference(degree: in
     tt = np.linspace(knots[0], knots[-1], 241)
     h = 1e-6
     fd = (
-        gamfit.bspline_basis(tt + h, knots, degree=degree, periodic=False)
-        - gamfit.bspline_basis(tt - h, knots, degree=degree, periodic=False)
+        gamfit.basis.bspline_basis(tt + h, knots, degree=degree, periodic=False)
+        - gamfit.basis.bspline_basis(tt - h, knots, degree=degree, periodic=False)
     ) / (2 * h)
-    d1 = gamfit.bspline_basis_derivative(tt, knots, degree=degree, order=1, periodic=False)
+    d1 = gamfit.basis.bspline_basis_derivative(tt, knots, degree=degree, order=1, periodic=False)
 
     # Skip a small neighborhood of every knot (where a low-order derivative is
     # discontinuous) and of the active-interval corners (clamp kink) — a
@@ -95,7 +95,7 @@ def test_derivative_is_zero_outside_active_interval() -> None:
     assert outside.size > 0
 
     for order in (1, 2):
-        d = gamfit.bspline_basis_derivative(
+        d = gamfit.basis.bspline_basis_derivative(
             outside, knots, degree=degree, order=order, periodic=False
         )
         assert np.allclose(d, 0.0, atol=1e-12), f"order-{order} nonzero outside interval"

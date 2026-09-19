@@ -58,12 +58,12 @@ def test_row_weights_pull_fit_toward_upweighted_rows() -> None:
     n = x.shape[0]
     clean_rows = np.arange(n_half)
 
-    base = gamfit.sae_manifold_fit(
+    base = gamfit.sae.sae_manifold_fit(
         x, K=1, d_atom=2, atom_topology="periodic", n_iter=30, random_state=0
     )
     weights = np.ones(n)
     weights[clean_rows] = 8.0
-    weighted = gamfit.sae_manifold_fit(
+    weighted = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=2,
@@ -85,10 +85,10 @@ def test_row_weights_pull_fit_toward_upweighted_rows() -> None:
 def test_uniform_weights_match_unweighted() -> None:
     x = _circle(80, 3, noise=0.05, seed=7)
     n = x.shape[0]
-    a = gamfit.sae_manifold_fit(
+    a = gamfit.sae.sae_manifold_fit(
         x, K=1, d_atom=2, atom_topology="periodic", n_iter=20, random_state=3
     )
-    b = gamfit.sae_manifold_fit(
+    b = gamfit.sae.sae_manifold_fit(
         x,
         K=1,
         d_atom=2,
@@ -106,14 +106,14 @@ def test_malformed_weights_raise() -> None:
     x = _circle(40, 2, noise=0.05, seed=1)
     n = x.shape[0]
     with pytest.raises(ValueError):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             x, K=1, atom_topology="periodic", weights=np.ones(n - 1)
         )
     with pytest.raises(ValueError):
         bad = np.ones(n)
         bad[0] = 0.0
-        gamfit.sae_manifold_fit(x, K=1, atom_topology="periodic", weights=bad)
+        gamfit.sae.sae_manifold_fit(x, K=1, atom_topology="periodic", weights=bad)
     with pytest.raises(ValueError):
         bad = np.ones(n)
         bad[0] = np.inf
-        gamfit.sae_manifold_fit(x, K=1, atom_topology="periodic", weights=bad)
+        gamfit.sae.sae_manifold_fit(x, K=1, atom_topology="periodic", weights=bad)

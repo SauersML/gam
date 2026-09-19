@@ -7,7 +7,7 @@ non-constant" (null = constant) — the same universal-inference instrument the
 atom-birth gate uses, honest at the ``df ≈ n`` regime (``E_{H0}[E] <= 1``).
 
 This test pins that the e-value actually ROUND-TRIPS to a Python caller: it is
-computed during a normal ``gamfit.sae_manifold_fit`` (no opt-in flag — magic by
+computed during a normal ``gamfit.sae.sae_manifold_fit`` (no opt-in flag — magic by
 default), surfaced through ``ManifoldSAE.atom_inference()``, and survives a
 ``save``/``load`` JSON round-trip. Before #1103's Python wiring the value was
 emitted by the FFI but dropped by the ``ManifoldSAE`` wrapper, so a caller could
@@ -48,7 +48,7 @@ def _circle_data(n: int, p: int, noise: float, seed: int) -> np.ndarray:
 
 def _fit_one_atom_periodic(seed: int = 0):
     z = _circle_data(n=300, p=48, noise=0.04, seed=seed)
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="periodic",

@@ -11,8 +11,8 @@
 //!
 //! The classes live here (not in any fit/predict module) so the Rust
 //! extension owns the canonical type identity; `gamfit/_exceptions.py`
-//! re-exports them so the public names remain `gamfit.GamError`,
-//! `gamfit.FormulaError`, etc.
+//! re-exports them so the public names remain `gamfit.errors.GamError`,
+//! `gamfit.errors.FormulaError`, etc.
 //!
 //! Inheritance: every gamfit exception is a subclass of `GamError`, and
 //! `GamError` itself is a subclass of Python's built-in `ValueError`.
@@ -62,7 +62,7 @@ create_exception!(
      present in the input, `similar` is a cheap shortlist of close matches, \
      and `tsv_hint` is True when the file is almost certainly a TSV mis-\
      extensioned as CSV (sole header contains literal tab characters). \
-     Subclass of `FormulaError` so `except gamfit.FormulaError` still \
+     Subclass of `FormulaError` so `except gamfit.errors.FormulaError` still \
      catches it."
 );
 
@@ -763,8 +763,15 @@ pub(crate) fn py_value_error(message: String) -> PyErr {
     // Engine errors funneled here are gamfit-specific failures, so they must
     // carry GamError identity (a ValueError subclass) — preserving the
     // historical `except ValueError` contract while making `except
-    // gamfit.GamError` reliable for engine errors (issue #330).
+    // gamfit.errors.GamError` reliable for engine errors (issue #330).
     GamError::new_err(message)
+}
+
+/// A table gam-data refuses to encode (an unsupported value, a blank label,
+/// a malformed layout) is a data error on every ingestion path, whichever
+/// transport the table crossed the boundary in.
+pub(crate) fn data_error_to_pyerr(error: gam::data::DataError) -> PyErr {
+    DataError::new_err(error.to_string())
 }
 
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
@@ -888,7 +895,7 @@ where
 /// `estimation_error_to_pyerr`. This is the principled engine→Python
 /// adaptor: no `err.to_string()` flattening, no message-regex
 /// reclassification on the Python side. Each `EstimationError` variant
-/// surfaces as a specific `gamfit.GamError` subclass (see issue #343).
+/// surfaces as a specific `gamfit.errors.GamError` subclass (see issue #343).
 pub(crate) fn detach_estimation_result<T, F>(
     py: Python<'_>,
     context: &'static str,
@@ -907,7 +914,7 @@ where
 
 /// Variant-dispatch the engine's top-level `WorkflowError` into the matching
 /// Python exception class. The key entry is `WorkflowError::ColumnNotFound`,
-/// which surfaces as `gamfit.ColumnNotFoundError` with the structured
+/// which surfaces as `gamfit.errors.ColumnNotFoundError` with the structured
 /// fields attached as Python attributes (`column`, `role`, `available`,
 /// `similar`, `tsv_hint`) — issue #305 / #343. Other variants degrade to
 /// the most appropriate existing gamfit exception type; new variants can
@@ -1015,8 +1022,12 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
             )
         }
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
+        WorkflowError::TermBuilder { .. } => TermBuilderError::new_err(err.to_string()),
         WorkflowError::MarginalSlopeLink { .. } => InvalidConfigurationError::new_err(err.to_string()),
         WorkflowError::TransformationNormalConflict { .. } => {
+            InvalidConfigurationError::new_err(err.to_string())
+        }
+        WorkflowError::WarmStartRefused { .. } => {
             InvalidConfigurationError::new_err(err.to_string())
         }
     }
@@ -1137,10 +1148,10 @@ where
 }
 
 /// Variant-dispatch the engine's `GeometryError` into the typed Python
-/// `gamfit.GeometryError`. All three variants — `DimensionMismatch`,
+/// `gamfit.errors.GeometryError`. All three variants — `DimensionMismatch`,
 /// `InvalidPoint`, `Singular` — share the same Python class because the
 /// distinction matters only in the message text; the typed class makes
-/// `except gamfit.GeometryError` actionable without parsing the prose.
+/// `except gamfit.errors.GeometryError` actionable without parsing the prose.
 pub(crate) fn geometry_error_to_pyerr(err: EngineGeometryError) -> PyErr {
     GeometryError::new_err(err.to_string())
 }
@@ -1171,7 +1182,7 @@ where
 // Engine error → typed `PyErr` adaptors (issue #343).
 //
 // One trivial converter per typed engine→Python boundary actually used.
-// Each helper preserves the typed-class identity so `except gamfit.SurvivalError`
+// Each helper preserves the typed-class identity so `except gamfit.errors.SurvivalError`
 // (etc.) is actionable without the user parsing the prose. A call site that does
 // `.map_err(|e| e.to_string())?` against a `Result<_, EngineError>` in a
 // `PyResult<_>` function should swap to `.map_err(<engine>_error_to_pyerr)?` —

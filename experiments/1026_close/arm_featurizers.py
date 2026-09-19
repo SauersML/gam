@@ -127,7 +127,7 @@ def build_external_topk(x_bits, *, W_enc, W_dec, b_dec, top_k) -> FittedFeaturiz
 
 
 def build_gam_flat(x_bits, *, fit, score_mode: str) -> FittedFeaturizer:
-    """FittedFeaturizer for gamfit.sparse_dictionary_fit on x_bits."""
+    """FittedFeaturizer for gamfit.sae.sparse_dictionary_fit on x_bits."""
     tr = fit.transform(x_bits, score_mode=score_mode)
     recon = fit.reconstruct(tr.indices, tr.codes)
     gate, contrib, code_dims, dparams = _flat_block_from_sparse(

@@ -84,6 +84,7 @@ fn empty_termspec() -> TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     }
 }
 
@@ -274,8 +275,19 @@ fn pooled_survival_baseline_ignores_origin_entry_offsets_2336() {
     let qd1 = Array1::from_elem(n, 1.0);
     let entry_low = Array1::from_elem(n, -2.5);
     let entry_high = Array1::from_elem(n, -1.2);
+    let unit_variance = Array1::from_elem(n, 1.0);
     let pilot = |entry_at_origin: &Array1<bool>, q0: &Array1<f64>| {
-        pooled_survival_baseline(&event, &weights, entry_at_origin, &z, q0, &q1, &qd1, 1.0)
+        pooled_survival_baseline(
+            &event,
+            &weights,
+            entry_at_origin,
+            &z,
+            &unit_variance,
+            q0,
+            &q1,
+            &qd1,
+            1.0,
+        )
     };
     let origin = Array1::from_elem(n, true);
     let delayed = Array1::from_elem(n, false);
@@ -295,6 +307,80 @@ fn pooled_survival_baseline_ignores_origin_entry_offsets_2336() {
         pilot(&delayed, &entry_low),
         pilot(&delayed, &entry_high),
         "the entry offsets must reach a delayed-entry pilot, or this gate is vacuous"
+    );
+}
+
+/// gam#2952: the pilot baseline slope solves the fitted row objective, and that
+/// objective's score variance is the conditional `Var(z | a)` the family's row
+/// inputs read (gam#2766). At a non-unit variance the pilot must reach a lower
+/// value of THAT objective, summed through the frame's own row value, than the
+/// slope it reaches at unit variance, which is what a pilot that set
+/// `1ᵀΣ1 = 1` returned.
+#[test]
+fn pooled_survival_baseline_solves_at_the_conditional_score_variance_2952() {
+    let n = 12;
+    let z = Array1::from_shape_fn(n, |i| (i as f64 - 5.5) / 4.0);
+    let event = Array1::from_shape_fn(n, |i| if (i * 7) % 12 < 7 { 1.0 } else { 0.0 });
+    let weights = Array1::from_elem(n, 1.0);
+    let delayed = Array1::from_elem(n, false);
+    let q0 = Array1::from_elem(n, -2.5);
+    let q1 = Array1::from_shape_fn(n, |i| -0.8 + 0.1 * i as f64);
+    let qd1 = Array1::from_elem(n, 1.0);
+    let variance = 0.25;
+    let pilot = |z_variance: f64| {
+        pooled_survival_baseline(
+            &event,
+            &weights,
+            &delayed,
+            &z,
+            &Array1::from_elem(n, z_variance),
+            &q0,
+            &q1,
+            &qd1,
+            1.0,
+        )
+    };
+    let conditional_slope = pilot(variance);
+    let unit_slope = pilot(1.0);
+    // The pilot returns exactly 0 when it declines to solve.
+    assert!(
+        conditional_slope.is_finite() && conditional_slope != 0.0,
+        "the pilot must solve for a slope at Var(z | a) = {variance}; got {conditional_slope:e}"
+    );
+    let objective = |slope: f64| -> (f64, f64) {
+        (0..n).fold((0.0, 0.0), |(total, magnitude), i| {
+            let inputs = RigidRowInputs {
+                row: i,
+                wi: weights[i],
+                wi_entry: weights[i],
+                di: event[i],
+                z_sum: z[i],
+                covariance_ones: variance,
+                probit_scale: 1.0,
+                qd1_lower: 0.0,
+                anchor: None,
+            };
+            let value = rigid_row_value::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(
+                &[q0[i], q1[i], qd1[i], slope],
+                &inputs,
+            )
+            .expect("an admissible row");
+            (total + value, magnitude + value.abs())
+        })
+    };
+    let (at_conditional, conditional_magnitude) = objective(conditional_slope);
+    let (at_unit, unit_magnitude) = objective(unit_slope);
+    // Each total is an n-term sum, so two of them can differ by rounding alone
+    // up to γ_{n−1}·(Σ|termᵢ| + Σ|termⱼ|), with γ_k = k·u/(1 − k·u) and u = ε/2.
+    let unit_roundoff = 0.5 * f64::EPSILON;
+    let terms = (n - 1) as f64;
+    let rounding = terms * unit_roundoff / (1.0 - terms * unit_roundoff)
+        * (conditional_magnitude + unit_magnitude);
+    assert!(
+        at_conditional < at_unit - rounding,
+        "the pilot ignored the conditional score variance: at Var(z | a) = {variance} its slope \
+         {conditional_slope:.12e} scores {at_conditional:.15e}, not below the unit-variance slope \
+         {unit_slope:.12e}'s {at_unit:.15e} by more than the rounding {rounding:.3e}"
     );
 }
 
@@ -1493,6 +1579,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         q_geom.qd1,
         block_states[2].eta[0],
         family.z[[0, 0]],
+        family.shared_slope_covariance_scale(0),
         family.weights[0],
         family.entry_weight(0),
         family.event[0],
@@ -1514,7 +1601,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
 
 #[test]
 fn row_primary_closed_form_rejects_negative_infinite_signed_margin() {
-    let err = row_primary_closed_form(f64::INFINITY, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
+    let err = row_primary_closed_form(f64::INFINITY, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
         .expect_err("exact closed-form row should reject -inf signed margins");
     assert!(err.contains("non-finite signed margin"));
 }
@@ -1560,7 +1647,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // cancellation must be ULP-exact for every η.
     for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 500.0, 988.0] {
         let (_nll, _grad, hess) =
-            row_primary_closed_form(eta, eta, qd1, g, z, w, w, 0.0, derivative_guard, probit_scale)
+            row_primary_closed_form(eta, eta, qd1, g, z, 1.0, w, w, 0.0, derivative_guard, probit_scale)
                 .expect("rigid censored row");
         let sum = hess[0][0] + hess[1][1];
         assert!(
@@ -1576,7 +1663,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // 1/η² by Mills asymptotic M(−η) = η + 1/η + O(1/η³).
     for &eta in &[40.0_f64, 100.0, 500.0, 988.0] {
         let (_nll, _grad, hess) =
-            row_primary_closed_form(eta, eta, qd1, g, z, w, w, 1.0, derivative_guard, probit_scale)
+            row_primary_closed_form(eta, eta, qd1, g, z, 1.0, w, w, 1.0, derivative_guard, probit_scale)
                 .expect("rigid event row");
         let sum = hess[0][0] + hess[1][1];
         let bound = 2.0 / (eta * eta);
@@ -1591,9 +1678,9 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
     // Cross-check at η = 988 (the user's large-scale saturation):
     // both kinds of rows hit the predicted floor exactly.
     let (_, _, ev) =
-        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0).unwrap();
+        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1e-6, 1.0).unwrap();
     let (_, _, ce) =
-        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1e-6, 1.0).unwrap();
+        row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1e-6, 1.0).unwrap();
     let ev_sum = ev[0][0] + ev[1][1];
     let ce_sum = ce[0][0] + ce[1][1];
     assert!(
@@ -1608,7 +1695,7 @@ fn marginal_block_hessian_cancels_in_saturated_regime() {
 
 #[test]
 fn row_primary_closed_form_rejects_nan_signed_margin() {
-    let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
+    let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1e-6, 1.0)
         .expect_err("exact closed-form row should reject NaN signed margins");
     assert!(err.contains("non-finite signed margin"));
 }
@@ -2189,6 +2276,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         q_geom.qd1,
         block_states[2].eta[0],
         family.z[[0, 0]],
+        family.shared_slope_covariance_scale(0),
         family.weights[0],
         family.entry_weight(0),
         family.event[0],

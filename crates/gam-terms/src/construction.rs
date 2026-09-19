@@ -732,6 +732,24 @@ impl ReparamResult {
             .map(|penalty| split.project_canonical(penalty, PenaltyFrame::Transformed))
             .collect()
     }
+
+    /// Bytes this reparameterization owns on the heap. Every rotated penalty in
+    /// `canonical_transformed` is dense in the transformed frame, so with `K`
+    /// smoothing coordinates this is about `(K + 3) p²` doubles: forty
+    /// coordinates at `p = 221` hold 16 MB here, far more than `S̃`, `Qs` and `E`.
+    pub fn resident_bytes(&self) -> usize {
+        let owned = self.s_transformed.len()
+            + self.det1.len()
+            + self.qs.len()
+            + self.e_transformed.len()
+            + self.u_truncated.len();
+        owned * std::mem::size_of::<f64>()
+            + self
+                .canonical_transformed
+                .iter()
+                .map(CanonicalPenalty::resident_bytes)
+                .sum::<usize>()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +946,17 @@ impl CanonicalPenalty {
     /// `&[CanonicalPenalty]`.
     pub fn from_dense_root(root: Array2<f64>, p: usize) -> Self {
         Self::from_dense_root_with_mean(root, p, Array1::zeros(p))
+    }
+
+    /// Bytes this penalty owns on the heap: its root, its cached `local` Gram,
+    /// its prior mean and eigenvalues. A shared `op` handle is not owned here.
+    /// A dense (reparam-rotated) penalty's `local` is a full `p × p` matrix.
+    pub fn resident_bytes(&self) -> usize {
+        (self.root.len()
+            + self.local.len()
+            + self.prior_mean.len()
+            + self.positive_eigenvalues.len())
+            * std::mem::size_of::<f64>()
     }
 
     pub fn from_dense_root_with_mean(root: Array2<f64>, p: usize, prior_mean: Array1<f64>) -> Self {
@@ -3458,6 +3487,45 @@ mod tests {
             "the split's penalized subspace has the balanced structural rank"
         );
         assert_eq!(invariant.split.q_null.ncols(), 0);
+    }
+
+    /// pyGAM audit speed F1: the PIRLS cache budgets its entries by
+    /// `resident_bytes`, so it must count the rotated penalties. Each of `K`
+    /// block-local penalties becomes dense in the transformed frame and carries
+    /// its own `p × p` Gram, so the reparameterization holds at least `K p²`
+    /// doubles beyond `S̃`, `Qs` and `E`, not the few `p²` those three alone hold.
+    #[test]
+    fn reparam_resident_bytes_counts_every_rotated_penalty_gram() {
+        let blocks = 6usize;
+        let width = 4usize;
+        let p = blocks * width;
+        let penalties: Vec<super::CanonicalPenalty> = (0..blocks)
+            .map(|block| {
+                let mut root = Array2::<f64>::zeros((width - 1, p));
+                for row in 0..width - 1 {
+                    root[[row, block * width + row]] = 1.0;
+                    root[[row, block * width + row + 1]] = -1.0;
+                }
+                super::CanonicalPenalty::from_dense_root(root, p)
+            })
+            .collect();
+        let lambdas = vec![1.0; blocks];
+        let invariant =
+            precompute_reparam_invariant_from_canonical(&penalties, p).expect("reparam invariant");
+        let reparam = stable_reparameterizationwith_invariant(&penalties, &lambdas, p, &invariant)
+            .expect("reparameterization");
+        assert_eq!(reparam.canonical_transformed.len(), blocks);
+        let f64_bytes = std::mem::size_of::<f64>();
+        let rotated_grams = blocks * p * p * f64_bytes;
+        let frame_matrices =
+            (reparam.s_transformed.len() + reparam.qs.len() + reparam.e_transformed.len())
+                * f64_bytes;
+        assert!(
+            reparam.resident_bytes() >= frame_matrices + rotated_grams,
+            "resident {} must cover the frame matrices {frame_matrices} and the {blocks} rotated \
+             p x p Grams {rotated_grams}",
+            reparam.resident_bytes()
+        );
     }
 
     use super::{

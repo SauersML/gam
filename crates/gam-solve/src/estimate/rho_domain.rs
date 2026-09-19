@@ -222,7 +222,7 @@ fn shared_columns_companions<'a>(
 /// Orthonormal frame of the null space of a symmetric PSD matrix, classified at
 /// the pseudo-determinant's positive-eigenvalue threshold. `None` when the
 /// eigendecomposition fails.
-fn psd_null_frame(matrix: &Array2<f64>) -> Option<Array2<f64>> {
+pub(crate) fn psd_null_frame(matrix: &Array2<f64>) -> Option<Array2<f64>> {
     let (evals, evecs) = matrix.eigh(Side::Lower).ok()?;
     let threshold = positive_eigenvalue_threshold(evals.as_slice()?);
     let null_cols: Vec<usize> = evals

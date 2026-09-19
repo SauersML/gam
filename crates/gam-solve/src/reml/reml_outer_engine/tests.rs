@@ -9141,3 +9141,71 @@ pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Contract: `GlmCurvatureCorrectionOperator`'s streamed `mul_mat`, its
+/// row-energy trace, and the cached trace shared across coordinates all equal
+/// the per-column `mul_vec` definition of `C = Xᵀ diag(d) X`. The cached slot is
+/// keyed on the design alone, so corrections with different `d` built on
+/// clones of one design share it, while a different design never reads it.
+/// The factor is wide enough that the design streams in more than one chunk.
+#[test]
+pub(crate) fn glm_curvature_correction_traces_match_column_matvecs() {
+    let n = 1100usize;
+    let p = 480usize;
+    let rank = 480usize;
+    let x_data = Array2::from_shape_fn((n, p), |(i, j)| {
+        ((i * 7 + j * 13) as f64 * 0.011).sin() + 0.02 * ((i + j) % 5) as f64
+    });
+    assert!(gam_runtime::resource::byte_balanced_row_chunk(p + rank, n) < n);
+    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.clone()));
+    let other_design =
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_data.mapv(|v| 0.5 * v)));
+    let factor = Array2::from_shape_fn((p, rank), |(i, k)| ((i * rank + k) as f64 * 0.017).cos());
+    let op = |x_design: &DesignMatrix, phase: f64| GlmCurvatureCorrectionOperator {
+        x_design: x_design.clone(),
+        neg_c_xv: Array1::from_shape_fn(n, |i| (i as f64 * 0.37 + phase).sin()),
+        p,
+    };
+    let ops = [op(&design, 0.0), op(&design, 1.3), op(&other_design, 2.1)];
+
+    let cache = ProjectedFactorCache::default();
+    for (idx, op) in ops.iter().enumerate() {
+        let mut column_products = Array2::<f64>::zeros((p, rank));
+        for col in 0..rank {
+            column_products
+                .column_mut(col)
+                .assign(&op.mul_vec(&factor.column(col).to_owned()));
+        }
+        let terms: Vec<f64> = factor
+            .iter()
+            .zip(column_products.iter())
+            .map(|(&f, &bf)| f * bf)
+            .collect();
+        let want: f64 = terms.iter().sum();
+        let magnitude: f64 = terms.iter().map(|t| t.abs()).sum();
+        // Every path accumulates `O(n · p · rank)` rounded products.
+        let band = (n * p * rank) as f64 * f64::EPSILON * magnitude.max(1.0);
+
+        let streamed = op.mul_mat(&factor);
+        let product_band = (n * p) as f64
+            * f64::EPSILON
+            * column_products.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+        let product_gap = (&streamed - &column_products)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            product_gap <= product_band,
+            "op {idx}: streamed C·F differs from column matvecs by {product_gap:.3e} (band {product_band:.3e})"
+        );
+        for (label, got) in [
+            ("uncached", op.trace_projected_factor(&factor)),
+            ("cached", op.trace_projected_factor_cached(&factor, &cache)),
+            ("cache hit", op.trace_projected_factor_cached(&factor, &cache)),
+        ] {
+            assert!(
+                (got - want).abs() <= band,
+                "op {idx} {label}: trace {got:.15e} vs column matvecs {want:.15e} (band {band:.3e})"
+            );
+        }
+    }
+}

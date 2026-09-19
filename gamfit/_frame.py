@@ -33,7 +33,7 @@ NumPy frame (no extra deps)::
     >>> import gamfit
     >>> theta = np.linspace(0.0, 2 * np.pi, 8, endpoint=False)
     >>> ell = np.linspace(0.0, 1.0, 8)
-    >>> phi = gamfit.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
+    >>> phi = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(theta, ell)
     >>> phi.shape[0]
     8
 
@@ -42,12 +42,12 @@ Torch frame (torch arrays in, torch tensor out, grad connected)::
     >>> import torch  # doctest: +SKIP
     >>> theta_t = torch.linspace(0, 2*torch.pi, 8, requires_grad=True)
     >>> ell_t = torch.linspace(0, 1, 8, requires_grad=True)
-    >>> phi_t = gamfit.Cylinder(n_knots=(7, 4)).evaluate(theta_t, ell_t)
+    >>> phi_t = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(theta_t, ell_t)
 
 JAX frame::
 
     >>> import jax.numpy as jnp  # doctest: +SKIP
-    >>> phi_j = gamfit.Cylinder(n_knots=(7, 4)).evaluate(jnp.asarray(theta),
+    >>> phi_j = gamfit.topology.Cylinder(n_knots=(7, 4)).evaluate(jnp.asarray(theta),
     ...                                                  jnp.asarray(ell))
 """
 

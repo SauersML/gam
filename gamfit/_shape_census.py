@@ -71,6 +71,26 @@ def _require_finite(matrix: _ControlMatrix) -> None:
             raise ValueError("data must contain only finite values")
 
 
+def _native_shape_control(
+    source: _ControlMatrix, kind: str, *, seed: int
+) -> _ControlMatrix:
+    """Run the native control matching ``source``'s (float32/float64) dtype.
+
+    ``source`` is already normalized to exactly one of the two native dtypes,
+    so ``astype(..., copy=False)`` returns ``source`` itself; it only restates
+    the dtype the branch has established for the typed Rust entry point.
+    """
+    if source.dtype == np.float32:
+        return np.asarray(
+            shape_matched_control_f32(
+                source.astype(np.float32, copy=False), kind, seed=seed
+            )
+        )
+    return np.asarray(
+        shape_matched_control(source.astype(np.float64, copy=False), kind, seed=seed)
+    )
+
+
 def _adjudication_margin(result: Any) -> float:
     if not isinstance(result, Mapping) or "circular_margin" not in result:
         raise TypeError(
@@ -236,11 +256,11 @@ def run_shape_controlled_census(
         and input_dtype.kind == "f"
         and input_dtype.itemsize == 4
     ):
-        source_dtype = np.dtype(np.float32)
-        control_function = shape_matched_control_f32
+        source_dtype: np.dtype[np.float32] | np.dtype[np.float64] = np.dtype(
+            np.float32
+        )
     else:
         source_dtype = np.dtype(np.float64)
-        control_function = shape_matched_control
     # np.asarray reuses an already native C-contiguous array and performs the
     # only normalization allocation otherwise. A view lets us enforce an
     # internal read-only contract without changing the caller's writeable flag.
@@ -255,12 +275,11 @@ def run_shape_controlled_census(
 
     observed = pipeline(source.copy(order="C"), pipeline_seed)
 
-    shuffled = control_function(
+    shuffled_array = _native_shape_control(
         source,
         "per_dimension_shuffle",
         seed=control_seed,
     )
-    shuffled_array = np.asarray(shuffled)
     if (
         shuffled_array.dtype != source_dtype
         or shuffled_array.shape != source.shape
@@ -275,15 +294,13 @@ def run_shape_controlled_census(
             f"writeable={shuffled_array.flags.writeable}"
         )
     shuffled_result = pipeline(shuffled_array, pipeline_seed)
-    del shuffled
     del shuffled_array
 
-    hadamard = control_function(
+    hadamard_array = _native_shape_control(
         source,
         "covariance_exact_hadamard",
         seed=control_seed,
     )
-    hadamard_array = np.asarray(hadamard)
     if (
         hadamard_array.dtype != source_dtype
         or hadamard_array.shape != source.shape
@@ -298,7 +315,6 @@ def run_shape_controlled_census(
             f"writeable={hadamard_array.flags.writeable}"
         )
     hadamard_result = pipeline(hadamard_array, pipeline_seed)
-    del hadamard
     del hadamard_array
 
     return ShapeControlledCensus(

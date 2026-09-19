@@ -102,6 +102,7 @@ fn survival_static_spatial_psi_blocks_match_shared_engine() {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     };
 
     let base_design =
@@ -273,6 +274,7 @@ fn test_survival_fit(
         penalty_block_trace: Vec::new(),
         edf_by_block: Vec::new(),
         edf_rank_bound: Vec::new(),
+        coefficient_mode_selection: Default::default(),
     })
     .expect("valid survival test fit")
 }
@@ -322,6 +324,7 @@ fn survival_fit_parts_with_outer_evidence(
         penalty_block_trace: Vec::new(),
         edf_by_block: Vec::new(),
         edf_rank_bound: Vec::new(),
+        coefficient_mode_selection: Default::default(),
     }
 }
 
@@ -406,6 +409,20 @@ fn survival_fit_finalization_preserves_outer_certificate() {
             .summary(),
         expected
     );
+}
+
+/// gam#2661: finalization carries the inner fit's mode-selection record rather than
+/// defaulting it to `NotRecorded`.
+#[test]
+fn survival_fit_finalization_preserves_the_mode_selection_record_2661() {
+    let selection = gam_solve::model_types::CoefficientModeSelection::AnchoredContinuation {
+        steps: 4,
+        endpoint_discrepancy: 1.0e-9,
+    };
+    let mut parts = survival_fit_parts_with_outer_evidence(0, None);
+    parts.coefficient_mode_selection = selection.clone();
+    let fit = survival_fit_from_parts(parts).expect("a fixed-outer survival fit finalizes");
+    assert_eq!(fit.artifacts.coefficient_mode_selection, selection);
 }
 
 fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {

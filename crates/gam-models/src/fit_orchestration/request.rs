@@ -345,6 +345,9 @@ pub enum FitResult {
     Ctn(Box<crate::inference::model::FittedModelPayload>),
     Standard(StandardFitResult),
     GaussianLocationScale(GaussianLocationScaleFitResult),
+    /// Joint non-crossing multi-level expectile fit: a Gaussian location-scale
+    /// GAM plus one standardized expectile per requested level.
+    ExpectileLocationScale(ExpectileLocationScaleFitResult),
     BinomialLocationScale(BinomialLocationScaleFitResult),
     DispersionLocationScale(DispersionLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
@@ -379,6 +382,19 @@ pub enum FitResult {
     /// precision, and an exact per-row `predict`; the CLI/FFI save paths build
     /// the persistence payload from its `to_state` snapshot.
     ResidualCascade(gam_solve::residual_cascade::ResidualCascadeFit),
+}
+
+/// Joint multi-level expectile fit `e_τ(x) = μ(x) + c_τ·E[σ(x)]`.
+///
+/// `location_scale` is the REML/LAML-certified Gaussian location-scale GAM in
+/// raw response units; `standardized_expectiles[k]` is the prior-weighted
+/// empirical `levels[k]`-expectile `c_τ` of the standardized residuals
+/// `(yᵢ − μᵢ)/E[σᵢ]`. Levels are strictly increasing and so are the `c_τ`,
+/// which with `σ > 0` makes the curves ordered at every covariate value.
+pub struct ExpectileLocationScaleFitResult {
+    pub location_scale: GaussianLocationScaleFitResult,
+    pub levels: Vec<f64>,
+    pub standardized_expectiles: Vec<f64>,
 }
 
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
@@ -582,19 +598,22 @@ pub struct FitConfig {
     pub transformation_normal_config: Option<TransformationNormalConfig>,
     /// Optional non-negative per-row training weights column.
     pub weight_column: Option<String>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `family = "expectile"`.
+    /// Expectile levels `τ ∈ (0, 1)` for `family = "expectile"`.
     ///
-    /// When `family` resolves to `"expectile"` the fit minimizes the
-    /// Newey–Powell asymmetric squared loss `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with
-    /// `wᵢ(τ) = τ` if `yᵢ > μᵢ` else `1 − τ`, tracing the conditional
-    /// `τ`-expectile — the smooth analogue of the `τ`-quantile. `τ = 0.5`
-    /// reduces exactly to the Gaussian-identity mean fit. The whole penalized
-    /// smooth + REML `λ`-selection machinery is reused via a Least
-    /// Asymmetrically Weighted Squares (LAWS) outer loop. `None` defaults to
-    /// the median expectile `τ = 0.5` when the family is `"expectile"`; it is
-    /// ignored for every other family. The asymmetry may also be written inline
-    /// as `family = "expectile(0.9)"`, which fills this field at resolve time.
-    pub expectile_tau: Option<f64>,
+    /// When `family` resolves to `"expectile"` each level traces the
+    /// conditional `τ`-expectile — the minimizer of the Newey–Powell
+    /// asymmetric squared loss `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with `wᵢ(τ) = τ` if
+    /// `yᵢ > μᵢ` else `1 − τ`, the smooth analogue of the `τ`-quantile.
+    ///
+    /// One level is fitted directly by Least Asymmetrically Weighted Squares
+    /// (LAWS) over the penalized Gaussian-identity GAM; `τ = 0.5` reduces
+    /// exactly to the mean fit. Several levels (strictly increasing) are one
+    /// joint location-scale fit `e_τ(x) = μ(x) + c_τ·σ(x)` whose curves cannot
+    /// cross anywhere (see `fit_expectile_location_scale`). `None` defaults to
+    /// the single median level `[0.5]`. The levels may also be written inline
+    /// as `family = "expectile(0.9)"` or `family = "expectile(0.1, 0.9)"`;
+    /// both spellings together must agree.
+    pub expectile_tau: Option<Vec<f64>>,
     /// Cross-fitted predictive CTN, saved with an ordinary marginal-slope outcome.
     pub ctn_stage1: Option<CtnStage1Recipe>,
     /// A previously fitted CTN, applied unchanged to training and prediction.
@@ -728,25 +747,11 @@ pub struct FitConfig {
     /// declares why (see `CovarianceDeclined`). This only avoids paying for one
     /// that is never read.
     pub compute_covariance: Option<bool>,
-    /// Absolute outer (smoothing-selection) stationarity tolerance. `None` keeps
-    /// each route's default: `1e-10` for the standard REML route
-    /// ([`canonical_standard_fit_options`](crate::fit_orchestration::canonical_standard_fit_options))
-    /// and `BlockwiseFitOptions::default().outer_tol` for the custom-family
-    /// routes. `Some` is handed to the route's outer optimizer unchanged, so a
-    /// reference fit can be converged past a default stop (gnomon-c9: the
-    /// default binary marginal-slope fit stopped at |g| = 0.796 inside its
-    /// 2e-5·n band).
-    pub outer_tol: Option<f64>,
-    /// Absolute inner (coefficient) stationarity tolerance of the custom-family
-    /// solver. `None` keeps `BlockwiseFitOptions::default().inner_tol`. The
-    /// standard REML route's PIRLS takes no caller tolerance, so a standard fit
-    /// with no custom-family refit refuses a set value instead of dropping it.
-    pub inner_tol: Option<f64>,
-    /// A saved model's certified outer point to resume from (`warm_start_from`).
-    /// Runtime only: the request document cannot carry a model, so the Python and
-    /// Rust front ends build it with
-    /// [`OuterWarmStart::from_model`](crate::fit_orchestration::OuterWarmStart::from_model).
-    pub outer_warm_start: Option<crate::fit_orchestration::OuterWarmStart>,
+    /// A saved model's certified outer point to start from (`warm_start_from`,
+    /// gam#3002). Runtime only: the request document cannot carry a model, so the
+    /// front ends resolve one with
+    /// [`resolve_warm_start`](crate::fit_orchestration::resolve_warm_start).
+    pub warm_start: Option<gam_model_api::WarmStart>,
 }
 
 impl Default for FitConfig {
@@ -754,9 +759,7 @@ impl Default for FitConfig {
         Self {
             precompute_conformal: None,
             compute_covariance: None,
-            outer_tol: None,
-            inner_tol: None,
-            outer_warm_start: None,
+            warm_start: None,
             family: None,
             negative_binomial_theta: None,
             link: None,

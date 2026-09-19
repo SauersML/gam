@@ -52,10 +52,10 @@ import gamfit
 # Reasonable, non-opaque outcomes if a link truly cannot be fit with a flexible
 # warp: an up-front, actionable link/configuration rejection.
 _CLEAN_REJECTIONS = (
-    gamfit.UnsupportedLinkError,
-    gamfit.InvalidConfigurationError,
-    gamfit.InvalidSpecificationError,
-    gamfit.FormulaError,
+    gamfit.errors.UnsupportedLinkError,
+    gamfit.errors.InvalidConfigurationError,
+    gamfit.errors.InvalidSpecificationError,
+    gamfit.errors.FormulaError,
 )
 
 

@@ -2,7 +2,7 @@
 
 Issue #357 asked the SAE joint Arrow-Schur solve (the natural *teacher* for an
 amortized Manifold-SAE encoder) to expose three things. This test pins all
-three on the public ``gamfit.sae_manifold_fit`` surface:
+three on the public ``gamfit.sae.sae_manifold_fit`` surface:
 
 1. **Converged per-token latents.** ``ManifoldSAE.converged_latents()`` must
    return the per-atom on-manifold coordinates ``t*`` (one ``(N, d_k)`` block
@@ -59,7 +59,7 @@ def _synth(n: int = 40, d: int = 6, k: int = 3, seed: int = 0) -> np.ndarray:
 
 
 def _fit(X: np.ndarray, k: int = 3):
-    return gamfit.sae_manifold_fit(
+    return gamfit.sae.sae_manifold_fit(
         X=X,
         K=k,
         d_atom=1,
@@ -139,7 +139,7 @@ def test_warm_start_accepted_and_refines() -> None:
 
     # Seed the warm fit at the teacher's DISCOVERED K so the warm-start logits /
     # coords line up atom-for-atom with the seed dictionary.
-    warm = gamfit.sae_manifold_fit(
+    warm = gamfit.sae.sae_manifold_fit(
         X=X,
         K=k_disc,
         d_atom=1,
@@ -166,13 +166,13 @@ def test_warm_start_shapes_are_validated() -> None:
     X = _synth()
     n, k = X.shape[0], 3
     with pytest.raises(ValueError):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X, K=k, d_atom=1, atom_topology="circle",
             assignment="softmax", n_iter=1, random_state=0,
             a_init=np.zeros((n, k + 1)),
         )
     with pytest.raises(ValueError):
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X, K=k, d_atom=1, atom_topology="circle",
             assignment="softmax", n_iter=1, random_state=0,
             t_init=np.zeros((k, n + 1, 1)),

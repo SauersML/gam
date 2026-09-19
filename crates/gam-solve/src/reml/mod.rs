@@ -4617,6 +4617,19 @@ pub(crate) struct FirthDesignFactor {
     pub(crate) n: usize,
 }
 
+/// The Jeffreys log-density `½ log|I(β)|` of a fixed design under one inverse
+/// link, as a function of `η = Xβ` alone.
+///
+/// It holds the β-independent [`FirthDesignFactor`] and evaluates the same
+/// identifiable-subspace value [`FirthDenseOperator`] carries, without the
+/// Fisher inverse, hat diagonal, and weight derivatives only the gradient
+/// needs: the per-state cost is `X_rᵀ W X_r` and one factorization. A
+/// Metropolis ratio `|I(β')|^½ / |I(β)|^½` needs nothing more.
+pub struct JeffreysHalfLogDet {
+    pub(crate) factor: FirthDesignFactor,
+    pub(crate) link: InverseLink,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthDirection {
     pub(crate) deta: Array1<f64>,
@@ -5229,13 +5242,16 @@ impl PenaltySubspaceCacheKey {
 ///   solveworking_response, solvemu, solve_c_array, solve_d_array);
 /// * the p-length coefficient vector;
 /// * the two p×p Hessians (dense or CSC sparse);
-/// * the `ReparamResult` payload — the dominant scaling term beyond n, since
-///   it carries `s_transformed`, `qs`, and `e_transformed` as p×p / rank×p
-///   matrices.
+/// * the `ReparamResult` payload, the dominant term beyond n: besides
+///   `s_transformed`, `qs` and `e_transformed` it carries one rotated penalty
+///   per smoothing coordinate, each with a dense p×p Gram, so it grows as K·p²;
+/// * the p-length penalized gradient, the Firth hat diagonal and any
+///   transformed inequality constraints.
 /// A small constant overhead absorbs scalar fields, enum discriminants, and
-/// the HashMap entry. This errs on the conservative side: overestimation
-/// causes earlier eviction, never under-counting that would let the cache
-/// silently exceed the byte budget.
+/// the HashMap entry. Every array the entry owns is counted: an entry that
+/// under-reports lets the cache hold many times its byte budget (pyGAM audit
+/// speed F1: forty coordinates at p = 221 put 16 MB of rotated penalties in
+/// each entry against a 2.5 MB estimate, so the 128 MiB cache pinned 1.3 GB).
 pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     use std::mem::size_of;
     let n_array_elems = result.final_eta.len()
@@ -5247,12 +5263,24 @@ pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     let p = result.beta_transformed.0.len();
     let pen_h = symmetric_matrix_cache_bytes(&result.penalized_hessian_transformed);
     let stab_h = symmetric_matrix_cache_bytes(&result.stabilizedhessian_transformed);
-    let reparam = (result.reparam_result.s_transformed.len()
-        + result.reparam_result.qs.len()
-        + result.reparam_result.e_transformed.len()
-        + result.reparam_result.det1.len())
-        * size_of::<f64>();
-    n_array_elems * size_of::<f64>() + p * size_of::<f64>() + pen_h + stab_h + reparam + 1024
+    let firth = match &result.firth {
+        crate::pirls::FirthDiagnostics::Inactive => 0,
+        crate::pirls::FirthDiagnostics::Active { hat_diag, .. } => hat_diag.len(),
+    };
+    let constraints = result
+        .linear_constraints_transformed
+        .as_ref()
+        .map_or(0, |constraints| constraints.a.len() + constraints.b.len());
+    let small_arrays = n_array_elems
+        + p
+        + result.penalized_gradient_transformed.len()
+        + firth
+        + constraints;
+    small_arrays * size_of::<f64>()
+        + pen_h
+        + stab_h
+        + result.reparam_result.resident_bytes()
+        + 1024
 }
 
 pub(crate) fn symmetric_matrix_cache_bytes(m: &gam_linalg::matrix::SymmetricMatrix) -> usize {
@@ -5539,6 +5567,16 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
+/// The #784 block quadrature latched beside the admission (#2623): the
+/// Gauss–Hermite order of each block axis, and whether the block marginal is
+/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
+/// rule over the whole block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockQuadratureLatch {
+    pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_split: bool,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5615,8 +5653,9 @@ pub(crate) struct RemlState<'a> {
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ.
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<Vec<usize>>>,
+    /// the value, gradient and moments, are one measure at every ρ. Whether the
+    /// block is integrated axis by axis is latched with them, for the same reason.
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///

@@ -104,6 +104,7 @@ impl GaussianFrozenRows {
             computeworkingweight_derivatives_from_eta(
                 likelihood,
                 inverse_link,
+                y,
                 &eta_owned,
                 weights,
             )?;

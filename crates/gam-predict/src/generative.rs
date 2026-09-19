@@ -520,7 +520,9 @@ pub fn generative_spec_for_saved_model(
         noise_offset_supplied,
         prior_weights,
     } = request;
-    if let FittedEstimator::Expectile { .. } = model.estimator() {
+    // An expectile target (one level or a joint set) names asymmetric
+    // least-squares surfaces, not an observation law to sample.
+    if !matches!(model.estimator(), FittedEstimator::Likelihood) {
         return Err(SavedGenerativeError::UnsupportedSampler {
             model_class: model.predict_model_class(),
             family: model.payload().family.clone(),

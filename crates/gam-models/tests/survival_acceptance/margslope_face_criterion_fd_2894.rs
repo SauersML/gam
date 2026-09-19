@@ -403,6 +403,14 @@ fn survival_marginal_slope_face_criterion_derivatives_match_central_differences_
     let data = build_dataset();
     let (formula, config) = fit_config();
 
+    // Tracked red (gam#2952), measured at 29221e56b1 with the value-route fix (job 1333188): this
+    // base fit refuses after about 460 s, so nothing below is graded. Its unarmed outer search
+    // certifies rho = [8.419, -0.209, 3.039, 0.469, 0.279, -1.823, -0.840] (|Pg| = 6.705e-4 within
+    // 8.807e-3, outer Hessian PD), but that mode's ambient posterior precision has one negative
+    // direction, so the fit arms the Jeffreys/Firth prior and re-solves from the unarmed mode. The
+    // armed search's inner solve does not converge ("did not converge after 117 cycle(s) ... the
+    // KKT certificate refused the iterate: active_set_incomplete") and the fit refuses. Without
+    // the fix the same unarmed optimum certifies and the armed search runs past the 600 s timeout.
     let optimum = match fit_from_formula(&formula, &data, &config) {
         Ok(FitResult::SurvivalMarginalSlope(result)) => result.fit.log_lambdas.clone(),
         Ok(_) => panic!("a marginal-slope survival formula returned another model class"),

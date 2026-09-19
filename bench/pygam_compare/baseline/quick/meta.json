@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "plan": {
+    "name": "quick",
+    "description": "n=1e3, every family x every design, 3 reps (committed baseline)",
+    "cells": [
+      {
+        "family": "gaussian",
+        "n": 1000,
+        "design": "p1"
+      },
+      {
+        "family": "gaussian",
+        "n": 1000,
+        "design": "p5"
+      },
+      {
+        "family": "gaussian",
+        "n": 1000,
+        "design": "p20"
+      },
+      {
+        "family": "gaussian",
+        "n": 1000,
+        "design": "te"
+      },
+      {
+        "family": "binomial",
+        "n": 1000,
+        "design": "p1"
+      },
+      {
+        "family": "binomial",
+        "n": 1000,
+        "design": "p5"
+      },
+      {
+        "family": "binomial",
+        "n": 1000,
+        "design": "p20"
+      },
+      {
+        "family": "binomial",
+        "n": 1000,
+        "design": "te"
+      },
+      {
+        "family": "poisson",
+        "n": 1000,
+        "design": "p1"
+      },
+      {
+        "family": "poisson",
+        "n": 1000,
+        "design": "p5"
+      },
+      {
+        "family": "poisson",
+        "n": 1000,
+        "design": "p20"
+      },
+      {
+        "family": "poisson",
+        "n": 1000,
+        "design": "te"
+      }
+    ],
+    "reps": 3,
+    "timeout_s": 600.0,
+    "libs": [
+      "gamfit",
+      "pygam",
+      "pygam_gs"
+    ]
+  },
+  "memcap_mb": 8047.841796875,
+  "safety_net": "timeout_s and memcap_mb are a harness safety net, not a solver budget",
+  "thread_env": {
+    "RAYON_NUM_THREADS": "1",
+    "OMP_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1",
+    "NUMEXPR_NUM_THREADS": "1"
+  },
+  "host": "vm",
+  "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+  "python": "3.11.15",
+  "nproc": 4,
+  "total_ram_mb": 16095.68359375,
+  "git_sha": "bdbbecdf50d490e84b7550bb9971503919ce0dc6",
+  "started": "2026-09-19T03:58:58Z",
+  "finished": "2026-09-19T04:27:31Z",
+  "lib_versions": [
+    "gamfit=0.1.268",
+    "pygam=0.12.0",
+    "pygam_gs=0.12.0"
+  ]
+}

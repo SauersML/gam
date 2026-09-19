@@ -30,7 +30,6 @@ _BASE: dict[str, typing.Any] = {
     "expectile_tau": None,
     "offset": None,
     "weights": None,
-    "persistent_warm_start_root": None,
     "transformation_normal": None,
     "transformation_normal_stage1": None,
     "survival_likelihood": None,
@@ -71,16 +70,18 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
         ("noise_formula", "s(x)"),
         ("negative_binomial_theta", 2.5),
         ("expectile_tau", 0.9),
+        ("expectile_tau", [0.1, 0.5, 0.9]),
         ("noise_offset", "logvar"),
         ("flexible_link", True),
         ("survival_time_anchor", 25.0),
-        ("persistent_warm_start_root", "warm-start-fixture"),
-        ("outer_tol", 1e-8),
-        ("inner_tol", 1e-9),
     ],
 )
 def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) -> None:
     assert _payload(**{kwarg: value}).get(kwarg) == value
+
+
+def test_expectile_level_sequence_rides_the_request_as_a_list() -> None:
+    assert _payload(expectile_tau=(0.1, 0.9))["expectile_tau"] == [0.1, 0.9]
 
 
 @pytest.mark.parametrize(
@@ -88,9 +89,6 @@ def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) ->
     [
         ("noise_formula", "noise_formula"),
         ("flexible_link", "flexible_link"),
-        ("persistent_warm_start_root", "persistent_warm_start_root"),
-        ("outer_tol", "outer_tol"),
-        ("inner_tol", "inner_tol"),
         ("family", "family"),
         ("offset", "offset"),
         ("weights", "weights"),
@@ -114,11 +112,18 @@ def test_config_key_without_a_keyword_passes_through() -> None:
     assert payload["group_metadata"] == {"g": {}}
 
 
-def test_persistent_warm_start_path_is_serialized_exactly() -> None:
-    from pathlib import Path
+def test_fit_takes_no_on_disk_warm_start_root() -> None:
+    """A cache directory does not change the fitted model, so it has no keyword.
 
-    root = Path("caller-owned") / ".." / "warm-root"
-    assert _payload(persistent_warm_start_root=root)["persistent_warm_start_root"] == str(root)
+    The request document is ``deny_unknown_fields`` and no longer carries the
+    key either, so the ``config`` spelling is refused by the Rust resolver.
+    """
+
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    with pytest.raises(TypeError, match=r"persistent_warm_start_root"):
+        gamfit.fit(data, "y ~ x", family="gaussian", persistent_warm_start_root="warm")
+    with pytest.raises(Exception, match=r"persistent_warm_start_root"):
+        gamfit.fit(data, "y ~ x", family="gaussian", config={"persistent_warm_start_root": "warm"})
 
 
 def test_unset_model_spec_kwargs_emit_no_config_keys() -> None:
@@ -128,9 +133,6 @@ def test_unset_model_spec_kwargs_emit_no_config_keys() -> None:
         "noise_offset",
         "flexible_link",
         "survival_time_anchor",
-        "persistent_warm_start_root",
-        "outer_tol",
-        "inner_tol",
     ):
         assert key not in payload
 
@@ -141,22 +143,18 @@ def test_fit_refuses_config_spelling_before_fitting() -> None:
         gamfit.fit(data, "y ~ x", family="gaussian", config={"noise_formula": "x"})
 
 
-def test_solver_tolerances_reach_the_rust_request() -> None:
-    """``outer_tol`` / ``inner_tol`` travel the wire to the route that runs.
+def test_solver_tolerances_are_not_request_options() -> None:
+    """Solver tolerances are derived (gam SPEC 18-23), never requested.
 
-    A standard Gaussian fit takes ``outer_tol`` as its REML tolerance. Its PIRLS
-    has no inner tolerance, so ``inner_tol`` is refused by name there. That
-    refusal can only come from the Rust materializer, so it proves the key
-    crossed the wire.
+    The request document refuses the keys by name, so ``config`` cannot carry
+    one either.
     """
 
     pytest.importorskip("gamfit._rust")
     data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
-    gamfit.fit(data, "y ~ x", family="gaussian", outer_tol=1e-8)
-    with pytest.raises(Exception, match=r"inner_tol"):
-        gamfit.fit(data, "y ~ x", family="gaussian", inner_tol=1e-9)
-    with pytest.raises(Exception, match=r"outer_tol must be finite and > 0"):
-        gamfit.fit(data, "y ~ x", family="gaussian", outer_tol=0.0)
+    for key in ("outer_tol", "inner_tol"):
+        with pytest.raises(Exception, match=rf"unknown field `{key}`"):
+            gamfit.fit(data, "y ~ x", family="gaussian", config={key: 1e-8})
 
 
 def test_warm_start_from_takes_a_fitted_model() -> None:

@@ -16,7 +16,8 @@ APIs such as a matrix kernel.
 | Families: auto, Gaussian, binomial (logit/probit/cloglog), Poisson, Gamma, beta, Tweedie, negative binomial, expectile | `FitConfig` / family resolver | `--family`; NB and expectile controls below | `family=` | Parity |
 | Fixed negative-binomial size | `FitConfig::negative_binomial_theta` | `--negative-binomial-theta` | `negative_binomial_theta=` | **Closed by this audit** |
 | Expectile target | `FitConfig::expectile_tau` | `--expectile-tau` | `expectile_tau=` or `expectile(tau)` family spelling | **Closed by this audit** |
-| Offset, weights, persistent warm starts | shared request fields | `--offset-column`, `--weights-column`, `--persistent-warm-start-root` | `offset=`, `weights=`, `persistent_warm_start_root=` | Parity |
+| Offset, weights | shared request fields | `--offset-column`, `--weights-column` | `offset=`, `weights=` | Parity |
+| Joint non-crossing expectile levels (location-scale `μ(x) + c_τ·σ(x)`) | `FitConfig::expectile_tau` list, `FitResult::ExpectileLocationScale`, `gam_predict::joint_expectile_curves` | `--expectile-tau 0.1,0.5,0.9`; predict writes one `expectile_{τ}` column per level | `expectile_tau=[0.1, 0.5, 0.9]`; `predict` returns `(n, K)` curves | Parity |
 | Links and flexible link | family/link resolver | binomial family variants; complete request for `link` / `flexible_link` | `link=`, `flexible_link=` | Parity through shared request |
 | Firth binomial correction | `FitConfig::firth` | `--firth` | `firth=` | Parity |
 | Location/dispersion scale models | typed `FitRequest` variants | `--predict-noise`, `--noise-offset-column` | `noise_formula=`, `noise_offset=` | Parity |
@@ -31,6 +32,7 @@ APIs such as a matrix kernel.
 | Posterior coefficient sampling | `gam::inference::sample` / `gam::hmc` | `sample --samples --seed` | `Model.sample` with the same controls | Same Rust sampler |
 | Posterior predictive / response generation | `gam::predict::generative` | `generate --n-draws --seed` | `sample_replicates`, `iter_replicates`; multinomial `posterior_predict` | Same Rust generator |
 | Summary and HTML report | saved model / `gam::report` | `report` | `summary`, `report` | Parity |
+| Model comparison on the smoothing-corrected AIC | `compare_saved_models` | `compare MODEL... --names` | `compare_models`, `Model.evidence_ratio_vs` | Same Rust function; identical JSON |
 | Persistence | saved-model envelope | fit writes and all consumers read it | `save`, `load`, `loads`, `Model.save`, `dumps`, `model_from_dict` | One Rust wire format |
 | Multinomial fit/predict/inference | Rust multinomial request/model | selected by `--family multinomial` | `family="multinomial"`, `MultinomialModel` | Parity |
 | Event history | Rust event-history engine | `fit-events` | `fit_event_history`, `EventHistoryModel` | Parity |
@@ -43,11 +45,12 @@ The one global flag is `--log-level`.
 
 | Command | Arguments and flags |
 |---|---|
-| `fit` | `DATA`, `FORMULA`; `--request`, `--predict-noise`, `--slope-formula`, `--z-column`, `--weights-column`, `--offset-column`, `--noise-offset-column`, `--frailty-kind`, `--frailty-sd`, `--hazard-loading`, `--transformation-normal`, `--firth`, `--family`, `--negative-binomial-theta`, `--expectile-tau`, `--survival-likelihood`, baseline and time-basis controls, `--scale-dimensions`, `--precompute-conformal`, `--persistent-warm-start-root`, `--out` |
+| `fit` | `DATA`, `FORMULA`; `--request`, `--predict-noise`, `--slope-formula`, `--z-column`, `--weights-column`, `--offset-column`, `--noise-offset-column`, `--frailty-kind`, `--frailty-sd`, `--hazard-loading`, `--transformation-normal`, `--firth`, `--family`, `--negative-binomial-theta`, `--expectile-tau`, `--survival-likelihood`, baseline and time-basis controls, `--scale-dimensions`, `--precompute-conformal`, `--out` |
 | `predict` | `MODEL NEW_DATA --out`; offset/noise-offset/ID, `--uncertainty`, `--level`, `--covariance-mode`, `--conformal`, `--calibration` |
 | `transformation-score` | `MODEL LABELLED_DATA --out`; offset and ID columns |
 | `diagnose` | `MODEL DATA` |
 | `sample` | `MODEL DATA`; `--samples`, `--seed`, `--out` |
+| `compare` | `MODEL...`; `--names` |
 | `generate` | `MODEL DATA`; `--n-draws`, `--seed`, `--out` |
 | `report` | `MODEL [DATA] [OUT]` |
 | `fit-events` | `--subjects`, `--events`, `--covariates`, `--formula` or `--mark-formula` (one per mark), `--marks`, `--horizons-after-exit`, `--forecast-cutoff`, `--reference-row`, `--reference-stratum`, `--out` |
@@ -59,22 +62,22 @@ The formula front doors are `fit`, `fit_array`, `validate_formula`, and
 `gaussian_reml_fit_formula`. The complete `fit` model-spec keyword set is:
 
 `family`, `negative_binomial_theta`, `expectile_tau`, `offset`, `weights`,
-`persistent_warm_start_root`, `transformation_normal`,
+`transformation_normal`,
 `transformation_normal_stage1`, `survival_likelihood`, `survival_time_anchor`,
 `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`,
 `baseline_makeham`, `z_column`, `link`, `slope_formula`, `frailty_kind`,
 `frailty_sd`, `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
-`noise_offset`, `flexible_link`, `outer_tol`, `inner_tol`, `warm_start_from`,
-`precision_hyperpriors`, `constraints`, `response_geometry`, `response_columns`,
-`response_coordinates`, `response_reference`, `fisher_rao_w`, `latents`,
-`penalties`, `smooths`, and `config`.
+`noise_offset`, `flexible_link`, `warm_start_from`, `precision_hyperpriors`,
+`constraints`, `response_geometry`, `response_columns`, `response_coordinates`,
+`response_reference`, `fisher_rao_w`, `latents`, `penalties`, `smooths`, and
+`config`.
 
 The fitted `Model` public workflow methods/properties are `predict`,
 `predict_array`, `transformation_score`, `summary`,
 `smoothing_parameters`, `check`, `curvature`, `smooth_significance`,
 `basis_check`, `debiased_functional`, `report`, `sample`, `sample_replicates`,
 `iter_replicates`, `design_matrix`, `design_matrix_array`, `difference_smooth`,
-`partial_dependence`, `variance_share`, `conditional_aic`, `evidence_ratio_vs`,
+`partial_dependence`, `variance_share`, `evidence_ratio_vs`,
 `diagnose`, `plot`, persistence methods, group extension, and model metadata.
 `MultinomialModel` exposes classes, deviance/iterations, prediction and standard
 errors, posterior prediction, smooth significance, summary, and persistence.

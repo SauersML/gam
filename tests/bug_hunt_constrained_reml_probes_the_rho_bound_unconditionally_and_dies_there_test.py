@@ -1,4 +1,4 @@
-"""Bug hunt: ``gamfit.gaussian_reml_fit_with_constraints_forward`` cannot solve a
+"""Bug hunt: ``gamfit.reml.gaussian_reml_fit_with_constraints_forward`` cannot solve a
 binding linear constraint against a *rank-deficient* penalty -- i.e. against any
 real smoothing penalty.
 
@@ -91,7 +91,7 @@ def _fixture() -> tuple[
     rng = np.random.default_rng(9)
     t = np.sort(rng.uniform(0.0, 1.0, _N))
     design = np.asarray(
-        gamfit.bspline_basis(t, _K_INTERNAL_KNOTS, degree=_DEGREE), dtype=np.float64
+        gamfit.basis.bspline_basis(t, _K_INTERNAL_KNOTS, degree=_DEGREE), dtype=np.float64
     )
     interior = np.quantile(t, np.linspace(0.0, 1.0, _K_INTERNAL_KNOTS + 2)[1:-1])
     knots = np.concatenate(
@@ -102,7 +102,7 @@ def _fixture() -> tuple[
         ]
     )
     penalty = np.asarray(
-        gamfit.smoothness_penalty(knots, degree=_DEGREE, order=_PENALTY_ORDER)[0],
+        gamfit.basis.smoothness_penalty(knots, degree=_DEGREE, order=_PENALTY_ORDER)[0],
         dtype=np.float64,
     )
     y = np.sin(5.0 * t) + 0.2 * rng.normal(size=_N)
@@ -135,14 +135,14 @@ def test_constrained_reml_solves_a_box_constraint_on_every_coefficient(
     design, y, penalty, weights = _fixture()
     p = design.shape[1]
     free = np.asarray(
-        gamfit.gaussian_reml_fit_with_constraints_forward(
+        gamfit.reml.gaussian_reml_fit_with_constraints_forward(
             design, y, penalty, weights=weights
         )["coefficients"],
         dtype=np.float64,
     ).ravel()
     a, b = _box_row(p, column, sign, free)
 
-    fit = gamfit.gaussian_reml_fit_with_constraints_forward(
+    fit = gamfit.reml.gaussian_reml_fit_with_constraints_forward(
         design, y, penalty, weights=weights, a_inequality=a, b_inequality=b
     )
     beta = np.asarray(fit["coefficients"], dtype=np.float64).ravel()
@@ -173,14 +173,14 @@ def test_constrained_reml_is_continuous_in_a_negligible_penalty_ridge(
     design, y, penalty, weights = _fixture()
     p = design.shape[1]
     free = np.asarray(
-        gamfit.gaussian_reml_fit_with_constraints_forward(
+        gamfit.reml.gaussian_reml_fit_with_constraints_forward(
             design, y, penalty, weights=weights
         )["coefficients"],
         dtype=np.float64,
     ).ravel()
     a, b = _box_row(p, column, sign, free)
 
-    ridged = gamfit.gaussian_reml_fit_with_constraints_forward(
+    ridged = gamfit.reml.gaussian_reml_fit_with_constraints_forward(
         design,
         y,
         penalty + _NEGLIGIBLE_RIDGE * np.eye(p),
@@ -190,7 +190,7 @@ def test_constrained_reml_is_continuous_in_a_negligible_penalty_ridge(
     )
     ridged_fitted = np.asarray(ridged["fitted"], dtype=np.float64).ravel()
 
-    exact = gamfit.gaussian_reml_fit_with_constraints_forward(
+    exact = gamfit.reml.gaussian_reml_fit_with_constraints_forward(
         design, y, penalty, weights=weights, a_inequality=a, b_inequality=b
     )
     exact_fitted = np.asarray(exact["fitted"], dtype=np.float64).ravel()
