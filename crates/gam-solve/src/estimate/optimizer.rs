@@ -3249,9 +3249,14 @@ where
                         &spectrum,
                         &lambdas,
                         reml_state.x(),
-                        hessian_rho,
-                        gradient,
-                        &railed,
+                        super::identified_hessian::OuterCertificatePoint {
+                            hessian_rho,
+                            gradient,
+                            railed: &railed,
+                            rho: &final_rho,
+                            lower: &rho_model_domain.0,
+                            upper: &rho_model_domain.1,
+                        },
                     ) {
                         Ok((certificate, step_radius)) => {
                             log::info!(

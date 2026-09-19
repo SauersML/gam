@@ -266,6 +266,13 @@ fn inner_with_abs(row: ArrayView1<f64>, x: ArrayView1<f64>) -> (f64, f64) {
 /// moves `ℓ_s` by `r_s` and `lse ℓ` by at most `max_t r_t`, so each log weight is
 /// within `b_s = r_s + max_t r_t + e_s` of exact. The weight `exp(log p_s)` adds
 /// one libm ulp, so its radius is `w_s (expm1(b_s) + ε)`.
+///
+/// Every exact weight lies in `[0, 1]` whatever the logits, so it is also within
+/// `max(ŵ_s, 1 − ŵ_s)` of the computed one, and the radius is the smaller bound. A
+/// narrow box keeps the first; a wide one (a box of component masks) makes `expm1(b_s)`
+/// overflow, where `ŵ_s · ∞` is infinite, or `0 · ∞`, no number at all, for a weight that
+/// underflowed. So the range bound holds the radius finite and every weight's radius is a
+/// number.
 fn attention_weights(logits: &[f64], logit_radius: &[f64]) -> Result<(Vec<f64>, Vec<f64>), CategoricalError> {
     let (log_weights, evaluation_radius) = log_softmax_with_error(logits)?;
     let widest = logit_radius.iter().copied().fold(0.0, f64::max);
@@ -274,7 +281,10 @@ fn attention_weights(logits: &[f64], logit_radius: &[f64]) -> Result<(Vec<f64>, 
     for ((&log_weight, &evaluation), &own) in log_weights.iter().zip(&evaluation_radius).zip(logit_radius) {
         let weight = log_weight.exp();
         weights.push(weight);
-        radius.push(weight * ((own + widest + evaluation).exp_m1() + f64::EPSILON));
+        let growth = (own + widest + evaluation).exp_m1() + f64::EPSILON;
+        let boxed = if growth.is_finite() { weight * growth } else { f64::INFINITY };
+        let range = (1.0 - weight).next_up().max(weight);
+        radius.push(boxed.min(range));
     }
     Ok((weights, radius))
 }
@@ -1883,6 +1893,47 @@ mod tests {
     /// - a moved admissible score changes its row's weights and leaves the other rows alone;
     /// - a NaN in a masked entry (`s > t`) is never read;
     /// - an array with the wrong head count is refused.
+    /// A logit box too wide for `expm1` keeps every weight's radius a finite number within the
+    /// weight's `[0, 1]` range: a weight near one, one that underflows to zero (where the box bound
+    /// alone is `0 · ∞`), and one in between. The exact weights at the box's corners stay within
+    /// the radii. Control: a narrow box's radius is its box bound `w (expm1(b) + ε)`, bit for bit.
+    #[test]
+    fn a_wide_logit_box_keeps_every_weight_radius_a_finite_number_in_the_unit_range() {
+        let logits = [0.0, -800.0, -0.5];
+        let wide = [1.0e3; 3];
+        let (weights, radius) = attention_weights(&logits, &wide).expect("finite logits");
+        assert_eq!(weights[1], 0.0, "the middle weight underflows");
+        for (s, (&weight, &bound)) in weights.iter().zip(&radius).enumerate() {
+            assert!(bound.is_finite(), "weight {s}: radius {bound}");
+            assert!(bound <= (1.0 - weight).next_up().max(weight), "weight {s}: radius {bound} past its range");
+        }
+        // The corners of the box: raise one logit by the radius and lower the others.
+        for raised in 0..logits.len() {
+            let corner: Vec<f64> = logits
+                .iter()
+                .enumerate()
+                .map(|(t, &logit)| if t == raised { logit + wide[t] } else { logit - wide[t] })
+                .collect();
+            let (exact, _) = attention_weights(&corner, &[0.0; 3]).expect("finite corner logits");
+            for s in 0..logits.len() {
+                assert!(
+                    (exact[s] - weights[s]).abs() <= radius[s],
+                    "corner {raised}, weight {s}: {} moved past {}",
+                    exact[s],
+                    radius[s]
+                );
+            }
+        }
+        let narrow = [1.0e-3; 3];
+        let (weights, radius) = attention_weights(&logits, &narrow).expect("finite logits");
+        let (log_weights, evaluation) = log_softmax_with_error(&logits).expect("finite logits");
+        for s in 0..logits.len() {
+            let boxed = weights[s] * ((narrow[s] + 1.0e-3 + evaluation[s]).exp_m1() + f64::EPSILON);
+            assert_eq!(weights[s].to_bits(), log_weights[s].exp().to_bits());
+            assert_eq!(radius[s].to_bits(), boxed.to_bits(), "weight {s}: a narrow box keeps its box bound");
+        }
+    }
+
     #[test]
     fn softmax_and_value_read_at_external_inputs_chain_to_attend_projected() {
         let fixture = Fixture::new(RotaryPairing::HalfSplit).biased();
