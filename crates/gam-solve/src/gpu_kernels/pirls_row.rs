@@ -134,6 +134,60 @@ impl PirlsRowFamily {
     }
 }
 
+/// Where the PIRLS rows of a `(response, link)` pair are evaluated.
+///
+/// Only the six canonical fast-path pairs have specialised device sources.
+/// Every generic variance × link cell (identity-Poisson, log-Gaussian,
+/// inverse-Gamma's siblings, log-binomial, ...) is composed on the CPU by
+/// the exact exponential-dispersion row kernel (`gam_math::edm_row`), whose
+/// feasibility-set step rejection has no device counterpart. That routing is
+/// a named decision, never an unmatched fall-through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PirlsRowRoute {
+    /// A specialised device row kernel.
+    Device(PirlsRowFamily),
+    /// A generic variance × link cell: CPU composed EDM row kernel.
+    CpuGenericEdm(gam_problem::GenericEdmCell),
+    /// Custom, blended, or non-EDM likelihoods with no device row kernel.
+    CpuNoDeviceKernel,
+}
+
+impl PirlsRowRoute {
+    pub fn for_spec(spec: &gam_problem::LikelihoodSpec) -> Self {
+        use gam_problem::{InverseLink, ResponseFamily, StandardLink};
+        if let Some(cell) = spec.generic_edm_cell() {
+            return Self::CpuGenericEdm(cell);
+        }
+        let InverseLink::Standard(link) = spec.link else {
+            return Self::CpuNoDeviceKernel;
+        };
+        match (&spec.response, link) {
+            (ResponseFamily::Binomial, StandardLink::Logit) => {
+                Self::Device(PirlsRowFamily::BernoulliLogit)
+            }
+            (ResponseFamily::Binomial, StandardLink::Probit) => {
+                Self::Device(PirlsRowFamily::BernoulliProbit)
+            }
+            (ResponseFamily::Binomial, StandardLink::CLogLog) => {
+                Self::Device(PirlsRowFamily::BernoulliCLogLog)
+            }
+            (ResponseFamily::Poisson, StandardLink::Log) => Self::Device(PirlsRowFamily::PoissonLog),
+            (ResponseFamily::Gaussian, StandardLink::Identity) => {
+                Self::Device(PirlsRowFamily::GaussianIdentity)
+            }
+            (ResponseFamily::Gamma, StandardLink::Log) => Self::Device(PirlsRowFamily::GammaLog),
+            _ => Self::CpuNoDeviceKernel,
+        }
+    }
+
+    pub const fn device_family(self) -> Option<PirlsRowFamily> {
+        match self {
+            Self::Device(family) => Some(family),
+            Self::CpuGenericEdm(_) | Self::CpuNoDeviceKernel => None,
+        }
+    }
+}
+
 /// Curvature surface used to populate `w_hessian` / `w_solver`.
 ///
 /// `Fisher` is the default and matches the CPU Stage-1 path bit-for-bit. The

@@ -134,12 +134,6 @@ fn stratum_problem() -> OuterProblem {
         .with_tolerance(OuterConfig::default().tolerance)
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 fn run_stratum(

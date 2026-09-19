@@ -168,7 +168,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
-use gam_math::roundoff::accumulation_growth;
+use gam_linalg::roundoff::accumulation_growth;
 use crate::model_types::FacePositivityRoute;
 use gam_terms::construction::CanonicalPenalty;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};

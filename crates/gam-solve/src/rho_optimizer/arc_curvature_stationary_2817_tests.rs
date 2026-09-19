@@ -635,16 +635,19 @@ fn a_route_that_declares_no_resolution_is_unchanged_2817() {
 
 // ─── the stop decides on the certificate's verdict (#2954) ──────────────────
 
-/// The size the verdict fixtures declare, as every REML route does.
+/// The size the certifying verdict fixture declares, as every REML route does:
+/// its statistical resolution is `τ_stat = 1/(2n) = 5e-4`.
 const VERDICT_ROWS_2954: usize = 1_000;
+/// The size the refusing verdict fixture declares, `τ_stat = 5e-6`.
+const REFUSING_ROWS_2954: usize = 100_000;
 const VERDICT_COEFFICIENTS_2954: usize = 10;
 
-/// [`claim_band_config_2817`] on a route that declares its size, so the
+/// [`claim_band_config_2817`] on a route that declares `n_obs` rows, so the
 /// certificate decides stationarity on the Newton-decrement verdict (#2954).
-fn sized_claim_band_config_2954() -> OuterConfig {
+fn sized_claim_band_config_2954(n_obs: usize) -> OuterConfig {
     OuterConfig {
         problem_size: crate::rho_optimizer::OuterProblemSize {
-            n_obs: Some(VERDICT_ROWS_2954),
+            n_obs: Some(n_obs),
             p_coefficients: Some(VERDICT_COEFFICIENTS_2954),
         },
         ..claim_band_config_2817(CLAIM_BAND_2817)
@@ -707,18 +710,18 @@ fn drive_flat_stall_with_verdict_2954(
 
 /// The loop does not stop where its certificate refuses (#2954).
 ///
-/// [`STOP_GRAD_2817`] against unit curvature is a Newton decrement of `8.45e-5`,
+/// [`STOP_GRAD_2817`] against unit curvature is a model decrease `½g² = 8.45e-5`,
 /// inside `floor·(1 + |V|) = 1.001e-4`, so the curvature-resolvability rung
 /// halts ARC there (the control half, on a route that takes no verdict). A route
-/// that declares its size is certified on the verdict instead, and a criterion
-/// of `V = 1e3` channelled through the penalty alone rounds at `γ₁·|V| ≈ 1e-13`:
-/// the decrement is nine orders outside that band and the certificate refuses
-/// the point by name. The abalone Poisson fit (UCI, 5-fold CV fold 0) was this
-/// split at scale: `|V| = 4.4e4` carries a λ-independent `Σ log y!`, so the old
-/// rung's tolerance was `4.4e-3` against a `band_f` of `5e-8`. Every seed
-/// stopped at `|Pg| ≈ 1e-4`, the screening certificate refused each on
-/// `DecrementAboveTolerance`, and the fit was minted only by the polish after
-/// all three seeds had run.
+/// that declares its size is certified on the verdict instead: at `1e5` rows its
+/// statistical resolution is `τ_stat = 1/(2n) = 5e-6`, and a criterion of `V =
+/// 1e3` channelled through the penalty alone rounds far inside it, so the
+/// decrement `g² = 1.69e-4` is resolvable and the certificate refuses the point by
+/// name. The abalone Poisson fit (UCI, 5-fold CV fold 0) was this split: `|V| =
+/// 4.4e4` carries a λ-independent `Σ log y!`, so the old rung's tolerance grew
+/// with a constant no decision depends on. Every seed stopped at `|Pg| ≈ 1e-4`,
+/// the screening certificate refused each on `DecrementAboveTolerance`, and the
+/// fit was minted only by the polish after all three seeds had run.
 #[test]
 fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
     let (control, _) = drive_arc_oracle_2817(
@@ -734,7 +737,7 @@ fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
         "control: without the verdict the curvature-resolvability rung halts this stall"
     );
 
-    let config = sized_claim_band_config_2954();
+    let config = sized_claim_band_config_2954(REFUSING_ROWS_2954);
     let evidence = published_evidence_2954(STOP_GRAD_2817, None);
     let decision = crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
         &config,
@@ -769,14 +772,15 @@ fn the_online_stop_declines_a_point_the_certificates_verdict_refuses_2954() {
 /// POSITIVE CONTROL: the verdict stops the loop where it certifies.
 ///
 /// The criterion's `½·log|H_β|` channel comes from a factor whose forward error
-/// is `1e-4`, which charges `5e-5` to the objective band, inside the resolution
-/// `1.001e-4`. `|g| = 5e-3` is a decrement of `1.25e-5`, inside that band, so the
-/// certificate accepts the point and the loop halts there, above the claim band
-/// the guard reads as KKT-stationary.
+/// is `1e-4`, which charges `5e-5` to the objective band, leaving the decrement
+/// `τ_stat − 5e-5 ≈ 4.5e-4` of the statistical resolution `τ_stat = 5e-4` at
+/// `1e3` rows. `|g| = 5e-3` is a decrement of `2.5e-5`, inside that tolerance, so
+/// the certificate accepts the point and the loop halts there, above the claim
+/// band the guard reads as KKT-stationary.
 #[test]
 fn the_online_stop_halts_where_the_certificates_verdict_certifies_2954() {
     const GRADIENT: f64 = 5.0e-3;
-    let config = sized_claim_band_config_2954();
+    let config = sized_claim_band_config_2954(VERDICT_ROWS_2954);
     let criterion = crate::estimate::outer_eval_capture::CertificateCriterion {
         cost: COST_2817,
         fixed_beta: COST_2817 - 1.0,
@@ -1416,13 +1420,9 @@ fn a_fixed_point_walk_that_bought_resolved_improvement_keeps_walking_2817() {
 fn an_exhausted_arc_budget_refuses_instead_of_retrying_2817() {
     const OFFSET: f64 = 0.5;
     const SCALE: f64 = 1.0e6;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![5.0])
         .with_max_iter(1)
         .with_fallback_policy(FallbackPolicy::Disabled);

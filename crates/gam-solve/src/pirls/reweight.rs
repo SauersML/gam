@@ -332,6 +332,16 @@ fn exact_newton_decrement_sq_on_face(
     (decrement_sq.is_finite() && decrement_sq >= 0.0).then_some(decrement_sq)
 }
 
+/// Where a P-IRLS trial point left the link's feasibility set: the typed
+/// fields of the [`EstimationError::InverseLinkDomainViolation`] that rejected it.
+#[derive(Clone, Copy, Debug)]
+struct FeasibilityWitness {
+    link: &'static str,
+    eta: f64,
+    lower: f64,
+    upper: f64,
+}
+
 /// The exact-decrement half of the P-IRLS convergence certificate, measured on
 /// a fully evaluated state: the squared Newton decrement and the threshold it is
 /// certified against.
@@ -623,6 +633,43 @@ where
     fn lm_can_retry(loop_lambda: f64) -> bool {
         crate::loop_guard::madsen_can_retry(loop_lambda)
     }
+    /// The step this iteration proposed toward the likelihood maximum left the
+    /// link's feasibility set, and the witness of that rejection says where.
+    /// Returns the witness of a trial-point domain violation, or `None` for
+    /// every other candidate failure.
+    fn feasibility_witness(err: &EstimationError) -> Option<FeasibilityWitness> {
+        match *err {
+            EstimationError::InverseLinkDomainViolation {
+                link,
+                eta,
+                lower,
+                upper,
+            } => Some(FeasibilityWitness {
+                link,
+                eta,
+                lower,
+                upper,
+            }),
+            _ => None,
+        }
+    }
+    /// The inner maximum is on the feasibility boundary: in the iteration
+    /// that ended the solve, the step toward it left the feasible linear
+    /// predictor, and the gradient never vanished.
+    fn boundary_optimum_error(
+        witness: FeasibilityWitness,
+        iteration: usize,
+        gradient_norm: f64,
+    ) -> EstimationError {
+        EstimationError::LinkFeasibilityBoundaryOptimum {
+            link: witness.link,
+            eta: witness.eta,
+            lower: witness.lower,
+            upper: witness.upper,
+            iterations: iteration,
+            gradient_norm,
+        }
+    }
     fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
         iteration: usize,
@@ -818,6 +865,10 @@ where
                 HessianCurvatureKind::Fisher
             };
         let mut used_fisher_fallback_this_iter = false;
+        // The latest trial point of THIS iteration that left the link's
+        // feasibility set. A rejection in an earlier iteration says nothing
+        // about where the final iterate sits.
+        let mut feasibility_witness_this_iter: Option<FeasibilityWitness> = None;
         let curvature_start = std::time::Instant::now();
         // The previous iter's LM accept path computed `accepted_state` via
         // `update_candidate(candidate_beta, state.hessian_curvature)` and
@@ -1374,7 +1425,27 @@ where
                                     if !is_lm_retriable_candidate_error(&err) {
                                         return Err(err);
                                     }
+                                    let witness = feasibility_witness(&err);
+                                    if witness.is_some() {
+                                        feasibility_witness_this_iter = witness;
+                                    }
                                     if lm_bound.exhausted_at(loop_lambda) {
+                                        // Every damped step, down to the
+                                        // steepest-descent limit, left the
+                                        // feasible set: the iterate is pressed
+                                        // against its boundary.
+                                        if let Some(witness) = witness {
+                                            return Err(boundary_optimum_error(
+                                                witness,
+                                                iter,
+                                                constrained_stationarity_norm(
+                                                    &state.gradient,
+                                                    beta.as_ref(),
+                                                    options.coefficient_lower_bounds.as_ref(),
+                                                    options.linear_constraints.as_ref(),
+                                                ),
+                                            ));
+                                        }
                                         return Err(lm_nonconvergence_error(
                                             options,
                                             iter,
@@ -1684,8 +1755,27 @@ where
                         // contracts and are required alongside it, never folded
                         // into the same max (#2705 group B — see
                         // `constrained_stationarity_norm`).
-                        if (final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance)
-                            || exact_nd_pass)
+                        let strict_kkt_pass =
+                            final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance);
+                        // The decrement collapses without the gradient doing so
+                        // when the curvature diverges, which a mean approaching
+                        // the edge of its domain does (Fisher weight 1/mu for
+                        // identity Poisson at mu -> 0, mu/(1-mu) for log binomial
+                        // at mu -> 1). If the step toward that edge was also
+                        // rejected as infeasible in this iteration, the iterate is
+                        // on the feasibility boundary, not at an interior mode the
+                        // decrement could certify.
+                        if exact_nd_pass
+                            && !strict_kkt_pass
+                            && let Some(witness) = feasibility_witness_this_iter
+                        {
+                            return Err(boundary_optimum_error(
+                                witness,
+                                iter,
+                                convergence_grad_norm,
+                            ));
+                        }
+                        if (strict_kkt_pass || exact_nd_pass)
                             && constraint_geometry_is_certified(
                                 beta.as_ref(),
                                 &final_state_ref.gradient,
@@ -1973,6 +2063,10 @@ where
                 }
                 Err(err) => {
                     candidate_buf = candidate_beta.into();
+                    let witness = feasibility_witness(&err);
+                    if witness.is_some() {
+                        feasibility_witness_this_iter = witness;
+                    }
                     if state.hessian_curvature == HessianCurvatureKind::Observed
                         && !used_fisher_fallback_this_iter
                     {
@@ -2017,6 +2111,18 @@ where
                         return Err(err);
                     }
                     if lm_bound.exhausted_at(loop_lambda) {
+                        if let Some(witness) = witness {
+                            return Err(boundary_optimum_error(
+                                witness,
+                                iter,
+                                constrained_stationarity_norm(
+                                    &state.gradient,
+                                    beta.as_ref(),
+                                    options.coefficient_lower_bounds.as_ref(),
+                                    options.linear_constraints.as_ref(),
+                                ),
+                            ));
+                        }
                         return Err(lm_nonconvergence_error(
                             options,
                             iter,
@@ -2121,7 +2227,7 @@ where
         // 10× relaxed band). A convergence verdict keyed on wall-clock is
         // non-deterministic under CPU contention — the same fit converges to
         // a different β in a parallel sweep than it does run alone, which
-        // cascades into different outer seed screening and load-unstable
+        // cascades into different outer search paths and load-unstable
         // fire/collapse decisions downstream (gam#979). It also accepted
         // iterates up to 10× outside `convergence_tolerance`, an
         // unrequested weakening of the inner certificate. Convergence is

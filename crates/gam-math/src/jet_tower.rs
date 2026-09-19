@@ -560,8 +560,7 @@ impl<const K: usize> Tower2<K> {
     /// left a ≤1-ulp asymmetry; mirroring removes it, so the result is exactly
     /// symmetric — strictly closer to the true symmetric Hessian, not merely a
     /// reordering. Dense-`h` consumers are all tolerance-gated (rel-tol ≥ 1e-11 ≫
-    /// 1e-16); the `f64`/`f64x4` lane oracle stays exact because
-    /// [`crate::jet_scalar::Order2Lane::mul`] mirrors term-for-term.
+    /// 1e-16).
     pub fn mul(&self, o: &Self) -> Self {
         let a = self;
         let b = o;
