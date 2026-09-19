@@ -848,12 +848,6 @@ fn constant_curvature_kappa_profile_optimum(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.max_seeds = 1;
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
-    seed_config.num_auxiliary_trailing = 1;
-    seed_config.over_smoothing_probe_rho = None;
     let initial_kappa = profile.spec.kappa.clamp(kappa_min, kappa_max);
     let problem = gam_solve::rho_optimizer::OuterProblem::new(1)
         .with_gradient(gam_problem::Derivative::Analytic)
@@ -879,8 +873,7 @@ fn constant_curvature_kappa_profile_optimum(
             Array1::from_vec(vec![kappa_min]),
             Array1::from_vec(vec![kappa_max]),
         )
-        .with_initial_rho(Array1::from_vec(vec![initial_kappa]))
-        .with_seed_config(seed_config);
+        .with_initial_rho(Array1::from_vec(vec![initial_kappa]));
     let mut objective = problem.build_objective(
         profile,
         |profile: &mut ConstantCurvatureProfile<'_>, theta: &Array1<f64>| {

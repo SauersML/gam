@@ -129,6 +129,19 @@ fn residual_cascade_failure(error: gam_solve::residual_cascade::ResidualCascadeE
     raised_fit_failure(category, error.to_string())
 }
 
+/// The REML fit of a standard request whose exact Gaussian boundary
+/// (`try_deterministic_gaussian_standard_fit`) has already been refused. That
+/// certificate builds its own dense design and normal equations, so a caller
+/// that already ran it hands the request here rather than back through
+/// [`fit_model`], which would build and refuse it a second time.
+fn fit_standard_past_exact_gaussian_boundary(
+    request: StandardFitRequest<'_>,
+) -> Result<FitResult, WorkflowError> {
+    fit_standard_model(request)
+        .map(FitResult::Standard)
+        .map_err(|failure| WorkflowError::from(failure.ending_the_fit()))
+}
+
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     let request = request;
     // Every arm hands back the helper's `FitFailure` whole. This boundary used
@@ -143,9 +156,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
             if let Some(fitted) = try_deterministic_gaussian_standard_fit(&request)? {
                 Ok(FitResult::Standard(fitted))
             } else {
-                fit_standard_model(request)
-                    .map(FitResult::Standard)
-                    .map_err(wrap_solver_err)
+                fit_standard_past_exact_gaussian_boundary(request)
             }
         }
         FitRequest::GaussianLocationScale(request) => fit_gaussian_location_scale_model(request)
@@ -1230,57 +1241,28 @@ fn exact_gaussian_coefficients(
     subspace: Option<(&Array2<f64>, f64)>,
 ) -> Option<Array1<f64>> {
     let p = x.ncols();
-    let (reduced_x, basis, rotation_radius) = match subspace {
-        Some((z, radius)) => (gam_linalg::faer_ndarray::fast_ab(x, z), Some(z), radius),
-        None => (x.clone(), None, 0.0),
+    let (reduced_x_storage, basis, rotation_radius) = match subspace {
+        Some((z, radius)) => (
+            std::borrow::Cow::Owned(gam_linalg::faer_ndarray::fast_ab(x, z)),
+            Some(z),
+            radius,
+        ),
+        None => (std::borrow::Cow::Borrowed(x), None, 0.0),
     };
+    let reduced_x: &Array2<f64> = &reduced_x_storage;
     if !rotation_radius.is_finite() {
         return None;
     }
     if adjusted_response.len() != reduced_x.nrows() || weights.len() != reduced_x.nrows() {
         return None;
     }
-    let beta = if reduced_x.ncols() == 0 {
+    let reduced_p = reduced_x.ncols();
+    let beta = if reduced_p == 0 {
         Array1::<f64>::zeros(p)
     } else {
-        // A zero-residual coefficient defines a deterministic Gaussian law
-        // only when it is unique on the positive-weight support.  A certified
-        // solve residual alone cannot establish that: when n < p an
-        // underdetermined design can interpolate arbitrary responses while
-        // still admitting infinitely many coefficient vectors.  Certify the
-        // injectivity promised by `exact_gaussian_boundary` directly on the
-        // reduced design's positive-weight support before forming its Gram
-        // matrix. Positive row scaling cannot change exact rank, so omitting it
-        // here also makes the structural certificate invariant to a uniform
-        // rescaling of all positive likelihood weights.
-        let reduced_p = reduced_x.ncols();
-        let positive_rows: Vec<usize> = weights
-            .iter()
-            .enumerate()
-            .filter_map(|(row, &weight)| (weight > 0.0).then_some(row))
-            .collect();
-        if positive_rows.len() < reduced_p {
-            return None;
-        }
-        let positive_weight_reduced_x = Array2::from_shape_fn(
-            (positive_rows.len(), reduced_p),
-            |(weighted_row, column)| {
-                let row = positive_rows[weighted_row];
-                reduced_x[[row, column]]
-            },
-        );
-        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
-            &positive_weight_reduced_x,
-            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-        )
-        .ok()?
-        .rank;
-        if rank != reduced_p {
-            return None;
-        }
-        let gram = gam_linalg::faer_ndarray::fast_xt_diag_x(&reduced_x, weights);
+        let gram = gam_linalg::faer_ndarray::fast_xt_diag_x(reduced_x, weights);
         let rhs_matrix = gam_linalg::faer_ndarray::fast_xt_diag_y(
-            &reduced_x,
+            reduced_x,
             weights,
             &adjusted_response.view().insert_axis(ndarray::Axis(1)),
         );
@@ -1338,6 +1320,43 @@ fn exact_gaussian_coefficients(
         let residual = (adjusted_response[row] - fitted[row]).abs();
         let allowed = gamma * operand_scale + rotation_residual / weights[row].sqrt();
         if !(residual.is_finite() && residual <= allowed) {
+            return None;
+        }
+    }
+    // A zero-residual coefficient defines a deterministic Gaussian law only
+    // when it is unique on the positive-weight support. A certified solve
+    // residual alone cannot establish that: when n < p an underdetermined
+    // design can interpolate arbitrary responses while still admitting
+    // infinitely many coefficient vectors. Certify the injectivity promised by
+    // `exact_gaussian_boundary` directly on the reduced design's positive-weight
+    // support. Positive row scaling cannot change exact rank, so omitting it
+    // here also makes the structural certificate invariant to a uniform
+    // rescaling of all positive likelihood weights. Every certificate here is
+    // a conjunct, so the rank-revealing QR runs last: a noisy response is
+    // refused by the residual bound above without paying for it.
+    if reduced_p > 0 {
+        let positive_rows: Vec<usize> = weights
+            .iter()
+            .enumerate()
+            .filter_map(|(row, &weight)| (weight > 0.0).then_some(row))
+            .collect();
+        if positive_rows.len() < reduced_p {
+            return None;
+        }
+        let positive_weight_reduced_x = Array2::from_shape_fn(
+            (positive_rows.len(), reduced_p),
+            |(weighted_row, column)| {
+                let row = positive_rows[weighted_row];
+                reduced_x[[row, column]]
+            },
+        );
+        let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
+            &positive_weight_reduced_x,
+            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .ok()?
+        .rank;
+        if rank != reduced_p {
             return None;
         }
     }
@@ -2215,8 +2234,22 @@ fn fit_materialized_once_with_notes(
     // Cloning the handle is `O(1)` by construction — a `Copy` view or an `Arc`
     // bump, aliasing the same storage — and its lifetime is the caller's
     // dataset, not `mat`, so it outlives the move.
+    //
+    // The response side travels with it: the conditional reference for a
+    // canonical binomial/Poisson fit conditions on `Xᵀ(w∘y)`, so it needs the
+    // response and prior weights the fit consumed (both `Arc` handles, so this
+    // is a refcount bump too).
     let standard_covariate_frame = match &mat.request {
-        FitRequest::Standard(request) => Some(request.data.clone()),
+        FitRequest::Standard(request) => Some(BasisAdequacyInputs {
+            frame: request.data.clone(),
+            y: request.y.clone(),
+            prior_weights: request.weights.clone(),
+            canonical_family: crate::fit_orchestration::drivers::basis_adequacy_canonical_family(
+                &request.family,
+                request.wiggle.is_some(),
+                request.latent_coord.is_some(),
+            ),
+        }),
         _ => None,
     };
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
@@ -2280,14 +2313,28 @@ fn fit_materialized_once_with_notes(
         }
     }
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
-    // directly instead of stringifying then re-wrapping.
-    let result = fit_model(mat.request)?;
+    // directly instead of stringifying then re-wrapping. A standard request
+    // was refused by the exact Gaussian boundary above, so it skips that
+    // certificate's second design build inside `fit_model`.
+    let result = match mat.request {
+        FitRequest::Standard(request) => fit_standard_past_exact_gaussian_boundary(request)?,
+        request => fit_model(request)?,
+    };
     Ok(attach_basis_adequacy(
         result,
         standard_covariate_frame,
         inference_notes,
         unidentified_scalar_terms,
     ))
+}
+
+/// What [`attach_basis_adequacy`] needs from the standard request, kept across
+/// the `fit_model` move.
+struct BasisAdequacyInputs<'a> {
+    frame: StandardFitData<'a>,
+    y: std::sync::Arc<ndarray::Array1<f64>>,
+    prior_weights: std::sync::Arc<ndarray::Array1<f64>>,
+    canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
 }
 
 /// Measure each smooth's basis adequacy (#2774) and fold the verdict into the
@@ -2305,7 +2352,7 @@ fn fit_materialized_once_with_notes(
 /// what this finds — the only thing that changes is what the caller is told.
 fn attach_basis_adequacy(
     result: FitResult,
-    covariate_frame: Option<StandardFitData<'_>>,
+    covariate_frame: Option<BasisAdequacyInputs<'_>>,
     mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
@@ -2324,12 +2371,17 @@ fn attach_basis_adequacy(
             &standard.resolvedspec,
             &standard.fit,
         );
-    if let Some(data) = covariate_frame {
+    if let Some(inputs) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
-            data.view(),
+            inputs.frame.view(),
             &standard.design,
             &standard.resolvedspec,
             &standard.fit,
+            &crate::fit_orchestration::drivers::BasisAdequacyResponse {
+                y: inputs.y.view(),
+                prior_weights: inputs.prior_weights.view(),
+                canonical_family: inputs.canonical_family,
+            },
         );
         inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,

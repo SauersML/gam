@@ -125,23 +125,15 @@ impl OuterObjective for RecordingStratum {
     }
 }
 
-/// The gradient-only plan #2939's fit ran, at production's default tolerance and the
-/// criterion's declared scale.
+/// The gradient-only plan #2939's fit ran, at production's default tolerance.
 fn stratum_problem() -> OuterProblem {
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_prefer_gradient_only(true)
         .with_tolerance(OuterConfig::default().tolerance)
-        .with_objective_scale(Some(STRATUM_OFFSET))
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 fn run_stratum(
@@ -281,10 +273,10 @@ fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<
     let eval = fixture.eval(&incumbent);
     let residual = eval.gradient.dot(&eval.gradient).sqrt();
     assert!(
-        residual > guard.stationarity_band(eval.cost),
+        residual > guard.stationarity_band(),
         "fixture premise: the pinned incumbent's |g| = {residual:.3e} must be outside the band \
          {:.3e}",
-        guard.stationarity_band(eval.cost),
+        guard.stationarity_band(),
     );
     guard.observe_seed(&incumbent, eval.cost, residual);
     (guard, exit, incumbent)

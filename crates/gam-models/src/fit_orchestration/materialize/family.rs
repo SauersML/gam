@@ -96,10 +96,13 @@ fn require_legal_link(response: &ResponseFamily, link: LinkFunction) -> Result<(
     }
     Err(WorkflowError::InvalidConfig {
         reason: format!(
-            "link `{}` is not supported for family `{}`; {}",
+            "link `{}` is not supported for family `{}`; {}{}",
             link.name(),
             response.name(),
-            LikelihoodSpec::legal_links_clause(response)
+            LikelihoodSpec::legal_links_clause(response),
+            LikelihoodSpec::illegal_cell_hint(response, link)
+                .map(|hint| format!("; {hint}"))
+                .unwrap_or_default()
         ),
     }
     .into())
@@ -677,22 +680,34 @@ pub fn resolve_family(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                // `log` (Poisson, Gamma, Tweedie, NB, Inverse-Gaussian) and
-                // `1/μ` (Gaussian, Gamma) are each legal for several families,
-                // and nothing in the link distinguishes them: a variance
-                // function is a modelling choice, not something to read off
-                // whether `y` happens to be integer-valued. The caller names
-                // the family. With an explicit family only `from_link.link`
-                // is carried below, so the response here is immaterial.
+                // `log`, `sqrt`, `1/μ` and `1/μ²` are each legal for several
+                // families (the generic variance × link cells carry the
+                // non-canonical ones), and nothing in the link distinguishes
+                // them: a variance function is a modelling choice, not
+                // something to read off whether `y` happens to be
+                // integer-valued. The caller names the family. With an
+                // explicit family only `from_link.link` is carried below, so
+                // the response here is immaterial.
                 LinkFunction::Log if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Log),
+                ),
+                LinkFunction::Sqrt if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::Sqrt),
                 ),
                 LinkFunction::Inverse if explicit.is_some() => LikelihoodSpec::new(
                     ResponseFamily::Gamma,
                     InverseLink::Standard(StandardLink::Inverse),
                 ),
-                link @ (LinkFunction::Log | LinkFunction::Inverse) => {
+                LinkFunction::InverseSquared if explicit.is_some() => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(StandardLink::InverseSquared),
+                ),
+                link @ (LinkFunction::Log
+                | LinkFunction::Sqrt
+                | LinkFunction::Inverse
+                | LinkFunction::InverseSquared) => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!(
                             "link '{}' does not determine a response family; name one \
@@ -703,12 +718,6 @@ pub fn resolve_family(
                     }
                     .into());
                 }
-                // `1/μ²` is the canonical Inverse-Gaussian link and legal for
-                // no other family.
-                LinkFunction::InverseSquared => LikelihoodSpec::new(
-                    ResponseFamily::InverseGaussian,
-                    InverseLink::Standard(StandardLink::InverseSquared),
-                ),
                 LinkFunction::Logit => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(StandardLink::Logit),
@@ -960,9 +969,13 @@ mod tweedie_power_tests {
         for (link, admitting) in [
             (
                 LinkFunction::Log,
-                "poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
+                "gaussian|binomial|poisson|tweedie|negative-binomial|gamma|inverse-gaussian",
             ),
-            (LinkFunction::Inverse, "gaussian|gamma"),
+            (
+                LinkFunction::Inverse,
+                "gaussian|poisson|gamma|inverse-gaussian",
+            ),
+            (LinkFunction::Sqrt, "gaussian|poisson|gamma|inverse-gaussian"),
         ] {
             let choice = LinkChoice {
                 mode: LinkMode::Strict,
