@@ -148,7 +148,7 @@ mod tests {
         Ok((
             op.pirls_hat_diag(),
             op.jeffreys_logdet(),
-            op.pirls_firth_score_shift(),
+            op.pirls_jeffreys_eta_score(),
         ))
     }
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
@@ -220,7 +220,7 @@ mod tests {
         );
 
         for link in [&cloglog, &mixture] {
-            let (hat, logdet, shift) = compute_jeffreys_pirls_diagnostics(
+            let (hat, logdet, score) = compute_jeffreys_pirls_diagnostics(
                 link,
                 x.view(),
                 eta.view(),
@@ -228,7 +228,7 @@ mod tests {
             )
             .expect("supported Firth inverse link");
             assert_eq!(hat.len(), x.nrows());
-            assert_eq!(shift.len(), x.nrows());
+            assert_eq!(score.len(), x.nrows());
             assert!(
                 logdet.is_finite(),
                 "Jeffreys logdet must stay finite for {link:?}"
@@ -238,8 +238,8 @@ mod tests {
                 "hat diagonal must stay finite and non-negative for {link:?}: {hat:?}"
             );
             assert!(
-                shift.iter().all(|value| value.is_finite()),
-                "Firth score shift must stay finite for {link:?}: {shift:?}"
+                score.iter().all(|value| value.is_finite()),
+                "Jeffreys eta-score must stay finite for {link:?}: {score:?}"
             );
         }
     }
@@ -296,16 +296,16 @@ mod tests {
                     .expect("factored weighted operator");
                 let hat_f = op_f.pirls_hat_diag();
                 let logdet_f = op_f.jeffreys_logdet();
-                let shift_f = op_f.pirls_firth_score_shift();
-                let (hat_o, logdet_o, shift_o) =
+                let score_f = op_f.pirls_jeffreys_eta_score();
+                let (hat_o, logdet_o, score_o) =
                     compute_jeffreys_pirls_diagnostics(link, x.view(), eta.view(), weights.view())
                         .expect("oracle weighted diagnostics");
                 assert_relative_eq!(logdet_f, logdet_o, epsilon = 1e-12, max_relative = 1e-12);
                 for i in 0..x.nrows() {
                     assert_relative_eq!(hat_f[i], hat_o[i], epsilon = 1e-12, max_relative = 1e-12);
                     assert_relative_eq!(
-                        shift_f[i],
-                        shift_o[i],
+                        score_f[i],
+                        score_o[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -317,7 +317,7 @@ mod tests {
                     .expect("factored unweighted operator");
                 let hat_fu = op_fu.pirls_hat_diag();
                 let logdet_fu = op_fu.jeffreys_logdet();
-                let shift_fu = op_fu.pirls_firth_score_shift();
+                let score_fu = op_fu.pirls_jeffreys_eta_score();
                 let op_u = FirthDenseOperator::build_for_link(link, &x, eta)
                     .expect("full unweighted operator");
                 assert_relative_eq!(
@@ -327,7 +327,7 @@ mod tests {
                     max_relative = 1e-12
                 );
                 let hat_ou = op_u.pirls_hat_diag();
-                let shift_ou = op_u.pirls_firth_score_shift();
+                let score_ou = op_u.pirls_jeffreys_eta_score();
                 for i in 0..x.nrows() {
                     assert_relative_eq!(
                         hat_fu[i],
@@ -336,8 +336,8 @@ mod tests {
                         max_relative = 1e-12
                     );
                     assert_relative_eq!(
-                        shift_fu[i],
-                        shift_ou[i],
+                        score_fu[i],
+                        score_ou[i],
                         epsilon = 1e-12,
                         max_relative = 1e-12
                     );
@@ -4707,6 +4707,43 @@ mod reporting_loglikelihood_tests {
             "omitting − full must equal Σ ln Γ(y+1) = {dropped}; got {}",
             omitting - total
         );
+    }
+
+    // A fractional binomial prior weight (a scikit-learn `sample_weight` on 0/1
+    // labels) is a weighted Bernoulli log-mass, w·[y ln μ + (1−y) ln(1−μ)]:
+    // the continuous `ln C(w, wy)` normalizer vanishes for a 0/1 response, and
+    // for a proportion it is the lnΓ continuation of the integer coefficient.
+    #[test]
+    fn binomial_full_loglik_accepts_fractional_prior_weights() {
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.4];
+        let mu = array![0.3, 0.8, 0.55, 0.1, 0.35];
+        let w = array![0.5, 2.25, 1.0, 3.7, 2.5];
+        let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
+        let pw = evaluation.pointwise();
+        for row in 0..y.len() {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let log_coefficient = ln_gamma(wi + 1.0)
+                - ln_gamma(wi * yi + 1.0)
+                - ln_gamma(wi * (1.0 - yi) + 1.0);
+            let expected =
+                log_coefficient + wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - expected).abs() < 1e-10,
+                "row {row} (w={wi}, y={yi}): {} vs {expected}",
+                pw[row]
+            );
+        }
+        let bernoulli_rows = [0, 1, 2, 3];
+        for row in bernoulli_rows {
+            let (yi, mui, wi) = (y[row], mu[row], w[row]);
+            let weighted_log_mass = wi * (yi * mui.ln() + (1.0 - yi) * (1.0 - mui).ln());
+            assert!(
+                (pw[row] - weighted_log_mass).abs() < 1e-12,
+                "row {row}: a 0/1 response carries no normalizer at w={wi}"
+            );
+        }
     }
 
     // ---- #1582: Poisson and NB(θ→∞) report the SAME log-likelihood on the same
