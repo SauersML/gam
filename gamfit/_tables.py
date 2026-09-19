@@ -4,7 +4,10 @@ import importlib
 import math
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from ._rust import _EncodedTable
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
@@ -43,7 +46,7 @@ class PreNormalizedTable:
 
     __slots__ = ("headers", "rows", "kind")
 
-    def __init__(self, headers: list[str], rows: Any, kind: str) -> None:
+    def __init__(self, headers: list[str], rows: _EncodedTable, kind: str) -> None:
         self.headers = headers
         self.rows = rows
         self.kind = kind
@@ -57,7 +60,9 @@ class PreNormalizedTable:
 CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
-def normalize_table(data: Any, *, required_columns=None) -> tuple[list[str], Any, str]:
+def normalize_table(
+    data: Any, *, required_columns: Sequence[str] | None = None
+) -> tuple[list[str], _EncodedTable, str]:
     """Encode ``data`` as a Rust-owned typed table.
 
     This is a transport adapter only. Polars and PyArrow tables hand Rust an

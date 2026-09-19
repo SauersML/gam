@@ -445,6 +445,7 @@ mod linux_impl {
                 let (sc, sd, sdmu, sd2, sd3) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &final_eta,
                     input.priorweights,
                 )?;
@@ -996,6 +997,7 @@ mod linux_impl {
                 let (c, d, dmu, d2mu, d3mu) = computeworkingweight_derivatives_from_eta(
                     input.likelihood,
                     input.inverse_link,
+                    input.y,
                     &eta_owned,
                     input.priorweights,
                 )

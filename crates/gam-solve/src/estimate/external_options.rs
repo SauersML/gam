@@ -129,12 +129,16 @@ pub(crate) fn resolve_external_family(
         // smooths log φ; without one, the external GLM route fits the mean with
         // a single estimated φ exactly as betareg does by default.
         (ResponseFamily::Beta { .. }, LinkFunction::Logit) => true,
+        // Scaled Student-t location regression: the inner P-IRLS runs
+        // observed-information Newton with EM weights and the outer LAML
+        // estimates (log σ, log ν) jointly with ρ (`student_t_outer_point`).
+        (ResponseFamily::StudentT { .. }, LinkFunction::Identity) => true,
         _ => false,
     };
     if !external_glm_supported {
         crate::bail_invalid_estim!(
             "the external-design route requires a supported standard GLM family/link; got {}. \
-             The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/loglog/cauchit/SAS/Beta-Logistic), \
+             The external-design route supports Gaussian(identity), Student-t(identity), Binomial(logit/probit/cloglog/loglog/cauchit/SAS/Beta-Logistic), \
              Beta(logit), and Poisson/Gamma/Tweedie/Negative-Binomial(log). For Beta precision modeling \
              add a noise_formula to upgrade to the dispersion-location-scale route",
             family.pretty_name(),

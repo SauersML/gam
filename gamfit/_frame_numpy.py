@@ -42,11 +42,12 @@ def stack_coords_f64(coords: list[Any] | tuple[Any, ...]) -> np.ndarray:
             )
         return a, int(a.shape[0])
 
-    return stack_coords_generic(
+    stacked: np.ndarray = stack_coords_generic(
         coords,
         coerce=_coerce,
         stack=lambda arrays: np.stack(arrays, axis=1),
     )
+    return stacked
 
 
 __all__ = ["to_numpy_f64", "stack_coords_f64"]

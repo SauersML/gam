@@ -2350,6 +2350,19 @@ pub enum CovarianceDeclined {
         /// serde tag.
         unavailable_channel: String,
     },
+    /// Expectile (LAWS) fit whose inner solve published no dense covariance —
+    /// the memory governor refused it and only a factorized diagonal of the
+    /// Gaussian working-model `Vb` exists, or inference was not computed.
+    ///
+    /// The expectile's covariance is the penalized Newey–Powell sandwich
+    /// `H⁻¹(c·Xᵀdiag(w²r²)X + φ̂S_λ)H⁻¹`, a correction of the FULL `Vb`; a
+    /// diagonal alone cannot carry it, and publishing the working-model
+    /// diagonal under the expectile's name is the under-coverage the sandwich
+    /// exists to remove. Point estimation is unaffected and IS published.
+    ExpectileSandwichRequiresDenseCovariance {
+        /// Coefficient count whose dense covariance was not admitted.
+        coefficients: usize,
+    },
 }
 
 impl CovarianceDeclined {
@@ -2410,6 +2423,19 @@ impl CovarianceDeclined {
                      correction exists to add, so the intervals would be too narrow and, on the \
                      wire, indistinguishable from corrected ones. The point estimates are \
                      unaffected and are published. See gam#2985."
+                )
+            }
+            Self::ExpectileSandwichRequiresDenseCovariance { coefficients } => {
+                format!(
+                    "no coefficient covariance was published for this expectile fit: its inner \
+                     solve published no dense {coefficients}-coefficient covariance (the memory \
+                     governor did not admit it, or inference was not computed), and the \
+                     expectile's Newey-Powell sandwich covariance is a correction of that full \
+                     matrix which a factorized diagonal or a bare Hessian cannot carry. \
+                     Publishing the Gaussian working-model standard errors instead is not \
+                     admissible: the asymmetric weights are not inverse variances, so those \
+                     intervals under-cover wherever the noise is large. The point estimates are \
+                     unaffected and are published."
                 )
             }
         }
@@ -2591,8 +2617,11 @@ pub struct FitArtifacts {
     /// git grep -n 'covariance_declined' -- crates/ src/ | grep -E 'covariance_declined\s*='
     /// ```
     ///
-    /// **Today that returns exactly 1** — `bms/block_specs.rs`, the BMS
-    /// Murphy-Topel seam. **If a second producer ever appears, check whether it
+    /// **Outside tests, today that returns** `bms/block_specs.rs` (the BMS
+    /// Murphy-Topel seam), `survival/marginal_slope/generated_regressor.rs`,
+    /// and `fit_orchestration/entry.rs` (the expectile sandwich on a fit whose
+    /// dense covariance was not admitted, persisted whole-fit through
+    /// `assemble_standard_payload`). **If a second producer ever appears, check whether it
     /// persists through a compact constructor; if it does, the parameter must be
     /// threaded and `tests/bms_covariance_declined_2718.rs` extended to cover
     /// that route.** The round-trip test there pins the wire, not the routing,
@@ -6062,7 +6091,9 @@ impl UnifiedFitResult {
         family: &gam_problem::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
         match (&family.response, &family.link) {
-            (ResponseFamily::Gaussian, _) => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::Gaussian, _) | (ResponseFamily::StudentT { .. }, _) => {
+                Ok(FittedLinkState::Standard(None))
+            }
             // Every state-less binomial probability link decodes to the bare
             // `Standard(None)` payload — the concrete `StandardLink` lives on the
             // family/spec, not in the fitted-link record. LogLog and Cauchit
