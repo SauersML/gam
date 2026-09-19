@@ -259,6 +259,11 @@ pub(crate) struct PenaltyBlockSpan {
     pub(crate) end: usize,
     pub(crate) rank_start: usize,
     pub(crate) rank_end: usize,
+    /// Set when the block's eigenvectors are coordinate vectors (every
+    /// component diagonal): entry `j` is the block-local row of the single
+    /// nonzero of W column `rank_start + j`. Reduced projections of diagonal
+    /// penalties are then diagonal and cost O(rank) instead of O(block³).
+    pub(crate) diagonal_rows: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -442,6 +447,7 @@ impl PenaltyPseudologdet {
             pub(crate) value: f64,
             pub(crate) rank: usize,
             pub(crate) nullity: usize,
+            pub(crate) diagonal_rows: Option<Vec<usize>>,
         }
 
         let process_block = |bd: &BlockData| -> Result<BlockResult, String> {
@@ -469,6 +475,11 @@ impl PenaltyPseudologdet {
                 Some(structural_rank),
             )?;
             let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+            let diagonal_rows = block_pld
+                .block_spans
+                .into_iter()
+                .next()
+                .and_then(|span| span.diagonal_rows);
             Ok(BlockResult {
                 start: bd.start,
                 end: bd.end,
@@ -480,6 +491,7 @@ impl PenaltyPseudologdet {
                 value: block_pld.value,
                 rank: block_pld.rank,
                 nullity,
+                diagonal_rows,
             })
         };
         let block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
@@ -516,6 +528,7 @@ impl PenaltyPseudologdet {
                     end: br.end,
                     rank_start: col_offset,
                     rank_end: col_offset + br.rank,
+                    diagonal_rows: br.diagonal_rows.clone(),
                 });
                 col_offset += br.rank;
             }
@@ -882,8 +895,159 @@ impl PenaltyPseudologdet {
                 block_spans: Vec::new(),
             });
         }
+        if components.iter().all(|(_, local, _)| gam_terms::construction::is_diagonal(*local)) {
+            return Self::from_diagonal_components(components, ridge, rank_hint, p_dim);
+        }
         let (evals, evecs) = Self::eigensystem_from_scaled_roots(components, ridge, p_dim)?;
         Self::from_eigensystem(s_total, evals, evecs, ridge, rank_hint, SpectrumScale::Root)
+    }
+
+    /// [`Self::from_scaled_components_with_rank_hint`] when every component is
+    /// diagonal (a ridge, or a random-effect variance over thousands of
+    /// levels). `Σ λ_k S_k + rI` is then diagonal: its eigenvalues are its
+    /// diagonal entries, exact, and its eigenvectors the coordinate vectors,
+    /// so the per-component eigendecompositions and the stacked-root SVD
+    /// (O(p³) each) reduce to per-coordinate arithmetic. Each component's
+    /// entries are thresholded on its own spectrum exactly as
+    /// [`Self::eigensystem_from_scaled_roots`] thresholds its eigenvalues, and
+    /// the positive/null split, value and W-factor follow
+    /// [`Self::from_eigensystem`] on the ascending spectrum.
+    fn from_diagonal_components(
+        components: &[(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)],
+        ridge: Option<f64>,
+        rank_hint: Option<usize>,
+        p_dim: usize,
+    ) -> Result<Self, String> {
+        let mut diag = vec![0.0_f64; p_dim];
+        for (lambda, local, col_range) in components {
+            if !(lambda.is_finite() && *lambda >= 0.0) {
+                return Err(format!(
+                    "PenaltyPseudologdet scaled-root eigensystem requires finite λ ≥ 0, got {lambda}"
+                ));
+            }
+            if *lambda == 0.0 {
+                continue;
+            }
+            let bd = local.nrows();
+            if local.ncols() != bd || col_range.len() != bd || col_range.end > p_dim {
+                return Err(format!(
+                    "PenaltyPseudologdet component block {bd}x{} does not fit col_range {col_range:?} in dimension {p_dim}",
+                    local.ncols()
+                ));
+            }
+            let unit_evals = local.diag().to_vec();
+            let unit_threshold =
+                super::reml_outer_engine::positive_eigenvalue_threshold(&unit_evals);
+            for (li, &ev) in unit_evals.iter().enumerate() {
+                if ev > unit_threshold {
+                    diag[col_range.start + li] += lambda * ev;
+                }
+            }
+        }
+        if let Some(r) = ridge
+            && r > 0.0
+        {
+            for value in &mut diag {
+                *value += r;
+            }
+        }
+        // Ascending spectrum; ties keep coordinate order.
+        let mut order: Vec<usize> = (0..p_dim).collect();
+        order.sort_by(|&a, &b| diag[a].total_cmp(&diag[b]).then(a.cmp(&b)));
+        let evals: Vec<f64> = order.iter().map(|&i| diag[i]).collect();
+        let (positive_indices, null_indices) =
+            Self::split_positive_null(&evals, ridge, rank_hint)?;
+        let rank = positive_indices.len();
+        let value: f64 = positive_indices.iter().map(|&idx| evals[idx].ln()).sum();
+        let mut w_factor = Array2::<f64>::zeros((p_dim, rank));
+        let mut inv_evals_sq = Array1::<f64>::zeros(rank);
+        let mut diagonal_rows = Vec::with_capacity(rank);
+        for (col, &idx) in positive_indices.iter().enumerate() {
+            let ev = evals[idx];
+            inv_evals_sq[col] = 1.0 / (ev * ev);
+            w_factor[[order[idx], col]] = 1.0 / ev.sqrt();
+            diagonal_rows.push(order[idx]);
+        }
+        let u_null = if null_indices.is_empty() {
+            None
+        } else {
+            let mut u0 = Array2::<f64>::zeros((p_dim, null_indices.len()));
+            for (col, &idx) in null_indices.iter().enumerate() {
+                u0[[order[idx], col]] = 1.0;
+            }
+            Some(u0)
+        };
+        Ok(Self {
+            w_factor,
+            u_null,
+            inv_evals_sq,
+            rank,
+            value,
+            block_spans: vec![PenaltyBlockSpan {
+                start: 0,
+                end: p_dim,
+                rank_start: 0,
+                rank_end: rank,
+                diagonal_rows: Some(diagonal_rows),
+            }],
+        })
+    }
+
+    /// The positive/null split of an ascending spectrum: with a structural
+    /// `rank_hint` the top `rank_hint` eigenvalues (each must be positive),
+    /// otherwise every eigenvalue above the noise band (above `r` plus the
+    /// band under a ridge `r`).
+    fn split_positive_null(
+        evals: &[f64],
+        ridge: Option<f64>,
+        rank_hint: Option<usize>,
+    ) -> Result<(Vec<usize>, Vec<usize>), String> {
+        let p_dim = evals.len();
+        let mut positive_indices = Vec::with_capacity(p_dim);
+        let mut null_indices = Vec::with_capacity(p_dim);
+        if let Some(rank_hint) = rank_hint {
+            let rank_hint = rank_hint.min(p_dim);
+            let first_positive = p_dim.saturating_sub(rank_hint);
+            for idx in 0..p_dim {
+                if idx >= first_positive {
+                    let eval = evals[idx];
+                    if !(eval.is_finite() && eval > 0.0) {
+                        return Err(format!(
+                            "PenaltyPseudologdet structural rank hint {rank_hint} selected \
+                             non-positive eigenvalue {eval} at sorted index {idx}"
+                        ));
+                    }
+                    positive_indices.push(idx);
+                } else {
+                    null_indices.push(idx);
+                }
+            }
+        } else {
+            // ridge = None:  boundary = positive_eigenvalue_threshold(evals)
+            //                (= 100 · p · ε · max|e|; eigenvalues at or below
+            //                this are noise around 0).
+            //
+            // ridge = r > 0: boundary = r + delta, where delta is the same
+            //                100 · p · ε · max|e| noise band.  Directions in
+            //                the structural null of the unridged S have
+            //                eigenvalue exactly r in the ridged S; the
+            //                eigendecomposition introduces at most O(p · ε · ‖S‖)
+            //                perturbation, so any eigenvalue ≤ r + delta is
+            //                indistinguishable from ridge-only within FP noise.
+            let noise_band = super::reml_outer_engine::positive_eigenvalue_threshold(evals);
+            let boundary = match ridge {
+                Some(r) if r > 0.0 => r + noise_band,
+                _ => noise_band,
+            };
+            for (idx, &eval) in evals.iter().enumerate() {
+                if eval > boundary {
+                    positive_indices.push(idx);
+                } else {
+                    null_indices.push(idx);
+                }
+            }
+        }
+        Ok((positive_indices, null_indices))
     }
 
     /// Assemble the pseudo-logdet from a precomputed eigensystem of
@@ -906,56 +1070,13 @@ impl PenaltyPseudologdet {
         scale: SpectrumScale,
     ) -> Result<Self, String> {
         let p_dim = s_total.nrows();
-        // Compute the null-vs-active boundary purely from the spectrum.
-        //
-        //   ridge = None:  boundary = positive_eigenvalue_threshold(evals)
-        //                  (= 100 · p · ε · max|e|; eigenvalues at or below
-        //                  this are noise around 0).
-        //
-        //   ridge = r > 0: boundary = r + delta, where delta is the same
-        //                  100 · p · ε · max|e| noise band.  Directions in
-        //                  the structural null of the unridged S have
-        //                  eigenvalue exactly r in the ridged S; the
-        //                  eigendecomposition introduces at most O(p · ε · ‖S‖)
-        //                  perturbation, so any eigenvalue ≤ r + delta is
-        //                  indistinguishable from ridge-only within FP noise.
-        let noise_band = super::reml_outer_engine::positive_eigenvalue_threshold(
+        let (positive_indices, null_indices) = Self::split_positive_null(
             evals
                 .as_slice()
                 .expect("eigh returns a freshly allocated contiguous eigenvalue array"),
-        );
-        let boundary = match ridge {
-            Some(r) if r > 0.0 => r + noise_band,
-            _ => noise_band,
-        };
-        let mut positive_indices = Vec::with_capacity(p_dim);
-        let mut null_indices = Vec::with_capacity(p_dim);
-        if let Some(rank_hint) = rank_hint {
-            let rank_hint = rank_hint.min(p_dim);
-            let first_positive = p_dim.saturating_sub(rank_hint);
-            for idx in 0..p_dim {
-                if idx >= first_positive {
-                    let eval = evals[idx];
-                    if !(eval.is_finite() && eval > 0.0) {
-                        return Err(format!(
-                            "PenaltyPseudologdet structural rank hint {rank_hint} selected \
-                             non-positive eigenvalue {eval} at sorted index {idx}"
-                        ));
-                    }
-                    positive_indices.push(idx);
-                } else {
-                    null_indices.push(idx);
-                }
-            }
-        } else {
-            for (idx, &eval) in evals.iter().enumerate() {
-                if eval > boundary {
-                    positive_indices.push(idx);
-                } else {
-                    null_indices.push(idx);
-                }
-            }
-        }
+            ridge,
+            rank_hint,
+        )?;
         let rank = positive_indices.len();
         let nullity = null_indices.len();
 
@@ -1091,6 +1212,7 @@ impl PenaltyPseudologdet {
             value: f64,
             rank: usize,
             nullity: usize,
+            diagonal_rows: Option<Vec<usize>>,
         }
 
         // Eigendecompose each disjoint block in its own frame.
@@ -1139,6 +1261,11 @@ impl PenaltyPseudologdet {
                 Some(structural_rank),
             )?;
             let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+            let diagonal_rows = block_pld
+                .block_spans
+                .into_iter()
+                .next()
+                .and_then(|span| span.diagonal_rows);
             block_results.push(BlockResult {
                 start,
                 end,
@@ -1150,6 +1277,7 @@ impl PenaltyPseudologdet {
                 value: block_pld.value,
                 rank: block_pld.rank,
                 nullity,
+                diagonal_rows,
             });
         }
 
@@ -1176,6 +1304,7 @@ impl PenaltyPseudologdet {
                     end: br.end,
                     rank_start: col_offset,
                     rank_end: col_offset + br.rank,
+                    diagonal_rows: br.diagonal_rows.clone(),
                 });
                 col_offset += br.rank;
             }
@@ -1421,9 +1550,18 @@ impl PenaltyPseudologdet {
             return (Array1::zeros(k), Array2::zeros((k, k)));
         }
 
+        /// `Y_k = WᵀS_kW` restricted to the W columns of one span. A diagonal
+        /// penalty against a span whose W columns are scaled coordinate
+        /// vectors gives a diagonal `Y_k`, stored as its diagonal.
+        enum ReducedY {
+            Dense(Array2<f64>),
+            Diagonal(Array1<f64>),
+        }
         struct ReducedPenalty {
-            pub(crate) span: Option<usize>,
-            pub(crate) y: Array2<f64>,
+            span: Option<usize>,
+            /// First W column `y` is indexed from.
+            rank_offset: usize,
+            y: ReducedY,
         }
 
         // `CanonicalPenalty::root` IS the `rank_k × block_dim` factor with
@@ -1446,6 +1584,25 @@ impl PenaltyPseudologdet {
                 let local_start = start - span.start;
                 let local_end = local_start + (end - start);
                 assert_eq!(local_end - local_start, penalty.local.nrows());
+                if let Some(rows) = span.diagonal_rows.as_ref()
+                    && gam_terms::construction::is_diagonal(penalty.local.view())
+                {
+                    // `wᵀS w` for a W column with one nonzero `w` at row `g`
+                    // is `S[g,g]·w²`, exactly the Gram of the root's column.
+                    let mut y = Array1::<f64>::zeros(rows.len());
+                    for (j, &row) in rows.iter().enumerate() {
+                        let g = span.start + row;
+                        if (start..end).contains(&g) {
+                            let w = self.w_factor[[g, span.rank_start + j]];
+                            y[j] = penalty.local[[g - start, g - start]] * w * w;
+                        }
+                    }
+                    return ReducedPenalty {
+                        span: Some(span_idx),
+                        rank_offset: span.rank_start,
+                        y: ReducedY::Diagonal(y),
+                    };
+                }
                 let w_block = self
                     .w_factor
                     .slice(s![start..end, span.rank_start..span.rank_end]);
@@ -1456,7 +1613,8 @@ impl PenaltyPseudologdet {
                 };
                 ReducedPenalty {
                     span: Some(span_idx),
-                    y,
+                    rank_offset: span.rank_start,
+                    y: ReducedY::Dense(y),
                 }
             } else {
                 // Overlapping/global fallback: still avoid cloning the block view.
@@ -1468,7 +1626,8 @@ impl PenaltyPseudologdet {
                 };
                 ReducedPenalty {
                     span: None,
-                    y,
+                    rank_offset: 0,
+                    y: ReducedY::Dense(y),
                 }
             }
         };
@@ -1481,50 +1640,53 @@ impl PenaltyPseudologdet {
 
         let mut det1 = Array1::<f64>::zeros(k);
         for (idx, reduced) in y_k.iter().enumerate() {
-            let tr: f64 = (0..reduced.y.nrows()).map(|i| reduced.y[[i, i]]).sum();
+            let tr: f64 = match &reduced.y {
+                ReducedY::Dense(y) => (0..y.nrows()).map(|i| y[[i, i]]).sum(),
+                ReducedY::Diagonal(y) => y.sum(),
+            };
             det1[idx] = lambdas[idx] * tr;
         }
 
+        // tr(Y_a Y_b) over W columns both projections share.
+        let trace_pair = |a: &ReducedPenalty, b: &ReducedPenalty| -> f64 {
+            match (&a.y, &b.y) {
+                (ReducedY::Dense(ya), ReducedY::Dense(yb)) => Self::trace_dense_product(ya, yb),
+                (ReducedY::Diagonal(da), ReducedY::Diagonal(db)) => da.dot(db),
+                (ReducedY::Diagonal(d), ReducedY::Dense(y))
+                | (ReducedY::Dense(y), ReducedY::Diagonal(d)) => {
+                    let (diag_offset, dense_offset) = match (&a.y, &b.y) {
+                        (ReducedY::Diagonal(_), _) => (a.rank_offset, b.rank_offset),
+                        _ => (b.rank_offset, a.rank_offset),
+                    };
+                    let shift = diag_offset - dense_offset;
+                    d.iter()
+                        .enumerate()
+                        .map(|(j, &value)| value * y[[shift + j, shift + j]])
+                        .sum()
+                }
+            }
+        };
+        let pair_value = |ki: usize, li: usize| -> (usize, usize, f64) {
+            let same_span = match (y_k[ki].span, y_k[li].span) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            };
+            let tr_ab = if same_span {
+                trace_pair(&y_k[ki], &y_k[li])
+            } else {
+                0.0
+            };
+            let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
+            if ki == li {
+                val += det1[ki];
+            }
+            (ki, li, val)
+        };
         let pairs = (0..k).flat_map(|ki| (0..=ki).map(move |li| (ki, li)));
         let pair_vals: Vec<(usize, usize, f64)> = if rayon::current_thread_index().is_some() {
-            pairs
-                .map(|(ki, li)| {
-                    let same_span = match (y_k[ki].span, y_k[li].span) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    };
-                    let tr_ab = if same_span {
-                        Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
-                    } else {
-                        0.0
-                    };
-                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                    if ki == li {
-                        val += det1[ki];
-                    }
-                    (ki, li, val)
-                })
-                .collect()
+            pairs.map(|(ki, li)| pair_value(ki, li)).collect()
         } else {
-            pairs
-                .par_bridge()
-                .map(|(ki, li)| {
-                    let same_span = match (y_k[ki].span, y_k[li].span) {
-                        (Some(a), Some(b)) => a == b,
-                        _ => true,
-                    };
-                    let tr_ab = if same_span {
-                        Self::trace_dense_product(&y_k[ki].y, &y_k[li].y)
-                    } else {
-                        0.0
-                    };
-                    let mut val = -lambdas[ki] * lambdas[li] * tr_ab;
-                    if ki == li {
-                        val += det1[ki];
-                    }
-                    (ki, li, val)
-                })
-                .collect()
+            pairs.par_bridge().map(|(ki, li)| pair_value(ki, li)).collect()
         };
         let mut det2 = Array2::<f64>::zeros((k, k));
         for (ki, li, val) in pair_vals {
@@ -2128,21 +2290,21 @@ mod tests {
     pub(crate) fn test_overlapping_ignores_inactive_lambda_for_structural_nullity() {
         let penalties = [
             gam_terms::construction::CanonicalPenalty {
-                root: array![[1.0, 0.0]],
+                root: array![[1.0, 0.0]].into_shared(),
                 col_range: 0..2,
                 total_dim: 3,
                 nullity: 1,
-                local: array![[1.0, 0.0], [0.0, 0.0]],
+                local: array![[1.0, 0.0], [0.0, 0.0]].into_shared(),
                 prior_mean: Array1::zeros(2),
                 positive_eigenvalues: vec![1.0],
                 op: None,
             },
             gam_terms::construction::CanonicalPenalty {
-                root: array![[1.0, 0.0]],
+                root: array![[1.0, 0.0]].into_shared(),
                 col_range: 1..3,
                 total_dim: 3,
                 nullity: 1,
-                local: array![[1.0, 0.0], [0.0, 0.0]],
+                local: array![[1.0, 0.0], [0.0, 0.0]].into_shared(),
                 prior_mean: Array1::zeros(2),
                 positive_eigenvalues: vec![1.0],
                 op: None,
@@ -2166,37 +2328,154 @@ mod tests {
         );
     }
 
+    /// A block of diagonal components (a random-effect ridge with a second,
+    /// same-range diagonal penalty) is factorized in closed form; the result
+    /// must equal the generic stacked-root SVD route to rounding, including
+    /// the ρ-derivatives read off the diagonal reduced projections and a
+    /// neighbouring non-diagonal block.
+    #[test]
+    fn diagonal_block_closed_form_matches_generic_scaled_root_route() {
+        let p_total = 8;
+        let lambdas = [0.8_f64, 3.1_f64, 1.9_f64];
+        let smooth_root = array![[1.0, -1.0, 0.0], [0.0, 1.0, -1.0]];
+        let penalties = vec![
+            gam_terms::construction::CanonicalPenalty {
+                root: array![
+                    [2.0_f64.sqrt(), 0.0, 0.0, 0.0],
+                    [0.0, 0.5_f64.sqrt(), 0.0, 0.0],
+                    [0.0, 0.0, 3.0_f64.sqrt(), 0.0]
+                ]
+                .into_shared(),
+                col_range: 0..4,
+                total_dim: p_total,
+                nullity: 1,
+                local: Array2::from_diag(&array![2.0, 0.5, 3.0, 0.0]).into_shared(),
+                prior_mean: Array1::zeros(4),
+                positive_eigenvalues: vec![3.0, 2.0, 0.5],
+                op: None,
+            },
+            gam_terms::construction::CanonicalPenalty {
+                root: array![[0.0, 1.5_f64.sqrt(), 0.0, 0.0]].into_shared(),
+                col_range: 0..4,
+                total_dim: p_total,
+                nullity: 3,
+                local: Array2::from_diag(&array![0.0, 1.5, 0.0, 0.0]).into_shared(),
+                prior_mean: Array1::zeros(4),
+                positive_eigenvalues: vec![1.5],
+                op: None,
+            },
+            gam_terms::construction::CanonicalPenalty {
+                local: smooth_root.t().dot(&smooth_root).into_shared(),
+                root: smooth_root.into_shared(),
+                col_range: 4..7,
+                total_dim: p_total,
+                nullity: 1,
+                prior_mean: Array1::zeros(3),
+                positive_eigenvalues: vec![3.0, 1.0],
+                op: None,
+            },
+        ];
+
+        let fast = PenaltyPseudologdet::from_penalties(&penalties, &lambdas, p_total).unwrap();
+        assert!(
+            fast.block_spans
+                .iter()
+                .any(|span| span.start == 0 && span.diagonal_rows.is_some()),
+            "the diagonal block must take the closed-form route"
+        );
+
+        // Generic route: one stacked-root SVD over the whole space.
+        let mut s_total = Array2::<f64>::zeros((p_total, p_total));
+        for (penalty, &lambda) in penalties.iter().zip(&lambdas) {
+            penalty.accumulate_weighted(&mut s_total, lambda);
+        }
+        let components: Vec<(f64, ndarray::ArrayView2<'_, f64>, std::ops::Range<usize>)> =
+            penalties
+                .iter()
+                .zip(&lambdas)
+                .map(|(penalty, &lambda)| (lambda, penalty.local.view(), penalty.col_range.clone()))
+                .collect();
+        let rank = structural_rank_from_canonical_penalties(&penalties, &lambdas, p_total).unwrap();
+        let (evals, evecs) =
+            PenaltyPseudologdet::eigensystem_from_scaled_roots(&components, None, p_total).unwrap();
+        let generic = PenaltyPseudologdet::from_eigensystem(
+            &s_total,
+            evals,
+            evecs,
+            None,
+            Some(rank),
+            SpectrumScale::Root,
+        )
+        .unwrap();
+        assert!(generic.block_spans.is_empty());
+
+        assert_eq!(fast.rank, generic.rank);
+        assert_eq!(fast.rank, 5);
+        assert!((fast.value - generic.value).abs() < 1e-12);
+        let pinv_fast = fast.w_factor.dot(&fast.w_factor.t());
+        let pinv_generic = generic.w_factor.dot(&generic.w_factor.t());
+        for (a, b) in pinv_fast.iter().zip(pinv_generic.iter()) {
+            assert!((a - b).abs() < 1e-12, "S⁺ mismatch: {a} vs {b}");
+        }
+        let null_fast = fast.u_null.as_ref().unwrap();
+        let null_generic = generic.u_null.as_ref().unwrap();
+        let proj_fast = null_fast.dot(&null_fast.t());
+        let proj_generic = null_generic.dot(&null_generic.t());
+        for (a, b) in proj_fast.iter().zip(proj_generic.iter()) {
+            assert!((a - b).abs() < 1e-12, "null projector mismatch: {a} vs {b}");
+        }
+        let mut inv_fast = fast.inv_evals_sq.to_vec();
+        let mut inv_generic = generic.inv_evals_sq.to_vec();
+        inv_fast.sort_by(f64::total_cmp);
+        inv_generic.sort_by(f64::total_cmp);
+        for (a, b) in inv_fast.iter().zip(&inv_generic) {
+            assert!((a - b).abs() < 1e-12 * b.abs().max(1.0));
+        }
+
+        let (fast_first, fast_second) = fast.rho_derivatives_from_penalties(&penalties, &lambdas);
+        let (generic_first, generic_second) =
+            generic.rho_derivatives_from_penalties(&penalties, &lambdas);
+        for k in 0..lambdas.len() {
+            assert!((fast_first[k] - generic_first[k]).abs() < 1e-12);
+            for l in 0..lambdas.len() {
+                assert!((fast_second[[k, l]] - generic_second[[k, l]]).abs() < 1e-12);
+            }
+        }
+        // Coordinate 1 carries both diagonal penalties: the pair couples.
+        assert!(fast_second[[0, 1]].abs() > 1e-3);
+    }
+
     #[test]
     pub(crate) fn test_block_factored_rho_derivatives_match_dense_without_cross_block_work() {
         let p_total = 6;
         let lambdas = [1.7_f64, 0.4_f64, 2.3_f64];
         let penalties = vec![
             gam_terms::construction::CanonicalPenalty {
-                root: array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+                root: array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]].into_shared(),
                 col_range: 0..3,
                 total_dim: p_total,
                 nullity: 1,
-                local: array![[1.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 0.0]],
+                local: array![[1.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 0.0]].into_shared(),
                 prior_mean: Array1::zeros(3),
                 positive_eigenvalues: vec![1.0, 4.0],
                 op: None,
             },
             gam_terms::construction::CanonicalPenalty {
-                root: array![[0.0, 0.0, 3.0]],
+                root: array![[0.0, 0.0, 3.0]].into_shared(),
                 col_range: 0..3,
                 total_dim: p_total,
                 nullity: 2,
-                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 9.0]],
+                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 9.0]].into_shared(),
                 prior_mean: Array1::zeros(3),
                 positive_eigenvalues: vec![9.0],
                 op: None,
             },
             gam_terms::construction::CanonicalPenalty {
-                root: array![[1.5, 0.0, 0.0], [0.0, 0.0, 0.5]],
+                root: array![[1.5, 0.0, 0.0], [0.0, 0.0, 0.5]].into_shared(),
                 col_range: 3..6,
                 total_dim: p_total,
                 nullity: 1,
-                local: array![[2.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.25]],
+                local: array![[2.25, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.25]].into_shared(),
                 prior_mean: Array1::zeros(3),
                 positive_eigenvalues: vec![2.25, 0.25],
                 op: None,
@@ -2235,21 +2514,21 @@ mod tests {
         let lambdas = [1.0e12_f64, 1.0e-6_f64];
         let penalties = vec![
             gam_terms::construction::CanonicalPenalty {
-                root: array![[10.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                root: array![[10.0, 0.0, 0.0], [0.0, 1.0, 0.0]].into_shared(),
                 col_range: 0..3,
                 total_dim: p_total,
                 nullity: 1,
-                local: array![[100.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+                local: array![[100.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]].into_shared(),
                 prior_mean: Array1::zeros(3),
                 positive_eigenvalues: vec![100.0, 1.0],
                 op: None,
             },
             gam_terms::construction::CanonicalPenalty {
-                root: array![[0.0, 0.0, 1.0]],
+                root: array![[0.0, 0.0, 1.0]].into_shared(),
                 col_range: 0..3,
                 total_dim: p_total,
                 nullity: 2,
-                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                local: array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]].into_shared(),
                 prior_mean: Array1::zeros(3),
                 positive_eigenvalues: vec![1.0],
                 op: None,

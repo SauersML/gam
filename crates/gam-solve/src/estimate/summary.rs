@@ -80,6 +80,13 @@ pub enum SmoothPValueUnavailable {
     /// The scale is estimated, but the fit has no positive residual degrees of
     /// freedom for the denominator of the reference law.
     ResidualDfUnavailable,
+    /// A random-effect term whose variance-component score test
+    /// (`gam_terms::inference::random_effect_test`) could not be computed, with
+    /// the test's own reason.
+    RandomEffect(gam_terms::inference::random_effect_test::RandomEffectTestUnavailable),
+    /// A random-effect term the fit carries no test record for: a model saved
+    /// before the test existed, or a fit route that does not compute it.
+    RandomEffectTestNotRecorded,
 }
 
 impl SmoothPValueUnavailable {
@@ -92,6 +99,8 @@ impl SmoothPValueUnavailable {
             Self::DispersionUnavailable => "dispersion_unavailable",
             Self::NotIdentified => "not_identified",
             Self::ResidualDfUnavailable => "residual_df_unavailable",
+            Self::RandomEffect(reason) => reason.label(),
+            Self::RandomEffectTestNotRecorded => "random_effect_test_not_recorded",
         }
     }
 
@@ -123,6 +132,10 @@ impl SmoothPValueUnavailable {
             Self::ResidualDfUnavailable => {
                 "residual df unavailable: the scale is estimated but the fit has no positive \
                  residual degrees of freedom; no p-value is reported"
+            }
+            Self::RandomEffect(reason) => reason.explanation(),
+            Self::RandomEffectTestNotRecorded => {
+                "the fit carries no variance-component test for this random effect"
             }
         }
     }

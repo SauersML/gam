@@ -113,6 +113,8 @@ fn report(formula: &str, data: &gam::data::EncodedDataset) -> gam::smooth::Smoot
         .into_iter()
         .find(|r| r.name.contains('z'))
         .unwrap_or_else(|| panic!("no s(z) report for {formula}"))
+        .outcome
+        .unwrap_or_else(|reason| panic!("s(z) has no LR inference for {formula}: {reason}"))
 }
 
 /// The block-offset guard, stated as an exact accounting identity so no seed can

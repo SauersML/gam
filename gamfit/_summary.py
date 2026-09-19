@@ -260,7 +260,9 @@ class Summary:
         :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
         estimated) is the null law at the fitted smoothing parameters of the
         other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
-        Random-effect smooths report ``edf`` only. A smooth with no valid
+        Random-effect blocks carry the score test of their variance component
+        against its exact boundary null law, or a ``"random_effect_*"``
+        reason when it could not be scored. A smooth with no valid
         p-value has no ``chi_sq`` or ``p_value`` and carries a
         ``p_value_unavailable`` reason instead: ``"shape_constrained"`` (the
         null is the apex of the constraint cone), ``"unpenalized_direction"``

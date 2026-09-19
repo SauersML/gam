@@ -147,6 +147,7 @@ nav:
     - Predictions: predictions.md
     - Posterior sampling: posterior-sampling.md
     - Diagnostics, summaries, reports: diagnostics.md
+    - p-values and calibration: pvalues.md
     - scikit-learn integration: sklearn.md
     - PyTorch integration: torch.md
     - Save and load: persistence.md

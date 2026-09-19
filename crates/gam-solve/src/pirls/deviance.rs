@@ -2320,6 +2320,66 @@ pub(crate) fn pirls_data_log_kernel_from_eta(
     }
 }
 
+/// Deviance and data log-kernel from ONE row pass, for a likelihood whose eta
+/// log-measure scale is zero (Bernoulli/binomial, Poisson, NB, Beta, ...).
+///
+/// `calculate_deviance_from_eta` evaluates each row at log-measure scale zero,
+/// and the log-kernel pass evaluates the same row at
+/// [`eta_log_measure_scale`]. When that scale is zero the two row evaluations
+/// are the same computation, so this pass evaluates it once and feeds both
+/// reductions; each sum runs over the same summands in the same order as the
+/// two-pass path, so both values are bit-identical to it. Returns `None` for a
+/// profiled Gaussian, for Tweedie (whose response validation lives in
+/// `loglik_deviance`) and for a non-zero scale; the caller keeps the two-pass
+/// path there.
+pub(crate) fn unit_measure_deviance_and_log_kernel_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<Option<(f64, f64)>, EstimationError> {
+    if matches!(likelihood.spec.response, ResponseFamily::Tweedie { .. })
+        || matches!(
+            likelihood.resolved_scale(),
+            Ok(gam_problem::ResolvedLikelihoodScale::ProfiledGaussian)
+        )
+    {
+        return Ok(None);
+    }
+    validate_deviance_row_inputs(y, eta, likelihood, priorweights)?;
+    if eta_log_measure_scale(likelihood)? != 0.0 {
+        return Ok(None);
+    }
+    let rows = super::par_certified_rows(y.len(), |i| {
+        let deviance_row = deviance_eta_row_with_log_measure_scale(
+            i,
+            y[i],
+            eta[i],
+            likelihood,
+            inverse_link,
+            priorweights[i],
+            0.0,
+        )?;
+        let log_likelihood = omitted_log_likelihood_row(
+            i,
+            y[i],
+            eta[i],
+            priorweights[i],
+            &likelihood.spec.response,
+            deviance_row,
+        )?;
+        Ok((deviance_row.half_deviance, log_likelihood))
+    })?;
+    let (half_values, log_likelihood_rows): (Vec<f64>, Vec<f64>) = rows.into_iter().unzip();
+    let deviance = 2.0 * stable_finite_signed_sum(&half_values, "deviance half-sum")?;
+    if !deviance.is_finite() {
+        crate::bail_invalid_estim!("deviance reduction exceeded f64 range");
+    }
+    let log_kernel = stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")?;
+    Ok(Some((deviance, log_kernel)))
+}
+
 #[inline]
 pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
     let inv = 1.0 / x;
@@ -2517,14 +2577,18 @@ fn full_log_likelihood_row(
                 ));
             }
         }
+        // A binomial prior weight need not be an integer trial count: the
+        // normalizer is the continuous extension `ln C(w, wy)` (see
+        // `binomial_log_coefficient_from_proportion`), which is exactly zero for
+        // a 0/1 response under any real weight, so a fractional sample weight on
+        // Bernoulli data is the weighted Bernoulli log-mass.
         ResponseFamily::Binomial => {
-            let successes = weight * y;
-            if !exact_integer(weight) || !exact_integer(successes) {
+            if !(weight.is_finite() && weight > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
-                    "fully-normalized binomial trials/successes (exact integers required)",
+                    "fully-normalized binomial prior weight (finite and positive required)",
                     eta,
-                    successes,
+                    weight,
                 ));
             }
         }

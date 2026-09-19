@@ -29,11 +29,11 @@ fn penalty(local: Array2<f64>, total_dim: usize) -> CanonicalPenalty {
         }
     }
     CanonicalPenalty {
-        root,
+        root: root.into_shared(),
         col_range: 0..block,
         total_dim,
         nullity: block - rank,
-        local,
+        local: local.into_shared(),
         prior_mean: Array1::zeros(block),
         positive_eigenvalues: positive,
         op: None,
@@ -277,7 +277,7 @@ fn disjoint_penalty_supports_have_no_invariance_2676() {
     widened
         .slice_mut(ndarray::s![..2, ..2])
         .assign(&overlapping[0].local);
-    overlapping[0].local = widened;
+    overlapping[0].local = widened.into_shared();
     overlapping[0].col_range = 0..3;
     overlapping[0].prior_mean = Array1::zeros(3);
     let general =
