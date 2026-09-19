@@ -162,7 +162,12 @@ def test_factor_level_curve_is_detected_under_a_binomial_response():
             contextlib.redirect_stdout(io.StringIO()),
         ):
             warnings.simplefilter("ignore")
-            model = gamfit.fit(frame, "y ~ s(x, by=g)", family="binomial")
+            try:
+                model = gamfit.fit(frame, "y ~ s(x, by=g)", family="binomial")
+            except gamfit.errors.RemlConvergenceError:
+                # The outer search refused to certify this fit, so the user gets
+                # no p-value and the curve is not found: a miss, not a skip.
+                continue
             rows = {row["name"]: row for row in model.summary().smooth_terms}
         row = rows["s(x, by=g):by=g[a]"]
         assert row["p_value"] is not None, row.get("p_value_unavailable")
