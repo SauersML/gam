@@ -177,7 +177,7 @@ fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
 
     // Finite entries are kept as computed, however small. Before an
     // eigendecomposition, `classify_eigenvalues_strict` already snaps roundoff at
-    // `max(64·ε·p, REL_PSD_FLOOR)·λ_max`, and every entry-level roundoff is bounded
+    // `max(p·ε, REL_PSD_FLOOR)·λ_max`, and every entry-level roundoff is bounded
     // by it because `|M_ij| ≤ ‖M‖₂`.
     for i in 0..rows {
         for j in 0..cols {
@@ -264,10 +264,10 @@ pub fn trace_penalty_covariance_in_orthogonal_basis(
 /// (mass-zeroing negative or non-finite eigenvalues) hid construction bugs and
 /// changed the optimisation objective downstream.
 ///
-/// The acceptance tolerance is the larger of a machine-ε floor
-/// (`C_EPS_P_FACTOR * eps_machine * p * scale`, with `C_EPS_P_FACTOR = 64`
-/// absorbing the rounding accumulated in a symmetric eigendecomposition of a
-/// moderate-dimension matrix) and a relative "numerically PSD" floor
+/// The acceptance tolerance is the larger of the eigendecomposition's own
+/// rounding band (`gam_linalg::roundoff::symmetric_spectrum_rounding_band`,
+/// `p·ε·scale`: a backward-stable symmetric eigensolver perturbs every
+/// eigenvalue by at most that much) and a relative "numerically PSD" floor
 /// `REL_PSD_FLOOR * scale`. The latter dominates for large high-rank penalties
 /// assembled / reparameterized at extreme λ, where roundoff produces
 /// ~1e-11-relative negative eigenvalues that are PSD to any reasonable precision
@@ -278,13 +278,10 @@ fn classify_eigenvalues_strict(
     eigenvalues: &mut [f64],
     context: &str,
 ) -> Result<(), EstimationError> {
-    const C_EPS_P_FACTOR: f64 = 64.0;
     // `REL_PSD_FLOOR` (module-level): the relative threshold below which a
     // (possibly slightly negative) eigenvalue is roundoff and is snapped to zero
     // rather than rejected. Shared with the subspace-leakage guard so the null
     // definition and the leakage tolerance stay mutually consistent.
-    let p = eigenvalues.len();
-
     let mut scale = 0.0_f64;
     for (idx, &val) in eigenvalues.iter().enumerate() {
         if !val.is_finite() {
@@ -297,13 +294,13 @@ fn classify_eigenvalues_strict(
         scale = scale.max(val.abs());
     }
 
-    // p * eps captures the rounding floor of a symmetric eigendecomposition of a
-    // p-dimensional matrix; multiplying by `scale` lifts the floor to the actual
-    // magnitude of the spectrum. For large high-rank penalties assembled at
-    // extreme λ this machine floor (~12×ε relative) is tighter than the roundoff
-    // actually produced, so we take the larger of it and a relative numerically-PSD
-    // floor `REL_PSD_FLOOR * scale` (#1619).
-    let machine_floor = C_EPS_P_FACTOR * f64::EPSILON * (p.max(1) as f64) * scale;
+    // `p·ε·scale` bounds the rounding a backward-stable symmetric
+    // eigendecomposition of a p-dimensional matrix adds to each eigenvalue. For
+    // large high-rank penalties assembled at extreme λ this machine band is
+    // tighter than the roundoff the assembly itself produced, so we take the
+    // larger of it and a relative numerically-PSD floor `REL_PSD_FLOOR * scale`
+    // (#1619).
+    let machine_floor = gam_linalg::roundoff::symmetric_spectrum_rounding_band(eigenvalues);
     let tolerance = machine_floor
         .max(REL_PSD_FLOOR * scale)
         .max(f64::MIN_POSITIVE);
@@ -3789,7 +3786,7 @@ mod tests {
 
     #[test]
     fn classify_strict_accepts_roundoff_negative() {
-        // -1e-16 * scale is well within tol = 64 * eps * p * scale.
+        // -1e-16 * scale is well within tol = max(p·ε, REL_PSD_FLOOR) * scale.
         let scale = 1.0_f64;
         let roundoff = -1e-16 * scale;
         let mut eigs = [scale, 0.5 * scale, roundoff, 0.25 * scale];
@@ -3822,6 +3819,29 @@ mod tests {
         assert_eq!(eigs[2], 0.0);
         // Strictly positive entries are preserved.
         assert!(eigs[0] > 0.0 && eigs[1] > 0.0 && eigs[3] > 0.0);
+    }
+
+    #[test]
+    fn classify_strict_tolerance_is_the_larger_of_the_eigensolver_band_and_psd_floor_2469() {
+        // The reported tolerance is exactly `max(p·ε·scale, REL_PSD_FLOOR·scale)`:
+        // the eigensolver's rounding band comes from the roundoff owner, not a
+        // local slack multiplier.
+        let scale = 3.0_f64;
+        let offending = -2.0 * REL_PSD_FLOOR * scale;
+        let mut eigs = [scale, 0.5 * scale, offending];
+        let expected = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigs)
+            .max(REL_PSD_FLOOR * scale);
+        match classify_eigenvalues_strict(&mut eigs, "test_band") {
+            Err(EstimationError::PenaltySpectrumIndefinite { tolerance, .. }) => {
+                assert_eq!(tolerance, expected);
+            }
+            other => panic!("expected PenaltySpectrumIndefinite, got {:?}", other),
+        }
+        // Negative control: just inside the same tolerance the eigenvalue is
+        // roundoff and snaps to zero.
+        let mut eigs = [scale, 0.5 * scale, -0.5 * REL_PSD_FLOOR * scale];
+        classify_eigenvalues_strict(&mut eigs, "test_band").expect("inside the band snaps");
+        assert_eq!(eigs[2], 0.0);
     }
 
     #[test]

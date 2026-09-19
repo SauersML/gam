@@ -988,6 +988,28 @@ fn nonfinite_signed_margin(row: usize, frame: &str, margin: f64) -> String {
     .into()
 }
 
+/// The model a rigid cache build on frame `G` asks the device row jet for,
+/// read from the frame's own declarations.
+pub(crate) const fn rigid_row_jet_model<const P: usize, G: SlopeRowGeometry<P>>()
+-> crate::gpu_kernels::survival_rowjet::SurvivalRowJetModel {
+    crate::gpu_kernels::survival_rowjet::SurvivalRowJetModel {
+        follow_up_varying_slope: G::FOLLOW_UP_VARYING,
+        anchored_latent_law: G::ANCHORED,
+    }
+}
+
+/// Which kernel evaluates an `n`-row rigid cache build on frame `G`: the one
+/// decision, read at fit entry (where `gpu=required` for a frame the row jet
+/// does not compute is refused before any seed) and by every batched build.
+pub(crate) fn rigid_row_jet_decision<const P: usize, G: SlopeRowGeometry<P>>(
+    n: usize,
+) -> Result<gam_gpu::GpuDecision, String> {
+    crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_decision(
+        &rigid_row_jet_model::<P, G>(),
+        n,
+    )
+}
+
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
 /// [`rigid_row_nll`]; this exposes it through [`gam_math::jet_tower::RowProgram`]
 /// so the `RowKernel` derivative channels below derive mechanically from `eval`
@@ -1052,18 +1074,15 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; P]>, Vec<[[f64; P]; P]>), String>> {
-        use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
-
-        // The device pullback is written for the four-primary Gaussian frame. A
-        // follow-up-varying slope, or a declared latent law, takes the ordinary
-        // per-row CPU path rather than a silently different lowering.
-        if G::FOLLOW_UP_VARYING || G::ANCHORED {
-            return None;
-        }
+        // The device pullback is written for the four-primary Gaussian frame,
+        // and the decision reads that declaration: a follow-up-varying slope, or
+        // a declared latent law, takes the ordinary per-row CPU path under
+        // `auto` rather than a silently different lowering, and is refused
+        // under `required`.
         let n = self.family.n;
-        match survival_rigid_row_vgh_device_selected(n) {
-            Ok(true) => {}
-            Ok(false) => return None,
+        match rigid_row_jet_decision::<P, G>(n) {
+            Ok(decision) if decision.use_gpu => {}
+            Ok(_) => return None,
             Err(error) => return Some(Err(error)),
         }
 
