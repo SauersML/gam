@@ -1751,19 +1751,13 @@ pub fn build_survival_time_basis(
                     }
                 }
             }
-            let x_derivative_time =
-                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
-                {
-                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                    Err(_) => {
-                        // Fallback: build dense
-                        let mut dense = Array2::<f64>::zeros((n, p_time));
-                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                            dense[[row, col]] = val;
-                        }
-                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                    }
-                };
+            // Every triplet is indexed inside `n × p_time` by construction, so
+            // assembly fails only on allocation, which is an error, not a
+            // reason to build a second (dense) copy of the same matrix.
+            let x_derivative_time = DesignMatrix::Sparse(SparseDesignMatrix::new(
+                faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                    .map_err(|e| format!("failed to assemble the time derivative design: {e:?}"))?,
+            ));
 
             let nullspace_dims = entry_basis
                 .active_penalties
@@ -2011,18 +2005,13 @@ pub fn build_survival_time_basis(
                     col + 1
                 ));
             }
-            let x_derivative_time =
-                match faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
-                {
-                    Ok(sparse) => DesignMatrix::Sparse(SparseDesignMatrix::new(sparse)),
-                    Err(_) => {
-                        let mut dense = Array2::<f64>::zeros((n, p_time));
-                        for &faer::sparse::Triplet { row, col, val } in &deriv_triplets {
-                            dense[[row, col]] = val;
-                        }
-                        DesignMatrix::Dense(DenseDesignMatrix::from(dense))
-                    }
-                };
+            // Every triplet is indexed inside `n × p_time` by construction, so
+            // assembly fails only on allocation, which is an error, not a
+            // reason to build a second (dense) copy of the same matrix.
+            let x_derivative_time = DesignMatrix::Sparse(SparseDesignMatrix::new(
+                faer::sparse::SparseColMat::try_new_from_triplets(n, p_time, &deriv_triplets)
+                    .map_err(|e| format!("failed to assemble the time derivative design: {e:?}"))?,
+            ));
 
             let penalty_basis = build_bspline_basis_1d(
                 log_exit.view(),
@@ -2185,8 +2174,7 @@ pub fn build_survival_time_basis(
                     let max_ev = evals_slice
                         .iter()
                         .copied()
-                        .fold(0.0_f64, |a, b| a.max(b.abs()))
-                        .max(1.0);
+                        .fold(0.0_f64, |a, b| a.max(b.abs()));
                     let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
                     let neg_tol = -100.0 * (p as f64) * f64::EPSILON * max_ev;
                     if min_ev < neg_tol {
@@ -2207,22 +2195,18 @@ pub fn build_survival_time_basis(
                 .map(|s_mat| {
                     let p = s_mat.nrows();
                     if p == 0 {
-                        return 0;
+                        return Ok(0);
                     }
-                    match gam_linalg::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower) {
-                        Ok((evals, _)) => {
-                            let max_ev = evals
-                                .iter()
-                                .copied()
-                                .fold(0.0_f64, |a, b| a.max(b.abs()))
-                                .max(1.0);
-                            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
-                            evals.iter().filter(|&&e| e <= threshold).count()
-                        }
-                        Err(_) => 0,
-                    }
+                    let (evals, _) =
+                        gam_linalg::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower)
+                            .map_err(|e| {
+                                format!("failed to resolve the ispline penalty spectrum: {e:?}")
+                            })?;
+                    let max_ev = evals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
+                    let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+                    Ok(evals.iter().filter(|&&e| e <= threshold).count())
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
                 x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit_time)),
