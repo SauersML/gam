@@ -955,15 +955,20 @@ fn gamlss_gaussian_dispersion_row() -> Vec<GradientChannel> {
         spec_without_penalty("mu", x_mu.clone()),
         spec_without_penalty("log_sigma", x_ls.clone()),
     ];
+    let weights = Array1::ones(n);
+    let sigma_floor =
+        gam::families::sigma_link::gaussian_resolution_sigma_floor(y.view(), weights.view())
+            .expect("resolution σ floor of the Gaussian fixture");
     let family = GaussianLocationScaleFamily {
         y,
-        weights: Array1::ones(n),
+        weights,
         mu_design: Some(specs[GaussianLocationScaleFamily::BLOCK_MU].design.clone()),
         log_sigma_design: Some(
             specs[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
                 .design
                 .clone(),
         ),
+        sigma_floor,
         policy: ResourcePolicy::default_library(),
         cached_row_scalars: RwLock::new(None),
     };
