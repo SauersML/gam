@@ -72,7 +72,7 @@ pub(crate) fn prepare_bilinear_contractions(
     ) {
         Ok(charge) => charge,
         Err(refusal) => {
-            log::debug!("[SAE row-jet] {refusal}; contracting through the tile per apply");
+            log::trace!("[SAE row-jet] {refusal}; contracting through the tile per apply");
             return Ok(None);
         }
     };

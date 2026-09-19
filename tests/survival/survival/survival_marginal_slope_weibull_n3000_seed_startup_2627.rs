@@ -46,7 +46,7 @@ struct StderrInfoLogger;
 
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -65,7 +65,7 @@ fn init() {
     init_parallelism();
     INIT_LOGGER.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
 }

@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-import gamfit.parameter_decomposition as facade
+import gamfit._parameter_decomposition as facade
 
 
 class _RustStub:

@@ -1,4 +1,4 @@
-"""Callable-basis contract for :func:`gamfit.Cylinder`.
+"""Callable-basis contract for :func:`gamfit.topology.Cylinder`.
 
 ``Cylinder`` is a factory returning a :class:`TensorBSpline` with one
 periodic marginal (the angular axis) and one open marginal (the height
@@ -19,7 +19,7 @@ import gamfit
 
 
 def test_cylinder_shape_and_periodicity() -> None:
-    cyl = gamfit.Cylinder(n_knots=(7, 4))
+    cyl = gamfit.topology.Cylinder(n_knots=(7, 4))
     assert cyl.intrinsic_dim == 2
     B = 13
     theta = torch.linspace(0.0, 1.0 - 1e-6, B, dtype=torch.float64)

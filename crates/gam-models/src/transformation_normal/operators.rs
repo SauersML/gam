@@ -75,13 +75,13 @@ impl TransformationNormalJointHessianWorkspace {
             // Write-once cache: a concurrent caller installed its Hessian first.
             // The `get` below adopts the winner, so this costs only the wasted
             // build — but it must be visible rather than silently swallowed.
-            log::debug!(
+            log::trace!(
                 "CTN dense Hessian cache lost the install race at p={}; adopting the \
                  concurrently-installed Hessian",
                 self.p_total()
             );
         }
-        log::info!(
+        log::debug!(
             "[STAGE] CTN dense Hessian cache build p={} elapsed={:.3}s",
             self.p_total(),
             dense_start.elapsed().as_secs_f64(),

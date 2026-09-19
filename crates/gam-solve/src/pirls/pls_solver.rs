@@ -104,6 +104,7 @@ impl GaussianFrozenRows {
             computeworkingweight_derivatives_from_eta(
                 likelihood,
                 inverse_link,
+                y,
                 &eta_owned,
                 weights,
             )?;
@@ -344,7 +345,6 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 }
                 PirlsWorkspace::add_dense_xtwx_signed(
                     &weights_owned,
-                    &mut workspace.weighted_x_chunk,
                     x_dense.as_ref(),
                     &mut workspace.hessian_buf,
                 );

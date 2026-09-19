@@ -1,6 +1,6 @@
 """Unified GAM fit for torch — one entry point for any smooth, any dimensionality.
 
-The user describes smooth-term specs (:class:`gamfit.Smooth` subclasses) and
+The user describes smooth-term specs (:class:`gamfit.basis.Smooth` subclasses) and
 calls :func:`fit`. The library constructs the right basis matrices and
 penalty matrices internally per spec, dispatches to Gaussian REML
 (single-smooth or joint additive depending on input shape), and returns a
@@ -18,7 +18,7 @@ engine's analytic VJP.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 import torch
 
@@ -96,7 +96,7 @@ class FitResult:
 # ---------------------------------------------------------------------------
 
 
-def _to_tensor(value, like: torch.Tensor) -> torch.Tensor:
+def _to_tensor(value: object, like: torch.Tensor) -> torch.Tensor:
     """Coerce an array-like (numpy ndarray / torch tensor / list) to a torch
     tensor matching ``like``'s device. dtype stays float64 for REML."""
     if isinstance(value, torch.Tensor):
@@ -288,7 +288,7 @@ def _build_design_penalty(
 
     Returns (design (N, M), penalty (M, M)) as float64 torch tensors.
     """
-    from .. import duchon_function_norm_penalty
+    from .._api import duchon_function_norm_penalty
 
     points = _coerce_2d(points, "points")
     N = points.shape[0]
@@ -866,7 +866,7 @@ def fit(
     _shape = shape_kind_for_smooths_arg(smooths)
 
     if isinstance(smooths, Smooth) and _shape is not None:
-        if isinstance(points, (list, tuple)):
+        if not isinstance(points, torch.Tensor):
             raise ValueError(
                 "got a list of points but a single smooth; pass one points tensor."
             )
@@ -904,7 +904,7 @@ def fit(
 
     # Branch: single smooth vs list of smooths
     if isinstance(smooths, Smooth):
-        if isinstance(points, (list, tuple)):
+        if not isinstance(points, torch.Tensor):
             raise ValueError(
                 "got a list of points but a single smooth; pass one points tensor."
             )

@@ -32,7 +32,7 @@ _REPRO = textwrap.dedent(
     rng = np.random.default_rng(1)
     X = rng.normal(size=(120, 32))
     try:
-        gamfit.sae_manifold_fit(
+        gamfit.sae.sae_manifold_fit(
             X=X,
             K=6,
             d_atom=1,

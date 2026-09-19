@@ -7,12 +7,22 @@ sampling uses NUTS. Geometric / manifold smooths (cyclic 1-D, cylinder
 / torus tensor, intrinsic sphere, boundary-conditioned B-splines) make
 predictor spaces that wrap or close first-class.
 
-The public surface also includes latent-coordinate and SAE-manifold tools:
-analytic penalties such as ``ScadMcpPenalty`` and ``NuclearNormPenalty``;
-assignment-family descriptors for softmax / ordered Beta--Bernoulli / top-k / smooth threshold
-SAE gates; topology selection helpers; and manifold-SAE result objects with
-per-row ``assignments`` plus per-atom decoder covariance / posterior shape
-bands when produced by the Rust fit.
+The top level holds the fit / load entry points and the fitted-model
+classes. Everything else lives in a public submodule, loaded on first
+attribute access:
+
+- ``gamfit.errors`` -- the exception hierarchy (``gamfit.errors.GamError``, ...)
+- ``gamfit.results`` -- result, prediction, and posterior-sample types
+- ``gamfit.plot`` -- matplotlib plotting (optional ``gamfit[plot]`` extra)
+- ``gamfit.smooth`` / ``gamfit.basis`` / ``gamfit.penalties`` -- term
+  specifications, raw basis builders, and analytic penalties
+- ``gamfit.reml`` -- array-level REML / ridge primitives
+- ``gamfit.topology`` / ``gamfit.manifolds`` / ``gamfit.geometry`` -- latent
+  topologies, topology selection, and manifold descriptors
+- ``gamfit.sae`` -- sparse-dictionary and SAE-manifold tools
+- ``gamfit.identifiability``, ``gamfit.inference``, ``gamfit.response_geometry``,
+  ``gamfit.diagnostics``, ``gamfit.kernels``, ``gamfit.cuda``,
+  ``gamfit.examples``, ``gamfit.sklearn``, ``gamfit.torch``
 
 Quick start::
 
@@ -31,458 +41,138 @@ API ``gamfit.fit(df, 'y ~ s(x1) + s(x2)')``.
 See https://github.com/SauersML/gam for the full guide.
 """
 
-from importlib import metadata as _metadata
+from importlib import import_module as _import_module
+from types import ModuleType as _ModuleType
+from typing import TYPE_CHECKING as _TYPE_CHECKING
 
 from ._api import (
-    SUPPORT_SAE_SCHEMA,
     CtnStage1,
-    SharedPrecisionGroup,
-    bspline_basis,
-    bspline_basis_derivative,
     build_info,
-    conditional_prior_ivae,
-    cross_fit_shared_precision_groups,
-    cuda_subprocess_env,
-    cuda_subprocess_library_dirs,
-    cuda_diagnostics,
-    derive_ivae_aux_scale,
-    duchon_basis,
-    duchon_function_norm_penalty,
-    matern_basis,
     explain_error,
     fit,
-    format_cuda_diagnostics,
     fit_array,
-    gaussian_reml_fit,
-    gaussian_reml_fit_backward,
-    gaussian_reml_fit_batched,
-    gaussian_reml_fit_batched_backward,
-    gaussian_reml_fit_blocks_backward,
-    gaussian_reml_fit_blocks_forward,
-    gaussian_reml_fit_formula,
-    gaussian_reml_fit_latent,
-    gaussian_reml_fit_latent_backward,
-    gaussian_reml_optimize_latent,
-    glm_reml_fit_latent,
-    glm_reml_fit_latent_backward,
-    gaussian_reml_fit_positions,
-    gaussian_reml_fit_positions_backward,
-    gaussian_reml_fit_positions_batched,
-    gaussian_reml_fit_positions_batched_backward,
-    gaussian_reml_fit_with_constraints_backward,
-    gaussian_reml_fit_with_constraints_forward,
-    gaussian_weighted_ridge,
-    gaussian_weighted_ridge_batch,
     load,
     loads,
-    model_from_dict,
-    save,
-    mechanism_sparsity_jacobian,
-    periodic_spline_curve_basis,
-    smoothness_penalty,
-    sphere_basis,
-    sphere_basis_jet,
     validate_formula,
-)
-from ._binding import RustExtensionUnavailableError
-from ._warnings import GamInferenceWarning, emit_inference_warnings
-from ._rust import (  # native topology-census instruments
-    adjudicate_atom_shape,
-    shape_matched_control,
-    shape_matched_control_f32,
-)
-from ._shape_census import (
-    LabelShuffleMarginNull,
-    ShapeControlledCensus,
-    run_label_shuffle_margin_null,
-    run_shape_controlled_census,
 )
 from ._compare import compare_models
 from ._event_history import EventHistoryModel, fit_event_history
-from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._joint_events import JointEventModel, fit_joint_event_model, load_joint_event_model
-from ._sparse_dictionary import (
-    BlockSparseDictStream,
-    BlockSparseDictionaryConvergence,
-    BlockSparseDictionaryFit,
-    BlockSparseStreamArtifact,
-    BlockSparseStreamConvergence,
-    SparseDictStream,
-    SparseDictStreamArtifact,
-    SparseDictionaryConvergence,
-    SparseDictionaryFit,
-    block_sparse_dictionary_fit,
-    block_sparse_dictionary_fit_begin,
-    fixed_budget_block_sparse_dictionary_fit,
-    sparse_dictionary_fit,
-    sparse_dictionary_fit_begin,
-)
-from ._sae_spectral import (
-    AtlasNerveDiagram,
-    AtomRetentionEvidence,
-    BlockCoordinateReport,
-    ChartInterpNullCalibration,
-    ChartInterpNullCalibrationReport,
-    ChartInterpNullProtocol,
-    ChartInterpReadout,
-    ChartInterpReport,
-    ChartInterpStatisticValue,
-    ComposedContract,
-    ConditionalCoactivationInfluence,
-    CoordinatePosterior,
-    CouplingRobustnessCertificate,
-    DoseResponseCalibrationReport,
-    DualCertificateReport,
-    FisherEffectEvidence,
-    HolonomyReport,
-    RoutabilityAudit,
-    RoutabilityFloor,
-    SpectrometerReport,
-    SpikeRecovery,
-    StageContainment,
-    VarianceChargeEvidence,
-    WholeSetContainment,
-    atlas_nerve_diagram,
-    audit_sae,
-    block_firing_coordinates,
-    chart_interp_score,
-    compose_contracts,
-    conditional_coactivation_influence,
-    coordinate_posterior_from_precision,
-    coupling_robustness_certificate,
-    dimension_spectrometer,
-    dose_response_calibration,
-    effect_weighted_retention,
-    loop_holonomy,
-    recover_spikes,
-    routability_audit,
-    routability_floor,
-    separation_limit,
-    sparse_dict_dual_certificate,
-    whole_set_containment,
-)
-from ._penalties import (
-    ARDPenalty,
-    AnalyticPenaltyKind,
-    AuxConditionalPriorPenalty,
-    BlockOrthogonalityPenalty,
-    BlockSparsityPenalty,
-    GatedSAEDecoder,
-    OrderedBetaBernoulliPenalty,
-    IsometryPenalty,
-    IvaeRidgeMeanGauge,
-    SmoothThresholdPenalty,
-    MechanismSparsityPenalty,
-    NuclearNormPenalty,
-    OrthogonalityPenalty,
-    ParametricAuxConditionalPriorPenalty,
-    Penalty,
-    PENALTY_MANIFEST,
-    ScalarWeightSchedule,
-    ScadMcpPenalty,
-    SoftmaxAssignmentSparsityPenalty,
-    SparsityPenalty,
-    TopKActivationPenalty,
-    TotalVariationPenalty,
-)
-from ._sheaf import SheafConsistencyPenalty
-from .topology import (
-    Circle,
-    Cylinder,
-    EuclideanPatch,
-    Sphere as TopologySphere,
-    Torus,
-)
-from ._select_topology import (
-    BasisSpec,
-    ScoreKind,
-    ScoreScale,
-    SelectTopologyResult,
-    TopologyAutoSelector,
-    TopologyAutoSelectorRank,
-    TopologyAutoSelectorResult,
-    TopologyCandidateFailure,
-    TopologySelectionError,
-    TopologyStack,
-    select_topology,
-    stack_topologies,
-)
-from ._diagnostics import Diagnostics
-from . import diagnostics
-from . import identifiability
-from .identifiability import (
-    IdentifiabilityReport,
-    IdentifiabilityTheoremResult,
-    IdentifiableFactorFitResult,
-    check as identifiability_check,
-    identifiable_factor_fit,
-)
-from ._equivariant import (
-    GaugeCompanion,
-    gauge_companion,
-    rho_so2,
-    rho_so2_jvp,
-    rho_so3,
-    rho_so3_jvp,
-)
-from .smooth import (
-    BSpline,
-    Categorical,
-    Duchon,
-    LatentCoord,
-    Matern,
-    MeasureJet,
-    Pca,
-    PeriodicSplineCurve,
-    ShapeConstraintLiteral,
-    Smooth as SmoothSpec,
-    Sphere,
-    TensorBSpline,
-)
-from ._protocol import BasisDescriptor, ManifoldDescriptor, PenaltyDescriptor
-from . import manifolds  # noqa: F401  expose gamfit.manifolds.Circle, …
-from . import kernels  # noqa: F401  expose gamfit.kernels.sinkhorn_barycenter, …
-from ._basis_descriptors import PeriodicHarmonic
-from ._composite_penalty import CompositePenalty
-from ._smooth import (
-    Smooth,
-    SmoothSum,
-)  # compositional Smooth(latent=..., basis=..., penalty=...)
-from . import examples, topology
-from .examples import (
-    PartialSupervisionExample,
-    PartialSupervisionFit,
-    SaeSupervisedFit,
-    partial_supervision,
-    sae_supervised,
-)
-from ._exceptions import (
-    AloError,
-    ArrowSchurError,
-    BasisError,
-    CacheStoreError,
-    CalibratorError,
-    ColumnNotFoundError,
-    CorrectedCovarianceError,
-    CubicCellKernelError,
-    CustomFamilyError,
-    DataError,
-    DeviationRuntimeError,
-    DictionaryConvergenceError,
-    EigendecompositionError,
-    FitConvergenceError,
-    FitError,
-    FitInputError,
-    FitInvariantError,
-    FitNumericalError,
-    FitSeedError,
-    FittedModelError,
-    FormulaError,
-    GamError,
-    GamlssError,
-    GeometryError,
-    GpuError,
-    GradientUnavailableError,
-    HessianNotPositiveDefiniteError,
-    HmcError,
-    IdentifiabilityCompilerError,
-    IllConditionedError,
-    InnerModeConvergenceError,
-    IntegrationError,
-    InvalidConfigurationError,
-    InvalidInputError,
-    InvalidSpecificationError,
-    JointPenaltyError,
-    LatentSurvivalError,
-    LayoutError,
-    LinearAlgebraError,
-    LinearSystemSolveError,
-    LognormalKernelError,
-    MapUniquenessError,
-    MatrixError,
-    MatrixMaterializationError,
-    MissingDependencyError,
-    ModelOverparameterizedError,
-    MonotoneRootError,
-    OuterStrategyError,
-    ParameterConstraintError,
-    PenaltySpectrumError,
-    PerfectSeparationError,
-    PirlsConvergenceError,
-    PredictInputError,
-    PredictionError,
-    RemlConvergenceError,
-    ScaleDesignError,
-    SchemaMismatchError,
-    SmoothError,
-    SurvivalConstructionError,
-    SurvivalError,
-    SurvivalLocationScaleError,
-    SurvivalMarginalSlopeError,
-    SurvivalPredictError,
-    TermBuilderError,
-    TransformationNormalError,
-    UnsupportedLinkError,
-)
-from ._model import (
-    AffineDesign,
-    CompetingRisksCIF,
-    CompetingRisksPrediction,
-    Model,
-    MultinomialModel,
-    MultinomialPrediction,
-    SurvivalPrediction,
-    TermBlock,
-    competing_risks_cif,
-)
-from ._response_geometry import (
-    ResponseGeometryModel,
-    alr,
-    closure,
-    clr,
-    simplex_frechet_mean,
-    sphere_frechet_mean,
-)
-from ._sampling import (
-    CumulativeIncidenceDraws,
-    PairedPosteriorSamples,
-    PosteriorPredictive,
-    PosteriorSamples,
-    SamplingConfig,
-)
-from ._tables import PredictionResult
-from ._sae_manifold import (
-    GumbelTemperatureSchedule,
-    ManifoldSAE,
-    flat_block_assignment,
-    gumbel_geometric_schedule,
-    gumbel_linear_schedule,
-    gumbel_reciprocal_iter_schedule,
-    plot,
-    sae_manifold_certify_external,
-    sae_manifold_fit,
-)
-from ._sae_viz import plot_atom, plot_fit
-from ._sae_trust import atom_trust_scores, sae_trust_diagnostics
-from ._schema import SchemaCheck, SchemaIssue
-from ._summary import Summary
-from ._validation import FormulaValidation
-from .structure_discovery import (
-    atom_birth_gate,
-    e_bh_dictionary_certificate,
-    expected_resolution_budget,
-    log_e_from_p_value,
-    plan_probe_for_contested_claim,
-    select_probe_by_expected_evidence,
-    split_likelihood_log_e,
-)
-from .bartlett import lawley_bartlett_factor, lawley_bartlett_factor_estimated_lambda
-from .full_conformal import glm_full_conformal
-from .layer_transport import (
-    certify_chart_transfer,
-    chart_transfer_operator,
-    fit_transport,
-    layer_transport_fit,
-    layer_transport_ladder,
-)
-from .manifold_crosscoder import sae_crosscoder_fit
-from .manifold_behavior import sae_behavior_fit
-from .checkpoint_dynamics import sae_checkpoint_dynamics
-from .intervention_calibration import ChartCalibration, fit_chart_calibration
-from .parameter_decomposition import ParameterDecompositionReport, run_parameter_decomposition
-from ._sae_spectral import audit_sae
-from .geometry import (
-    CircleManifold,
-    EuclideanManifold,
-    GrassmannManifold,
-    ProductManifold,
-    SpdManifold,
-    SphereManifold,
-    StiefelManifold,
-    TorusManifold,
+from ._model import Model, MultinomialModel, competing_risks_cif
+from ._response_geometry import ResponseGeometryModel
+
+__all__ = [
+    "CtnStage1",
+    "EventHistoryModel",
+    "JointEventModel",
+    "Model",
+    "MultinomialModel",
+    "ResponseGeometryModel",
+    "__version__",
+    "build_info",
+    "compare_models",
+    "competing_risks_cif",
+    "explain_error",
+    "fit",
+    "fit_array",
+    "fit_event_history",
+    "fit_joint_event_model",
+    "load",
+    "load_joint_event_model",
+    "loads",
+    "validate_formula",
+]
+
+# Public submodules. They are imported on first attribute access so that
+# ``import gamfit`` stays cheap and never pulls in optional dependencies.
+# They are not in ``__all__``: ``from gamfit import *`` must not import torch.
+_SUBMODULES = frozenset(
+    {
+        "basis",
+        "cuda",
+        "diagnostics",
+        "errors",
+        "examples",
+        "geometry",
+        "identifiability",
+        "inference",
+        "kernels",
+        "kernels_jax",
+        "kernels_torch",
+        "manifolds",
+        "penalties",
+        "plot",
+        "reml",
+        "response_geometry",
+        "results",
+        "sae",
+        "sklearn",
+        "smooth",
+        "topology",
+        "torch",
+    }
 )
 
-try:
-    __version__ = _metadata.version("gamfit")
-except _metadata.PackageNotFoundError:
-    __version__ = "0.0.0+unknown"
 
-# Names whose implementation lives behind the optional ``torch`` extra. They
-# are loaded lazily while keeping the cold-start import path torch-free.
-_LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
-    "PoincareAtoms": ("gamfit.torch.hyperbolic", "PoincareAtoms"),
-    "InterchangeSwapDecoder": ("gamfit.torch.interchange", "InterchangeSwapDecoder"),
-}
+if _TYPE_CHECKING:
+    __version__: str
+    from . import (
+        basis,
+        cuda,
+        diagnostics,
+        errors,
+        examples,
+        geometry,
+        identifiability,
+        inference,
+        kernels,
+        kernels_jax,
+        kernels_torch,
+        manifolds,
+        penalties,
+        plot,
+        reml,
+        response_geometry,
+        results,
+        sae,
+        sklearn,
+        smooth,
+        topology,
+        torch,
+    )
 
 
-def __getattr__(name: str):
-    """Lazy attribute hook for optional-extra primitives exposed at the top level.
+def __getattr__(name: str) -> _ModuleType | str:
+    """Resolve ``__version__`` or import a public submodule on first access.
 
-    A missing optional dependency (typically ``torch``) is surfaced as
-    ``AttributeError`` chained from the underlying ``ModuleNotFoundError``.
-    This preserves the Python contract that ``hasattr`` only ever returns a
-    bool and that ``from gamfit import *`` does not blow up on torch-less
-    installs while torch-specific modules remain under ``gamfit.torch``.
+    A submodule whose optional dependency (e.g. ``torch``) is missing raises
+    ``AttributeError`` chained from the ``ModuleNotFoundError``, so
+    ``hasattr(gamfit, "torch")`` returns a bool instead of raising.
     """
-    target = _LAZY_TORCH_ATTRS.get(name)
-    if target is not None:
-        module_path, attr = target
-        from importlib import import_module
+    if name == "__version__":
+        # Read from the installed distribution on first access, not at import:
+        # ``importlib.metadata`` is the largest single cost of ``import gamfit``
+        # after numpy, and a fit never needs it.
+        from importlib import metadata
 
         try:
-            module = import_module(module_path)
+            version = metadata.version("gamfit")
+        except metadata.PackageNotFoundError:
+            version = "0.0.0+unknown"
+        globals()["__version__"] = version
+        return version
+    if name in _SUBMODULES:
+        try:
+            return _import_module(f"{__name__}.{name}")
         except ModuleNotFoundError as exc:
-            if exc.name != "torch" and not module_path.startswith(exc.name):
+            if exc.name is None or exc.name.startswith(__name__):
                 raise
             raise AttributeError(
-                f"gamfit.{name} requires an optional dependency that is not "
-                f"installed ({exc.name!r}). Install it with: "
-                f"pip install torch."
+                f"gamfit.{name} requires the optional dependency {exc.name!r}, "
+                "which is not installed"
             ) from exc
-        return getattr(module, attr)
-    raise AttributeError(f"module 'gamfit' has no attribute {name!r}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _build_public_api() -> list[str]:
-    """Derive ``__all__`` from what is actually importable at this install.
-
-    Hand-maintaining ``__all__`` is brittle: every new top-level export has to
-    be added in two places, and lazy-torch names placed in ``__all__`` blow
-    up ``from gamfit import *`` on torch-less installs because Python's
-    star-import iterates ``__all__`` and runs ``getattr`` on every entry
-    (issue #303).
-
-    Instead, derive the public API at import time:
-      1. every non-underscore name currently bound in the module globals
-         (the heavy ``from ._x import ...`` blocks above), minus submodules
-         and private re-imports;
-      2. an explicit allowlist of submodule attributes (``diagnostics``,
-         ``examples``, ``topology``, ``identifiability``, ``manifolds``,
-         ``kernels``) that are part of the public API even though they are
-         module objects.
-    """
-    from types import ModuleType
-
-    public_submodules = {
-        "diagnostics",
-        "examples",
-        "topology",
-        "identifiability",
-        "manifolds",
-        "kernels",
-    }
-    api: set[str] = set()
-    for name, value in globals().items():
-        if name.startswith("_"):
-            continue
-        # Skip module objects unless they are explicitly in the public
-        # submodule allowlist: ``importlib`` etc. were imported
-        # for internal use and should not leak into star imports.
-        if isinstance(value, ModuleType) and name not in public_submodules:
-            continue
-        api.add(name)
-    api.add("__version__")
-    return sorted(api)
-
-
-__all__ = _build_public_api()
+def __dir__() -> list[str]:
+    return sorted(set(__all__) | _SUBMODULES)

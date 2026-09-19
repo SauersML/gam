@@ -246,18 +246,110 @@ fn bspline_locations(
         return Err("periodic B-spline position fits require a finite positive period".to_string());
     };
     let origin = t.iter().copied().fold(f64::INFINITY, f64::min);
-    let end = origin + period;
-    // `i · step + origin`, closing exactly on `end`: the evaluation order a
-    // uniform `linspace(origin, end, num_basis + 1)` uses.
+    Ok((cyclic_uniform_grid(origin, origin + period, num_basis), degree))
+}
+
+/// The `num_basis + 1`-point uniform cyclic grid over `[origin, end]`, one
+/// cyclic control per interval: `i · step + origin`, closing exactly on `end`,
+/// the evaluation order a uniform `linspace(origin, end, num_basis + 1)` uses.
+fn cyclic_uniform_grid(origin: f64, end: f64, num_basis: usize) -> Array1<f64> {
     let step = (end - origin) / num_basis as f64;
-    let grid = Array1::from_iter((0..=num_basis).map(|i| {
+    Array1::from_iter((0..=num_basis).map(|i| {
         if i == num_basis {
             end
         } else {
             i as f64 * step + origin
         }
-    }));
-    Ok((grid, degree))
+    }))
+}
+
+/// The knots or centers a 1-D basis-evaluation helper (`bspline_basis`,
+/// `bspline_basis_derivative`, `duchon_basis` and their tensor front ends)
+/// builds on `t`, with the order they were built for.
+#[derive(Clone, Debug)]
+pub struct ResolvedBasisLocations {
+    pub locations: Array1<f64>,
+    /// The B-spline degree or Duchon order the locations were built for. An
+    /// auto-placed open knot vector lowers the requested degree when `t` is
+    /// too short for it (#340).
+    pub order: usize,
+    /// Whether that auto-placement lowered the requested degree or knot count.
+    pub shrunk: bool,
+}
+
+/// Resolve a basis-evaluation helper's knots or centers on `t`.
+///
+/// An omitted size takes the formula front door's default for the same kind
+/// on the same data, so `bspline_basis(x)` has the columns of the pilot basis
+/// `s(x)` starts from (a formula fit may refine that pilot from its own
+/// adequacy evidence; a bare basis has no fit to refine from) and
+/// `duchon_basis(x)` the centers of `duchon(x)`:
+///
+/// - Open B-spline: an explicit knot vector is used as given; otherwise the
+///   internal-knot count (the request's, or [`heuristic_knots_for_column`])
+///   is placed at quantiles by [`auto_knot_vector_1d_quantile`].
+/// - Cyclic B-spline: an explicit grid is used as given; otherwise the uniform
+///   grid over `[min t, max t]` with one cyclic control per interval. An
+///   integer `K` names the same dimension it does for an open basis,
+///   `K + degree + 1` controls; the default is the formula's cyclic basis
+///   dimension [`default_cyclic_basis_dim`].
+/// - Duchon: an explicit center vector is used as given; otherwise the center
+///   count (the request's, at least 2, or the formula's 1-D Duchon default) is
+///   placed by equal mass.
+pub fn resolve_basis_locations_1d(
+    t: ArrayView1<'_, f64>,
+    kind: PositionBasisKind,
+    request: PositionBasisLocations,
+    order: usize,
+    periodic: bool,
+) -> Result<ResolvedBasisLocations, String> {
+    finite_nonempty("t", t)?;
+    if let PositionBasisLocations::Given(given) = request {
+        finite_nonempty("knots_or_centers", given.view())?;
+        return Ok(ResolvedBasisLocations {
+            locations: given,
+            order,
+            shrunk: false,
+        });
+    }
+    match kind {
+        PositionBasisKind::Duchon => Ok(ResolvedBasisLocations {
+            locations: duchon_centers(t, request)?,
+            order,
+            shrunk: false,
+        }),
+        PositionBasisKind::BSpline if !periodic => {
+            let internal_knots = match request {
+                PositionBasisLocations::Count(count) => count,
+                _ => heuristic_knots_for_column(t),
+            };
+            let auto = auto_knot_vector_1d_quantile(t, internal_knots, order)
+                .map_err(|err| err.to_string())?;
+            Ok(ResolvedBasisLocations {
+                locations: auto.knots,
+                order: auto.degree,
+                shrunk: auto.shrunk,
+            })
+        }
+        PositionBasisKind::BSpline => {
+            let num_basis = match request {
+                PositionBasisLocations::Count(count) => count + order + 1,
+                _ => default_cyclic_basis_dim(heuristic_knots_for_column(t), order),
+            };
+            let low = t.iter().copied().fold(f64::INFINITY, f64::min);
+            let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if high <= low {
+                return Err(format!(
+                    "periodic auto-knots need a positive range of t, got [{low}, {high}]"
+                ));
+            }
+            Ok(ResolvedBasisLocations {
+                locations: cyclic_uniform_grid(low, high, num_basis),
+                order,
+                shrunk: false,
+            })
+        }
+    }
 }
 
 /// The centers of a Duchon position basis.
@@ -529,6 +621,76 @@ mod tests {
         assert!(
             duchon.locations.len() >= univariate_spline_basis_dim(t.view()),
             "the 1-D Duchon default is floored at the open s(x) dimension (#1867)"
+        );
+    }
+
+    /// PKG-10: an omitted helper size takes the formula default, so
+    /// `bspline_basis(x)` has the dimension of `s(x)` rather than a
+    /// binding-side `K = 10`.
+    #[test]
+    fn helper_locations_take_the_formula_defaults() {
+        let t = positions();
+        let internal = heuristic_knots_for_column(t.view());
+        let open = resolve_basis_locations_1d(
+            t.view(),
+            PositionBasisKind::BSpline,
+            PositionBasisLocations::Default,
+            DEFAULT_BSPLINE_DEGREE,
+            false,
+        )
+        .expect("default open knots");
+        assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
+        assert_eq!(
+            open.locations.len() - open.order - 1,
+            univariate_spline_basis_dim(t.view())
+        );
+
+        let cyclic = resolve_basis_locations_1d(
+            t.view(),
+            PositionBasisKind::BSpline,
+            PositionBasisLocations::Default,
+            DEFAULT_BSPLINE_DEGREE,
+            true,
+        )
+        .expect("default cyclic grid");
+        let num_basis = default_cyclic_basis_dim(internal, DEFAULT_BSPLINE_DEGREE);
+        assert_eq!(cyclic.locations.len(), num_basis + 1);
+        let low = t.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert_eq!(cyclic.locations[0], low);
+        assert_eq!(cyclic.locations[num_basis], high);
+
+        let counted = resolve_basis_locations_1d(
+            t.view(),
+            PositionBasisKind::BSpline,
+            PositionBasisLocations::Count(5),
+            DEFAULT_BSPLINE_DEGREE,
+            true,
+        )
+        .expect("counted cyclic grid");
+        assert_eq!(counted.locations.len(), 5 + DEFAULT_BSPLINE_DEGREE + 2);
+
+        let duchon = resolve_basis_locations_1d(
+            t.view(),
+            PositionBasisKind::Duchon,
+            PositionBasisLocations::Default,
+            2,
+            false,
+        )
+        .expect("default Duchon centers");
+        assert_eq!(
+            duchon.locations.len(),
+            default_univariate_duchon_center_count(t.view())
+        );
+        assert!(
+            resolve_basis_locations_1d(
+                t.view(),
+                PositionBasisKind::Duchon,
+                PositionBasisLocations::Count(1),
+                2,
+                false,
+            )
+            .is_err()
         );
     }
 

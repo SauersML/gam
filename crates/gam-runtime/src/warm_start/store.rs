@@ -28,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// growth. `debug` keeps that observable without adding noise to a healthy run.
 fn log_best_effort<E: std::fmt::Display>(operation: &str, result: Result<(), E>) {
     if let Err(error) = result {
-        log::debug!("warm-start store: {operation} failed: {error}");
+        log::trace!("warm-start store: {operation} failed: {error}");
     }
 }
 
@@ -1056,7 +1056,7 @@ fn producer_identity() -> &'static str {
                         );
                     }
                     Err(error) => {
-                        log::debug!(
+                        log::trace!(
                             "warm-start store: cannot stat the running executable ({error}); \
                              falling back to a per-process producer identity, so no entry will \
                              be certified across processes"
@@ -1070,7 +1070,7 @@ fn producer_identity() -> &'static str {
                 }
             }
             Err(error) => {
-                log::debug!(
+                log::trace!(
                     "warm-start store: cannot locate the running executable ({error}); falling \
                      back to a per-process producer identity, so no entry will be certified \
                      across processes"
@@ -1114,7 +1114,7 @@ fn read_meta(path: &Path) -> Result<OnDiskMeta, StoreError> {
     let bytes = fs::read(path)?;
     let mut parsed: OnDiskMeta = serde_json::from_slice(&bytes)?;
     if parsed.kind == EntryKind::Final && parsed.producer != producer_identity() {
-        log::debug!(
+        log::trace!(
             "warm-start store: {} was finalized by a different build; resuming it as a seed \
              rather than as a terminal certificate",
             path.display()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One curved fit -> the #1026 EV number AND the #1942 manifold-native numbers.
 
-The shared-infra leverage: a single ``gamfit.sae_manifold_fit(...)`` is the
+The shared-infra leverage: a single ``gamfit.sae.sae_manifold_fit(...)`` is the
 expensive step; from that one fitted handle we read
 
   * the #1026 close-bar number — held-out explained variance of the curved
@@ -47,13 +47,13 @@ def _held_out_ev(x_te: np.ndarray, recon: np.ndarray, mean_tr: np.ndarray) -> fl
 def _metric_arm(gamfit, model, name: str, *args):
     """Call the manifold-native metric accessor ``name`` if the wheel exposes it.
 
-    Tries the module-function form ``gamfit.<name>(model, *args)`` first (matching
+    Tries the module-function form ``gamfit.sae.<name>(model, *args)`` first (matching
     chart_interp_score / dose_response_calibration / audit_sae), then a method
     ``model.<name>(*args)``. Records a precise ``pending`` marker otherwise so the
     report says exactly which routed accessor is still missing."""
-    fn = getattr(gamfit, name, None)
+    fn = getattr(gamfit.sae, name, None)
     if fn is not None:
-        return {"source": f"gamfit.{name}", "report": _jsonable(fn(model, *args))}
+        return {"source": f"gamfit.sae.{name}", "report": _jsonable(fn(model, *args))}
     meth = getattr(model, name, None)
     if callable(meth):
         return {"source": f"model.{name}", "report": _jsonable(meth(*args))}
@@ -109,7 +109,7 @@ def main() -> None:
     print(f"[curved] X={X.shape} train={x_tr.shape} test={x_te.shape} "
           f"K={args.K} d_atom={args.d_atom} top_k={args.top_k} topology={args.topology}", flush=True)
 
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         x_tr, K=args.K, d_atom=args.d_atom, atom_topology=args.topology,
         assignment="topk", top_k=args.top_k, random_state=args.seed,
     )
@@ -139,12 +139,12 @@ def main() -> None:
     frozen = getattr(model, "frozen_dictionary", None)
     if callable(frozen):
         decoder = np.ascontiguousarray(np.asarray(frozen(), dtype=np.float32))
-        audit = gamfit.audit_sae(
+        audit = gamfit.sae.audit_sae(
             decoder, x_te.astype(np.float32, copy=False),
             random_weight_codes=np.zeros((x_te.shape[0], decoder.shape[0]), dtype=np.float32),
             active=args.audit_active, block_size=args.audit_block_size,
         )
-        report["issue_1942_audit"] = {"source": "model.frozen_dictionary + gamfit.audit_sae",
+        report["issue_1942_audit"] = {"source": "model.frozen_dictionary + gamfit.sae.audit_sae",
                                       "report": _jsonable(audit)}
         print(f"[curved] #1942 audit ran on frozen dictionary K x P={decoder.shape}", flush=True)
     else:
