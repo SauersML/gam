@@ -1279,24 +1279,14 @@ pub(crate) fn build_outer_hessian_operator(
                 *dst += projected;
             }
 
-            let mut ct = Array2::<f64>::zeros((total, total));
-            for ii in 0..total {
-                for jj in ii..total {
-                    let value =
-                        dense_hop.trace_logdet_hessian_cross_rotated(&rotated[ii], &rotated[jj]);
-                    if !value.is_finite() {
-                        return Err(RemlError::NonFiniteValue {
-                            reason: format!(
-                                "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
-                            ),
-                        }
-                        .into());
-                    }
-                    ct[[ii, jj]] = value;
-                    if ii != jj {
-                        ct[[jj, ii]] = value;
-                    }
+            let ct = dense_hop.trace_logdet_hessian_crosses_rotated(&rotated);
+            if let Some(((ii, jj), value)) = ct.indexed_iter().find(|(_, v)| !v.is_finite()) {
+                return Err(RemlError::NonFiniteValue {
+                    reason: format!(
+                        "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
+                    ),
                 }
+                .into());
             }
             Some(ct)
         } else {
