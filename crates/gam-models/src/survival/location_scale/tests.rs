@@ -337,12 +337,7 @@ fn certified_survival_fit_quadratic() -> gam_solve::rho_optimizer::CertifiedOute
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_tolerance(1.0e-8)
         .with_max_iter(40)
-        .with_initial_rho(array![0.5])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.5]);
     let mut objective = problem.build_objective(
         (),
         |_: &mut (), theta: &Array1<f64>| Ok(0.5 * (theta[0] - 0.25).powi(2)),
@@ -7637,3 +7632,9 @@ fn the_explicit_psi_terms_are_the_psi_derivatives_of_the_nll_2695() {
 
 /// gam#2695 degree ladder (child module so this file stays under the line gate).
 mod knot_ladder_2695;
+
+/// #3090: the direct parametric-AFT step on an indefinite Hessian.
+mod absolute_newton_3090;
+
+/// #3185: the direct parametric-AFT backtracking floor and stall.
+mod line_search_3185;

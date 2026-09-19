@@ -1032,16 +1032,16 @@ where
     // decided the survival time-block λ until a03438645 (#2670) nor the
     // engine's ±30 fallback applies (#2902 row 8).
     let (lower, upper) = survival_baseline_theta_domain(target, &seed, age_exit).map_err(config)?;
+    // The criterion is the baseline likelihood summed over the survival
+    // records, in the `dim` baseline parameters themselves.
     let problem = contract
-        .configure(OuterProblem::new(dim).with_prefer_gradient_only(true))
+        .configure(
+            OuterProblem::new(dim)
+                .with_prefer_gradient_only(true)
+                .with_problem_size(age_exit.len(), dim),
+        )
         .with_bounds(lower, upper)
-        .with_initial_rho(seed.clone())
-        .with_seed_config(crate::seeding::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            num_auxiliary_trailing: dim,
-            ..Default::default()
-        });
+        .with_initial_rho(seed.clone());
     let mut obj = problem.build_objective(
         (),
         cost_fn,
@@ -1492,7 +1492,7 @@ pub fn build_survival_time_basis(
                         degree: knot_degree,
                         penalty_order: 2,
                         knotspec: BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
+                            num_internal_knots,
                             placement,
                             adaptive: false,
                         },
@@ -4741,7 +4741,7 @@ pub fn build_time_varying_survival_covariate_template(
         degree: time_degree,
         penalty_order: 2,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
             adaptive: false,
         },

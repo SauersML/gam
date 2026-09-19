@@ -566,7 +566,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
 
                 // Continuous smoothness order
                 let smooth_rows =
-                    smooth_term_summary_rows(&design, &spec, &fit, fit.weighted_gram());
+                    smooth_term_summary_rows(&design, &fit, fit.weighted_gram());
                 for st in &smooth_rows {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {
@@ -867,7 +867,7 @@ fn report_family_residuals(
     // finite quantile, so u is held inside the representable open interval:
     // the smallest positive double and the largest double below one.
     let to_normal = |u: f64| {
-        standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON / 2.0))
+        standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0_f64.next_down()))
     };
 
     match response {

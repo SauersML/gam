@@ -349,6 +349,8 @@ class Summary:
         record per smooth term with ``name``, ``term_idx``, ``basis_dim`` (the
         realized ``k'``), ``nullspace_dim``, ``edf``, ``enrichment_dim``,
         ``enrichment_rank``, ``statistic``, ``p_value`` and ``provenance``. A
+        field the check did not measure is omitted, so a row whose
+        ``provenance`` is not ``"radial_enrichment"`` carries no ``p_value``. A
         small ``p_value`` says the fit's residuals still carry structure in that
         smooth's covariates which its realized basis cannot represent. See
         :meth:`gamfit.Model.basis_check` for the construction and its limits.

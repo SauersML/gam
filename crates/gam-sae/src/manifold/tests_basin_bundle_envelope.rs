@@ -235,11 +235,6 @@ fn two_basin_outer_fit_engages_exact_envelope() {
     let n_params = seed.len();
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold basin envelope")
         .expect("two-basin outer penalized quasi-Laplace fit must terminate");
     assert!(result.converged(), "the envelope fit must be certified");

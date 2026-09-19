@@ -465,7 +465,7 @@ fn summary_smooth_terms(
     // (`wald_residual_degrees_of_freedom`, `wald_scale_is_estimated`) are read
     // off the fit inside that walk, which is where `fd998d957` put them.
     let rows =
-        gam_solve::estimate::smooth_term_summary_rows(design, spec, fit, whitening_gram_full);
+        gam_solve::estimate::smooth_term_summary_rows(&design, fit, whitening_gram_full);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
@@ -762,6 +762,12 @@ pub const NO_AIC_AT_EXACT_FIT: &str =
     "the fit interpolates the response exactly (zero dispersion), so it has no \
      normalized log-likelihood and no AIC";
 
+/// Why a fit that retained no inference record reports no AIC: both criteria
+/// charge the conditional EDF `tr(F)`, which only that record carries.
+pub const NO_AIC_WITHOUT_A_RETAINED_EDF: &str =
+    "the fit retained no inference record, so it has no conditional EDF for the AIC \
+     to charge";
+
 /// The information criteria a model summary publishes (#946, slop G2).
 ///
 /// Both AICs are formed by the single owner
@@ -838,6 +844,9 @@ fn summary_information_criteria(
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
+    if fit.edf_total().is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(NO_AIC_WITHOUT_A_RETAINED_EDF));
+    }
     let criteria = gam_solve::inference::information_criteria::information_criteria(
         fit,
         log_likelihood,
@@ -1777,7 +1786,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()
