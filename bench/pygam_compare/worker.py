@@ -5,7 +5,8 @@ Usage: worker.py LIB FAMILY N DESIGN SEED
   LIB     gamfit | pygam | pygam_gs
   FAMILY  gaussian | binomial | poisson, or a binomial variant of the
           ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``)
-  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te
+  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
+          | by (see ``make_data``)
 
 Prints exactly one ``RESULT {json}`` line on stdout. The driver (``run.py``)
 launches this script with a pinned thread environment and a scratch working
@@ -60,6 +61,10 @@ BINOMIAL_PREVALENCE = {"binomial_p10": 0.1, "binomial_p01": 0.01}
 BINOMIAL_SLOPE = 1.5
 TRIALS_MAX = 20
 DESIGNS = ("p1", "p5", "p20", "te")
+# Designs beyond the core grid, run by the Gaussian sweep plans: a tensor plus
+# an additive smooth, and a factor-by smooth (one curve per level).
+EXTRA_DESIGNS = ("te+s", "by")
+BY_LEVELS = ("a", "b", "c")
 INTERVAL_LEVEL = 0.95
 TEST_SEED_OFFSET = 1000
 
@@ -83,12 +88,27 @@ def make_data(
     mean, and the per-row trial counts (``None`` for families without them).
 
     Same generators as the pyGAM audit (bench/pygam_audit/speed/worker.py) so
-    numbers stay comparable with the audit's speed.md tables.
+    numbers stay comparable with the audit's speed.md tables. The extra designs:
+
+      te+s  ``sin(2 pi x0) cos(2 pi x1) + sin(2 pi x2)``, fitted as
+            ``te(x0, x1) + s(x2)``;
+      by    ``sin(2 pi x0 + g) + (g - 1) / 2`` for a factor ``g`` with levels
+            ``BY_LEVELS`` (column 1 of ``X`` holds its integer code), fitted
+            as a factor-by smooth of ``x0``.
     """
     rng = np.random.default_rng(seed)
     if design == "te":
         X = rng.uniform(0.0, 1.0, (n, 2))
         eta = np.sin(2 * np.pi * X[:, 0]) * np.cos(2 * np.pi * X[:, 1])
+    elif design == "te+s":
+        X = rng.uniform(0.0, 1.0, (n, 3))
+        eta = np.sin(2 * np.pi * X[:, 0]) * np.cos(2 * np.pi * X[:, 1])
+        eta += np.sin(2 * np.pi * X[:, 2])
+    elif design == "by":
+        x = rng.uniform(0.0, 1.0, n)
+        g = rng.integers(0, len(BY_LEVELS), n).astype(float)
+        X = np.column_stack([x, g])
+        eta = np.sin(2 * np.pi * x + g) + (g - 1) / 2
     elif design_width(design) is not None:
         p = design_width(design)
         X = rng.uniform(0.0, 1.0, (n, p))
@@ -96,7 +116,9 @@ def make_data(
         for j in range(p):
             eta += np.sin(2 * np.pi * X[:, j] + j) / np.sqrt(p)
     else:
-        raise ValueError(f"unknown design {design!r}; expected p<k> or te")
+        raise ValueError(
+            f"unknown design {design!r}; expected p<k> or one of te, {EXTRA_DESIGNS}"
+        )
     if family == "gaussian":
         mu = eta
         y = eta + rng.normal(0.0, 0.5, n)
@@ -216,14 +238,23 @@ class GamfitAdapter(Adapter):
         self.family = family
         self.gamfit_family = "binomial" if is_binomial(family) else family
         self.names = [f"x{j}" for j in range(p)]
+        self.factor = design == "by"
         if design == "te":
             self.formula = "y ~ te(x0, x1)"
+        elif design == "te+s":
+            self.formula = "y ~ te(x0, x1) + s(x2)"
+        elif self.factor:
+            self.names = ["x0"]
+            self.formula = "y ~ s(x0, by=g)"
         else:
             self.formula = "y ~ " + " + ".join(f"s({nm})" for nm in self.names)
         self.model: Any = None
 
-    def _table(self, X: FloatArray) -> dict[str, FloatArray]:
-        return {nm: X[:, j] for j, nm in enumerate(self.names)}
+    def _table(self, X: FloatArray) -> dict[str, Any]:
+        table: dict[str, Any] = {nm: X[:, j] for j, nm in enumerate(self.names)}
+        if self.factor:
+            table["g"] = np.asarray(BY_LEVELS)[X[:, 1].astype(int)]
+        return table
 
     def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
         data = self._table(X)
@@ -265,9 +296,9 @@ class GamfitAdapter(Adapter):
         return {
             "edf": None if summ.edf_total is None else float(summ.edf_total),
             "ncoef": None if summ.coefficients is None else len(summ.coefficients),
-            "outer_iterations": conv.get("outer_iterations"),
-            "inner_iterations": conv.get("inner_iterations"),
-            "certified": conv.get("certified"),
+            "iterations": self.model.outer_iterations,
+            "inner_iterations": self.model.inner_iterations,
+            "certified": conv.get("certified") if isinstance(conv, dict) else None,
             "convergence": conv,
         }
 
@@ -281,6 +312,13 @@ class PygamAdapter(Adapter):
         self.family = family
         if design == "te":
             self.terms: Any = pygam.te(0, 1)
+        elif design == "te+s":
+            self.terms = pygam.te(0, 1) + pygam.s(2)
+        elif design == "by":
+            # pyGAM's ``by=`` is a numeric multiplier only; its factor-by smooth
+            # is the tensor of a spline in x0 with the categorical marginal of
+            # the factor, which spans one curve per level with its level offset.
+            self.terms = pygam.te(0, 1, dtype=["numerical", "categorical"])
         else:
             self.terms = pygam.s(0)
             for j in range(1, p):
