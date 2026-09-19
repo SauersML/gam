@@ -330,6 +330,7 @@ mod tensor_function_space_runtime_tests {
             double_penalty: true,
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+            adaptive: false,
         };
         let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
             .expect("double-penalty tensor basis");
@@ -430,6 +431,7 @@ mod tensor_function_space_runtime_tests {
                 double_penalty: true,
                 identifiability,
                 penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+                adaptive: false,
             };
             let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
                 .expect("double-penalty tensor basis");
@@ -474,6 +476,7 @@ mod tensor_function_space_runtime_tests {
             double_penalty: false,
             identifiability: TensorBSplineIdentifiability::None,
             penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+            adaptive: false,
         };
 
         let error = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
@@ -883,6 +886,7 @@ mod factor_smooth_null_component_tests {
             flavour,
             group_frozen_levels: None,
             frozen_global_orthogonality: None,
+            adaptive: false,
         };
         build_factor_smooth(
             grouped_data(n_levels).view(),
@@ -1144,6 +1148,7 @@ mod factor_smooth_heldout_group_tests {
                     flavour,
                     group_frozen_levels: frozen,
                     frozen_global_orthogonality: None,
+                    adaptive: false,
                 },
             },
             shape: ShapeConstraint::None.into(),
@@ -1340,6 +1345,7 @@ mod frozen_factor_level_collection_tests {
                             flavour: FactorSmoothFlavour::Fs {},
                             group_frozen_levels: Some(vec![9.0_f64.to_bits(), 8.0_f64.to_bits()]),
                             frozen_global_orthogonality: None,
+                            adaptive: false,
                         },
                     }),
                 }),

@@ -68,12 +68,13 @@ fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
         // A radial plan starved below the floor is lifted to it.
         let starved = 1usize;
         assert!(default_matern_center_count(n, 1, starved, univariate_floor) >= univariate_floor);
-        assert!(
-            default_duchon_center_count(n, 1, starved, 2, univariate_floor) >= univariate_floor
+        assert!(default_duchon_center_count(n, 1, 2, univariate_floor) >= univariate_floor);
+        // Without the floor the Duchon default is the rate pilot itself
+        // (bounded below only by the null-space identifiability floor).
+        assert_eq!(
+            default_duchon_center_count(n, 1, 2, 0),
+            starting_num_centers(n, 1, 2).max(3)
         );
-        // Without the floor the starved plan is kept (bounded below only by
-        // the null-space identifiability floor).
-        assert!(default_duchon_center_count(n, 1, starved, 2, 0) <= 3);
     }
     // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
     // the generic n-scaling plan unchanged.
@@ -92,7 +93,7 @@ fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
     let mut previous = 0usize;
     for n in [500usize, 5_000, 50_000, 500_000] {
         let generic_plan = default_num_centers(n, d);
-        let duchon_default = default_duchon_center_count(n, d, generic_plan, polynomial_cols, 0);
+        let duchon_default = default_duchon_center_count(n, d, polynomial_cols, 0);
         assert_eq!(
             duchon_default,
             starting_num_centers(n, d, polynomial_cols),
@@ -1158,7 +1159,7 @@ fn one_dimensional_bspline_accepts_boundary_periodic() {
         &spec.knotspec,
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis: 8
+            num_basis: 8, ..
         } if *data_range == (0.0, std::f64::consts::TAU)
     ));
 }

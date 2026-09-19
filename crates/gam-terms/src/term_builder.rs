@@ -2698,7 +2698,7 @@ pub(crate) fn build_smooth_basis(
             let internal_cap = basis_cap.saturating_sub(degree + 1);
             pilot_internal.max(1).min(internal_cap.max(1))
         };
-        let (n_knots, _, effective_degree) =
+        let (n_knots, knots_inferred, effective_degree) =
             parse_ps_internal_knots(options, degree, default_internal)?;
         // `m=` is mgcv's spelling of `penalty_order=` and is resolved as its
         // alias here (#2791). It used to be read further down as a boolean gate
@@ -2785,6 +2785,10 @@ pub(crate) fn build_smooth_basis(
                 ));
             }
         };
+        // `re` is an identity ridge whose width is a modelling choice, not a
+        // resolution; every other inferred marginal is a pilot the standard
+        // workflow refines from the converged fit's evidence.
+        let adaptive = knots_inferred && !matches!(flavour, FactorSmoothFlavour::Re);
         return Ok(SmoothBasisSpec::FactorSmooth {
             spec: FactorSmoothSpec {
                 continuous_cols: vec![c],
@@ -2793,6 +2797,7 @@ pub(crate) fn build_smooth_basis(
                 flavour,
                 group_frozen_levels: None,
                 frozen_global_orthogonality: None,
+                adaptive,
             },
         });
     }
@@ -2834,8 +2839,10 @@ pub(crate) fn build_smooth_basis(
             let unique = unique_count_column(ds.values.column(c));
             let default_basis = pilot_cyclic_basis_dim(sizing_rows, degree, penalty_order)
                 .min(unique.max(degree + 1));
-            let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?
-                .unwrap_or(default_basis);
+            let requested_basis =
+                option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
+            let adaptive = requested_basis.is_none();
+            let num_basis = requested_basis.unwrap_or(default_basis);
             if num_basis < degree + 1 {
                 return Err(format!(
                     "periodic smooth: k={} too small for degree {}; expected k >= {}",
@@ -2910,6 +2917,7 @@ pub(crate) fn build_smooth_basis(
                     knotspec: BSplineKnotSpec::PeriodicUniform {
                         data_range: (domain_start, domain_start + period),
                         num_basis,
+                        adaptive,
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability,
@@ -3049,6 +3057,7 @@ pub(crate) fn build_smooth_basis(
                         BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_end),
                             num_basis: n_knots + effective_degree + 1,
+                            adaptive: inferred,
                         },
                         OneDimensionalBoundary::Cyclic {
                             start: domain_start,
@@ -3302,6 +3311,9 @@ pub(crate) fn build_smooth_basis(
             };
             let penalty_order =
                 parse_penalty_order_alias(options)?.unwrap_or(DEFAULT_PENALTY_ORDER);
+            // `true` when nobody chose the harmonic truncation: the degree is
+            // the penalized-resolution pilot the formula workflow refines.
+            let mut adaptive_degree = false;
             let max_degree = if matches!(method, SphereMethod::Harmonic) {
                 let explicit_degree =
                     match option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])? {
@@ -3310,11 +3322,20 @@ pub(crate) fn build_smooth_basis(
                     };
                 let degree = match explicit_degree {
                     Some(degree) => degree,
-                    None => option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?
-                        .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
-                        .unwrap_or_else(|| {
+                    None => match option_usize_any(
+                        options,
+                        &["k", "basis_dim", "basis-dim", "basisdim"],
+                    )? {
+                        // The least degree whose harmonic span `L(L + 2)` holds
+                        // the requested dimension.
+                        Some(k) => (1usize..)
+                            .find(|&l| l.saturating_mul(l + 2) >= k)
+                            .unwrap_or(k),
+                        None => {
+                            adaptive_degree = true;
                             default_spherical_harmonic_degree(sizing_rows, penalty_order)
-                        }),
+                        }
+                    },
                 };
                 if degree == 0 {
                     return Err("sphere smooth requires degree/max_degree >= 1".to_string());
@@ -3332,17 +3353,21 @@ pub(crate) fn build_smooth_basis(
             let center_strategy = if matches!(method, SphereMethod::Wahba) {
                 // Pilot Wahba center count: the kernel's constant null space
                 // (removed by the center sum-to-zero constraint) plus the
-                // directions an order-`m` penalty resolves on the 2-D sphere,
-                // within the production center budget. The formula workflow
-                // refines it on the fit's own REML evidence.
+                // directions an order-`m` penalty resolves on the 2-D sphere.
+                // Nobody chose it, so it is `Auto`: the formula workflow refines
+                // it on the fit's own REML evidence.
                 let pilot_centers = 1usize
                     .saturating_add(penalized_resolution_rank(sizing_rows, 2, penalty_order.max(1)))
-                    .min(default_num_centers(sizing_rows, cols.len()))
                     .min(sizing_rows)
                     .max(1);
                 let centers = parse_countwith_basis_alias(options, "centers", pilot_centers)?;
-                CenterStrategy::FarthestPoint {
+                let strategy = CenterStrategy::FarthestPoint {
                     num_centers: centers,
+                };
+                if has_explicit_countwith_basis_alias(options, "centers") {
+                    strategy
+                } else {
+                    CenterStrategy::Auto(Box::new(strategy))
                 }
             } else {
                 CenterStrategy::FarthestPoint { num_centers: 0 }
@@ -3358,6 +3383,7 @@ pub(crate) fn build_smooth_basis(
                     max_degree,
                     wahba_kernel,
                     identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+                    adaptive_degree,
                 },
             })
         }
@@ -3723,7 +3749,6 @@ pub(crate) fn build_smooth_basis(
             let default_centers = default_duchon_center_count(
                 sizing_rows,
                 cols.len(),
-                default_num_centers(sizing_rows, cols.len()),
                 polynomial_cols,
                 univariate_floor,
             );
@@ -4181,6 +4206,8 @@ pub(crate) fn build_smooth_basis(
                         BSplineKnotSpec::PeriodicUniform {
                             data_range: (domain_start, domain_end),
                             num_basis: k_axis,
+                            // The tensor owns its margins' refinement.
+                            adaptive: false,
                         },
                         OneDimensionalBoundary::Cyclic {
                             start: domain_start,
@@ -4294,6 +4321,12 @@ pub(crate) fn build_smooth_basis(
             // shrinkable by default, so REML can recover an unsupported surface
             // as zero. Explicit `double_penalty=false` remains the MLE opt-out.
             let tensor_double_penalty = smooth_double_penalty;
+            // Nobody chose the margin sizes (and no domain or knot placement
+            // pins their knots), so they are the penalized-resolution pilot the
+            // formula workflow refines jointly from the converged fit.
+            let adaptive = k_inferred
+                && requested_knot_placement.is_none()
+                && domains.iter().all(Option::is_none);
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: canon_cols,
                 spec: TensorBSplineSpec {
@@ -4317,6 +4350,7 @@ pub(crate) fn build_smooth_basis(
                     } else {
                         TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
                     },
+                    adaptive,
                 },
             })
         }
@@ -5710,7 +5744,6 @@ fn default_matern_center_count(
 pub(crate) fn default_duchon_center_count(
     n: usize,
     d: usize,
-    planned_count: usize,
     polynomial_cols: usize,
     univariate_floor: usize,
 ) -> usize {
@@ -5726,15 +5759,13 @@ pub(crate) fn default_duchon_center_count(
     // full effect upstream, and the polynomial null space must still fit, so
     // tiny high-order bases are raised to the smallest admissible count.
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
-    // #1867: at small n the generic conditioning cap (`n / COND_N_DIVISOR`) in
-    // `default_num_centers` starves `planned_count` below the univariate spline
-    // resolution the competing `s(x)` gets on the SAME data, so `duchon(x)`
-    // over-smooths sparse oscillations. `univariate_floor` (0 for d>1) carries
-    // that spline-equivalent basis dimension and floors the 1-D default,
-    // bounded by n; smoothness is set by the REML penalty, not the raw count.
-    // Explicit `k`/`centers` still override upstream.
-    planned_count
-        .min(starting_num_centers(n, d, polynomial_cols))
+    // #1867: a 1-D radial basis must not be dimensioned coarser than the
+    // univariate spline the competing `s(x)` gets on the SAME data, or
+    // `duchon(x)` over-smooths sparse oscillations. `univariate_floor` (0 for
+    // d>1) carries that spline-equivalent basis dimension and floors the 1-D
+    // default, bounded by n; smoothness is set by the REML penalty, not the raw
+    // count. Explicit `k`/`centers` still override upstream.
+    starting_num_centers(n, d, polynomial_cols)
         .max(low_n_floor)
         .max(univariate_floor.min(n))
 }

@@ -383,7 +383,6 @@ fn default_univariate_duchon_center_count(t: ArrayView1<'_, f64>) -> usize {
     default_duchon_center_count(
         n,
         1,
-        default_num_centers(n, 1),
         polynomial_cols,
         univariate_spline_basis_dim(t),
     )

@@ -780,6 +780,7 @@ fn apply_bspline_1d(
                 BSplineKnotSpec::PeriodicUniform {
                     data_range: *data_range,
                     num_basis: n_internal + spec.degree + 1,
+                    adaptive: false,
                 }
             }
             // The formula already fixed this smooth's knots — an explicit
@@ -847,6 +848,7 @@ fn apply_bspline_1d(
         spec.knotspec = BSplineKnotSpec::PeriodicUniform {
             data_range: (start, end),
             num_basis,
+            adaptive: false,
         };
         spec.boundary = OneDimensionalBoundary::Cyclic { start, end };
     }
@@ -1488,7 +1490,7 @@ mod tests {
         match spec.knotspec {
             BSplineKnotSpec::PeriodicUniform {
                 data_range,
-                num_basis,
+                num_basis, ..
             } => {
                 assert_eq!(data_range, (0.0, 1.0));
                 // num_internal_knots + degree + 1 = 5 + 3 + 1 = 9

@@ -2628,6 +2628,7 @@ mod spherical_design_hessian_tests {
             max_degree,
             wahba_kernel,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         }
     }
 

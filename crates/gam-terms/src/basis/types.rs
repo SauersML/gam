@@ -229,6 +229,13 @@ pub enum BSplineKnotSpec {
     PeriodicUniform {
         data_range: (f64, f64),
         num_basis: usize,
+        /// `true` when nobody chose `num_basis`: it is the formula default's
+        /// starting resolution, which the standard formula workflow refines
+        /// from the converged fit's own evidence (see
+        /// [`BSplineKnotSpec::Automatic`]'s `adaptive`). An explicit `k=` is
+        /// `false` and honoured verbatim.
+        #[serde(default)]
+        adaptive: bool,
     },
     Automatic {
         num_internal_knots: Option<usize>,
@@ -613,16 +620,12 @@ pub const fn minimal_embedding_order(d: usize) -> usize {
 /// the [`penalized_resolution_rank`] of its minimal-embedding-order penalty:
 /// the smallest basis whose penalized span holds every direction an optimally
 /// smoothed fit on `n` rows keeps. It grows with `n` without bound other than
-/// the validated production basis [`default_num_centers`] and the row count;
-/// the adequacy loop refines it further only when the converged fit's own
-/// evidence says the surface is under-resolved (#1689).
+/// the row count (a center is a row); the adequacy loop refines it further only
+/// when the converged fit's own evidence says the surface is under-resolved
+/// (#1689).
 pub fn starting_num_centers(n: usize, d: usize, nullspace_dim: usize) -> usize {
     let rank = penalized_resolution_rank(n, d, minimal_embedding_order(d));
-    nullspace_dim
-        .saturating_add(rank)
-        .min(default_num_centers(n, d))
-        .min(n)
-        .max(1)
+    nullspace_dim.saturating_add(rank).min(n).max(1)
 }
 
 /// One level of uniform nested refinement of a knot grid: every one of the
@@ -3382,9 +3385,13 @@ mod saturation_escalation_tests {
         // dimension, where `10 * 3^(d-1)` pinned it.
         assert!(starting_num_centers(100_000, 2, 3) > starting_num_centers(10_000, 2, 3));
         assert!(starting_num_centers(10_000, 2, 3) > starting_num_centers(1_000, 2, 3));
-        // Capped by the validated production basis and the row count.
+        // Bounded only by the row count, never by the production heuristic
+        // budget: at n = 16 that budget's `n / 4` conditioning cap would hold
+        // a 2-D thin plate below its 3 null directions plus a penalized span.
+        assert_eq!(starting_num_centers(16, 2, 3), 3 + 3);
+        assert!(starting_num_centers(16, 2, 3) > default_num_centers(16, 2));
         for (n, d) in [(20, 2), (100, 4), (100_000, 1), (5_000, 16)] {
-            assert!(starting_num_centers(n, d, d + 1) <= default_num_centers(n, d).max(1));
+            assert!(starting_num_centers(n, d, d + 1) <= n);
         }
         assert_eq!(starting_num_centers(3, 5, 6), 1);
         assert_eq!(starting_num_centers(1, 2, 3), 1);

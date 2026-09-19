@@ -3909,6 +3909,7 @@ mod wahba_penalty_invariants_tests {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let error = build_spherical_spline_basis(data.view(), &spec)
             .expect_err("m = 1 Sobolev has no Gram diagonal and must be refused");
@@ -3948,6 +3949,7 @@ mod wahba_penalty_invariants_tests {
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba basis");
         assert_eq!(built.active_penalties.len(), 1);
@@ -4253,6 +4255,7 @@ mod harmonic_penalty_invariants_tests {
             max_degree: Some(3),
             wahba_kernel: SphereWahbaKernel::Sobolev,
             identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+            adaptive_degree: false,
         };
         let built = build_spherical_harmonic_basis(data.view(), &spec).expect("harmonic basis");
         assert_eq!(built.active_penalties.len(), 2);
