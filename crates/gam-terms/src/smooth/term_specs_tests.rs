@@ -494,8 +494,6 @@ mod random_effect_signed_zero_tests {
         RandomEffectTermSpec {
             name: "g".to_string(),
             feature_col: 0,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
             carries_level: false,
@@ -554,7 +552,7 @@ mod random_effect_signed_zero_tests {
     // ---- #2137: fixed factor (`factor(g)`) strict-unseen enforcement --------
 
     fn fixed_factor_spec() -> RandomEffectTermSpec {
-        // A numeric-coded `factor(year)`: full one-hot (`drop_first_level=false`),
+        // A numeric-coded `factor(year)`: full one-hot,
         // FIXED (`lenient_unseen=false`), vocabulary pinned at fit.
         let mut s = spec();
         s.name = "year".to_string();
@@ -1285,8 +1283,6 @@ mod frozen_factor_level_collection_tests {
             random_effect_terms: vec![RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 1,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![2.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 lenient_unseen: false,
                 carries_level: false,
@@ -1366,8 +1362,6 @@ mod frozen_factor_level_collection_tests {
             random_effect_terms: vec![RandomEffectTermSpec {
                 name: "main".to_string(),
                 feature_col: 1,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![2.0_f64.to_bits(), 1.0_f64.to_bits()]),
                 lenient_unseen: false,
                 carries_level: false,

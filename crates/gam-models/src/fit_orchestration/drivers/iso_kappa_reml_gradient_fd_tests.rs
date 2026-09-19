@@ -3269,8 +3269,6 @@ fn a_root_priced_rho_gradient_matches_its_value_2959() {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "grp".to_string(),
             feature_col: 1,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
             carries_level: false,

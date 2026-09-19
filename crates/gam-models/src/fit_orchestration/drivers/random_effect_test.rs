@@ -10,8 +10,8 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component (or, for an unpenalized factor block, fixed-effect)
-/// test of every random-effect block of a fitted standard GAM.
+/// The variance-component test of every random-effect block of a fitted
+/// standard GAM.
 ///
 /// Never fails: a fit without the row state the score needs yields one
 /// `NoIrlsRowState` record per block, so the summary always has an answer for
@@ -87,11 +87,11 @@ pub fn random_effect_test_records(
         .iter()
         .map(|(name, range)| RandomEffectTermRequest {
             range: range.clone(),
-            penalized: spec
+            carries_level: spec
                 .random_effect_terms
                 .iter()
                 .find(|term| term.name == *name)
-                .is_none_or(|term| term.penalized),
+                .is_some_and(|term| term.carries_level),
         })
         .collect();
     records(

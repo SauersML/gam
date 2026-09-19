@@ -29,8 +29,8 @@
 //! other random effects) projected out in the fit's own curvature metric. The
 //! variance component is the whole alternative, so a single scalar direction is
 //! tested and no `b̂` enters — the statistic cannot be shrunk by the penalty it
-//! is testing. The group penalties this crate builds are identity ridges, so
-//! `Σ_b = I` and `T = ‖u‖²`.
+//! is testing. A group block's penalty is an identity ridge, so `Σ_b = I` and
+//! `T = ‖u‖²`; the level carrier below is the one exception.
 //!
 //! `v` is read off the full fit rather than a refit: with `s = W_F ⊙ (z − η̂)`
 //! the fit's working score,
@@ -76,23 +76,25 @@
 //! not the fit's `φ̂` because `φ̂` is computed from a residual the penalty shrank,
 //! whose law under `H₀` depends on the smoothing parameters REML chose.
 //!
-//! # An unpenalized block
+//! # The level carrier
 //!
-//! A random-effect block that carries no penalty (the treatment-coded factor
-//! main effect a factor `by=` smooth injects) is a FIXED effect: its null
-//! `b = 0` is interior, and the classical score test `uᵀV⁺u/φ ~ χ²_rank` — the
-//! nested `F(rank, ν)` when the scale is estimated — applies. It is reported
-//! under its own hypothesis label rather than silently sharing the
-//! variance-component one.
+//! When the formula removes the intercept, one factor block carries the
+//! model's level, and its penalty is the centring projector `I − 11ᵀ/L`
+//! instead of the ridge. The constant direction of that block is unpenalized:
+//! it is the level, a fixed effect that stays in the model under `H₀`. So the
+//! block's constant column `X_R 1` joins the columns projected out, and only
+//! the contrasts are tested: with `Q` an orthonormal basis of `{c : 1ᵀc = 0}`,
+//! `b = Qc` with `c ~ N(0, σ²_b I)`, and the test above runs on the design
+//! `X_R Q` with `Σ_c = I`. Since `QQᵀ = I − 11ᵀ/L`, the statistic and its law do
+//! not depend on which `Q` is used. `0 + g` is then tested exactly as `1 + g`
+//! is: both test the between-level contrasts against a free level.
 
 use std::ops::Range;
 
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 use gam_linalg::matrix::DesignMatrix;
-use gam_math::probability::{
-    WeightedChiSquareTerm, chi_square_sf, fisher_snedecor_sf, signed_weighted_chi_square_sf,
-};
+use gam_math::probability::{WeightedChiSquareTerm, signed_weighted_chi_square_sf};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use serde::{Deserialize, Serialize};
 
@@ -108,16 +110,6 @@ pub enum RandomEffectTestScale {
     /// `φ` was estimated from the data, so the statistic is a ratio against the
     /// unpenalized residual sum of squares.
     Estimated,
-}
-
-/// Which null the reported p-value tests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RandomEffectHypothesis {
-    /// `σ²_b = 0` for a penalized (random) block — the boundary null.
-    VarianceComponent,
-    /// `b = 0` for an unpenalized (fixed) block — an interior null.
-    FixedEffect,
 }
 
 /// Why a random-effect term has no p-value.
@@ -175,15 +167,12 @@ impl RandomEffectTestUnavailable {
 /// A computed random-effect test.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RandomEffectTest {
-    pub hypothesis: RandomEffectHypothesis,
-    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`.
-    ///
-    /// Variance component: `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known
-    /// scale and `D'/ν` for an estimated one. Fixed effect: `uᵀV⁺u/φ̂`.
+    /// Reported on a chi-square-like scale with mean `reference_df` under `H₀`:
+    /// `(T/φ̂)·reference_df/Σμ`, with `φ̂ = φ` for a known scale and `D'/ν` for
+    /// an estimated one.
     pub statistic: f64,
-    /// Variance component: the effective degrees of freedom `(Σμ)²/Σμ²` of the
-    /// spectral reference — `rank` exactly when the design is balanced.
-    /// Fixed effect: `rank`.
+    /// The effective degrees of freedom `(Σμ)²/Σμ²` of the spectral reference —
+    /// `rank` exactly when the design is balanced.
     pub reference_df: f64,
     /// Number of estimable directions of the term (eigenvalues of `V` above its
     /// rounding floor).
@@ -228,9 +217,10 @@ pub struct RandomEffectTestRecord {
 pub struct RandomEffectTermRequest {
     /// GLOBAL coefficient range of the term's block.
     pub range: Range<usize>,
-    /// Whether the block carries a penalty (a random effect) or not (a fixed
-    /// factor block).
-    pub penalized: bool,
+    /// Whether the block carries the model's level (its penalty is the
+    /// centring projector), so its constant direction is held fixed and only
+    /// its contrasts are tested. See the module docs.
+    pub carries_level: bool,
 }
 
 /// The fit's row state, in the fit's own row and coefficient layout.
@@ -387,40 +377,73 @@ impl<'a> RandomEffectTestBasis<'a> {
         if range.is_empty() || range.end > p {
             return Err(RandomEffectTestUnavailable::NoEstimableDirection);
         }
-        let tested: Vec<usize> = range.clone().collect();
+        let block: Vec<usize> = range.clone().collect();
+        let contrast_basis = request
+            .carries_level
+            .then(|| centred_contrast_basis(block.len()));
+        let tested_width = contrast_basis.as_ref().map_or(block.len(), |q| q.ncols());
+        if tested_width == 0 {
+            // A one-level carrier is the constant alone, which `H₀` keeps.
+            return Err(RandomEffectTestUnavailable::NoEstimableDirection);
+        }
+        // `M_T` maps the tested directions onto the fit's columns (the block's
+        // columns, or its contrasts `E_R Q` for a carrier); `M_F` the columns
+        // held fixed under `H₀` (every other column, plus `E_R 1` for a
+        // carrier). The projected design is `X̃ = X D` with
+        // `D = M_T − M_F (M_FᵀG_H M_F)⁻ M_FᵀG_H M_T`.
         let other: Vec<usize> = (0..p).filter(|j| !range.contains(j)).collect();
-        let projection = if other.is_empty() {
-            Array2::<f64>::zeros((0, tested.len()))
-        } else {
-            let other_gram = self
-                .hessian_gram
-                .select(Axis(0), &other)
-                .select(Axis(1), &other);
-            let cross = self
-                .hessian_gram
-                .select(Axis(0), &other)
-                .select(Axis(1), &tested);
-            let pinv = equilibrated_pseudo_inverse(&other_gram)
+        let fixed_width = other.len() + usize::from(request.carries_level);
+        let mut direction = Array2::<f64>::zeros((p, tested_width));
+        match &contrast_basis {
+            Some(q) => direction.slice_mut(s![range.clone(), ..]).assign(q),
+            None => {
+                for (k, &j) in block.iter().enumerate() {
+                    direction[[j, k]] = 1.0;
+                }
+            }
+        }
+        if fixed_width > 0 {
+            // `M_FᵀG_H`, `fixed_width × p`: the `other` rows of `G_H`, and for a
+            // carrier the sum of its block rows.
+            let fixed_gram_rows =
+                fixed_combination(&self.hessian_gram, &other, &range, request.carries_level);
+            let fixed_gram = fixed_combination(
+                &fixed_gram_rows.t().to_owned(),
+                &other,
+                &range,
+                request.carries_level,
+            );
+            let cross = fixed_gram_rows.dot(&direction);
+            let pinv = equilibrated_pseudo_inverse(&fixed_gram)
                 .ok_or(RandomEffectTestUnavailable::DesignUnavailable)?;
-            pinv.inverse.dot(&cross)
-        };
-        if projection.iter().any(|v| !v.is_finite()) {
+            let projection = pinv.inverse.dot(&cross);
+            for (k, &j) in other.iter().enumerate() {
+                let mut row = direction.row_mut(j);
+                row -= &projection.row(k);
+            }
+            if request.carries_level {
+                let level = projection.row(other.len());
+                for j in range.clone() {
+                    let mut row = direction.row_mut(j);
+                    row -= &level;
+                }
+            }
+        }
+        if direction.iter().any(|v| !v.is_finite()) {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
         }
-        let q = tested.len();
         Ok(PreparedTerm {
-            penalized: request.penalized,
-            beta_tested: self.input.beta.slice(s![range]).to_owned(),
-            tested,
-            other,
-            projection,
-            fisher_projected: Array2::zeros((q, q)),
-            score: Array1::zeros(q),
+            beta_block: self.input.beta.slice(s![range]).to_owned(),
+            block,
+            contrast_basis,
+            direction,
+            fisher_projected: Array2::zeros((tested_width, tested_width)),
+            score: Array1::zeros(tested_width),
             unprojected_trace: 0.0,
         })
     }
 
-    /// Second pass: `V = X̃_RᵀW_F X̃_R` and `u = X̃_Rᵀv` for every prepared term.
+    /// Second pass: `V = X̃ᵀW_F X̃` and `u = X̃ᵀv` for every prepared term.
     fn accumulate(
         &self,
         prepared: &mut [Result<PreparedTerm, RandomEffectTestUnavailable>],
@@ -438,19 +461,19 @@ impl<'a> RandomEffectTestBasis<'a> {
             let score_weights = self.input.score_weights.slice(s![start..stop]);
             let score = self.input.score.slice(s![start..stop]);
             for term in prepared.iter_mut().flatten() {
-                let tested_block = block.select(Axis(1), &term.tested);
+                let term_block = block.select(Axis(1), &term.block);
                 let mut residual = score.to_owned();
-                residual += &(&hessian_weights * &tested_block.dot(&term.beta_tested));
-                term.unprojected_trace += tested_block
+                residual += &(&hessian_weights * &term_block.dot(&term.beta_block));
+                let tested = match &term.contrast_basis {
+                    Some(q) => term_block.dot(q),
+                    None => term_block,
+                };
+                term.unprojected_trace += tested
                     .axis_iter(Axis(0))
                     .zip(score_weights.iter())
                     .map(|(row, &weight)| weight * row.dot(&row))
                     .sum::<f64>();
-                let projected = if term.other.is_empty() {
-                    tested_block
-                } else {
-                    tested_block - block.select(Axis(1), &term.other).dot(&term.projection)
-                };
+                let projected = block.dot(&term.direction);
                 term.fisher_projected += &weighted_cross(&projected, score_weights);
                 term.score += &projected.t().dot(&residual);
             }
@@ -467,11 +490,11 @@ impl<'a> RandomEffectTestBasis<'a> {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
         }
         let symmetric = 0.5 * (&term.fisher_projected + &term.fisher_projected.t());
-        let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&symmetric, Side::Lower)
+        let (eigenvalues, _) = strict_symmetric_eigh(&symmetric, Side::Lower)
             .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
-        // `X̃_R` is a difference of two quantities of the size of `X_R`, so an
-        // eigenvalue of `V` is resolved only above the rounding of that
-        // difference: `p·ε` relative to `‖X_RᵀW_F X_R‖`, whose trace bounds it.
+        // `X̃` is a difference of two quantities of the size of the tested
+        // design, so an eigenvalue of `V` is resolved only above the rounding of
+        // that difference: `p·ε` relative to its `W_F` Gram, whose trace bounds it.
         let floor = (p as f64) * f64::EPSILON * term.unprojected_trace;
         let kept: Vec<usize> = (0..eigenvalues.len())
             .filter(|&j| eigenvalues[j] > floor)
@@ -493,102 +516,98 @@ impl<'a> RandomEffectTestBasis<'a> {
             }
         };
 
-        if term.penalized {
-            let statistic = term.score.dot(&term.score);
-            let weights: Vec<f64> = kept.iter().map(|&j| eigenvalues[j]).collect();
-            let weight_sum: f64 = weights.iter().sum();
-            let weight_square_sum: f64 = weights.iter().map(|w| w * w).sum();
-            let effective_df = weight_sum * weight_sum / weight_square_sum;
-            let mut terms: Vec<WeightedChiSquareTerm> = weights
-                .iter()
-                .map(|&weight| WeightedChiSquareTerm {
-                    weight,
-                    degrees_of_freedom: 1.0,
-                })
-                .collect();
-            let (tail, dispersion) = match self.scale {
-                ResolvedScale::Known(dispersion) => (
-                    signed_weighted_chi_square_sf(&terms, statistic / dispersion),
-                    dispersion,
-                ),
-                ResolvedScale::Estimated {
-                    residual_sum_of_squares,
-                    residual_df,
-                } => {
-                    terms.push(WeightedChiSquareTerm {
-                        weight: -statistic / residual_sum_of_squares,
-                        degrees_of_freedom: residual_df,
-                    });
-                    (
-                        signed_weighted_chi_square_sf(&terms, 0.0),
-                        residual_sum_of_squares / residual_df,
-                    )
-                }
-            };
-            let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
-            Ok(RandomEffectTest {
-                hypothesis: RandomEffectHypothesis::VarianceComponent,
-                statistic: statistic / dispersion * effective_df / weight_sum,
-                reference_df: effective_df,
-                rank,
-                residual_df,
-                p_value,
-                p_value_relative_error,
+        let statistic = term.score.dot(&term.score);
+        let weights: Vec<f64> = kept.iter().map(|&j| eigenvalues[j]).collect();
+        let weight_sum: f64 = weights.iter().sum();
+        let weight_square_sum: f64 = weights.iter().map(|w| w * w).sum();
+        let effective_df = weight_sum * weight_sum / weight_square_sum;
+        let mut terms: Vec<WeightedChiSquareTerm> = weights
+            .iter()
+            .map(|&weight| WeightedChiSquareTerm {
+                weight,
+                degrees_of_freedom: 1.0,
             })
-        } else {
-            let quadratic: f64 = kept
-                .iter()
-                .map(|&j| {
-                    let projection = eigenvectors.column(j).dot(&term.score);
-                    projection * projection / eigenvalues[j]
-                })
-                .sum();
-            let rank_df = rank as f64;
-            let (statistic, p_value) = match self.scale {
-                ResolvedScale::Known(dispersion) => {
-                    let statistic = quadratic / dispersion;
-                    (statistic, chi_square_sf(statistic, rank_df))
-                }
-                ResolvedScale::Estimated {
-                    residual_sum_of_squares,
-                    residual_df,
-                } => {
-                    let statistic = quadratic / (residual_sum_of_squares / residual_df);
-                    (
-                        statistic,
-                        fisher_snedecor_sf(statistic / rank_df, rank_df, residual_df),
-                    )
-                }
-            };
-            if !p_value.is_finite() {
-                return Err(RandomEffectTestUnavailable::TailUnresolved);
+            .collect();
+        let (tail, dispersion) = match self.scale {
+            ResolvedScale::Known(dispersion) => (
+                signed_weighted_chi_square_sf(&terms, statistic / dispersion),
+                dispersion,
+            ),
+            ResolvedScale::Estimated {
+                residual_sum_of_squares,
+                residual_df,
+            } => {
+                terms.push(WeightedChiSquareTerm {
+                    weight: -statistic / residual_sum_of_squares,
+                    degrees_of_freedom: residual_df,
+                });
+                (
+                    signed_weighted_chi_square_sf(&terms, 0.0),
+                    residual_sum_of_squares / residual_df,
+                )
             }
-            Ok(RandomEffectTest {
-                hypothesis: RandomEffectHypothesis::FixedEffect,
-                statistic,
-                reference_df: rank_df,
-                rank,
-                residual_df,
-                p_value,
-                p_value_relative_error: 0.0,
-            })
-        }
+        };
+        let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
+        Ok(RandomEffectTest {
+            statistic: statistic / dispersion * effective_df / weight_sum,
+            reference_df: effective_df,
+            rank,
+            residual_df,
+            p_value,
+            p_value_relative_error,
+        })
     }
 }
 
 struct PreparedTerm {
-    penalized: bool,
-    tested: Vec<usize>,
-    other: Vec<usize>,
-    beta_tested: Array1<f64>,
-    /// `A = G_OO⁻G_OR` in the `W_H` metric.
-    projection: Array2<f64>,
-    /// `V = X̃_RᵀW_F X̃_R`.
+    /// The block's GLOBAL columns.
+    block: Vec<usize>,
+    beta_block: Array1<f64>,
+    /// `Q`, the carrier's orthonormal contrast basis; `None` tests every column.
+    contrast_basis: Option<Array2<f64>>,
+    /// `D`, `p × r`: the projected tested design is `X̃ = X D`.
+    direction: Array2<f64>,
+    /// `V = X̃ᵀW_F X̃`.
     fisher_projected: Array2<f64>,
-    /// `u = X̃_Rᵀv`.
+    /// `u = X̃ᵀv`.
     score: Array1<f64>,
-    /// `tr(X_RᵀW_F X_R)`, the scale `V`'s rounding floor is relative to.
+    /// `tr` of the tested design's `W_F` Gram before projection, the scale
+    /// `V`'s rounding floor is relative to.
     unprojected_trace: f64,
+}
+
+/// An orthonormal basis of the contrasts `{c : 1ᵀc = 0}` of `levels` levels:
+/// column `k` is `(1, …, 1, −k, 0, …, 0)/√(k(k+1))` with `k` leading ones, the
+/// normalized Helmert contrasts. `QQᵀ = I − 11ᵀ/L`, the level carrier's penalty.
+fn centred_contrast_basis(levels: usize) -> Array2<f64> {
+    let mut basis = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
+    for k in 1..levels {
+        let norm = ((k * (k + 1)) as f64).sqrt();
+        for j in 0..k {
+            basis[[j, k - 1]] = 1.0 / norm;
+        }
+        basis[[k, k - 1]] = -(k as f64) / norm;
+    }
+    basis
+}
+
+/// `M_Fᵀ Y` for a `p`-row `Y`: its `other` rows, and for a carrier the sum of
+/// its `block` rows.
+fn fixed_combination(
+    rows: &Array2<f64>,
+    other: &[usize],
+    block: &Range<usize>,
+    carries_level: bool,
+) -> Array2<f64> {
+    let selected = rows.select(Axis(0), other);
+    if !carries_level {
+        return selected;
+    }
+    let level_row = rows
+        .slice(s![block.clone(), ..])
+        .sum_axis(Axis(0))
+        .insert_axis(Axis(0));
+    ndarray::concatenate![Axis(0), selected, level_row]
 }
 
 /// Read the weighted chi-square tail through its own error contract: a
@@ -685,6 +704,7 @@ fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
 mod tests {
     use super::*;
     use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_math::probability::fisher_snedecor_sf;
 
     struct Lcg(u64);
 
@@ -729,7 +749,7 @@ mod tests {
         y: &Array1<f64>,
         beta: &Array1<f64>,
         range: Range<usize>,
-        penalized: bool,
+        carries_level: bool,
         scale: RandomEffectTestScale,
     ) -> Result<RandomEffectTest, RandomEffectTestUnavailable> {
         let n = design.nrows();
@@ -745,7 +765,10 @@ mod tests {
             scale,
         })?;
         basis
-            .test_terms(&[RandomEffectTermRequest { range, penalized }])
+            .test_terms(&[RandomEffectTermRequest {
+                range,
+                carries_level,
+            }])
             .pop()
             .expect("one term requested")
     }
@@ -796,6 +819,52 @@ mod tests {
             &y,
             &beta,
             1..1 + levels,
+            false,
+            RandomEffectTestScale::Estimated,
+        )
+        .expect("test runs");
+        let (f, df1, df2) = anova_f(&groups, levels, &y);
+        let expected = fisher_snedecor_sf(f, df1, df2);
+        assert_eq!(test.rank, levels - 1);
+        assert!((test.reference_df - df1).abs() < 1e-9, "{test:?}");
+        assert_eq!(test.residual_df, Some(df2));
+        assert!((test.statistic - f * df1).abs() < 1e-8 * f * df1, "{test:?} vs F={f}");
+        assert!(
+            (test.p_value - expected).abs() <= 1e-8 * expected + 1e-14,
+            "{} vs {expected}",
+            test.p_value
+        );
+    }
+
+    /// `[x | indicator(g)]`: no intercept, so the group block carries the level.
+    fn carrier_design(groups: &[usize], levels: usize, x: &[f64]) -> Array2<f64> {
+        let n = groups.len();
+        let mut design = Array2::<f64>::zeros((n, 1 + levels));
+        for i in 0..n {
+            design[[i, 0]] = x[i];
+            design[[i, 1 + groups[i]]] = 1.0;
+        }
+        design
+    }
+
+    #[test]
+    fn balanced_level_carrier_is_the_one_way_anova_f() {
+        let levels = 6;
+        let groups: Vec<usize> = (0..60).map(|i| i % levels).collect();
+        let mut rng = Lcg(7);
+        let y: Array1<f64> = groups
+            .iter()
+            .map(|&g| 2.0 + 0.3 * g as f64 + rng.next_normal())
+            .collect();
+        let mut carrier = Array2::<f64>::zeros((groups.len(), levels));
+        for (i, &g) in groups.iter().enumerate() {
+            carrier[[i, g]] = 1.0;
+        }
+        let test = gaussian_test(
+            &carrier,
+            &y,
+            &Array1::zeros(levels),
+            0..levels,
             true,
             RandomEffectTestScale::Estimated,
         )
@@ -814,30 +883,118 @@ mod tests {
     }
 
     #[test]
-    fn unbalanced_fixed_effect_branch_is_the_nested_f_test() {
+    fn level_carrier_is_tested_exactly_as_the_intercept_plus_ridge_block() {
         let levels = 5;
+        let n = 83;
         let mut rng = Lcg(11);
-        let groups: Vec<usize> = (0..83)
-            .map(|i| if i < levels { i } else { (rng.next_uniform() * rng.next_uniform() * levels as f64) as usize })
+        let x: Vec<f64> = (0..n).map(|_| rng.next_uniform()).collect();
+        let groups: Vec<usize> = (0..n)
+            .map(|i| {
+                if i < levels {
+                    i
+                } else {
+                    (rng.next_uniform() * rng.next_uniform() * levels as f64) as usize
+                }
+            })
             .collect();
-        let y: Array1<f64> = groups.iter().map(|_| rng.next_normal()).collect();
-        let design = intercept_and_groups(&groups, levels);
+        let y: Array1<f64> = (0..n)
+            .map(|i| 1.5 + x[i] + 0.2 * groups[i] as f64 + rng.next_normal())
+            .collect();
+        let with_intercept = one_way_design(&groups, levels, &x);
+        let without = carrier_design(&groups, levels, &x);
+        for scale in [
+            RandomEffectTestScale::Known { dispersion: 1.0 },
+            RandomEffectTestScale::Estimated,
+        ] {
+            let ridge = gaussian_test(
+                &with_intercept,
+                &y,
+                &Array1::zeros(with_intercept.ncols()),
+                2..2 + levels,
+                false,
+                scale,
+            )
+            .expect("test runs");
+            let carried = gaussian_test(
+                &without,
+                &y,
+                &Array1::zeros(without.ncols()),
+                1..1 + levels,
+                true,
+                scale,
+            )
+            .expect("test runs");
+            assert_eq!(carried.rank, ridge.rank);
+            assert_eq!(carried.residual_df, ridge.residual_df);
+            assert!((carried.reference_df - ridge.reference_df).abs() < 1e-9 * ridge.reference_df);
+            assert!(
+                (carried.statistic - ridge.statistic).abs() < 1e-9 * ridge.statistic,
+                "{carried:?} vs {ridge:?}"
+            );
+            assert!(
+                (carried.p_value - ridge.p_value).abs() <= 1e-9 * ridge.p_value + 1e-14,
+                "{carried:?} vs {ridge:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_p_values_are_uniform_for_the_level_carrier() {
+        let levels = 7;
+        let n = 70;
+        let reps = 2000;
+        let mut rng = Lcg(4049);
+        let x: Vec<f64> = (0..n).map(|_| rng.next_uniform()).collect();
+        let groups: Vec<usize> = (0..n)
+            .map(|i| ((i as f64 / n as f64).powi(2) * levels as f64) as usize)
+            .collect();
+        let design = carrier_design(&groups, levels, &x);
         let beta = Array1::<f64>::zeros(design.ncols());
-        let test = gaussian_test(
+        for scale in [
+            RandomEffectTestScale::Known { dispersion: 1.0 },
+            RandomEffectTestScale::Estimated,
+        ] {
+            let mut rejections_05 = 0usize;
+            let mut rejections_10 = 0usize;
+            let mut sum = 0.0;
+            for _ in 0..reps {
+                // A nonzero level: `H₀` keeps it, so it must not be tested.
+                let y: Array1<f64> = (0..n).map(|i| 3.0 + x[i] + rng.next_normal()).collect();
+                let test = gaussian_test(&design, &y, &beta, 1..1 + levels, true, scale)
+                    .expect("test runs");
+                sum += test.p_value;
+                rejections_05 += usize::from(test.p_value < 0.05);
+                rejections_10 += usize::from(test.p_value < 0.10);
+            }
+            let m = reps as f64;
+            for (alpha, count) in [(0.05, rejections_05), (0.10, rejections_10)] {
+                let rate = count as f64 / m;
+                let mcse = (alpha * (1.0 - alpha) / m).sqrt();
+                assert!(
+                    (rate - alpha).abs() <= 3.0 * mcse,
+                    "{scale:?}: size {rate} at {alpha}"
+                );
+            }
+            let mean = sum / m;
+            assert!((mean - 0.5).abs() <= 3.0 * (1.0 / 12.0 / m).sqrt(), "{scale:?}: mean {mean}");
+        }
+    }
+
+    #[test]
+    fn a_one_level_carrier_has_no_estimable_direction() {
+        let n = 30;
+        let design = carrier_design(&vec![0; n], 1, &(0..n).map(|i| i as f64 / n as f64).collect::<Vec<_>>());
+        let y: Array1<f64> = (0..n).map(|i| 1.0 + i as f64 * 0.01).collect();
+        let reason = gaussian_test(
             &design,
             &y,
-            &beta,
-            1..1 + levels,
-            false,
-            RandomEffectTestScale::Estimated,
+            &Array1::zeros(design.ncols()),
+            1..2,
+            true,
+            RandomEffectTestScale::Known { dispersion: 1.0 },
         )
-        .expect("test runs");
-        let (f, df1, df2) = anova_f(&groups, levels, &y);
-        assert_eq!(test.hypothesis, RandomEffectHypothesis::FixedEffect);
-        assert_eq!(test.rank, levels - 1);
-        assert!((test.statistic - f * df1).abs() < 1e-8 * f * df1, "{test:?} vs F={f}");
-        let expected = fisher_snedecor_sf(f, df1, df2);
-        assert!((test.p_value - expected).abs() <= 1e-9 * expected + 1e-14);
+        .expect_err("the constant alone is not tested");
+        assert_eq!(reason, RandomEffectTestUnavailable::NoEstimableDirection);
     }
 
     #[test]
@@ -854,7 +1011,7 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             2..2 + levels,
-            true,
+            false,
             RandomEffectTestScale::Estimated,
         )
         .expect("test runs");
@@ -866,7 +1023,7 @@ mod tests {
             &y,
             &shifted,
             2..2 + levels,
-            true,
+            false,
             RandomEffectTestScale::Estimated,
         )
         .expect("test runs");
@@ -897,7 +1054,7 @@ mod tests {
             let mut sum = 0.0;
             for _ in 0..reps {
                 let y: Array1<f64> = (0..n).map(|i| 1.0 + x[i] + rng.next_normal()).collect();
-                let test = gaussian_test(&design, &y, &beta, 2..2 + levels, true, scale)
+                let test = gaussian_test(&design, &y, &beta, 2..2 + levels, false, scale)
                     .expect("test runs");
                 sum += test.p_value;
                 rejections_05 += usize::from(test.p_value < 0.05);
@@ -932,7 +1089,7 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             2..2 + levels,
-            true,
+            false,
             RandomEffectTestScale::Known { dispersion: 1.0 },
         )
         .expect("test runs");
@@ -952,7 +1109,7 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             5..9,
-            true,
+            false,
             RandomEffectTestScale::Known { dispersion: 1.0 },
         )
         .expect_err("no direction survives");
@@ -969,7 +1126,7 @@ mod tests {
             &y,
             &Array1::zeros(design.ncols()),
             1..7,
-            true,
+            false,
             RandomEffectTestScale::Estimated,
         )
         .expect_err("no residual d.f.");

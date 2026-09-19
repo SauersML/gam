@@ -5201,9 +5201,9 @@ impl FittedModel {
     /// the `check`/`predict` schema layer can enforce the same fixed-factor
     /// contract the design operator (`build_random_effect_block`) enforces.
     ///
-    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
-    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
-    /// training vocabulary) are returned, matching the operator's strict gate.
+    /// Only strict terms with concrete `frozen_levels` (captured at fit, the
+    /// complete training vocabulary) are returned, matching the operator's
+    /// strict gate.
     pub fn numeric_fixed_factor_vocabularies(&self) -> Vec<(String, HashSet<u64>)> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return Vec::new();
@@ -5214,7 +5214,7 @@ impl FittedModel {
         let mut out = Vec::<(String, HashSet<u64>)>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
-                if term.lenient_unseen || term.drop_first_level {
+                if term.lenient_unseen {
                     continue;
                 }
                 let Some(levels) = term.frozen_levels.as_ref() else {
@@ -7268,8 +7268,6 @@ mod tests {
             .push(gam_terms::smooth::RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 0,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
                 lenient_unseen: true,
                 carries_level: false,

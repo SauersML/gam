@@ -15,23 +15,21 @@
 //     for term in design.smooth.terms { ...per_term_edf(.., penalty_cursor, k); penalty_cursor += k }
 //
 // i.e. it assumes EVERY random-effect range owns exactly ONE penalty block.
-// But the actual penalty layout built in `design_construction.rs` only emits a
-// ridge block for a random effect when `spec.random_effect_terms[i].penalized`
-// (line ~233: `if range.is_empty() || !...penalized { continue; }`).
+// But the actual penalty layout only emits a penalty block for a random effect
+// that `owns_penalty_block`: a one-level carrier of the model's level (the
+// block that is the constant alone) contributes a column and NO penalty block.
 //
 // A factor-`by` smooth `s(x, by=g)` used to add an UNPENALIZED treatment-coded
-// random-effect main effect for `g` (`penalized: false`, `drop_first_level:
-// true`), so that `g` appeared in `random_effect_ranges` but contributed NO
-// penalty block. The summary's cursor then over-counted by one and every
-// following smooth term read a penalty-block trace shifted by +1.
+// random-effect main effect for `g`, so that `g` appeared in
+// `random_effect_ranges` but contributed NO penalty block. The summary's
+// cursor then over-counted by one and every following smooth term read a
+// penalty-block trace shifted by +1.
 //
-// Since 35c8b53864 (SPEC rules 12 and 14) the by= main effect is a penalized
-// full-level random block, so a fresh formula fit no longer produces that
-// range. Saved models fitted before it still carry the unpenalized
-// treatment-coded spec, and predict and summary must honour it. So the fixture
-// rebuilds the fitted design from the fit's own resolved spec with the `g`
-// block set back to that saved-model representation, and checks the invariant
-// on both designs.
+// The by= main effect is now a penalized full-level random block, so the
+// formula fit no longer produces that range. The penalty-free random-effect
+// range that remains is the one-level level carrier, so the fixture rebuilds
+// the fitted design from the fit's own resolved spec with the `g` block turned
+// into one, and checks the invariant on both designs.
 //
 // This corrupts per-term EDF / ref_df / p-value whenever the influence matrix
 // is unavailable so `per_term_edf` falls through to its
@@ -41,8 +39,8 @@
 //
 // This test asserts the structural invariant directly on the built design: the
 // number of leading random-effect ranges that the summary cursor SKIPS must
-// equal the number of leading penalty blocks they actually own. With an
-// unpenalized `by` factor present these disagree, so the reconstructed cursor
+// equal the number of leading penalty blocks they actually own. With a
+// penalty-free carrier range present these disagree, so the reconstructed cursor
 // for the first smooth term points past the smooth's own penalty block.
 
 use csv::StringRecord;
@@ -178,25 +176,29 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
     };
     assert_cursor_matches_layout(&std_fit.design, "fitted design");
 
-    // The saved-model representation of the same fit: the by= main effect as the
-    // unpenalized treatment-coded block it was before 35c8b53864, unfrozen as it
-    // was at fit time, so the build derives its kept levels from the data again.
-    let mut saved_spec = std_fit.resolvedspec.clone();
-    let main_effect = saved_spec
+    // The same fit with the by= main effect turned into a one-level carrier of
+    // the level: one column, the constant alone, which owns no penalty block.
+    let mut carrier_spec = std_fit.resolvedspec.clone();
+    let main_effect = carrier_spec
         .random_effect_terms
         .iter_mut()
         .find(|term| term.name == "g")
         .expect("the by= factor main effect `g` must be a random-effect term");
-    main_effect.penalized = false;
-    main_effect.drop_first_level = true;
-    main_effect.frozen_levels = None;
-    let saved_design = build_term_collection_design(data.values.view(), &saved_spec)
-        .expect("rebuild the design with the saved-model unpenalized main effect");
+    let first_level = main_effect
+        .frozen_levels
+        .as_ref()
+        .and_then(|levels| levels.first().copied())
+        .expect("the fit freezes the by= factor's levels");
+    main_effect.carries_level = true;
+    main_effect.lenient_unseen = true;
+    main_effect.frozen_levels = Some(vec![first_level]);
+    let carrier_design = build_term_collection_design(data.values.view(), &carrier_spec)
+        .expect("rebuild the design with a one-level carrier main effect");
     let (buggy_cursor_skips, leading_re_penalty_blocks) =
-        assert_cursor_matches_layout(&saved_design, "saved-model design");
+        assert_cursor_matches_layout(&carrier_design, "one-level carrier design");
     assert_ne!(
         buggy_cursor_skips, leading_re_penalty_blocks,
-        "saved-model design: the unpenalized random-effect range must add columns but no \
-         penalty block, or the old one-slot-per-range cursor would not desync"
+        "one-level carrier design: the carrier's range must add a column but no penalty \
+         block, or the old one-slot-per-range cursor would not desync"
     );
 }

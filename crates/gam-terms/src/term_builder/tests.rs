@@ -4861,8 +4861,6 @@ fn no_intercept_factor_carries_the_level_and_keeps_its_contrasts_penalized() {
         let spec = build_formula(formula, &ds);
         assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
         let re = &spec.random_effect_terms[0];
-        assert!(!re.drop_first_level, "`{formula}` keeps every level");
-        assert!(re.penalized, "`{formula}`: the level carrier stays penalized");
         assert!(re.carries_level, "`{formula}`: the factor carries the level");
         let residual = unpenalized_constant_residual(&ds, &spec);
         assert!(residual < 1e-8, "`{formula}`: {residual}");
@@ -4893,16 +4891,13 @@ fn no_intercept_factor_carries_the_level_and_keeps_its_contrasts_penalized() {
 
     let with_intercept = build_formula("y ~ f", &ds);
     assert_eq!(with_intercept.level, ModelLevel::Intercept);
-    assert!(with_intercept.random_effect_terms[0].penalized);
     assert!(!with_intercept.random_effect_terms[0].carries_level);
 
     // Only the FIRST factor carries the level; a second one stays the plain
     // ridge block whose offsets shrink toward zero.
     let two = build_formula("y ~ 0 + f + g", &ds);
     assert!(two.random_effect_terms[0].carries_level);
-    assert!(two.random_effect_terms[0].penalized);
     assert!(!two.random_effect_terms[1].carries_level);
-    assert!(two.random_effect_terms[1].penalized);
     let residual = unpenalized_constant_residual(&ds, &two);
     assert!(residual < 1e-8, "`0 + f + g`: {residual}");
 }
@@ -4915,14 +4910,12 @@ fn no_intercept_genuine_random_effect_does_not_carry_the_level() {
     let ds = two_factor_dataset();
     let spec = build_formula("y ~ 0 + group(f) + s(x)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: Some(0) });
-    assert!(spec.random_effect_terms[0].penalized);
     let residual = unpenalized_constant_residual(&ds, &spec);
     assert!(residual < 1e-8, "{residual}");
 
     // With nothing else able to carry it, the model has no level at all.
     let spec = build_formula("y ~ 0 + x + group(f)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
-    assert!(spec.random_effect_terms[0].penalized);
 }
 
 /// Without a factor block, a pure-indicator interaction keeps every cell (its
@@ -5016,7 +5009,6 @@ fn no_intercept_factor_by_main_effect_carries_the_level() {
     let spec = build_formula("y ~ 0 + s(x, by=g)", &ds);
     assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
     assert_eq!(spec.random_effect_terms.len(), 1);
-    assert!(spec.random_effect_terms[0].penalized);
     assert!(spec.random_effect_terms[0].carries_level);
     let residual = unpenalized_constant_residual(&ds, &spec);
     assert!(residual < 1e-8, "{residual}");
