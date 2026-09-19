@@ -4,6 +4,33 @@ use ndarray::array;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Report the trial just evaluated as accepted, as `OuterAcceptObserver` does
+/// when `opt`'s ratio test accepts it (#3017). The gate reads only whether a
+/// report arrived; the scalars are `StepInfo`'s, which these fixtures do not
+/// model.
+fn report_accepted_trial_3017(ledger: &AcceptedStepLedger, iter: usize) {
+    ledger.push(AcceptedOuterStep {
+        iter,
+        step_norm: 0.0,
+        actual_decrease: 0.0,
+    });
+}
+
+/// Evaluate `x` through the dense ARC bridge and settle it as an accepted
+/// iterate, the sequence `opt::Arc` drives for a trial its ratio test accepts
+/// (#3017): the evaluation, the observer's report, then the next evaluation's
+/// settle, whose stop (if any) is returned in place of the sample.
+fn eval_accepted_hessian_3017(
+    bridge: &mut OuterSecondOrderBridge<'_>,
+    ledger: &AcceptedStepLedger,
+    x: &Array1<f64>,
+    iter: usize,
+) -> Result<SecondOrderSample, ObjectiveEvalError> {
+    let sample = SecondOrderObjective::eval_hessian(bridge, x)?;
+    report_accepted_trial_3017(ledger, iter);
+    bridge.settle_pending_trial().map_or(Ok(sample), Err)
+}
+
 // ─── #934 first-order optimality certificate ──────────────────────
 
 /// Quadratic ½‖ρ − c‖² with value and gradient from the SAME center:
@@ -2804,6 +2831,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::default()),
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2867,6 +2895,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::default()),
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a candidate whose row geometry refuses must not produce a cost");
@@ -2939,6 +2968,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::default()),
     };
     let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
         panic!("a structural refusal must not produce a cost");
@@ -2995,6 +3025,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         cost_stall: None,
         cost_stall_bounds: None,
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::default()),
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -3233,6 +3264,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
     // Threshold the projected residual (0 here) must clear; any positive value
     // certifies the at-bound stall as converged.
     let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -3245,13 +3277,14 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
     // retain its Hessian so ARC owns the convergence verdict. The schedule spans
     // one window, so the #2817 progress licence is spent only once here.
-    for _ in 0..(COST_STALL_WINDOW + 2) {
-        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
+    for iter in 0..(COST_STALL_WINDOW + 2) {
+        let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &lo, iter)
             .expect("finite ARC stall sample must reach the second-order solver");
         assert_eq!(sample.hessian, Some(array![[1.0]]));
     }
@@ -3299,6 +3332,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -3311,10 +3345,11 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
 
-    for _ in 0..5 {
-        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &point)
+    for iter in 0..5 {
+        let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &point, iter)
             .expect("strict-saddle Hessian must reach ARC after the stall window fills");
         assert_eq!(sample.hessian, Some(array![[-1.0]]));
     }
@@ -3376,6 +3411,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -3388,9 +3424,10 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
-    for _ in 0..(COST_STALL_WINDOW + 2) {
-        let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
+    for iter in 0..(COST_STALL_WINDOW + 2) {
+        let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &lo, iter)
             .expect("finite bound sample must reach ARC with curvature");
         assert_eq!(sample.hessian, Some(array![[1.0]]));
     }
@@ -3456,6 +3493,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -3468,13 +3506,16 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
     let mut sentinel_fired = false;
     // First: the feasible iterate.
+    // ARC accepts it; the next evaluation folds it as the incumbent (#3017).
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
         .expect("feasible iterate must evaluate cleanly");
+    report_accepted_trial_3017(&ledger, 0);
     let separating = array![-10.0];
     for _ in 0..(COST_STALL_WINDOW + 2) {
         match SecondOrderObjective::eval_hessian(&mut bridge, &separating) {
@@ -3558,6 +3599,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -3570,9 +3612,12 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
         curvature_stationary_floor: None,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
+    // ARC accepts it; the next evaluation folds it as the incumbent (#3017).
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
         .expect("feasible iterate must evaluate cleanly");
+    report_accepted_trial_3017(&ledger, 0);
     let separating = array![-10.0];
     let mut sentinel_fired = false;
     for _ in 0..(COST_STALL_WINDOW + 2) {
@@ -6564,3 +6609,8 @@ mod arc_curvature_stationary_2817_tests;
 // for the source-file length budget.
 #[path = "typed_objective_failure_propagation_1561_tests.rs"]
 mod typed_objective_failure_propagation_1561_tests;
+
+// The trust-region routes' cost-stall guard counts accepted iterates, not
+// evaluated trials (#3017).
+#[path = "arc_rejected_trials_3017_tests.rs"]
+mod arc_rejected_trials_3017_tests;

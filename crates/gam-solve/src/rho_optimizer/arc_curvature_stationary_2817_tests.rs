@@ -152,6 +152,7 @@ fn drive_arc_oracle_at_points_2817(
         &claim_band_config_2817(CLAIM_BAND_2817),
         exit.clone(),
     );
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(point.len(), 0),
@@ -164,11 +165,20 @@ fn drive_arc_oracle_at_points_2817(
         cost_stall: Some(guard),
         cost_stall_bounds: Some(bounds),
         curvature_stationary_floor: floor,
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
+    // Every scripted evaluation is an iterate ARC accepted, so each one is
+    // reported accepted and settled before the next (#3017); a stop that
+    // settling reaches is that evaluation's outcome.
     let mut outcomes = Vec::new();
-    for trial in &points {
-        match SecondOrderObjective::eval_hessian(&mut bridge, trial) {
-            Ok(sample) => outcomes.push(Ok(sample.value)),
+    for (iter, trial) in points.iter().enumerate() {
+        let outcome = SecondOrderObjective::eval_hessian(&mut bridge, trial)
+            .and_then(|sample| {
+                report_accepted_trial_3017(&ledger, iter);
+                bridge.settle_pending_trial().map_or(Ok(sample.value), Err)
+            });
+        match outcome {
+            Ok(value) => outcomes.push(Ok(value)),
             Err(err) => {
                 outcomes.push(Err(err.into_message()));
                 break;
@@ -902,6 +912,7 @@ fn drive_operator_oracle_2817(
         &claim_band_config_2817(CLAIM_BAND_2817),
         Arc::new(Mutex::new(None)),
     );
+    let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterOperatorBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(point.len(), 0),
@@ -913,11 +924,17 @@ fn drive_operator_oracle_2817(
         cost_stall: Some(guard),
         cost_stall_bounds: Some(wide_box_2817(point.len())),
         unprogressing_stop: Arc::clone(&stop),
+        accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
     };
     let mut outcomes = Vec::new();
-    for _ in 0..samples.len() {
-        match OperatorObjective::eval_value_grad_op(&mut bridge, &point) {
-            Ok(sample) => outcomes.push(Ok(sample.value)),
+    for iter in 0..samples.len() {
+        let outcome = OperatorObjective::eval_value_grad_op(&mut bridge, &point)
+            .and_then(|sample| {
+                report_accepted_trial_3017(&ledger, iter);
+                bridge.settle_pending_trial().map_or(Ok(sample.value), Err)
+            });
+        match outcome {
+            Ok(value) => outcomes.push(Ok(value)),
             Err(err) => {
                 outcomes.push(Err(err.into_message()));
                 break;

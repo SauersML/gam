@@ -1057,6 +1057,27 @@ impl CostStallGuard {
         self.publish_stall(rho, self.best_value, self.best_grad_norm)
     }
 
+    /// Fold one finite trial the solver's ratio test REJECTED (#3017).
+    ///
+    /// The iterate did not move, so this is not an outer step: the incumbent,
+    /// the accepted-iterate count and the no-improvement streak are untouched.
+    /// A window counts steps that bought nothing; a rejection bought nothing
+    /// only in the sense that the solver has not yet found the step, and while
+    /// it raises σ toward the Hessian's Lipschitz scale the next accepted step
+    /// is still owed. Counting rejections stopped the #3017 fixture thirteen
+    /// rejections short of a Newton step that lands on the optimum.
+    ///
+    /// What the trial does change: its finite value ends any run of infeasible
+    /// trials, since that run means consecutive trials that did not evaluate,
+    /// and it is a point the open window evaluated, so it belongs to the window's
+    /// replay identity. The curvature staged for it is dropped, since it never
+    /// becomes the incumbent.
+    pub(crate) fn observe_rejected_trial(&mut self, rho: &Array1<f64>) {
+        self.staged_curvature = None;
+        self.infeasible_streak = 0;
+        self.record_window_trial(rho);
+    }
+
     /// Fold one trial refused for keeping a different kept rank than the run's start
     /// (#2765) into the guard (#2939).
     ///
@@ -2544,9 +2565,9 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// displacement in line-search / trial-acceptance STAGE traces.
     pub(crate) last_value_grad_rho: Option<Array1<f64>>,
     /// Cost-stall convergence guard (#1089/#1237). Identical role to the field
-    /// on [`OuterFirstOrderBridge`]: `opt::Arc` calls `eval_grad` once per
-    /// accepted (and rejected-then-recomputed) iterate, so folding the
-    /// `(cost, projected ‖g‖)` sample in here counts outer descent steps. On a
+    /// on [`OuterFirstOrderBridge`]: `opt::Arc` evaluates every trial through
+    /// `eval_hessian`, and [`Self::accepted_trials`] folds only the trials its
+    /// ratio test accepted, so the guard counts outer descent steps (#3017). On a
     /// near-separable multinomial fit the unpenalized softmax MLE is unbounded,
     /// so the outer REML criterion keeps decreasing as λ→0 and several log-λ
     /// directions slam to the lower box bound and bounce — the ARC loop cycles
@@ -2566,6 +2587,10 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// (which is every route with no synchronized analytic Hessian at the
     /// evaluated point). See [`ARC_CURVATURE_STATIONARY_SENTINEL`].
     pub(crate) curvature_stationary_floor: Option<f64>,
+    /// The last evaluated trial, held until `opt::Arc`'s ratio test decides it,
+    /// and the ledger the run's [`OuterAcceptObserver`] reports that decision
+    /// through (#3017).
+    pub(crate) accepted_trials: AcceptedTrialGate<PendingSecondOrderTrial>,
 }
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
@@ -2665,13 +2690,36 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 }
 
 impl OuterSecondOrderBridge<'_> {
-    /// Fold one finite ARC oracle eval `(ρ, cost, grad)` into the cost-stall
+    /// Act on `opt::Arc`'s decision about the pending trial (#3017). An
+    /// accepted trial is folded into the cost-stall guard as the new iterate,
+    /// and a stop that fold reaches is returned; a rejected one is recorded as
+    /// a trial that did not move the iterate
+    /// ([`CostStallGuard::observe_rejected_trial`]).
+    ///
+    /// `eval_hessian` calls this before it evaluates anything, since the
+    /// observer reports on the previous trial only after that trial's
+    /// evaluation has returned. A stop therefore ends the run at the accepted
+    /// iterate before the new trial is spent.
+    pub(crate) fn settle_pending_trial(&mut self) -> Option<ObjectiveEvalError> {
+        match self.accepted_trials.decide()? {
+            TrialDecision::Accepted(trial) => self.observe_cost_stall(&trial),
+            TrialDecision::Rejected(trial) => {
+                self.cost_stall
+                    .as_mut()?
+                    .observe_rejected_trial(&trial.rho);
+                None
+            }
+        }
+    }
+
+    /// Fold one accepted ARC iterate `(ρ, cost, grad)` into the cost-stall
     /// guard without allowing that first-order guard to halt the second-order
     /// solver.
     ///
     /// Cost-stall halt (#1089/#1237). `opt::Arc` evaluates the (value, gradient,
-    /// Hessian) triple at every trial point — accepted or rejected — through
-    /// `eval_hessian`, so observing here counts ARC's outer descent. On a
+    /// Hessian) triple at every trial point through `eval_hessian`, and
+    /// [`Self::settle_pending_trial`] folds the ones its ratio test accepted, so
+    /// observing here counts ARC's outer descent (#3017). On a
     /// near-separable multinomial fit the unpenalized softmax MLE is unbounded:
     /// the outer REML criterion keeps decreasing as λ→0, several log-λ
     /// directions slam to the lower box bound and bounce, and ARC otherwise
@@ -2682,14 +2730,17 @@ impl OuterSecondOrderBridge<'_> {
     /// direction with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
     /// though its raw gradient never vanishes. A trial that beats the best cost
     /// resets the streak, so genuine descent never trips the halt.
-    fn observe_cost_stall(
-        &mut self,
-        x: &Array1<f64>,
-        cost: f64,
-        gradient: &Array1<f64>,
-        hessian: Option<&Array2<f64>>,
-        hessian_psd: Option<bool>,
-    ) -> Option<ObjectiveEvalError> {
+    fn observe_cost_stall(&mut self, trial: &PendingSecondOrderTrial) -> Option<ObjectiveEvalError> {
+        let PendingSecondOrderTrial {
+            rho: x,
+            cost,
+            gradient,
+            hessian,
+            hessian_psd,
+            curvature,
+            inner_converged,
+        } = trial;
+        let (cost, hessian_psd, inner_converged) = (*cost, *hessian_psd, *inner_converged);
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
             let Some(guard) = self.cost_stall.as_ref() else {
@@ -2698,14 +2749,15 @@ impl OuterSecondOrderBridge<'_> {
             lower_bound_outward_active_count(x, gradient, bounds.as_ref(), guard.stationarity_band(cost))
                 >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
         };
-        // #1426: inner-PIRLS convergence flag for the solve behind this eval (see
-        // the matching read in the first-order bridge). A non-converged inner
-        // solve at the λ→0 ridge reports a half-fit cost the guard must not adopt
-        // as best-so-far. `None` (no feedback) defaults to `true`.
-        let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
+        // #1426: `inner_converged` is the inner-PIRLS convergence flag for the
+        // solve behind this trial, snapshotted when it was evaluated (see the
+        // matching read in the first-order bridge). A non-converged inner solve
+        // at the λ→0 ridge reports a half-fit cost the guard must not adopt as
+        // best-so-far.
         let Some(guard) = self.cost_stall.as_mut() else {
             return None;
         };
+        guard.stage_sample_curvature(curvature.clone());
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
         // box: it counts coordinates pinned at the LOWER bound for the
@@ -2825,7 +2877,8 @@ impl OuterSecondOrderBridge<'_> {
         // deferral above is unchanged; what follows is the adjudication it was
         // always waiting for and never had.
         if adjudicate_second_order {
-            let verdict = self.curvature_stationary_exit(x, cost, gradient, hessian, hessian_psd);
+            let verdict =
+                self.curvature_stationary_exit(x, cost, gradient, hessian.as_ref(), hessian_psd);
             if verdict.is_some() {
                 return verdict;
             }
@@ -3127,6 +3180,9 @@ impl OuterSecondOrderBridge<'_> {
 impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_hessian(&mut self, x: &Array1<f64>) -> Result<SecondOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(stop) = self.settle_pending_trial() {
+            return Err(stop);
+        }
         apply_arc_inner_cap_schedule(
             self.outer_inner_cap.as_ref(),
             self.last_g_norm,
@@ -3231,8 +3287,13 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 curvature_resolution,
             )
         });
-        if let Some(guard) = self.cost_stall.as_mut() {
-            guard.stage_sample_curvature(match (hessian_psd, hessian.as_ref()) {
+        // Hold this trial until ARC's ratio test decides it (#3017). ARC must
+        // receive this exact sample so its projected-gradient + reduced-Hessian
+        // gate can either certify a mode or exploit negative curvature (#979);
+        // the guard sees it on the next evaluation, as an iterate only if it
+        // was accepted.
+        if self.cost_stall.is_some() {
+            let curvature = match (hessian_psd, hessian.as_ref()) {
                 (Some(false), Some(dense)) => incumbent_curvature(
                     x,
                     &eval.gradient,
@@ -3241,20 +3302,16 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                     curvature_resolution,
                 ),
                 _ => None,
+            };
+            self.accepted_trials.stage(PendingSecondOrderTrial {
+                rho: x.clone(),
+                cost: eval.cost,
+                gradient: eval.gradient.clone(),
+                hessian: hessian.clone(),
+                hessian_psd,
+                curvature,
+                inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
             });
-        }
-        // Observe finite cost progress, but never let this first-order guard
-        // halt a second-order route. ARC must receive this exact sample so its
-        // projected-gradient + reduced-Hessian gate can either certify a mode
-        // or exploit negative curvature (#979).
-        if let Some(stop) = self.observe_cost_stall(
-            x,
-            eval.cost,
-            &eval.gradient,
-            hessian.as_ref(),
-            hessian_psd,
-        ) {
-            return Err(stop);
         }
         Ok(SecondOrderSample {
             value: eval.cost,
@@ -3497,6 +3554,83 @@ pub(crate) struct PendingOuterEval {
     pub(crate) inner_converged: bool,
 }
 
+/// The one evaluated trial a trust-region-type solver has not yet accepted or
+/// rejected, held until `opt` says which it was (#3017).
+///
+/// `opt::Arc` and `opt::MatrixFreeTrustRegion` evaluate the objective (value,
+/// gradient, curvature) at every TRIAL `x_k + s`, and only then run the ratio
+/// test that decides whether `x_{k+1} = x_k + s` or `x_{k+1} = x_k`. The
+/// observer reports that decision after the evaluation and before the next
+/// one. Each iteration evaluates at most one finite trial (ARC's antipode is
+/// evaluated only when the primary trial raised an error), so the pending
+/// trial is exactly the one the next accept or reject is about. The accepted
+/// iterates are therefore identified by structure, not reconstructed from
+/// `StepInfo`'s scalars the way the first-order bridge's line-search trials
+/// must be ([`OuterFirstOrderBridge::drain_accepted_steps`]).
+///
+/// Folding every evaluated trial as an iterate is the defect this exists to
+/// end: a run of ratio-test rejections while ARC raises σ toward the Hessian's
+/// Lipschitz scale left `x_k` unchanged, and the cost-stall guard counted each
+/// one as an accepted step that failed to improve, filled its window and
+/// stopped the run with `OUTER_ARC_UNPROGRESSING_STALL` before the successful
+/// step was due.
+pub(crate) struct AcceptedTrialGate<S> {
+    ledger: Arc<AcceptedStepLedger>,
+    pending: Option<S>,
+}
+
+/// What `opt` decided about the gate's pending trial.
+pub(crate) enum TrialDecision<S> {
+    /// The trial became the next iterate.
+    Accepted(S),
+    /// The ratio test rejected it; the iterate did not move.
+    Rejected(S),
+}
+
+impl<S> AcceptedTrialGate<S> {
+    pub(crate) fn new(ledger: Arc<AcceptedStepLedger>) -> Self {
+        Self {
+            ledger,
+            pending: None,
+        }
+    }
+
+    /// Hold `sample`, the trial just evaluated, until `opt` decides on it.
+    /// The previous pending trial must already have been [`Self::decide`]d.
+    pub(crate) fn stage(&mut self, sample: S) {
+        self.pending = Some(sample);
+    }
+
+    /// Consume `opt`'s decision on the pending trial. Called at the top of the
+    /// next evaluation, the first point the bridge can act after the observer
+    /// has run. `None` when nothing is pending (no finite trial was evaluated
+    /// since the last decision).
+    pub(crate) fn decide(&mut self) -> Option<TrialDecision<S>> {
+        let accepted = !self.ledger.drain().is_empty();
+        let pending = self.pending.take()?;
+        Some(if accepted {
+            TrialDecision::Accepted(pending)
+        } else {
+            TrialDecision::Rejected(pending)
+        })
+    }
+}
+
+/// One finite dense-ARC trial as the cost-stall guard needs it, captured at
+/// evaluation time (#3017). `inner_converged` is the inner-progress snapshot,
+/// valid only immediately after this ρ's solve, and `curvature` is the
+/// reduced-Hessian description the guard attaches to the incumbent should this
+/// trial become it.
+pub(crate) struct PendingSecondOrderTrial {
+    pub(crate) rho: Array1<f64>,
+    pub(crate) cost: f64,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) hessian: Option<Array2<f64>>,
+    pub(crate) hessian_psd: Option<bool>,
+    pub(crate) curvature: Option<IncumbentCurvature>,
+    pub(crate) inner_converged: bool,
+}
+
 /// A trial the first-order bridge refused because its criterion keeps a different rank
 /// than the run's start (#2765): the point, its criterion value, and the rank it kept.
 #[derive(Debug, Clone)]
@@ -3556,10 +3690,30 @@ pub(crate) struct OuterOperatorBridge<'a> {
     /// the guard stops the run, is how the runner tells that stop from a
     /// genuine evaluation failure.
     pub(crate) unprogressing_stop: Arc<Mutex<Option<CostStallExit>>>,
+    /// The last evaluated trial, held until the trust region's ratio test
+    /// decides it, and the ledger the run's [`OuterAcceptObserver`] reports
+    /// that decision through (#3017).
+    pub(crate) accepted_trials: AcceptedTrialGate<PendingOuterEval>,
 }
 
 impl OuterOperatorBridge<'_> {
-    /// Fold one evaluated point into the stall guard, and stop the run when a
+    /// Act on the trust region's decision about the pending trial (#3017):
+    /// fold an accepted one as the new iterate, record a rejected one as a
+    /// trial that did not move it. See
+    /// [`OuterSecondOrderBridge::settle_pending_trial`].
+    pub(crate) fn settle_pending_trial(&mut self) -> Option<ObjectiveEvalError> {
+        match self.accepted_trials.decide()? {
+            TrialDecision::Accepted(trial) => self.observe_unprogressing_stall(&trial),
+            TrialDecision::Rejected(trial) => {
+                self.cost_stall
+                    .as_mut()?
+                    .observe_rejected_trial(&trial.rho);
+                None
+            }
+        }
+    }
+
+    /// Fold one accepted iterate into the stall guard, and stop the run when a
     /// filled window has bought nothing since the previous one (#2817).
     ///
     /// A filled window is handled as the dense route handles a deferred one:
@@ -3568,17 +3722,15 @@ impl OuterOperatorBridge<'_> {
     /// Hessian operator at the bridge, so there is no second-order adjudication
     /// to run first; the terminal certificate judges whatever point this stops
     /// at.
-    fn observe_unprogressing_stall(
-        &mut self,
-        x: &Array1<f64>,
-        cost: f64,
-        gradient: &Array1<f64>,
-    ) -> Option<ObjectiveEvalError> {
-        let bounds = self.cost_stall_bounds.clone();
-        let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
+    fn observe_unprogressing_stall(&mut self, trial: &PendingOuterEval) -> Option<ObjectiveEvalError> {
         let guard = self.cost_stall.as_mut()?;
-        let projected_g_norm = rail_projected_gradient_norm(x, gradient, bounds.as_ref());
-        match guard.observe_second_order(x, cost, projected_g_norm, inner_converged, None) {
+        match guard.observe_second_order(
+            &trial.rho,
+            trial.cost,
+            trial.projected_grad_norm,
+            trial.inner_converged,
+            None,
+        ) {
             CostStallVerdict::Continue => return None,
             CostStallVerdict::StuckKeepDescending { .. } => {
                 if let Some(feedback) = self.outer_inner_cap.as_ref() {
@@ -3668,9 +3820,12 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         x: &Array1<f64>,
     ) -> Result<OperatorSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        if let Some(stop) = self.settle_pending_trial() {
+            return Err(stop);
+        }
         // Drive the outer-aware inner-PIRLS cap, mirroring
-        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each
-        // accepted outer iter calls eval_value_grad_op exactly once
+        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each outer
+        // iteration calls eval_value_grad_op exactly once, at its trial
         // (the matrix-free TR's inner CG uses HVPs, not full
         // evaluations), so we increment per call without the /2 the
         // ARC bridge needs.
@@ -3705,8 +3860,18 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        if let Some(stop) = self.observe_unprogressing_stall(x, eval.cost, &eval.gradient) {
-            return Err(stop);
+        // Hold this trial until the ratio test decides it (#3017).
+        if self.cost_stall.is_some() {
+            self.accepted_trials.stage(PendingOuterEval {
+                rho: x.clone(),
+                cost: eval.cost,
+                projected_grad_norm: rail_projected_gradient_norm(
+                    x,
+                    &eval.gradient,
+                    self.cost_stall_bounds.as_ref(),
+                ),
+                inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
+            });
         }
         log::debug!(
             "[STAGE] outer eval end elapsed={:.3}s cost={:.6e} |g|={:.3e} (operator bridge)",
