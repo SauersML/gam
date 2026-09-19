@@ -42,7 +42,6 @@ See https://github.com/SauersML/gam for the full guide.
 """
 
 from importlib import import_module as _import_module
-from importlib import metadata as _metadata
 from types import ModuleType as _ModuleType
 from typing import TYPE_CHECKING as _TYPE_CHECKING
 
@@ -61,11 +60,6 @@ from ._event_history import EventHistoryModel, fit_event_history
 from ._joint_events import JointEventModel, fit_joint_event_model, load_joint_event_model
 from ._model import Model, MultinomialModel, competing_risks_cif
 from ._response_geometry import ResponseGeometryModel
-
-try:
-    __version__ = _metadata.version("gamfit")
-except _metadata.PackageNotFoundError:
-    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "CtnStage1",
@@ -121,6 +115,7 @@ _SUBMODULES = frozenset(
 
 
 if _TYPE_CHECKING:
+    __version__: str
     from . import (
         basis,
         cuda,
@@ -147,13 +142,25 @@ if _TYPE_CHECKING:
     )
 
 
-def __getattr__(name: str) -> _ModuleType:
-    """Import a public submodule on first access.
+def __getattr__(name: str) -> _ModuleType | str:
+    """Resolve ``__version__`` or import a public submodule on first access.
 
     A submodule whose optional dependency (e.g. ``torch``) is missing raises
     ``AttributeError`` chained from the ``ModuleNotFoundError``, so
     ``hasattr(gamfit, "torch")`` returns a bool instead of raising.
     """
+    if name == "__version__":
+        # Read from the installed distribution on first access, not at import:
+        # ``importlib.metadata`` is the largest single cost of ``import gamfit``
+        # after numpy, and a fit never needs it.
+        from importlib import metadata
+
+        try:
+            version = metadata.version("gamfit")
+        except metadata.PackageNotFoundError:
+            version = "0.0.0+unknown"
+        globals()["__version__"] = version
+        return version
     if name in _SUBMODULES:
         try:
             return _import_module(f"{__name__}.{name}")

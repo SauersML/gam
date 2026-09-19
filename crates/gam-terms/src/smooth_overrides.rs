@@ -84,6 +84,7 @@ pub fn apply_smooth_overrides(
             .ok_or_else(|| {
                 format!("smooths[{symbol:?}] descriptor missing required \"kind\" field")
             })?;
+        pin_adaptive_bspline_default(&mut term.basis, data)?;
         apply_one_override(term, kind, descriptor_obj, symbol, inference_notes)?;
         apply_by_variable(
             term,
@@ -95,6 +96,55 @@ pub fn apply_smooth_overrides(
         )?;
     }
     Ok(())
+}
+
+/// A `smooths={...}` descriptor is an explicit specification of the smooth, so
+/// the formula default's adaptive resolution
+/// ([`BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`) is replaced by the
+/// fixed spec the formula DSL builds for the same count and placement: the
+/// descriptor's own tunables (knot count, knot vector, periodicity, degree) then
+/// act on exactly the basis they always did, and the formula workflow never
+/// grows a smooth the caller described by hand. Uniform placement becomes the
+/// `Generate` vector over the covariate's range, which is the knot vector the
+/// adaptive spec builds.
+fn pin_adaptive_bspline_default(
+    basis: &mut SmoothBasisSpec,
+    data: &Dataset,
+) -> Result<(), String> {
+    use crate::basis::BSplineKnotPlacement;
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            pin_adaptive_bspline_default(inner, data)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => pin_adaptive_bspline_default(smooth, data),
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            let BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(num_internal_knots),
+                placement,
+                adaptive: true,
+            } = spec.knotspec
+            else {
+                return Ok(());
+            };
+            spec.knotspec = match placement {
+                BSplineKnotPlacement::Uniform => {
+                    let column = data.values.column(*feature_col);
+                    BSplineKnotSpec::Generate {
+                        data_range: crate::term_builder::col_minmax(column)?,
+                        num_internal_knots,
+                    }
+                }
+                BSplineKnotPlacement::Quantile => BSplineKnotSpec::Automatic {
+                    num_internal_knots: Some(num_internal_knots),
+                    placement,
+                    adaptive: false,
+                },
+            };
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Wrap the term's basis in the `ByVariable` row-gating envelope when the
@@ -724,6 +774,7 @@ fn apply_bspline_1d(
             BSplineKnotSpec::Automatic { placement, .. } => BSplineKnotSpec::Automatic {
                 num_internal_knots: Some(n_internal),
                 placement: *placement,
+                adaptive: false,
             },
             BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
                 BSplineKnotSpec::PeriodicUniform {
@@ -1466,6 +1517,7 @@ mod tests {
         automatic.knotspec = BSplineKnotSpec::Automatic {
             num_internal_knots: Some(5),
             placement: crate::basis::BSplineKnotPlacement::Quantile,
+            adaptive: false,
         };
         let err2 = apply_bspline_1d(&mut automatic, &obj(json!({"periodic": true})), "x")
             .expect_err("periodic against automatic knots must error");

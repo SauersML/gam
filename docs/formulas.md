@@ -233,6 +233,15 @@ So `factor(year)` treats `year` as levels rather than as a slope, and a
 held-out level is a schema mismatch for `+ site` and `factor(site)` but an
 expected new group for `group(site)`.
 
+`factor()`, `C()`, `group()` and `re()` take no options: the penalty
+strength is always estimated, so `factor(site, k=3)` is rejected as an
+unknown option instead of being ignored. A categorical column is also
+refused inside a term that treats its inputs as numeric axes (`linear()`,
+`s()`, `te()`, `thinplate()`, `matern()`, cyclic smooths and the other
+non-factor bases): the error points to `factor(site)` or `group(site)` for
+the level effect, or `s(x, by=site)` / `fs(x, site)` for a per-level
+smooth of a numeric `x`.
+
 Why estimate the penalty rather than leave the levels unpenalized? The
 penalized estimate is the random-effect (partial-pooling) estimate, and
 REML decides how much pooling the data support. When every level has plenty

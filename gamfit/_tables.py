@@ -61,7 +61,10 @@ CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
 def normalize_table(
-    data: Any, *, required_columns: Sequence[str] | None = None
+    data: Any,
+    *,
+    required_columns: Sequence[str] | None = None,
+    positional_headers: Sequence[str] | None = None,
 ) -> tuple[list[str], _EncodedTable, str]:
     """Encode ``data`` as a Rust-owned typed table.
 
@@ -72,10 +75,14 @@ def normalize_table(
     decides what every column means, so all input libraries share one set of
     inference rules and one set of ``DataError`` messages. pandas needs no
     pyarrow for any of this.
+
+    ``positional_headers`` names the columns of a NumPy input (by default the
+    synthetic ``x0, x1, ...``); prediction passes the names the model binds a
+    positional array to.
     """
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
-    columns, kind = _table_column_views(data)
+    columns, kind = _table_column_views(data, positional_headers)
     if required_columns is not None:
         names = list(required_columns)
         missing = set(names) - set(columns)
@@ -162,7 +169,9 @@ def _reject_unsupported_dtype(name: str, dtype: Any) -> None:
         )
 
 
-def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
+def _table_column_views(
+    data: Any, positional_headers: Sequence[str] | None = None
+) -> tuple[dict[str, Any], str]:
     """Return zero-copy/lazy column views for the primary Rust table boundary."""
     kind = detect_table_kind(data)
     if kind == "pandas":
@@ -182,12 +191,19 @@ def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
 
         values = np.asarray(data)
         if values.ndim == 1:
-            return {"x0": values}, kind
+            values = values[:, None]
         if values.ndim != 2:
             raise ValueError("numpy input must be 1D or 2D")
-        return {
-            f"x{index}": values[:, index] for index in range(values.shape[1])
-        }, kind
+        names = (
+            [f"x{index}" for index in range(values.shape[1])]
+            if positional_headers is None
+            else list(positional_headers)
+        )
+        if len(names) != values.shape[1]:
+            raise ValueError(
+                f"numpy input has {values.shape[1]} columns but {len(names)} names"
+            )
+        return {name: values[:, index] for index, name in enumerate(names)}, kind
     if isinstance(data, Mapping):
         columns: dict[str, Any] = {}
         for key, value in data.items():
@@ -283,10 +299,17 @@ def restore_output_table(
     if target == "dict":
         return PredictionResult(columns)
     if target == "numpy":
+        # A structured array: one named field per output column, so a NumPy
+        # result is read by the same names as the DataFrame path
+        # (``pred["posterior_mean_lower"]``).
         import numpy as np
 
-        ordered = list(columns)
-        return np.column_stack([columns[name] for name in ordered])
+        arrays = {name: np.asarray(values) for name, values in columns.items()}
+        rows = len(next(iter(arrays.values()))) if arrays else 0
+        table = np.empty(rows, dtype=[(name, array.dtype) for name, array in arrays.items()])
+        for name, array in arrays.items():
+            table[name] = array
+        return table
     library = _import_output_library(target)
     if target == "pyarrow":
         return library.table(columns)
@@ -370,6 +393,18 @@ def sequence_table_columns(rows: Sequence[Sequence[Any]]) -> dict[str, list[Any]
     return columns
 
 
+def numpy_table_width(array: Any) -> int:
+    """Column count of a 1-D (one column) or 2-D NumPy input."""
+    import numpy as np
+
+    shape = np.shape(array)
+    if len(shape) == 1:
+        return 1
+    if len(shape) != 2:
+        raise ValueError("numpy input must be 1D or 2D")
+    return int(shape[1])
+
+
 def numpy_table_columns(array: Any) -> dict[str, list[Any]]:
     import numpy as np
 
@@ -431,28 +466,94 @@ def coerce_numeric_vector(values: Sequence[Any], *, label: str) -> list[float]:
     return numeric
 
 
-def attach_target(
-    data: Any,
-    y: Any,
-    *,
-    target_name: str = "y",
-) -> tuple[dict[str, list[Any]], str]:
-    columns, kind = table_columns(data)
-    if target_name in columns:
-        raise ValueError(
-            f"target column '{target_name}' already exists in the feature table"
-        )
-    if isinstance(y, str):
-        raise TypeError("string targets must refer to an existing column on the input table")
-    target_values = vector_values(y)
-    if columns:
-        expected = len(next(iter(columns.values())))
-        if len(target_values) != expected:
+def table_column_names(data: Any) -> list[str] | None:
+    """Column names of a named table, or ``None`` for a positional input.
+
+    Mappings, record lists, and pandas/polars/pyarrow frames name their
+    columns. A pandas frame whose column labels are not all strings (the
+    ``RangeIndex`` of ``pd.DataFrame(array)``) is positional, matching
+    scikit-learn's rule for ``feature_names_in_``.
+    """
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        labels = list(data.columns)
+        if not labels or not all(isinstance(label, str) for label in labels):
+            return None
+        return labels
+    if kind == "polars":
+        return [str(name) for name in data.columns]
+    if kind == "pyarrow":
+        return [str(name) for name in data.column_names]
+    if isinstance(data, Mapping):
+        return list(mapping_table_columns(data))
+    if (
+        isinstance(data, Sequence)
+        and not isinstance(data, (str, bytes, bytearray))
+        and len(data) > 0
+        and isinstance(data[0], Mapping)
+    ):
+        return collect_record_headers(cast("list[Mapping[str, Any]]", list(data)))[0]
+    return None
+
+
+def table_row_count(data: Any) -> int:
+    columns, _kind = _table_column_views(data)
+    if not columns:
+        return 0
+    return len(next(iter(columns.values())))
+
+
+def with_columns(data: Any, extra: Mapping[str, Any]) -> Any:
+    """Return ``data`` with the ``extra`` columns set, keeping its table library.
+
+    Columns of the same name are replaced. pandas, polars, and pyarrow tables
+    stay typed so their declared dtypes (categoricals, strings) reach the fit
+    unchanged; every other carrier becomes a mapping of column views.
+    """
+    rows = table_row_count(data)
+    for name, values in extra.items():
+        if len(values) != rows:
             raise ValueError(
-                f"target vector has length {len(target_values)} but expected {expected}"
+                f"column '{name}' has {len(values)} rows but the table has {rows}"
             )
-    columns[target_name] = target_values
-    return columns, kind
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        out = data.copy(deep=False)
+        for name, values in extra.items():
+            out[name] = values
+        return out
+    if kind == "polars":
+        import polars as pl
+
+        return data.with_columns(
+            [pl.Series(name, values) for name, values in extra.items()]
+        )
+    if kind == "pyarrow":
+        import pyarrow as pa
+
+        out = data
+        for name, values in extra.items():
+            array = pa.array(values)
+            if name in out.column_names:
+                out = out.set_column(out.column_names.index(name), name, array)
+            else:
+                out = out.append_column(name, array)
+        return out
+    columns, _kind = _table_column_views(data)
+    return {**columns, **extra}
+
+
+def drop_columns(data: Any, names: Sequence[str]) -> Any:
+    """Return ``data`` without the named columns, keeping its table library."""
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        return data.drop(columns=[label for label in data.columns if str(label) in names])
+    if kind == "polars":
+        return data.drop([label for label in data.columns if label in names])
+    if kind == "pyarrow":
+        return data.drop_columns([label for label in data.column_names if label in names])
+    columns, _kind = _table_column_views(data)
+    return {name: values for name, values in columns.items() if name not in names}
 
 
 def vector_values(values: Any) -> list[Any]:

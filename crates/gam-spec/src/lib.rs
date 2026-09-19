@@ -170,20 +170,18 @@ impl LinkFunction {
 
     /// Accepted spellings beyond the canonical [`Self::name`], normalized
     /// (lower-case, `_` read as `-`). These are the names other GAM/GLM
-    /// packages use for the same link (R's `1/mu^2`, pyGAM's `inv_squared`).
+    /// packages use for the same link (R's `1/mu^2`, pyGAM's `inv_squared`),
+    /// and the binomial links' family-qualified names (`binomial-probit`), so a
+    /// `--family` value is also a valid `--link` / `link(type=...)` / `link=`.
     const fn aliases(self) -> &'static [&'static str] {
         match self {
+            Self::Logit => &["binomial-logit"],
+            Self::Probit => &["binomial-probit"],
+            Self::CLogLog => &["binomial-cloglog"],
             Self::Inverse => &["1/mu"],
             Self::InverseSquared => &["inv-squared", "1/mu^2"],
             Self::BetaLogistic => &["betalogistic"],
-            Self::Logit
-            | Self::Probit
-            | Self::CLogLog
-            | Self::LogLog
-            | Self::Cauchit
-            | Self::Sas
-            | Self::Identity
-            | Self::Log => &[],
+            Self::LogLog | Self::Cauchit | Self::Sas | Self::Identity | Self::Log => &[],
         }
     }
 
@@ -1284,7 +1282,8 @@ impl ResponseDegeneracy {
     pub fn message_for(&self, response_name: &str) -> String {
         match self.kind {
             ResponseDegeneracyKind::BinomialAllZeros => format!(
-                "{family} response '{name}' is degenerate: all values are 0 (no events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 0, no events). \
                  The maximum-likelihood logit is −∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -1293,7 +1292,8 @@ impl ResponseDegeneracy {
                 name = response_name,
             ),
             ResponseDegeneracyKind::BinomialAllOnes => format!(
-                "{family} response '{name}' is degenerate: all values are 1 (no non-events). \
+                "{family} response '{name}' is degenerate: it has only one class (all values \
+                 are 1, no non-events). \
                  The maximum-likelihood logit is +∞ at this boundary, so the REML score \
                  is not finite. Fix: ensure the response contains at least one 0 and \
                  at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
@@ -4282,6 +4282,10 @@ mod tests {
         assert_eq!(LinkFunction::from_name("inv_squared"), Some(LinkFunction::InverseSquared));
         assert_eq!(LinkFunction::from_name("1/mu^2"), Some(LinkFunction::InverseSquared));
         assert_eq!(LinkFunction::from_name("1/mu"), Some(LinkFunction::Inverse));
+        // The binomial family names name their link too.
+        assert_eq!(LinkFunction::from_name("binomial-logit"), Some(LinkFunction::Logit));
+        assert_eq!(LinkFunction::from_name("binomial_probit"), Some(LinkFunction::Probit));
+        assert_eq!(LinkFunction::from_name("Binomial-CLogLog"), Some(LinkFunction::CLogLog));
         assert_eq!(LinkFunction::from_name("sqrt"), None);
     }
 

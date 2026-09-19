@@ -163,10 +163,6 @@ pub use gam_report as report;
 /// re-exported here so existing `crate::psis` / `gam::psis` callers (including
 /// `inference::{rho_posterior, model_comparison}`) resolve it downward.
 pub use gam_solve::psis;
-/// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
-/// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
-/// so the public `gam::rho_uncertainty` path is preserved.
-pub use gam_solve::rho_uncertainty;
 /// `gam::solver` — the estimation-engine public surface.
 ///
 /// Almost everything is the `gam-solve` crate, re-exported wholesale. The one

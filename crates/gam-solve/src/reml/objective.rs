@@ -282,7 +282,7 @@ impl<'a> RemlState<'a> {
         // tabulated `backend DenseSpectral` from THIS line on both sides of a
         // 12x per-trial cost change and could conclude only "it is not a
         // backend switch" -- the label is two-valued, so it cannot say which of
-        // the six routes to it was taken, nor whether a density was measured at
+        // the routes to it was taken, nor whether a density was measured at
         // all.
         log::trace!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?} | {}",
@@ -1353,16 +1353,13 @@ impl<'a> RemlState<'a> {
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Only the penalty-side `log|S|₊` machinery consumes the penalty
-        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
-        // and no longer needs `range(S_+)`. Its rank bounds H's identified rank
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // need `range(S_+)`. The penalty rank bounds H's identified rank
         // below, so it is computed before the Hessian operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet.as_ref())?);
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet.as_ref(),
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             free_basis_opt.as_ref(),
@@ -1576,6 +1573,7 @@ impl<'a> RemlState<'a> {
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
+            op = op.with_hessian(sparse.hessian.clone());
             std::sync::Arc::new(op)
         };
 
@@ -1769,15 +1767,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
-        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
-        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`. Its
-        // rank bounds H's identified rank, so it is computed before the operator.
-        let penalty_subspace = Some(self.compute_penalty_subspace(e_for_logdet)?);
+        // The Hessian-side kernel is intrinsic to H_pen (#901) and does not
+        // consume `range(S_+)`. The penalty rank bounds H's identified rank,
+        // so it is computed before the operator.
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
             e_for_logdet,
             &[],
-            penalty_subspace.as_ref(),
             bundle,
             mode,
             // Original-basis assembly is only used when there are no active
@@ -1805,6 +1801,7 @@ impl<'a> RemlState<'a> {
             weights: pirls_result.finalweights.view(),
             penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
+            data_root: Some(&self.data_root_cache),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
@@ -4112,11 +4109,11 @@ mod ift_warm_start_tests {
         }
         let nullity = p - rank;
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,

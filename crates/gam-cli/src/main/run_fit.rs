@@ -196,15 +196,6 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
         }
         return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
     }
-    // `--expectile-tau` only has meaning under `--family expectile`; reject the
-    // combination upfront rather than silently ignoring the asymmetry.
-    if fit_config.expectile_tau.is_some() && fit_config.family.as_deref() != Some("expectile") {
-        return Err(
-            "--expectile-tau requires --family expectile (the asymmetry is only used by the \
-             expectile estimator)"
-                .into(),
-        );
-    }
     // Several expectile levels are one joint location-scale fit, which the
     // library's formula-to-payload service assembles like any location-scale model.
     let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)?
@@ -224,6 +215,9 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     // integer covariate is untouched.
     let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
+    // The saved payload below is assembled from this table, so it is the one
+    // the fit sees: zero-weight rows are deleted, not merely down-weighted.
+    let ds = drop_zero_weight_rows(&ds, &fit_config).map_err(|error| error.to_string())?;
     // Every single-parameter formula fit, the expectile estimator included, is
     // owned end-to-end by gam-models; this route adds the CLI's summary lines and
     // its compact saved fit.

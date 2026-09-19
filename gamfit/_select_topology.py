@@ -78,7 +78,7 @@ class _TopologyRustModule(Protocol):
     ) -> list[float]: ...
 
 BasisSpec: TypeAlias = Smooth
-ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
+ScoreKind: TypeAlias = Literal["reml", "laml", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 TopologyName: TypeAlias = Literal[
     "euclidean", "circle", "sphere", "torus", "cylinder"
@@ -86,7 +86,7 @@ TopologyName: TypeAlias = Literal[
 TopologyScoreScale: TypeAlias = Literal["per_effective_dim", "per_observation"]
 TopologyAutoSelectorRank: TypeAlias = tuple[str, float, float, float, int, Any]
 
-_SCORE_KINDS: tuple[ScoreKind, ...] = ("reml", "laml", "bic", "tk")
+_SCORE_KINDS: tuple[ScoreKind, ...] = ("reml", "laml", "tk")
 _SCORE_SCALES: tuple[ScoreScale, ...] = ("per_observation", "per_effective_dim", "raw")
 
 _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
@@ -198,7 +198,7 @@ def select_topology(
         Euclidean patch, circle, sphere, torus, and cylinder constructors whose
         required dimension matches the predictor count.
     score:
-        ``"reml"``, ``"laml"``, ``"bic"``, or ``"tk"``. ``"tk"`` adds the
+        ``"reml"``, ``"laml"``, or ``"tk"``. ``"tk"`` adds the
         Tierney-Kadane null-space normalizer to the raw REML/evidence score.
     score_scale:
         ``"per_observation"``, ``"per_effective_dim"``, or ``"raw"``.
@@ -691,7 +691,6 @@ def _fitted_candidate_outcome(
         "name": candidate.name,
         "raw_reml": _lifecycle_number(raw_reml),
         "laml": _optional_lifecycle_number(fields.get("laml")),
-        "deviance": _optional_lifecycle_number(fields.get("deviance")),
         "null_dim": _optional_lifecycle_number(fields.get("null_dim")),
         "null_space_logdet": _optional_lifecycle_number(fields.get("null_space_logdet")),
         "effective_dim": _lifecycle_number(fields["edf_total"]),
@@ -874,7 +873,7 @@ def _normalize_score_kind(score: str) -> ScoreKind:
     for kind in _SCORE_KINDS:
         if score == kind:
             return kind
-    raise ValueError("score must be one of: 'reml', 'laml', 'bic', 'tk'")
+    raise ValueError("score must be one of: 'reml', 'laml', 'tk'")
 
 
 def _normalize_score_scale(score_scale: str) -> ScoreScale:
