@@ -1345,11 +1345,16 @@ class Model:
         return _plot(self, data, x=x, y=y, interval=interval, kind=kind, ax=ax)
 
     def __repr__(self) -> str:
+        summary = self.summary()
         parts = [
             f"formula={self.formula!r}",
-            f"family_name={self.family_name!r}",
+            f"family_name={summary.family_name!r}",
             f"training_table_kind={self._training_table_kind!r}",
         ]
+        # The objective's name is rendered in Rust (`SummaryEstimator`), so the
+        # repr, `print(model)` and `gam summary` print the same words.
+        if summary.convergence is not None:
+            parts.append(f"estimator={summary.convergence['estimator']['text']!r}")
         return f"Model({', '.join(parts)})"
 
     def __str__(self) -> str:

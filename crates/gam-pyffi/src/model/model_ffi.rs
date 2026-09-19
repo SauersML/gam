@@ -16,6 +16,7 @@ use gam::families::inference::saved_summary::{
     compare_saved_models, prediction_model_class_label, saved_model_report_input,
     saved_model_summary, saved_models_log_evidence_ratio, scan_introspection, scan_smooth_label,
 };
+use gam::families::inference::summary_text::render_summary_text;
 
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
@@ -215,11 +216,14 @@ struct SamplePayload {
     /// response-scale transforms (issue #1133).
     link_spec: String,
     /// The sampler that produced the draws, stamped by that sampler itself
-    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`, `"laplace"`,
-    /// `"truncated-laplace"`, or `"conjugate-gaussian"`. Callers use it to badge
-    /// the posterior or to warn when a class has fallen back to the approximate
-    /// path.
+    /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`,
+    /// `"polya-gamma-jeffreys"`, `"laplace"`, `"truncated-laplace"`, or
+    /// `"conjugate-gaussian"`. Callers use it to badge the posterior or to warn
+    /// when a class has fallen back to the approximate path.
     method: String,
+    /// Metropolis acceptance rate of the draws (`PosteriorSampler::acceptance_rate`),
+    /// present only for a sampler with an accept/reject step.
+    acceptance_rate: Option<f64>,
     /// Whether `method` targets the model's exact posterior (the MCMC routes and
     /// the closed-form conjugate Gaussian route) rather than a Gaussian
     /// approximation of it (every Laplace form).
@@ -2079,6 +2083,7 @@ fn sample_table(
     out.set_item("family_kind", payload.family_kind)?;
     out.set_item("link_spec", payload.link_spec)?;
     out.set_item("method", payload.method)?;
+    out.set_item("acceptance_rate", payload.acceptance_rate)?;
     out.set_item("exact", payload.exact)?;
     out.set_item("covariance_source", payload.covariance_source)?;
     Ok(out.unbind())

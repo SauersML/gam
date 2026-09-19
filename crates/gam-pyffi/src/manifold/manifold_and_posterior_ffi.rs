@@ -330,6 +330,7 @@ fn build_sample_payload(
         // produced them (gam#2778); nothing here re-derives it from the
         // model class.
         method: nuts.sampler.label().to_string(),
+        acceptance_rate: nuts.sampler.acceptance_rate(),
         exact: nuts.sampler.targets_exact_posterior(),
         covariance_source: nuts.covariance.as_str().to_string(),
     })
@@ -964,6 +965,21 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let summary = saved_model_summary(&model)?;
     serde_json::to_string(&summary).map_err(|err| format!("failed to serialize summary: {err}"))
+}
+
+/// The summary payload with its rendered text under `"text"`: the one Rust
+/// renderer `gam summary` prints, so `str(model.summary())` is that same string.
+fn summary_value_with_text_impl(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let model = load_model_impl(model_bytes)?;
+    let summary = saved_model_summary(&model)?;
+    let text = render_summary_text(&summary);
+    let mut value = serde_json::to_value(&summary)
+        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("model summary payload must be a JSON object".to_string());
+    };
+    fields.insert("text".to_string(), serde_json::Value::String(text));
+    Ok(value)
 }
 
 /// One `curv(...)` term's #944 report, JSON-serialized for the Python surface.

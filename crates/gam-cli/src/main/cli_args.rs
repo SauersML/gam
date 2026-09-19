@@ -95,6 +95,9 @@ pub(crate) enum Command {
     ParameterDecomposition(ParameterDecompositionArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
+    /// Print the text summary of a fitted model (the text gamfit's
+    /// `Model.summary()` prints).
+    Summary(SummaryArgs),
     /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
     /// Evaluate a fitted conditional transformation model at observed responses.
@@ -604,6 +607,12 @@ pub(crate) struct GenerateArgs {
         help = "Long-form output CSV (draw,row,value); default: <model_stem>.generated.csv"
     )]
     pub(crate) out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SummaryArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
 }
 
 #[derive(Args, Debug)]

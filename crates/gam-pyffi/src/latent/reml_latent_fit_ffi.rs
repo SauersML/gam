@@ -4044,7 +4044,7 @@ fn resolve_average_derivative_column(
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyObject> {
     let payload = detach_py_result(py, "summary_payload_from_model", move || {
-        summary_payload_value_from_model_bytes(&model_bytes)
+        summary_value_with_text_impl(&model_bytes)
     })?;
     json_object_to_py_dict(py, payload)
 }
@@ -4163,25 +4163,24 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             fields.push(format!("{key}={repr}"));
         }
     }
+    if let Some(estimator) = summary_estimator_text(payload)? {
+        fields.push(format!("estimator={}", estimator.repr()?.extract::<String>()?));
+    }
     Ok(format!("Summary({})", fields.join(", ")))
 }
 
-/// The summary's criterion row in gam-report's words, so the printed summary
-/// names a fit without null-space metadata apart from an exact fit the same way
-/// `gam fit` and the HTML report do (#2627).
-#[pyfunction]
-fn summary_criterion_row(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    let criterion = |key: &str| -> PyResult<Option<f64>> {
-        match payload.get_item(key)? {
-            Some(value) if !value.is_none() => Ok(Some(value.extract::<f64>()?)),
-            _ => Ok(None),
-        }
+/// `convergence.estimator.text`: the words `SummaryEstimator` renders for the
+/// objective the fit optimized. `None` for a route that certifies no optimizer.
+fn summary_estimator_text<'py>(
+    payload: &Bound<'py, PyDict>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(convergence) = payload.get_item("convergence")? else {
+        return Ok(None);
     };
-    Ok(gam::report::criterion_row(
-        criterion("reml_score")?,
-        criterion("raw_reml_score")?,
-        summary_render::summary_format_float,
-    ))
+    if convergence.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(convergence.get_item("estimator")?.get_item("text")?))
 }
 
 #[pyfunction]
