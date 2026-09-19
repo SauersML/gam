@@ -48,17 +48,13 @@ def _data(truth: str, seed: int, n: int = 200) -> pd.DataFrame:
 def _intercept_and_term(model: Any, df: pd.DataFrame) -> tuple[float, np.ndarray]:
     design = model.design_matrix(df)
     blocks = {b.kind: b for b in model.term_blocks}
-    names = [b.name for b in model.term_blocks]
-    intercept_block = next(b for b in model.term_blocks if "intercept" in b.name.lower())
-    smooth_block = next(b for b in model.term_blocks if b is not intercept_block)
-    assert len(model.term_blocks) == 2, f"expected intercept + s(x), got {names} / {blocks}"
+    assert set(blocks) == {"intercept", "smooth_bspline1d"}, f"unexpected terms {blocks}"
     beta = np.asarray(design.coefficients, dtype=float)
     x_mat = np.asarray(design.matrix, dtype=float)
-    assert intercept_block.end - intercept_block.start == 1
-    intercept = float(beta[intercept_block.start])
-    sl = slice(smooth_block.start, smooth_block.end)
-    term = x_mat[:, sl] @ beta[sl]
-    return intercept, term
+    icpt = blocks["intercept"]
+    assert icpt.end - icpt.start == 1
+    smooth = slice(blocks["smooth_bspline1d"].start, blocks["smooth_bspline1d"].end)
+    return float(beta[icpt.start]), x_mat[:, smooth] @ beta[smooth]
 
 
 @pytest.mark.parametrize(
