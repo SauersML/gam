@@ -3287,7 +3287,7 @@ mod tests {
         ) {
             self.steps.lock().expect("step record").push(step.clone());
         }
-        fn order_is_representable(&self, order: usize) -> bool {
+        fn is_representable_order(&self, order: usize) -> bool {
             gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
     }
@@ -3339,21 +3339,18 @@ mod tests {
     struct ScriptedCorrector {
         script: Vec<f64>,
         requests: std::sync::Mutex<Vec<Vec<usize>>>,
-        asked: std::sync::Mutex<Vec<usize>>,
+        representability_queries: std::sync::Mutex<Vec<usize>>,
     }
     impl ScriptedCorrector {
         fn new(script: Vec<f64>) -> Self {
             Self {
                 script,
                 requests: std::sync::Mutex::new(Vec::new()),
-                asked: std::sync::Mutex::new(Vec::new()),
+                representability_queries: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn requests(self) -> Vec<Vec<usize>> {
             self.requests.into_inner().expect("request record")
-        }
-        fn asked(&self) -> Vec<usize> {
-            self.asked.lock().expect("representability record").clone()
         }
     }
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for ScriptedCorrector {
@@ -3414,10 +3411,10 @@ mod tests {
         ) {
             assert_eq!(step.axis_orders.len(), 1, "the scripted corrector is one-axis");
         }
-        fn order_is_representable(&self, order: usize) -> bool {
-            self.asked
+        fn is_representable_order(&self, order: usize) -> bool {
+            self.representability_queries
                 .lock()
-                .expect("representability record")
+                .expect("query record")
                 .push(order);
             gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
         }
@@ -3465,8 +3462,10 @@ mod tests {
                 super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order,
                     running_minimum,
+                    max_representable_order,
                 } if order == max_order
                     && running_minimum == 1e-2
+                    && max_representable_order == max_order
             ),
             "typed refusal at order {max_order} expected, got {refusal}"
         );
@@ -3493,8 +3492,10 @@ mod tests {
                 super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order,
                     running_minimum,
+                    max_representable_order,
                 } if order == max_order
                     && running_minimum == smallest
+                    && max_representable_order == max_order
             ),
             "typed refusal at order {max_order} expected, got {refusal}"
         );
@@ -3564,30 +3565,21 @@ mod tests {
                 super::BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order,
                     running_minimum,
+                    max_representable_order,
                 } if order == max_order
                     && running_minimum == 1e-2
+                    && max_representable_order == max_order
             ),
             "typed refusal at order {max_order} expected, got {refusal}"
         );
     }
 
     #[test]
-    fn a_fast_contracting_axis_resolves_without_a_refusal_784() {
-        // Positive control: 1e-2, 1e-4, 1e-7. The axis resolves 1e-6 at order 6, the first
-        // order it is judged at, so the stop never fires on a search that resolves.
-        let (outcome, requests) = scripted_search(vec![1e-2, 1e-4, 1e-7], 1e-6);
-        assert_eq!(requests, vec![vec![4], vec![5], vec![6]], "requests {requests:?}");
-        let marginal = outcome.expect("a fast-contracting axis resolves");
-        assert_eq!(marginal.axis_orders, vec![6]);
-    }
-
-    #[test]
     fn the_order_search_asks_representability_only_of_the_orders_it_raises_to_784() {
-        // The axis resolves 1e-6 at order 6 after two raises. The search asks whether an
-        // order is representable only before raising an axis to it, one rule per question,
-        // and never measures the ceiling itself: that scan builds every rule up to a few
-        // hundred nodes, and it cost each cold binomial fit that reached the order search
-        // about 0.6 s (binomial_p01, n=1000, p5).
+        // A search that resolves at order 6 raises 4 → 5 → 6, so it asks the rule builder
+        // about orders 5 and 6 alone. Taking the ceiling from a scan of every order up to it
+        // built a few hundred rules, most of a second, on the first non-Gaussian fit of
+        // every process.
         let target = AnharmonicBlock {
             lambdas: array![2.0],
             a: 0.05,
@@ -3598,7 +3590,22 @@ mod tests {
         )
         .expect("a fast-contracting axis resolves");
         assert_eq!(marginal.axis_orders, vec![6]);
-        assert_eq!(corrector.asked(), vec![5, 6], "one question per raise");
+        let queries = corrector
+            .representability_queries
+            .lock()
+            .expect("query record")
+            .clone();
+        assert_eq!(queries, vec![5, 6], "representability queries {queries:?}");
+    }
+
+    #[test]
+    fn a_fast_contracting_axis_resolves_without_a_refusal_784() {
+        // Positive control: 1e-2, 1e-4, 1e-7. The axis resolves 1e-6 at order 6, the first
+        // order it is judged at, so the stop never fires on a search that resolves.
+        let (outcome, requests) = scripted_search(vec![1e-2, 1e-4, 1e-7], 1e-6);
+        assert_eq!(requests, vec![vec![4], vec![5], vec![6]], "requests {requests:?}");
+        let marginal = outcome.expect("a fast-contracting axis resolves");
+        assert_eq!(marginal.axis_orders, vec![6]);
     }
 
     #[test]
@@ -6376,12 +6383,10 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         log::debug!("[#784] block quadrature order search: {step}");
     }
 
-    /// `block_quadrature_marginal_correction` refuses exactly the orders this rejects, as
-    /// [`BlockQuadratureRefusal::UnrepresentableOrder`] or as an integration refusal when the
-    /// rule cannot be built, because it integrates with the same rule builder. One rule is
-    /// built per question, so an order search pays for the orders it reaches instead of the
-    /// process-wide ceiling scan.
-    fn order_is_representable(&self, order: usize) -> bool {
+    /// `block_quadrature_marginal_correction` refuses an order this rejects as
+    /// [`BlockQuadratureRefusal::UnrepresentableOrder`], or as an integration refusal when the
+    /// rule cannot be built, because it integrates with the same rule builder.
+    fn is_representable_order(&self, order: usize) -> bool {
         gam_math::quadrature::standard_normal_gauss_hermite_order_is_representable(order)
     }
 }

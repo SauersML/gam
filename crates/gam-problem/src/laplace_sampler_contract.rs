@@ -137,12 +137,16 @@ pub enum BlockQuadratureRefusal {
     /// that underflows to zero, so the rule has passed the largest order whose
     /// nodes all carry representable mass.
     UnrepresentableOrder { axis: usize, order: usize },
-    /// The axis was evaluated at every order from four through `order`, the largest
-    /// representable one (the rule one order higher underflows), and is still unresolved
-    /// there, so no representable order is left to raise it to (#784). `running_minimum`
-    /// is the smallest paired difference the axis showed at any of those orders. The
-    /// refusal is measured at the ceiling, never projected from a rate.
-    UnresolvableAtRepresentableOrders { order: usize, running_minimum: f64 },
+    /// The axis was evaluated at every order through `max_representable_order`, the
+    /// order past which [`LaplaceMarginalCorrector::is_representable_order`] refuses, and is
+    /// still unresolved there, so no representable order is left to raise it to (#784).
+    /// `running_minimum` is the smallest paired difference the axis showed at any of
+    /// those orders. The refusal is measured at the ceiling, never projected from a rate.
+    UnresolvableAtRepresentableOrders {
+        order: usize,
+        running_minimum: f64,
+        max_representable_order: usize,
+    },
     /// Any other failure of the integration itself (non-positive curvature,
     /// infeasible nodes, non-finite output, a malformed order list).
     Integration(String),
@@ -175,10 +179,11 @@ impl std::fmt::Display for BlockQuadratureRefusal {
             Self::UnresolvableAtRepresentableOrders {
                 order,
                 running_minimum,
+                max_representable_order,
             } => write!(
                 f,
                 "unresolved through the largest representable Gauss–Hermite order: the axis \
-                 reached order {order}, whose next rule underflows, and its smallest paired \
+                 reached order {order} (of {max_representable_order}), and its smallest paired \
                  difference at any order was {running_minimum:.4e}"
             ),
             Self::Integration(reason) => f.write_str(reason),
@@ -282,9 +287,12 @@ fn axis_resolved(paired_error: f64, resolution_target: f64) -> bool {
 /// unresolved axis:
 /// - when the axis to raise already sits at the largest representable order and is
 ///   still unresolved there ([`BlockQuadratureRefusal::UnresolvableAtRepresentableOrders`]).
-///   Each step raises one axis by one order, so the search makes at most `m·(R − 3)`
-///   requests, `R` the largest representable order, before every axis is resolved or
-///   one is refused;
+///   The search asks [`LaplaceMarginalCorrector::is_representable_order`] of the one order
+///   it would raise to, so it learns that ceiling by reaching it and never scans the orders
+///   past the ones it evaluates.
+///   Each step raises one axis by one order, so the search makes at most
+///   `m·(max_representable_order − 3)` requests before every axis is resolved or one is
+///   refused;
 /// - or when the corrector refuses the next orders (a one-node chunk the memory budget
 ///   does not admit, or a rule past the representable order).
 ///
@@ -382,14 +390,10 @@ pub fn select_block_quadrature_orders(
             projected_remaining_raises: remaining,
             projected_node_count,
         });
-        // The axis to raise already sits at the largest representable order, unresolved
-        // there, so no representable order is left to raise it to (#784). The search has
-        // built every order from four up to this one, so the first order whose rule does
-        // not represent its mass is the next one; only that one rule is built to ask.
-        if !axis_orders[axis]
-            .checked_add(1)
-            .is_some_and(|next| corrector.order_is_representable(next))
-        {
+        // The order the axis would rise to is not representable, so it already sits at the
+        // largest representable order, unresolved there, and no representable order is left
+        // to raise it to (#784).
+        if !corrector.is_representable_order(axis_orders[axis] + 1) {
             let running_minimum = errors_by_order[axis]
                 .values()
                 .copied()
@@ -401,6 +405,7 @@ pub fn select_block_quadrature_orders(
                 cause: BlockQuadratureRefusal::UnresolvableAtRepresentableOrders {
                     order: axis_orders[axis],
                     running_minimum,
+                    max_representable_order: axis_orders[axis],
                 },
                 axis_orders,
             });
@@ -658,13 +663,13 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
     /// grinds names what it is grinding on (#784).
     fn publish_order_search_step(&self, step: &BlockQuadratureOrderStep);
 
-    /// Whether this corrector's rule builder represents the Gauss–Hermite rule of
-    /// `order`: it builds, and every weight is positive. The order search asks it of the
-    /// order it is about to raise an axis to, and refuses the axis as unresolvable at the
-    /// representable orders when the answer is no (#784). The search asks only of orders
-    /// one past an order it has already integrated at, so an implementation builds one
-    /// rule per question rather than measuring a global ceiling.
-    fn order_is_representable(&self, order: usize) -> bool;
+    /// Whether this corrector's rule builder represents a Gauss–Hermite rule of `order`,
+    /// every weight positive, so [`Self::block_quadrature_marginal_correction`] admits it.
+    /// The order search asks it of the one order it would raise an axis to (#784). The
+    /// search reaches an order only through every lower one, so the first order this
+    /// refuses sits one past the largest representable order, which no fit has to scan
+    /// for.
+    fn is_representable_order(&self, order: usize) -> bool;
 }
 
 // ───────────────────────── process-level injection registry ──────────────────

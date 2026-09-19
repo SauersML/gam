@@ -31,6 +31,9 @@ on:
       - "gamfit/**"
       # The gamfit-vs-pyGAM harness: its smoke test runs in the bench step.
       - "bench/pygam_compare/**"
+      # The p-value calibration harness (it reuses pygam_compare's runner); its
+      # CI plan runs in the same bench step.
+      - "bench/pvalue_calibration/**"
       - "src/inference/model.rs"
       - "src/inference/predict/mod.rs"
       - "src/inference/predict/standard.rs"

@@ -61,16 +61,29 @@ These are the plans (see `plans.py`):
 | `binomial_small` | n ∈ {1e2, 1e3}, {`binomial`, `binomial_p10`, `binomial_p01`, `binomial_trials`} × all designs | 3 |
 | `binomial_1e4` | n=1e4, the four binomial variants × all designs | 2 |
 | `binomial_1e5` | n=1e5, the four binomial variants × all designs | 1 |
+| `positive_small` | n ∈ {1e2, 1e3}, positive-response families × all designs | 3 |
+| `positive_1e4` | n=1e4, positive-response families × all designs | 2 |
+| `positive_1e5` | n=1e5, positive-response families × {`p1`, `p5`, `te`} | 1 |
 | `threads`   | gamfit only: n ∈ {1e4, 1e5, 1e6} × {gaussian, binomial} × {`p5`, `p20`, `te`} × threads {1, 2, 4, 8, auto} | 2 |
 | `oversubscribe` | gamfit only: gaussian n=2e4 `te` and n=1e5 `p5`, alone and as one process per CPU at once, threads {1, auto} | 2 |
 
-The last two measure parallelism rather than compare libraries. A cell's
-`threads` sets every pool variable listed under **Threads** below (`auto`
-unsets them all, so each pool sizes itself to the host); `concurrency` K runs K
-identical processes at once, which is what `joblib` or `n_jobs=-1` does, and
-records the batch wall time. The report then adds a thread-scaling table
-(speedup over one thread) and a process fan-out table (throughput of the batch
-against the same process run alone).
+The positive-response families are Gamma on the log link (`gamma_log`, shape 3),
+heavy right skew with responses near zero (`gamma_skew`, shape 0.5), Gamma on the
+inverse link (`gamma_inverse`), the inverse Gaussian (`inverse_gaussian`),
+log-normal data fitted as a Gaussian on log y (`lognormal_gaussian`) and as a
+Gamma on y (`lognormal_gamma`), and scaled-t noise with 3 degrees of freedom
+(`student_t`). pyGAM is the comparator for the Gamma and log-normal families.
+It has no scaled-t family, and its inverse Gaussian stores sqrt(phi) as its
+scale, so `inverse_gaussian` and `student_t` run gamfit alone and report
+absolute numbers.
+
+The `threads` and `oversubscribe` plans measure parallelism rather than compare
+libraries. A cell's `threads` sets every pool variable listed under **Threads**
+below (`auto` unsets them all, so each pool sizes itself to the host);
+`concurrency` K runs K identical processes at once, which is what `joblib` or
+`n_jobs=-1` does, and records the batch wall time. The report then adds a
+thread-scaling table (speedup over one thread) and a process fan-out table
+(throughput of the batch against the same process run alone).
 
 Overrides: `--reps`, `--timeout`, `--memcap-mb` and `--only-libs gamfit,pygam_gs`.
 

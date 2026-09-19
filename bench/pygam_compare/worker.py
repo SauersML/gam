@@ -3,8 +3,10 @@
 Usage: worker.py LIB FAMILY N DESIGN SEED
 
   LIB     gamfit | pygam | pygam_gs
-  FAMILY  gaussian | binomial | poisson, or a binomial variant of the
-          ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``)
+  FAMILY  gaussian | binomial | poisson, a binomial variant of the
+          ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), or a
+          positive-continuous family of the ``positive_*`` plans (see
+          ``POSITIVE_FAMILIES``)
   DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
           | by (see ``make_data``)
 
@@ -56,10 +58,66 @@ FAMILIES = ("gaussian", "binomial", "poisson")
 # the observed proportion ``y_i / m_i`` with prior weight ``m_i`` by both
 # libraries (the binomial likelihood with ``m_i`` trials up to a constant).
 BINOMIAL_FAMILIES = ("binomial_p10", "binomial_p01", "binomial_trials")
-ALL_FAMILIES = FAMILIES + BINOMIAL_FAMILIES
 BINOMIAL_PREVALENCE = {"binomial_p10": 0.1, "binomial_p01": 0.01}
 BINOMIAL_SLOPE = 1.5
 TRIALS_MAX = 20
+# Positive-continuous families of the ``positive_*`` plans (audit lane
+# sweep-positive). The mean is ``exp(0.5 + 0.7 eta)`` unless stated.
+#   gamma_log           Gamma, shape 3, log link.
+#   gamma_skew          Gamma, shape 1/2, mean ``exp(0.7 eta - 2)``: heavy right
+#                       skew with most responses near zero.
+#   gamma_inverse       Gamma, shape 3, fitted on the canonical inverse link;
+#                       the truth is ``1 / mu = 1 + 0.2 eta``, which stays
+#                       positive for every design (``|eta| <= sqrt(p)``).
+#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3, log link.
+#   lognormal_gaussian  ``log y = 0.5 + 0.7 eta + N(0, 0.5^2)`` fitted as a
+#                       Gaussian on the log scale (response and mean are logs).
+#   lognormal_gamma     the same draw of ``y`` fitted by Gamma(log) on the raw
+#                       scale; the mean is ``E[y] = exp(0.5 + 0.7 eta + 0.125)``.
+#   student_t           ``y = eta + 0.5 t_3``, fitted with scale and degrees
+#                       of freedom estimated.
+POSITIVE_FAMILIES = (
+    "gamma_log",
+    "gamma_skew",
+    "gamma_inverse",
+    "inverse_gaussian",
+    "lognormal_gaussian",
+    "lognormal_gamma",
+    "student_t",
+)
+ALL_FAMILIES = FAMILIES + BINOMIAL_FAMILIES + POSITIVE_FAMILIES
+GAMMA_SHAPE, GAMMA_SKEW_SHAPE, GAMMA_SKEW_LEVEL = 3.0, 0.5, -2.0
+GAMMA_INVERSE_SLOPE = 0.2
+INVERSE_GAUSSIAN_PHI = 0.3
+LOGNORMAL_SD = 0.5
+STUDENT_T_DF, STUDENT_T_SCALE = 3.0, 0.5
+# pyGAM fits every binomial variant, the Gamma families (log and inverse
+# links) and both log-normal fits. It has no scaled-t family, and its InvGaussGAM stores sqrt(phi) as its
+# scale (see inverse_gaussian_scale.py), so it is not a like-for-like
+# comparator: those two run gamfit alone and report absolute times and the
+# certification rate.
+PYGAM_FAMILIES = frozenset(
+    {
+        *FAMILIES,
+        *BINOMIAL_FAMILIES,
+        "gamma_log",
+        "gamma_skew",
+        "gamma_inverse",
+        "lognormal_gaussian",
+        "lognormal_gamma",
+    }
+)
+# gamfit (family, link) of each family whose name is not a gamfit family.
+GAMFIT_FAMILY: dict[str, tuple[str, str | None]] = {
+    **{family: ("binomial", None) for family in BINOMIAL_FAMILIES},
+    "gamma_log": ("gamma", None),
+    "gamma_skew": ("gamma", None),
+    "gamma_inverse": ("gamma", "inverse"),
+    "inverse_gaussian": ("inverse-gaussian", None),
+    "lognormal_gaussian": ("gaussian", None),
+    "lognormal_gamma": ("gamma", None),
+    "student_t": ("student-t", None),
+}
 DESIGNS = ("p1", "p5", "p20", "te")
 # Designs beyond the core grid, run by the Gaussian sweep plans: a tensor plus
 # an additive smooth, and a factor-by smooth (one curve per level).
@@ -69,6 +127,10 @@ INTERVAL_LEVEL = 0.95
 TEST_SEED_OFFSET = 1000
 
 FloatArray = NDArray[np.float64]
+
+
+def supports(lib: str, family: str) -> bool:
+    return lib == "gamfit" or family in PYGAM_FAMILIES
 
 
 def design_width(design: str) -> int | None:
@@ -137,6 +199,28 @@ def make_data(
     elif family == "poisson":
         mu = np.exp(0.5 + 0.7 * eta)
         y = rng.poisson(mu).astype(float)
+    elif family in ("gamma_log", "gamma_skew"):
+        shape = GAMMA_SHAPE if family == "gamma_log" else GAMMA_SKEW_SHAPE
+        level = 0.5 if family == "gamma_log" else GAMMA_SKEW_LEVEL
+        mu = np.exp(level + 0.7 * eta)
+        y = rng.gamma(shape, mu / shape)
+    elif family == "gamma_inverse":
+        mu = 1.0 / (1.0 + GAMMA_INVERSE_SLOPE * eta)
+        y = rng.gamma(GAMMA_SHAPE, mu / GAMMA_SHAPE)
+    elif family == "inverse_gaussian":
+        mu = np.exp(0.5 + 0.7 * eta)
+        # numpy's wald(mean, scale) has variance mean^3 / scale.
+        y = rng.wald(mu, 1.0 / INVERSE_GAUSSIAN_PHI)
+    elif family in ("lognormal_gaussian", "lognormal_gamma"):
+        log_mean = 0.5 + 0.7 * eta
+        log_y = log_mean + rng.normal(0.0, LOGNORMAL_SD, n)
+        if family == "lognormal_gaussian":
+            mu, y = log_mean, log_y
+        else:
+            mu, y = np.exp(log_mean + LOGNORMAL_SD**2 / 2), np.exp(log_y)
+    elif family == "student_t":
+        mu = eta
+        y = eta + STUDENT_T_SCALE * rng.standard_t(STUDENT_T_DF, n)
     else:
         raise ValueError(f"unknown family {family!r}; expected one of {ALL_FAMILIES}")
     return X, y, mu, None
@@ -150,8 +234,12 @@ def mean_deviance(
     A grouped binomial is the per-trial deviance: the rows are weighted by
     their trial counts.
     """
-    if family == "gaussian":
+    if family in ("gaussian", "lognormal_gaussian", "student_t"):
         return float(np.mean((y - mu) ** 2))
+    if family.startswith("gamma") or family == "lognormal_gamma":
+        return float(np.mean(2 * (-np.log(y / mu) + (y - mu) / mu)))
+    if family == "inverse_gaussian":
+        return float(np.mean((y - mu) ** 2 / (mu**2 * y)))
     if is_binomial(family):
         unit = special.xlogy(y, y / mu) + special.xlogy(1 - y, (1 - y) / (1 - mu))
         return float(np.average(2 * unit, weights=trials))
@@ -165,15 +253,19 @@ def mean_logscore(
     mu: FloatArray,
     predictive_sd: FloatArray | None,
     trials: FloatArray | None = None,
-) -> float:
+) -> float | None:
     """Mean negative log predictive density of held-out ``y`` (lower is better).
 
     Binomial and Poisson are scored at the predicted mean; a grouped binomial
     scores the observed count out of its trials, per trial. Gaussian needs a
     predictive scale: the library's own 95% prediction interval gives it as
     ``(upper - lower) / (2 z_0.975)``, which prices both the fitted scale and
-    the posterior variance of the mean.
+    the posterior variance of the mean. The positive families need their fitted
+    shape / dispersion, which the libraries do not expose alike, so they report
+    no log score.
     """
+    if family in POSITIVE_FAMILIES:
+        return None
     if trials is not None:
         counts = np.rint(y * trials)
         return float(-np.sum(stats.binom.logpmf(counts, trials, mu)) / np.sum(trials))
@@ -236,7 +328,7 @@ class GamfitAdapter(Adapter):
         self.gamfit: Any = importlib.import_module("gamfit")
         self.version = str(self.gamfit.__version__)
         self.family = family
-        self.gamfit_family = "binomial" if is_binomial(family) else family
+        self.gamfit_family, self.link = GAMFIT_FAMILY.get(family, (family, None))
         self.names = [f"x{j}" for j in range(p)]
         self.factor = design == "by"
         if design == "te":
@@ -265,6 +357,7 @@ class GamfitAdapter(Adapter):
             data,
             self.formula,
             family=self.gamfit_family,
+            link=self.link,
             weights=None if weights is None else WEIGHTS_COLUMN,
         )
 
@@ -323,10 +416,17 @@ class PygamAdapter(Adapter):
             self.terms = pygam.s(0)
             for j in range(1, p):
                 self.terms = self.terms + pygam.s(j)
+        if family not in PYGAM_FAMILIES:
+            raise ValueError(f"pyGAM has no {family!r} comparator")
         self.dist, self.link = {
             "gaussian": ("normal", "identity"),
             "binomial": ("binomial", "logit"),
             "poisson": ("poisson", "log"),
+            "gamma_log": ("gamma", "log"),
+            "gamma_skew": ("gamma", "log"),
+            "gamma_inverse": ("gamma", "inverse"),
+            "lognormal_gaussian": ("normal", "identity"),
+            "lognormal_gamma": ("gamma", "log"),
         }["binomial" if is_binomial(family) else family]
         self.gridsearch = gridsearch
         self.model: Any = None
