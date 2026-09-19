@@ -80,7 +80,7 @@ another covariance.
 
 | surface | tested predictor | null | before | after |
 |---|---|---|---|---|
-| multinomial, per class | class `a` block, `a·P + span` | term does not move log-odds of `a` vs the reference class | raw-covariance truncation, not whitened; oversized (table below) | whitened by the exact softmax curvature `XᵀW(β̂)X`, like the scalar summary |
+| multinomial, per class | class `a` block, `a·P + span` | term does not move log-odds of `a` vs the reference class | raw-covariance truncation, not whitened; oversized (table below) | two classes: whitened by the exact softmax curvature `XᵀW(β̂)X`, like the scalar summary. Three or more: refused with `penalty_couples_outside_tested_set` (see below) |
 | multinomial, joint (new) | union of the term's span in every class block | term moves no class probability | did not exist | `MultinomialModel.joint_smooth_significance()`; reference-class invariant |
 | Gaussian location-scale | Location block | term does not move the mean | table refused: "Refit the model" (λ count compared against all blocks) | tested at the Location block's offsets |
 | survival location-scale | Threshold block, after the Time block | term does not move the threshold predictor | the TIME block's coefficients were tested under the covariate names (a null covariate read p ≈ 1e-17; the real one had no p-value) | tested at the Threshold block's offsets |
@@ -102,22 +102,93 @@ instead of a p-value for the wrong coefficients.
 ### Multinomial: which test to use
 
 The per-class test asks whether the term moves the log-odds of one class
-against the reference class. Its answer depends on which class is the
-reference. A class block `F_jj` of the joint influence matrix is not an
-influence matrix of its own. Its trace can come out zero or negative when the
-fit shrinks the term toward the other classes. The rank-`round(edf)`
-truncation then has no direction to test, and the row reports
-`NoEffectiveDegreesOfFreedom` instead of a p-value. The joint test,
-`joint_smooth_significance()`, tests every class block of the term at once.
-Its null, that the term moves no class probability, does not depend on the
-reference class, and its EDF is the sum of the per-class EDFs. It is the test
-to use for "does this covariate matter". Rejecting when any per-class test
-rejects is not a valid substitute: it multiplies the size, as the legacy table
-below shows.
+against the reference class. With three or more classes it has no valid
+p-value on these fits, and every per-class row now reports
+`penalty_couples_outside_tested_set` instead of one.
+
+The reason is the penalty. Since #1587 the fit penalizes each class's
+deviation from the all-class mean, `Σ_c λ_c ‖f_c − f̄‖²`, so that the fit does
+not depend on which class is the reference. That penalty couples the class
+blocks. The shrinkage target of class `a`'s coefficients is a share of the
+other classes' fit, not `β_a = 0`. Under the per-class null, with another class
+carrying the effect, the class-`a` estimate is biased toward that effect.
+Wood's test assumes the penalty shrinks the tested block toward its null, and
+no reference df corrects a biased estimate. The runs below show both failures:
+
+- under the global null (`multinomial_null`), the a-vs-c row rejected 0.075
+  (n = 300) and 0.087 (n = 2000) at 0.05;
+- under `multinomial_power`, x moves class b only, so the a-vs-c null still
+  holds. The a-vs-c row rejected 0.088 at 0.01 (n = 2000), almost nine times
+  its level, and more as n grows.
+
+A class block of the joint influence matrix is not an influence matrix of its
+own either: its trace goes to zero or below when the fit ties class `a`'s term
+to the others, so up to 10% of the null runs' rows had no EDF at all.
+
+The refusal is structural. The test reads the fitted penalty and refuses any
+coefficient set `J` whose rows reach outside `J`. A two-class fit has one class
+block, nothing to couple, and keeps its per-class test
+(`sbc_multinomial_smooth_significance_size_curve`).
+
+The joint test, `joint_smooth_significance()`, tests every class block of the
+term at once, and the penalty does not reach outside that set. Its null, that
+the term moves no class probability, is the penalty's shrinkage target and
+does not depend on the reference class. Its EDF is the trace of the term's
+`F_JJ` over all classes. It is the test to use for "does this covariate
+matter", and it holds its size at both sample sizes. Rejecting when any
+per-class test rejects is not a valid substitute: it multiplies the size, as
+the legacy table below shows.
 
 ## Results
 
-RESULTS_TABLE
+| scenario | n | test | usable/R | p<=.10 | p<=.05 | p<=.01 | MCSE (.10/.05/.01) | KS p | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| multinomial_null | 300 | joint (all classes) | 500/500 | 0.108 | 0.052 | 0.010 | 0.013/0.010/0.004 | 6.92e-101 | PASS |
+| multinomial_null | 300 | per-class a vs c | 468/500 | 0.143 | 0.075 | 0.013 | 0.014/0.010/0.005 | 2.87e-77 | FAIL, now refused |
+| multinomial_null | 300 | per-class b vs c | 448/500 | 0.127 | 0.054 | 0.007 | 0.014/0.010/0.005 | 8.87e-85 | PASS, now refused |
+| multinomial_null | 2000 | joint (all classes) | 499/500 | 0.090 | 0.044 | 0.002 | 0.013/0.010/0.004 | 3.19e-111 | PASS |
+| multinomial_null | 2000 | per-class a vs c | 494/500 | 0.158 | 0.087 | 0.012 | 0.013/0.010/0.004 | 1.94e-84 | FAIL, now refused |
+| multinomial_null | 2000 | per-class b vs c | 455/500 | 0.121 | 0.057 | 0.007 | 0.014/0.010/0.005 | 1.61e-99 | PASS, now refused |
+| multinomial_power | 300 | joint (all classes) | 500/500 | 0.290 | 0.176 | 0.066 | 0.013/0.010/0.004 | 6.11e-31 | power |
+| multinomial_power | 300 | per-class a vs c | 407/500 | 0.174 | 0.088 | 0.037 | 0.015/0.011/0.005 | 1.34e-32 | now refused |
+| multinomial_power | 300 | per-class b vs c | 477/500 | 0.277 | 0.155 | 0.061 | 0.014/0.010/0.005 | 1.24e-24 | now refused |
+| multinomial_power | 2000 | joint (all classes) | 500/500 | 0.992 | 0.980 | 0.876 | 0.013/0.010/0.004 | 0 | power |
+| multinomial_power | 2000 | per-class a vs c | 432/500 | 0.150 | 0.125 | 0.088 | 0.014/0.010/0.005 | 5.53e-15 | now refused |
+| multinomial_power | 2000 | per-class b vs c | 500/500 | 0.980 | 0.970 | 0.858 | 0.013/0.010/0.004 | 0 | now refused |
+| ls_scale_only | 300 | mean s(x) | 499/500 | 0.086 | 0.044 | 0.004 | 0.013/0.010/0.004 | 1.84e-146 | PASS |
+| ls_scale_only | 2000 | mean s(x) | 498/500 | 0.058 | 0.026 | 0.006 | 0.013/0.010/0.004 | 1.44e-138 | PASS |
+| ls_power | 300 | mean s(x) | 500/500 | 0.622 | 0.502 | 0.268 | 0.013/0.010/0.004 | 9.48e-144 | power |
+| ls_power | 2000 | mean s(x) | 500/500 | 1.000 | 1.000 | 1.000 | 0.013/0.010/0.004 | 0 | power |
+| weibull_null | 300 | s(noise) | 473/500 | 0.106 | 0.044 | 0.015 | 0.014/0.010/0.005 | 1.17e-88 | PASS |
+| weibull_null | 2000 | s(noise) | 491/500 | 0.102 | 0.049 | 0.010 | 0.014/0.010/0.004 | 1.14e-53 | PASS |
+| weibull_power | 300 | s(age) | 480/500 | 1.000 | 1.000 | 1.000 | 0.014/0.010/0.005 | 0 | power |
+| weibull_power | 2000 | s(age) | 491/500 | 1.000 | 1.000 | 1.000 | 0.014/0.010/0.004 | 0 | power |
+| transformation_null | 300 | s(noise) | 476/500 | 0.101 | 0.061 | 0.013 | 0.014/0.010/0.005 | 1.34e-109 | PASS |
+| transformation_null | 2000 | s(noise) | 491/500 | 0.096 | 0.063 | 0.016 | 0.014/0.010/0.004 | 1.4e-54 | PASS |
+| transformation_power | 300 | s(age) | 465/500 | 1.000 | 1.000 | 1.000 | 0.014/0.010/0.005 | 0 | power |
+| transformation_power | 2000 | s(age) | 488/500 | 1.000 | 1.000 | 1.000 | 0.014/0.010/0.005 | 0 | power |
+| survls_null | 300 | s(noise) | 500/500 | 0.064 | 0.034 | 0.004 | 0.013/0.010/0.004 | 1.79e-134 | PASS |
+| survls_null | 2000 | s(noise) | 500/500 | 0.068 | 0.034 | 0.006 | 0.013/0.010/0.004 | 2.79e-110 | PASS |
+| survls_power | 300 | s(age) | 500/500 | 1.000 | 1.000 | 1.000 | 0.013/0.010/0.004 | 0 | power |
+| survls_power | 2000 | s(age) | 500/500 | 1.000 | 1.000 | 1.000 | 0.013/0.010/0.004 | 0 | power |
+
+The multinomial per-class rows are the p-values the per-class test gave before
+it was made to refuse. They are the evidence for the refusal described above;
+the current build reports no per-class p-value for these three-class fits.
+The joint rows are unchanged by the refusal, which only reads the penalty.
+
+Failed fits are recorded, not dropped, and they are fitting failures rather
+than p-value failures: the fit raised before any test ran.
+
+| scenario | n = 300 | n = 2000 |
+|---|---|---|
+| multinomial_null | 0 | 1 |
+| ls_scale_only | 1 | 2 |
+| weibull_null / power | 27 / 20 | 9 / 9 |
+| transformation_null / power | 24 / 35 | 9 / 12 |
+
+Every other run fitted all 500 replications. The Weibull and transformation
+failures are REML or inner P-IRLS convergence refusals on the survival path.
 
 ### Legacy multinomial per-class test (before)
 

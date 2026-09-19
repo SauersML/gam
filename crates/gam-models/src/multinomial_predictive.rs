@@ -507,8 +507,6 @@ impl<'a> MultinomialPredictiveModel<'a> {
         (gradient, precision)
     }
 
-    /// `Q = T − XᵀW(β̂)X` at `anchor`, symmetrized, with its inertia against its
-    /// own rounding band (see `terminal_precision`).
     /// The training rows' likelihood curvature `XᵀW(θ)X` at `θ`, in the stacked
     /// class-major order, where `W` holds each row's softmax Fisher block
     /// `w·p_a(δ_ab − p_b)` over the active classes. At the published mode this
@@ -533,6 +531,8 @@ impl<'a> MultinomialPredictiveModel<'a> {
         Ok(curvature)
     }
 
+    /// `Q = T − XᵀW(β̂)X` at `anchor`, symmetrized, with its inertia against its
+    /// own rounding band (see `terminal_precision`).
     fn fitted_quadratic(
         &self,
         anchor: &[f64],

@@ -2557,6 +2557,15 @@ impl MultinomialSavedModel {
     ///
     /// A row whose test cannot be formed carries the typed reason instead of
     /// being dropped, so the table always has one row per `(class, term)`.
+    ///
+    /// With `K ≥ 3` classes every row carries
+    /// [`MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet`]:
+    /// the reference-symmetric penalty shrinks each class's term toward the
+    /// all-class mean, so the class-`a` estimate borrows the other classes'
+    /// fit and is biased under its own null. Measured at `n = 2000`
+    /// (`bench/pvalue_calibration/pv-multi-predictor`), a class whose null held
+    /// while another class carried the effect rejected at 0.088 at `α = 0.01`.
+    /// A two-class fit has one class block and no such coupling.
     pub fn smooth_significance(&self) -> Vec<MultinomialSmoothSignificance> {
         let p = self.p_per_class;
         let inputs = self.smooth_test_inputs();
@@ -2649,6 +2658,7 @@ impl MultinomialSavedModel {
             covariance,
             influence,
             curvature,
+            penalty,
         })
     }
 
@@ -3012,6 +3022,16 @@ pub enum MultinomialSmoothTestUnavailable {
     /// Every direction of the whitened block covariance is numerically null,
     /// or the statistic or its tail probability is not finite.
     NoEstimableDirection { edf: f64 },
+    /// The fitted penalty couples the tested coefficients to coefficients
+    /// outside the tested set, so the penalized estimate of `β_J` does not
+    /// shrink toward the null `β_J = 0`. With `K ≥ 3` classes the
+    /// reference-symmetric carrier `Σ λ (M ⊗ S_t)` penalizes each class's
+    /// deviation from the all-class mean, which pulls one class's term
+    /// coefficients toward the others' fit; under the per-class null
+    /// `β_{a,J} = 0` the estimate is then biased by whatever the other classes
+    /// carry, and no reference distribution sizes the test. The all-classes
+    /// set is closed under that coupling, so the joint test stays available.
+    PenaltyCouplesOutsideTestedSet,
 }
 
 impl std::fmt::Display for MultinomialSmoothTestUnavailable {
@@ -3030,6 +3050,9 @@ impl std::fmt::Display for MultinomialSmoothTestUnavailable {
             Self::NoEstimableDirection { edf } => {
                 write!(f, "no estimable direction in the term block (edf {edf})")
             }
+            Self::PenaltyCouplesOutsideTestedSet => {
+                f.write_str("penalty couples this block to other classes; use the all-classes test")
+            }
         }
     }
 }
@@ -3045,6 +3068,7 @@ impl MultinomialSmoothTestUnavailable {
             Self::SpanOutOfRange => "span_out_of_range",
             Self::NoEffectiveDegreesOfFreedom { .. } => "no_effective_degrees_of_freedom",
             Self::NoEstimableDirection { .. } => "no_estimable_direction",
+            Self::PenaltyCouplesOutsideTestedSet => "penalty_couples_outside_tested_set",
         }
     }
 }
@@ -3056,6 +3080,7 @@ struct SmoothTestInputs {
     covariance: Array2<f64>,
     influence: Array2<f64>,
     curvature: Array2<f64>,
+    penalty: Array2<f64>,
 }
 
 impl SmoothTestInputs {
@@ -3073,6 +3098,31 @@ impl SmoothTestInputs {
         let d = self.mode.len();
         if span_end > self.p_per_class || indices.iter().any(|&index| index >= d) {
             return Err(MultinomialSmoothTestUnavailable::SpanOutOfRange);
+        }
+        // Wood's test reads the tested block's principal submatrices, which
+        // describes a penalized estimate shrinking toward `β_J = 0` only when
+        // the penalty on `J` does not reach outside `J`. Entries at round-off
+        // of the rows' own scale are assembly noise, not coupling.
+        let mut in_set = vec![false; d];
+        for &index in indices {
+            in_set[index] = true;
+        }
+        let row_scale = indices
+            .iter()
+            .flat_map(|&i| self.penalty.row(i).to_vec())
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let coupling = indices
+            .iter()
+            .flat_map(|&i| {
+                let row = self.penalty.row(i);
+                (0..d)
+                    .filter(|&k| !in_set[k])
+                    .map(move |k| row[k].abs())
+                    .collect::<Vec<f64>>()
+            })
+            .fold(0.0_f64, f64::max);
+        if coupling > f64::EPSILON * row_scale * d as f64 {
+            return Err(MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet);
         }
         let principal = |matrix: &Array2<f64>| {
             Array2::from_shape_fn((indices.len(), indices.len()), |(i, j)| {
@@ -6343,6 +6393,69 @@ mod reference_class_invariance_tests {
             a.p_value > 1e-6,
             "fixture must keep the joint p-value off zero, got {}",
             a.p_value
+        );
+    }
+    /// With three classes the per-class null `β_{a,x} = 0` is not the
+    /// penalty's shrinkage target: the reference-symmetric carrier penalizes
+    /// each class's deviation from the all-class mean, so the class-`a` estimate
+    /// is pulled toward class `b`'s effect and the per-class Wood test rejects a
+    /// true null far above its level (0.088 at `α = 0.01`, n = 2000, in
+    /// `bench/pvalue_calibration/pv-multi-predictor`). The per-class rows must
+    /// carry the typed reason instead of that p-value, while the all-classes
+    /// row, whose coefficient set the penalty does not reach outside of, stays
+    /// a test.
+    #[test]
+    fn three_class_per_class_rows_refuse_the_coupled_penalty() {
+        let td = tempdir().expect("tempdir");
+        let mut rng = SplitMix64(0x7E57_0002);
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut labels = Vec::with_capacity(n);
+        for _ in 0..n {
+            let xi = rng.unit();
+            // x moves class B only; A against the reference C has no x effect.
+            let eta = [0.0, (std::f64::consts::PI * xi).sin(), 0.0];
+            let weights = eta.map(f64::exp);
+            let u = rng.unit() * weights.iter().sum::<f64>();
+            let label = if u < weights[0] {
+                "A"
+            } else if u < weights[0] + weights[1] {
+                "B"
+            } else {
+                "C"
+            };
+            x.push(xi);
+            labels.push(label.to_string());
+        }
+        let train = dataset_xy(td.path(), "coupled", &x, &labels);
+        let config = FitConfig::default();
+        let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            init_lambda: 1.0,
+            max_iter: 60,
+            tol: 1e-6,
+            ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
+        })
+        .expect("multinomial formula fit must succeed");
+
+        let rows = model.smooth_significance();
+        assert_eq!(rows.len(), 2, "one row per active class");
+        for row in &rows {
+            assert_eq!(
+                row.test,
+                Err(MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet),
+                "class {} row must refuse the class-coupled penalty",
+                row.class_label
+            );
+        }
+        let joint = model.joint_smooth_significance();
+        assert_eq!(joint.len(), 1, "one smooth term, one joint row");
+        let test = joint[0]
+            .test
+            .unwrap_or_else(|reason| panic!("joint term test unavailable: {reason}"));
+        assert!(
+            test.p_value.is_finite() && (0.0..=1.0).contains(&test.p_value),
+            "joint p-value out of range: {}",
+            test.p_value
         );
     }
 }

@@ -11,13 +11,20 @@
 //! Audit: type-I size under a TRUE NULL. `x` has no effect on any class while
 //! a second covariate `z` drives the class probabilities, so the null term is
 //! tested inside a genuinely multi-predictor fit. At `α ∈ {0.01, 0.05, 0.10}`
-//! the rejection rate of the joint test and of each per-class test must not
-//! exceed `α` beyond Monte-Carlo error, audited as coverage of the
-//! non-rejection event at nominal `1 − α`: an oversized test under-covers
-//! non-rejection and gates; an undersized one over-covers and only reports.
+//! the rejection rate of the joint test must not exceed `α` beyond Monte-Carlo
+//! error, audited as coverage of the non-rejection event at nominal `1 − α`:
+//! an oversized test under-covers non-rejection and gates; an undersized one
+//! over-covers and only reports.
+//!
+//! The per-class rows are not sized here: with three classes the
+//! reference-symmetric penalty couples each class block to the others, the
+//! per-class estimate is biased under its own null, and every per-class row
+//! must carry `PenaltyCouplesOutsideTestedSet` rather than a p-value.
 
 use csv::StringRecord;
-use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, MultinomialSmoothTestUnavailable, fit_penalized_multinomial_formula,
+};
 use gam::{FitConfig, encode_recordswith_inferred_schema};
 use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
 
@@ -81,7 +88,6 @@ impl SizeTally {
 fn multinomial_three_class_null_term_tests_hold_their_size() {
     let mut rng = CalibrationRng::new(SEED);
     let mut joint = SizeTally::default();
-    let mut per_class = [SizeTally::default(), SizeTally::default()];
 
     for rep in 0..N_REPLICATIONS {
         let rows: Vec<StringRecord> = (0..N_TRAIN)
@@ -135,20 +141,20 @@ fn multinomial_three_class_null_term_tests_hold_their_size() {
             .collect();
         assert_eq!(
             class_rows.len(),
-            per_class.len(),
+            CLASSES.len() - 1,
             "rep {rep}: one per-class row per active class"
         );
-        for (tally, row) in per_class.iter_mut().zip(&class_rows) {
-            if let Ok(test) = &row.test {
-                tally.record(test.p_value, "per-class", rep);
-            }
+        for row in &class_rows {
+            assert_eq!(
+                row.test,
+                Err(MultinomialSmoothTestUnavailable::PenaltyCouplesOutsideTestedSet),
+                "rep {rep}: class {} row must refuse the class-coupled penalty",
+                row.class_label
+            );
         }
     }
 
-    let mut failures = joint.oversized("joint (all classes)");
-    for (index, tally) in per_class.iter().enumerate() {
-        failures.extend(tally.oversized(&format!("per-class {} vs c", CLASSES[index])));
-    }
+    let failures = joint.oversized("joint (all classes)");
     assert!(
         failures.is_empty(),
         "multinomial null-term tests are oversized:\n{}",

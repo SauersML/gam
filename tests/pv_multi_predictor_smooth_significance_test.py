@@ -21,6 +21,8 @@ Before the fix the table indexed the flat vector from zero:
 
 The multinomial model gains the all-classes term test, whose null — the
 covariate moves no class probability — does not mention the reference class.
+With three classes the per-class rows refuse: the reference-symmetric penalty
+couples the class blocks, so a class's estimate is biased under its own null.
 """
 
 from __future__ import annotations
@@ -153,12 +155,14 @@ def test_multinomial_joint_term_test_rows():
     joint = {row["term"]: row for row in model.joint_smooth_significance()}
     per_class = model.smooth_significance()
     assert set(joint) == {row["term"] for row in per_class}
-    for term, row in joint.items():
+    for row in joint.values():
         assert set(row) >= {"term", "edf", "ref_df", "statistic", "p_value", "unavailable"}
         assert row["unavailable"] is None, row
-        # One test over every class block: its EDF is the per-class EDFs' sum.
-        class_edf = sum(r["edf"] for r in per_class if r["term"] == term)
-        assert row["edf"] == pytest.approx(class_edf, rel=1e-9)
+        assert row["edf"] > 0, row
+    for row in per_class:
+        # The penalty ties each class block to the others; no per-class p-value.
+        assert row["unavailable"] == "penalty_couples_outside_tested_set", row
+        assert row["p_value"] is None, row
     z_term = next(t for t in joint if "z" in t)
     x_term = next(t for t in joint if "x" in t)
     assert joint[z_term]["p_value"] < 1e-8, joint[z_term]

@@ -1609,6 +1609,12 @@ class MultinomialModel:
         class is the reference; :meth:`joint_smooth_significance` asks whether
         the term moves any class. A row whose test could not be formed has
         ``None`` in the numeric keys and the reason in ``unavailable``.
+
+        With three or more classes every row is unavailable with
+        ``"penalty_couples_outside_tested_set"``: the reference-symmetric
+        penalty shrinks each class toward the all-class mean, so one class's
+        estimate borrows the others' fit and is biased under its own null. Use
+        :meth:`joint_smooth_significance` there.
         """
         try:
             return list(
