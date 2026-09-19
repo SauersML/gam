@@ -2510,6 +2510,9 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             ) => &["[0.0, None]"],
             ("tensor", "periodic" | "cyclic") => &["[0]"],
             ("tensor", "boundary" | "bc") => &["['periodic', 'natural']"],
+            // Open-spline interval: wider than the fixture's [0, 1] columns.
+            ("tensor", "domain") => &["[[-0.5, 1.5], none]"],
+            (_, "domain") => &["[-0.5, 1.5]"],
             (_, "periodic" | "cyclic") => &["true"],
             (_, "period" | "periods") => &["0.7"],
             (_, "period_start" | "start") => &["0.05"],
@@ -4890,5 +4893,153 @@ fn no_intercept_parametric_model_passes_through_the_origin() {
     assert_eq!(dense.ncols(), 1, "only the slope column remains");
     for (row, value) in dense.column(0).iter().enumerate() {
         assert!((value - ds.values[[row, 1]]).abs() < 1e-12);
+    }
+}
+
+/// `smooth_option_dataset` restricted to `x ∈ [lo, hi]`.
+fn smooth_option_subrange(lo: f64, hi: f64) -> Dataset {
+    continuous_dataset(
+        &["y", "x", "z"],
+        (0..40)
+            .map(|i| {
+                let x = lo + (hi - lo) * i as f64 / 39.0;
+                let z = ((i * 7) % 40) as f64 / 39.0;
+                vec![(4.0 * x).sin() + z, x, z]
+            })
+            .collect(),
+    )
+}
+
+fn tensor_margins(spec: &TermCollectionSpec, idx: usize) -> &[BSplineBasisSpec] {
+    match &spec.smooth_terms[idx].basis {
+        SmoothBasisSpec::TensorBSpline { spec, .. } => &spec.marginalspecs,
+        other => panic!("expected a tensor smooth, got {other:?}"),
+    }
+}
+
+/// The span of a margin's knot set, whatever its representation.
+fn knot_span(spec: &BSplineBasisSpec) -> (f64, f64) {
+    match &spec.knotspec {
+        BSplineKnotSpec::Generate { data_range, .. } => *data_range,
+        BSplineKnotSpec::Provided(knots) | BSplineKnotSpec::NaturalCubicRegression { knots } => {
+            (knots[0], knots[knots.len() - 1])
+        }
+        other => panic!("knot span is not resolved at spec time for {other:?}"),
+    }
+}
+
+/// `domain=[a, b]` fixes the interval the basis is built on, so two samples of
+/// different extent inside it build the same smooth; without it the basis
+/// follows each sample's own range.
+#[test]
+fn domain_fixes_the_bspline_interval_independently_of_the_sample() {
+    let wide = smooth_option_subrange(0.0, 1.0);
+    let narrow = smooth_option_subrange(0.2, 0.8);
+    let formula = "y ~ s(x, k=8, domain=[-0.5, 1.5])";
+    let a = build_formula(formula, &wide);
+    let b = build_formula(formula, &narrow);
+    assert_eq!(knot_span(bspline_spec(&a, 0)), (-0.5, 1.5));
+    assert_eq!(
+        format!("{:?}", bspline_spec(&a, 0).knotspec),
+        format!("{:?}", bspline_spec(&b, 0).knotspec)
+    );
+    let a_default = build_formula("y ~ s(x, k=8)", &wide);
+    let b_default = build_formula("y ~ s(x, k=8)", &narrow);
+    assert_ne!(
+        knot_span(bspline_spec(&a_default, 0)),
+        knot_span(bspline_spec(&b_default, 0))
+    );
+    // The domain-built smooth assembles into a design like any other.
+    let design = crate::smooth::build_term_collection_design(narrow.values.view(), &b)
+        .expect("a domain wider than the data builds");
+    assert_eq!(design.design.nrows(), narrow.values.nrows());
+
+    // Numeric expressions are bounds too, and explicit interior knots are
+    // placed inside the domain rather than the data range.
+    let pi_domain = build_formula("y ~ s(x, domain=[0, pi])", &wide);
+    assert_eq!(knot_span(bspline_spec(&pi_domain, 0)).1, std::f64::consts::PI);
+    let explicit = build_formula("y ~ s(x, knots=[0.5, 1.2], domain=[0, 2])", &wide);
+    assert_eq!(knot_span(bspline_spec(&explicit, 0)), (0.0, 2.0));
+    // Quantile interior knots come from the data, boundary knots from the domain.
+    let quantile = build_formula("y ~ s(x, knot_placement=quantile, domain=[-1, 2])", &wide);
+    let BSplineKnotSpec::Provided(knots) = &bspline_spec(&quantile, 0).knotspec else {
+        panic!("quantile placement on a domain resolves to an explicit knot vector");
+    };
+    assert_eq!((knots[0], knots[knots.len() - 1]), (-1.0, 2.0));
+    assert!(knots.iter().filter(|&&t| t > -1.0 && t < 2.0).all(|&t| (0.0..=1.0).contains(&t)));
+    // A cubic regression spline keeps its quantile value-knots inside and moves
+    // its end knots to the domain.
+    let cr = build_formula("y ~ s(x, bs=cr, k=6, domain=[-1, 2])", &wide);
+    assert_eq!(knot_span(bspline_spec(&cr, 0)), (-1.0, 2.0));
+}
+
+/// A tensor smooth takes one domain interval per margin, `none` keeping a
+/// margin's data range, for both the default cr margins and B-spline margins.
+#[test]
+fn domain_applies_per_tensor_margin() {
+    let ds = smooth_option_dataset();
+    let cr = build_formula("y ~ te(x, z, domain=[[-1, 2], none])", &ds);
+    let margins = tensor_margins(&cr, 0);
+    assert_eq!(knot_span(&margins[0]), (-1.0, 2.0));
+    assert_eq!(knot_span(&margins[1]), (0.0, 1.0));
+    let ps = build_formula("y ~ te(x, z, bs=[ps, ps], domain=[[-1, 2], [0, 5]])", &ds);
+    let margins = tensor_margins(&ps, 0);
+    assert_eq!(knot_span(&margins[0]), (-1.0, 2.0));
+    assert_eq!(knot_span(&margins[1]), (0.0, 5.0));
+}
+
+/// A scalar `bs=` on `te()` names the basis of every margin, exactly like the
+/// per-margin vector; it never turns the tensor product into a 1-D smooth.
+#[test]
+fn scalar_bs_on_te_is_broadcast_to_every_margin() {
+    let ds = smooth_option_dataset();
+    for (formula, want_cr) in [
+        ("y ~ te(x, z, bs=ps)", false),
+        ("y ~ te(x, z, bs='cr')", true),
+        ("y ~ ti(x, z, bs=cr)", true),
+    ] {
+        let spec = build_formula(formula, &ds);
+        let margins = tensor_margins(&spec, 0);
+        assert_eq!(margins.len(), 2, "{formula}");
+        for margin in margins {
+            let is_cr = matches!(
+                margin.knotspec,
+                BSplineKnotSpec::NaturalCubicRegression { .. }
+            );
+            assert_eq!(is_cr, want_cr, "{formula}: {:?}", margin.knotspec);
+        }
+    }
+    let err = formula_error("y ~ te(x, z, bs=re)", &ds);
+    assert!(
+        err.contains("margin 0 basis 're' is not a supported penalized-spline margin"),
+        "{err}"
+    );
+}
+
+/// Data outside a declared domain, a malformed interval, and a domain on a
+/// periodic axis are errors that name the term and the option.
+#[test]
+fn domain_is_validated_against_the_data_and_its_own_shape() {
+    let ds = smooth_option_dataset();
+    let outside = formula_error("y ~ s(x, domain=[0.1, 1])", &ds);
+    assert!(outside.contains("in term s(x"), "{outside}");
+    assert!(outside.contains("domain=[0.1, 1] does not contain the data"), "{outside}");
+    assert!(outside.contains("column 'x' spans [0, 1]"), "{outside}");
+    for (term, needle) in [
+        ("s(x, domain=[0])", "must be an interval [lower, upper]"),
+        ("s(x, domain=[0, 1, 2])", "must be an interval [lower, upper]"),
+        ("s(x, domain=5)", "must be an interval [lower, upper]"),
+        ("s(x, domain=[2, -1])", "must satisfy lower < upper"),
+        ("s(x, domain=[low, 1])", "bound 'low' is not a number"),
+        ("te(x, z, domain=[0, 1])", "needs one [lower, upper] interval (or none) per margin"),
+        ("te(x, z, domain=[[0, 1]])", "needs one [lower, upper] interval (or none) per margin"),
+        ("te(x, z, domain=[[0, 1], [0.5, 1]])", "tensor margin 1"),
+        ("cyclic(x, period=1, domain=[0, 1])", "period="),
+        ("s(x, bs=cc, period=1, domain=[0, 1])", "period="),
+    ] {
+        let err = formula_error(&format!("y ~ {term}"), &ds);
+        assert!(err.contains("in term"), "`{term}`: {err}");
+        assert!(err.contains("domain"), "`{term}`: {err}");
+        assert!(err.contains(needle), "`{term}`: expected {needle:?} in {err}");
     }
 }

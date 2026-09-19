@@ -2317,18 +2317,15 @@ pub fn resolve_smooth_type_name(
     n_cols: usize,
     options: &BTreeMap<String, String>,
 ) -> String {
-    let selector = options.get("type").or_else(|| options.get("bs"));
-    // A per-margin basis vector is a tensor request, never a scalar type. Route
-    // it to the tensor builder, which reads the per-margin types out of the
-    // same `bs=` option. (A vector on a non-tensor smooth is ill-formed and
-    // falls through to the scalar path below so the existing diagnostic fires.)
-    if let Some(raw) = selector
-        && bs_selector_is_vector(raw)
-        && matches!(kind, SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2)
-    {
+    // `te`/`ti`/`t2` always build a tensor product (#1082). Their `bs=` —
+    // scalar or per-margin vector — names the MARGIN basis, which the tensor
+    // builder reads and validates; it never selects a different smooth type.
+    if matches!(kind, SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2) {
         return "tensor".to_string();
     }
-    selector
+    options
+        .get("type")
+        .or_else(|| options.get("bs"))
         .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te | SmoothKind::Ti | SmoothKind::T2 => "tensor".to_string(),
@@ -2697,6 +2694,7 @@ pub(crate) fn build_smooth_basis(
             options,
             ds.values.column(c),
             (minv, maxv),
+            None,
             effective_degree,
             n_knots,
         )?;
@@ -2753,6 +2751,9 @@ pub(crate) fn build_smooth_basis(
         // Route it through the cyclic arm so the formula path agrees with the
         // rest of the codebase instead of rejecting it as an unsupported type.
         "cyclic" | "cc" | "cp" | "cyclic-ps" | "periodic" => {
+            if options.contains_key("domain") {
+                return Err(periodic_domain_error());
+            }
             validate_known_options("cyclic", options, CYCLIC_SMOOTH_OPTION_KEYS)?;
             if cols.len() != 1 {
                 return Err(format!(
@@ -2911,6 +2912,13 @@ pub(crate) fn build_smooth_basis(
             // inside the `periodic_axes[0]` branch below, so one that leaves the
             // axis aperiodic would be silently discarded (#2781).
             reject_unconsumable_period_declaration(validation_name, options, &periodic_axes)?;
+            let domain = parse_smooth_domain(options, 1)?[0];
+            if let Some(domain) = domain {
+                if periodic_axes[0] {
+                    return Err(periodic_domain_error());
+                }
+                check_data_inside_domain(domain, (minv, maxv), &vars[0])?;
+            }
             // Periodic margins still need enough basis functions to wrap, so
             // surface the per-axis degree reduction as a config error when the
             // user explicitly asked for a periodic-but-too-small basis. The
@@ -3043,11 +3051,15 @@ pub(crate) fn build_smooth_basis(
                     &vars.join(","),
                     inference_notes,
                 )? {
-                    Some(cr_knotspec) => cr_knotspec,
+                    Some(mut cr_knotspec) => {
+                        widen_cr_knots_to_domain(&mut cr_knotspec, domain);
+                        cr_knotspec
+                    }
                     None => resolve_nonperiodic_bspline_knotspec(
                         options,
                         ds.values.column(c),
                         (minv, maxv),
+                        domain,
                         effective_degree,
                         n_knots,
                     )?,
@@ -3059,6 +3071,7 @@ pub(crate) fn build_smooth_basis(
                         options,
                         ds.values.column(c),
                         (minv, maxv),
+                        domain,
                         effective_degree,
                         n_knots,
                     )?,
@@ -3862,10 +3875,15 @@ pub(crate) fn build_smooth_basis(
             // the same tensor smoothing space; genuinely different margin kinds
             // (e.g. adaptive `ad`, random `re`) are rejected loudly rather than
             // silently substituted.
-            if let Some(raw) = options.get("bs").or_else(|| options.get("type"))
-                && bs_selector_is_vector(raw)
-            {
-                let per_margin = parse_option_list(raw);
+            // A scalar `bs=cr` is the same request broadcast to every margin, so
+            // it is validated the same way.
+            if let Some(raw) = options.get("bs").or_else(|| options.get("type")) {
+                let per_margin = if bs_selector_is_vector(raw) {
+                    parse_option_list(raw)
+                } else {
+                    let scalar = raw.trim().trim_matches('"').trim_matches('\'');
+                    vec![scalar.to_ascii_lowercase(); dim]
+                };
                 if per_margin.len() != dim {
                     return Err(TermBuilderError::invalid_option(format!(
                         "tensor smooth per-margin bs vector has {} entries but the smooth has {} margins",
@@ -3976,11 +3994,20 @@ pub(crate) fn build_smooth_basis(
                 )
             };
             let requested_knot_placement = explicit_knot_placement(options)?;
+            let domains = parse_smooth_domain(options, dim)?;
             let mut margins: Vec<BSplineBasisSpec> = Vec::with_capacity(dim);
             let mut emitted_periods: Vec<Option<f64>> = Vec::with_capacity(dim);
             for axis in 0..dim {
                 let c = cols[axis];
                 let (data_min, data_max) = col_minmax(ds.values.column(c))?;
+                let domain = domains[axis];
+                if let Some(domain) = domain {
+                    if periodic_axes[axis] {
+                        return Err(format!("tensor margin {axis}: {}", periodic_domain_error()));
+                    }
+                    check_data_inside_domain(domain, (data_min, data_max), &vars[axis])
+                        .map_err(|e| format!("tensor margin {axis}: {e}"))?;
+                }
                 // mgcv reduces a tensor margin's basis dimension to what its data
                 // can support: a cr or B-spline margin cannot place more value
                 // knots / basis functions than there are DISTINCT covariate
@@ -4118,11 +4145,9 @@ pub(crate) fn build_smooth_basis(
                     // margin has already materialized its quantile value-knots.
                     let cr_knots = crate::basis::select_cr_knots(ds.values.column(c), k_axis)
                         .map_err(|e| e.to_string())?;
-                    (
-                        BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
-                        OneDimensionalBoundary::Open,
-                        None,
-                    )
+                    let mut knotspec = BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots };
+                    widen_cr_knots_to_domain(&mut knotspec, domain);
+                    (knotspec, OneDimensionalBoundary::Open, None)
                 } else {
                     // `num_internal_knots = k - effective_degree - 1` is the
                     // only count that realises the requested per-margin basis
@@ -4139,21 +4164,15 @@ pub(crate) fn build_smooth_basis(
                         .unwrap_or(crate::basis::BSplineKnotPlacement::Uniform)
                     {
                         crate::basis::BSplineKnotPlacement::Uniform => BSplineKnotSpec::Generate {
-                            data_range: (data_min, data_max),
+                            data_range: domain.unwrap_or((data_min, data_max)),
                             num_internal_knots,
                         },
-                        crate::basis::BSplineKnotPlacement::Quantile => {
-                            crate::basis::auto_knot_vector_1d_quantile(
-                                ds.values.column(c),
-                                num_internal_knots,
-                                effective_degree,
-                            )
-                            .map_err(|e| e.to_string())?;
-                            BSplineKnotSpec::Automatic {
-                                num_internal_knots: Some(num_internal_knots),
-                                placement: crate::basis::BSplineKnotPlacement::Quantile,
-                            }
-                        }
+                        crate::basis::BSplineKnotPlacement::Quantile => quantile_bspline_knotspec(
+                            ds.values.column(c),
+                            num_internal_knots,
+                            effective_degree,
+                            domain,
+                        )?,
                     };
                     (knotspec, OneDimensionalBoundary::Open, None)
                 };
@@ -5119,18 +5138,21 @@ fn explicit_knot_placement(
 ///   2. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
 ///   3. uniform generation                          → [`BSplineKnotSpec::Generate`]
 ///
-/// `data` is the covariate column (used to clamp explicit positions to the
-/// observed range and to drive quantile placement); `n_knots` is the resolved
-/// internal-knot count from [`parse_ps_internal_knots`] used for the automatic
-/// strategies.
+/// `data` is the covariate column (used to drive quantile placement);
+/// `data_range` is its observed range and `domain` the declared `domain=`
+/// interval, which when present replaces the data range as the span of the
+/// clamped boundary knots. `n_knots` is the resolved internal-knot count from
+/// [`parse_ps_internal_knots`] used for the automatic strategies.
 fn resolve_nonperiodic_bspline_knotspec(
     options: &BTreeMap<String, String>,
     data: ArrayView1<'_, f64>,
     data_range: (f64, f64),
+    domain: Option<(f64, f64)>,
     degree: usize,
     n_knots: usize,
 ) -> Result<BSplineKnotSpec, String> {
     use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
+    let knot_range = domain.unwrap_or(data_range);
     if let Some(positions) = parse_explicit_internal_knots(options)? {
         if option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?.is_some()
         {
@@ -5140,26 +5162,19 @@ fn resolve_nonperiodic_bspline_knotspec(
             )
             .to_string());
         }
-        let knots = clamped_knot_vector_from_internal_positions(data_range, &positions, degree)
+        let knots = clamped_knot_vector_from_internal_positions(knot_range, &positions, degree)
             .map_err(|e| e.to_string())?;
         return Ok(BSplineKnotSpec::Provided(knots));
     }
     match parse_knot_placement(options)? {
         BSplineKnotPlacement::Uniform => Ok(BSplineKnotSpec::Generate {
-            data_range,
+            data_range: knot_range,
             num_internal_knots: n_knots,
         }),
-        BSplineKnotPlacement::Quantile => {
-            // Validate the column up-front so an unfittable request surfaces a
-            // user-correctable error at parse time rather than deep in basis
-            // construction. The same data drives the eventual quantile knots.
-            crate::basis::auto_knot_vector_1d_quantile(data, n_knots, degree)
-                .map_err(|e| e.to_string())?;
-            Ok(BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(n_knots),
-                placement: BSplineKnotPlacement::Quantile,
-            })
-        }
+        // Building the quantile vector up-front also validates the column, so
+        // an unfittable request surfaces a user-correctable error at parse
+        // time rather than deep in basis construction.
+        BSplineKnotPlacement::Quantile => quantile_bspline_knotspec(data, n_knots, degree, domain),
     }
 }
 
@@ -5315,6 +5330,7 @@ pub(crate) const BSPLINE_SMOOTH_OPTION_KEYS: &[&str] = &[
     "period_start",
     "period_end",
     "origin",
+    "domain",
     "double_penalty",
     "id",
     "identifiability",
@@ -5481,6 +5497,7 @@ pub(crate) const TENSOR_SMOOTH_OPTION_KEYS: &[&str] = &[
     "period_origin",
     "period-origin",
     "domain_origin",
+    "domain",
     "boundary",
     "bc",
     "identifiability",
@@ -5814,6 +5831,199 @@ pub(crate) fn parse_cyclic_boundary(
         ));
     }
     Ok(OneDimensionalBoundary::Cyclic { start, end })
+}
+
+/// Strip one list wrapper (`[..]`, `c(..)`, `(..)`) from an option value.
+fn strip_list_wrapper(raw: &str) -> Option<&str> {
+    let t = raw.trim();
+    t.strip_prefix('[')
+        .and_then(|u| u.strip_suffix(']'))
+        .or_else(|| {
+            t.strip_prefix("c(")
+                .or_else(|| t.strip_prefix('('))
+                .and_then(|u| u.strip_suffix(')'))
+        })
+}
+
+/// Split on the commas of `raw` that are not nested inside brackets or
+/// parentheses, so `[0, 1], none` splits into `[0, 1]` and `none`.
+fn split_top_level_commas(raw: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, ch) in raw.char_indices() {
+        if ch == '[' || ch == '(' {
+            depth += 1;
+        } else if ch == ']' || ch == ')' {
+            depth = depth.saturating_sub(1);
+        } else if ch == ',' && depth == 0 {
+            parts.push(raw[start..i].trim());
+            start = i + 1;
+        }
+    }
+    parts.push(raw[start..].trim());
+    parts.retain(|p| !p.is_empty());
+    parts
+}
+
+/// Parse one `[lower, upper]` domain interval. `key` is the option spelling
+/// the error names (`domain` or `domain[axis]`).
+fn parse_domain_interval(raw: &str, key: &str) -> Result<(f64, f64), String> {
+    let shape_error = || {
+        TermBuilderError::invalid_option(format!(
+            "{key}={raw} must be an interval [lower, upper], e.g. {key}=[0, 1]"
+        ))
+        .to_string()
+    };
+    let inner = strip_list_wrapper(raw).ok_or_else(shape_error)?;
+    let parts = split_top_level_commas(inner);
+    let [lower, upper] = parts.as_slice() else {
+        return Err(shape_error());
+    };
+    let bound = |text: &str| {
+        parse_numeric_expr(text).map_err(|err| {
+            TermBuilderError::invalid_option(format!(
+                "{key}={raw}: bound '{text}' is not a number: {err}"
+            ))
+            .to_string()
+        })
+    };
+    let (lower, upper) = (bound(lower)?, bound(upper)?);
+    if !(lower.is_finite() && upper.is_finite() && lower < upper) {
+        return Err(TermBuilderError::invalid_option(format!(
+            "{key}={raw} must satisfy lower < upper with finite bounds, got [{lower}, {upper}]"
+        ))
+        .to_string());
+    }
+    Ok((lower, upper))
+}
+
+/// Parse the `domain=` option of a B-spline smooth over `dim` coordinates.
+///
+/// `domain` fixes the interval the basis is built on instead of the observed
+/// data range: the clamped boundary knots of a B-spline (and the end
+/// value-knots of a cubic regression spline) sit at its bounds, so the basis,
+/// its roughness penalty and uniform interior knots are the same for every
+/// sample drawn from that interval. A one-dimensional smooth takes
+/// `domain=[lower, upper]`; a tensor smooth takes one interval per margin, with
+/// `none` for a margin that keeps its data range (`domain=[[0, 1], none]`).
+///
+/// It is not `boundary=`, which declares periodic or endpoint conditions.
+fn parse_smooth_domain(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Vec<Option<(f64, f64)>>, String> {
+    let Some(raw) = options.get("domain") else {
+        return Ok(vec![None; dim]);
+    };
+    if dim == 1 {
+        return Ok(vec![Some(parse_domain_interval(raw, "domain")?)]);
+    }
+    let per_margin_error = |got: usize| {
+        TermBuilderError::invalid_option(format!(
+            "domain={raw} on a {dim}-margin tensor smooth needs one [lower, upper] interval \
+             (or none) per margin, got {got} entries; e.g. domain=[[0, 1], none]"
+        ))
+        .to_string()
+    };
+    let inner = strip_list_wrapper(raw).ok_or_else(|| per_margin_error(1))?;
+    let entries = split_top_level_commas(inner);
+    if entries.len() != dim || entries.iter().all(|e| strip_list_wrapper(e).is_none()) {
+        return Err(per_margin_error(entries.len()));
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(axis, entry)| {
+            if entry.eq_ignore_ascii_case("none") {
+                Ok(None)
+            } else {
+                parse_domain_interval(entry, &format!("domain[{axis}]")).map(Some)
+            }
+        })
+        .collect()
+}
+
+/// A declared `domain=` must contain the data the smooth is fitted on.
+///
+/// Fitting rows outside it would put observations where the basis is only
+/// its linear extrapolation and the penalty does not reach, so it is an error
+/// rather than a silent widening. Prediction outside the domain is allowed and
+/// extrapolates linearly, the same rule as predicting past the training range
+/// of a smooth without a domain.
+fn check_data_inside_domain(
+    domain: (f64, f64),
+    data_range: (f64, f64),
+    column: &str,
+) -> Result<(), String> {
+    if data_range.0 < domain.0 || data_range.1 > domain.1 {
+        return Err(TermBuilderError::invalid_option(format!(
+            "domain=[{}, {}] does not contain the data: column '{column}' spans [{}, {}]. \
+             Fitted rows must lie inside the declared domain; widen domain= or drop the \
+             rows outside it (prediction outside the domain extrapolates linearly)",
+            domain.0, domain.1, data_range.0, data_range.1
+        ))
+        .to_string());
+    }
+    Ok(())
+}
+
+/// `domain=` on a periodic axis: the period endpoints already are its domain.
+fn periodic_domain_error() -> String {
+    TermBuilderError::incompatible_config(
+        "domain= fixes the interval of an open (non-periodic) spline; a periodic axis \
+         takes its interval from period=/period_start=/period_end= (or origins= on a \
+         tensor margin) instead",
+    )
+    .to_string()
+}
+
+/// Move the end value-knots of a cubic regression spline to a declared domain.
+/// The interior knots stay at the data quantiles; the data-inside-domain check
+/// has already guaranteed `domain.0 <= knots[0]` and `knots[k-1] <= domain.1`.
+fn widen_cr_knots_to_domain(knotspec: &mut BSplineKnotSpec, domain: Option<(f64, f64)>) {
+    if let (Some((lower, upper)), BSplineKnotSpec::NaturalCubicRegression { knots }) =
+        (domain, knotspec)
+    {
+        let last = knots.len() - 1;
+        knots[0] = lower;
+        knots[last] = upper;
+    }
+}
+
+/// Quantile-placed B-spline knots. Without a domain the placement stays
+/// automatic (resolved from the data at basis construction); with one the
+/// interior knots are the data quantiles and the clamped boundary knots are the
+/// domain bounds.
+fn quantile_bspline_knotspec(
+    data: ArrayView1<'_, f64>,
+    num_internal_knots: usize,
+    degree: usize,
+    domain: Option<(f64, f64)>,
+) -> Result<BSplineKnotSpec, String> {
+    use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
+    let auto = crate::basis::auto_knot_vector_1d_quantile(data, num_internal_knots, degree)
+        .map_err(|e| e.to_string())?;
+    let Some(domain) = domain else {
+        return Ok(BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(num_internal_knots),
+            placement: BSplineKnotPlacement::Quantile,
+        });
+    };
+    if auto.shrunk {
+        return Err(TermBuilderError::invalid_option(format!(
+            "knot_placement=quantile with domain=: the data has too few rows for \
+             {num_internal_knots} quantile knots of a degree-{degree} basis"
+        ))
+        .to_string());
+    }
+    let interior = auto
+        .knots
+        .slice(ndarray::s![degree + 1..auto.knots.len() - degree - 1])
+        .to_vec();
+    clamped_knot_vector_from_internal_positions(domain, &interior, degree)
+        .map(BSplineKnotSpec::Provided)
+        .map_err(|e| e.to_string())
 }
 
 /// Parse the periodic-uniform domain for a one-dimensional cyclic smooth.

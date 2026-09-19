@@ -33,7 +33,7 @@ unary = { unary_op* ~ primary }
 unary_op = _{ "+" | "-" }
 
 primary = { function_call | list_lit | tuple_lit | ident | backtick_ident | number | string_lit | "(" ~ expr ~ ")" }
-list_lit = @{ "[" ~ (!"]" ~ ANY)* ~ "]" }
+list_lit = @{ "[" ~ (list_lit | !"]" ~ ANY)* ~ "]" }
 tuple_lit = @{ "(" ~ (!("," | ")") ~ ANY)+ ~ "," ~ (!")" ~ ANY)* ~ ")" }
 function_call = { ident ~ "(" ~ arg_list? ~ ")" }
 arg_list = { arg ~ ("," ~ arg)* }
