@@ -3867,7 +3867,6 @@ dependencies = [
  "statrs 0.19.0",
  "tempfile",
  "thiserror 2.0.19",
- "wide 1.5.0",
 ]
 
 [[package]]

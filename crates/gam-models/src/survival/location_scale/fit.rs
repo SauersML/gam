@@ -881,11 +881,9 @@ pub(crate) fn fit_survival_location_scale_terms(
         &[threshold_terms, log_sigma_terms],
         kappa_options,
         &joint_setup,
-        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         None,
         outer_policy,
         // The final fit: the solver's error is carried whole (#2937). Its link and

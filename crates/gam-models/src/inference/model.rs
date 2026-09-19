@@ -132,7 +132,18 @@ use std::path::Path;
 // with the training rows. A v28 or older payload still loads: its conformal `x` and `y` and
 // its working geometry are read past and dropped. A v28 binary refuses a v29 payload by
 // version instead of failing on the conformal field's missing `x`.
-pub const MODEL_PAYLOAD_VERSION: u32 = 29;
+// v30 records whether the certificate's Newton polish ended on a settling step, in place of
+// the step budget it no longer has (`NewtonPolishRecord::settled`, #3012). 996d0af2c1 made
+// that change at v29, so a v29 payload has two shapes (gam#3166): one written before it
+// carries `step_budget`, which this binary reads past, and one written after it carries
+// `settled`. Both load, and `settled` reads as false where it is absent. A v29 binary
+// refuses a v30 payload by version instead of failing on the missing `step_budget`.
+pub const MODEL_PAYLOAD_VERSION: u32 = 30;
+
+/// The schema whose Newton-polish record may carry its step budget (#2954), or already
+/// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
+/// [`MODEL_PAYLOAD_VERSION`] is that record's `step_budget`, which this binary reads past.
+const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
 
 /// The schema before the saved model stopped persisting training rows (speed F6), whose
 /// only difference is the conformal field's `x` and `y` and the serialized working
@@ -189,8 +200,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 12] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 13] = [
     MODEL_PAYLOAD_VERSION,
+    POLISH_STEP_BUDGET_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
     WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -5234,9 +5246,9 @@ impl FittedModel {
     /// end refuse the level before the design operator
     /// (`build_random_effect_block`) is reached.
     ///
-    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
-    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
-    /// training vocabulary) are checked, matching the operator's strict gate.
+    /// Only strict terms with concrete `frozen_levels` (captured at fit, the
+    /// complete training vocabulary) are checked, matching the operator's
+    /// strict gate.
     pub fn unseen_numeric_factor_levels(
         &self,
         headers: &[String],
@@ -5251,7 +5263,7 @@ impl FittedModel {
         let mut out = Vec::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
-                if term.lenient_unseen || term.drop_first_level {
+                if term.lenient_unseen {
                     continue;
                 }
                 let Some(levels) = term.frozen_levels.as_ref() else {
@@ -7325,8 +7337,6 @@ mod tests {
             .push(gam_terms::smooth::RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 0,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
                 lenient_unseen: true,
             });
@@ -7748,6 +7758,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
@@ -7765,7 +7776,14 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            MODEL_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
@@ -7909,6 +7927,123 @@ mod tests {
                 MODEL_PAYLOAD_VERSION + 1
             )),
             "{err}"
+        );
+    }
+
+    /// gam#3166: 996d0af2c1 replaced the Newton-polish record's `step_budget` with
+    /// `settled` without a version bump, so v29 has two shapes.
+    /// - A v29 payload written before that commit carries `step_budget` and no `settled`.
+    ///   It loads with `settled` false.
+    /// - A v29 payload written after it carries `settled` and no `step_budget`. It loads
+    ///   as written.
+    /// - A payload claiming the version after this binary's is refused by the named
+    ///   version error, as a v29 binary refuses a v30 payload.
+    #[test]
+    fn both_v29_polish_record_shapes_load_and_a_later_version_is_refused_by_name_3166() {
+        use gam_solve::model_types::NewtonPolishRecord;
+        let blocks = || {
+            vec![FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            }]
+        };
+        let polish = NewtonPolishRecord {
+            lambda_sq_before: 1.5e-6,
+            lambda_sq_after: 2.0e-9,
+            decreases: vec![7.0e-7, -3.0e-8],
+            settled: true,
+            rails: Vec::new(),
+            entry: vec![0.3],
+        };
+        let mut fit = saved_fit(blocks());
+        fit.artifacts.criterion_certificate =
+            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
+                stationarity:
+                    gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
+                        grad_norm: 2e-7,
+                        projected_grad_norm: 2e-7,
+                        bound: 1e-5,
+                        rung: gam_solve::rho_optimizer::CertifiedRung {
+                            label: "newton-decrement".to_string(),
+                            derived_standard: true,
+                        },
+                    },
+                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                newton_polish: Some(polish.clone()),
+                curvature_floor: None,
+            });
+        let written = serde_json::to_value(marginal_slope_payload(
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            fit,
+        ))
+        .expect("serialize a v29 payload");
+        // The record as each v29 writer left it: before 996d0af2c1 it held the step
+        // budget and no settling flag.
+        let as_written = |before_996d: bool| {
+            let mut value = written.clone();
+            let mut records = 0;
+            for materialization in ["fit_result", "unified"] {
+                if let Some(record) = value
+                    .get_mut(materialization)
+                    .and_then(|fit| fit.get_mut("artifacts"))
+                    .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
+                    .and_then(|certificate| certificate.get_mut("newton_polish"))
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    records += 1;
+                    if before_996d {
+                        record
+                            .remove("settled")
+                            .expect("the settling flag was written");
+                        record.insert("step_budget".to_string(), serde_json::json!(2));
+                    }
+                }
+            }
+            assert!(records > 0, "the payload carries the polish record");
+            value
+        };
+        for (before_996d, settled) in [(true, false), (false, true)] {
+            let loaded: FittedModelPayload = serde_json::from_value(as_written(before_996d))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a v29 payload (written before 996d0af2c1: {before_996d}) parses: {error}"
+                    )
+                });
+            FittedModel::from_payload(loaded.clone())
+                .payload()
+                .validate_payload_version()
+                .expect("a v29 payload is readable");
+            let record = loaded
+                .fit_result
+                .as_ref()
+                .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
+                .and_then(|certificate| certificate.newton_polish.as_ref())
+                .expect("the loaded certificate keeps its polish");
+            assert_eq!(
+                record,
+                &NewtonPolishRecord {
+                    settled,
+                    ..polish.clone()
+                },
+                "written before 996d0af2c1: {before_996d}"
+            );
+        }
+
+        let newer = MODEL_PAYLOAD_VERSION + 1;
+        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
+            .payload()
+            .validate_payload_version()
+            .expect_err("a payload from a later schema is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("payload schema mismatch")
+                && message.contains(&format!("file has version={newer}"))
+                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+            "a later payload must be refused by its version: {message}"
         );
     }
 

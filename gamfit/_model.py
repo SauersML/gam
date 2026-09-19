@@ -858,8 +858,9 @@ class Model:
         * ``provenance`` — ``"radial_enrichment"`` when a test ran, else the
           NAME of the evidence that was missing (``"no_continuous_covariates"``,
           ``"enrichment_budget_below_realized_width"``, ``"no_irls_row_state"``,
-          ``"design_gram_unavailable"``, ...). ``p_value`` is present exactly
-          when a test ran, so "adequate" and "not measured" are never
+          ``"design_gram_unavailable"``, ``"null_fit_unavailable"``,
+          ``"conditional_reference_unavailable"``, ...). ``p_value`` is present
+          exactly when a test ran, so "adequate" and "not measured" are never
           confusable.
 
         Method
@@ -869,8 +870,21 @@ class Model:
         in the fit's own IRLS weight metric. The statistic is
         :math:`T = U^{\top} V^{-} U / \hat\varphi` with
         :math:`U = \tilde Z^{\top} s` and :math:`V = \tilde Z^{\top} W \tilde Z`,
-        referred to :math:`\chi^2_r` (known dispersion) or :math:`F(r, \nu)`
-        (estimated).
+        referred to :math:`\chi^2_r` (known dispersion) or, with the scale
+        estimated on :math:`\nu` residual degrees of freedom, as the
+        added-variable :math:`(T/r)(\nu - r)/(\nu - T)` to :math:`F(r, \nu - r)`.
+
+        For a canonical binomial (logit) or Poisson (log) fit that reference is
+        only first order, and at small ``n`` its error is not small (a
+        conservative test is as miscalibrated as an anti-conservative one).
+        There the score is instead evaluated at the unpenalized null MLE on the
+        test's rows and referred to its law CONDITIONAL on the sufficient
+        statistic :math:`X^{\top}(w \circ y)`, which removes the nuisance
+        :math:`\beta` exactly: the score's conditional mean and covariance are
+        corrected to :math:`O(1/n)` and its fourth cumulant matched by a scaled
+        :math:`c\,\chi^2_{r/c}`. Where that expansion leaves its range of
+        validity (high-leverage rows at an extreme fitted mean) the row reports
+        ``"conditional_reference_unavailable"`` rather than a number.
 
         The projection is **orthogonal in the weight metric**, not the fit's
         penalized :math:`H^{-1}`. That is deliberate and it is what the test

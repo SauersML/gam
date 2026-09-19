@@ -3118,7 +3118,9 @@ fn affine_value_from_moment_primitive(
     let s = beta.hypot(1.0);
     let h = alpha / s;
     let rho = -beta / s;
-    bivariate_normal_interval_probability(h, left, right, rho).map_err(String::from)
+    bivariate_normal_interval_probability(h, left, right, rho)
+        .map(|bounded| bounded.value)
+        .map_err(String::from)
 }
 
 fn validate_cell_inputs(cell: DenestedCubicCell) -> Result<(), String> {
