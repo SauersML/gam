@@ -4883,7 +4883,8 @@ fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64
 /// `0 + g` (and `- 1`, and every spelling of the fixed factor) is the
 /// cell-means model: every level keeps its column, the block is unpenalized,
 /// and the constant is spanned at no penalty. With an intercept the same
-/// factor stays the penalized full-level block it has always been.
+/// factor is the unpenalized treatment-coded block (its reference level is
+/// absorbed by the intercept).
 #[test]
 fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
     let ds = two_factor_dataset();
@@ -4899,13 +4900,17 @@ fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
 
     let with_intercept = build_formula("y ~ f", &ds);
     assert_eq!(with_intercept.level, ModelLevel::Intercept);
-    assert!(with_intercept.random_effect_terms[0].penalized);
+    assert!(with_intercept.random_effect_terms[0].drop_first_level);
+    assert!(!with_intercept.random_effect_terms[0].penalized);
 
-    // Only the FIRST fixed factor carries the level; a second one stays the
-    // penalized block whose offsets shrink toward zero.
+    // Only the FIRST fixed factor carries the level; a second one keeps its
+    // treatment coding, since a second full level set would duplicate the
+    // constant.
     let two = build_formula("y ~ 0 + f + g", &ds);
+    assert!(!two.random_effect_terms[0].drop_first_level);
     assert!(!two.random_effect_terms[0].penalized);
-    assert!(two.random_effect_terms[1].penalized);
+    assert!(two.random_effect_terms[1].drop_first_level);
+    assert!(!two.random_effect_terms[1].penalized);
     let residual = unpenalized_constant_residual(&ds, &two);
     assert!(residual < 1e-8, "`0 + f + g`: {residual}");
 }

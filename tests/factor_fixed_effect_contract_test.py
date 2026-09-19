@@ -203,7 +203,7 @@ def test_categorical_column_in_a_numeric_axis_term_is_refused(formula: str) -> N
     data["x"] = np.linspace(0.0, 1.0, len(data))
     for column in (data["g"], data["g"].astype("category")):
         frame = data.assign(g=column)
-        with pytest.raises(gamfit.GamError) as excinfo:
+        with pytest.raises(gamfit.errors.GamError) as excinfo:
             gamfit.fit(frame, formula)
         message = str(excinfo.value)
         assert "'g' is categorical" in message, message
@@ -221,7 +221,7 @@ def test_categorical_column_in_a_numeric_axis_term_is_refused(formula: str) -> N
 )
 def test_categorical_wrappers_reject_unknown_options(formula: str) -> None:
     data, _ = _gaussian_frame(seed=3)
-    with pytest.raises(gamfit.FormulaError, match="does not accept option"):
+    with pytest.raises(gamfit.errors.FormulaError, match="does not accept option"):
         gamfit.fit(data, formula)
 
 
@@ -232,5 +232,5 @@ def test_fixed_factor_rejects_an_unseen_level_and_accepts_the_reference() -> Non
     fitted = np.asarray(model.predict(pd.DataFrame({"g": [reference]})), dtype=float)
     expected = data["y"].to_numpy()[data["g"].to_numpy() == reference].mean()
     np.testing.assert_allclose(fitted.reshape(-1), [expected], rtol=0.0, atol=1e-8)
-    with pytest.raises(gamfit.GamError):
+    with pytest.raises(gamfit.errors.GamError):
         model.predict(pd.DataFrame({"g": ["never-seen"]}))

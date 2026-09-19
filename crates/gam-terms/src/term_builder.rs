@@ -444,9 +444,9 @@ pub fn build_termspec(
         .sum::<usize>();
     // Intercept removal (`0 + …`, `… - 1`) hands the constant to one term (see
     // `ModelLevel` and docs/formulas.md "Removing the intercept"). The first
-    // fixed factor block already spans it with its full level set, and becomes
-    // unpenalized so the level is not shrunk toward zero (the cell-means
-    // model); otherwise the first pure-indicator interaction keeps its
+    // fixed factor block spans it once it keeps its reference level — full
+    // dummy coding instead of treatment coding — and is unpenalized so the
+    // level is not shrunk toward zero (the cell-means model); otherwise the first pure-indicator interaction keeps its
     // reference cell (unpenalized), and failing that the first B-spline smooth
     // keeps its constant with its null-space ridge dropped. A genuine random
     // effect (`group(g)`, `re(g)`) never carries the level: its levels are
@@ -460,13 +460,13 @@ pub fn build_termspec(
     };
     let genuine_random_effect = |name: &str| {
         terms.iter().any(|t| {
-            matches!(t, ParsedTerm::RandomEffect { name: n, lenient_unseen: true } if n == name)
+            matches!(t, ParsedTerm::RandomEffect { name: n } if n == name)
         })
     };
     // Every term matched here lowers to a `RandomEffectTermSpec` with
     // `lenient_unseen: false` (a fixed factor); see the resolution after the loop.
     let factor_block_present = terms.iter().any(|t| match t {
-        ParsedTerm::RandomEffect { lenient_unseen, .. } => !*lenient_unseen,
+        ParsedTerm::Factor { .. } => true,
         ParsedTerm::Linear {
             name,
             explicit: false,
@@ -1039,6 +1039,7 @@ pub fn build_termspec(
         if factor_block_present
             && let Some(carrier) = random_terms.iter_mut().find(|rt| !rt.lenient_unseen)
         {
+            carrier.drop_first_level = false;
             carrier.penalized = false;
         }
         let level_smooth = match explicit_level_smooth.or(level_smooth_candidate) {

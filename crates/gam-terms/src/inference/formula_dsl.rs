@@ -1631,7 +1631,7 @@ mod tests {
         let c = parse_formula("y ~ C(g) + x").expect("C() parses");
         let f = parse_formula("y ~ factor(g) + x").expect("factor() parses");
         assert_eq!(format!("{:?}", c.terms), format!("{:?}", f.terms));
-        assert!(!random_effect_lenient_unseen("y ~ C(g)"));
+        assert!(categorical_term_is_fixed("y ~ C(g)"));
         // Lowercase `c()` is R's vector constructor, not patsy's C().
         let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
         assert!(err.to_string().contains("C()"), "{err}");
@@ -3102,6 +3102,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 ParsedTerm::Linear { .. }
                     | ParsedTerm::BoundedLinear { .. }
                     | ParsedTerm::RandomEffect { .. }
+                    | ParsedTerm::Factor { .. }
                     | ParsedTerm::Smooth { .. }
                     | ParsedTerm::Interaction { .. }
             )
@@ -3162,12 +3163,11 @@ fn unquote_parsed_term(term: ParsedTerm) -> ParsedTerm {
             prior,
             double_penalty,
         },
-        ParsedTerm::RandomEffect {
-            name,
-            lenient_unseen,
-        } => ParsedTerm::RandomEffect {
+        ParsedTerm::RandomEffect { name } => ParsedTerm::RandomEffect {
             name: unquote_column(&name),
-            lenient_unseen,
+        },
+        ParsedTerm::Factor { name } => ParsedTerm::Factor {
+            name: unquote_column(&name),
         },
         ParsedTerm::Smooth {
             label,

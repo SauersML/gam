@@ -17,10 +17,11 @@
 //! * one distinct value — the column equals a multiple of the intercept, so no
 //!   term on it is identifiable. It is dropped with a note (see
 //!   [`AutomaticColumnTerm::Constant`] for why this is a note, not an error);
-//! * categorical (string, pandas category) — `factor(col)`, a ridge-penalized
-//!   level effect estimated by REML. When every level occurs exactly once the
-//!   level effects are aliased one-for-one with the observations, so the column
-//!   is an identifier, not a factor, and is dropped with a note;
+//! * categorical (string, pandas category) — `factor(col)`, an unpenalized
+//!   treatment-coded level effect (no smoothing parameter). When every level
+//!   occurs exactly once the level effects are aliased one-for-one with the
+//!   observations, so the column is an identifier, not a factor, and is
+//!   dropped with a note;
 //! * numeric with two distinct values (0/1 indicators, booleans) — a bare linear
 //!   term `col`. Two support points identify an intercept and a slope and
 //!   nothing more, so a smooth has no curvature direction to estimate;
