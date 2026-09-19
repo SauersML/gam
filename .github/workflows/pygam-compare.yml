@@ -3,7 +3,9 @@ name: gamfit vs pyGAM benchmark
 # Runs a named plan of the permanent gamfit-vs-pyGAM benchmark
 # (bench/pygam_compare) on a fresh release wheel and publishes the markdown
 # report as the job summary and as an artifact. Optional by design: manual
-# dispatch or weekly, never per-PR, because a benchmark on a shared runner is a
+# dispatch, the weekly `quick` baseline or the nightly `gaussian_small`
+# regression cells (Gaussian identity, n in {1e2, 1e3, 1e4} across every sweep
+# design), never per-PR, because a benchmark on a shared runner is a
 # measurement to read, not a gate. The per-PR contract is the smoke test in
 # bench/pygam_compare/test_pygam_compare_smoke.py, which python-contracts.yml
 # runs with the rest of bench/.
@@ -15,11 +17,15 @@ on:
   workflow_dispatch:
     inputs:
       plan:
-        description: "Plan name from bench/pygam_compare/plans.py (smoke, quick, n1e4_core, n1e5_core, full)"
+        description: "Plan name from bench/pygam_compare/plans.py (smoke, quick, n1e4_core, n1e5_core, full, gaussian_small, gaussian_1e5, gaussian_1e6)"
         required: true
         default: quick
   schedule:
+    # Weekly: the committed `quick` baseline.
     - cron: '17 4 * * 1'
+    # Nightly: the Gaussian regression cells. The plan is picked from this
+    # exact cron string below, so the two must change together.
+    - cron: '41 3 * * *'
 
 concurrency:
   group: pygam-compare-${{ github.event_name }}-${{ github.ref }}
@@ -35,8 +41,10 @@ env:
 
 jobs:
   pygam-compare:
-    name: gamfit vs pyGAM (${{ inputs.plan || 'quick' }})
+    name: gamfit vs pyGAM (${{ inputs.plan || (github.event.schedule == '41 3 * * *' && 'gaussian_small') || 'quick' }})
     runs-on: ubuntu-latest
+    env:
+      PLAN: ${{ inputs.plan || (github.event.schedule == '41 3 * * *' && 'gaussian_small') || 'quick' }}
     # Harness safety net for the whole job, not a solver budget: the quick plan
     # takes minutes after the ~17 min wheel build, and per-rep runaways are
     # already bounded (and recorded as a status) by the plan's own timeout.
@@ -74,9 +82,7 @@ jobs:
 
       - name: Run plan
         shell: bash
-        env:
-          # Passed through the environment, not interpolated into the script.
-          PLAN: ${{ inputs.plan || 'quick' }}
+        # PLAN comes from the job environment, not interpolated into the script.
         run: |
           set -euo pipefail
           python -m bench.pygam_compare.run "$PLAN" --out "$RUNNER_TEMP/pygam_compare"
@@ -93,6 +99,6 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
-          name: pygam-compare-${{ inputs.plan || 'quick' }}
+          name: pygam-compare-${{ env.PLAN }}
           path: ${{ runner.temp }}/pygam_compare
           if-no-files-found: warn

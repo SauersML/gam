@@ -231,7 +231,7 @@ pub fn adaptive_resolution_of(basis: &SmoothBasisSpec) -> Option<AdaptiveResolut
         B::BSpline1D { spec, .. } => match (&spec.knotspec, &spec.boundary) {
             (
                 BSplineKnotSpec::Automatic {
-                    num_internal_knots: Some(knots),
+                    num_internal_knots: knots,
                     adaptive: true,
                     ..
                 },
@@ -257,7 +257,7 @@ pub fn adaptive_resolution_of(basis: &SmoothBasisSpec) -> Option<AdaptiveResolut
                     num_internal_knots, ..
                 }
                 | BSplineKnotSpec::Automatic {
-                    num_internal_knots: Some(num_internal_knots),
+                    num_internal_knots,
                     ..
                 } => Some(AdaptiveResolution::InternalKnots(*num_internal_knots)),
                 _ => None,
@@ -457,7 +457,7 @@ pub fn apply_adaptive_resolution(
         (B::BSpline1D { spec, .. }, AdaptiveResolution::InternalKnots(k)) => match &mut spec.knotspec {
             BSplineKnotSpec::Automatic {
                 num_internal_knots, ..
-            } => *num_internal_knots = Some(*k),
+            } => *num_internal_knots = *k,
             other => return Err(unsupported(&format!("B-spline {other:?}"))),
         },
         (B::BSpline1D { spec, .. }, AdaptiveResolution::PeriodicBasis(b)) => match &mut spec.knotspec {
@@ -471,7 +471,7 @@ pub fn apply_adaptive_resolution(
                 } => *num_internal_knots = *k,
                 BSplineKnotSpec::Automatic {
                     num_internal_knots, ..
-                } => *num_internal_knots = Some(*k),
+                } => *num_internal_knots = *k,
                 other => return Err(unsupported(&format!("factor-smooth {other:?}"))),
             }
         }

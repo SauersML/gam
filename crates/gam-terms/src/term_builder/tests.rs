@@ -847,13 +847,8 @@ fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
             } => num_internal_knots + marginal.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + marginal.degree + 1,
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test helper cannot infer automatic knot count"),
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(marginal.degree + 1),
             // cr basis dimension equals the knot count (no degree offset).
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
@@ -883,13 +878,8 @@ fn tensor_margin_basis_sizes(ds: &Dataset, formula: &str) -> Vec<usize> {
             } => num_internal_knots + marginal.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + marginal.degree + 1,
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test helper cannot infer automatic knot count"),
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(marginal.degree + 1),
             // cr basis dimension equals the knot count (no degree offset).
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
@@ -1385,7 +1375,7 @@ fn univariate_ps_small_k_degree_reduces_through_build(/* gam#1130 */) {
                 num_internal_knots, ..
             } => *num_internal_knots,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(n),
+                num_internal_knots: n,
                 ..
             } => *n,
             other => panic!("`{formula}` unexpected knotspec: {other:?}"),
@@ -1473,10 +1463,12 @@ fn default_sphere_smooth_uses_spherical_farthest_point_centers() {
     let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!("expected sphere term");
     };
-    assert!(matches!(
-        spec.center_strategy,
-        CenterStrategy::FarthestPoint { .. }
-    ));
+    // Nobody chose the count, so the farthest-point centers are an `Auto`
+    // pilot the formula workflow refines on the fit's REML evidence.
+    let CenterStrategy::Auto(inner) = &spec.center_strategy else {
+        panic!("default sphere centers must be an adaptive pilot: {:?}", spec.center_strategy);
+    };
+    assert!(matches!(**inner, CenterStrategy::FarthestPoint { .. }));
 }
 
 #[test]
@@ -1827,8 +1819,7 @@ fn factor_smooth_marginal_degree_reduces_for_small_k() {
                 num_internal_knots, ..
             } => num_internal_knots + spec.marginal.degree + 1,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + spec.marginal.degree + 1,
             ref other => panic!("unexpected factor-smooth knotspec: {other:?}"),
         };
@@ -3425,7 +3416,7 @@ fn tensor_smooth_low_cardinality_axis_falls_back_to_lower_degree_basis() {
             num_internal_knots, ..
         } => num_internal_knots + m.degree + 1,
         BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n),
+            num_internal_knots: n,
             ..
         } => n + m.degree + 1,
         // The mgcv-default `cr` margin (#1074) reports its basis size as the
@@ -3475,7 +3466,7 @@ fn tensor_smooth_uniform_k_is_capped_to_a_low_cardinality_margins_distinct_value
             num_internal_knots, ..
         } => num_internal_knots + m.degree + 1,
         BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(n),
+            num_internal_knots: n,
             ..
         } => n + m.degree + 1,
         BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
@@ -3542,16 +3533,11 @@ fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
                 num_internal_knots, ..
             } => num_internal_knots + m.degree + 1,
             BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
-                ..
+                num_internal_knots, ..
             } => num_internal_knots + m.degree + 1,
             BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             BSplineKnotSpec::Provided(ref knots) => knots.len().saturating_sub(m.degree + 1),
             BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
-            BSplineKnotSpec::Automatic {
-                num_internal_knots: None,
-                ..
-            } => panic!("test cannot infer automatic knot count"),
         })
         .collect::<Vec<_>>();
     assert_eq!(dims, vec![5, 5]);
@@ -3748,8 +3734,7 @@ fn inferred_three_dim_tensor_basis_stays_bounded_for_reml_selection() {
                     num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
                 BSplineKnotSpec::Automatic {
-                    num_internal_knots: Some(num_internal_knots),
-                    ..
+                    num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
                 // The mgcv-default `cr` margin (#1074) reports its basis size
                 // as the number of value-knots placed.
@@ -4275,7 +4260,7 @@ fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
         };
         let internal = match &spec.knotspec {
             BSplineKnotSpec::Generate { num_internal_knots, .. } => *num_internal_knots,
-            BSplineKnotSpec::Automatic { num_internal_knots: Some(knots), .. } => *knots,
+            BSplineKnotSpec::Automatic { num_internal_knots, .. } => *num_internal_knots,
             other => panic!("unexpected default knot spec {other:?}"),
         };
         assert!(spec.penalty_order <= spec.degree);

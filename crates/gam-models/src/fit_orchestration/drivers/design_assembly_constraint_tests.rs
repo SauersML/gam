@@ -2284,11 +2284,9 @@ pub(super) fn run_two_block_exact_joint_optimize(
         &[mean_terms, noise_terms],
         &kappa_options,
         &joint_setup,
-        gam_problem::SeedRiskProfile::Gaussian,
         true,
         true,
         false,
-        None,
         None,
         policy,
         |theta, specs, designs, _| {

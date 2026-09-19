@@ -238,7 +238,10 @@ pub enum BSplineKnotSpec {
         adaptive: bool,
     },
     Automatic {
-        num_internal_knots: Option<usize>,
+        /// Internal-knot count. Always resolved by the caller (the formula
+        /// default is `pilot_internal_knots_for_column`); the basis builder has no
+        /// second, row-count-based default of its own.
+        num_internal_knots: usize,
         placement: BSplineKnotPlacement,
         /// `true` when nobody chose `num_internal_knots`: it is the formula
         /// default's starting resolution, which the standard formula workflow
@@ -702,6 +705,15 @@ pub fn basis_is_saturated(
     penalized_edf >= capacity - margin
 }
 
+/// The one center-placement rule for a spatial (radial-kernel) smooth of
+/// dimension `d`.
+///
+/// In low dimensions (`d <= 3`) a center count is a resolution request, so the
+/// centers are deterministic maximin (farthest-point) geometry: kriging and
+/// Duchon accuracy are governed by fill distance, and equal-mass midpoints
+/// leave holes and endpoint under-resolution that REML then compensates for by
+/// over-smoothing low-noise signals (#504). In higher dimensions the centers
+/// are equal-mass covariance representatives.
 pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d <= 3 {
         CenterStrategy::FarthestPoint { num_centers }
@@ -710,22 +722,10 @@ pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> Ce
     }
 }
 
+/// [`default_spatial_center_strategy`] for an inferred center count, wrapped in
+/// `Auto` so adaptive resolution may resize it before the centers are frozen.
 pub(crate) fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
-    let strategy = if d == 1 {
-        // In one dimension, farthest-point selection is the deterministic
-        // maximin grid over the observed domain. Equal-mass midpoints leave the
-        // low-frequency Duchon radial block slightly under-resolved at the
-        // boundaries, and REML then compensates with an over-smooth λ on
-        // low-noise signals (#504). The maximin grid matches the native
-        // reproducing-kernel interpolation geometry. The default strategy below
-        // extends the same space-filling contract to low-dimensional spatial
-        // GP bases, where kriging accuracy is governed by fill distance rather
-        // than marginal quantile balance.
-        CenterStrategy::FarthestPoint { num_centers }
-    } else {
-        default_spatial_center_strategy(num_centers, d)
-    };
-    CenterStrategy::Auto(Box::new(strategy))
+    CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
 }
 
 pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
@@ -3393,7 +3393,7 @@ mod saturation_escalation_tests {
         for (n, d) in [(20, 2), (100, 4), (100_000, 1), (5_000, 16)] {
             assert!(starting_num_centers(n, d, d + 1) <= n);
         }
-        assert_eq!(starting_num_centers(3, 5, 6), 1);
+        assert_eq!(starting_num_centers(3, 5, 6), 3);
         assert_eq!(starting_num_centers(1, 2, 3), 1);
     }
 

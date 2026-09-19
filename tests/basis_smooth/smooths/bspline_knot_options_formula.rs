@@ -167,7 +167,7 @@ fn unsized_default_smooth_is_an_adaptive_uniform_pilot() {
     // fit's adaptive resolution loop to grow; its knots stay uniform.
     match &bspline_spec(&build("y ~ s(x)")).knotspec {
         BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(num_internal_knots),
+            num_internal_knots,
             placement,
             adaptive,
         } => {

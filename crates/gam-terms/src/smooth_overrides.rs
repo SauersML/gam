@@ -23,8 +23,9 @@
 //!
 //! Magic by default — when a descriptor field defaults to `None` we leave
 //! the formula-DSL-chosen value alone, so `Duchon(centers=K)` (with K an
-//! integer) only swaps in `EqualMass { num_centers: K }` and leaves the
-//! kernel order, identifiability, and nullspace order untouched.
+//! integer) is the formula's `k=K`: it fixes the center count and keeps the
+//! term's own placement rule, kernel order, identifiability, and nullspace
+//! order untouched.
 
 use ndarray::{Array1, Array2};
 use serde_json::Value as JsonValue;
@@ -34,13 +35,15 @@ use std::path::PathBuf;
 use crate::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
     MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
-    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec, center_strategy_with_num_centers,
+    default_spatial_center_strategy,
 };
 use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
     TermCollectionSpec,
 };
+use crate::term_builder::duchon_center_strategy;
 use gam_data::{ColumnKindTag, EncodedDataset as Dataset};
 
 /// Apply the Python-side `smooths={...}` registry to a built term collection.
@@ -120,7 +123,7 @@ fn pin_adaptive_bspline_default(
         SmoothBasisSpec::BySmooth { smooth, .. } => pin_adaptive_bspline_default(smooth, data),
         SmoothBasisSpec::BSpline1D { feature_col, spec } => {
             let BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(num_internal_knots),
+                num_internal_knots,
                 placement,
                 adaptive: true,
             } = spec.knotspec
@@ -136,7 +139,7 @@ fn pin_adaptive_bspline_default(
                     }
                 }
                 BSplineKnotPlacement::Quantile => BSplineKnotSpec::Automatic {
-                    num_internal_knots: Some(num_internal_knots),
+                    num_internal_knots,
                     placement,
                     adaptive: false,
                 },
@@ -377,13 +380,36 @@ fn apply_kind_specific(
     let normalized = kind.to_ascii_lowercase();
     let normalized = normalized.as_str();
     match (normalized, &mut *basis) {
-        ("duchon", SmoothBasisSpec::Duchon { spec, .. })
-        | ("tps", SmoothBasisSpec::Duchon { spec, .. }) => apply_duchon(spec, descriptor, symbol),
-        ("duchon", SmoothBasisSpec::ThinPlate { spec, .. })
-        | ("tps", SmoothBasisSpec::ThinPlate { spec, .. }) => {
-            apply_thinplate(spec, descriptor, symbol)
-        }
-        ("matern", SmoothBasisSpec::Matern { spec, .. }) => apply_matern(spec, descriptor, symbol),
+        (
+            "duchon",
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            },
+        )
+        | (
+            "tps",
+            SmoothBasisSpec::Duchon {
+                feature_cols, spec, ..
+            },
+        ) => apply_duchon(spec, feature_cols.len(), descriptor, symbol),
+        (
+            "duchon",
+            SmoothBasisSpec::ThinPlate {
+                feature_cols, spec, ..
+            },
+        )
+        | (
+            "tps",
+            SmoothBasisSpec::ThinPlate {
+                feature_cols, spec, ..
+            },
+        ) => apply_thinplate(spec, feature_cols.len(), descriptor, symbol),
+        (
+            "matern",
+            SmoothBasisSpec::Matern {
+                feature_cols, spec, ..
+            },
+        ) => apply_matern(spec, feature_cols.len(), descriptor, symbol),
         ("sphere", SmoothBasisSpec::Sphere { spec, .. })
         | ("s2", SmoothBasisSpec::Sphere { spec, .. }) => apply_sphere(spec, descriptor, symbol),
         ("curvature", SmoothBasisSpec::ConstantCurvature { spec, .. })
@@ -443,10 +469,29 @@ fn smooth_basis_kind_name(basis: &SmoothBasisSpec) -> &'static str {
 
 fn apply_duchon(
     spec: &mut DuchonBasisSpec,
+    d: usize,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
 ) -> Result<(), String> {
-    apply_center_strategy(&mut spec.center_strategy, descriptor, symbol)?;
+    // The formula's explicit-`k` rule for this term: periodic Duchon places
+    // centers like every other spatial smooth, open-domain Duchon uses the
+    // 1-D interval grid.
+    let periodic = spec
+        .periodic
+        .as_ref()
+        .is_some_and(|axes| axes.iter().any(Option::is_some));
+    let explicit_rule = if periodic {
+        default_spatial_center_strategy
+    } else {
+        explicit_duchon_center_strategy
+    };
+    apply_center_strategy(
+        &mut spec.center_strategy,
+        d,
+        explicit_rule,
+        descriptor,
+        symbol,
+    )?;
     if let Some(m_val) = descriptor.get("m") {
         let m = m_val.as_u64().filter(|m| *m >= 1).ok_or_else(|| {
             format!("smooths[{symbol:?}].m must be a positive integer (spline order)")
@@ -508,10 +553,17 @@ fn apply_duchon(
 
 fn apply_thinplate(
     spec: &mut ThinPlateBasisSpec,
+    d: usize,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
 ) -> Result<(), String> {
-    apply_center_strategy(&mut spec.center_strategy, descriptor, symbol)?;
+    apply_center_strategy(
+        &mut spec.center_strategy,
+        d,
+        default_spatial_center_strategy,
+        descriptor,
+        symbol,
+    )?;
     if let Some(ls) = descriptor.get("length_scale").and_then(JsonValue::as_f64) {
         if !ls.is_finite() || ls <= 0.0 {
             return Err(format!(
@@ -537,10 +589,17 @@ fn apply_thinplate(
 
 fn apply_matern(
     spec: &mut MaternBasisSpec,
+    d: usize,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
 ) -> Result<(), String> {
-    apply_center_strategy(&mut spec.center_strategy, descriptor, symbol)?;
+    apply_center_strategy(
+        &mut spec.center_strategy,
+        d,
+        default_spatial_center_strategy,
+        descriptor,
+        symbol,
+    )?;
     if let Some(nu) = descriptor.get("nu").and_then(JsonValue::as_f64) {
         spec.nu = parse_matern_nu(nu, symbol)?;
     }
@@ -772,7 +831,7 @@ fn apply_bspline_1d(
                 num_internal_knots: n_internal,
             },
             BSplineKnotSpec::Automatic { placement, .. } => BSplineKnotSpec::Automatic {
-                num_internal_knots: Some(n_internal),
+                num_internal_knots: n_internal,
                 placement: *placement,
                 adaptive: false,
             },
@@ -1031,22 +1090,55 @@ fn apply_categorical_reject(
 // Common parsers
 // --------------------------------------------------------------------------
 
+fn explicit_duchon_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
+    duchon_center_strategy(num_centers, d, false)
+}
+
+/// `n_centers` is the registry spelling of the formula's `k`: it fixes how
+/// many centers the term places, never how it places them. The count is
+/// written into the term's own placement rule (the formula already chose
+/// farthest-point, equal-mass, the 1-D grid, ...), and — like an explicit
+/// formula `k` — the `Auto` wrapper is dropped so adaptive resolution cannot
+/// resize a count the user fixed. A term whose centers were a concrete
+/// array falls back to `explicit_rule`, the formula's rule for an explicit
+/// `k` on this kind.
 fn apply_center_strategy(
     target: &mut CenterStrategy,
+    d: usize,
+    explicit_rule: fn(usize, usize) -> CenterStrategy,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
 ) -> Result<(), String> {
+    fn without_auto(strategy: &CenterStrategy) -> CenterStrategy {
+        match strategy {
+            CenterStrategy::Auto(inner) => without_auto(inner),
+            CenterStrategy::DuchonSpectral { knots, basis } => CenterStrategy::DuchonSpectral {
+                knots: Box::new(without_auto(knots)),
+                basis: basis.clone(),
+            },
+            other => other.clone(),
+        }
+    }
     if let Some(centers_val) = descriptor.get("centers") {
         let centers = parse_2d_array(centers_val, "centers", symbol)?;
         *target = CenterStrategy::UserProvided(centers);
         return Ok(());
     }
     if let Some(n) = descriptor.get("n_centers").and_then(JsonValue::as_u64) {
-        if n == 0 {
-            return Err(format!("smooths[{symbol:?}].n_centers must be positive"));
-        }
-        *target = CenterStrategy::EqualMass {
-            num_centers: n as usize,
+        let n = usize::try_from(n)
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("smooths[{symbol:?}].n_centers must be positive"))?;
+        let placed = without_auto(target);
+        *target = match center_strategy_with_num_centers(&placed, n, d) {
+            Ok(resized) => resized,
+            Err(_) => match placed {
+                CenterStrategy::DuchonSpectral { basis, .. } => CenterStrategy::DuchonSpectral {
+                    knots: Box::new(explicit_rule(n, d)),
+                    basis,
+                },
+                _ => explicit_rule(n, d),
+            },
         };
     }
     Ok(())
@@ -1207,6 +1299,7 @@ mod tests {
     use super::*;
     use crate::basis::{
         BSplineIdentifiability, DuchonNullspaceOrder, MaternNu, SpatialIdentifiability,
+        auto_spatial_center_strategy,
     };
     use crate::smooth::ShapeConstraint;
     use serde_json::json;
@@ -1419,18 +1512,79 @@ mod tests {
     #[test]
     fn double_penalty_wires_into_thinplate_and_matern() {
         let mut tps = thinplate_spec();
-        apply_thinplate(&mut tps, &obj(json!({"double_penalty": true})), "x").unwrap();
+        apply_thinplate(&mut tps, 2, &obj(json!({"double_penalty": true})), "x").unwrap();
         assert!(tps.double_penalty);
 
         let mut mat = matern_spec();
-        apply_matern(&mut mat, &obj(json!({"double_penalty": true})), "x").unwrap();
+        apply_matern(&mut mat, 2, &obj(json!({"double_penalty": true})), "x").unwrap();
         assert!(mat.double_penalty);
+    }
+
+    /// Regression for #3179: `Duchon(centers=30)` / `Matern(centers=30)`
+    /// reach the registry as `n_centers`, which used to force
+    /// `EqualMass { 30 }` — a different center set from the formula's `k=30`
+    /// on the same term (farthest-point for d ≤ 3, the interval grid for 1-D
+    /// Duchon). The count must land in the term's own placement rule, with
+    /// `Auto` dropped exactly as an explicit formula `k` drops it.
+    #[test]
+    fn n_centers_keeps_the_terms_placement_rule() {
+        // `CenterStrategy` carries float arrays and has no `PartialEq`.
+        let shown = |strategy: &CenterStrategy| format!("{strategy:?}");
+        let n_centers = obj(json!({"n_centers": 30}));
+
+        let mut tps = thinplate_spec();
+        tps.center_strategy = auto_spatial_center_strategy(12, 2);
+        apply_thinplate(&mut tps, 2, &n_centers, "x").unwrap();
+        assert_eq!(
+            shown(&tps.center_strategy),
+            shown(&default_spatial_center_strategy(30, 2)),
+            "thin-plate n_centers must be the formula's explicit k=30",
+        );
+
+        let mut mat = matern_spec();
+        mat.center_strategy = CenterStrategy::KMeans {
+            num_centers: 12,
+            max_iter: 7,
+        };
+        apply_matern(&mut mat, 2, &n_centers, "x").unwrap();
+        assert_eq!(
+            shown(&mat.center_strategy),
+            shown(&CenterStrategy::KMeans {
+                num_centers: 30,
+                max_iter: 7,
+            }),
+            "an explicitly chosen placement must survive a count override",
+        );
+
+        let mut duchon_1d = duchon_spec();
+        duchon_1d.center_strategy = duchon_center_strategy(12, 1, true);
+        apply_duchon(&mut duchon_1d, 1, &n_centers, "x").unwrap();
+        assert_eq!(
+            shown(&duchon_1d.center_strategy),
+            shown(&duchon_center_strategy(30, 1, false)),
+            "1-D Duchon n_centers must stay on the interval grid",
+        );
+
+        // A term whose centers were a concrete array falls back to the
+        // formula's explicit-k rule for its kind, not to a third placement.
+        let mut duchon_user = duchon_spec();
+        duchon_user.center_strategy = CenterStrategy::UserProvided(Array2::zeros((4, 3)));
+        apply_duchon(&mut duchon_user, 3, &n_centers, "x").unwrap();
+        assert_eq!(
+            shown(&duchon_user.center_strategy),
+            shown(&duchon_center_strategy(30, 3, false)),
+        );
+
+        let mut zero = thinplate_spec();
+        let err = apply_thinplate(&mut zero, 2, &obj(json!({"n_centers": 0})), "x")
+            .expect_err("n_centers = 0 must be rejected");
+        assert!(err.contains("n_centers must be positive"), "got: {err}");
     }
 
     #[test]
     fn double_penalty_rejected_for_duchon() {
         let mut duchon = duchon_spec();
-        let err = apply_duchon(&mut duchon, &obj(json!({"double_penalty": true})), "x")
+        let err = apply_duchon(&mut duchon, 2, &obj(json!({"double_penalty": true})), "x")
             .expect_err("double_penalty on Duchon must be rejected");
         assert!(err.contains("not supported on Duchon"), "got: {err}");
 
@@ -1439,10 +1593,11 @@ mod tests {
         // `apply_duchon` only rejects `Some(true)` — `false` must pass through
         // (relevant since #1565 now always emits the key, including `false`).
         let mut duchon_ok = duchon_spec();
-        apply_duchon(&mut duchon_ok, &obj(json!({"m": 2})), "x").unwrap();
+        apply_duchon(&mut duchon_ok, 2, &obj(json!({"m": 2})), "x").unwrap();
         let mut duchon_false = duchon_spec();
         apply_duchon(
             &mut duchon_false,
+            2,
             &obj(json!({"double_penalty": false})),
             "x",
         )
@@ -1517,7 +1672,7 @@ mod tests {
 
         let mut automatic = open_bspline_spec();
         automatic.knotspec = BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(5),
+            num_internal_knots: 5,
             placement: crate::basis::BSplineKnotPlacement::Quantile,
             adaptive: false,
         };

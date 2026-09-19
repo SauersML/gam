@@ -116,9 +116,8 @@ where
              under the dimension {dim} they are applied in"
         ));
     }
-    let band = |terms: usize| terms as f64 * f64::EPSILON / (1.0 - terms as f64 * f64::EPSILON);
-    let gamma = band(dim);
-    let operator_gamma = band(operator_terms);
+    let gamma = gam_linalg::roundoff::accumulation_growth(dim);
+    let operator_gamma = gam_linalg::roundoff::accumulation_growth(operator_terms);
     let a_slice = |input: &[f64], output: &mut [f64]| -> Result<(), String> {
         let value = a_flat(&Array1::from_vec(input.to_vec()))?;
         for (slot, &value) in output.iter_mut().zip(value.iter()) {
