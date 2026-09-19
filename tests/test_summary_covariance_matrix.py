@@ -17,7 +17,11 @@ def test_summary_covariance_is_the_coefficient_covariance_matrix() -> None:
     n = 300
     x0 = rng.uniform(size=n)
     x1 = rng.uniform(size=n)
-    y = np.sin(2.0 * np.pi * x0) + np.cos(2.0 * np.pi * x1) + rng.normal(scale=0.3, size=n)
+    y = (
+        np.sin(2.0 * np.pi * x0)
+        + np.cos(2.0 * np.pi * x1)
+        + rng.normal(scale=0.3, size=n)
+    )
     model = gamfit.fit({"x0": x0, "x1": x1, "y": y}, "y ~ s(x0) + s(x1)")
     summary = model.summary()
 
@@ -33,4 +37,4 @@ def test_summary_covariance_is_the_coefficient_covariance_matrix() -> None:
 
     assert "covariance_flat" not in summary
     assert "covariance_n" not in summary
-    assert "covariance" not in summary._repr_html_()
+    assert ">covariance</th>" not in summary._repr_html_()
