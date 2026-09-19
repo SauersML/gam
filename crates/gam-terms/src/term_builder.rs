@@ -200,6 +200,9 @@ impl From<DataError> for TermBuilderError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::MissingColumn { reason },
+            cell @ DataError::InvalidCell { .. } => Self::MissingColumn {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },
@@ -383,6 +386,19 @@ pub(crate) fn marginal_slope_z_alias_is_live(
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
 
+/// A categorical column cannot be the argument of a term that treats its
+/// input as a numeric axis: the category codes would be read as positions on
+/// a line, silently fitting an arbitrary order. Point the user at the
+/// categorical spellings instead.
+fn categorical_in_numeric_term_error(term: &str, column: &str) -> TermBuilderError {
+    TermBuilderError::incompatible_config(format!(
+        "{term} treats its arguments as numeric axes, but column '{column}' is \
+         categorical; use factor({column}) for a categorical level effect, \
+         group({column}) for a random effect, or s(x, {column}, bs=\"fs\") for a \
+         per-level smooth of a numeric x"
+    ))
+}
+
 pub fn build_termspec(
     terms: &[ParsedTerm],
     ds: &Dataset,
@@ -420,15 +436,15 @@ pub fn build_termspec(
             _ => 0,
         })
         .sum::<usize>();
-    // Intercept removal (`0 + …`, `… - 1`) hands the constant to one term (see
-    // `ModelLevel` and docs/formulas.md "Removing the intercept"). The first
-    // fixed factor block already spans it with its full level set, and becomes
-    // unpenalized so the level is not shrunk toward zero (the cell-means
-    // model); otherwise the first pure-indicator interaction keeps its
-    // reference cell (unpenalized), and failing that the first B-spline smooth
-    // keeps its constant with its null-space ridge dropped. A genuine random
-    // effect (`group(g)`, `re(g)`) never carries the level: its levels are
-    // deviations with mean zero.
+    // Intercept removal (`0 + …`, `… - 1`) removes the constant only when no
+    // term spans it (see `ModelLevel` and docs/formulas.md "Removing the
+    // intercept"). A fixed factor block, a pure-indicator interaction over the
+    // full level cross, or a B-spline smooth whose own gauge would keep the
+    // constant all span it, and then the model keeps its intercept: the column
+    // space is the one the formula asked for, the constant is the one free
+    // direction, and every other direction keeps its default penalty. A
+    // genuine random effect (`group(g)`, `re(g)`) never spans it: its levels
+    // are deviations with mean zero.
     let no_intercept = terms.iter().any(|t| matches!(t, ParsedTerm::NoIntercept));
     let is_categorical = |name: &str| {
         col_map
@@ -442,24 +458,25 @@ pub fn build_termspec(
         })
     };
     // Every term matched here lowers to a `RandomEffectTermSpec` with
-    // `lenient_unseen: false` (a fixed factor); see the resolution after the loop.
-    let factor_block_present = terms.iter().any(|t| match t {
-        ParsedTerm::RandomEffect { lenient_unseen, .. } => !*lenient_unseen,
+    // `lenient_unseen: false` (a fixed factor) coded over its full level set.
+    // The first term found to span the constant is named in the inference
+    // note that keeps the intercept.
+    let mut constant_spanning_term: Option<String> = terms.iter().find_map(|t| match t {
+        ParsedTerm::RandomEffect {
+            name,
+            lenient_unseen: false,
+        } => Some(format!("factor `{name}`")),
         ParsedTerm::Linear {
             name,
             explicit: false,
             ..
-        } => is_categorical(name),
+        } if is_categorical(name) => Some(format!("factor `{name}`")),
         ParsedTerm::Smooth { options, .. } => options
             .get("by")
-            .is_some_and(|by| is_categorical(by) && !genuine_random_effect(by)),
-        _ => false,
+            .filter(|by| is_categorical(by) && !genuine_random_effect(by))
+            .map(|by| format!("factor `{by}` (the main effect of its `by=` smooth)")),
+        _ => None,
     });
-    let mut level_carried = !no_intercept || factor_block_present;
-    // Index of the first smooth eligible to carry the level, and whether an
-    // explicit `double_penalty=true` asks to keep its null-space ridge.
-    let mut level_smooth_candidate: Option<(usize, bool)> = None;
-    let mut explicit_level_smooth: Option<(usize, bool)> = None;
 
     for t in terms {
         match t {
@@ -478,6 +495,9 @@ pub fn build_termspec(
                     .to_string()
                 })?;
                 if *explicit {
+                    if matches!(auto_kind, ColumnKindTag::Categorical) {
+                        return Err(categorical_in_numeric_term_error("linear()", name));
+                    }
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
                         feature_col: col,
@@ -783,20 +803,16 @@ pub fn build_termspec(
                         }
                     }
                 } else {
-                    // An explicit gauge is the user's choice: one that keeps the
-                    // constant is the preferred carrier, and a default-centred
-                    // smooth is the fallback.
-                    let keep_null_ridge = option_bool(options, "double_penalty")? == Some(true);
-                    if options.contains_key("identifiability") {
-                        if explicit_level_smooth.is_none()
-                            && crate::smooth::bspline_smooth_spans_constant(&inner_basis)
-                        {
-                            explicit_level_smooth = Some((smooth_terms.len(), keep_null_ridge));
-                        }
-                    } else if level_smooth_candidate.is_none()
-                        && crate::smooth::bspline_smooth_is_default_centred(&inner_basis)
-                    {
-                        level_smooth_candidate = Some((smooth_terms.len(), keep_null_ridge));
+                    // A B-spline smooth spans the constant before its default
+                    // centring removes it, and keeps it under an explicit
+                    // `identifiability=none`.
+                    let spans_constant = if options.contains_key("identifiability") {
+                        crate::smooth::bspline_smooth_spans_constant(&inner_basis)
+                    } else {
+                        crate::smooth::bspline_smooth_is_default_centred(&inner_basis)
+                    };
+                    if spans_constant && constant_spanning_term.is_none() {
+                        constant_spanning_term = Some(format!("smooth `{label}`"));
                     }
                     smooth_terms.push(SmoothTermSpec {
                         frozen_parametric_residualization: None,
@@ -965,14 +981,18 @@ pub fn build_termspec(
                     let any_dummy_coded = categorical_factors
                         .iter()
                         .any(|(_, _, _, treatment_coded)| !*treatment_coded);
-                    // Without an intercept (and no factor block spanning the
-                    // constant) the first such cell set is the level carrier:
-                    // every cell is kept, the saturated cell-means model.
-                    let cells_carry_level = numeric_cols.is_empty() && !level_carried;
-                    if cells_carry_level {
-                        level_carried = true;
+                    // Pure indicators over the full cross of every operand's
+                    // levels sum to the all-ones column: they span the
+                    // constant, which the intercept then carries.
+                    if numeric_cols.is_empty()
+                        && constant_spanning_term.is_none()
+                        && categorical_factors.iter().all(|(_, col, levels, _)| {
+                            levels.len() == encoded_levels_for_column(ds, ColIdx::new(*col)).len()
+                        })
+                    {
+                        constant_spanning_term = Some(format!("interaction `{label}`"));
                     }
-                    if numeric_cols.is_empty() && any_dummy_coded && !cells_carry_level {
+                    if numeric_cols.is_empty() && any_dummy_coded {
                         // The reference cell pairs each factor's column with the
                         // bits of its lexicographically-first (index 0) level.
                         let reference_cell: Vec<(usize, u64)> = categorical_factors
@@ -1013,9 +1033,7 @@ pub fn build_termspec(
                             feature_col,
                             feature_cols: numeric_cols.clone(),
                             categorical_levels,
-                            // Cells that carry the level hold it unpenalized:
-                            // a ridge on them would pull the level toward zero.
-                            double_penalty: *double_penalty && !cells_carry_level,
+                            double_penalty: *double_penalty,
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
@@ -1039,25 +1057,21 @@ pub fn build_termspec(
         }
     }
 
-    let level = if no_intercept {
-        if factor_block_present
-            && let Some(carrier) = random_terms.iter_mut().find(|rt| !rt.lenient_unseen)
-        {
-            carrier.penalized = false;
+    // Freeing the constant any other way would leave a penalty on it or strip
+    // one from a direction that is not the constant: the intercept is exactly
+    // the constant, unpenalized, and a full-level ridge beside it profiles to
+    // the ridge on the level contrasts alone.
+    let level = match (no_intercept, constant_spanning_term) {
+        (true, None) => ModelLevel::NoIntercept,
+        (true, Some(term)) => {
+            inference_notes.inform(format!(
+                "kept the intercept although the formula removes it: {term} spans the \
+                 constant, so the constant stays in the model as its one unpenalized \
+                 direction and every other direction keeps its penalty"
+            ));
+            ModelLevel::Intercept
         }
-        let level_smooth = match explicit_level_smooth.or(level_smooth_candidate) {
-            Some((idx, keep_null_ridge)) if !level_carried => {
-                crate::smooth::release_model_centring_for_level(
-                    &mut smooth_terms[idx].basis,
-                    keep_null_ridge,
-                );
-                Some(idx)
-            }
-            _ => None,
-        };
-        ModelLevel::NoIntercept { level_smooth }
-    } else {
-        ModelLevel::Intercept
+        (false, _) => ModelLevel::Intercept,
     };
     let spec = TermCollectionSpec {
         linear_terms,
@@ -2592,6 +2606,19 @@ pub(crate) fn build_smooth_basis(
     let smooth_double_penalty = option_bool(options, "double_penalty")?.unwrap_or(true);
     let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
 
+    // Only the factor-smooth family (fs/sz/re) consumes a categorical column
+    // as a grouping factor. Every other smooth places its inputs on numeric
+    // axes, where category codes would silently fit an arbitrary level order.
+    if !matches!(type_opt.as_str(), "fs" | "sz" | "re")
+        && let Some((var, _)) = vars.iter().zip(cols.iter()).find(|(_, col)| {
+            matches!(ds.column_kinds.get(**col), Some(ColumnKindTag::Categorical))
+        })
+    {
+        return Err(
+            categorical_in_numeric_term_error(&format!("a '{type_opt}' smooth"), var).to_string(),
+        );
+    }
+
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         if type_opt == "re" {
             validate_random_effect_smooth_options(options)?;
@@ -2755,6 +2782,7 @@ pub(crate) fn build_smooth_basis(
             None,
             effective_degree,
             n_knots,
+            false,
         )?;
         let marginal = BSplineBasisSpec {
             degree: effective_degree,
@@ -2990,54 +3018,16 @@ pub(crate) fn build_smooth_basis(
                 ))
                 .to_string());
             }
-            let heuristic_knots = n_knots;
             if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 n_knots = n_knots.min(1);
             }
             let unique = unique_count_column(ds.values.column(c));
-            let knots_before_support_cap = n_knots;
             let degree_before_support_cap = effective_degree;
             if inferred && !periodic_axes[0] && unique >= 2 {
                 let (capped_knots, capped_degree) =
                     support_capped_bspline_dimension(n_knots, effective_degree, unique);
                 n_knots = capped_knots;
                 effective_degree = capped_degree;
-            }
-            if inferred {
-                // State the rule the engine actually applied
-                // (`heuristic_knots_for_column`: `clamp(unique/4, 4..8)`), and
-                // the small-data reduction when it fired. The note used to
-                // announce a `max(20, cbrt(unique))` ceiling that no code path
-                // computed, so for every column with 36 or more unique values
-                // it printed a rule whose own arithmetic disagreed with the
-                // count beside it.
-                let mut note = format!(
-                    "Automatically set {} internal knots for smooth '{}' from {} unique values (rule: clamp(unique/4, 4..{}) = {}; basis dimension = internal knots + degree + 1).",
-                    n_knots,
-                    vars.join(","),
-                    unique,
-                    MAX_DEFAULT_INTERNAL_KNOTS,
-                    heuristic_knots,
-                );
-                if knots_before_support_cap != heuristic_knots {
-                    note.push_str(&format!(
-                        " Reduced to {} because the fit has only {} rows and {} smooth coordinates.",
-                        knots_before_support_cap,
-                        ds.values.nrows(),
-                        smooth_coordinate_count,
-                    ));
-                }
-                if n_knots != knots_before_support_cap || effective_degree != degree {
-                    note.push_str(&format!(
-                        " Capped to {} internal knots at degree {} (basis dimension {}) because the covariate has only {} unique values.",
-                        n_knots,
-                        effective_degree,
-                        n_knots + effective_degree + 1,
-                        unique,
-                    ));
-                }
-                note.push_str(" Override with knots=... or k=....");
-                inference_notes.inform(note);
             }
             let boundary_conditions =
                 if periodic_axes[0] && bspline_boundary_declares_periodic_axis(options) {
@@ -3137,6 +3127,7 @@ pub(crate) fn build_smooth_basis(
                         domain,
                         effective_degree,
                         n_knots,
+                        false,
                     )?,
                 };
                 (knotspec, parse_cyclic_boundary(options, minv, maxv)?)
@@ -3149,6 +3140,7 @@ pub(crate) fn build_smooth_basis(
                         domain,
                         effective_degree,
                         n_knots,
+                        inferred,
                     )?,
                     parse_cyclic_boundary(options, minv, maxv)?,
                 )
@@ -4684,43 +4676,36 @@ fn min_per_group_unique_count(
         .max(1)
 }
 
-/// Cap on the automatically inferred internal-knot count of a 1-D smooth.
-/// Default cubic basis ≈ `MAX_DEFAULT_INTERNAL_KNOTS + degree + 1` = 12
-/// functions, matching mgcv's lean univariate default. Named at module level
-/// so the inference note reports the ceiling the engine applies rather than
-/// one of its own.
-pub(crate) const MAX_DEFAULT_INTERNAL_KNOTS: usize = 8;
+/// Internal-knot count of the lean default univariate B-spline basis:
+/// `DEFAULT_PILOT_INTERNAL_KNOTS + degree + 1` = 12 cubic functions, close to
+/// mgcv's univariate default (`k = 10`).
+///
+/// For the formula default `s(x)` this is only the *starting* resolution, not a
+/// ceiling: the standard formula workflow refits with a doubled knot count
+/// whenever the converged fit's own adequacy evidence (EDF saturation, or the
+/// #2774 residual lack-of-fit score test) says the basis is too small, up to
+/// the covariate's distinct-value support and the design's rank (see
+/// `finish_adaptive_spatial_fit`). Starting lean is what lets a null or linear
+/// truth finish on a small, cheap basis. Bases that loop does not own (cyclic,
+/// factor-smooth and tensor margins, radial floors that copy this spline's
+/// size) take this count as their fixed default.
+pub(crate) const DEFAULT_PILOT_INTERNAL_KNOTS: usize = 8;
 
-/// Default internal-knot count for an *additive* univariate smooth, derived
-/// from the column's unique-value count.
+/// Default (pilot) internal-knot count for a univariate smooth, derived from
+/// the column's unique-value count: `unique/4`, floored at 4 knots so a
+/// non-trivial smooth is representable at all and capped at
+/// [`DEFAULT_PILOT_INTERNAL_KNOTS`] so the pilot fit is lean.
 ///
-/// The basis dimension is `internal_knots + degree + 1`, so the cap below maps
-/// to a default cubic basis of ~12 functions — deliberately close to mgcv's
-/// univariate default (`k = 10`). A penalized smooth controls its wiggliness
-/// through the *penalty*, not the basis size: REML/LAML shrinks a too-rich
-/// basis toward the null, but it cannot do so cleanly when the basis is so
-/// over-sized that the design becomes weakly identified. Growing the basis with
-/// `n` (the old `n^(1/3)`-ceilinged `unique/4` rule, which pinned to 20 internal
-/// knots ⇒ a 24-function basis for any column with ≥80 unique values) therefore
-/// *hurts* recovery on finite, weak-signal fits: a 4-smooth additive model on
-/// n=120 asks for ~92 coefficients, the outer optimizer stalls on the resulting
-/// flat two-penalty (range + null-space) REML surface, and the truth leaks into
-/// surplus columns the penalty can't shrink away (gam#1680; the same defect was
-/// documented for thin-plate fields in gam#1074). A k-sweep on the #1680 design
-/// confirms a basis of ~10–15 recovers truth at RMSE ≈ 0.12 while the old
-/// 24-function default lands at ≈ 0.39 (~3× worse) — *whether or not* the
-/// covariates are collinear, so this is basis over-richness, not collinearity.
-///
-/// The cap is flat in `n`: a user who genuinely needs a wigglier fit raises `k`
-/// explicitly (mgcv's contract — opt *in* to more flexibility), and the SPEC
-/// requires the default to allow recovering the null rather than forcing the
-/// user to opt out of overfitting. The 4-knot floor stays put because we still
-/// need enough basis functions to fit a non-trivial smooth at all, and the
-/// `unique/4` growth below the cap keeps small/sparse columns (n ≤ 32, where
-/// `unique/4 ≤ 8`) on exactly their previous knot count.
+/// A penalized smooth controls its wiggliness through the *penalty*, not the
+/// basis size, so the pilot deliberately stays small: REML/LAML then only has
+/// to shrink what the data do not support, and the adaptive formula loop adds
+/// resolution only where the fit itself shows the pilot is too coarse. (Before
+/// that loop existed this count was the final basis of every default `s(x)`,
+/// so a strongly wiggly truth plateaued at the 12-function bias floor no
+/// matter how much data arrived.)
 pub(crate) fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
-    (unique / 4).clamp(4, MAX_DEFAULT_INTERNAL_KNOTS)
+    (unique / 4).clamp(4, DEFAULT_PILOT_INTERNAL_KNOTS)
 }
 
 /// Cap a default open B-spline `(internal_knots, degree)` so its basis
@@ -5200,34 +5185,7 @@ const CR_MARGIN_DEGREE: usize = 3;
 /// interpolating cubic.
 const CR_MARGIN_PENALTY_ORDER: usize = 2;
 
-fn parse_knot_placement(
-    options: &BTreeMap<String, String>,
-) -> Result<crate::basis::BSplineKnotPlacement, String> {
-    use crate::basis::BSplineKnotPlacement;
-    match options
-        .get("knot_placement")
-        .or_else(|| options.get("knot-placement"))
-        .or_else(|| options.get("knotplacement"))
-    {
-        None => Ok(BSplineKnotPlacement::Uniform),
-        Some(raw) => match raw
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "uniform" | "even" | "equal" => Ok(BSplineKnotPlacement::Uniform),
-            "quantile" | "quantiles" | "data" | "empirical" => Ok(BSplineKnotPlacement::Quantile),
-            other => Err(TermBuilderError::invalid_option(format!(
-                "knot_placement={other} is not recognised; expected \"uniform\" or \"quantile\""
-            ))
-            .to_string()),
-        },
-    }
-}
-
-/// Like [`parse_knot_placement`] but distinguishes "unset" from an explicit
+/// The declared `knot_placement=`, distinguishing "unset" from an explicit
 /// `knot_placement=uniform`.
 ///
 /// The two are not the same request on a tensor margin: unset means "give me
@@ -5239,26 +5197,49 @@ fn parse_knot_placement(
 fn explicit_knot_placement(
     options: &BTreeMap<String, String>,
 ) -> Result<Option<crate::basis::BSplineKnotPlacement>, String> {
-    let declared = ["knot_placement", "knot-placement", "knotplacement"]
-        .iter()
-        .any(|key| options.contains_key(*key));
-    if !declared {
-        return Ok(None);
+    use crate::basis::BSplineKnotPlacement;
+    match options
+        .get("knot_placement")
+        .or_else(|| options.get("knot-placement"))
+        .or_else(|| options.get("knotplacement"))
+    {
+        None => Ok(None),
+        Some(raw) => match raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "uniform" | "even" | "equal" => Ok(Some(BSplineKnotPlacement::Uniform)),
+            "quantile" | "quantiles" | "data" | "empirical" => {
+                Ok(Some(BSplineKnotPlacement::Quantile))
+            }
+            other => Err(TermBuilderError::invalid_option(format!(
+                "knot_placement={other} is not recognised; expected \"uniform\" or \"quantile\""
+            ))
+            .to_string()),
+        },
     }
-    parse_knot_placement(options).map(Some)
 }
 
 /// Build the non-periodic 1D B-spline knot spec for the `ps`/`bspline` and
 /// factor-smooth marginal paths, honoring (in priority order):
 ///   1. `knots=[...]` explicit internal positions  → [`BSplineKnotSpec::Provided`]
-///   2. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
-///   3. uniform generation                          → [`BSplineKnotSpec::Generate`]
+///   2. an adaptive formula default                → [`BSplineKnotSpec::Automatic`]`{ adaptive: true }`
+///   3. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
+///   4. uniform generation                          → [`BSplineKnotSpec::Generate`]
 ///
 /// `data` is the covariate column (used to drive quantile placement);
 /// `data_range` is its observed range and `domain` the declared `domain=`
 /// interval, which when present replaces the data range as the span of the
 /// clamped boundary knots. `n_knots` is the resolved internal-knot count from
-/// [`parse_ps_internal_knots`] used for the automatic strategies.
+/// [`parse_ps_internal_knots`] used for the automatic strategies. `adaptive`
+/// marks the formula default `s(x)`: nobody chose the count, so it is only the
+/// starting resolution that the standard formula workflow refines from the
+/// converged fit's own adequacy evidence. A declared `domain=` pins the knot
+/// span the adaptive spec cannot carry, so it keeps the count fixed. Undeclared
+/// placement is uniform either way.
 fn resolve_nonperiodic_bspline_knotspec(
     options: &BTreeMap<String, String>,
     data: ArrayView1<'_, f64>,
@@ -5266,6 +5247,7 @@ fn resolve_nonperiodic_bspline_knotspec(
     domain: Option<(f64, f64)>,
     degree: usize,
     n_knots: usize,
+    adaptive: bool,
 ) -> Result<BSplineKnotSpec, String> {
     use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
     let knot_range = domain.unwrap_or(data_range);
@@ -5282,7 +5264,22 @@ fn resolve_nonperiodic_bspline_knotspec(
             .map_err(|e| e.to_string())?;
         return Ok(BSplineKnotSpec::Provided(knots));
     }
-    match parse_knot_placement(options)? {
+    let placement = explicit_knot_placement(options)?.unwrap_or(BSplineKnotPlacement::Uniform);
+    if adaptive && domain.is_none() {
+        if placement == BSplineKnotPlacement::Quantile {
+            // Validate the column up-front so an unfittable request surfaces a
+            // user-correctable error at parse time rather than deep in basis
+            // construction. The same data drives the eventual quantile knots.
+            crate::basis::auto_knot_vector_1d_quantile(data, n_knots, degree)
+                .map_err(|e| e.to_string())?;
+        }
+        return Ok(BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(n_knots),
+            placement,
+            adaptive: true,
+        });
+    }
+    match placement {
         BSplineKnotPlacement::Uniform => Ok(BSplineKnotSpec::Generate {
             data_range: knot_range,
             num_internal_knots: n_knots,
@@ -6139,6 +6136,7 @@ fn quantile_bspline_knotspec(
         return Ok(BSplineKnotSpec::Automatic {
             num_internal_knots: Some(num_internal_knots),
             placement: BSplineKnotPlacement::Quantile,
+            adaptive: false,
         });
     };
     if auto.shrunk {

@@ -170,8 +170,9 @@ impl std::fmt::Display for WorkflowError {
                 ..
             } => write!(
                 f,
-                "spatial term '{term}' remains under-resolution-uncertain at {current_centers} \
-                 centers: the {attempted_centers}-center certification refit failed ({reason})"
+                "smooth term '{term}' remains under-resolution-uncertain at resolution \
+                 {current_centers} (centers, or internal knots for a B-spline): the \
+                 resolution-{attempted_centers} certification refit failed ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
             WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
@@ -1190,6 +1191,15 @@ impl From<gam_data::DataError> for WorkflowError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            cell @ DataError::InvalidCell {
+                problem: gam_data::CellProblem::NonFinite,
+                ..
+            } => Self::InvalidConfig {
+                reason: cell.to_string(),
+            },
+            cell @ DataError::InvalidCell { .. } => Self::SchemaMismatch {
+                reason: cell.to_string(),
+            },
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }

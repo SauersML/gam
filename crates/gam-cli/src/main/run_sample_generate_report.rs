@@ -872,7 +872,7 @@ fn report_family_residuals(
     // finite quantile, so u is held inside the representable open interval:
     // the smallest positive double and the largest double below one.
     let to_normal = |u: f64| {
-        standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON / 2.0))
+        standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0_f64.next_down()))
     };
 
     match response {

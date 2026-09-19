@@ -120,3 +120,127 @@ fn diagnose_rejects_removed_no_op_alo_flag() {
         stderr(&output)
     );
 }
+
+#[test]
+fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let training = scratch.path().join("training.csv");
+    let model = scratch.path().join("model.gam");
+    let out = scratch.path().join("predictions.csv");
+    let mut rows = String::from("y,x,g,k\n");
+    for i in 0..90 {
+        let x = f64::from(i) / 90.0;
+        let level = i % 3;
+        let code = (i / 3) % 3;
+        let y = (6.0 * x).sin()
+            + f64::from(level)
+            + 0.5 * f64::from(code)
+            + 0.05 * f64::from(i % 7);
+        rows.push_str(&format!("{y},{x},L{level},{code}\n"));
+    }
+    std::fs::write(&training, rows).expect("write training fixture");
+    let fit = gam(&[
+        "fit",
+        training.to_str().expect("UTF-8 path"),
+        "y ~ s(x) + g + factor(k)",
+        "--out",
+        model.to_str().expect("UTF-8 path"),
+    ]);
+    assert!(fit.status.success(), "{}", stderr(&fit));
+
+    let predict = |name: &str, body: &str| {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, body).expect("write new-data fixture");
+        gam(&[
+            "predict",
+            model.to_str().expect("UTF-8 path"),
+            path.to_str().expect("UTF-8 path"),
+            "--out",
+            out.to_str().expect("UTF-8 path"),
+        ])
+    };
+    let cases = [
+        (
+            "nan.csv",
+            "x,g,k\n0.5,L0,0\nNaN,L1,1\n",
+            [
+                "non-finite value at row 2, column 'x'",
+                "help: Drop or impute",
+            ],
+        ),
+        (
+            "unseen_label.csv",
+            "x,g,k\n0.5,L0,0\n0.5,LNEW,1\n",
+            [
+                "unseen level 'LNEW' in categorical column 'g' at row 2",
+                "help: Map the label",
+            ],
+        ),
+        (
+            "unseen_code.csv",
+            "x,g,k\n0.5,L0,0\n0.5,L1,7\n",
+            [
+                "unseen level '7' in categorical column 'k' at row 2",
+                "help: Map the label",
+            ],
+        ),
+    ];
+    for (name, body, expected) in cases {
+        let output = predict(name, body);
+        assert_eq!(output.status.code(), Some(1), "{name}: {}", stderr(&output));
+        let error = stderr(&output);
+        for needle in expected {
+            assert!(
+                error.contains(needle),
+                "{name}: missing {needle:?} in\n{error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn expectile_tau_is_held_to_the_expectile_family_and_the_open_unit_interval() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bug_hunt_expectile_frailty_guard.csv"
+    );
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let model = scratch.path().join("model.gam");
+    let model = model.to_str().expect("UTF-8 path");
+    let fit = |extra: &[&str]| {
+        let mut args = vec!["fit", fixture, "y ~ s(x)", "--out", model];
+        args.extend_from_slice(extra);
+        gam(&args)
+    };
+
+    // Any family but expectile — the inferred one, an explicit one, and the
+    // `--predict-noise` location-scale route — refuses the asymmetry.
+    for extra in [
+        &["--expectile-tau", "0.9"][..],
+        &["--family", "gaussian", "--expectile-tau", "0.9"],
+        &["--predict-noise", "s(x)", "--expectile-tau", "0.9"],
+        &["--family", "gaussian", "--expectile-tau", "0.1,0.9"],
+    ] {
+        let output = fit(extra);
+        assert_eq!(output.status.code(), Some(1), "{extra:?}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("requires family = \"expectile\""),
+            "{extra:?}: {}",
+            stderr(&output)
+        );
+    }
+
+    // An out-of-range asymmetry is refused while parsing the flag.
+    for tau in ["0", "1", "1.5"] {
+        let output = fit(&["--family", "expectile", "--expectile-tau", tau]);
+        assert!(!output.status.success(), "tau={tau}: {}", stderr(&output));
+        assert!(
+            stderr(&output).contains("in (0, 1)"),
+            "tau={tau}: {}",
+            stderr(&output)
+        );
+    }
+
+    let expectile = fit(&["--family", "expectile", "--expectile-tau", "0.9"]);
+    assert!(expectile.status.success(), "{}", stderr(&expectile));
+}

@@ -1566,7 +1566,7 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SparsityPenalty")]
 struct SparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1750,7 +1750,7 @@ fn py_repr(value: &Bound<'_, PyAny>) -> PyResult<String> {
     value.repr()?.extract()
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ARDPenalty")]
+#[pyclass(module = "gamfit._rust", name = "ARDPenalty")]
 struct ARDPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1813,7 +1813,7 @@ impl ARDPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TopKActivationPenalty")]
+#[pyclass(module = "gamfit._rust", name = "TopKActivationPenalty")]
 struct PyTopKActivationPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -1892,7 +1892,7 @@ impl PyTopKActivationPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SmoothThresholdPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SmoothThresholdPenalty")]
 struct SmoothThresholdPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2093,7 +2093,7 @@ fn validate_aux_conditional_prior_lambda(
     Ok(())
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "BlockSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "BlockSparsityPenalty")]
 struct BlockSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2261,7 +2261,7 @@ fn block_sparsity_coerce_groups(groups: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<u
     Ok(out)
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SoftmaxAssignmentSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SoftmaxAssignmentSparsityPenalty")]
 struct SoftmaxAssignmentSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2348,7 +2348,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "IsometryPenalty")]
+#[pyclass(module = "gamfit._rust", name = "IsometryPenalty")]
 struct IsometryPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2413,7 +2413,7 @@ impl IsometryPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "OrderedBetaBernoulliPenalty")]
+#[pyclass(module = "gamfit._rust", name = "OrderedBetaBernoulliPenalty")]
 struct PyOrderedBetaBernoulliPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2563,7 +2563,7 @@ fn total_variation_coerce_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(i64, 
     Ok(out)
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TotalVariationPenalty")]
+#[pyclass(module = "gamfit._rust", name = "TotalVariationPenalty")]
 struct TotalVariationPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -2832,7 +2832,7 @@ fn validate_parametric_aux_conditional_prior(
 use gam::terms::sae::assignment::inverse_softplus as inverse_softplus_scalar;
 
 #[pyclass(
-    module = "gam_pyffi._rust",
+    module = "gamfit._rust",
     name = "ParametricAuxConditionalPriorPenalty"
 )]
 struct ParametricAuxConditionalPriorPenalty {
@@ -3057,7 +3057,7 @@ impl ParametricAuxConditionalPriorPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "OrthogonalityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "OrthogonalityPenalty")]
 struct OrthogonalityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3140,7 +3140,7 @@ impl OrthogonalityPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "ScadMcpPenalty")]
+#[pyclass(module = "gamfit._rust", name = "ScadMcpPenalty")]
 struct ScadMcpPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3285,7 +3285,7 @@ impl ScadMcpPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "IvaeRidgeMeanGauge")]
+#[pyclass(module = "gamfit._rust", name = "IvaeRidgeMeanGauge")]
 struct IvaeRidgeMeanGauge {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3488,7 +3488,7 @@ fn validate_ivae_ridge_mean_gauge_aux(
     Ok(())
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "MechanismSparsityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "MechanismSparsityPenalty")]
 struct MechanismSparsityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3746,7 +3746,7 @@ fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> 
     ))
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "BlockOrthogonalityPenalty")]
+#[pyclass(module = "gamfit._rust", name = "BlockOrthogonalityPenalty")]
 struct BlockOrthogonalityPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -3921,7 +3921,7 @@ impl BlockOrthogonalityPenalty {
 // SheafConsistencyPenalty — cellular-sheaf consistency loss.
 // ---------------------------------------------------------------------------
 
-#[pyclass(module = "gam_pyffi._rust", name = "SheafConsistencyPenalty")]
+#[pyclass(module = "gamfit._rust", name = "SheafConsistencyPenalty")]
 struct SheafConsistencyPenalty {
     inner: CoreSheafConsistencyPenalty,
     #[pyo3(get)]
@@ -4188,7 +4188,7 @@ impl SheafConsistencyPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "AuxConditionalPriorPenalty")]
+#[pyclass(module = "gamfit._rust", name = "AuxConditionalPriorPenalty")]
 struct AuxConditionalPriorPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -4335,7 +4335,7 @@ impl AuxConditionalPriorPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "NuclearNormPenalty")]
+#[pyclass(module = "gamfit._rust", name = "NuclearNormPenalty")]
 struct NuclearNormPenalty {
     #[pyo3(get, set)]
     target: PyObject,
@@ -4778,7 +4778,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
-    module.add_function(wrap_pyfunction!(vec_to_array1_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
     module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
@@ -4812,6 +4811,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(residuals_table, module)?)?;
     module.add_function(wrap_pyfunction!(ctn_required_fit_columns, module)?)?;
     module.add_function(wrap_pyfunction!(required_model_columns, module)?)?;
+    module.add_function(wrap_pyfunction!(positional_prediction_headers, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     // #1098: exact Gaussian full-conformal prediction set (no calibration fold).
     module.add_function(wrap_pyfunction!(predict_table_full_conformal, module)?)?;
@@ -4889,7 +4889,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
-    module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
     module.add_function(wrap_pyfunction!(
         select_topology_candidate_lifecycle,
         module
@@ -5105,7 +5104,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(auc_from_predictions, module)?)?;
-    module.add_function(wrap_pyfunction!(weighted_auc_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
@@ -6471,7 +6469,7 @@ fn mdl_featurizer_to_py(py: Python<'_>, row: &MdlFeaturizerRow) -> PyResult<Py<P
 /// routes and accumulates one shard; `end_epoch()` refreshes the decoder and
 /// revives dead atoms; `finalize()` returns the decoder + metadata. The decoder
 /// and dead-atom revival state warm-start across every call.
-#[pyclass(module = "gam_pyffi._rust", name = "SparseDictStream")]
+#[pyclass(module = "gamfit._rust", name = "SparseDictStream")]
 struct SparseDictStream {
     inner: SparseDictStreamState,
 }
@@ -6600,7 +6598,7 @@ impl SparseDictStream {
 /// routes + accumulates one shard, `end_epoch()` refreshes γ + frames and revives
 /// dead blocks, `finalize()` returns the frames + γ + per-block report. The frames,
 /// γ, and revival state warm-start across every call.
-#[pyclass(module = "gam_pyffi._rust", name = "BlockSparseDictStream")]
+#[pyclass(module = "gamfit._rust", name = "BlockSparseDictStream")]
 struct BlockSparseDictStream {
     inner: BlockSparseStreamState,
 }
@@ -7112,7 +7110,7 @@ fn predict_encoded_table_configured_impl(
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
-) -> Result<String, PredictError> {
+) -> Result<TablePrediction, PredictError> {
     let model_class = model.predict_model_class();
     parse_covariance_mode(covariance_mode.as_deref()).map_err(PredictError::Other)?;
     let time_grid =
@@ -7133,7 +7131,7 @@ fn predict_encoded_table_configured_impl(
         return Err(PredictError::SchemaMismatch(missing.join(" ")));
     }
     let dataset =
-        dataset_with_model_schema_from_encoded(model, &source).map_err(PredictError::Other)?;
+        dataset_with_model_schema_from_encoded(model, &source)?;
     predict_dataset_with_options_impl(model, model_class, dataset, &options)
         .map_err(PredictError::Other)
 }
@@ -7188,12 +7186,12 @@ fn predict_dataset_with_options_impl(
     model_class: PredictModelClass,
     dataset: EncodedDataset,
     options: &PyPredictOptions,
-) -> Result<String, String> {
+) -> Result<TablePrediction, String> {
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(model, &dataset, options);
     }
     let (columns, provenance) = predict_columns(model, dataset, options)?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(TablePrediction::Point(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(model),
         point_column: model_class.point_column(),
@@ -7213,8 +7211,7 @@ fn predict_dataset_with_options_impl(
             .map(|source| source.as_str().to_string()),
         point_covariance_source: provenance.point.map(|source| source.as_str().to_string()),
         point_covariance_note: provenance.point_note,
-    })
-    .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+    }))
 }
 
 /// Result-owned covariance provenance for a `predict_columns` call (#2296):
@@ -7534,7 +7531,7 @@ fn predict_encoded_table_conformal_impl(
     calibration_source: EncodedDataset,
     conformal_level: f64,
     options_json: Option<&str>,
-) -> Result<String, String> {
+) -> Result<PredictionPayload, String> {
     let options = parse_predict_options(options_json)?;
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let calibration = dataset_with_model_schema_from_encoded(&model, &calibration_source)?;
@@ -7568,7 +7565,7 @@ fn predict_encoded_table_conformal_impl(
         parse_covariance_mode(options.covariance_mode.as_deref())?,
         options.observation_interval.unwrap_or(false),
     )?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
@@ -7582,7 +7579,6 @@ fn predict_encoded_table_conformal_impl(
         point_covariance_source: None,
         point_covariance_note: None,
     })
-    .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
 
 /// #1098 Gaussian full-conformal prediction set at frozen `Sλ` — no
@@ -7596,7 +7592,7 @@ fn predict_encoded_table_full_conformal_impl(
     source: EncodedDataset,
     training_source: EncodedDataset,
     conformal_level: f64,
-) -> Result<String, String> {
+) -> Result<PredictionPayload, String> {
     let dataset = dataset_with_model_schema_from_encoded(model, &source)?;
     let training = dataset_with_model_schema_from_encoded(model, &training_source)?;
     let test_col_map = dataset.column_map();
@@ -7613,7 +7609,7 @@ fn predict_encoded_table_full_conformal_impl(
         },
         conformal_level,
     )?;
-    serde_json::to_string(&PredictionPayload {
+    Ok(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
@@ -7631,7 +7627,6 @@ fn predict_encoded_table_full_conformal_impl(
         point_covariance_source: None,
         point_covariance_note: None,
     })
-    .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }
 
 /// Full-conformal prediction intervals — no held-out calibration fold required
@@ -7646,7 +7641,8 @@ fn predict_encoded_table_full_conformal_impl(
 /// finite-sample ≥`conformal_level` marginal-coverage theorem. The returned
 /// `conformal_certificate` column is `0` (exact_frozen) or `1` (honest_refit)
 /// for such rows and a negative refusal code otherwise (the frozen-ρ set, no
-/// guarantee). Returns the same column JSON as `predict_table` plus that column.
+/// guarantee). Returns the same column payload as `predict_table` plus that
+/// column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
 /// weighted, scan-routed, …) directing the user to split conformal.
@@ -7659,7 +7655,7 @@ fn predict_table_full_conformal(
     training_headers: Vec<String>,
     training_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
-) -> PyResult<String> {
+) -> PyResult<PyObject> {
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     training_rows
@@ -7667,9 +7663,10 @@ fn predict_table_full_conformal(
         .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let training = training_rows.dataset.clone();
-    detach_py_result(py, "predict_table_full_conformal", move || {
+    let payload = detach_py_result(py, "predict_table_full_conformal", move || {
         predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level)
-    })
+    })?;
+    prediction_payload_into_py(py, payload)
 }
 
 /// #1057 Posterior-predictive replicate sampling — `model.sample_replicates`.
@@ -7781,11 +7778,11 @@ fn generative_replicates_encoded_impl(
 }
 
 fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
-    let ordered = ordered_prediction_column_values(&columns);
+    let ordered = ordered_prediction_column_entries(columns);
     let n_cols = ordered.len();
-    let n_rows = ordered.first().map(|values| values.len()).unwrap_or(0);
+    let n_rows = ordered.first().map(|(_, values)| values.len()).unwrap_or(0);
     let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-    for (j, values) in ordered.into_iter().enumerate() {
+    for (j, (_, values)) in ordered.into_iter().enumerate() {
         if values.len() != n_rows {
             return Err("prediction columns have inconsistent lengths".to_string());
         }
@@ -7796,24 +7793,93 @@ fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, 
     Ok(out)
 }
 
-fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
+fn ordered_prediction_column_entries(
+    mut columns: BTreeMap<String, Vec<f64>>,
+) -> Vec<(String, Vec<f64>)> {
     // Single source of truth for the user-facing column order; the numpy
-    // (Array2) path and the Python dict path (`ordered_prediction_columns`)
-    // must agree, so both read `PREFERRED_PREDICTION_COLUMNS`.
-    let mut out = Vec::<Vec<f64>>::new();
-    let mut seen = BTreeSet::<&str>::new();
+    // (Array2) path and the Python dict path (`prediction_payload_into_py`)
+    // must agree, so both read `PREFERRED_PREDICTION_COLUMNS`. The columns are
+    // moved, never copied.
+    let mut out = Vec::with_capacity(columns.len());
     for key in PREFERRED_PREDICTION_COLUMNS.iter().copied() {
-        if let Some(values) = columns.get(key) {
-            out.push(values.clone());
-            seen.insert(key);
+        if let Some(entry) = columns.remove_entry(key) {
+            out.push(entry);
         }
     }
-    for (key, values) in columns {
-        if !seen.contains(key.as_str()) {
-            out.push(values.clone());
-        }
-    }
+    out.extend(columns);
     out
+}
+
+/// A table prediction as the engine produced it. Point payloads cross to
+/// Python as a dict of numpy columns; survival and competing-risks payloads
+/// keep their structured serializers and are decoded here, in Rust, so every
+/// `predict_table` result reaches Python as the same kind of object.
+enum TablePrediction {
+    Point(PredictionPayload),
+    Survival(String),
+    CompetingRisks(String),
+}
+
+impl TablePrediction {
+    fn into_py(self, py: Python<'_>) -> PyResult<PyObject> {
+        let (decoded, class) = match self {
+            Self::Point(payload) => return prediction_payload_into_py(py, payload),
+            Self::Survival(raw) => (
+                survival_prediction_payload_from_json(py, &raw)?,
+                "survival_prediction",
+            ),
+            Self::CompetingRisks(raw) => (
+                competing_risks_prediction_payload_from_json(py, &raw)?,
+                "competing_risks_prediction",
+            ),
+        };
+        decoded.bind(py).cast::<PyDict>()?.set_item("class", class)?;
+        Ok(decoded)
+    }
+}
+
+/// Hand a point payload to Python without a JSON round trip: scalar metadata
+/// as `str` values and `columns` as an insertion-ordered dict of float64
+/// arrays, each built from its moved `Vec<f64>` without a copy. Optional
+/// provenance keys are present only when set, matching the omitted-when-`None`
+/// wire shape the payload has always had.
+fn prediction_payload_into_py(py: Python<'_>, payload: PredictionPayload) -> PyResult<PyObject> {
+    let PredictionPayload {
+        columns,
+        model_class,
+        point_column,
+        point_shape,
+        point_columns,
+        family,
+        interval_method,
+        covariance_source,
+        point_covariance_source,
+        point_covariance_note,
+    } = payload;
+    let out = PyDict::new(py);
+    out.set_item("model_class", model_class)?;
+    out.set_item("point_column", point_column)?;
+    out.set_item("point_shape", point_shape)?;
+    if let Some(point_columns) = point_columns {
+        out.set_item("point_columns", point_columns)?;
+    }
+    out.set_item("family", family)?;
+    for (key, value) in [
+        ("interval_method", interval_method),
+        ("covariance_source", covariance_source),
+        ("point_covariance_source", point_covariance_source),
+        ("point_covariance_note", point_covariance_note),
+    ] {
+        if let Some(value) = value {
+            out.set_item(key, value)?;
+        }
+    }
+    let ordered = PyDict::new(py);
+    for (key, values) in ordered_prediction_column_entries(columns) {
+        ordered.set_item(key, values.into_pyarray(py))?;
+    }
+    out.set_item("columns", ordered)?;
+    Ok(out.into_any().unbind())
 }
 
 fn parse_sample_options(options_json: Option<&str>) -> Result<PySampleOptions, String> {

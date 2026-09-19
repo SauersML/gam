@@ -38,6 +38,14 @@ contrast, is a `Model` method.)
 ## summary()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 s = model.summary()
 print(s)                       # text repr; HTML in notebooks
 s["formula"]
@@ -126,6 +134,16 @@ covariates**.
 That is what `basis_check` measures, and what every fit now measures for itself:
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+pcs = rng.normal(0, 1, (400, 4))
+dose = rng.uniform(0, 2, 400)
+eta = -0.5 + 0.8 * dose + np.sin(pcs[:, 0]) + 0.5 * pcs[:, 1] * pcs[:, 2]
+data = {"dose": dose, **{f"pc{j + 1}": pcs[:, j] for j in range(4)},
+        "case": (rng.uniform(size=400) < 1 / (1 + np.exp(-eta))).astype(float)}
+
 model = gamfit.fit(data, "case ~ dose + duchon(pc1, pc2, pc3, pc4, centers=24)",
                    family="binomial")
 # 1. when the basis is too small, the fit already told you, as a GamInferenceWarning:
@@ -226,6 +244,15 @@ the model's class publishes through `predict(..., return_type="dict")`.
 ## check()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+test_df = {"x": np.linspace(0.5, 9.5, 20)}
+
 check = model.check(test_df)
 
 if check.ok:
@@ -244,6 +271,14 @@ and `schema_error`.
 ## validate_formula()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+site = rng.choice(["a", "b", "c"], 300)
+data = {"x": x, "site": site, "y": np.sin(x) + (site == "b") + rng.normal(0, 0.3, 300)}
+
 v = gamfit.validate_formula(
     data,
     "y ~ s(x) + group(site)",
@@ -279,6 +314,13 @@ fit-only objects `constraints`, `latents`, `penalties`, `smooths`,
 
 ```python
 import matplotlib.pyplot as plt
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
 
 fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 model.plot(train_df, x="x", kind="prediction",            ax=axes[0])
@@ -309,6 +351,14 @@ matplotlib (install `gamfit[plot]`).
 ## report()
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 model.report("report.html")       # writes the file and returns its path
 html = model.report()             # returns the HTML string
 ```
@@ -322,6 +372,14 @@ for notebook display.
 ## Inspecting the model object
 
 ```python
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+train_df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+model = gamfit.fit(train_df, "y ~ s(x)")
+
 model.formula                   # str
 model.family_name               # str, e.g. "Gaussian Identity"
 model.model_class               # str, e.g. "standard", "survival marginal-slope"
@@ -340,7 +398,7 @@ These are read-only properties.
 
 | Symptom | Try this |
 | --- | --- |
-| `diag.metrics["r_squared"]` low on training | The basis may be too small for the function. `k` is an upper bound on each smooth's flexibility, and REML chooses how much of it to use. Run `basis_check(data)` and raise `k` where it reports the basis is inadequate, or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
+| `diag.metrics["r_squared"]` low on training | A fixed basis may be too small for the function. A default `s(x)` grows its own basis, but an explicit `k`, a `by=` smooth and the tensor-product, cyclic, factor-smooth and Matérn bases do not. Run `basis_check(data)`; where it reports a fixed basis is inadequate, drop the `k=` on an `s(x)` or give the other bases a larger `k`. Or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
 | `rmse` low on training, high on test | Lowering `k` is not the fix: REML already penalizes wiggliness the data do not support. Check for leakage between training and test rows, for a shift between them, and for terms that should not be in the model. |
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |

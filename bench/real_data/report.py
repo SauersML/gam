@@ -1,0 +1,238 @@
+"""Render real-data leaderboard records as ``leaderboard.json`` + ``LEADERBOARD.md``.
+
+    python -m bench.real_data.report RUN_DIR
+
+Per (dataset, lib) the folds are aggregated as: ok folds out of those
+attempted, median fit wall / CPU time, the largest process-tree peak RSS,
+and the mean over ok folds of held-out deviance, RMSE and (Gaussian) 95%
+prediction-interval coverage and width. A dataset's headline row compares
+gamfit against pyGAM's gridsearch (``pygam_gs``, the fair comparator) on the
+folds both finished; every fold a library did not finish is printed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Iterable
+
+Record = dict[str, Any]
+LIB_ORDER = ("gamfit", "gamfit_auto", "pygam", "pygam_gs")
+
+
+def _mean(xs: Iterable[float | None]) -> float | None:
+    vals = [x for x in xs if x is not None]
+    return statistics.fmean(vals) if vals else None
+
+
+def _median(xs: Iterable[float | None]) -> float | None:
+    vals = [x for x in xs if x is not None]
+    return statistics.median(vals) if vals else None
+
+
+def aggregate(records: list[Record]) -> dict[str, dict[str, dict[str, Any]]]:
+    by: dict[str, dict[str, list[Record]]] = defaultdict(lambda: defaultdict(list))
+    for r in records:
+        by[r["dataset"]][r["lib"]].append(r)
+    out: dict[str, dict[str, dict[str, Any]]] = {}
+    for name, libs in by.items():
+        out[name] = {}
+        for lib, recs in libs.items():
+            ok = [r for r in recs if r["status"] == "ok"]
+            out[name][lib] = {
+                "family": recs[0]["family"],
+                "n": next((r["n"] for r in recs if "n" in r), None),
+                "folds": len(recs),
+                "ok_folds": len(ok),
+                "ok_fold_ids": sorted(r["fold"] for r in ok),
+                "certified_folds": sum(r.get("certified") is True for r in ok),
+                "failures": {
+                    str(r["fold"]): {
+                        "status": r["status"],
+                        "error": _first_error(r),
+                    }
+                    for r in recs
+                    if r["status"] != "ok"
+                },
+                "fit_s": _median(r.get("fit_s") for r in ok),
+                "fit_cpu_s": _median(r.get("fit_cpu_s") for r in ok),
+                "pred_s": _median(r.get("pred_s") for r in ok),
+                "peak_rss_mb": max((r.get("peak_tree_rss_mb") or 0.0 for r in recs), default=None),
+                "deviance": _mean(r.get("deviance") for r in ok),
+                "deviance_by_fold": {str(r["fold"]): r.get("deviance") for r in ok},
+                "rmse": _mean(r.get("rmse") for r in ok),
+                "coverage": _mean(r.get("coverage") for r in ok),
+                "pi_width": _mean(r.get("pi_width") for r in ok),
+                "logscore": _mean(r.get("logscore") for r in ok),
+                "edf": _mean(r.get("edf") for r in ok),
+                "pygam_not_converged_folds": sum(bool(r.get("pygam_not_converged")) for r in ok),
+                "auto_formula": next((r["auto_formula"] for r in ok if r.get("auto_formula")), None),
+                "lib_version": next((r["lib_version"] for r in recs if r.get("lib_version")), None),
+            }
+    return out
+
+
+def _first_error(r: Record) -> str | None:
+    errs = r.get("errors") or {}
+    for text in errs.values():
+        lines = [ln for ln in str(text).strip().splitlines() if ln.strip()]
+        return lines[-1][:300] if lines else None
+    tail = r.get("stderr_tail")
+    if tail:
+        lines = [ln for ln in str(tail).strip().splitlines() if ln.strip()]
+        return lines[-1][:300] if lines else None
+    return None
+
+
+def _paired_dev(a: dict[str, Any], b: dict[str, Any]) -> tuple[float, float, int] | None:
+    folds = sorted(set(a["deviance_by_fold"]) & set(b["deviance_by_fold"]))
+    pairs = [
+        (a["deviance_by_fold"][f], b["deviance_by_fold"][f])
+        for f in folds
+        if a["deviance_by_fold"][f] is not None and b["deviance_by_fold"][f] is not None
+    ]
+    if not pairs:
+        return None
+    return statistics.fmean(p[0] for p in pairs), statistics.fmean(p[1] for p in pairs), len(pairs)
+
+
+def _f(x: float | None, spec: str = ".4g") -> str:
+    return "—" if x is None or (isinstance(x, float) and not math.isfinite(x)) else format(x, spec)
+
+
+def _ok(cell: dict[str, Any] | None, key: str = "ok_folds") -> str:
+    if cell is None:
+        return "—"
+    s = f"{cell[key]}/{cell['folds']}"
+    return s if cell[key] == cell["folds"] else f"**{s}**"
+
+
+def render(agg: dict[str, dict[str, dict[str, Any]]], meta: dict[str, Any]) -> str:
+    names = [n for n in meta.get("datasets", sorted(agg)) if n in agg]
+    lines: list[str] = []
+    w = lines.append
+    w("# Real-data leaderboard: gamfit vs pyGAM")
+    w("")
+    w(f"Generated by `python -m bench.real_data.run` on {meta.get('host')} "
+      f"({meta.get('nproc')} cores, {_f(meta.get('total_ram_mb', 0) / 1024, '.0f')} GiB), "
+      f"git `{str(meta.get('git_sha'))[:12]}`, {meta.get('started')} → {meta.get('finished')}.")  # fmt: skip
+    w(f"Versions: {', '.join(meta.get('lib_versions', []))}. Every rep is its own "
+      "subprocess with every thread pool pinned to 1 thread. "
+      f"{meta.get('n_folds')}-fold CV, split seed {meta.get('split_seed')} "
+      "(binomial folds stratified on the response).")  # fmt: skip
+    w("")
+    w("`gamfit` fits the dataset's formula, `gamfit_auto` fits `y ~ .`, `pygam` is pyGAM "
+      "at its default smoothing, `pygam_gs` is pyGAM's `gridsearch` (the fair comparator). "
+      "Deviance is the mean held-out unit deviance (lower is better); Δdev is gamfit vs "
+      "pygam_gs on the folds both finished. Coverage is the held-out coverage of the 95% "
+      "prediction interval for a new observation (Gaussian datasets).")  # fmt: skip
+    w("")
+    w("## Headline")
+    w("")
+    w("| dataset | family | n | gamfit certified | fit s gamfit | fit s pygam_gs | speed-up | "
+      "dev gamfit | dev pygam_gs | Δdev | cov gamfit | cov pygam_gs | peak MB gamfit | peak MB pygam_gs |")  # fmt: skip
+    w("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    speedups: list[float] = []
+    dev_wins = dev_losses = 0
+    for name in names:
+        libs = agg[name]
+        g, gs = libs.get("gamfit"), libs.get("pygam_gs")
+        any_cell = g or gs or next(iter(libs.values()))
+        spd = dd = None
+        dev_g = dev_gs = None
+        if g and gs:
+            if g["fit_s"] and gs["fit_s"]:
+                spd = gs["fit_s"] / g["fit_s"]
+                speedups.append(spd)
+            pd = _paired_dev(g, gs)
+            if pd:
+                dev_g, dev_gs, _ = pd
+                dd = (dev_g - dev_gs) / abs(dev_gs) if dev_gs else None
+                if dd is not None:
+                    dev_wins += dd < 0
+                    dev_losses += dd > 0
+        w(f"| {name} | {any_cell['family']} | {any_cell['n']} | {_ok(g, 'certified_folds')} | "
+          f"{_f(g and g['fit_s'], '.3f')} | {_f(gs and gs['fit_s'], '.3f')} | "
+          f"{_f(spd, '.1f')}× | {_f(dev_g)} | {_f(dev_gs)} | {_f(dd and 100 * dd, '+.1f')}% | "
+          f"{_f(g and g['coverage'], '.3f')} | {_f(gs and gs['coverage'], '.3f')} | "
+          f"{_f(g and g['peak_rss_mb'], '.0f')} | {_f(gs and gs['peak_rss_mb'], '.0f')} |")  # fmt: skip
+    w("")
+    if speedups:
+        gm = math.exp(statistics.fmean(math.log(s) for s in speedups))
+        w(f"Geometric-mean fit speed-up of gamfit over pygam_gs: **{gm:.1f}×** over "
+          f"{len(speedups)} datasets (min {min(speedups):.1f}×, max {max(speedups):.1f}×). "
+          f"Held-out deviance: gamfit lower on {dev_wins}, higher on {dev_losses}.")  # fmt: skip
+        w("")
+    w("## Every library")
+    w("")
+    w("| dataset | lib | ok | fit s | fit CPU s | predict s | peak MB | deviance | RMSE | "
+      "coverage | PI width | edf | pyGAM not-converged folds |")  # fmt: skip
+    w("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name in names:
+        for lib in LIB_ORDER:
+            c = agg[name].get(lib)
+            if c is None:
+                continue
+            nc = str(c["pygam_not_converged_folds"]) if lib.startswith("pygam") else ""
+            w(f"| {name} | {lib} | {_ok(c)} | {_f(c['fit_s'], '.3f')} | "
+              f"{_f(c['fit_cpu_s'], '.3f')} | {_f(c['pred_s'], '.3f')} | "
+              f"{_f(c['peak_rss_mb'], '.0f')} | {_f(c['deviance'])} | {_f(c['rmse'])} | "
+              f"{_f(c['coverage'], '.3f')} | {_f(c['pi_width'])} | {_f(c['edf'], '.1f')} | {nc} |")  # fmt: skip
+    w("")
+    failures = [
+        (name, lib, fold, f)
+        for name in names
+        for lib, c in agg[name].items()
+        for fold, f in c["failures"].items()
+    ]
+    w("## Folds not finished")
+    w("")
+    if not failures:
+        w("None: every library finished every fold of every dataset.")
+    else:
+        w("| dataset | lib | fold | status | error |")
+        w("|---|---|---:|---|---|")
+        for name, lib, fold, f in failures:
+            err = (f["error"] or "").replace("|", "\\|")
+            w(f"| {name} | {lib} | {fold} | {f['status']} | {err} |")
+    w("")
+    autos = [(n, agg[n]["gamfit_auto"]["auto_formula"]) for n in names
+             if agg[n].get("gamfit_auto", {}).get("auto_formula")]  # fmt: skip
+    if autos:
+        w("## Formulas")
+        w("")
+        w("| dataset | explicit formula (gamfit, pyGAM terms) | `y ~ .` expanded by gamfit |")
+        w("|---|---|---|")
+        from .datasets import REGISTRY
+
+        for n, auto in autos:
+            w(f"| {n} | `{REGISTRY[n].formula}` | `{auto}` |")
+        w("")
+    return "\n".join(lines)
+
+
+def write(records: list[Record], meta: dict[str, Any], out_dir: Path) -> None:
+    agg = aggregate(records)
+    (out_dir / "leaderboard.json").write_text(
+        json.dumps({"meta": meta, "leaderboard": agg}, indent=2, sort_keys=True) + "\n"
+    )
+    (out_dir / "LEADERBOARD.md").write_text(render(agg, meta))
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("run_dir", type=Path)
+    args = ap.parse_args(argv)
+    records = [json.loads(ln) for ln in (args.run_dir / "records.jsonl").read_text().splitlines() if ln]
+    meta = json.loads((args.run_dir / "meta.json").read_text())
+    write(records, meta, args.run_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

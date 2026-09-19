@@ -1,0 +1,5 @@
+
+== gamma (n=600, reps=4)
+  gamfit            RMSE 0.2118 (sd 0.0804)  cover95 0.937  time 14.25s  ok=4
+  pygam_default     RMSE 0.3515 (sd 0.0361)  cover95 0.938  time 24.58s  ok=4
+  pygam_gridsearch  RMSE 0.2813 (sd 0.0730)  cover95 0.859  time 228.59s  ok=4
