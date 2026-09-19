@@ -19,10 +19,13 @@ import os
 from dataclasses import dataclass, field
 
 from .worker import DESIGNS as ALL_DESIGNS
-from .worker import FAMILIES, LIBS
+from .worker import EXTRA_DESIGNS, FAMILIES, LIBS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
 SMALL_N_DESIGNS: tuple[str, ...] = ("p1", "p3", "p5")
+# The Gaussian identity sweep (audit lane sweep-gaussian): every core design
+# plus a tensor-with-additive-smooth and a factor-by smooth.
+GAUSSIAN_SWEEP_DESIGNS: tuple[str, ...] = ALL_DESIGNS + EXTRA_DESIGNS
 
 
 @dataclass(frozen=True)
@@ -63,11 +66,15 @@ class Plan:
     libs: tuple[str, ...] = field(default=LIBS)
 
 
-def _grid(ns: tuple[int, ...], designs: tuple[str, ...]) -> tuple[Cell, ...]:
+def _grid(
+    ns: tuple[int, ...],
+    designs: tuple[str, ...],
+    families: tuple[str, ...] = FAMILIES,
+) -> tuple[Cell, ...]:
     # Ordered by n ascending so a timeout at small n can mark the larger n of
     # the same (lib, family, design) as not run instead of burning the net on
     # each one in turn.
-    return tuple(Cell(f, n, d) for n in ns for f in FAMILIES for d in designs)
+    return tuple(Cell(f, n, d) for n in ns for f in families for d in designs)
 
 
 SCALING_NS: tuple[int, ...] = (10_000, 100_000, 1_000_000)
@@ -155,6 +162,33 @@ PLANS: dict[str, Plan] = {
                 Cell(f, 1_000_000, d) for f in ("gaussian", "poisson") for d in ("p1", "p5")
             ),
             reps=1,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="gaussian_small",
+            description=(
+                "Gaussian identity, n in {1e2, 1e3, 1e4} x {p1, p5, p20, te, te+s, by},"
+                " 3 reps (the nightly Gaussian regression cells)"
+            ),
+            cells=_grid((100, 1_000, 10_000), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=1_200.0,
+        ),
+        Plan(
+            name="gaussian_1e5",
+            description="Gaussian identity, n=1e5 x {p1, p5, p20, te, te+s, by}, 3 reps",
+            cells=_grid((100_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
+            timeout_s=3_600.0,
+        ),
+        Plan(
+            name="gaussian_1e6",
+            description=(
+                "Gaussian identity, n=1e6 x {p1, p5, p20, te, te+s, by}, 3 reps:"
+                " wall, CPU and peak RSS at the largest scale"
+            ),
+            cells=_grid((1_000_000,), GAUSSIAN_SWEEP_DESIGNS, ("gaussian",)),
+            reps=3,
             timeout_s=3_600.0,
         ),
         Plan(
