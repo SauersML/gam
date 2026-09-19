@@ -49,7 +49,7 @@ The engine also provides, past fitting and point prediction (see
   intervals (split, jackknife+, and full conformal), and posterior draws
   via NUTS or a Laplace approximation, with posterior-predictive checks.
 - **Model comparison** — per-term Wald and likelihood-ratio tests, and
-  AIC / approximate-leave-one-out comparison via `compare_models`.
+  ranking on the smoothing-corrected AIC via `compare_models`.
 - **Difference smooths** — covariance-aware contrasts between by-group
   smooths, with optional simultaneous bands.
 - **Diagnostics and reports** — `summary` (coefficient table, effective
@@ -111,7 +111,7 @@ gam report model.json data.csv
 ```
 
 CLI subcommands: `fit`, `predict`, `report`, `diagnose`, `sample`,
-`generate`. Run `gam <command> --help` for options.
+`generate`, `compare`. Run `gam <command> --help` for options.
 
 ## Examples
 
@@ -314,8 +314,9 @@ gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=["sand
 gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=["nx", "ny", "nz"])
 ```
 
-Model comparison. `compare_models` reports AIC and approximate
-leave-one-out (elpd), corrected for smoothing-parameter selection.
+Model comparison. `compare_models` ranks fits on the Wood-Pya-Saefken AIC,
+corrected for smoothing-parameter selection (`gam compare` prints the same
+document from saved models).
 
 ```python
 gamfit.compare_models([model_a, model_b])

@@ -1263,39 +1263,18 @@ class Model:
             return shares[term]
         return shares
 
-    @property
-    def conditional_aic(self) -> float:
-        """Model-selection cost for this fit, on the same rank scale used by
-        ``gamfit.compare_models`` to pick its winner: the Occam-penalised
-        conditional AIC (``-2*loglik + 2*edf``). Both the ordinary
-        log-likelihood and effective degrees of freedom are required; raw REML /
-        LAML is a different estimand and is never used as a fallback (#2079).
-        It is a *cost*, so **lower is better** -- the model with the smaller
-        ``conditional_aic`` is the better-supported one, agreeing with the
-        winner reported by ``gamfit.compare_models``. It is not a marginal
-        likelihood or evidence (#2946). Use :meth:`evidence_ratio_vs` or
-        ``gamfit.compare_models`` for a direct comparison. (The raw REML/LAML
-        criterion remains available as ``Summary.reml_score`` and the
-        ``score_table`` column of ``gamfit.compare_models``.)
-        """
-        return float(rust_module().model_conditional_aic(self._model_bytes))
-
     def evidence_ratio_vs(self, other: "Model") -> float:
         """Akaike evidence ratio of this fit over ``other``.
 
-        ``exp(-(self.conditional_aic - other.conditional_aic) / 2)``: the
-        relative likelihood of the two fits under the conditional-AIC criterion that
-        ``gamfit.compare_models`` ranks on (Burnham & Anderson). Returns ``> 1``
-        when this fit is better supported than ``other`` (i.e. has the lower
-        :attr:`conditional_aic` cost) and ``< 1`` otherwise, agreeing with the winner
-        reported by ``gamfit.compare_models``.
+        ``exp((other_aic - self_aic) / 2)`` on the smoothing-corrected AIC
+        (``Summary.aic_corrected``) that ``gamfit.compare_models`` ranks on
+        (Burnham & Anderson's relative likelihood). Returns ``> 1`` when this
+        fit is better supported than ``other`` and ``< 1`` otherwise, agreeing
+        with the winner ``gamfit.compare_models`` reports. Both fits must share
+        the response family and the number of observations.
 
-        This is **not** a Bayes factor. A Bayes factor is a ratio of
-        prior-integrated marginal likelihoods; this quantity integrates over no
-        prior and must not be read against Jeffreys / Kass-Raftery thresholds.
-        (The raw REML/LAML headline in the ``score_table`` of
-        ``gamfit.compare_models`` is the Laplace-approximate marginal-likelihood
-        diagnostic, kept on its own labelled scale.)
+        This is **not** a Bayes factor: it integrates over no prior and must
+        not be read against Jeffreys / Kass-Raftery thresholds.
         """
         # allow-list (a): FFI input validation.
         if not isinstance(other, Model):
