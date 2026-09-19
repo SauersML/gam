@@ -531,9 +531,8 @@ where
     )
 }
 
-pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
-    let gaussian = matches!(link, LinkFunction::Identity);
-    if gaussian {
+pub(crate) fn external_reml_seed_config(k: usize, gaussian_identity: bool) -> SeedConfig {
+    if gaussian_identity {
         // Profiled Gaussian REML already constructs and scores two
         // data-derived starts below: the commensurate-curvature `initial.sp`
         // point and the certified summed-penalty diagonal profile.  Sending
@@ -1051,6 +1050,14 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
     Ok(())
 }
 
+/// The Student-t `(σ, ν)` at the outer coordinates `(ln(σ/s₀), ln ν)`, where
+/// `s₀` is [`pirls::student_t_reference_scale`]. The shift by `ln s₀` leaves
+/// every derivative of the criterion in `ln σ` unchanged and makes the
+/// coordinate, its box, and the zero seed equivariant under `y ↦ a·y`.
+fn student_t_outer_point(reference_scale: f64, log_relative_sigma: f64, log_nu: f64) -> (f64, f64) {
+    (reference_scale * log_relative_sigma.exp(), log_nu.exp())
+}
+
 pub(crate) fn optimize_external_designwith_heuristic_log_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -1092,6 +1099,18 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    // Student-t `(σ, ν)` are outer LAML hyperparameters searched jointly with
+    // ρ in the coordinates `(ln(σ/s₀), ln ν)` (see `student_t_outer_point`).
+    // Install the zero seed before any evaluation reads the family.
+    let student_t_reference_scale = match cfg.likelihood.student_t_parameters() {
+        Some(_) => Some(pirls::student_t_reference_scale(y, offset, w)?),
+        None => None,
+    };
+    let mut cfg = cfg;
+    if let Some(scale) = student_t_reference_scale {
+        let (sigma, nu) = student_t_outer_point(scale, 0.0, 0.0);
+        cfg.likelihood = cfg.likelihood.clone().with_student_t(sigma, nu);
+    }
     reject_prefit_unpenalized_rank_deficiency(w, &x_fit, &canonical)?;
     reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
 
@@ -1241,7 +1260,7 @@ where
             .store(theta_seed.to_bits(), Ordering::Relaxed);
     }
 
-    let reml_seed_config = external_reml_seed_config(k, cfg.link_function());
+    let reml_seed_config = external_reml_seed_config(k, cfg.likelihood.spec.is_gaussian_identity());
     // #2363: pin the λ-search nuisance BEFORE any warm start — external, in
     // memory, or on disk — can reach this state. `freeze_lambda_search_nuisance_at_canonical_anchor`
     // documents why the criterion is otherwise a function of the search path.
@@ -1285,6 +1304,7 @@ where
         .map(|s| s.initial_rho.len())
         .unwrap_or(0);
     let sas_dim = if sas_optspec.is_some() { 2 } else { 0 };
+    let student_t_dim = if student_t_reference_scale.is_some() { 2 } else { 0 };
     let sasridgeweight = if sas_dim > 0 {
         sas_log_deltaridgeweight()
     } else {
@@ -1338,7 +1358,7 @@ where
             crate::bail_invalid_estim!(
                 "simultaneous mixture and SAS optimization is not supported"
             );
-        } else if mixture_dim == 0 && sas_dim == 0 {
+        } else if mixture_dim == 0 && sas_dim == 0 && student_t_dim == 0 {
             use crate::rho_optimizer::{OuterEvalOrder, OuterProblem};
             use gam_problem::{DeclaredHessianForm, Derivative};
 
@@ -1800,7 +1820,9 @@ where
             let use_sas = sas_dim > 0;
             let use_beta_logistic =
                 use_sas && matches!(cfg.link_function(), LinkFunction::BetaLogistic);
-            let theta_dim = k + mixture_dim + sas_dim;
+            let theta_dim = k + mixture_dim + sas_dim + student_t_dim;
+            // The Student-t block trails every link-shape coordinate.
+            let student_t_offset = k + mixture_dim + sas_dim;
             let sasspec = sas_optspec;
             let mixspec = mixture_optspec
                 .clone()
@@ -1828,13 +1850,16 @@ where
                     heuristic_theta.push(spec.initial_epsilon);
                     heuristic_theta.push(spec.initial_log_delta);
                 }
+                if student_t_dim > 0 {
+                    heuristic_theta.extend_from_slice(&[0.0, 0.0]);
+                }
             }
             let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
                 Some(heuristic_theta.as_slice())
             } else {
                 None
             };
-            let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
+            let aux_dim_outer = mixture_dim + sas_dim + student_t_dim;
             let mut reml_seed_config_mix = reml_seed_config;
             reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
             if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
@@ -1844,6 +1869,7 @@ where
             use crate::rho_optimizer::OuterProblem;
             use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
+            let initial_likelihood = cfg.likelihood.clone();
             // Same criterion, same declaration as the profiled-REML arm above
             // (#1082): this is the location-scale / SAS-mixture LAML score, a
             // sum over the same n rows, so its d/d-theta inherits the same O(n)
@@ -1860,7 +1886,7 @@ where
             // the edge of its support (`smooth_bound_support`), and the standardized
             // beta-logistic `[ε, log δ]` are log-shape coordinates like the mixture
             // logit (#2902 row 34).
-            let (link_lower, link_upper): (Vec<f64>, Vec<f64>) = if use_mixture {
+            let (mut link_lower, mut link_upper): (Vec<f64>, Vec<f64>) = if use_mixture {
                 let (lower, upper) = crate::estimate::rho_domain::precision_box();
                 (vec![lower; mixture_dim], vec![upper; mixture_dim])
             } else if use_beta_logistic {
@@ -1869,7 +1895,7 @@ where
                 // box, as a mixture free logit does (#2902 row 34).
                 let (lower, upper) = crate::estimate::rho_domain::precision_box();
                 (vec![lower; sas_dim], vec![upper; sas_dim])
-            } else {
+            } else if use_sas {
                 let (epsilon_lower, epsilon_upper) =
                     crate::estimate::evaluation::sas_epsilon_domain();
                 let (log_delta_lower, log_delta_upper) =
@@ -1878,7 +1904,16 @@ where
                     vec![epsilon_lower, log_delta_lower],
                     vec![epsilon_upper, log_delta_upper],
                 )
+            } else {
+                (Vec::new(), Vec::new())
             };
+            // Student-t `ln(σ/s₀)` and `ln ν` are log-scale coordinates with no
+            // penalty spectrum, so they take the precision box too.
+            if student_t_dim > 0 {
+                let (lower, upper) = crate::estimate::rho_domain::precision_box();
+                link_lower.extend_from_slice(&[lower; 2]);
+                link_upper.extend_from_slice(&[upper; 2]);
+            }
             let theta_lower =
                 Array1::from_iter(rho_model_domain.0.iter().copied().chain(link_lower));
             let theta_upper =
@@ -1893,7 +1928,7 @@ where
                 .with_prefer_gradient_only(false)
                 .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
-                .with_psi_dim(mixture_dim + sas_dim)
+                .with_psi_dim(mixture_dim + sas_dim + student_t_dim)
                 .with_barrier(
                     crate::estimate::reml::reml_outer_engine::BarrierConfig::from_constraints(
                         fit_linear_constraints.as_ref(),
@@ -1974,6 +2009,14 @@ where
                     cfg_eval.link_kind.mixture_state().cloned(),
                     cfg_eval.link_kind.sas_state().copied(),
                 );
+                if let Some(scale) = student_t_reference_scale {
+                    let (sigma, nu) = student_t_outer_point(
+                        scale,
+                        theta[student_t_offset],
+                        theta[student_t_offset + 1],
+                    );
+                    state.set_student_t_state(sigma, nu)?;
+                }
                 Ok(rho)
             };
 
@@ -2064,7 +2107,7 @@ where
                 }
 
                 let cost_sec = tcost.elapsed().as_secs_f64();
-                let aux_dim = if use_mixture { mixture_dim } else { sas_dim };
+                let aux_dim = mixture_dim + sas_dim + student_t_dim;
                 log::debug!(
                     "[outer-eval {eval_idx}] theta_dim={} aux_dim={} unified_link_ext time_sec={:.3}",
                     theta_dim,
@@ -2084,6 +2127,7 @@ where
                     initial_link_kind.mixture_state().cloned(),
                     initial_link_kind.sas_state().copied(),
                 );
+                state.restore_student_t_state(&initial_likelihood);
             }),
             Some(
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>,
@@ -2133,7 +2177,12 @@ where
             // Same exact-seed cache publish/consume symmetry as the standard
             // REML arm above (issue #236).
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
-            let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
+            let context = if student_t_dim > 0 {
+                "Student-t scale and degrees of freedom"
+            } else {
+                "mixture/SAS flexible link"
+            };
+            let outer_result = problem.run(&mut obj, context)?;
             drop(obj);
             let final_rho = outer_result.rho.slice(s![..k]).to_owned();
             // #2727: the remainder of the joint outer coordinate. `final_rho`
@@ -2198,6 +2247,19 @@ where
                 outer_result,
             )
         };
+        // The shipped Student-t `(σ̂, ν̂)`: the trailing block of the certified
+        // joint coordinate, installed on the state every post-fit quantity is
+        // read from and on the family the final fit and the report carry.
+        if let Some(scale) = student_t_reference_scale {
+            let offset_in_link = mixture_dim + sas_dim;
+            let (sigma, nu) = student_t_outer_point(
+                scale,
+                final_link_coords[offset_in_link],
+                final_link_coords[offset_in_link + 1],
+            );
+            reml_state.set_student_t_state(sigma, nu)?;
+            cfg.likelihood = cfg.likelihood.clone().with_student_t(sigma, nu);
+        }
         if estimates_negbin_theta {
             let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
             if frozen_bits == 0 {
@@ -2367,6 +2429,7 @@ where
         // never decides, and the certificate gate after the loop refuses it typed.
         if mixture_dim == 0
             && sas_dim == 0
+            && student_t_dim == 0
             && outer_result.converged()
             && outer_result
                 .criterion_certificate
@@ -2488,7 +2551,7 @@ where
     // inner-solution assembly and must apply the same positive-weight count.
     let n = w_o.iter().filter(|&&wi| wi > 0.0).count() as f64;
     let mut identity_fit_is_exact = false;
-    let weighted_rss = if matches!(cfg.link_function(), LinkFunction::Identity) {
+    let weighted_rss = if cfg.likelihood.spec.is_gaussian_identity() {
         let fitted = {
             let mut eta = offset_o.clone();
             eta += &x_o.matrixvectormultiply(&beta_orig);
@@ -3808,6 +3871,8 @@ where
         // K≤16, honest Unavailable beyond) at this same live seam.
         (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
             &final_rho,
+            // The searched and certified box is the posterior's support.
+            &rho_model_domain,
             !opts.skip_rho_posterior_inference,
             None,
         );
@@ -4125,6 +4190,7 @@ where
                 *phi = fitted_phi;
             }
         }
+
         // Every other scale metadata is either fixed (nothing was estimated to
         // thread back), or belongs to a family whose variant carries no
         // dispersion at all — Gamma shape and Tweedie φ live only on
@@ -4139,6 +4205,19 @@ where
         | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
         | LikelihoodScaleMetadata::FixedNegBinTheta { .. }
         | LikelihoodScaleMetadata::Unspecified => {}
+    }
+    // Student-t `(σ̂, ν̂)` are outer hyperparameters carried on the family
+    // variant rather than scale metadata; the final fit read them from there.
+    if let (
+        ResponseFamily::StudentT { sigma, nu },
+        ResponseFamily::StudentT {
+            sigma: fitted_sigma,
+            nu: fitted_nu,
+        },
+    ) = (&mut reported_family.response, &pirls_res.likelihood.spec.response)
+    {
+        *sigma = *fitted_sigma;
+        *nu = *fitted_nu;
     }
     // The fully-normalized reporting kernel (#2096) reads a CONCRETE dispersion
     // `φ = σ̂²` for Gaussian off `likelihood.scale`. A profiled Gaussian carries

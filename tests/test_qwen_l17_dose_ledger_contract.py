@@ -85,6 +85,20 @@ def test_only_targets_above_the_floor_are_requested() -> None:
         DRIVER.dose_floor([], 30)
 
 
+def test_router_topk_changes_count_token_rows_whose_expert_set_moved() -> None:
+    base = [np.asarray([[1, 2], [3, 4]]), np.asarray([[5, 6], [7, 8]])]
+    # Call 0: row 0 keeps {1, 2} in another order, row 1 trades expert 4 for 5.
+    # Call 1: both rows keep their sets. One row in total changed its set.
+    patched = [np.asarray([[2, 1], [3, 5]]), np.asarray([[5, 6], [8, 7]])]
+    assert DRIVER.router_topk_changes(base, patched) == 1
+    assert DRIVER.router_topk_changes(base, base) == 0
+    assert DRIVER.router_topk_changes([], []) == 0
+    with pytest.raises(ValueError, match="router calls"):
+        DRIVER.router_topk_changes(base, patched[:1])
+    with pytest.raises(ValueError, match="shapes differ"):
+        DRIVER.router_topk_changes(base, [patched[0][:1], patched[1]])
+
+
 def _plan(predicted: float, measured: float) -> dict[str, object]:
     return {
         "predicted_nats": predicted,
@@ -110,6 +124,7 @@ def test_the_assembled_ledger_is_what_the_scorer_accepts() -> None:
                 split=split,
                 fraction_index=k,
                 target_nats=0.01 * (k + 1),
+                router_topk_changes=0,
             )
             for b, split in enumerate(("calibration", "heldout"))
             for k in range(3)

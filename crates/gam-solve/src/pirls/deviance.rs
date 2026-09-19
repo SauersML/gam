@@ -1283,6 +1283,9 @@ pub fn deviance_eta_row_on_measure(
             };
             (half, score)
         }
+        ResponseFamily::StudentT { sigma, nu } => {
+            student_t_half_deviance_and_eta_score(row, y, eta, *sigma, *nu, weight)?
+        }
         ResponseFamily::RoystonParmar => {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(
                 row,
@@ -1788,6 +1791,11 @@ pub fn calculate_null_deviance(
                 },
             )
         }
+        ResponseFamily::StudentT { sigma, nu } => (
+            student_t_null_location(y, priorweights, *sigma, *nu)?,
+            InverseLink::Standard(StandardLink::Identity),
+            likelihood.clone(),
+        ),
         ResponseFamily::Beta { phi } => {
             let eta = beta_null_eta(y, priorweights, *phi)?;
             let inverse_link = InverseLink::Standard(StandardLink::Logit);
@@ -1973,6 +1981,13 @@ fn omitted_log_likelihood_row(
                 "beta log-likelihood row",
             )
         }
+        ResponseFamily::StudentT { sigma, nu } => stable_finite_signed_sum(
+            &[
+                prior_weight * student_t_log_normalizer(*sigma, *nu)?,
+                -deviance.half_deviance,
+            ],
+            "Student-t log-likelihood row",
+        ),
         ResponseFamily::RoystonParmar => Err(EstimationError::pirls_row_geometry_unrepresentable(
             row,
             "Royston-Parmar GLM log-likelihood",
@@ -2325,6 +2340,7 @@ fn full_log_likelihood_row(
         ResponseFamily::Gaussian
         | ResponseFamily::Gamma
         | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::StudentT { .. }
         | ResponseFamily::RoystonParmar => {}
     }
     if matches!(&likelihood.spec.response, ResponseFamily::Poisson) {
@@ -2384,9 +2400,12 @@ fn full_log_likelihood_row(
             }
             value
         }
+        // The Student-t omitted row already carries its full normalizer:
+        // `(σ, ν)` are hyperparameters, so the LAML surface needs it too.
         ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. } => 0.0,
+        | ResponseFamily::Beta { .. }
+        | ResponseFamily::StudentT { .. } => 0.0,
         ResponseFamily::RoystonParmar => {
             return Err(EstimationError::pirls_row_geometry_unrepresentable(
                 row,

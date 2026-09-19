@@ -20,7 +20,7 @@ use penalty_priors::realize_coefficient_groups;
 
 use gam_problem::EstimationError;
 
-use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
+use gam_linalg::faer_ndarray::fast_ab;
 
 use gam_linalg::matrix::{
     BlockDesignOperator, DenseDesignOperator, DesignBlock, DesignMatrix, FiniteSignedWeightsView,
