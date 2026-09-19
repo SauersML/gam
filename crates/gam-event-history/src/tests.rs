@@ -5305,3 +5305,132 @@ fn a_finer_rule_keeps_a_dynamic_factor_forecast_within_the_coarser_ones_error() 
     install_test_logger();
     assert_the_finer_rule_is_within_the_coarser_ones_error("dynamic", true, false);
 }
+
+/// The constant-hazard fixture made risk-set centred by a reference snapshot
+/// whose normaliser `log M(t)` is `log_normaliser` at `times`, the same for
+/// every mark, and linear between them. At rank zero the model's intensities
+/// are then `r_d e^{−log M(t)}`, with a kink at every interior grid time.
+fn kinked_constant_hazard_fit(times: &[f64], log_normaliser: &[f64]) -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
+    let (cohort, mut fit, rates) = constant_hazard_fit();
+    let marks = fit.marks();
+    let gaps = times.windows(2).map(|w| w[1] - w[0]).collect();
+    fit.centring = Some(super::family::RiskSetCentring {
+        grid: ReferenceGrid { times: times.to_vec(), gaps },
+        profiles: Array2::zeros((1, cohort.covariates.ncols())),
+        coefficients: Vec::new(),
+        node_stratum: vec![0; times.len()],
+        log_normaliser: log_normaliser.iter().flat_map(|&m| std::iter::repeat_n(m, marks)).collect(),
+        log_risk_mass: vec![0.0; times.len() * marks],
+        masks: 0,
+        mask_of_mark: vec![0; marks],
+    });
+    (cohort, fit, rates)
+}
+
+/// Every reference-grid time strictly inside a window is one of its level-0
+/// breakpoints, beside its start, its covariate changes and its last horizon.
+/// A grid time outside the window is not, and no horizon is.
+#[test]
+fn every_reference_grid_time_inside_a_window_is_a_level_zero_breakpoint() {
+    let fit = kinked_constant_hazard_fit(&[0.0, 0.7, 1.9, 3.1, 6.0], &[0.0, 0.4, -0.3, 0.2, 0.0]).1;
+    let window = SubjectHistory {
+        id: "window".to_string(),
+        entry: 1.0,
+        exit: 3.5,
+        events: Vec::new(),
+        segments: vec![CovariateSegment { start: 1.0, row: 0 }, CovariateSegment { start: 2.5, row: 0 }],
+    };
+    let breakpoints = super::forecast::window_breakpoints(&fit, &window);
+    emit(&format!("[2963 breakpoints] {breakpoints:?}"));
+    assert_eq!(breakpoints, vec![1.0, 1.9, 2.5, 3.1, 3.5]);
+}
+
+/// `∫₀ʰ e^{−m(t)} dt` for `m` linear between `times` with values `values`,
+/// piece by piece in closed form, with its first-order running bound `μ`
+/// (Higham, *Accuracy and Stability*, ch. 3): the value is within `ε μ`. The
+/// grid's times and values and `h` are exact inputs; every operation charges
+/// its operands' propagated bounds and its result's magnitude, a quotient
+/// through its operands' relative bounds, an exponential the propagated bound
+/// times its value plus one rounding of it.
+fn kinked_exposure(times: &[f64], values: &[f64], h: f64) -> (f64, f64) {
+    let (mut total, mut total_mu) = (0.0_f64, 0.0_f64);
+    for i in 0..times.len() - 1 {
+        let (a, b) = (times[i], times[i + 1].min(h));
+        if !(b > a) {
+            break;
+        }
+        let rise = values[i + 1] - values[i];
+        let span = times[i + 1] - times[i];
+        let slope = rise / span;
+        let slope_mu = slope.abs() * 3.0;
+        let width = b - a;
+        let step = slope * width;
+        let step_mu = width.abs() * slope_mu + step.abs() * 2.0;
+        let end = values[i] + step;
+        let end_mu = step_mu + end.abs();
+        let (e0, e1) = ((-values[i]).exp(), (-end).exp());
+        let num = e0 - e1;
+        let num_mu = e0 + e1 * end_mu + e1 + num.abs();
+        let piece = num / slope;
+        let piece_mu = num_mu / slope.abs() + piece.abs() * (slope_mu / slope.abs() + 1.0);
+        total += piece;
+        total_mu += piece_mu + total.abs();
+    }
+    (total, total_mu)
+}
+
+/// A rank-zero window from the risk-set centred fit's origin across its
+/// reference grid's kinks is its closed form to the checked error. The
+/// survival is `e^{−Λ ∫ e^{−m}}`, and every mark takes its share `r_d/Λ` of
+/// `1 − S`, since all the marks share the one normaliser. The kinks move the
+/// survival away from the constant-rate model's by more than the checked
+/// error: the magnitude floor. The closed forms carry their running bounds
+/// ([`kinked_exposure`]); the fitted rates are exact inputs to both routes.
+#[test]
+fn a_centred_forecast_across_its_reference_grid_matches_its_closed_form() {
+    install_test_logger();
+    let times = [0.0, 0.7, 1.9, 3.1, 6.0];
+    let values = [0.0, 0.4, -0.3, 0.2, 0.0];
+    let (cohort, fit, rates) = kinked_constant_hazard_fit(&times, &values);
+    let total = rates[0] + rates[1];
+    let horizons = [1.3, 2.6, 4.4];
+    let f = constant_hazard_population(&fit, &cohort, &horizons);
+    for (i, &h) in horizons.iter().enumerate() {
+        let (exposure, exposure_mu) = kinked_exposure(&times, &values, h);
+        let total_mu = total.abs();
+        let hazard = total * exposure;
+        let hazard_mu = total.abs() * exposure_mu + exposure.abs() * total_mu + hazard.abs();
+        let survival = (-hazard).exp();
+        let survival_mu = survival * hazard_mu + survival;
+        let decrement = -(-hazard).exp_m1();
+        let decrement_mu = survival * hazard_mu + decrement;
+        let mut closed = [survival, 0.0, 0.0, 0.0];
+        let mut closed_bound = [f64::EPSILON * survival_mu, 0.0, 0.0, 0.0];
+        for d in 0..3 {
+            let share = rates[d] / total;
+            let share_mu = share * (total_mu / total + 1.0);
+            closed[d + 1] = share * decrement;
+            closed_bound[d + 1] = f64::EPSILON * (share * decrement_mu + decrement * share_mu + closed[d + 1]);
+        }
+        let (forecast, errors) = forecast_quantities(&f, i);
+        emit(&format!(
+            "[2963 kinked] h {h}: forecast {forecast:?} errors {errors:?} closed {closed:?} closed bound {closed_bound:?}"
+        ));
+        let constant_rate = (-total * h).exp();
+        assert!(
+            (survival - constant_rate).abs() > errors[0] + closed_bound[0],
+            "h {h}: the kinks move survival from {constant_rate} to {survival} only, within the checked error {}",
+            errors[0]
+        );
+        for q in 0..4 {
+            assert!(
+                (forecast[q] - closed[q]).abs() <= errors[q] + closed_bound[q],
+                "quantity {q} at h {h}: forecast {} vs closed form {}, checked error {} + closed-form bound {}",
+                forecast[q],
+                closed[q],
+                errors[q],
+                closed_bound[q]
+            );
+        }
+    }
+}

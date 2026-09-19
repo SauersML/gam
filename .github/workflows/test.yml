@@ -1276,7 +1276,7 @@ jobs:
             'pytest>=8' 'pytest-xdist>=3' 'pytest-timeout>=2' \
             'numpy>=1.26' 'pandas>=2.0' \
             'pyarrow>=14' 'polars>=1' 'matplotlib>=3.8' 'scikit-learn>=1.4' \
-            'lifelines>=0.28'
+            'lifelines>=0.28' 'mypy>=2.3'
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -1414,7 +1414,7 @@ jobs:
         # should not disagree about whether it is allowed to hang.
         run: |
           python -m pytest tests/ \
-            -m "not slow" \
+            -m "not slow and not static_typing" \
             -n auto --timeout=300 \
             --tb=short -q --junitxml=python-reports/full_suite.xml
 
