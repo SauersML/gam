@@ -448,6 +448,48 @@ class Model:
             training_kind=self._training_table_kind,
         )
 
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
     def predict_array(
         self,
         X: Any,

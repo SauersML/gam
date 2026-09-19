@@ -4808,6 +4808,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(transformation_score_table, module)?)?;
+    module.add_function(wrap_pyfunction!(latent_conditional_residual_table, module)?)?;
     module.add_function(wrap_pyfunction!(residuals_table, module)?)?;
     module.add_function(wrap_pyfunction!(ctn_required_fit_columns, module)?)?;
     module.add_function(wrap_pyfunction!(required_model_columns, module)?)?;

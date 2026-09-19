@@ -138,11 +138,20 @@ use std::path::Path;
 // carries `step_budget`, which this binary reads past, and one written after it carries
 // `settled`. Both load, and `settled` reads as false where it is absent. A v29 binary
 // refuses a v30 payload by version instead of failing on the missing `step_budget`.
-pub const MODEL_PAYLOAD_VERSION: u32 = 30;
+// v31 records the Gaussian location-scale σ floor (`gaussian_sigma_floor`): the recording-grid
+// bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
+// a serde default so every other family's older payload reads through; a Gaussian location-scale
+// payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
+pub const MODEL_PAYLOAD_VERSION: u32 = 31;
+
+/// The schema before the Gaussian location-scale σ floor record, whose only difference
+/// is that field's absence.
+const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
 
 /// The schema whose Newton-polish record may carry its step budget (#2954), or already
 /// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
-/// [`MODEL_PAYLOAD_VERSION`] is that record's `step_budget`, which this binary reads past.
+/// [`SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION`] is that record's `step_budget`, which
+/// this binary reads past.
 const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
 
 /// The schema before the saved model stopped persisting training rows (speed F6), whose
@@ -200,8 +209,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 13] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 14] = [
     MODEL_PAYLOAD_VERSION,
+    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     POLISH_STEP_BUDGET_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
     WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
@@ -655,6 +665,11 @@ pub struct FittedModelPayload {
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
+    /// Gaussian location-scale σ floor `b` of σ = b + exp(η) in standardized response
+    /// units (`sigma_link::gaussian_resolution_sigma_floor`); the raw-unit floor is
+    /// `gaussian_response_scale · gaussian_sigma_floor`. Required for that family.
+    #[serde(default)]
+    pub gaussian_sigma_floor: Option<f64>,
     #[serde(default)]
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
@@ -1099,6 +1114,7 @@ impl FittedModelPayload {
             noise_non_intercept_start: None,
             noise_projection_ridge_alpha: None,
             gaussian_response_scale: None,
+            gaussian_sigma_floor: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             linkwiggle_penalty_metadata: None,
@@ -1709,6 +1725,29 @@ fn validate_location_scale_saved_fit(
         });
     }
     Ok(())
+}
+
+/// The saved σ floor of a Gaussian location-scale model, in standardized response
+/// units. A payload without one was fitted before the floor became a property of
+/// the data (payload version 28) and predicts through a link this binary no longer
+/// has, so it is refused by name rather than read under any substitute floor.
+pub fn gaussian_location_scale_saved_sigma_floor(
+    payload: &FittedModelPayload,
+) -> Result<f64, FittedModelError> {
+    match payload.gaussian_sigma_floor {
+        Some(floor) if floor.is_finite() && floor > 0.0 => Ok(floor),
+        Some(floor) => Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "gaussian-location-scale gaussian_sigma_floor must be finite and positive, got {floor}"
+            ),
+        }),
+        None => Err(FittedModelError::MissingField {
+            reason: "gaussian-location-scale model is missing gaussian_sigma_floor: it was saved \
+                     before payload version 30, when σ = b + exp(η) used a fixed floor b instead \
+                     of the response's recording-grid bound. Refit with the current version."
+                .to_string(),
+        }),
+    }
 }
 
 fn validate_survival_saved_block_matches_payload(
@@ -3881,6 +3920,37 @@ impl FittedModel {
         Ok(required)
     }
 
+    /// Columns [`Self::latent_conditional_residual`] reads: the prediction
+    /// columns less a survival response's time columns, since ζ is a function
+    /// of the score and the conditioning covariates alone (gam#3016). A time
+    /// column the formula also names as a covariate stays. The CLI and PyFFI
+    /// residual commands project their frames onto this one set.
+    pub fn latent_conditional_residual_columns(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut required = self.prediction_required_columns()?;
+        let parsed = parse_formula(self.payload().formula.as_str()).map_err(|e| e.to_string())?;
+        let mut covariates = std::collections::BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut covariates);
+        let mut time_columns = Vec::new();
+        if let Some((entry, exit, _event)) =
+            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend(entry);
+            time_columns.push(exit);
+        } else if let Some((left, right, _event)) =
+            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend([left, right]);
+        }
+        for column in time_columns {
+            if !covariates.contains(&column) {
+                required.remove(&column);
+            }
+        }
+        Ok(required)
+    }
+
     /// Columns a *post-fit diagnostic* command (diagnose / sample / report)
     /// needs **beyond** [`Self::prediction_required_columns`].
     ///
@@ -4336,6 +4406,9 @@ impl FittedModel {
                 runtime.model_class,
                 runtime.link_wiggle.as_ref(),
             )?;
+            if matches!(runtime.model_class, PredictModelClass::GaussianLocationScale) {
+                gaussian_location_scale_saved_sigma_floor(self.payload())?;
+            }
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
                 .payload()
@@ -6235,6 +6308,9 @@ impl FittedModel {
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v).map_err(corrupt)?;
         }
+        if let Some(v) = self.gaussian_sigma_floor {
+            ensure_finite_scalar("gaussian_sigma_floor", v).map_err(corrupt)?;
+        }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
             validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
         }
@@ -7727,6 +7803,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
@@ -7746,8 +7823,12 @@ mod tests {
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
         assert_eq!(
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             MODEL_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
