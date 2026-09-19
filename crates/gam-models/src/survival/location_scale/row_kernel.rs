@@ -3728,20 +3728,18 @@ fn require_fitted_block_geometry(
 }
 
 /// The three coefficient-space views lowered from the same packed survival-LS
-/// row-Hessian coefficients. `DenseFull` is the coupled exact-Newton matrix,
-/// `BlockDiagonal` is the per-block inner-Newton working set, and
-/// `DiagonalOnly` is the trust metric. No target re-evaluates row calculus.
+/// row-Hessian coefficients. `DenseFull` is the coupled exact-Newton matrix
+/// and `BlockDiagonal` is the per-block inner-Newton working set. Neither
+/// target re-evaluates row calculus.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlsCoefficientHessianTarget {
     DenseFull,
     BlockDiagonal,
-    DiagonalOnly,
 }
 
 pub(crate) enum SlsCoefficientHessian {
     DenseFull(Array2<f64>),
     BlockDiagonal(Vec<Array2<f64>>),
-    DiagonalOnly(Array1<f64>),
 }
 
 impl SlsCoefficientHessian {
@@ -3769,23 +3767,10 @@ impl SlsCoefficientHessian {
         }
     }
 
-    /// Consume the trust-metric diagonal. See `into_dense_full` for the
-    /// single-source invariant that makes a mismatch an internal error.
-    pub(crate) fn into_diagonal_only(self) -> Result<Array1<f64>, String> {
-        match self {
-            SlsCoefficientHessian::DiagonalOnly(diagonal) => Ok(diagonal),
-            other => Err(SlsCoefficientHessian::variant_mismatch(
-                "DiagonalOnly",
-                &other,
-            )),
-        }
-    }
-
     fn variant_mismatch(expected: &str, got: &SlsCoefficientHessian) -> String {
         let got_name = match got {
             SlsCoefficientHessian::DenseFull(_) => "DenseFull",
             SlsCoefficientHessian::BlockDiagonal(_) => "BlockDiagonal",
-            SlsCoefficientHessian::DiagonalOnly(_) => "DiagonalOnly",
         };
         SurvivalLocationScaleError::InternalInvariant {
             reason: format!(
@@ -4136,39 +4121,6 @@ impl SurvivalLocationScaleFamily {
             .into());
         }
 
-        if target == SlsCoefficientHessianTarget::DiagonalOnly {
-            let mut diagonal = Array1::<f64>::zeros(p_total);
-            for (slot, group) in groups.iter().enumerate() {
-                let left_block = group.left_channel / 3;
-                let right_block = group.right_channel / 3;
-                if left_block != right_block {
-                    continue;
-                }
-                let left =
-                    designs[group.left_channel].expect("active survival-LS pair has a left design");
-                let right = designs[group.right_channel]
-                    .expect("active survival-LS pair has a right design");
-                let weights = sanitize_survival_weight_vector(&slots.row(slot).to_owned());
-                let multiplicity = if group.left_channel == group.right_channel {
-                    1.0
-                } else {
-                    2.0
-                };
-                let offset = offsets[left_block];
-                for row in 0..self.n {
-                    let weight = multiplicity * weights[row];
-                    if weight == 0.0 {
-                        continue;
-                    }
-                    for coefficient in 0..left.ncols() {
-                        diagonal[offset + coefficient] +=
-                            weight * left[[row, coefficient]] * right[[row, coefficient]];
-                    }
-                }
-            }
-            return Ok(SlsCoefficientHessian::DiagonalOnly(diagonal));
-        }
-
         let selected = groups
             .iter()
             .enumerate()
@@ -4230,13 +4182,6 @@ impl SurvivalLocationScaleFamily {
                     }
                 }
                 Ok(SlsCoefficientHessian::BlockDiagonal(blocks))
-            }
-            SlsCoefficientHessianTarget::DiagonalOnly => {
-                Err(SurvivalLocationScaleError::InternalInvariant {
-                    reason: "diagonal-only survival-LS lowering escaped its dedicated branch"
-                        .to_string(),
-                }
-                .into())
             }
         }
     }

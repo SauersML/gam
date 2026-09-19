@@ -1402,10 +1402,6 @@ fn survival_ls_packed_targets_apply_ht_mask_once_932() {
         SlsCoefficientHessian::BlockDiagonal(blocks) => blocks,
         _ => panic!("block target returned another packed SLS shape"),
     };
-    let diagonal = match target(SlsCoefficientHessianTarget::DiagonalOnly) {
-        SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
-        _ => panic!("diagonal target returned another packed SLS shape"),
-    };
     let offsets = family.joint_block_offsets();
     for block in 0..3 {
         let (start, end) = (offsets[block], offsets[block + 1]);
@@ -1417,13 +1413,6 @@ fn survival_ls_packed_targets_apply_ht_mask_once_932() {
                 "masked block {block} [{row},{column}] disagrees with dense target"
             );
         }
-    }
-    for coefficient in 0..diagonal.len() {
-        assert!(
-            (diagonal[coefficient] - dense[[coefficient, coefficient]]).abs()
-                <= 1e-9 * dense[[coefficient, coefficient]].abs().max(1.0),
-            "masked diagonal [{coefficient}] disagrees with dense target"
-        );
     }
 }
 
