@@ -142,6 +142,7 @@ pub fn smooth_term_summary_rows(
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
         let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
+        let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k_pen);
         penalty_cursor += k_pen;
         // Random-effect smooths are variance-component tests on the boundary; a
         // naive coefficient Wald χ² p-value is anti-conservative, so only EDF is
@@ -154,6 +155,7 @@ pub fn smooth_term_summary_rows(
             pvalue: None,
             continuous_order: None,
             basis_note: None,
+            edf_rank_bound,
         });
     }
 
@@ -180,6 +182,7 @@ pub fn smooth_term_summary_rows(
         let global_range =
             (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
+        let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
@@ -218,10 +221,29 @@ pub fn smooth_term_summary_rows(
                 } => auto_shrink_note.clone(),
                 _ => None,
             },
+            edf_rank_bound,
         });
     }
 
     rows
+}
+
+/// The label a term's EDF carries when a penalty block among its `count` blocks from
+/// `start` is not rank-bound certified (#2901): "rank bound not assessed" when the
+/// governor refused a certificate, else "rank bound not certified". Such a block's
+/// trace is published raw, so the term's EDF is not clamped to its dimension.
+fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> Option<String> {
+    let bounds = fit.edf_rank_bound().get(start..start + count)?;
+    if bounds
+        .iter()
+        .any(|bound| matches!(bound, crate::estimate::EdfRankBound::NotAssessed { .. }))
+    {
+        Some("rank bound not assessed".to_string())
+    } else if bounds.iter().any(|bound| !bound.is_certified()) {
+        Some("rank bound not certified".to_string())
+    } else {
+        None
+    }
 }
 
 /// Invert the three-λ Matérn identity for a continuous-order smooth, in
