@@ -1215,6 +1215,7 @@ mod tests {
     fn typed_oos_entry_reconstructs_frozen_periodic_dictionary() {
         let request = periodic_request();
         let expected = request.target.clone();
+        let ard_strength = request.regularization.log_ard[0][0].exp();
         let report = run_sae_manifold_oos(request).unwrap();
         assert_eq!(report.assignments.dim(), (4, 1));
         assert!(
@@ -1230,7 +1231,24 @@ mod tests {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
-        assert!(max_error <= 1.0e-12, "max reconstruction error={max_error}");
+        // The target lies exactly on the frozen dictionary, so the only pull
+        // off it is the ARD coordinate prior (#2822): the miss is at most of
+        // the prior's order and vanishes linearly as the prior weakens.
+        assert!(
+            max_error <= ard_strength,
+            "max reconstruction error={max_error} exceeds the ARD strength {ard_strength}"
+        );
+        let mut weak = periodic_request();
+        weak.regularization.log_ard = vec![vec![(ard_strength * 1.0e-2).ln()]];
+        let weak_report = run_sae_manifold_oos(weak).unwrap();
+        let weak_error = (&weak_report.fitted - &expected)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            weak_error <= 1.0e-1 * max_error,
+            "a 100x weaker ARD prior must shrink the miss: {weak_error} vs {max_error}"
+        );
         let atom_error = (&report.atoms[0].reconstruction - &report.fitted)
             .iter()
             .map(|value| value.abs())

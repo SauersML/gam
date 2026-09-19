@@ -6987,7 +6987,7 @@ impl SaeManifoldTerm {
         // the step from GN toward gradient descent (shorter, better-scaled) so the
         // full step is accepted and real progress resumes; shrinking recovers GN's
         // quadratic convergence as the fit enters its local quadratic basin. Uses
-        // ONLY the existing ridge parameters and `SAE_MANIFOLD_ROW_RIDGE_GROWTH`
+        // ONLY the existing ridge parameters and `SAE_MANIFOLD_LM_RIDGE_FACTOR`
         // (no new tuning knob), floored at the caller's ridges, and reset to them
         // on a proximal-correction fallback (which runs its own escalation).
         // Armijo still refereed the true objective, so descent — and the
