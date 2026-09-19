@@ -5535,6 +5535,16 @@ pub(crate) enum BlockCorrectionDecision {
     AdmittedAtOptimum,
 }
 
+/// The #784 block quadrature latched beside the admission (#2623): the
+/// Gauss–Hermite order of each block axis, and whether the block marginal is
+/// integrated axis by axis with the analytic mixed-axis term, or as one tensor
+/// rule over the whole block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockQuadratureLatch {
+    pub(crate) axis_orders: Vec<usize>,
+    pub(crate) axis_split: bool,
+}
+
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5611,8 +5621,9 @@ pub(crate) struct RemlState<'a> {
     /// [`Self::block_correction_admission`] (#2623). They are selected once, at
     /// admission, as the smallest orders whose paired differences resolve
     /// `min(|Δ_b|, 1/n_eff²)`, and held for the fit, so the nodes, and with them
-    /// the value, gradient and moments, are one measure at every ρ.
-    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<Vec<usize>>>,
+    /// the value, gradient and moments, are one measure at every ρ. Whether the
+    /// block is integrated axis by axis is latched with them, for the same reason.
+    pub(crate) block_correction_axis_orders: std::sync::Mutex<Option<BlockQuadratureLatch>>,
     /// Adaptive IFT step-cap controller, the hypergradient budget controller,
     /// and the two mode-response caches.
     ///
