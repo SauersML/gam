@@ -18,7 +18,8 @@ binomial, fixed dispersion) keep z, because their pivot really is Gaussian.
 
 L3: ``PredictOptions.multi_point_joint`` was always false in every caller.
 Joint bands go through ``effect_report`` instead, so the option has been
-deleted per SPEC "delete unnecessary options".
+deleted per SPEC.md: "Unnecessary choices and options should be deleted, not
+included."
 """
 
 from __future__ import annotations
