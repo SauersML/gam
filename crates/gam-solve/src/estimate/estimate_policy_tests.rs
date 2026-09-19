@@ -514,6 +514,120 @@ fn prefit_binomial_separation_reads_through_a_scalar_ridge_but_not_a_basis_penal
         .expect("a multi-column basis penalty keeps its columns out of the certificate");
 }
 
+/// A double penalty's null-space ridge bounds its block's kernel the way a
+/// one-column ridge bounds a parametric column: the certificate reads the
+/// design along that kernel, and only along it. The block is three basis
+/// columns `(a, b, c)` with the roughness penalty on `u = (a − b)/√2` and `c`,
+/// and the ridge on `v = (a + b)/√2`. Neither `a` nor `b` separates alone.
+#[test]
+fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::ones(y.len());
+    let cfg = RemlConfig::external(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        1e-7,
+        false,
+    );
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let v = array![half, half, 0.0];
+    let u = array![half, -half, 0.0];
+    let e = array![0.0, 0.0, 1.0];
+    let outer = |a: &Array1<f64>| {
+        let column = a.view().insert_axis(ndarray::Axis(1));
+        column.dot(&column.t())
+    };
+    let roughness = outer(&u) + outer(&e);
+    let ridge = outer(&v);
+    let double_penalty = gam_terms::construction::canonicalize_penalty_specs(
+        &[roughness.clone(), ridge]
+            .into_iter()
+            .map(|local| PenaltySpec::Block {
+                local,
+                col_range: 1..4,
+                prior_mean: gam_problem::CoefficientPriorMean::Zero,
+                structure_hint: None,
+                op: None,
+            })
+            .collect::<Vec<_>>(),
+        &[1, 2],
+        4,
+        "prefit separation null-space ridge",
+    )
+    .expect("canonicalize the double penalty")
+    .0;
+    let design_from = |a: [f64; 4], b: [f64; 4]| {
+        let mut x = Array2::<f64>::ones((4, 4));
+        for row in 0..4 {
+            x[[row, 1]] = a[row];
+            x[[row, 2]] = b[row];
+            x[[row, 3]] = [0.5, -0.5, 0.25, -0.25][row];
+        }
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+    };
+
+    // a + b = (−2, −1, 1, 2) separates along the ridge's direction.
+    let kernel_separated = design_from([1.0, -2.0, 2.0, -1.0], [-3.0, 1.0, -1.0, 3.0]);
+    let err = reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &kernel_separated,
+        &double_penalty,
+    )
+    .expect_err("separation along the penalty null space must be certified");
+    match err {
+        EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin,
+            column_indices,
+            ..
+        } => {
+            assert!(min_signed_margin > 0.0, "margin {min_signed_margin}");
+            assert_eq!(column_indices, vec![0, 1, 2, 3]);
+        }
+        other => panic!("expected a linear separation certificate, got {other:?}"),
+    }
+
+    // a − b = (−2, −1, 1, 2) separates only along the roughness penalty's range.
+    let range_separated = design_from([1.0, -2.0, 2.0, -1.0], [3.0, -1.0, 1.0, -3.0]);
+    reject_prefit_binomial_separation(
+        &cfg,
+        y.view(),
+        w.view(),
+        &range_separated,
+        &double_penalty,
+    )
+    .expect("a direction the roughness penalty bounds certifies nothing");
+
+    // Alone on its block, the roughness penalty leaves `v` unpenalized.
+    let roughness_only = gam_terms::construction::canonicalize_penalty_specs(
+        &[PenaltySpec::Block {
+            local: roughness,
+            col_range: 1..4,
+            prior_mean: gam_problem::CoefficientPriorMean::Zero,
+            structure_hint: None,
+            op: None,
+        }],
+        &[1],
+        4,
+        "prefit separation unpenalized kernel",
+    )
+    .expect("canonicalize the roughness penalty")
+    .0;
+    assert!(matches!(
+        reject_prefit_binomial_separation(
+            &cfg,
+            y.view(),
+            w.view(),
+            &kernel_separated,
+            &roughness_only,
+        ),
+        Err(EstimationError::PrefitLinearSeparationDetected { .. })
+    ));
+}
+
 #[test]
 fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     let x = array![

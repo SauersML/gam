@@ -17,6 +17,7 @@ APIs such as a matrix kernel.
 | Fixed negative-binomial size | `FitConfig::negative_binomial_theta` | `--negative-binomial-theta` | `negative_binomial_theta=` | **Closed by this audit** |
 | Expectile target | `FitConfig::expectile_tau` | `--expectile-tau` | `expectile_tau=` or `expectile(tau)` family spelling | **Closed by this audit** |
 | Offset, weights | shared request fields | `--offset-column`, `--weights-column` | `offset=`, `weights=` | Parity |
+| Joint non-crossing expectile levels (location-scale `μ(x) + c_τ·σ(x)`) | `FitConfig::expectile_tau` list, `FitResult::ExpectileLocationScale`, `gam_predict::joint_expectile_curves` | `--expectile-tau 0.1,0.5,0.9`; predict writes one `expectile_{τ}` column per level | `expectile_tau=[0.1, 0.5, 0.9]`; `predict` returns `(n, K)` curves | Parity |
 | Links and flexible link | family/link resolver | binomial family variants; complete request for `link` / `flexible_link` | `link=`, `flexible_link=` | Parity through shared request |
 | Firth binomial correction | `FitConfig::firth` | `--firth` | `firth=` | Parity |
 | Location/dispersion scale models | typed `FitRequest` variants | `--predict-noise`, `--noise-offset-column` | `noise_formula=`, `noise_offset=` | Parity |

@@ -90,8 +90,14 @@ pub struct FitRequestConfigDocument {
     pub frozen_ctn: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transformation_normal_config: Option<CtnStage1ConfigDocument>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expectile_tau: Option<f64>,
+    /// Expectile level(s): one level, or a strictly increasing list fitted
+    /// jointly without crossing. A bare number is the one-level spelling.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_expectile_levels",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expectile_tau: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,9 +365,44 @@ pub struct CtnStage1ConfigDocument {
     pub double_penalty: Option<bool>,
 }
 
+/// `expectile_tau` accepts one level (`0.9`) or a list of levels (`[0.1, 0.9]`).
+fn deserialize_expectile_levels<'de, D>(deserializer: D) -> Result<Option<Vec<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Levels {
+        One(f64),
+        Many(Vec<f64>),
+    }
+    Ok(
+        Option::<Levels>::deserialize(deserializer)?.map(|levels| match levels {
+            Levels::One(tau) => vec![tau],
+            Levels::Many(levels) => levels,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expectile_tau_accepts_one_level_or_a_list() {
+        let parse = |value: &str| -> Option<Vec<f64>> {
+            let json = format!(
+                r#"{{"schema":"gam.fit-request","schema_version":1,"formula":"y ~ x","config":{{"expectile_tau":{value}}}}}"#
+            );
+            FitRequestDocument::from_json(&json)
+                .unwrap()
+                .config
+                .expectile_tau
+        };
+        assert_eq!(parse("0.9"), Some(vec![0.9]));
+        assert_eq!(parse("[0.1, 0.5, 0.9]"), Some(vec![0.1, 0.5, 0.9]));
+        assert_eq!(parse("null"), None);
+    }
 
     #[test]
     fn parser_rejects_another_schema_or_version() {

@@ -46,7 +46,7 @@ fn fit_request_document_from_fit_args(
         baseline_scale: args.baseline_scale,
         baseline_shape: args.baseline_shape,
         baseline_target: Some(args.baseline_target.clone()),
-        expectile_tau: args.expectile_tau,
+        expectile_tau: args.expectile_tau.clone(),
         family: family_arg_canonical_name(args.family).map(str::to_string),
         firth: args.firth.then_some(true),
         frailty_kind,
@@ -206,6 +206,14 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // Several expectile levels are one joint location-scale fit, which the
+    // library's formula-to-payload service assembles like any location-scale model.
+    let joint_expectile = gam::families::fit_orchestration::expectile_levels_for_config(&fit_config)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|levels| levels.len() > 1);
+    if joint_expectile {
+        return run_library_formula_fit(&args, &parsed, formula_text, &fit_config);
+    }
     let requested_columns = fit_required_columns(&parsed, &fit_config)
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -305,6 +313,13 @@ fn run_canonical_standard_fit(
                 ),
                 gam::inference::model::FittedEstimator::Likelihood => {
                     ("standard", family.name().to_string())
+                }
+                // Joint expectile levels route to the library fit above; a
+                // standard payload never carries them.
+                gam::inference::model::FittedEstimator::ExpectileLocationScale { .. } => {
+                    return Err(
+                        "a standard fit assembled a joint expectile estimator".to_string()
+                    );
                 }
             };
             let fit = payload

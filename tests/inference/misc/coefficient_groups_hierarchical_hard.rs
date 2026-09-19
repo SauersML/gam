@@ -74,6 +74,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
             lenient_unseen: true,
         }],
         smooth_terms: Vec::new(),
+        level: Default::default(),
     }
 }
 
@@ -507,6 +508,7 @@ fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
         ],
         random_effect_terms: Vec::new(),
         smooth_terms: Vec::new(),
+        level: Default::default(),
     };
     (spec, x)
 }

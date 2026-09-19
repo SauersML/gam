@@ -2160,6 +2160,7 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
     let mut notes = Vec::new();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(
