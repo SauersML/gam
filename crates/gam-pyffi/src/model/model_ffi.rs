@@ -76,7 +76,7 @@ struct PyPredictOptions {
 /// immutable value instead of reparsing and revalidating the JSON archive on
 /// every batch. `Arc` makes detaching prediction from the GIL a constant-time
 /// ownership transfer without cloning the potentially large fitted payload.
-#[pyclass(name = "_FittedModel", frozen)]
+#[pyclass(module = "gamfit._rust", name = "_FittedModel", frozen)]
 struct PyFittedModel {
     model: Arc<FittedModel>,
 }
