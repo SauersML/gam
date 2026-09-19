@@ -328,7 +328,7 @@ pub(super) fn working_deriv_slices<'a>(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct WorkingBernoulliGeometry {
     pub(crate) mu: f64,
     pub(crate) weight: f64,

@@ -4,7 +4,7 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct CertifiedBernoulliRow {
     geometry: WorkingBernoulliGeometry,
     jet: MixtureInverseLinkJet,
@@ -48,11 +48,9 @@ fn certify_bernoulli_rows(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<Vec<CertifiedBernoulliRow>, EstimationError> {
-    let rows: Vec<Result<CertifiedBernoulliRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| certify_bernoulli_row(inverse_link, i, eta[i], y[i], priorweights[i]))
-        .collect();
-    rows.into_iter().collect()
+    super::par_certified_rows(eta.len(), |i| {
+        certify_bernoulli_row(inverse_link, i, eta[i], y[i], priorweights[i])
+    })
 }
 
 /// Scatter certified Bernoulli rows into the PIRLS working vectors, and into
@@ -292,40 +290,36 @@ pub(crate) fn update_glmvectors_integrated_for_link(
             inverse_link
         );
     }
-    let certified: Vec<Result<CertifiedBernoulliRow, EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-                crate::quadrature::latent_cloglog_inverse_link_jet(
-                    quadctx,
-                    eta[i],
-                    se[i].hypot(state.latent_sd),
-                )?
-            } else {
-                crate::quadrature::integrated_inverse_link_jetwith_state(
-                    quadctx,
-                    link,
-                    eta[i],
-                    se[i],
-                    inverse_link.mixture_state(),
-                    inverse_link.sas_state(),
-                )?
-            };
-            let jet = MixtureInverseLinkJet {
-                mu: jet.mean,
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-            };
-            // Integrated mean has no closed-form tail complement; the naive
-            // complement stays interior except at se -> 0, where the saturation
-            // handling in `bernoulli_geometry_from_jet` is the correct limit.
-            let omm = 1.0 - jet.mu;
-            let geometry = bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet, omm)?;
-            Ok(CertifiedBernoulliRow { geometry, jet })
-        })
-        .collect();
-    let certified: Vec<CertifiedBernoulliRow> = certified.into_iter().collect::<Result<_, _>>()?;
+    let certified: Vec<CertifiedBernoulliRow> = super::par_certified_rows(eta.len(), |i| {
+        let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
+            crate::quadrature::latent_cloglog_inverse_link_jet(
+                quadctx,
+                eta[i],
+                se[i].hypot(state.latent_sd),
+            )?
+        } else {
+            crate::quadrature::integrated_inverse_link_jetwith_state(
+                quadctx,
+                link,
+                eta[i],
+                se[i],
+                inverse_link.mixture_state(),
+                inverse_link.sas_state(),
+            )?
+        };
+        let jet = MixtureInverseLinkJet {
+            mu: jet.mean,
+            d1: jet.d1,
+            d2: jet.d2,
+            d3: jet.d3,
+        };
+        // Integrated mean has no closed-form tail complement; the naive
+        // complement stays interior except at se -> 0, where the saturation
+        // handling in `bernoulli_geometry_from_jet` is the correct limit.
+        let omm = 1.0 - jet.mu;
+        let geometry = bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet, omm)?;
+        Ok(CertifiedBernoulliRow { geometry, jet })
+    })?;
     scatter_certified_bernoulli_rows(&certified, mu, weights, z, derivatives);
     Ok(())
 }
@@ -509,12 +503,9 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             if !valid_beta_phi(phi) {
                 crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
             }
-            let certified: Vec<Result<ExactBetaLogitRow, EstimationError>> = (0..eta.len())
-                .into_par_iter()
-                .map(|i| exact_beta_logit_row(i, eta[i], None, priorweights[i], phi))
-                .collect();
-            let certified: Vec<ExactBetaLogitRow> =
-                certified.into_iter().collect::<Result<_, _>>()?;
+            let certified: Vec<ExactBetaLogitRow> = super::par_certified_rows(eta.len(), |i| {
+                exact_beta_logit_row(i, eta[i], None, priorweights[i], phi)
+            })?;
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
             let dmu_s = dmu_deta
@@ -564,26 +555,20 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             )?;
         }
         ResponseFamily::Binomial => {
-            let certified: Vec<Result<CertifiedBernoulliRow, EstimationError>> = (0..eta.len())
-                .into_par_iter()
-                .map(|i| {
-                    let jet = if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit))
-                    {
-                        let jet = logit_inverse_link_jet5(eta[i]);
-                        MixtureInverseLinkJet {
-                            mu: jet.mu,
-                            d1: jet.d1,
-                            d2: jet.d2,
-                            d3: jet.d3,
-                        }
-                    } else {
-                        standard_inverse_link_jet(inverse_link, eta[i])?
-                    };
-                    certify_bernoulli_row(inverse_link, i, eta[i], jet.mu, priorweights[i])
-                })
-                .collect();
-            let certified: Vec<CertifiedBernoulliRow> =
-                certified.into_iter().collect::<Result<_, _>>()?;
+            let certified: Vec<CertifiedBernoulliRow> = super::par_certified_rows(eta.len(), |i| {
+                let jet = if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+                    let jet = logit_inverse_link_jet5(eta[i]);
+                    MixtureInverseLinkJet {
+                        mu: jet.mu,
+                        d1: jet.d1,
+                        d2: jet.d2,
+                        d3: jet.d3,
+                    }
+                } else {
+                    standard_inverse_link_jet(inverse_link, eta[i])?
+                };
+                certify_bernoulli_row(inverse_link, i, eta[i], jet.mu, priorweights[i])
+            })?;
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
             let dmu_s = dmu_deta

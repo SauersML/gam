@@ -136,7 +136,7 @@ fn asinh_jet5(eta: f64) -> AsinhJet5 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InverseLinkJet {
     pub mu: f64,
     pub d1: f64,
