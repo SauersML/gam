@@ -85,8 +85,11 @@ REFERENCE_FAMILY = "linux-x86_64"
 _CLASSIFIER = re.compile(r"^Programming Language :: Python :: (3\.\d+)$")
 _FREE_THREADING = re.compile(r"^Programming Language :: Python :: Free Threading :: ")
 
-# CPython's free-threaded build (PEP 703) exists from this version on.
-FREE_THREADED_SINCE = "3.13"
+# The first free-threaded CPython the extension can be built for. CPython has a
+# free-threaded build (PEP 703) from 3.13, but PyO3 0.29 (Cargo.lock) supports
+# it only from 3.14: its build script stops with "PyO3 does not support the
+# free-threaded build of CPython versions below 3.14".
+FREE_THREADED_SINCE = "3.14"
 
 
 # ---------------------------------------------------------------------- matrix
@@ -112,10 +115,10 @@ def classifier_python_versions(project: dict) -> list[str]:
 
 
 def free_threaded_python_versions(project: dict) -> list[str]:
-    """The free-threaded interpreters (``3.13t`` ...) the package advertises, oldest first.
+    """The free-threaded interpreters (``3.14t`` ...) the package advertises, oldest first.
 
     A Free Threading classifier claims support on every advertised version
-    that has a free-threaded build; without one there are none.
+    the extension can be built free-threaded for; without one there are none.
     """
     if not any(_FREE_THREADING.match(classifier) for classifier in project["classifiers"]):
         return []
@@ -227,7 +230,7 @@ def wheel_for(wheels: list[pathlib.Path], python_tag: str, free_threaded: bool) 
     """The one wheel of a family an interpreter installs.
 
     A GIL interpreter takes the abi3 wheel; a free-threaded one takes the
-    wheel built for its own ABI (``cp313t``), which a GIL build cannot load.
+    wheel built for its own ABI (``cp314t``), which a GIL build cannot load.
     """
     abi = f"{python_tag}t" if free_threaded else "abi3"
     # name-version[-build]-python-abi-platform.whl

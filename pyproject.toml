@@ -46,7 +46,8 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   # The extension declares `gil_used = false`, and every advertised version
-  # with a free-threaded build (3.13t on) gets its own wheel and smoke lane.
+  # PyO3 builds free-threaded (3.14t on; scripts/wheel_smoke.py) gets its own
+  # wheel and smoke lane.
   "Programming Language :: Python :: Free Threading :: 2 - Beta",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Rust",

@@ -35,12 +35,12 @@ class PyprojectMatrixTests(unittest.TestCase):
         self.assertEqual([lane["python"] for lane in matrix if not lane["free_threaded"]], versions)
 
     def test_free_threaded_wheels_are_built_and_installed_on_every_family(self):
-        self.assertEqual(wheel_smoke.free_threaded_python_versions(self.project), ["3.13t", "3.14t"])
-        self.assertEqual(wheel_smoke.build_interpreters(self.project), ["3.10", "3.13t", "3.14t"])
+        self.assertEqual(wheel_smoke.free_threaded_python_versions(self.project), ["3.14t"])
+        self.assertEqual(wheel_smoke.build_interpreters(self.project), ["3.10", "3.14t"])
         matrix = wheel_smoke.build_matrix(list(wheel_smoke.SCOPES["full"]), self.project)["include"]
         for family in wheel_smoke.FAMILIES:
             lanes = [lane for lane in matrix if lane["family"] == family and lane["free_threaded"]]
-            self.assertEqual([lane["python"] for lane in lanes], ["3.13t", "3.14t"], family)
+            self.assertEqual([lane["python"] for lane in lanes], ["3.14t"], family)
             self.assertEqual({lane["resolution"] for lane in lanes}, {"highest"}, family)
 
     def test_free_threaded_lanes_follow_the_classifier(self):

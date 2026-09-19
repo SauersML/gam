@@ -12,11 +12,17 @@ For every platform family (manylinux and musllinux on x86_64 and aarch64,
 macOS x86_64 and arm64, Windows x64):
 
 * one `cp310-abi3` wheel, which every GIL CPython from 3.10 on installs;
-* one wheel per free-threaded CPython the classifiers advertise
-  (`cp313-cp313t`, `cp314-cp314t`). The stable ABI does not exist for
+* one wheel per free-threaded CPython the classifiers advertise that PyO3 can
+  build for (`cp314-cp314t` today). The stable ABI does not exist for
   free-threaded builds, so each needs its own version-specific wheel. The
   extension declares `gil_used = false`, and the smoke lanes fail if importing
   gamfit, or numpy, turns the GIL back on.
+
+There is no `cp313t` wheel. CPython 3.13 has a free-threaded build, but PyO3
+0.29, which the extension is built with, refuses it: its build script stops
+with "PyO3 does not support the free-threaded build of CPython versions below
+3.14" (building the sdist on 3.13t fails the same way). GIL CPython 3.13
+installs the abi3 wheel as before.
 
 The list of interpreters comes from `pyproject.toml`:
 `python3 scripts/wheel_smoke.py interpreters` prints the abi3 floor and the
@@ -52,8 +58,8 @@ Where the project stood when the guard was added (read from
 |---|---|
 | Stored | 8,289,947,778 bytes (7.72 GiB) in 434 files, 69 releases (0.1.174 to 0.1.267) |
 | Latest full release (0.1.267) | 245.8 MB: seven abi3 wheels of about 32 MB and a 20 MB sdist |
-| A full release with free-threaded wheels | about 0.69 GB: 21 wheels and a 15 MB sdist |
-| Room below the 90% threshold | 1.37 GB, about two full releases |
+| A full release with free-threaded wheels | about 0.47 GB: 14 wheels and a 15 MB sdist |
+| Room below the 90% threshold | 1.37 GB, two full releases (not three) |
 
 None of the 69 releases is a PEP 440 pre-release, so there are no
 pre-releases to prune as such; the space is held by 0.1.x releases that are

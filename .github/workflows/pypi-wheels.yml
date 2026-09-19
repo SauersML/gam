@@ -508,8 +508,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # No Alpine image ships a free-threaded CPython: the 3.13t lane runs
-          # uv's managed musl build of it on the python:3.13-alpine image.
+          # No Alpine image ships a free-threaded CPython: the 3.14t lane runs
+          # uv's managed musl build of it on the python:3.14-alpine image.
           docker run --rm -e RESOLUTION -e PYTHON_VERSION -v "$GITHUB_WORKSPACE:/w" -w /w "python:${PYTHON_VERSION%t}-alpine" sh -euc '
             python -m pip install --root-user-action=ignore uv
             case "$PYTHON_VERSION" in *t) python -m uv python install "$PYTHON_VERSION" ;; esac

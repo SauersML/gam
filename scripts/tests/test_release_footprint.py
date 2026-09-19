@@ -27,10 +27,10 @@ GIB = release_footprint.GIB
 MIB = release_footprint.MIB
 LIMIT = release_footprint.PYPI_DEFAULT_PROJECT_LIMIT
 # What gamfit's PyPI project held when this guard was written (69 releases),
-# and one full release's worth of files (seven abi3 wheels, the free-threaded
-# wheels for two versions on the same seven platforms, the sdist).
+# and one full release's worth of files (seven abi3 wheels, the cp314t wheels
+# on the same seven platforms, the sdist).
 PUBLISHED_TODAY = 8_289_947_778
-FULL_RELEASE = {f"gamfit-0.2.0-{i}.whl": 30 * MIB for i in range(21)} | {"gamfit-0.2.0.tar.gz": 15 * MIB}
+FULL_RELEASE = {f"gamfit-0.2.0-{i}.whl": 32 * MIB for i in range(14)} | {"gamfit-0.2.0.tar.gz": 15 * MIB}
 
 
 class DepInfoTests(unittest.TestCase):
