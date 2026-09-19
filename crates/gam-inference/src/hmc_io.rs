@@ -1125,6 +1125,40 @@ mod tests {
         }
     }
 
+    /// #3090: the mass-matrix configs carry no jitter and no dense-metric cap.
+    /// Their diagonal metric is `(1 - regularize)·var + regularize` with
+    /// `var ≥ 0`, so its positive floor is the regularization itself, for every
+    /// dimension on both sides of the high-dimension threshold.
+    #[test]
+    fn mass_matrix_configs_floor_by_regularization_not_jitter_3090() {
+        for dim in [
+            1usize,
+            super::HIGH_DIM_THRESHOLD,
+            super::HIGH_DIM_THRESHOLD + 1,
+            200,
+        ] {
+            for cfg in [
+                super::robust_mass_matrix_config(dim),
+                super::robust_survival_mass_matrix_config(dim),
+            ] {
+                assert_eq!(cfg.jitter, 0.0, "dim={dim}: mass-matrix jitter must be absent");
+                assert!(
+                    cfg.regularize > 0.0 && cfg.regularize < 1.0,
+                    "dim={dim}: regularize={} must bound the diagonal metric away from zero",
+                    cfg.regularize
+                );
+                assert!(matches!(
+                    cfg.adaptation,
+                    super::MassMatrixAdaptation::Diagonal
+                ));
+                assert_eq!(
+                    cfg.dense_max_dim, 0,
+                    "dim={dim}: no dense-metric cap under diagonal adaptation"
+                );
+            }
+        }
+    }
+
     use super::{FamilyNutsInputs, GlmFlatInputs, NUTS_CHAINS, NutsConfig, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad, laplace_directional_cubic_diagnostic_on_eigenpairs, laplace_skewness_threshold, laplace_trustworthiness_from_skewness, run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family};
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
@@ -4682,8 +4716,7 @@ fn draw_logit_pg1_omega(
 /// Parameter dimension above which the posterior is treated as "high-dimensional"
 /// for the purpose of the more conservative sampler heuristics below: a higher
 /// target-acceptance floor (smaller leapfrog steps) and stronger mass-matrix
-/// regularization. The boundary matches the `dense_max_dim` cap at which the
-/// engine stops attempting dense mass-matrix adaptation.
+/// regularization.
 const HIGH_DIM_THRESHOLD: usize = 50;
 
 /// Target-acceptance floor enforced for high-dimensional posteriors
@@ -4696,11 +4729,6 @@ const LOW_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.90;
 /// 1 collapses the step size and stalls mixing, so we cap the requested value.
 const MAX_TARGET_ACCEPT: f64 = 0.95;
 
-/// Largest parameter dimension for which the engine attempts *dense* mass-matrix
-/// adaptation; above this it falls back to a diagonal metric (an `O(p²)` dense
-/// metric is neither affordable nor reliably estimable from limited warmup).
-const DENSE_MASS_MATRIX_MAX_DIM: usize = 75;
-
 /// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
 /// general (mean-family) sampler. The high-dimensional value is larger because
 /// the warmup metric estimate is noisier relative to its scale as `p` grows.
@@ -4710,10 +4738,6 @@ const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
 /// censoring / rare events and so warrant a heavier ridge than the mean family.
 const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
 const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
-
-/// Jitter added during mass-matrix inversion to keep the metric strictly
-/// positive-definite against round-off in the warmup covariance estimate.
-const MASS_MATRIX_JITTER: f64 = 1e-5;
 
 #[inline]
 fn robust_target_accept(requested: f64, dim: usize) -> f64 {
@@ -4752,8 +4776,12 @@ fn robust_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 
@@ -4771,8 +4799,12 @@ fn robust_survival_mass_matrix_config(dim: usize) -> NUTSMassMatrixConfig {
         } else {
             SURVIVAL_MASS_REGULARIZE_LOW_DIM
         },
-        jitter: MASS_MATRIX_JITTER,
-        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
+        // No jitter: the diagonal metric is `(1 - regularize)·var + regularize`,
+        // so its entries are bounded below by `regularize > 0` and a floor could
+        // never bind (#3090). `dense_max_dim` is read only under dense
+        // adaptation, and both configs are diagonal.
+        jitter: 0.0,
+        dense_max_dim: 0,
     }
 }
 
@@ -4918,8 +4950,10 @@ pub struct NutsResult {
     pub sampler: PosteriorSampler,
     /// Which coefficient covariance the draws describe. MCMC on the exact
     /// likelihood is conditional on the fitted smoothing parameters; the
-    /// Laplace path draws from the fit's PUBLISHED covariance, which is the
-    /// smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
+    /// standard-GAM sampler then maps its draws through the linear transport
+    /// `Vb → V_c` so they describe the smoothing-corrected `V_c`, and
+    /// the Laplace path draws from the fit's PUBLISHED covariance, which is
+    /// the smoothing-corrected `Vp` whenever the fit carries one (gam#2777).
     pub covariance: InferenceCovarianceMode,
 }
 
@@ -5591,13 +5625,6 @@ fn run_conjugate_gaussian_sampling(
     })
 }
 
-/// Penalty subtracted from the log-density when the `ρ`-criterion closure
-/// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
-/// (#938). The fallback density is the whitened standard normal shifted down by
-/// this constant, so the sampler sees a smooth, coercive pull back toward the
-/// feasible region around `ρ̂` instead of a `-inf` cliff.
-const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
-
 /// Tier-2 of the marginal-smoothing inference stack (#938): the whitened
 /// `ρ`-criterion Hamiltonian target.
 ///
@@ -5613,9 +5640,16 @@ const RHO_NUTS_INFEASIBLE_LOGP_PENALTY: f64 = 1.0e8;
 /// solve with interior caches), so it is serialized behind a `Mutex`; chains
 /// take turns evaluating, which also keeps the inner warm-start trajectory
 /// coherent.
+///
+/// The criterion is `π(ρ|y)` on all of `ρ`-space, so a position it cannot value
+/// is not a zero-density region: the first such failure is recorded in
+/// `evaluation_failure`, the position is rejected, and the run is failed with
+/// that reason rather than sampled from a density invented for it.
 struct WhitenedRhoCriterionTarget<F> {
-    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`; `None` marks an infeasible point.
+    /// `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, or why it cannot be valued.
     criterion_and_grad: Mutex<F>,
+    /// The first position the criterion could not value, and why.
+    evaluation_failure: Arc<Mutex<Option<String>>>,
     /// `ρ̂`, the converged smoothing parameters (the whitening center).
     mode: Array1<f64>,
     /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
@@ -5628,7 +5662,7 @@ struct WhitenedRhoCriterionTarget<F> {
 
 impl<F> HamiltonianTarget<Array1<f64>> for WhitenedRhoCriterionTarget<F>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
         let rho = &self.mode + &self.chol.dot(position);
@@ -5639,8 +5673,8 @@ where
                 .expect("rho-criterion mutex poisoned");
             (*criterion)(&rho)
         };
-        match eval {
-            Some((cost, g))
+        let failure = match eval {
+            Ok((cost, g))
                 if cost.is_finite()
                     && g.len() == position.len()
                     && g.iter().all(|v| v.is_finite()) =>
@@ -5649,18 +5683,20 @@ where
                 for (gi, &v) in grad.iter_mut().zip(grad_z.iter()) {
                     *gi = -v;
                 }
-                -(cost - self.cost_hat)
+                return -(cost - self.cost_hat);
             }
-            _ => {
-                // Infeasible criterion: smooth coercive fallback toward ρ̂.
-                let mut quad = 0.0;
-                for (gi, &zi) in grad.iter_mut().zip(position.iter()) {
-                    *gi = -zi;
-                    quad += zi * zi;
-                }
-                -0.5 * quad - RHO_NUTS_INFEASIBLE_LOGP_PENALTY
-            }
-        }
+            Ok((cost, g)) => format!(
+                "criterion at rho {rho:?} is {cost} with a {}-entry gradient {g:?}",
+                g.len()
+            ),
+            Err(detail) => format!("criterion unavailable at rho {rho:?}: {detail}"),
+        };
+        self.evaluation_failure
+            .lock()
+            .expect("rho-criterion failure mutex poisoned")
+            .get_or_insert(failure);
+        grad.fill(0.0);
+        f64::NEG_INFINITY
     }
 }
 
@@ -5670,8 +5706,9 @@ where
 /// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
 /// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
 ///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
-/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact; `None`
-///   for infeasible `ρ`. Each call is one warm inner profile solve.
+/// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
+///   reason it cannot value `ρ`; any such position fails the run with that
+///   reason. Each call is one warm inner profile solve.
 /// * `config` — sampler configuration; determinism comes from `config.seed`
 ///   through the same splitmix64 chain/transition streams as every other NUTS
 ///   entry point (no clock, no global RNG).
@@ -5685,7 +5722,7 @@ pub(crate) fn run_rho_criterion_nuts<F>(
     config: &NutsConfig,
 ) -> Result<NutsResult, String>
 where
-    F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
+    F: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
     validate_nuts_config(config).map_err(String::from)?;
     let dim = rho_hat.len();
@@ -5708,17 +5745,22 @@ where
     )?;
 
     let cost_hat = match criterion_and_grad(&mode) {
-        Some((cost, _)) if cost.is_finite() => cost,
-        _ => {
-            return Err(
-                "rho-posterior NUTS: criterion is infeasible at rho_hat itself".to_string(),
-            );
+        Ok((cost, _)) if cost.is_finite() => cost,
+        Ok((cost, _)) => {
+            return Err(format!("rho-posterior NUTS: criterion at rho_hat is {cost}"));
+        }
+        Err(detail) => {
+            return Err(format!(
+                "rho-posterior NUTS: criterion is unavailable at rho_hat itself: {detail}"
+            ));
         }
     };
 
     let chol = whitening.chol;
+    let evaluation_failure = Arc::new(Mutex::new(None));
     let target = WhitenedRhoCriterionTarget {
         criterion_and_grad: Mutex::new(criterion_and_grad),
+        evaluation_failure: Arc::clone(&evaluation_failure),
         mode: mode.clone(),
         chol: chol.clone(),
         chol_t: whitening.chol_t,
@@ -5730,7 +5772,7 @@ where
     // dense metric during warmup would spend expensive profile solves estimating
     // curvature we have already supplied analytically.
     let mass_cfg = NUTSMassMatrixConfig::disabled();
-    let (result, run_stats) = run_whitened_nuts_result(
+    let run = run_whitened_nuts_result(
         target,
         &mode,
         &chol,
@@ -5741,7 +5783,17 @@ where
         0x6B42_E9A1_05D7_C83F,
         "rho-posterior NUTS sampling failed",
         mode.clone(),
-    )?;
+    );
+    // A position the criterion could not value is the run's failure, whether or
+    // not the sampler itself then stopped.
+    if let Some(failure) = evaluation_failure
+        .lock()
+        .expect("rho-criterion failure mutex poisoned")
+        .take()
+    {
+        return Err(format!("rho-posterior NUTS: {failure}"));
+    }
+    let (result, run_stats) = run?;
     log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }

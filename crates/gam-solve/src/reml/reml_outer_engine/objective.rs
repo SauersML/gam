@@ -1680,6 +1680,11 @@ pub(crate) fn reml_laml_evaluate(
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("the constrained normalizer requests every rho mode response");
+        // Where `cone_solve` is the kernel's pseudo-inverse its derivative carries the kernel's
+        // kept–dropped rotation, read off the drift on the dropped basis (gam#2952). The kernel
+        // prices operator units, so the rotation takes the curvature scale like `cone_solve`.
+        let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
+        let normals = normalizer.retained_normals();
         for coordinate in 0..(k + ext_dim) {
             let (response, fixed_beta_rate) = if coordinate < k {
                 (&rho_vs[coordinate], &rho_curvature_a_k_betas[coordinate])
@@ -1702,11 +1707,30 @@ pub(crate) fn reml_laml_evaluate(
                     .column_mut(column)
                     .assign(&(drift.apply(&r.column(column).to_owned()) / cone_scale));
             }
+            let (inverse_rotation_on_gradient, inverse_rotation_on_normals) =
+                match pseudo_inverse_kernel {
+                    Some(kernel) => {
+                        let mut rate_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                        for column in 0..kernel.dropped_basis.ncols() {
+                            rate_on_dropped
+                                .column_mut(column)
+                                .assign(&drift.apply(&kernel.dropped_basis.column(column).to_owned()));
+                        }
+                        let rotation = kernel.pseudo_inverse_rotation(&rate_on_dropped)?;
+                        (
+                            rotation.apply(&input.gradient) * cone_scale,
+                            rotation.apply_columns(&normals) * cone_scale,
+                        )
+                    }
+                    None => (Array1::zeros(y.len()), Array2::zeros(normals.raw_dim())),
+                };
             let motion = crate::constrained_posterior::ConeCoordinateMotion {
                 mode_response,
                 gradient_rate,
                 precision_rate_on_y,
                 precision_rate_on_r,
+                inverse_rotation_on_gradient,
+                inverse_rotation_on_normals,
             };
             let first = normalizer.first_order(&motion, &cone_solve);
             grad[coordinate] += first.derivative;

@@ -255,13 +255,17 @@ fn railed_psi_coordinate_is_in_the_certificates_evidence_not_only_on_its_face_26
 
 // ─── #2596: one stationarity standard for screening and mint ──────────────
 
+/// The observations the #2596 fixture declares.
+const N_OBS_2596: usize = 5_000;
+
 /// Build a one-coordinate flat-valley objective `c + ½·curvature·(ρ − ρ*)²`
 /// with an analytic Hessian, and certify the point `ρ* + offset` at `fidelity`.
 ///
 /// `curvature` sets the Newton decrement at a given gradient: a LARGE curvature
 /// makes `½gᵀH⁻¹g` tiny, which is precisely the regime the
 /// curvature-resolvability rung exists to certify — a residual gradient that
-/// buys no resolvable objective decrease.
+/// buys no resolvable objective decrease. The fixture declares `n = 5000`
+/// observations, so the criterion resolution is `τ_stat = 1/(2n) = 1e-4`.
 fn certify_flat_valley_point_2596(
     curvature: f64,
     offset: f64,
@@ -310,7 +314,13 @@ fn certify_flat_valley_point_2596(
     );
     certify_outer_optimality_with_fidelity(
         &mut obj,
-        &OuterConfig::default(),
+        &OuterConfig {
+            problem_size: crate::rho_optimizer::OuterProblemSize {
+                n_obs: Some(N_OBS_2596),
+                p_coefficients: Some(1),
+            },
+            ..OuterConfig::default()
+        },
         "screening-vs-mint-2596",
         &mut result,
         fidelity,

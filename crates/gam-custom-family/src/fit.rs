@@ -430,6 +430,10 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) smoothing_correction_absence: Option<gam_solve::model_types::SmoothingCorrectionAbsence>,
     /// Which rule selected the coefficient mode the fit reports (#2366, #2661).
     pub(crate) coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
+    /// The terminal posterior assembly's improper-posterior evidence (#3164),
+    /// published on `FitArtifacts::improper_penalty_null_posterior`.
+    pub(crate) improper_penalty_null_posterior:
+        Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
 }
 
 /// The family's classical deviance at the converged mode, as a typed
@@ -465,6 +469,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         smoothing_corrected,
         smoothing_correction_absence,
         coefficient_mode_selection,
+        improper_penalty_null_posterior,
     } = assembly;
     let log_lambdas = rho_physical;
     let lambdas =
@@ -521,6 +526,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         result_specs,
     )?;
     fit.artifacts.coefficient_mode_selection = coefficient_mode_selection;
+    fit.artifacts.improper_penalty_null_posterior = improper_penalty_null_posterior;
     Ok(fit)
 }
 
@@ -2517,6 +2523,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             covariance_conditional,
             mut geometry,
             reported_beta,
+            improper_penalty_null_posterior,
         } = posterior;
         let reml_term = if options.use_remlobjective {
             let logdet_h = inner
@@ -2606,6 +2613,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 } else {
                     gam_solve::model_types::CoefficientModeSelection::UniqueMode
                 },
+                improper_penalty_null_posterior,
             },
         );
     }
@@ -2884,7 +2892,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_require_measured_psd(need_outer_hessian)
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
-        .with_rel_cost_tolerance(options.outer_rel_cost_tol)
         .with_max_iter(options.outer_max_iter)
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
@@ -3605,6 +3612,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
     // fit: persist the descriptor-indexed raw-β + ρ so a later fold transfers
@@ -3777,6 +3785,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             smoothing_corrected,
             smoothing_correction_absence,
             coefficient_mode_selection,
+            improper_penalty_null_posterior,
         },
     )?;
     fit.artifacts.outer_warm_start = Some(outer_warm_start);
@@ -3997,6 +4006,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     install_reported_posterior_mean(
         family,
@@ -4037,6 +4047,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             // which does not yet carry the rule it applied (#2661).
             coefficient_mode_selection:
                 gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+            improper_penalty_null_posterior,
         },
     )
 }
@@ -4254,6 +4265,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     install_reported_posterior_mean(
         family,
@@ -4295,6 +4307,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             // which does not yet carry the rule it applied (#2661).
             coefficient_mode_selection:
                 gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+            improper_penalty_null_posterior,
         },
     )
 }

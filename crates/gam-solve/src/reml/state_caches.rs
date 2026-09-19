@@ -31,9 +31,9 @@ pub(crate) const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 // 5e-6 because the gradient is scaled by penalised Hessian curvature
 // that can carry an extra ~order of magnitude of roundoff at convergence.
 // The gradient-unit channels (dual, complementarity, stationarity) are judged
-// relative to `max(1, ‖g‖∞)` as well as absolutely, through
-// `active_set::exceeds_at_gradient_scale`, so the verdict does not depend on
-// the response's units.
+// relative to the gradient's natural (operand) scale and only relative to it,
+// through `active_set::exceeds_at_gradient_scale`, so the verdict does not
+// depend on the response's units or on any rescaling of the objective.
 pub(crate) const KKT_TOL_PRIMAL: f64 = 1e-7;
 
 pub(crate) const KKT_TOL_DUAL: f64 = 1e-7;

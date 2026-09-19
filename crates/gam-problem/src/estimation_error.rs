@@ -1009,6 +1009,31 @@ pub enum EstimationError {
         upper: f64,
     },
 
+    /// The penalized likelihood of a link whose range overshoots the family's
+    /// mean domain (identity Poisson, log binomial, ...) increases toward the
+    /// edge of the link's feasibility set, so its maximum is on that edge and
+    /// not at an interior stationary point. P-IRLS detects it at the iterate
+    /// where the Newton decrement has collapsed — the curvature diverges as a
+    /// mean approaches the edge of its domain — while the gradient has not,
+    /// and the step toward it was rejected for leaving the feasible set in the
+    /// same iteration. No interior mode exists to report, and a clamped one
+    /// would be a spurious mean.
+    #[error(
+        "The {link} link's likelihood maximum lies on the boundary of its feasibility set: \
+         after {iterations} P-IRLS iteration(s) the gradient norm is still \
+         {gradient_norm:.6e}, and the step toward the maximum leaves the feasible linear \
+         predictor (eta={eta:?}, feasible set {}). There is no interior maximum to report.",
+        feasible_eta_set(*.lower, *.upper)
+    )]
+    LinkFeasibilityBoundaryOptimum {
+        link: &'static str,
+        eta: f64,
+        lower: f64,
+        upper: f64,
+        iterations: usize,
+        gradient_norm: f64,
+    },
+
     #[error(
         "PIRLS row geometry is not representable at row {row}: {quantity} evaluated from \
          eta={eta:?} produced {value:?}"
@@ -1064,6 +1089,18 @@ pub enum EstimationError {
 
     #[error("Prediction error")]
     PredictionError,
+}
+
+/// The open feasibility interval `(lower, upper)` of a link's linear predictor,
+/// written as the inequality it imposes. An endpoint at `±f64::MAX` or beyond
+/// is the unbounded side, so `(0, f64::MAX)` reads `eta > 0`.
+fn feasible_eta_set(lower: f64, upper: f64) -> String {
+    match (lower > -f64::MAX, upper < f64::MAX) {
+        (true, true) => format!("{lower} < eta < {upper}"),
+        (true, false) => format!("eta > {lower}"),
+        (false, true) => format!("eta < {upper}"),
+        (false, false) => "every finite eta".to_string(),
+    }
 }
 
 // Ensure Debug prints with actual line breaks by delegating to Display
@@ -1123,6 +1160,12 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {SEPARATION}"
             )),
+            Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
+                "The {link} link's range exceeds the family's mean domain and the data put \
+                 a fitted mean on the edge of that domain. Use a link whose range is the \
+                 whole mean domain (the canonical link), or remove the predictor or rows \
+                 that force the mean to the boundary."
+            )),
             Self::PrefitRankDeficientDesignDetected { column_indices, .. }
             | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
@@ -1179,6 +1222,10 @@ impl EstimationError {
             | Self::MultinomialSeparationDetected { .. }
             | Self::PirlsDidNotConverge { .. }
             | Self::FixedLambdaNewtonDidNotConverge { .. } => true,
+            // The inner maximum at THIS rho is on the link's feasibility
+            // boundary; a heavier penalty can pull it inside, as it can pull a
+            // quasi-separated fit back from infinity.
+            Self::LinkFeasibilityBoundaryOptimum { .. } => true,
             // A structural failure, an already-terminal outer verdict, or a
             // statement about the configuration, the data, or the prediction
             // request: none of these becomes true or false by moving rho.
@@ -1382,6 +1429,7 @@ impl EstimationError {
             Self::InvalidStabilization(_)
             | Self::BasisError(_)
             | Self::PerfectSeparationDetected { .. }
+            | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
@@ -1411,6 +1459,22 @@ impl EstimationError {
             | Self::MonotoneRoot(_) => FailureCategory::Numerical,
             // Prose from the calibrator's own trainer; no producer names a kind.
             Self::CalibratorTrainingFailed(_) => FailureCategory::Unclassified,
+        }
+    }
+
+    /// The user-facing category of this failure: [`Self::failure_category`]
+    /// read at the coarser grain every front end classifies by, except that
+    /// a model specification the engine refuses before any data is looked at
+    /// is a defect of the request rather than of the data.
+    #[must_use]
+    pub fn error_category(&self) -> crate::ErrorCategory {
+        let decisive = self.innermost_estimation_error();
+        match decisive {
+            Self::InvalidSpecification(_) | Self::InvalidStabilization(_) | Self::BasisError(_) => {
+                crate::ErrorCategory::Formula
+            }
+            Self::CustomFamily(err) => err.error_category(),
+            _ => decisive.failure_category().error_category(),
         }
     }
 
@@ -1492,6 +1556,9 @@ impl EstimationError {
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
             Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
             Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::LinkFeasibilityBoundaryOptimum { .. } => {
+                "EstimationError::LinkFeasibilityBoundaryOptimum"
+            }
             Self::PirlsRowGeometryUnrepresentable { .. } => {
                 "EstimationError::PirlsRowGeometryUnrepresentable"
             }
@@ -1646,6 +1713,29 @@ impl From<LinalgError> for EstimationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boundary optimum is an input-class, trial-infeasible refusal whose
+    /// message states the feasible set as an inequality, not as an interval
+    /// with a `f64::MAX` endpoint spelled out in full.
+    #[test]
+    fn link_feasibility_boundary_optimum_reads_its_feasible_set() {
+        let boundary = |lower, upper| EstimationError::LinkFeasibilityBoundaryOptimum {
+            link: "identity",
+            eta: 0.0,
+            lower,
+            upper,
+            iterations: 2,
+            gradient_norm: 282.8,
+        };
+        let above = boundary(0.0, f64::MAX);
+        assert!(above.is_trial_point_infeasible());
+        assert_eq!(above.failure_category(), FailureCategory::Input);
+        let message = above.to_string();
+        assert!(message.contains("feasible set eta > 0)"), "{message}");
+        assert!(!message.contains("1797693"), "{message}");
+        assert!(boundary(-f64::MAX, 0.0).to_string().contains("feasible set eta < 0)"));
+        assert!(boundary(0.0, 1.0).to_string().contains("feasible set 0 < eta < 1)"));
+    }
 
     // ── stationarity rung provenance (#2458) ─────────────────────────────────
 

@@ -176,7 +176,9 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -189,22 +191,24 @@ class Model:
             band at ``conformal_level`` coverage in ``posterior_mean_lower`` /
             ``posterior_mean_upper`` — the same routes as ``gam predict
             --conformal``. Exactly one of ``training_data`` or ``calibration``
-            is required. With ``training_data`` it is the exact full-conformal
-            set at the fitted (frozen) smoothing parameters (#942 Layer 1):
-            every labeled row is used for both fitting and calibration, the
-            set is exact *given* the frozen penalty, and it costs one Cholesky
-            per test point with zero refits. It needs a Gaussian-identity model
-            fitted without prior weights, offsets, or a link wiggle. The saved
-            model carries only the ``p x p`` frozen penalty, never per-row
-            training data, so the labeled rows are passed again here. Because the
-            smoothing parameters were selected from all training responses, the
-            finite-sample ``conformal_level`` coverage theorem applies only
-            where the per-row ``frozen_rho_certified`` output column is 1.0 (the
-            Layer-3 certificate that freezing the global smoothing parameter
-            matches the honest ρ-re-selecting set, under a grid-checked
-            Lipschitz assumption); rows with 0.0 carry no finite-sample
-            guarantee, and the bounds report the outer envelope of the
-            (possibly multi-interval) set. With ``calibration`` it is the
+            is required. With ``training_data`` it is the full-conformal set of
+            the fit that re-selects the smoothing strength by REML on the
+            training rows plus the candidate test row (#942 Layer 3): every
+            labeled row is used for both fitting and calibration, and the test
+            row is treated exactly like a training row, so the finite-sample
+            ``conformal_level`` coverage theorem holds. It costs one Cholesky
+            per test point plus a cold REML refit at each finite endpoint. It
+            needs a Gaussian-identity model fitted without prior weights,
+            offsets, or a link wiggle. The saved model carries only the
+            ``p x p`` frozen penalty and its smoothing-parameter count, never
+            per-row training data, so the labeled rows are passed again here.
+            The per-row ``conformal_certificate`` output column is 0
+            (exact_frozen: nothing to re-select) or 1 (honest_refit) where the
+            guarantee holds; a negative code is a typed refusal (several
+            smoothing parameters, a payload without the count, a degenerate
+            criterion) where the row carries the frozen-smoothing set with no
+            finite-sample guarantee. The bounds report the outer envelope of
+            the (possibly multi-interval) set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for
@@ -274,8 +278,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -437,6 +443,48 @@ class Model:
         if return_type is None and id_column is None:
             return scores
         columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
         if id_column is not None:
             columns = {id_column: list(row_ids or []), **columns}
         return restore_output_table(
@@ -816,8 +864,9 @@ class Model:
         * ``provenance`` — ``"radial_enrichment"`` when a test ran, else the
           NAME of the evidence that was missing (``"no_continuous_covariates"``,
           ``"enrichment_budget_below_realized_width"``, ``"no_irls_row_state"``,
-          ``"design_gram_unavailable"``, ...). ``p_value`` is present exactly
-          when a test ran, so "adequate" and "not measured" are never
+          ``"design_gram_unavailable"``, ``"null_fit_unavailable"``,
+          ``"conditional_reference_unavailable"``, ...). ``p_value`` is present
+          exactly when a test ran, so "adequate" and "not measured" are never
           confusable.
 
         Method
@@ -827,8 +876,21 @@ class Model:
         in the fit's own IRLS weight metric. The statistic is
         :math:`T = U^{\top} V^{-} U / \hat\varphi` with
         :math:`U = \tilde Z^{\top} s` and :math:`V = \tilde Z^{\top} W \tilde Z`,
-        referred to :math:`\chi^2_r` (known dispersion) or :math:`F(r, \nu)`
-        (estimated).
+        referred to :math:`\chi^2_r` (known dispersion) or, with the scale
+        estimated on :math:`\nu` residual degrees of freedom, as the
+        added-variable :math:`(T/r)(\nu - r)/(\nu - T)` to :math:`F(r, \nu - r)`.
+
+        For a canonical binomial (logit) or Poisson (log) fit that reference is
+        only first order, and at small ``n`` its error is not small (a
+        conservative test is as miscalibrated as an anti-conservative one).
+        There the score is instead evaluated at the unpenalized null MLE on the
+        test's rows and referred to its law CONDITIONAL on the sufficient
+        statistic :math:`X^{\top}(w \circ y)`, which removes the nuisance
+        :math:`\beta` exactly: the score's conditional mean and covariance are
+        corrected to :math:`O(1/n)` and its fourth cumulant matched by a scaled
+        :math:`c\,\chi^2_{r/c}`. Where that expansion leaves its range of
+        validity (high-leverage rows at an extreme fitted mean) the row reports
+        ``"conditional_reference_unavailable"`` rather than a number.
 
         The projection is **orthogonal in the weight metric**, not the fit's
         penalized :math:`H^{-1}`. That is deliberate and it is what the test
