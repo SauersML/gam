@@ -2237,8 +2237,22 @@ fn fit_materialized_once_with_notes(
     // Cloning the handle is `O(1)` by construction — a `Copy` view or an `Arc`
     // bump, aliasing the same storage — and its lifetime is the caller's
     // dataset, not `mat`, so it outlives the move.
+    //
+    // The response side travels with it: the conditional reference for a
+    // canonical binomial/Poisson fit conditions on `Xᵀ(w∘y)`, so it needs the
+    // response and prior weights the fit consumed (both `Arc` handles, so this
+    // is a refcount bump too).
     let standard_covariate_frame = match &mat.request {
-        FitRequest::Standard(request) => Some(request.data.clone()),
+        FitRequest::Standard(request) => Some(BasisAdequacyInputs {
+            frame: request.data.clone(),
+            y: request.y.clone(),
+            prior_weights: request.weights.clone(),
+            canonical_family: crate::fit_orchestration::drivers::basis_adequacy_canonical_family(
+                &request.family,
+                request.wiggle.is_some(),
+                request.latent_coord.is_some(),
+            ),
+        }),
         _ => None,
     };
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
@@ -2325,9 +2339,18 @@ fn fit_materialized_once_with_notes(
 /// A missing verdict is never an error. `basis_adequacy_report` returns a typed
 /// reason per term instead, and a fit is not refused, delayed, or altered by
 /// what this finds — the only thing that changes is what the caller is told.
+/// What [`attach_basis_adequacy`] needs from the standard request, kept across
+/// the `fit_model` move.
+struct BasisAdequacyInputs<'a> {
+    frame: StandardFitData<'a>,
+    y: std::sync::Arc<ndarray::Array1<f64>>,
+    prior_weights: std::sync::Arc<ndarray::Array1<f64>>,
+    canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
+}
+
 fn attach_basis_adequacy(
     result: FitResult,
-    covariate_frame: Option<StandardFitData<'_>>,
+    covariate_frame: Option<BasisAdequacyInputs<'_>>,
     mut inference_notes: FitNotes,
     unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 ) -> FormulaFitResult {
@@ -2338,12 +2361,17 @@ fn attach_basis_adequacy(
             unidentified_scalar_terms,
         };
     };
-    if let Some(data) = covariate_frame {
+    if let Some(inputs) = covariate_frame {
         standard.basis_adequacy = crate::fit_orchestration::drivers::basis_adequacy_report(
-            data.view(),
+            inputs.frame.view(),
             &standard.design,
             &standard.resolvedspec,
             &standard.fit,
+            &crate::fit_orchestration::drivers::BasisAdequacyResponse {
+                y: inputs.y.view(),
+                prior_weights: inputs.prior_weights.view(),
+                canonical_family: inputs.canonical_family,
+            },
         );
         inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
             &standard.basis_adequacy,
