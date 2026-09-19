@@ -3798,6 +3798,7 @@ pub(crate) fn fit_survival_location_scale_model(
             let pilot = fit_survival_location_scale_terms(data, pilot_spec, kappa_options)?;
             let selected_wiggle_basis = select_survival_link_wiggle_basis_from_pilot(
                 &pilot,
+                spec.age_exit.view(),
                 &WiggleBlockConfig {
                     degree: wiggle.degree,
                     num_internal_knots: wiggle.num_internal_knots,
