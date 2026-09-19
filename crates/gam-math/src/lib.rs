@@ -5,6 +5,7 @@ pub mod constrained_partition;
 // kernel (families.md F2/F3).
 pub mod edm_row;
 pub mod fast_channel;
+pub mod fractional_rank;
 pub mod gaussian_activation;
 pub mod gaussian_reciprocal;
 mod jet_algebra;

@@ -2540,14 +2540,18 @@ fn full_log_likelihood_row(
                 ));
             }
         }
+        // A binomial prior weight need not be an integer trial count: the
+        // normalizer is the continuous extension `ln C(w, wy)` (see
+        // `binomial_log_coefficient_from_proportion`), which is exactly zero for
+        // a 0/1 response under any real weight, so a fractional sample weight on
+        // Bernoulli data is the weighted Bernoulli log-mass.
         ResponseFamily::Binomial => {
-            let successes = weight * y;
-            if !exact_integer(weight) || !exact_integer(successes) {
+            if !(weight.is_finite() && weight > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     row,
-                    "fully-normalized binomial trials/successes (exact integers required)",
+                    "fully-normalized binomial prior weight (finite and positive required)",
                     eta,
-                    successes,
+                    weight,
                 ));
             }
         }
