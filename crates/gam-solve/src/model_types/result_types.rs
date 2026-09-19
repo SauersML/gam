@@ -663,6 +663,34 @@ mod per_term_edf_tests {
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 
+/// Which exact test proved a rail face's first-order expansion positive.
+///
+/// Off a face `F` the criterion is `V_∞ + f(t) + O(|t|²)` with
+/// `f(t) = ½tr((Σ_{j∈F} A_j/t_j)⁻¹C)`, `t_j = e^{−ρ_j} ≥ 0`. `f` is
+/// homogeneous of degree one, so positivity on the closed orthant is
+/// positivity on the simplex — and two of its cases are decided exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FacePositivityRoute {
+    /// `C ≻ 0`: every compression of `C` is positive definite, so `f > 0` for
+    /// every weighting. Sufficient, not necessary.
+    PositiveForm,
+    /// The released ranges of the face penalties are linearly independent
+    /// (`Σ_j rank A_j = q`). A congruence then block-diagonalizes every `A_j`
+    /// at once, `f(t) = Σ_j c_j t_j` is exactly LINEAR, and `f > 0` on the
+    /// simplex iff every identified `c_j > 0` — the KKT test at the face.
+    IndependentRanges,
+    /// The released ranges OVERLAP, so `f` is genuinely nonlinear and neither
+    /// the per-axis slopes nor `C ≻ 0` decides it (both axis laws can be
+    /// positive while a joint release descends). The weighted parallel sum
+    /// `M(t) = (Σ_j A_j/t_j)⁻¹` is matrix-concave, so on the spectral split
+    /// `C = C₊ − C₋` the expansion is a difference of concave functions; a
+    /// simplicial branch-and-bound bounds it below on every cell (vertex values
+    /// of the concave part, a tangent plane of the subtracted one) and proves
+    /// `f > 0` on the whole simplex, each cell's bound clearing its own
+    /// rounding band.
+    SimplexBound,
+}
+
 /// What established a rail coordinate's tail law, and the standard it cleared
 /// (#2348 Inc 5 build-out).
 ///
@@ -677,9 +705,11 @@ pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RailTailEvidence {
     /// PROVEN at the face. The `λ = ∞` limit was formed exactly and the
-    /// first-order form `C` on the released subspace is positive definite, so
-    /// the criterion strictly increases for every finite smoothing parameter on
-    /// the face, and on every sub-face, at once.
+    /// criterion's first-order expansion off the face,
+    /// `V = V_∞ + ½tr((Σ_j A_j/t_j)⁻¹C) + O(|t|²)` with `t_j = e^{−ρ_j}`, is
+    /// strictly positive for every way of coming off it — every finite
+    /// smoothing parameter on the face and on every sub-face, at once.
+    /// [`FacePositivityRoute`] names which exact positivity test decided it.
     ///
     /// A coordinate whose own penalty releases nothing once the REST of the
     /// face is at `λ = ∞` is unidentified there, and the proof derives
@@ -688,11 +718,17 @@ pub enum RailTailEvidence {
     /// measurement — which is precisely why the two routes cannot share one
     /// well-formedness rule.
     AnalyticFaceProof {
-        /// `λ_min(C)`, the smallest curvature of the face's first-order form.
-        min_curvature: f64,
-        /// The floor it cleared: `q·ε·‖C‖·(1 + cond)`, the eigenvalue backward
-        /// error amplified by the `Z`-block solve that formed `C`.
-        curvature_margin: f64,
+        /// Which exact positivity test proved the face.
+        route: FacePositivityRoute,
+        /// The route's decisive statistic: `λ_min(C)` on
+        /// [`FacePositivityRoute::PositiveForm`], the binding coordinate's
+        /// analytic pencil constant `c_j` on
+        /// [`FacePositivityRoute::IndependentRanges`], the binding simplex
+        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`].
+        statistic: f64,
+        /// The rounding band that statistic had to clear, from the measured
+        /// error of forming `C` in floating point (never a tuned margin).
+        band: f64,
     },
     /// MEASURED by probing back from the rail: the pencil constant
     /// `ĉ = −e^{ρ}·∂V/∂ρ` held across a finite-difference-clean window. The
@@ -723,16 +759,16 @@ impl RailTailEvidence {
         }
         match self {
             Self::AnalyticFaceProof {
-                min_curvature,
-                curvature_margin,
+                statistic, band, ..
             } => {
                 // Re-check the proof's own inequality: `certifies()` may be
                 // asked of a DESERIALIZED certificate, where these are only
                 // numbers someone supplied.
                 tail_constant >= 0.0
-                    && min_curvature.is_finite()
-                    && curvature_margin.is_finite()
-                    && *min_curvature > *curvature_margin
+                    && statistic.is_finite()
+                    && band.is_finite()
+                    && *band >= 0.0
+                    && *statistic > *band
             }
             Self::ProbedTail { noise_floor, .. } => noise_floor.is_finite() && tail_constant > 0.0,
         }
@@ -1949,7 +1985,8 @@ impl Default for FitOptions {
 mod tests_certification_refusal_2550 {
     use super::{
         CertificationRefusal, CurvatureAdmissibility, CurvatureEvidence, OuterCriterionCertificate,
-        OuterStationarityCertificate, RailCoordinate, RailFault, RailTailEvidence,
+        FacePositivityRoute, OuterStationarityCertificate, RailCoordinate, RailFault,
+        RailTailEvidence,
     };
     use crate::rho_optimizer::asymptote_certificate::AsymptoteSide;
 
@@ -1970,8 +2007,9 @@ mod tests_certification_refusal_2550 {
             value_gap: 2.6e-5,
             estimand_travel_bound: 1.0e-9,
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: 3.5,
-                curvature_margin: 1.0e-12,
+                route: FacePositivityRoute::PositiveForm,
+                statistic: 3.5,
+                band: 1.0e-12,
             },
         }
     }
@@ -2165,8 +2203,8 @@ mod tests_certification_refusal_2550 {
 #[cfg(test)]
 mod rail_tail_evidence_tests {
     use super::{
-        CurvatureEvidence, OuterCriterionCertificate, OuterStationarityCertificate, RailCoordinate,
-        RailTailEvidence,
+        CurvatureEvidence, FacePositivityRoute, OuterCriterionCertificate,
+        OuterStationarityCertificate, RailCoordinate, RailTailEvidence,
     };
     use crate::rho_optimizer::asymptote_certificate::AsymptoteSide;
 
@@ -2178,8 +2216,9 @@ mod rail_tail_evidence_tests {
             value_gap: tail_constant * (-12.0_f64).exp(),
             estimand_travel_bound: 1.0e-9,
             evidence: RailTailEvidence::AnalyticFaceProof {
-                min_curvature: 3.5,
-                curvature_margin: 1.0e-12,
+                route: FacePositivityRoute::PositiveForm,
+                statistic: 3.5,
+                band: 1.0e-12,
             },
         }
     }
@@ -2256,8 +2295,9 @@ mod rail_tail_evidence_tests {
     fn a_claimed_face_proof_below_its_own_margin_does_not_certify_2348() {
         let mut rail = proven_rail(0, 4.25);
         rail.evidence = RailTailEvidence::AnalyticFaceProof {
-            min_curvature: 1.0e-14,
-            curvature_margin: 1.0e-12,
+            route: FacePositivityRoute::PositiveForm,
+            statistic: 1.0e-14,
+            band: 1.0e-12,
         };
         assert!(
             !certificate(vec![rail]).certifies(),

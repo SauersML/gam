@@ -195,13 +195,7 @@ fn run_bimodal_terminal(owns_terminal: bool) -> (f64, f64) {
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0]);
     let result = problem
         .run(&mut obj, "bimodal-terminal")
         .expect("stationary seed must certify");
@@ -282,12 +276,6 @@ fn saddle_problem() -> OuterProblem {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -390,12 +378,6 @@ fn railed_saddle_problem() -> OuterProblem {
             Array1::from_elem(3, RAILED_SADDLE_FACE),
         )
         .with_initial_rho(array![0.0, 0.0, RAILED_SADDLE_FACE])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -570,13 +552,7 @@ fn criterion_contradicts_a_lying_hessian_and_the_point_certifies_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(lying_hessian_cost(rho)),
@@ -670,13 +646,7 @@ fn escape_reaches_a_descent_below_the_old_fixed_ladder_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(narrow_well_cost(rho)),
@@ -870,13 +840,7 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0, 0.0]);
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_cost(rho)),
@@ -980,12 +944,6 @@ fn ridge_problem() -> OuterProblem {
             array![RIDGE_BOX_FACE, RIDGE_BOX_FACE],
         )
         .with_initial_rho(array![0.0, 0.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -1198,12 +1156,6 @@ fn corner_problem() -> OuterProblem {
             Array1::from_elem(dim, CORNER_BOX_FACE),
         )
         .with_initial_rho(Array1::<f64>::zeros(dim))
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 #[test]
@@ -1334,12 +1286,6 @@ fn valley_problem(initial_rho: Array1<f64>) -> OuterProblem {
         .with_rel_cost_tolerance(Some(VALLEY_REL_COST))
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(initial_rho)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
 }
 
 /// One request the valley objective served, in the order it was served.

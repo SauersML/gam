@@ -163,7 +163,7 @@ pub use result_types::{
     InferenceCovarianceMode, NO_CRITERION_AT_EXACT_FIT,
     NewtonPolishRail, NewtonPolishRecord,
     OuterCriterionCertificate,
-    RailFaceKind,
+    FacePositivityRoute, RailFaceKind,
     OuterHessianAbsence, OuterStationarityCertificate, OuterWarmStartRecord, RailCoordinate,
     RailTailEvidence,
     RailedCoordinateFact, RankConstancyNotEvaluated, SmoothingCorrectionAbsence,
