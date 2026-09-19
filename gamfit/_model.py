@@ -1105,6 +1105,18 @@ class Model:
         return self.summary().family_name
 
     @property
+    def student_t_sigma(self) -> float | None:
+        """LAML-estimated scale σ of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._model_bytes)
+        return None if params is None else params[0]
+
+    @property
+    def student_t_nu(self) -> float | None:
+        """LAML-estimated degrees of freedom ν of a ``family="student-t"`` fit; ``None`` otherwise."""
+        params = rust_module().student_t_parameters_from_model(self._model_bytes)
+        return None if params is None else params[1]
+
+    @property
     def notes(self) -> list[str]:
         """Inference advisories recorded while this model was fit.
 
