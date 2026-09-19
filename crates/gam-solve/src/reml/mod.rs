@@ -5809,6 +5809,13 @@ pub(crate) struct RemlState<'a> {
     /// on `reset_surface`.
     pub(crate) frozen_beta_phi: Arc<AtomicU64>,
 
+    /// Gaussian (non-identity link) / inverse Gaussian dispersion `phi` frozen
+    /// for the λ search, bit-packed `f64`; `0` means "not yet frozen". Captured
+    /// once as the converged-η MLE `Σwd/Σw` and applied via
+    /// `GlmLikelihoodSpec::with_dispersion_phi_frozen_for_search`, exactly like
+    /// [`Self::frozen_tweedie_phi`]; the final reported fit refreshes it.
+    pub(crate) frozen_dispersion_phi: Arc<AtomicU64>,
+
     /// Last observed IFT-prediction residual (`‖β_converged − β_predicted‖
     /// / ‖β_converged‖`) from the most recent non-screening solve where
     /// the predictor was actually consumed. Bit-packed `f64` (low 64

@@ -60,7 +60,7 @@ pub(crate) use gam_predict::{
 pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{
-    normal_cdf, normal_two_sided_probability, standard_normal_quantile,
+    inverse_gaussian_cdf, normal_cdf, normal_two_sided_probability, standard_normal_quantile,
     student_t_two_sided_probability,
 };
 

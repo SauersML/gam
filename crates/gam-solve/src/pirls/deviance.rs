@@ -598,6 +598,114 @@ pub(crate) fn beta_fitted_loglikelihood_unit_from_eta(
     )
 }
 
+/// Half-deviance and `∂(half-deviance)/∂η` of one row under a reciprocal-power
+/// link `μ = η^(−a)` (the inverse link `a = 1`, the inverse-squared link
+/// `a = ½`).
+///
+/// Every quantity is assembled in log space from `ln μ = −a ln η`, so the row
+/// stays representable when `μ` itself would overflow or underflow. The score is
+/// the exponential-dispersion identity `w (μ − y) μ′ / V(μ)` with
+/// `μ′ = −a μ / η`. The link is only defined on `η > 0`; outside it the jet
+/// reports [`EstimationError::InverseLinkDomainViolation`], which the inner
+/// solver treats as an infeasible trial step and damps (step-halving to
+/// feasibility) instead of projecting `η`.
+fn reciprocal_link_edm_row(
+    row: usize,
+    family: PowerVarianceEdm,
+    link: StandardLink,
+    exponent: f64,
+    y: f64,
+    eta: f64,
+    log_weight: f64,
+) -> Result<(f64, f64), EstimationError> {
+    require_reciprocal_link_domain(link, eta)?;
+    let log_eta = eta.ln();
+    let log_mu = -exponent * log_eta;
+    let log_score_link = exponent.ln() - log_eta;
+    match family {
+        PowerVarianceEdm::Gaussian => {
+            if !y.is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian response", eta, y));
+            }
+            let mu = log_mu.exp();
+            if !mu.is_finite() {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian mean", eta, mu));
+            }
+            let (sign, log_abs_residual) = signed_log_difference(y, mu);
+            let half = finite_signed_from_log(
+                row,
+                "Gaussian half-deviance",
+                eta,
+                1.0,
+                log_weight + 2.0 * log_abs_residual - std::f64::consts::LN_2,
+            )?;
+            // w (μ − y) μ′ = w a μ (y − μ) / η.
+            let score = finite_signed_from_log(
+                row,
+                "Gaussian eta score",
+                eta,
+                sign,
+                log_weight + log_score_link + log_mu + log_abs_residual,
+            )?;
+            Ok((half, score))
+        }
+        PowerVarianceEdm::Gamma => {
+            if !(y.is_finite() && y > 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gamma response", eta, y));
+            }
+            let log_r = y.ln() - log_mu;
+            let half = finite_signed_from_log(
+                row,
+                "Gamma half-deviance",
+                eta,
+                1.0,
+                log_weight + log_gamma_ratio_deviance(log_r),
+            )?;
+            // w (μ − y) μ′ / μ² = w a (r − 1) / η.
+            let score_sign = if log_r > 0.0 { 1.0 } else { -1.0 };
+            let score = finite_signed_from_log(
+                row,
+                "Gamma eta score",
+                eta,
+                score_sign,
+                log_weight + log_score_link + log_abs_one_minus_exp(log_r),
+            )?;
+            Ok((half, score))
+        }
+        PowerVarianceEdm::InverseGaussian => {
+            if !(y.is_finite() && y > 0.0) {
+                return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                    row,
+                    "inverse-Gaussian response",
+                    eta,
+                    y,
+                ));
+            }
+            let log_y = y.ln();
+            let (sign, log_abs_residual) = signed_log_exp_difference(log_y, log_mu);
+            let half = finite_signed_from_log(
+                row,
+                "inverse-Gaussian half-deviance",
+                eta,
+                1.0,
+                log_weight + 2.0 * log_abs_residual
+                    - std::f64::consts::LN_2
+                    - log_y
+                    - 2.0 * log_mu,
+            )?;
+            // w (μ − y) μ′ / μ³ = w a (y − μ) / (η μ²).
+            let score = finite_signed_from_log(
+                row,
+                "inverse-Gaussian eta score",
+                eta,
+                sign,
+                log_weight + log_score_link + log_abs_residual - 2.0 * log_mu,
+            )?;
+            Ok((half, score))
+        }
+    }
+}
+
 /// The `eta`-independent factors of one row's likelihood measure: the prior
 /// weight, the log-measure scale, and the weight `w·e^{scale}` and log weight
 /// `ln w + scale` every family branch of the row oracle is assembled from.
@@ -762,7 +870,59 @@ pub fn deviance_eta_row_on_measure(
     // name its half-deviance as a plain product of finite factors, take the
     // product — one rounding instead of three. `weight` is `log_weight`'s
     // exponentiated twin, the first of those factors.
+    let reciprocal_link = reciprocal_power_link(inverse_link);
     let (half_deviance, eta_score) = match &likelihood.spec.response {
+        ResponseFamily::Gaussian if reciprocal_link.is_some() => {
+            let (link, exponent) = reciprocal_link.expect("guarded by is_some");
+            reciprocal_link_edm_row(row, PowerVarianceEdm::Gaussian, link, exponent, y, eta, log_weight)?
+        }
+        ResponseFamily::Gamma if reciprocal_link.is_some() => {
+            let (link, exponent) = reciprocal_link.expect("guarded by is_some");
+            reciprocal_link_edm_row(row, PowerVarianceEdm::Gamma, link, exponent, y, eta, log_weight)?
+        }
+        ResponseFamily::InverseGaussian => match reciprocal_link {
+            Some((link, exponent)) => reciprocal_link_edm_row(
+                row,
+                PowerVarianceEdm::InverseGaussian,
+                link,
+                exponent,
+                y,
+                eta,
+                log_weight,
+            )?,
+            None => {
+                // Log link: μ = e^η, so ½d = (y − μ)²/(2yμ²) and the score is
+                // w (μ − y) μ / μ³ = w (1 − y/μ) / μ.
+                if !(y.is_finite() && y > 0.0) {
+                    return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                        row,
+                        "inverse-Gaussian response",
+                        eta,
+                        y,
+                    ));
+                }
+                let log_y = y.ln();
+                let (sign, log_abs_residual) = signed_log_exp_difference(log_y, eta);
+                let half = finite_signed_from_log(
+                    row,
+                    "inverse-Gaussian half-deviance",
+                    eta,
+                    1.0,
+                    log_weight + 2.0 * log_abs_residual
+                        - std::f64::consts::LN_2
+                        - log_y
+                        - 2.0 * eta,
+                )?;
+                let score = finite_signed_from_log(
+                    row,
+                    "inverse-Gaussian eta score",
+                    eta,
+                    -sign,
+                    log_weight + log_abs_residual - 2.0 * eta,
+                )?;
+                (half, score)
+            }
+        },
         ResponseFamily::Gaussian => {
             if !y.is_finite() {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(row, "Gaussian response", eta, y));
@@ -1827,8 +1987,13 @@ pub fn calculate_null_deviance(
                 },
             )
         }
-        ResponseFamily::Gamma => {
-            let mean = response_mean("Gamma null model", |value| value.is_finite() && value > 0.0)?;
+        // The intercept-only score `Σ w (y − μ) μ′/V(μ) = 0` has the weighted
+        // response mean as its root under every link, so the null deviance is
+        // evaluated through the log link whatever link the fit uses.
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian => {
+            let mean = response_mean("positive-response null model", |value| {
+                value.is_finite() && value > 0.0
+            })?;
             let inverse_link = InverseLink::Standard(StandardLink::Log);
             (
                 mean.ln(),
@@ -1875,6 +2040,10 @@ fn eta_log_measure_scale(likelihood: &GlmLikelihoodSpec) -> Result<f64, Estimati
             .tweedie_log_phi()
             .map(|log_phi| -log_phi)
             .map_err(scale_error),
+        ResponseFamily::InverseGaussian => scale
+            .dispersion_log_phi()
+            .map(|log_phi| -log_phi)
+            .map_err(scale_error),
         _ => Ok(0.0),
     }
 }
@@ -1906,9 +2075,10 @@ fn omitted_log_likelihood_row(
         }
     };
     match response {
-        ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } => {
-            Ok(-deviance.half_deviance)
-        }
+        ResponseFamily::Gaussian
+        | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
+        | ResponseFamily::Tweedie { .. } => Ok(-deviance.half_deviance),
         ResponseFamily::Poisson => {
             if y == 0.0 {
                 finite_signed_from_log(row, "Poisson log-likelihood", eta, -1.0, log_weight + eta)
@@ -2339,6 +2509,7 @@ fn full_log_likelihood_row(
         // instead of silently skipping the check.
         ResponseFamily::Gaussian
         | ResponseFamily::Gamma
+        | ResponseFamily::InverseGaussian
         | ResponseFamily::Tweedie { .. }
         | ResponseFamily::StudentT { .. }
         | ResponseFamily::RoystonParmar => {}
@@ -2399,6 +2570,10 @@ fn full_log_likelihood_row(
                 ));
             }
             value
+        }
+        // `−½ ln(2π φ y³ / w)`, with `log_measure_scale = −ln φ`.
+        ResponseFamily::InverseGaussian => {
+            -0.5 * (LN_2PI - log_measure_scale + 3.0 * y.ln() - weight.ln())
         }
         // The Student-t omitted row already carries its full normalizer:
         // `(σ, ν)` are hyperparameters, so the LAML surface needs it too.

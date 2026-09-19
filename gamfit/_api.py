@@ -812,7 +812,7 @@ def fit(
         Likelihood family, or ``"auto"`` to infer from the response. Corresponds
         to the ``--family`` CLI flag. Scalar fit values include ``"gaussian"``,
         ``"binomial"`` / ``"bernoulli"``, ``"poisson"``, ``"gamma"``,
-        ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
+        ``"inverse-gaussian"``, ``"beta"``, ``"tweedie"`` / ``"tw"``, and ``"negative-binomial"`` /
         ``"negbin"`` / ``"nb"``, and the heavy-tailed ``"student-t"`` /
         ``"student_t"`` / ``"t"`` (identity link, scale and degrees of freedom
         estimated by LAML jointly with the smoothing parameters; the fitted
