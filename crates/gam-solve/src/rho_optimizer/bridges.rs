@@ -128,12 +128,13 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// used `on_step_accepted` to drive the inner-PIRLS cap. This wires the
     /// same signal to the guard, which is the place it is load-bearing.
     ///
-    /// `None` leaves the pre-#2613 fold-every-eval behaviour, which is what the
-    /// routes without a cost-stall guard want anyway (they never fold).
-    pub(crate) accepted_steps: Option<Arc<AcceptedStepLedger>>,
+    /// The ledger is mandatory (#3018): folding every evaluation when none was
+    /// wired was a second behaviour that only unit-test literals reached, and a
+    /// test that means "every evaluation is accepted" says so by pushing the
+    /// accepts itself.
+    pub(crate) accepted_steps: Arc<AcceptedStepLedger>,
     /// First-order evaluations made since the last accepted step, oldest first.
-    /// Drained by [`Self::drain_accepted_steps`]. Empty whenever
-    /// `accepted_steps` is `None`.
+    /// Drained by [`Self::drain_accepted_steps`].
     pub(crate) pending_first_order: Vec<PendingOuterEval>,
     /// `(ρ, cost)` of the last iterate known to be accepted — the seed, then
     /// each accepted step. The reference point for reconciling
@@ -2057,19 +2058,10 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                 projected_grad_norm,
                 inner_converged,
             };
-            match self.accepted_steps.is_some() {
-                true => {
-                    if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
-                        self.pending_first_order.remove(0);
-                    }
-                    self.pending_first_order.push(sample);
-                }
-                // No accept signal wired (a caller that built the bridge
-                // directly, e.g. a unit test): every gradient eval is folded,
-                // which is the pre-#2613 behaviour and is safe on any driver
-                // that really does call `eval_grad` once per accepted step.
-                false => self.fold_accepted_iterate(&sample)?,
+            if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
+                self.pending_first_order.remove(0);
             }
+            self.pending_first_order.push(sample);
         }
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2120,14 +2112,10 @@ impl OuterFirstOrderBridge<'_> {
     /// observes it — an observer cannot stop `opt::Bfgs`, an error is the only
     /// in-band way.
     fn drain_accepted_steps(&mut self) -> Result<(), ObjectiveEvalError> {
-        let Some(ledger) = self.accepted_steps.clone() else {
-            return Ok(());
-        };
-        if self.cost_stall.is_none() {
-            return Ok(());
-        }
-        let steps = ledger.drain();
-        if steps.is_empty() {
+        // Drained on every route so the observer's pushes never accumulate
+        // where no guard reads them.
+        let steps = self.accepted_steps.drain();
+        if self.cost_stall.is_none() || steps.is_empty() {
             return Ok(());
         }
         let mut outcome = Ok(());
@@ -3098,8 +3086,8 @@ impl OuterSecondOrderBridge<'_> {
     /// margin-railed coordinates of the search box, the objective's declared
     /// invariance, and the resolution `floor·(1 + |V|)` that the certificate's
     /// `asymptote_objective_tol` equals. It stops ARC only when the claim is
-    /// contradicted AND `|Pg|` is inside the certificate's first-order band at the
-    /// incumbent's value ([`CostStallGuard::stationarity_band`]); the mandatory final certificate
+    /// contradicted, or unresolvable at every allowed step (#3036), AND `|Pg|`
+    /// is inside the certificate's first-order band at the incumbent's value ([`CostStallGuard::stationarity_band`]); the mandatory final certificate
     /// re-derives its verdict from a fresh evaluation regardless. A descended or
     /// declined adjudication leaves the escape standing, and the objective is
     /// re-evaluated at `x` so ARC's next trial starts from the state it holds.
@@ -3159,23 +3147,23 @@ impl OuterSecondOrderBridge<'_> {
                      |Pg|={grad_norm:.3e} is inside the certificate's band {grad_threshold:.3e} after \
                      {iterations} accepted outer iteration(s) (value={value:.6e}; #1082, #2612).",
                 );
-                let guard = self.cost_stall.as_mut()?;
-                if let Ok(mut slot) = guard.exit.lock() {
-                    *slot = Some(CostStallExit {
-                        rho,
-                        value,
-                        grad_norm,
-                        iterations,
-                        converged: true,
-                        // No stall window's evidence is reported: the rung that
-                        // stopped this run is the certificate's band.
-                        probe_scale: None,
-                        rank_boundary: None,
-                    });
-                }
-                Some(ObjectiveEvalError::fatal(
-                    ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
-                ))
+                self.stop_at_accepted_strict_saddle(rho, value, grad_norm, iterations)
+            }
+            super::run::SaddleAdjudication::Unresolvable {
+                lambda_min,
+                predicted_at_largest,
+                ..
+            } => {
+                log::debug!(
+                    "[OUTER] ARC stopping at the strict-saddle incumbent its own certificate \
+                     accepts: the reported negative curvature is UNRESOLVABLE by the criterion \
+                     ({curvature_note}; lambda_min={lambda_min:.6e} predicts at most \
+                     {predicted_at_largest:.3e} at the largest step, against resolution \
+                     {objective_resolution:.3e}), and |Pg|={grad_norm:.3e} is inside the \
+                     certificate's band {grad_threshold:.3e} after {iterations} accepted outer \
+                     iteration(s) (value={value:.6e}; #1082, #3036).",
+                );
+                self.stop_at_accepted_strict_saddle(rho, value, grad_norm, iterations)
             }
             other => {
                 if let super::run::SaddleAdjudication::Declined(reason) = &other {
@@ -3192,6 +3180,35 @@ impl OuterSecondOrderBridge<'_> {
                 None
             }
         }
+    }
+
+    /// Stop ARC at a strict-saddle incumbent whose curvature verdict the
+    /// criterion withdrew, contradicted (#2612) or unresolvable (#3036): publish
+    /// the incumbent as a converged cost-stall exit and hand `opt` the sentinel.
+    fn stop_at_accepted_strict_saddle(
+        &mut self,
+        rho: Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        iterations: usize,
+    ) -> Option<ObjectiveEvalError> {
+        let guard = self.cost_stall.as_mut()?;
+        if let Ok(mut slot) = guard.exit.lock() {
+            *slot = Some(CostStallExit {
+                rho,
+                value,
+                grad_norm,
+                iterations,
+                converged: true,
+                // No stall window's evidence is reported: the rung that
+                // stopped this run is the certificate's band.
+                probe_scale: None,
+                rank_boundary: None,
+            });
+        }
+        Some(ObjectiveEvalError::fatal(
+            ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
+        ))
     }
 
     /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
@@ -3432,10 +3449,10 @@ pub(crate) struct OuterAcceptObserver {
     /// Trajectory census (#2735), read by the runner after the solver returns.
     /// `None` on routes whose summary does not report one.
     pub(crate) census: Option<Arc<OuterStepCensus>>,
-    /// Accepted-outer-step ledger shared with [`OuterFirstOrderBridge`], which
-    /// drains it to decide which of its own evaluations were accepted iterates
-    /// (#2613). `None` on routes with no cost-stall guard.
-    pub(crate) accepted_steps: Option<Arc<AcceptedStepLedger>>,
+    /// Accepted-outer-step ledger shared with the route's bridge, which drains
+    /// it to decide which of its own evaluations were accepted iterates
+    /// (#2613, #3017). Every route that installs the observer drains one (#3018).
+    pub(crate) accepted_steps: Arc<AcceptedStepLedger>,
 }
 
 /// What a trust-region trajectory actually did, counted as `opt` reported it.
@@ -3556,13 +3573,11 @@ impl OptimizerObserver for OuterAcceptObserver {
         if let Some(feedback) = self.feedback.as_ref() {
             feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(ledger) = self.accepted_steps.as_ref() {
-            ledger.push(AcceptedOuterStep {
-                iter: info.iter,
-                step_norm: info.step_norm,
-                actual_decrease: info.actual_decrease,
-            });
-        }
+        self.accepted_steps.push(AcceptedOuterStep {
+            iter: info.iter,
+            step_norm: info.step_norm,
+            actual_decrease: info.actual_decrease,
+        });
         if let Some(census) = self.census.as_ref() {
             census.observe(info, true);
         }
