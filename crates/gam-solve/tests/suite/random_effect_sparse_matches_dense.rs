@@ -140,9 +140,7 @@ fn many_level_random_effect_sparse_fit_matches_the_dense_fit() {
     assert!(dense.outer_converged, "the dense fit must converge");
     assert!(sparse.outer_converged, "the sparse fit must converge");
 
-    let dense_score = dense
-        .reml_score
-        .expect("the dense fit has a finite REML score");
+    let dense_score = dense.reml_score.expect("the dense fit has a finite REML score");
     let sparse_score = sparse
         .reml_score
         .expect("the sparse fit has a finite REML score");
