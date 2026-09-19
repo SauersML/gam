@@ -577,6 +577,18 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
         raise map_exception(exc) from exc
 
 
+MULTINOMIAL_FAMILY_NAMES = frozenset(
+    {"multinomial", "multinomial-logit", "categorical", "categorical-logit", "softmax"}
+)
+
+
+def is_multinomial_family(family: str | None) -> bool:
+    """Whether ``family`` names the softmax (multinomial-logit) likelihood."""
+    if family is None:
+        return False
+    return str(family).lower().replace("_", "-") in MULTINOMIAL_FAMILY_NAMES
+
+
 @overload
 def fit(
     data: Any,
@@ -1117,14 +1129,7 @@ def fit(
     # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
     # to select an independent smoothing parameter per (class, term), from the
     # same `MultinomialFitRequest::new` defaults the CLI uses.
-    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
-    if family_canonical in {
-        "multinomial",
-        "multinomial-logit",
-        "categorical",
-        "categorical-logit",
-        "softmax",
-    }:
+    if is_multinomial_family(family):
         if warm_start_bytes is not None:
             raise ValueError("warm_start_from is not supported for multinomial fits")
         try:

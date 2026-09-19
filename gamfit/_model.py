@@ -1399,17 +1399,15 @@ class MultinomialModel:
     Returned by ``gamfit.fit(data, formula, family='multinomial')``. The
     underlying solver is the canonical
     ``gam::families::multinomial::fit_penalized_multinomial`` Newton solve
-    against a reference-coded softmax likelihood; the reference class is the
-    last level recorded in the dataset schema (i.e. order of first appearance
-    in the training table, which is stable across runs).
+    against a reference-coded softmax likelihood with ``K − 1`` linear
+    predictors; every (class, term) penalty carries its own smoothing
+    parameter, selected jointly by REML/LAML. Class levels are the sorted label
+    set of the categorical response column and the reference class is the last
+    of them.
 
     Class names are preserved verbatim from the categorical response column,
     so :attr:`classes_` matches what ``predict`` columns line up with — no
     silent permutation.
-
-    Slice A of issue #328: a single uniform smoothing parameter is shared
-    across every penalty block and every active class. REML / LAML λ
-    selection lands in the follow-up slice.
     """
 
     __slots__ = ("_model_bytes", "_training_table_kind", "_metadata")
