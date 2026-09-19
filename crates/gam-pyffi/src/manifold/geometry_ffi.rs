@@ -4498,6 +4498,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("MissingDependencyError", module.py().get_type::<MissingDependencyError>())?;
     module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
     module.add("PredictionError", module.py().get_type::<PredictionError>())?;
+    module.add("PredictInputError", module.py().get_type::<PredictInputError>())?;
     module.add("PerfectSeparationError", module.py().get_type::<PerfectSeparationError>())?;
     module.add("ModelOverparameterizedError", module.py().get_type::<ModelOverparameterizedError>())?;
     module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
@@ -6962,7 +6963,7 @@ fn predict_encoded_table_configured_impl(
         return Err(PredictError::SchemaMismatch(missing.join(" ")));
     }
     let dataset =
-        dataset_with_model_schema_from_encoded(model, &source).map_err(PredictError::Other)?;
+        dataset_with_model_schema_from_encoded(model, &source)?;
     predict_dataset_with_options_impl(model, model_class, dataset, &options)
         .map_err(PredictError::Other)
 }

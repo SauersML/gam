@@ -111,6 +111,16 @@ def test_non_finite_data_is_a_data_error():
         gamfit.fit(frame, "y ~ s(x)")
 
 
+def test_an_unpredictable_cell_is_a_data_error():
+    model = gamfit.fit(_categorical_frame(), "y ~ s(x) + factor(grp)")
+    new = _categorical_frame(6)
+    new.loc[2, "grp"] = "west"
+    with pytest.raises(gamfit.errors.PredictInputError, match="'west'") as caught:
+        model.predict(new)
+    assert isinstance(caught.value, gamfit.errors.PredictionError)
+    assert isinstance(caught.value, gamfit.errors.DataError)
+
+
 def test_an_unfinished_solve_is_a_convergence_error():
     rng = np.random.RandomState(7)
     n = 30

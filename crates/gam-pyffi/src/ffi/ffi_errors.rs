@@ -218,6 +218,14 @@ create_exception!(
 
 create_exception!(
     _rust,
+    PredictInputError,
+    PredictionError,
+    "A cell of the prediction data cannot be predicted from: a non-finite \
+     covariate, a missing categorical label or an unseen fixed-factor level."
+);
+
+create_exception!(
+    _rust,
     PerfectSeparationError,
     DataError,
     "Perfect or quasi-perfect separation detected during model fitting."
@@ -655,8 +663,13 @@ where
 /// sniffing, while any non-schema `?` inside the predict impl still converts
 /// straight through `From<String>`.
 pub(crate) enum PredictError {
-    /// The frame does not carry a column the model needs → `SchemaMismatchError`.
+    /// The frame does not carry a column the model needs, or a column's kind
+    /// disagrees with the saved schema → `SchemaMismatchError`.
     SchemaMismatch(String),
+    /// A cell of the frame cannot be predicted from — a non-finite covariate,
+    /// a missing categorical label or an unseen fixed-factor level →
+    /// `PredictInputError`, carrying the typed error's advice.
+    Input(gam::data::DataError),
     /// Any other predict failure → `PredictionError`, a `DataError`: the
     /// prediction data is what the fitted model could not evaluate.
     Other(String),
@@ -672,13 +685,15 @@ impl From<PredictError> for String {
     fn from(err: PredictError) -> Self {
         match err {
             PredictError::SchemaMismatch(message) | PredictError::Other(message) => message,
+            PredictError::Input(error) => error.to_string(),
         }
     }
 }
 
 /// Predict-path twin of [`detach_py_result`]: releases the GIL, runs the
 /// closure, and maps a [`PredictError`] onto the *typed* Python exception —
-/// `SchemaMismatch` → `SchemaMismatchError`, everything else → `PredictionError`.
+/// `SchemaMismatch` → `SchemaMismatchError`, `Input` → `PredictInputError`,
+/// everything else → `PredictionError`.
 /// Panics are still surfaced as the context-tagged panic error.
 pub(crate) fn detach_predict_result<T, F>(
     py: Python<'_>,
@@ -694,6 +709,9 @@ where
         Ok(Err(PredictError::SchemaMismatch(message))) => {
             Err(SchemaMismatchError::new_err(message))
         }
+        Ok(Err(PredictError::Input(error))) => Err(PredictInputError::new_err(
+            message_with_advice(&error, error.advice()),
+        )),
         Ok(Err(PredictError::Other(message))) => Err(PredictionError::new_err(message)),
         Err(payload) => Err(py_panic_error(context, payload)),
     }

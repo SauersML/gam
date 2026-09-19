@@ -47,6 +47,7 @@ MissingDependencyError = _rust.MissingDependencyError
 # DataError subclasses.
 SchemaMismatchError = _rust.SchemaMismatchError
 PredictionError = _rust.PredictionError
+PredictInputError = _rust.PredictInputError
 PerfectSeparationError = _rust.PerfectSeparationError
 ModelOverparameterizedError = _rust.ModelOverparameterizedError
 IllConditionedError = _rust.IllConditionedError

@@ -319,9 +319,24 @@ pub enum DataError {
     /// The source has no headers, no rows, or contains an empty / missing
     /// field at a row that requires a value.
     EmptyInput { reason: String },
-    /// A cell value cannot be used as a feature: non-finite float, Arrow null,
-    /// or an unsupported Arrow data type for the column.
+    /// A cell value cannot be used as a feature: an Arrow null or an
+    /// unsupported Arrow data type for the column. A missing, non-finite or
+    /// unseen cell of a column the model reads is [`DataError::InvalidCell`].
     InvalidValue { reason: String },
+    /// One cell of a column the model reads cannot be encoded: a missing or
+    /// non-finite numeric value, a missing categorical label, or a label the
+    /// training data never had. Structured so every front end routes it by
+    /// variant rather than by message: at predict time Python raises
+    /// `PredictInputError` and the CLI prints the same text and advice.
+    InvalidCell {
+        /// The column holding the cell.
+        column: String,
+        /// The 1-based data row, as the message prints it.
+        row: usize,
+        problem: CellProblem,
+        /// The data file the row came from, when the table was read from one.
+        source: Option<String>,
+    },
     /// A complete table reached the fitting boundary but one of its columns
     /// cannot identify a model effect. Unlike `InvalidValue`, this retains
     /// both pieces of machine-readable context for front ends.
@@ -352,13 +367,66 @@ pub enum DataError {
     },
 }
 
+/// Why a cell of [`DataError::InvalidCell`] cannot be encoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellProblem {
+    /// A missing, NaN or infinite value in a numeric column.
+    NonFinite,
+    /// A missing label in a categorical column: a missing label is not a level.
+    MissingLevel,
+    /// A label the training data never had, in a column whose levels were
+    /// fixed at fit time.
+    UnseenLevel {
+        level: String,
+        /// The column's training levels, in schema order.
+        known_levels: Vec<String>,
+    },
+}
+
 impl DataError {
+    /// A missing or non-finite value in numeric column `column`.
+    #[must_use]
+    pub fn non_finite_cell(column: &str, row: usize) -> Self {
+        Self::InvalidCell {
+            column: column.to_string(),
+            row,
+            problem: CellProblem::NonFinite,
+            source: None,
+        }
+    }
+
+    /// A missing label in categorical column `column`.
+    #[must_use]
+    pub fn missing_level_cell(column: &str, row: usize) -> Self {
+        Self::InvalidCell {
+            column: column.to_string(),
+            row,
+            problem: CellProblem::MissingLevel,
+            source: None,
+        }
+    }
+
+    /// Label `level` of categorical column `column` is not a training level.
+    #[must_use]
+    pub fn unseen_level_cell(column: &str, row: usize, level: &str, known_levels: &[String]) -> Self {
+        Self::InvalidCell {
+            column: column.to_string(),
+            row,
+            problem: CellProblem::UnseenLevel {
+                level: level.to_string(),
+                known_levels: known_levels.to_vec(),
+            },
+            source: None,
+        }
+    }
+
     /// Attach the source file to errors produced while loading a table.
     ///
     /// Column lookup and degenerate-column errors already identify the
     /// offending column and expose structured fields to the Python boundary,
-    /// so they deliberately remain unchanged. All other ingest failures need
-    /// the file identity as well.
+    /// so they deliberately remain unchanged. An invalid cell keeps its
+    /// structured column and row and records the file beside them; all other
+    /// ingest failures need the file identity in their reason.
     #[must_use]
     fn with_source_path(self, path: &Path) -> Self {
         let qualify = |reason: String| {
@@ -376,6 +444,17 @@ impl DataError {
             Self::InvalidValue { reason } => Self::InvalidValue { reason: qualify(reason) },
             column @ Self::ColumnNotFound { .. } => column,
             degenerate @ Self::DegenerateColumn { .. } => degenerate,
+            Self::InvalidCell {
+                column,
+                row,
+                problem,
+                source: _,
+            } => Self::InvalidCell {
+                column,
+                row,
+                problem,
+                source: Some(path.display().to_string()),
+            },
         }
     }
 
@@ -389,6 +468,21 @@ impl DataError {
                  and that the formula terms match."
                     .to_string(),
             ),
+            Self::InvalidCell { column, problem, .. } => Some(match problem {
+                CellProblem::NonFinite => format!(
+                    "Drop or impute the rows whose '{column}' value is missing, NaN or \
+                     infinite; the model reads every cell of the columns its terms use."
+                ),
+                CellProblem::MissingLevel => format!(
+                    "Fill the missing '{column}' labels with one of its training levels, \
+                     or drop those rows."
+                ),
+                CellProblem::UnseenLevel { .. } => format!(
+                    "Map the label onto one of the training levels of '{column}' or drop \
+                     those rows; fit the column as group({column}) for a random effect \
+                     that predicts held-out levels."
+                ),
+            }),
             Self::ParseError { .. }
             | Self::EncodingFailure { .. }
             | Self::EmptyInput { .. }
@@ -407,6 +501,7 @@ impl DataError {
             Self::EncodingFailure { .. } => "DataError::EncodingFailure",
             Self::EmptyInput { .. } => "DataError::EmptyInput",
             Self::InvalidValue { .. } => "DataError::InvalidValue",
+            Self::InvalidCell { .. } => "DataError::InvalidCell",
             Self::DegenerateColumn { .. } => "DataError::DegenerateColumn",
             Self::ColumnNotFound { .. } => "DataError::ColumnNotFound",
         }
@@ -426,6 +521,7 @@ impl DataError {
             | Self::ParseError { .. }
             | Self::EmptyInput { .. }
             | Self::InvalidValue { .. }
+            | Self::InvalidCell { .. }
             | Self::DegenerateColumn { .. } => ErrorCategory::Data,
         }
     }
@@ -475,6 +571,33 @@ impl fmt::Display for DataError {
             | DataError::InvalidValue { reason } => f.write_str(reason),
             DataError::DegenerateColumn { column, problem } => {
                 write!(f, "column '{column}' {problem}")
+            }
+            DataError::InvalidCell {
+                column,
+                row,
+                problem,
+                source,
+            } => {
+                if let Some(source) = source {
+                    write!(f, "data file '{source}': ")?;
+                }
+                match problem {
+                    CellProblem::NonFinite => {
+                        write!(f, "non-finite value at row {row}, column '{column}'")
+                    }
+                    CellProblem::MissingLevel => {
+                        write!(f, "missing value at row {row}, categorical column '{column}'")
+                    }
+                    CellProblem::UnseenLevel {
+                        level,
+                        known_levels,
+                    } => write!(
+                        f,
+                        "unseen level '{level}' in categorical column '{column}' at row {row}; \
+                         allowed levels: {}",
+                        known_levels.join(",")
+                    ),
+                }
             }
             DataError::ColumnNotFound {
                 name,
@@ -1245,9 +1368,7 @@ impl DelimitedInferenceState {
             Ok(value) => {
                 self.saw_numeric = true;
                 if !value.is_finite() {
-                    return Err(DataError::InvalidValue {
-                        reason: format!("non-finite value at row {row}, column '{header}'"),
-                    });
+                    return Err(DataError::non_finite_cell(header, row));
                 }
                 if !is_binary_value(value) {
                     self.all_binary = false;
@@ -1352,9 +1473,7 @@ fn parse_inferred_numeric_cell(raw: &str, row: usize, header: &str) -> Result<f6
             ),
         })?;
     if !value.is_finite() {
-        return Err(DataError::InvalidValue {
-            reason: format!("non-finite value at row {row}, column '{header}'"),
-        });
+        return Err(DataError::non_finite_cell(header, row));
     }
     Ok(value)
 }
@@ -1788,9 +1907,7 @@ fn parse_cell_with_schema(
     if matches!(meta.kind, ColumnKindTag::Continuous | ColumnKindTag::Binary)
         && is_missing_marker(raw)
     {
-        return Err(DataError::InvalidValue {
-            reason: format!("non-finite value at row {row}, column '{col_name}'"),
-        });
+        return Err(DataError::non_finite_cell(col_name, row));
     }
     let val = match meta.kind {
         ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
@@ -1831,19 +1948,14 @@ fn parse_cell_with_schema(
                 Some(v) => *v,
                 None => unseen_policy
                     .unseen_code_for(col_name, meta.schema_col.levels.len())
-                    .ok_or_else(|| DataError::SchemaMismatch {
-                        reason: format!(
-                            "unseen level '{}' in categorical column '{}' at row {}",
-                            raw, col_name, row
-                        ),
+                    .ok_or_else(|| {
+                        DataError::unseen_level_cell(col_name, row, raw, &meta.schema_col.levels)
                     })?,
             }
         }
     };
     if !val.is_finite() {
-        return Err(DataError::InvalidValue {
-            reason: format!("non-finite value at row {}, column '{}'", row, col_name),
-        });
+        return Err(DataError::non_finite_cell(col_name, row));
     }
     Ok(val)
 }
@@ -2646,9 +2758,7 @@ pub fn project_encoded_to_schema(
             }
             (ColumnKindTag::Continuous | ColumnKindTag::Binary, _) => {
                 if let Some(row) = values.column(j).iter().position(|value| !value.is_finite()) {
-                    return Err(DataError::InvalidValue {
-                        reason: format!("non-finite value at row {}, column '{name}'", row + 1),
-                    });
+                    return Err(DataError::non_finite_cell(name, row + 1));
                 }
                 if sc.kind == ColumnKindTag::Binary
                     && let Some(row) = values
@@ -2677,12 +2787,7 @@ pub fn project_encoded_to_schema(
                     let code = values[[i, j]];
                     let unseen = || unseen_policy.unseen_code_for(name, sc.levels.len());
                     values[[i, j]] = if code.is_nan() {
-                        unseen().ok_or_else(|| DataError::SchemaMismatch {
-                            reason: format!(
-                                "missing value at row {}, categorical column '{name}'",
-                                i + 1
-                            ),
-                        })?
+                        unseen().ok_or_else(|| DataError::missing_level_cell(name, i + 1))?
                     } else if code < 0.0 || code.fract() != 0.0 || code >= inferred_levels.len() as f64
                     {
                         return Err(DataError::EncodingFailure {
@@ -2697,11 +2802,8 @@ pub fn project_encoded_to_schema(
                             .get(label)
                             .copied()
                             .or_else(unseen)
-                            .ok_or_else(|| DataError::SchemaMismatch {
-                                reason: format!(
-                                    "unseen level '{label}' in categorical column '{name}' at row {}",
-                                    i + 1
-                                ),
+                            .ok_or_else(|| {
+                                DataError::unseen_level_cell(name, i + 1, label, &sc.levels)
                             })?
                     };
                 }
@@ -2922,25 +3024,19 @@ fn encode_one_column(
                     None => unseen_policy
                         .unseen_code_for(name, col_schema.levels.len())
                         .ok_or_else(|| {
-                            String::from(DataError::SchemaMismatch {
-                                reason: format!(
-                                    "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
-                                    raw,
-                                    name,
-                                    i + 1,
-                                    col_schema.levels.join(",")
-                                ),
-                            })
+                            String::from(DataError::unseen_level_cell(
+                                name,
+                                i + 1,
+                                raw,
+                                &col_schema.levels,
+                            ))
                         })?,
                 }
             }
         };
         // NaN here is the encoded missing marker (#2495), not a bad value.
         if !val.is_finite() && !is_missing_marker(raw) {
-            return Err(DataError::InvalidValue {
-                reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
-            }
-            .into());
+            return Err(DataError::non_finite_cell(name, i + 1).into());
         }
         column.push(val);
     }
@@ -2980,9 +3076,7 @@ fn infer_schema_column(
         if let Ok(v) = raw.parse::<f64>() {
             saw_numeric = true;
             if !v.is_finite() {
-                return Err(DataError::InvalidValue {
-                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
-                });
+                return Err(DataError::non_finite_cell(name, i + 1));
             }
             if !is_binary_value(v) {
                 all_binary = false;
@@ -4054,6 +4148,96 @@ mod tests {
             invalid_code.to_string().contains("invalid encoded value 3"),
             "{invalid_code}"
         );
+    }
+
+    #[test]
+    fn projection_names_the_cell_it_refuses_with_a_typed_error_and_advice() {
+        let schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string()],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: Vec::new(),
+                },
+            ],
+        };
+        let table = |g_levels: &[&str], g: &[f64], x: &[f64]| EncodedDataset {
+            headers: vec!["g".to_string(), "x".to_string()],
+            values: Array2::from_shape_fn((g.len(), 2), |(i, j)| {
+                if j == 0 { g[i] } else { x[i] }
+            }),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "g".to_string(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: g_levels.iter().map(|level| level.to_string()).collect(),
+                    },
+                    SchemaColumn {
+                        name: "x".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: Vec::new(),
+                    },
+                ],
+            },
+            column_kinds: vec![ColumnKindTag::Categorical, ColumnKindTag::Continuous],
+        };
+        let strict = UnseenCategoryPolicy::Error;
+
+        let non_finite =
+            project_encoded_to_schema(table(&["a"], &[0.0, 0.0], &[0.5, f64::NAN]), &schema, &strict)
+                .expect_err("a NaN covariate is refused");
+        assert!(
+            matches!(
+                &non_finite,
+                DataError::InvalidCell { column, row: 2, problem: CellProblem::NonFinite, .. }
+                    if column == "x"
+            ),
+            "{non_finite:?}"
+        );
+        let advice = non_finite.advice().expect("a refused cell carries advice");
+        assert!(advice.contains("'x'"), "{advice}");
+
+        let unseen =
+            project_encoded_to_schema(table(&["a", "z"], &[0.0, 1.0], &[0.5, 1.5]), &schema, &strict)
+                .expect_err("z is not a training level");
+        assert!(
+            matches!(
+                &unseen,
+                DataError::InvalidCell {
+                    column,
+                    row: 2,
+                    problem: CellProblem::UnseenLevel { level, known_levels },
+                    ..
+                } if column == "g" && level == "z" && known_levels == &["a", "b"]
+            ),
+            "{unseen:?}"
+        );
+        let message = unseen.to_string();
+        assert!(
+            message.contains("unseen level 'z'") && message.contains("'g'"),
+            "{message}"
+        );
+        let advice = unseen.advice().expect("an unseen level carries advice");
+        assert!(advice.contains("group(g)"), "{advice}");
+
+        let missing =
+            project_encoded_to_schema(table(&["a"], &[0.0, f64::NAN], &[0.5, 1.5]), &schema, &strict)
+                .expect_err("a missing label is refused under the strict policy");
+        assert!(
+            matches!(
+                &missing,
+                DataError::InvalidCell { column, row: 2, problem: CellProblem::MissingLevel, .. }
+                    if column == "g"
+            ),
+            "{missing:?}"
+        );
+        assert!(missing.advice().is_some_and(|advice| advice.contains("'g'")));
     }
 
     #[test]

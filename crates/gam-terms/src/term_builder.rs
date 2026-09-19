@@ -260,7 +260,8 @@ impl From<DataError> for TermBuilderError {
             | DataError::ParseError { .. }
             | DataError::EncodingFailure { .. }
             | DataError::EmptyInput { .. }
-            | DataError::InvalidValue { .. }) => Self::Data(other),
+            | DataError::InvalidValue { .. }
+            | DataError::InvalidCell { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => Self::DegenerateData {
                 reason: format!("column '{column}' {problem}"),
             },

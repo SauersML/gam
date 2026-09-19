@@ -1230,7 +1230,8 @@ impl From<gam_data::DataError> for WorkflowError {
             other @ (DataError::ParseError { .. }
             | DataError::EncodingFailure { .. }
             | DataError::EmptyInput { .. }
-            | DataError::InvalidValue { .. }) => Self::Data(other),
+            | DataError::InvalidValue { .. }
+            | DataError::InvalidCell { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }
