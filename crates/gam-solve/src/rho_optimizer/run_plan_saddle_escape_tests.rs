@@ -1263,11 +1263,12 @@ fn outer_search_reaches_a_corner_minimum_that_needs_more_than_one_escape_2612() 
 //   ∇f    = (A·u,  −2A·ρ₁·u + ρ₁³/s² − ρ₁)
 //   H     = [[A, −2A·ρ₁], [−2A·ρ₁, A·(4ρ₁² − 2u) + 3ρ₁²/s² − 1]]
 //
-// Every band is production's, derived at production's default tolerance
-// `τ = 1e−5` and the declared scale `V₀ = 3e4`: the solver band `τ·(1 + V₀) ≈ 0.30`
-// and the certificate band `τ·(1 + |V|)`. That is #2939's regime, where a
-// score-relative band (1.958) is wide against the curvature the escape follows
-// (λ_min = −4.2e−2).
+// #2939 was found under the score-relative band `τ·(1 + V₀)` that #2954
+// removed; the fixture now states that band as its declared tolerance,
+// `VALLEY_BAND = 1e−5·(1 + V₀) ≈ 0.30`, and keeps the criterion resolution at
+// production's default `rel_cost = 1e−7`. That is #2939's regime: a caller's band
+// wide against the curvature the escape follows (λ_min = −4.2e−2), which a caller
+// may still declare, so the latch must still hold there.
 //
 // At ρ = 0 the gradient vanishes and H = diag(A, −1). The escape ray along ρ₁
 // climbs the valley wall, `f(0, t) − V₀ = (A/2 + 1/(4s²))·t⁴ − t²/2`. The ladder's
@@ -1280,6 +1281,12 @@ fn outer_search_reaches_a_corner_minimum_that_needs_more_than_one_escape_2612() 
 const VALLEY_WALL: f64 = 16.0;
 const VALLEY_SCALE: f64 = 3.0;
 const VALLEY_OFFSET: f64 = 3.0e4;
+/// The stationarity band the fixture declares: production's default tolerance
+/// scaled by `1 + V₀`, the band #2939 ran under before #2954.
+const VALLEY_BAND: f64 = 1.0e-5 * (1.0 + VALLEY_OFFSET);
+/// The criterion's relative cost resolution, production's default `1e−2·τ` at
+/// `τ = 1e−5`, held there while the band is widened.
+const VALLEY_REL_COST: f64 = 1.0e-7;
 
 fn valley_cost(rho: &Array1<f64>) -> f64 {
     let u = rho[0] - rho[1] * rho[1];
@@ -1317,15 +1324,14 @@ fn valley_eval(rho: &Array1<f64>) -> OuterEval {
 }
 
 /// The #2898 lifecycle (the exact Hessian declared, gradient-only search
-/// preferred) at production's default tolerance and the criterion's declared
-/// scale.
+/// preferred) at the fixture's declared band and production's cost resolution.
 fn valley_problem(initial_rho: Array1<f64>) -> OuterProblem {
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_prefer_gradient_only(true)
-        .with_tolerance(OuterConfig::default().tolerance)
-        .with_objective_scale(Some(VALLEY_OFFSET))
+        .with_tolerance(VALLEY_BAND)
+        .with_rel_cost_tolerance(Some(VALLEY_REL_COST))
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(initial_rho)
         .with_screen_initial_rho(false)
@@ -1531,8 +1537,7 @@ fn valley_minimum_and_slack() -> (f64, f64) {
     let trace = h[[0, 0]] + h[[1, 1]];
     let det = h[[0, 0]] * h[[1, 1]] - h[[0, 1]] * h[[1, 0]];
     let lambda_min = 0.5 * (trace - (trace * trace - 4.0 * det).sqrt());
-    let band =
-        outer_stationarity_band_and_rung_at(&valley_problem(minimum).config(), value).bound;
+    let band = outer_stationarity_band_and_rung(&valley_problem(minimum).config()).bound;
     (value, band * band / (2.0 * lambda_min))
 }
 
