@@ -3960,7 +3960,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     enum ScoreKind {
         Reml,
         Laml,
-        Bic,
         Tk,
     }
     #[derive(Deserialize)]
@@ -4003,7 +4002,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             name: String,
             raw_reml: LifecycleFloat,
             laml: Option<LifecycleFloat>,
-            deviance: Option<LifecycleFloat>,
             null_dim: Option<LifecycleFloat>,
             null_space_logdet: Option<LifecycleFloat>,
             effective_dim: LifecycleFloat,
@@ -4034,7 +4032,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     let score_kind = match request.score_kind {
         ScoreKind::Reml => gam::solver::TopologySelectionScoreKind::Reml,
         ScoreKind::Laml => gam::solver::TopologySelectionScoreKind::Laml,
-        ScoreKind::Bic => gam::solver::TopologySelectionScoreKind::Bic,
         ScoreKind::Tk => gam::solver::TopologySelectionScoreKind::Tk,
     };
     let score_scale = match request.score_scale {
@@ -4050,7 +4047,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                 name,
                 raw_reml,
                 laml,
-                deviance,
                 null_dim,
                 null_space_logdet,
                 effective_dim,
@@ -4061,7 +4057,6 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                     name,
                     raw_reml: raw_reml.decode()?,
                     laml: laml.map(LifecycleFloat::decode).transpose()?,
-                    deviance: deviance.map(LifecycleFloat::decode).transpose()?,
                     null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
                     null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
                     effective_dim: effective_dim.decode()?,
