@@ -2,6 +2,7 @@
 
     python -m bench.pygam_compare.run PLAN --out DIR [--reps R] [--timeout S]
                                               [--memcap-mb M] [--only-libs a,b]
+                                              [--shard I/K]
 
 Writes ``DIR/records.jsonl`` (one JSON object per rep, including reps that
 timed out, blew the memory cap, errored or were not run), ``DIR/meta.json``
@@ -242,6 +243,11 @@ def main(argv: list[str] | None = None) -> int:
         help="per-rep process-tree RSS safety net (default: half of total RAM)",
     )
     ap.add_argument("--only-libs", help="comma-separated subset of the plan's libs")
+    ap.add_argument(
+        "--shard",
+        help="I/K: run only the designs whose index in the plan is I mod K, so "
+        "K drivers can split a plan across cores (merge with report.py)",
+    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     plan = PLANS[args.plan]
@@ -255,6 +261,17 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             ap.error(f"unknown libs {sorted(unknown)}")
         plan = dataclasses.replace(plan, libs=libs)
+    if args.shard:
+        index, count = (int(v) for v in args.shard.split("/"))
+        if not 0 <= index < count:
+            ap.error(f"--shard {args.shard}: need 0 <= I < K")
+        # Shard by design, so every n of one design stays in one driver and
+        # the not-run-after-timeout rule still sees it.
+        designs = list(dict.fromkeys(c.design for c in plan.cells))
+        mine = {d for j, d in enumerate(designs) if j % count == index}
+        plan = dataclasses.replace(
+            plan, cells=tuple(c for c in plan.cells if c.design in mine)
+        )
     records = run_plan(plan, args.out, args.memcap_mb, progress=not args.quiet)
     print(f"wrote {len(records)} records to {args.out}", file=sys.stderr)
     return 0
