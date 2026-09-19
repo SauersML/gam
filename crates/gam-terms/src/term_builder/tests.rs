@@ -4856,7 +4856,7 @@ fn unpenalized_constant_residual(ds: &Dataset, spec: &TermCollectionSpec) -> f64
 #[test]
 fn no_intercept_factor_is_the_unpenalized_cell_means_model() {
     let ds = two_factor_dataset();
-    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)", "y ~ 0 + C(f)"] {
+    for formula in ["y ~ 0 + f", "y ~ f - 1", "y ~ 0 + factor(f)"] {
         let spec = build_formula(formula, &ds);
         assert_eq!(spec.level, ModelLevel::NoIntercept { level_smooth: None });
         let re = &spec.random_effect_terms[0];

@@ -30,7 +30,7 @@ hyphen, a leading digit, or non-ASCII letters — is written in backticks,
 anywhere a column name is accepted, the response included:
 
 ```
-`body mass` ~ s(`flipper.length`) + `2nd dose` + C(`site id`)
+`body mass` ~ s(`flipper.length`) + `2nd dose` + factor(`site id`)
 ```
 
 Everything between the backticks is the column name, verbatim. Plain
@@ -164,7 +164,7 @@ shifting the response shifts the fit and nothing else. With the intercept
 it is the all-ones column and every other term is centred against it.
 Without it the level moves to one term, chosen by this rule:
 
-1. **The first fixed factor** — `+ g`, `factor(g)`, `C(g)`, or the main
+1. **The first fixed factor** — `+ g`, `factor(g)`, or the main
    effect of a factor `by=` smooth. It is dummy-coded with every level kept
    (no reference level) and made unpenalized, so `0 + g` is exactly the
    cell-means model. A second factor keeps its usual coding.
@@ -195,7 +195,6 @@ support shrinkage.
 y ~ x + group(site)                      # random intercept per level
 y ~ x + re(site)                         # random-intercept alias of group()
 y ~ x + factor(site)                     # same penalized block as bare `+ site`; forces categorical encoding
-y ~ x + C(site)                          # alias of factor(), as in patsy/formulaic
 y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
 y ~ s(time, by=dose)                     # numeric varying-coefficient smooth: f(time)·dose, f keeps its constant
 y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
@@ -208,11 +207,12 @@ y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 `group(g)`/`re(g)`/`s(g, bs="re")` add a random intercept per level of the
 grouping column. The column may be string- or integer-valued. Random slopes are
 supported with `s(x, group, bs="re")`, usually paired with `group(group)` for
-random intercepts.
+random intercepts. patsy's `C(site)` is not a term function: the error names
+`factor(site)` and `group(site)` instead.
 
 ### How categorical terms are estimated {#factor-terms}
 
-A bare string column (`+ site`), `factor(site)` (alias `C(site)`) and `group(site)` all build
+A bare string column (`+ site`), `factor(site)` and `group(site)` all build
 the same term: one coefficient per level, with a ridge penalty on those
 coefficients whose strength REML estimates along with every other smoothing
 parameter. On the same data the three spellings choose the same smoothing

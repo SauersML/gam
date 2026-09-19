@@ -5,8 +5,8 @@ Pins the user-visible contract of:
 * intercept removal (``0 + ...``, ``... + 0``, ``... - 1``): an unpenalized
   slope without the intercept is ordinary least squares through the origin,
   and ``0 + g`` is the cell-means model;
-* backtick-quoted, non-identifier column names and ``C()`` as a ``factor()``
-  alias;
+* backtick-quoted, non-identifier column names, and patsy's ``C()`` refused
+  with an error that names ``factor()``;
 * ``domain=[a, b]`` on ``s()`` (validated against the data, linear
   extrapolation past it at predict time);
 * strict option parsing: a malformed value, an unknown option, or
@@ -91,13 +91,13 @@ def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
     np.testing.assert_allclose(_predict(reloaded, grid), _predict(model, grid), rtol=1e-12)
 
 
-def test_backtick_columns_and_c_alias_match_plain_names():
+def test_backtick_columns_match_plain_names():
     x, y = _linear_data()
     site = np.resize(np.array(["north", "south", "east"]), N)
     y = y + np.where(site == "south", 0.5, 0.0)
     quoted = gamfit.fit(
         {"y": y, "dose (mg)": x, "site-id": site},
-        "y ~ `dose (mg)` + C(`site-id`)",
+        "y ~ `dose (mg)` + factor(`site-id`)",
         family="gaussian",
     )
     plain = gamfit.fit(
@@ -110,6 +110,18 @@ def test_backtick_columns_and_c_alias_match_plain_names():
         _predict(plain, {"dose": x, "site": site}),
         rtol=1e-8,
     )
+
+
+@pytest.mark.parametrize(
+    ("formula", "column"), [("y ~ x + C(x2)", "x2"), ("y ~ x + C(`site-id`)", "`site-id`")]
+)
+def test_patsy_c_is_refused_with_a_pointer_to_factor(formula, column):
+    x, y = _linear_data()
+    site = np.resize(np.array(["north", "south", "east"]), N)
+    with pytest.raises(gamfit.errors.FormulaError) as excinfo:
+        gamfit.fit({"y": y, "x": x, "x2": site, "site-id": site}, formula, family="gaussian")
+    message = str(excinfo.value)
+    assert f"factor({column})" in message and f"group({column})" in message, message
 
 
 def test_domain_must_contain_the_data():
