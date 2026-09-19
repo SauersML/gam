@@ -37,7 +37,7 @@ struct StderrInfoLogger;
 
 impl log::Log for StderrInfoLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::Level::Debug
     }
     fn log(&self, record: &log::Record<'_>) {
         if self.enabled(record.metadata()) {
@@ -106,7 +106,7 @@ fn build_gompertz_frame() -> gam::data::EncodedDataset {
 fn survival_transformation_fit_publishes_smoothing_corrected_covariance_2912() {
     INIT_LOGGER.call_once(|| {
         if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
     let data = build_gompertz_frame();

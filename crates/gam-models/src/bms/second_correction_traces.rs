@@ -215,7 +215,7 @@ impl BernoulliMarginalSlopeFamily {
             },
         )?
         .unwrap_or_else(|| vec![0.0; pairs.len()]);
-        log::info!(
+        log::debug!(
             "[BMS second-correction traces] rows={} p={} rank={} directions={} pairs={} \
              elapsed={:.3}s",
             weighted_rows.len(),

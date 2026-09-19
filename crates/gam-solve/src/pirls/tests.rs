@@ -375,6 +375,9 @@ mod tests {
             | LinkFunction::Sas
             | LinkFunction::BetaLogistic
             | LinkFunction::Log => 1.0,
+            LinkFunction::Inverse | LinkFunction::InverseSquared => {
+                panic!("calculate_scale has no residual scale for the reciprocal links")
+            }
             LinkFunction::Identity => {
                 let mut fitted = x.dot(beta);
                 fitted += &offset;

@@ -82,6 +82,12 @@ pub(crate) struct GamWorkingModel<'a> {
     /// fixed within the inner solve, refreshing across outer iterations (a fresh
     /// working model is built per inner solve). Issue #771.
     pub(crate) tweedie_phi_locked: bool,
+    /// Whether the Gaussian (non-identity link) or inverse Gaussian dispersion
+    /// `phi` has been estimated and frozen for this inner P-IRLS solve. `phi`
+    /// scales the whole data term (`W ∝ prior/φ`, score `∝ 1/φ`), so, like the
+    /// Tweedie `phi`, it is estimated once from the warm-start η and held fixed
+    /// within the inner solve so the product `φ·λ` stays a stationary target.
+    pub(crate) dispersion_phi_locked: bool,
     /// Whether the Negative-Binomial overdispersion `theta` has been estimated
     /// and frozen for the duration of this inner P-IRLS solve. `theta` enters the
     /// working weight `W = μθ/(θ+μ)` (the NB2 Fisher information) and the working
@@ -309,6 +315,7 @@ impl<'a> GamWorkingModel<'a> {
             gamma_shape_locked: false,
             beta_phi_locked: false,
             tweedie_phi_locked: false,
+            dispersion_phi_locked: false,
             negbin_theta_locked: false,
             quadctx,
             glm_first_step_gram,
@@ -896,7 +903,7 @@ impl<'a> GamWorkingModel<'a> {
                 .take()
                 .expect("frozen first-step Gram present by the guard above");
             self.glm_first_step_gram_consumed = true;
-            log::debug!(
+            log::trace!(
                 "[frozen-glm-gram] serving first Fisher-step XᵀWX n-free (p={})",
                 xtwx.nrows()
             );
@@ -1237,6 +1244,29 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 self.likelihood = self.likelihood.clone().with_tweedie_phi(phi);
                 self.tweedie_phi_locked = true;
             }
+        }
+
+        // Estimate the Gaussian (non-identity link) / inverse Gaussian dispersion
+        // φ once from the warm-start η and freeze it for this inner solve, exactly
+        // as the Tweedie φ above: φ scales the working weight and the score
+        // uniformly, so holding it fixed keeps φ·λ — hence β̂ — stationary.
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Dispersion {
+                estimated: true,
+                ..
+            }
+        ) && !self.dispersion_phi_locked
+        {
+            let phi = estimate_dispersion_phi_from_eta(
+                &self.likelihood.spec.response,
+                &self.likelihood.spec.link,
+                self.y,
+                &self.workspace.eta_buf,
+                self.priorweights,
+            )?;
+            self.likelihood = self.likelihood.clone().with_dispersion_phi(phi);
+            self.dispersion_phi_locked = true;
         }
 
         // Estimate the Negative-Binomial overdispersion `theta` once from the

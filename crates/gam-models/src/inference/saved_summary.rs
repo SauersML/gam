@@ -546,6 +546,7 @@ fn scan_summary_payload(
         // fabricated "certified" block here would be the exact confusion
         // #2411 exists to remove.
         convergence: None,
+        notes: summary_notes(model),
     })
 }
 
@@ -681,9 +682,21 @@ impl SummaryInformationCriteria {
     }
 }
 
+/// Why a fit with no single response family (a location-scale or other
+/// multi-block fit) reports no AIC.
+pub const NO_AIC_WITHOUT_A_SCALAR_FAMILY: &str =
+    "the fit models its response through several linear predictors and has no single \
+     response family or scalar dispersion, which both AICs and their scale degrees of \
+     freedom are defined from";
+
 fn summary_information_criteria(
     fit: &UnifiedFitResult,
 ) -> Result<SummaryInformationCriteria, String> {
+    if fit.likelihood_family.is_none() {
+        return Ok(SummaryInformationCriteria::unavailable(
+            NO_AIC_WITHOUT_A_SCALAR_FAMILY,
+        ));
+    }
     let Some(log_likelihood) = fit.reported_log_likelihood() else {
         return Ok(SummaryInformationCriteria::unavailable(NO_AIC_AT_EXACT_FIT));
     };
@@ -796,6 +809,7 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
         coefficient_se_source: display_uncertainty.map(|view| view.definition.as_str().to_string()),
         convergence: Some(summary_convergence(&fit)),
+        notes: summary_notes(model),
     })
 }
 
@@ -1073,6 +1087,23 @@ pub struct SummaryPayload {
     /// (the O(n) spline scan).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub convergence: Option<SummaryConvergence>,
+    /// The notes the fit recorded, advisories (`inference_notes`: the model
+    /// differs from the literal request) first, then informational notes
+    /// (`informational_notes`: defaults chosen on the user's behalf). Empty
+    /// when the fit recorded none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Every note the fit recorded, advisories first.
+fn summary_notes(model: &FittedModel) -> Vec<String> {
+    let payload = model.payload();
+    payload
+        .inference_notes
+        .iter()
+        .chain(&payload.informational_notes)
+        .cloned()
+        .collect()
 }
 
 /// How the optimization that produced this fit terminated.

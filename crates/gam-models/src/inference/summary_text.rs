@@ -52,5 +52,11 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
     if !summary.coefficients.is_empty() {
         line("Coefficients", &summary.coefficients.len().to_string());
     }
+    if !summary.notes.is_empty() {
+        out.push_str("\n  Notes:");
+        for note in &summary.notes {
+            write!(out, "\n    - {note}").expect("writing to a String cannot fail");
+        }
+    }
     out
 }

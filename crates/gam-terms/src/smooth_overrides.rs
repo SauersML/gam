@@ -36,9 +36,10 @@ use crate::basis::{
     MaternBasisSpec, MaternLengthScale, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
     SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
+use crate::fit_notes::FitNoteSink;
 use crate::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
-    TermCollectionSpec, parse_shape_constraint,
+    TermCollectionSpec,
 };
 use gam_data::{ColumnKindTag, EncodedDataset as Dataset};
 
@@ -51,7 +52,7 @@ pub fn apply_smooth_overrides(
     spec: &mut TermCollectionSpec,
     overrides: &JsonValue,
     data: &Dataset,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut impl FitNoteSink,
 ) -> Result<(), String> {
     let registry = overrides
         .as_object()
@@ -111,7 +112,7 @@ fn apply_by_variable(
     symbol: &str,
     data: &Dataset,
     column_index: &HashMap<&str, usize>,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     let by_name = match descriptor.get("by") {
         None => return Ok(()),
@@ -160,7 +161,7 @@ fn apply_by_variable(
                 kind: BySmoothKind::Numeric,
                 by: ByVariableSpec::Numeric,
             };
-            inference_notes.push(format!(
+            inference_notes.inform(format!(
                 "smooths[{symbol:?}] gated by numeric column {by_name:?} (by·s(x))",
             ));
             Ok(())
@@ -265,7 +266,7 @@ fn apply_one_override(
     kind: &str,
     descriptor: &serde_json::Map<String, JsonValue>,
     symbol: &str,
-    inference_notes: &mut Vec<String>,
+    inference_notes: &mut dyn FitNoteSink,
 ) -> Result<(), String> {
     // Push the descriptor's optional `name` into the term name for downstream
     // diagnostics (purely cosmetic — the term identity is its feature_cols).
@@ -278,17 +279,28 @@ fn apply_one_override(
     // Universal shape constraint (`Smooth.shape_constraint`). Stamped onto the
     // term, not the basis: the constraint solver (box-reparam / tangent-LAML)
     // keys off `SmoothTermSpec.shape`. A basis-incompatible request fails
-    // loudly downstream via `shape_supports_basis`.
-    if let Some(shape_val) = descriptor.get("shape_constraint") {
-        let raw = shape_val
-            .as_str()
-            .ok_or_else(|| format!("smooths[{symbol:?}].shape_constraint must be a string"))?;
-        term.shape = parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
-    }
+    // loudly downstream via `validate_shape_request`. The value is a DSL
+    // string or a (nested) JSON list, resolved against the final basis so a
+    // `te()` list addresses the tensor's margins.
+    let shape_expr = descriptor
+        .get("shape_constraint")
+        .map(|value| {
+            crate::smooth::shape_expr_from_json(value)
+                .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))
+        })
+        .transpose()?;
 
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
 
-    inference_notes.push(format!(
+    if let Some(expr) = shape_expr {
+        term.shape = crate::smooth::resolve_shape_spec(
+            &expr,
+            crate::smooth::shape_tensor_margin_count(&term.basis),
+        )
+        .map_err(|e| format!("smooths[{symbol:?}].shape_constraint: {e}"))?;
+    }
+
+    inference_notes.inform(format!(
         "smooths[{symbol:?}] descriptor (kind={kind}) merged onto formula-built term",
     ));
     Ok(())
@@ -1175,7 +1187,7 @@ mod tests {
                 feature_col: 0,
                 spec: open_bspline_spec(),
             },
-            shape: ShapeConstraint::None,
+            shape: ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }
     }
