@@ -109,8 +109,12 @@ fn gaussian_location_scale_recovers_noise_far_below_one_percent_of_the_spread() 
             "σ = {sigma:e}: fitted σ̂ = {sigma_hat:e} but the sample's residual SD about \
              the true mean is {oracle:e} (relative error {relative:.3e})"
         );
+        // The floor is the Sheppard bound on the smallest response gap. For n
+        // draws spread over a range R that gap is about R/n² ≈ 3e-5, so the raw
+        // floor is about 1e-5: a few percent of σ at the smallest case, and far
+        // below it in the others. The former floor sat at 1 % of sd(y), above σ.
         assert!(
-            raw_floor < 0.01 * oracle,
+            raw_floor < 0.1 * oracle,
             "σ = {sigma:e}: the raw σ floor {raw_floor:e} must sit far below the noise \
              the data resolve ({oracle:e})"
         );

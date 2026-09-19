@@ -88,7 +88,10 @@ fn penalty_rounding_bands(
 
 /// The data term of the stationarity rounding band per coefficient, where the
 /// workspace measures the row summands of its gradient: `γ_depth · Σ|products|ⱼ`
-/// (#2976). `None` when it measures none.
+/// (#2976), plus the error those summands inherit from their predictors where the
+/// workspace also measures that
+/// ([`ExactNewtonJointHessianWorkspace::joint_gradient_formation_bands`]). `None`
+/// when it measures no summands.
 fn measured_gradient_rounding_bands(
     workspace: Option<&Arc<dyn ExactNewtonJointHessianWorkspace>>,
     total_p: usize,
@@ -111,7 +114,26 @@ fn measured_gradient_rounding_bands(
         ));
     }
     let growth = gam_linalg::roundoff::accumulation_growth(accumulation.accumulation_depth);
-    Ok(Some(accumulation.absolute_sums.mapv(|sum| growth * sum)))
+    let mut bands = accumulation.absolute_sums.mapv(|sum| growth * sum);
+    // The terms' own error from the predictors they are evaluated at, which a
+    // high signal-to-noise residual term carries in excess of the sum's.
+    if let Some(formation) = workspace.joint_gradient_formation_bands()? {
+        if formation.len() != total_p {
+            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+                "joint Newton gradient formation bands have {} coordinates for {total_p} coefficients",
+                formation.len()
+            ) });
+        }
+        if !formation.iter().all(|value| value.is_finite() && *value >= 0.0) {
+            return Err(CustomFamilyError::trial_point(
+                "joint Newton gradient formation bands are not finite and non-negative at the \
+                 returned mode"
+                    .to_string(),
+            ));
+        }
+        bands += &formation;
+    }
+    Ok(Some(bands))
 }
 
 /// `data_bands` plus the penalty product's band per coefficient
@@ -198,9 +220,10 @@ pub(super) fn spectrum_decrement_resolution(
 /// meets the caller's target, a residual consistent with the arithmetic meets it,
 /// whatever the projection. The band enters per coordinate and never through a
 /// norm, which would let one coordinate settle on another's rounding. `bⱼ` is the
-/// data term `γ_depth · Σ|products|ⱼ` plus the penalty product's band
-/// ([`penalty_rounding_bands`]). It omits each row term's formation and the
-/// Jeffreys score's rounding, so it can only fail to settle a state.
+/// data term `γ_depth · Σ|products|ⱼ`, the error the row terms inherit from their
+/// predictors where the workspace measures it, and the penalty product's band
+/// ([`penalty_rounding_bands`]). It omits the rest of each row term's formation
+/// and the Jeffreys score's rounding, so it can only fail to settle a state.
 ///
 /// Only a returned-mode settlement reads it, where the Newton decrement is also at
 /// the objective's resolution; every residual-only exit keeps its residual. `None`
