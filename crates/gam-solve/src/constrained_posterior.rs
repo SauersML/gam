@@ -4276,6 +4276,7 @@ mod tests_orthant_rule_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_math::probability::normal_cdf;
     use ndarray::array;
 
 
@@ -6723,6 +6724,7 @@ mod coverage_gate_tests {
 #[cfg(test)]
 mod affine_ceiling_tests {
     use super::*;
+    use gam_math::probability::normal_cdf;
     use ndarray::array;
 
     /// Run the cubature over `{u >= 0}` intersected with an optional affine
