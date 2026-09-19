@@ -13,8 +13,8 @@ use manifold_pyclasses::{
 use sklearn_metadata::sklearn_fit_metadata;
 
 use gam::families::inference::saved_summary::{
-    prediction_model_class_label, saved_model_report_input, saved_model_summary,
-    scan_introspection, scan_smooth_label,
+    compare_saved_models, prediction_model_class_label, saved_model_report_input,
+    saved_model_summary, saved_models_log_evidence_ratio, scan_introspection, scan_smooth_label,
 };
 
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
@@ -1372,8 +1372,7 @@ fn default_survival_time_grid_from_model(
     formula,
     config_json = None,
     fisher_rao_w = None,
-    warm_start_model = None,
-    warm_start_dir = None
+    warm_start_model = None
 ))]
 fn fit_table(
     py: Python<'_>,
@@ -1383,7 +1382,6 @@ fn fit_table(
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
     warm_start_model: Option<Vec<u8>>,
-    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
@@ -1397,7 +1395,7 @@ fn fit_table(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
-            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
@@ -1409,8 +1407,7 @@ fn fit_table(
     formula,
     config_json = None,
     fisher_rao_w = None,
-    warm_start_model = None,
-    warm_start_dir = None
+    warm_start_model = None
 ))]
 fn fit_array(
     py: Python<'_>,
@@ -1420,7 +1417,6 @@ fn fit_array(
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
     warm_start_model: Option<Vec<u8>>,
-    warm_start_dir: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
@@ -1432,7 +1428,7 @@ fn fit_array(
             formula,
             config_json.as_deref(),
             fisher_values.as_ref().map(|w| w.view()),
-            warm_start_model.as_deref().zip(warm_start_dir.as_deref()),
+            warm_start_model.as_deref(),
         )
     })?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
@@ -1448,37 +1444,24 @@ fn compile_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyFittedModel
     })
 }
 
-/// Log Akaike evidence ratio of model A over model B: `−(AIC_A − AIC_B)/2`.
+/// Log Akaike evidence ratio of model A over model B on the smoothing-corrected
+/// AIC, `−(AIC_c(A) − AIC_c(B))/2`, formed by the same Rust comparison as
+/// `compare_models`.
 ///
 /// This is the relative likelihood of Burnham & Anderson, NOT a log Bayes
 /// factor (no prior is integrated over), and the Python surface names it
 /// `Model.evidence_ratio_vs` accordingly.
 #[pyfunction]
-fn log_evidence_ratio(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
-    let payload_a = summary_payload_from_model_bytes(&model_a_bytes)?;
-    let payload_b = summary_payload_from_model_bytes(&model_b_bytes)?;
-    // Rank on the SAME Occam-penalised conditional AIC that `compare_models`
-    // uses (`-2·loglik + 2·edf`, `ranking_score_from_summary_payload`), not the
-    // raw REML/LAML evidence headline. The raw headline fails to penalise a
-    // pure-noise smooth, so the pairwise ratio used to declare the augmented
-    // model better supported even though `compare_models` correctly picked the
-    // smaller one — the two contradicted each other (issue #2079).
-    let score_a = ranking_score_from_summary_payload(&payload_a)?;
-    let score_b = ranking_score_from_summary_payload(&payload_b)?;
-    // The ranking score is a minimised cost (lower = better), so the log ratio
-    // of A over B is `score_b - score_a`, not `score_a - score_b`. Route
-    // through the shared convention so this agrees with `compare_reml_fits`
-    // (issue #575: the raw subtraction was inverted, reporting overwhelming
-    // evidence for the worse-fitting model).
-    //
-    // The ranking score is the conditional AIC (`−2·loglik + 2·edf`), a −2·log /
-    // deviance-scale cost, so its gap is a ΔAIC. The Akaike evidence ratio for an
-    // AIC gap Δ is `exp(−½Δ)` (Burnham & Anderson), so the LOG ratio is HALF
-    // the raw score gap. `Model.evidence_ratio_vs` exponentiates this value
-    // directly; returning the un-halved gap made it report `exp(ΔAIC)`, the SQUARE
-    // of the intended ratio (issue #2124). Halve here, at the AIC-scale site, so
-    // no raw-REML consumer is affected.
-    Ok(0.5 * criterion_gap(score_a, score_b))
+fn log_evidence_ratio(
+    py: Python<'_>,
+    model_a_bytes: Vec<u8>,
+    model_b_bytes: Vec<u8>,
+) -> PyResult<f64> {
+    detach_py_result(py, "log_evidence_ratio", move || {
+        let model_a = load_model_impl(&model_a_bytes)?;
+        let model_b = load_model_impl(&model_b_bytes)?;
+        saved_models_log_evidence_ratio(&model_a, &model_b)
+    })
 }
 
 #[pyfunction]
@@ -1520,6 +1503,17 @@ fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
         })
         .unwrap_or_default();
     Ok(notes)
+}
+
+/// The LAML-estimated `(σ, ν)` of a scaled Student-t fit, read off the saved
+/// model's likelihood; `None` for every other response family.
+#[pyfunction]
+fn student_t_parameters_from_model(model_bytes: Vec<u8>) -> PyResult<Option<(f64, f64)>> {
+    let model = load_model_impl(&model_bytes).map_err(py_value_error)?;
+    Ok(match model_likelihood_spec(&model).response {
+        ResponseFamily::StudentT { sigma, nu } => Some((sigma, nu)),
+        _ => None,
+    })
 }
 
 fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
@@ -4176,18 +4170,6 @@ fn no_criterion_error(payload: &serde_json::Value, surface: &str) -> pyo3::PyErr
     }
 }
 
-const EDF_KEYS: &[&str] = &["edf_total"];
-
-const LOG_LIK_KEYS: &[&str] = &["log_likelihood"];
-// Response-family tag, used only by the compare_models comparability guard (#1384).
-const FAMILY_KEYS: &[&str] = &["family_name"];
-// Observation count, used only by the compare_models comparability guard.
-const NUM_OBS_KEYS: &[&str] = &["n_obs"];
-
-const NULL_DIM_KEYS: &[&str] = &["null_dim"];
-
-const NULL_HESSIAN_LOGDET_KEYS: &[&str] = &["null_space_logdet"];
-
 enum RemlFitView<'py> {
     /// The `SummaryPayload` of a gamfit Model or its saved bytes.
     SavedSummary(serde_json::Value),
@@ -4201,18 +4183,14 @@ fn extract_reml_score_raw(py: Python<'_>, fit: Py<PyAny>) -> PyResult<f64> {
     extract_reml_score_raw_impl(fit)
 }
 
-#[pyfunction(signature = (fits, names = None, cv_scores = None))]
-fn compare_reml_fits(
+/// Rank fitted models on their smoothing-corrected AIC. The ranking is
+/// `compare_saved_models`, the same one `gam compare` prints.
+#[pyfunction(signature = (fits, names = None))]
+fn compare_models(
     py: Python<'_>,
     fits: Vec<Py<PyAny>>,
     names: Option<Vec<String>>,
-    cv_scores: Option<Vec<f64>>,
-) -> PyResult<Py<PyDict>> {
-    if fits.is_empty() {
-        return Err(PyValueError::new_err(
-            "compare_models requires at least one fit",
-        ));
-    }
+) -> PyResult<PyObject> {
     let labels = match names {
         Some(names) => {
             if names.len() != fits.len() {
@@ -4226,92 +4204,36 @@ fn compare_reml_fits(
         }
         None => (0..fits.len()).map(|idx| format!("fit_{idx}")).collect(),
     };
-    if let Some(scores) = cv_scores.as_ref() {
-        if scores.len() != fits.len() {
-            return Err(PyValueError::new_err(format!(
-                "len(cv_scores)={} does not match len(fits)={}",
-                scores.len(),
-                fits.len()
-            )));
-        }
-    }
-
-    // Python-specific work: extract raw diagnostic score plus the required
-    // conditional-AIC inputs (log-likelihood and EDF) from each PyAny
-    // fit (which may be a saved-summary mapping, a Model object, or its
-    // saved bytes; see `reml_fit_view`). Then the ranking, delta,
-    // evidence-ratio and evidence-summary logic is delegated to the pure-Rust core in
-    // `gam::solver::evidence`, which is identically callable from
-    // the CLI binary.
-    let mut candidates = Vec::with_capacity(fits.len());
-    for (index, (name, fit)) in labels.into_iter().zip(fits.iter()).enumerate() {
-        let fit = fit.bind(py);
-        let view = reml_fit_view(fit)?;
-        let score = extract_reml_score_from_view(&view)?;
-        let edf = extract_required_ranking_edf_from_view(&view, &name)?;
-        let log_lik = extract_required_ranking_log_lik_from_view(&view, &name)?;
-        candidates.push(RemlCandidate {
-            index,
-            name,
-            score,
-            edf,
-            log_lik,
-            family: extract_family_from_view(&view)?,
-            n_obs: extract_n_obs_from_view(&view)?,
-        });
-    }
-
-    let comparison = compare_reml_fits_core(candidates.clone()).map_err(PyValueError::new_err)?;
-
-    let ranking = PyList::empty(py);
-    for row in comparison.ranking.iter() {
-        ranking.append((
-            row.name.as_str(),
-            row.score,
-            row.delta,
-            row.evidence_ratio,
-            row.edf,
-        ))?;
-    }
-    let score_table = PyList::empty(py);
-    for row in comparison.score_table.iter() {
-        let table_row = PyDict::new(py);
-        table_row.set_item("name", row.name.as_str())?;
-        table_row.set_item("reml_score", row.reml_score)?;
-        table_row.set_item("delta_reml", row.delta_reml)?;
-        table_row.set_item(
-            "reml_criterion_ratio_best_over_model",
-            row.reml_criterion_ratio_best_over_model,
-        )?;
-        table_row.set_item("effective_dof", row.effective_dof)?;
-        score_table.append(table_row)?;
-    }
-
-    let out = PyDict::new(py);
-    out.set_item("ranking", ranking)?;
-    out.set_item("winner", &comparison.winner)?;
-    out.set_item("evidence_summary", &comparison.evidence_summary)?;
-    out.set_item("score_table", score_table)?;
-    if let Some(scores) = cv_scores {
-        // cv_optional walks the ranked order but uses the caller's
-        // original score indices — preserved via `RemlCandidate.index`.
-        let by_name: std::collections::HashMap<&str, usize> = candidates
+    let model_bytes = fits
+        .iter()
+        .map(|fit| {
+            let fit = fit.bind(py);
+            if let Ok(bytes) = fit.extract::<Vec<u8>>() {
+                return Ok(bytes);
+            }
+            if fit.hasattr("_model_bytes")? {
+                return fit.getattr("_model_bytes")?.extract::<Vec<u8>>();
+            }
+            Err(PyTypeError::new_err(format!(
+                "compare_models: expected a gamfit.Model or its saved bytes; got {}",
+                fit.get_type().name()?
+            )))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let comparison = detach_py_result(py, "compare_models", move || {
+        let models = model_bytes
             .iter()
-            .map(|c| (c.name.as_str(), c.index))
-            .collect();
-        let cv_optional = PyList::empty(py);
-        for row in comparison.ranking.iter() {
-            let original_index = by_name[row.name.as_str()];
-            cv_optional.append((row.name.as_str(), scores[original_index]))?;
-        }
-        out.set_item("cv_optional", cv_optional)?;
-    }
-    Ok(out.unbind())
-}
-
-fn extract_reml_score_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    let raw = extract_reml_score_raw_from_view(view)?;
-    with_tierney_kadane_normalizer_from_view(view, raw)
+            .map(|bytes| load_model_impl(bytes))
+            .collect::<Result<Vec<_>, String>>()?;
+        let named = labels
+            .into_iter()
+            .zip(models.iter())
+            .collect::<Vec<_>>();
+        let comparison = compare_saved_models(&named)?;
+        serde_json::to_value(comparison)
+            .map_err(|err| format!("failed to serialize model comparison: {err}"))
+    })?;
+    json_value_to_py(py, comparison)
 }
 
 fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {
@@ -4336,149 +4258,6 @@ fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
     }
 }
 
-/// The comparable criterion of a fit view, or `None` when the view carries no
-/// null-space metadata: a raw criterion without the Tierney-Kadane normalizer is
-/// not comparable across fits (#2627).
-fn with_tierney_kadane_normalizer_from_view(
-    view: &RemlFitView<'_>,
-    score: f64,
-) -> PyResult<Option<f64>> {
-    let Some(null_dim) = extract_null_dim_from_view(view)? else {
-        return Ok(None);
-    };
-    gam::solver::topology_selector::comparable_reml_score(
-        score,
-        Some(null_dim),
-        extract_float_metadata_from_view(view, NULL_HESSIAN_LOGDET_KEYS)?,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-/// Occam-penalised conditional-AIC ranking score for a saved-model summary
-/// payload, matching `gam::solver::evidence::RemlCandidate::ranking_score`
-/// exactly (`-2·loglik + 2·edf`) so `Model.conditional_aic` and
-/// `Model.evidence_ratio_vs` pick the SAME winner as `gamfit.compare_models`
-/// (issue #2079).
-///
-/// Both inputs are required and finite. A raw REML/LAML criterion is a different
-/// estimand, so an incomplete summary is refused rather than ranked on another
-/// scale.
-fn ranking_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {
-    let log_lik = required_summary_ranking_value(payload, "log_likelihood")?;
-    let edf = required_summary_ranking_value(payload, "edf_total")?;
-    if edf < 0.0 {
-        return Err(py_value_error(format!(
-            "model evidence requires non-negative edf_total, got {edf}"
-        )));
-    }
-    let score = -2.0 * log_lik + 2.0 * edf;
-    if !score.is_finite() {
-        return Err(py_value_error(
-            "model evidence conditional AIC is outside f64 range".to_string(),
-        ));
-    }
-    Ok(score)
-}
-
-fn required_summary_ranking_value(payload: &serde_json::Value, key: &str) -> PyResult<f64> {
-    if let Some(value) = payload.get(key).and_then(serde_json::Value::as_f64) {
-        if value.is_finite() {
-            return Ok(value);
-        }
-    }
-    if key == "log_likelihood" && json_lookup_str(payload, REML_UNAVAILABLE_KEYS).is_some() {
-        return Err(no_criterion_error(payload, "model evidence"));
-    }
-    Err(py_value_error(format!(
-        "model evidence requires a finite '{key}' in the current model summary; \
-         raw REML/LAML is not a substitute ranking estimand"
-    )))
-}
-
-fn extract_null_dim_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    extract_float_metadata_from_view(view, NULL_DIM_KEYS)
-}
-
-fn extract_edf_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
-    extract_float_metadata_from_view(view, EDF_KEYS)
-}
-
-fn extract_required_ranking_edf_from_view(
-    view: &RemlFitView<'_>,
-    name: &str,
-) -> PyResult<f64> {
-    let value = extract_edf_from_view(view)?;
-    match value {
-        Some(edf) if edf.is_finite() && edf >= 0.0 => Ok(edf),
-        _ => Err(py_value_error(format!(
-            "compare_models: candidate '{name}' requires finite non-negative edf_total; \
-             raw REML/LAML is not a substitute ranking estimand"
-        ))),
-    }
-}
-
-/// Required ordinary log-likelihood at the converged mode, used by
-/// `compare_models` to form the conditional AIC that decides the winner.
-fn extract_required_ranking_log_lik_from_view(
-    view: &RemlFitView<'_>,
-    name: &str,
-) -> PyResult<f64> {
-    match extract_float_metadata_from_view(view, LOG_LIK_KEYS)? {
-        Some(log_lik) if log_lik.is_finite() => Ok(log_lik),
-        _ => Err(py_value_error(format!(
-            "compare_models: candidate '{name}' requires finite log_likelihood; \
-             raw REML/LAML is not a substitute ranking estimand"
-        ))),
-    }
-}
-
-/// Response-family tag of a candidate fit, for the compare_models comparability
-/// guard (#1384). `None` when the fit does not expose one (legacy payloads),
-/// which the guard treats as unconstrained.
-fn extract_family_from_view(view: &RemlFitView<'_>) -> PyResult<Option<String>> {
-    extract_string_metadata_from_view(view, FAMILY_KEYS)
-}
-
-/// Observation count of a candidate fit, for the compare_models cross-`n`
-/// comparability guard. `None` when the fit does not expose one (legacy payloads
-/// / O(n) scan smoothers), which the guard treats as unconstrained. A
-/// non-finite or negative value is dropped to `None` rather than truncated.
-fn extract_n_obs_from_view(view: &RemlFitView<'_>) -> PyResult<Option<usize>> {
-    Ok(extract_float_metadata_from_view(view, NUM_OBS_KEYS)?
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .map(|value| value as usize))
-}
-
-/// String-valued metadata lookup over the same saved-summary JSON or summary
-/// mapping as [`extract_float_metadata_from_view`].
-fn extract_string_metadata_from_view(
-    view: &RemlFitView<'_>,
-    keys: &[&str],
-) -> PyResult<Option<String>> {
-    match view {
-        RemlFitView::SavedSummary(payload) => Ok(json_lookup_str(payload, keys)),
-        RemlFitView::Mapping(_) => {
-            let Some(value) = extract_py_metadata_value(view, keys)? else {
-                return Ok(None);
-            };
-            value.extract::<String>().map(Some)
-        }
-    }
-}
-
-/// First string value found under any of `keys` in a SavedSummary JSON payload.
-fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    let object = payload.as_object()?;
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            if let Some(s) = value.as_str() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn extract_float_metadata_from_view(
     view: &RemlFitView<'_>,
     keys: &[&str],
@@ -4492,6 +4271,18 @@ fn extract_float_metadata_from_view(
             value.extract::<f64>().map(Some)
         }
     }
+}
+
+fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = payload.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            if let Some(s) = value.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {

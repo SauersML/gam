@@ -211,6 +211,7 @@ difference-penalized P-spline of the same dimension.
 | `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value and zero first derivative). Combine with `side=left`/`right` for half-open smooths. |
 | `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
 | `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
+| `shape` | `none` | Shape constraint: `monotone_increasing`, `monotone_decreasing`, `convex`, `concave`. See [Shape-constrained smooths](#shape-constrained-smooths). |
 
 Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes the left endpoint value and slope while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
@@ -301,21 +302,47 @@ dimension (11 after centering), the basis check's p-value is about
 passes (p ≈ 0.67) and the error drops to 0.06. REML used about 33 of the 39
 available dimensions; it did not need to be told how many.
 
-### Shape constraints {#shape-constraints}
+### Shape-constrained smooths {#shape-constrained-smooths}
 
 ```
-y ~ s(x, shape=monotone_increasing)
-y ~ s(x, shape=monotone_decreasing)
-y ~ s(x, shape=convex)
-y ~ s(x, shape=concave)
+y ~ s(x, shape=monotone_increasing)   # f'(x) >= 0 on the knot range
+y ~ s(x, shape=monotone_decreasing)   # f'(x) <= 0
+y ~ s(x, shape=convex)                # f''(x) >= 0
+y ~ s(x, shape=concave, k=12)         # f''(x) <= 0
 ```
 
-`shape=` constrains a 1-D smooth to be non-decreasing, non-increasing,
-convex or concave.
-The smoothing parameter is still chosen by REML. Case and hyphens are
-normalized, and `increasing`, `decreasing`, `mono_inc` and `mono_dec` are
-accepted aliases. The [tour](tour.md#shape-constraints-a-monotone-curve-cars)
-fits a monotone curve to real data.
+Accepted spellings (case and hyphens are ignored): `none`;
+`monotone_increasing` (`monotonic_increasing`, `increasing`, `mono_inc`,
+`mpi`); `monotone_decreasing` (`monotonic_decreasing`, `decreasing`,
+`mono_dec`, `mpd`); `convex` (`cvx`); `concave` (`ccv`). From Python,
+`gamfit.fit(..., constraints={"s(x)": "monotone_increasing"})` rewrites the
+formula into the same `shape=` option.
+
+The constraint is exact, not a penalty and not a check on a grid of points.
+The B-spline coefficients are written as `β = C·δ`, where `δ` holds
+successive coefficient differences (monotone) or knot-scaled slope
+differences (convex/concave), and the solver enforces `δ ≥ 0`. A
+non-negative control-polygon difference makes the spline itself monotone
+(or convex) everywhere on the knot range. The roughness penalty stays the
+function penalty `βᵀSβ`, carried into `δ` coordinates by congruence.
+
+A shape-constrained smooth is centred like an unconstrained one. The chart
+drops the constant ("level") direction, which the B-spline partition of
+unity would otherwise make identical to the intercept. It also subtracts
+each increment column's weighted training mean, which leaves every
+coefficient difference, and so the cone, unchanged. The fitted term then
+sums to zero over the training rows and the intercept carries the level.
+`identifiability=` takes `sum_tozero` (the default) or `none`. With `none`,
+the constant stays in the chart as an unbounded level coordinate. `linear`
+is refused because removing a linear trend is not compatible with the cone.
+
+Only open 1-D B-spline `s(x)` smooths accept `shape=`. Periodic
+(`cyclic()`), cubic-regression (`bs='cr'`/`'cs'`) and boundary-conditioned
+bases, thin-plate/Duchon/Matérn/sphere smooths, and tensor products reject a
+non-`none` shape with an error.
+
+The [tour](tour.md#shape-constraints-a-monotone-curve-cars) fits a
+monotone curve to real data.
 
 ### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
 

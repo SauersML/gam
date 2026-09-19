@@ -166,7 +166,7 @@ print(f"stopping distance at 10 mph = {np.interp(10, grid['speed'], curve):.1f} 
 ```
 
 `shape=` also accepts `monotone_decreasing`, `convex` and `concave`; see
-[shape constraints](formulas.md#shape-constraints).
+[shape constraints](formulas.md#shape-constrained-smooths).
 
 ## Surfaces: a tensor product (topo)
 

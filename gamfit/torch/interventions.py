@@ -200,8 +200,8 @@ def run_interventions(
     logit_max_abs = np.empty((m,), dtype=np.float64)
     logit_max_abs_change = np.empty((m,), dtype=np.float64)
     is_control = np.zeros((m,), dtype=bool)
-    logit_dtypes = set()
-    vocab_sizes = set()
+    logit_dtypes: set[torch.dtype] = set()
+    vocab_sizes: set[int] = set()
 
     with torch.no_grad():
         for i in range(m):

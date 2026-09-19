@@ -11,11 +11,14 @@ itself never raises; it imports torch lazily on first use of any helper.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from ._frame_shared import stack_coords_generic
+
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 
 def _torch() -> Any:
@@ -24,7 +27,7 @@ def _torch() -> Any:
     return import_torch()
 
 
-def to_numpy_f64(value: Any) -> np.ndarray:
+def to_numpy_f64(value: Any) -> NDArray[np.float64]:
     """Convert a torch tensor to a contiguous f64 NumPy array on CPU.
 
     The autograd graph is *not* preserved — callers that need a
@@ -45,7 +48,7 @@ def to_numpy_f64(value: Any) -> np.ndarray:
         tensor = tensor.to(dtype=torch.float64)
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
-    arr = tensor.numpy()
+    arr: NDArray[np.float64] = tensor.numpy()
     if arr.dtype == np.float64 and arr.flags.c_contiguous:
         return arr
     return np.ascontiguousarray(arr, dtype=np.float64)
