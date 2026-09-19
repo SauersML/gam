@@ -863,18 +863,23 @@ impl Clone for SaeManifoldTerm {
             best_fit_incumbent: None,
             structural_cocollapse_reseeds: self.structural_cocollapse_reseeds,
             evidence_root_telemetry: self.evidence_root_telemetry.clone(),
-            // Transient per-assembly frozen gate — rebuilt at the next assembly.
-            decoder_repulsion_gate: None,
-            // #1625 — transient per-assembly frozen barrier coactivation; rebuilt
-            // at the next assembly, exactly like the repulsion gate above.
-            barrier_coactivation_gate: None,
-            // #2343 — transient per-assembly frozen amplitude-barrier turn-on
-            // radius; rebuilt at the next assembly like the gates above.
-            amplitude_barrier_gate: None,
-            // #1801 — transient streaming gate-freeze flag; a fresh clone refreshes
-            // its gates per assembly like the dense path until a streaming fit
-            // re-arms it.
-            streaming_gates_frozen: false,
+            // #2933 F05 — declared (frozen) collapse-prevention gates are part of the
+            // objective a term is priced under, so a clone of such a term prices the
+            // same criterion. Unfrozen gates are transient per-assembly state; a
+            // clone rebuilds them at its next assembly.
+            decoder_repulsion_gate: self
+                .streaming_gates_frozen
+                .then(|| self.decoder_repulsion_gate.clone())
+                .flatten(),
+            barrier_coactivation_gate: self
+                .streaming_gates_frozen
+                .then(|| self.barrier_coactivation_gate.clone())
+                .flatten(),
+            amplitude_barrier_gate: self
+                .streaming_gates_frozen
+                .then_some(self.amplitude_barrier_gate)
+                .flatten(),
+            streaming_gates_frozen: self.streaming_gates_frozen,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),

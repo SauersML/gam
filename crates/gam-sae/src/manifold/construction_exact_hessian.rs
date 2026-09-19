@@ -7211,7 +7211,7 @@ mod test_support {
                     .iter()
                     .enumerate()
                 {
-                    // A clone drops the three frozen gates, and
+                    // A clone of an undeclared term carries no gate, and
                     // `barrier_coactivation_pairs` then recomputes the barrier
                     // coactivation from the moved logits, so the border gap would
                     // move with theta. Production holds the gates fixed across a step.

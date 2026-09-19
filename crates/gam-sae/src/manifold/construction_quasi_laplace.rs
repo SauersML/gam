@@ -6907,7 +6907,7 @@ mod shape_covariance_observed_information_2933_f33_tests {
     ///
     /// The collapse-prevention gates are the ones `term` declared at its root: `A`
     /// is the Hessian of `V(ρ; w₀)` with the routing weights `w₀` held fixed
-    /// (#2933 F05). `SaeManifoldTerm::clone` resets every gate to `None`, and a
+    /// (#2933 F05). A clone of a term whose gates are not declared carries none, and a
     /// clone without a gate reads the separation barrier's coactivation from its
     /// live assignments. Its logit columns would then differentiate a routing
     /// refresh the observed information does not carry, so every perturbed clone
