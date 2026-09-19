@@ -12,9 +12,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from ._binding import rust_module
+
+if TYPE_CHECKING:
+    from ._rust import _EncodedTable
 
 (
     DEFAULT_SURVIVAL_PEOPLE_CHUNK,
@@ -188,6 +191,11 @@ class SurvivalPrediction:
         if surface is not None:
             return grid, surface
         grid, survival_surface = self._ffi_surface("survival")
+        if survival_surface is None:
+            raise RuntimeError(
+                "no saved cumulative-hazard or survival surface; callers must "
+                "check _has_nonparametric_surface() first"
+            )
         return grid, rust_module().survival_cumulative_from_survival(survival_surface)
 
     def hazard_at(self, times: Any) -> Any:
@@ -464,7 +472,7 @@ class SurvivalPrediction:
         # other times share the call.
         grid, cum_knots = self._cumulative_hazard_knots()
 
-        def block_fn(row_slice: slice, time_slice: slice) -> Any:
+        def knot_slope_block_fn(row_slice: slice, time_slice: slice) -> Any:
             return rust_module().hazard_from_cumulative_knots(
                 grid, cum_knots[row_slice, :], times_arr[time_slice]
             )
@@ -474,7 +482,7 @@ class SurvivalPrediction:
             times_arr=times_arr,
             people_chunk=people_chunk,
             time_grid_chunk=time_grid_chunk,
-            block_fn=block_fn,
+            block_fn=knot_slope_block_fn,
         )
 
     def write_survival_at_csv(
@@ -488,15 +496,19 @@ class SurvivalPrediction:
         times_arr = self._coerce_times(times)
         grid, surface = self._ffi_surface("survival")
         stored = None if grid is None or surface is None else (grid, surface)
-        include_ids = self.id_column is not None and self.row_ids is not None
+        id_column: str | None = None
+        row_ids: list[str] | None = None
+        if self.id_column is not None and self.row_ids is not None:
+            id_column = self.id_column
+            row_ids = list(self.row_ids)
         return str(
             rust_module().write_survival_csv(
                 str(path),
                 stored,
                 self._parameters_array() if stored is None else None,
                 times_arr,
-                self.id_column if include_ids else None,
-                list(self.row_ids) if include_ids else None,
+                id_column,
+                row_ids,
                 people_chunk,
                 time_grid_chunk,
             )
@@ -606,7 +618,10 @@ class SurvivalPrediction:
 
 def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:
     columns_json = json.dumps(columns, separators=(",", ":"))
-    return json.loads(rust_module().ordered_prediction_columns(columns_json))
+    ordered: dict[str, list[float]] = json.loads(
+        rust_module().ordered_prediction_columns(columns_json)
+    )
+    return ordered
 
 
 def numeric_matrix(values: Any, label: str) -> Any:
@@ -615,7 +630,7 @@ def numeric_matrix(values: Any, label: str) -> Any:
 
 def extract_row_ids(
     headers: list[str],
-    rows: list[list[str]],
+    rows: _EncodedTable,
     id_column: str | None,
 ) -> list[str] | None:
     return rust_module().extract_row_ids(headers, rows, id_column)
@@ -673,25 +688,6 @@ def competing_risks_prediction_from_ffi_payload(
         eta_upper=parsed["eta_upper"],
         columns=parsed["columns"],
     )
-
-
-def default_survival_time_grid(
-    model_class: str,
-    formula: str,
-    headers: list[str],
-    rows: list[list[str]],
-    model_bytes: bytes | None = None,
-) -> list[float] | None:
-    # When ``model_bytes`` is supplied the grid's upper edge is anchored to the
-    # fitted model's training time support rather than the prediction frame's
-    # ``exit`` placeholder, so an in-range query time cannot be silently
-    # truncated to the ``t -> inf`` asymptote (issue #896).
-    from ._binding import rust_module
-
-    result = rust_module().default_survival_time_grid(
-        model_class, formula, list(headers), [list(r) for r in rows], model_bytes
-    )
-    return list(result) if result is not None else None
 
 
 def term_blocks_for_model(model: Any) -> tuple[TermBlock, ...]:

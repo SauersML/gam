@@ -4095,20 +4095,19 @@ fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) 
     Ok(out.unbind().into_any())
 }
 
-#[pyfunction]
-fn model_conditional_aic(model: PyRef<'_, PyFittedModel>) -> PyResult<f64> {
-    // Report the SAME Occam-penalised conditional-AIC ranking score that
-    // `gamfit.compare_models` ranks on (`-2·loglik + 2·edf`), not the raw
-    // REML/LAML criterion, so `Model.conditional_aic` ordering agrees with the
-    // winner `compare_models` declares. Lower is still better (issue #2079). It
-    // is a cost on the −2·log scale and no marginal likelihood (#2946 T12).
-    ranking_score_from_summary_payload(model.summary_value()?)
-}
-
-/// The saved-model summary as a JSON value, built from the typed model.
+/// The saved-model summary as a JSON value, built from the typed model, with its
+/// rendered text under `"text"`: the one Rust renderer `gam summary` prints, so
+/// `str(model.summary())` is that same string.
 fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, String> {
     let summary = saved_model_summary(model)?;
-    serde_json::to_value(&summary).map_err(|err| format!("failed to serialize summary: {err}"))
+    let text = render_summary_text(&summary);
+    let mut value = serde_json::to_value(&summary)
+        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("model summary payload must be a JSON object".to_string());
+    };
+    fields.insert("text".to_string(), serde_json::Value::String(text));
+    Ok(value)
 }
 
 fn json_object_to_py_dict(py: Python<'_>, value: serde_json::Value) -> PyResult<PyObject> {
@@ -4176,25 +4175,24 @@ fn summary_repr(payload: &Bound<'_, PyDict>) -> PyResult<String> {
             fields.push(format!("{key}={repr}"));
         }
     }
+    if let Some(estimator) = summary_estimator_text(payload)? {
+        fields.push(format!("estimator={}", estimator.repr()?.extract::<String>()?));
+    }
     Ok(format!("Summary({})", fields.join(", ")))
 }
 
-/// The summary's criterion row in gam-report's words, so the printed summary
-/// names a fit without null-space metadata apart from an exact fit the same way
-/// `gam fit` and the HTML report do (#2627).
-#[pyfunction]
-fn summary_criterion_row(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    let criterion = |key: &str| -> PyResult<Option<f64>> {
-        match payload.get_item(key)? {
-            Some(value) if !value.is_none() => Ok(Some(value.extract::<f64>()?)),
-            _ => Ok(None),
-        }
+/// `convergence.estimator.text`: the words `SummaryEstimator` renders for the
+/// objective the fit optimized. `None` for a route that certifies no optimizer.
+fn summary_estimator_text<'py>(
+    payload: &Bound<'py, PyDict>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    let Some(convergence) = payload.get_item("convergence")? else {
+        return Ok(None);
     };
-    Ok(gam::report::criterion_row(
-        criterion("reml_score")?,
-        criterion("raw_reml_score")?,
-        summary_render::summary_format_float,
-    ))
+    if convergence.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(convergence.get_item("estimator")?.get_item("text")?))
 }
 
 #[pyfunction]

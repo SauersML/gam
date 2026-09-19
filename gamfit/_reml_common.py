@@ -254,7 +254,7 @@ def run_point_design_forward(
         for key in REML_FORWARD_KEYS
     )
     return RemlForwardRun(
-        outputs=outputs,  # type: ignore[arg-type]
+        outputs=outputs,
         forward_state=forward_state,
         arrays=arrays,
     )

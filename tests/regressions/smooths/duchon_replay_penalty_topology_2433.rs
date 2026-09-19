@@ -84,6 +84,7 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

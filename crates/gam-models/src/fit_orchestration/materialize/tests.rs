@@ -380,7 +380,7 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
 #[test]
 fn an_absent_warm_start_attaches_no_cache_session() {
     let absent = blockwise_fit_options(&FitConfig::default());
-    assert!(absent.cache_session.is_none() && absent.required_warm_start.is_none());
+    assert!(absent.cache_session.is_none() && absent.warm_start.is_none());
 }
 
 /// The carrier is survival-only: a standard fit has no survival time basis to
@@ -473,7 +473,7 @@ fn saved_standard_payload_carries_no_per_row_training_data() {
         "the longest array in the saved payload must not depend on the training rows"
     );
 
-    // A v27 payload of the same fit carried the per-row data this version no
+    // A v28 payload of the same fit carried the per-row data this version no
     // longer writes: the conformal training `x` and `y`, and the working PIRLS
     // geometry under every fit geometry. It must still load.
     fn insert_working_geometry(value: &mut serde_json::Value, rows: usize) -> usize {
@@ -501,24 +501,24 @@ fn saved_standard_payload_carries_no_per_row_training_data() {
     }
     let rows = large_rows as usize;
     let mut legacy = large.clone();
-    legacy["version"] = serde_json::json!(27);
+    legacy["version"] = serde_json::json!(28);
     let p = conformal["s_lambda"]["dim"][0].as_u64().expect("s_lambda dim") as usize;
     legacy["full_conformal"]["x"] = serde_json::to_value(Array2::<f64>::zeros((rows, p))).expect("x");
     legacy["full_conformal"]["y"] = serde_json::to_value(ndarray::Array1::<f64>::zeros(rows)).expect("y");
     assert!(
         insert_working_geometry(&mut legacy, rows) > 0,
-        "the fit payload must carry a fit geometry to plant the v27 working rows in"
+        "the fit payload must carry a fit geometry to plant the v28 working rows in"
     );
     let loaded: crate::inference::model::FittedModelPayload =
-        serde_json::from_value(legacy).expect("a v27 standard payload with training rows must load");
+        serde_json::from_value(legacy).expect("a v28 standard payload with training rows must load");
     let penalty = loaded
         .full_conformal
         .as_ref()
-        .expect("the v27 conformal field loads as the frozen penalty");
+        .expect("the v28 conformal field loads as the frozen penalty");
     assert_eq!(penalty.p(), p);
     crate::inference::model::FittedModel::from_payload(loaded)
         .validate_for_persistence()
-        .expect("a loaded v27 standard payload passes the saved-model gate");
+        .expect("a loaded v28 standard payload passes the saved-model gate");
 }
 
 #[test]
@@ -2222,6 +2222,7 @@ fn bernoulli_marginal_slope_prune_drops_penalized_redundant_scalar_term() {
         }],
         random_effect_terms: vec![],
         smooth_terms: vec![],
+        level: Default::default(),
     };
     let mut notes = Vec::new();
     let removed = prune_unidentified_linear_terms_for_marginal_slope(

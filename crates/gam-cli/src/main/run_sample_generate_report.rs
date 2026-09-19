@@ -1,5 +1,6 @@
 use super::*;
-use gam::families::inference::saved_summary::saved_model_report_input;
+use gam::families::inference::saved_summary::{saved_model_report_input, saved_model_summary};
+use gam::families::inference::summary_text::render_summary_text;
 
 
 fn saved_alo_report_data(
@@ -173,6 +174,14 @@ pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
         nuts.converged,
         nuts.warmup_transitions
     );
+    match nuts.sampler.acceptance_rate() {
+        Some(rate) => cli_out!(
+            "  sampler: {}  acceptance rate={:.4}",
+            nuts.sampler.label(),
+            rate
+        ),
+        None => cli_out!("  sampler: {}", nuts.sampler.label()),
+    }
 
     // Write per-coefficient posterior summary (mean, std, 95% CI) to CSV.
     let summary_path = out.with_extension("summary.csv");
@@ -354,6 +363,17 @@ pub(crate) fn run_generate_unified(
         },
     )
     .map_err(|error| error.to_string())
+}
+
+pub(crate) fn run_summary(args: SummaryArgs) -> Result<(), String> {
+    reject_multinomial_model(&args.model, "summary")?;
+    let model = SavedModel::load_from_path(&args.model)?;
+    // One renderer owns the text; gamfit's `Model.summary()` prints the same
+    // string from the same payload.
+    let text = render_summary_text(&saved_model_summary(&model)?);
+    use std::io::Write as _;
+    writeln!(std::io::stdout(), "{text}")
+        .map_err(|error| format!("failed to write the summary: {error}"))
 }
 
 pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
@@ -823,7 +843,9 @@ fn report_family_residuals(
     edf_total: f64,
 ) -> Result<FamilyResiduals, String> {
     use rand::RngExt;
-    use statrs::distribution::{Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
+    use statrs::distribution::{
+        Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson, StudentsT,
+    };
 
     let n = y.len().min(mu.len());
     if n == 0 {
@@ -940,6 +962,21 @@ fn report_family_residuals(
             Ok(FamilyResiduals {
                 values,
                 label: "Randomized Quantile Residual",
+            })
+        }
+        ResponseFamily::StudentT { sigma, nu } => {
+            // σ and ν are the fitted LAML estimates, so the residual is the exact
+            // quantile residual Φ⁻¹(F_t((y−μ)/σ; ν)).
+            let values = (0..n)
+                .map(|i| {
+                    let dist = StudentsT::new(mu[i], *sigma, *nu)
+                        .map_err(|e| format!("Student-t residual at μ={}: {e}", mu[i]))?;
+                    to_normal(dist.cdf(y[i]))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(FamilyResiduals {
+                values,
+                label: "Quantile Residual",
             })
         }
         ResponseFamily::Gamma => {

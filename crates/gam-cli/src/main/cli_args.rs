@@ -95,12 +95,18 @@ pub(crate) enum Command {
     ParameterDecomposition(ParameterDecompositionArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
+    /// Print the text summary of a fitted model (the text gamfit's
+    /// `Model.summary()` prints).
+    Summary(SummaryArgs),
     /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
     /// Evaluate a fitted conditional transformation model at observed responses.
     TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Rank fitted models on their smoothing-corrected AIC and print the
+    /// comparison as JSON.
+    Compare(CompareArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
@@ -370,11 +376,17 @@ pub(crate) struct FitArgs {
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
     #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     pub(crate) negative_binomial_theta: Option<f64>,
-    /// Expectile asymmetry `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
+    /// Expectile level(s) `τ ∈ (0, 1)` for `--family expectile` (default 0.5,
     /// the ordinary mean). `τ > 0.5` fits an upper expectile, `τ < 0.5` a lower
-    /// one — the smooth analogue of a quantile.
-    #[arg(long = "expectile-tau", value_parser = parse_probability_open_cli)]
-    pub(crate) expectile_tau: Option<f64>,
+    /// one — the smooth analogue of a quantile. A comma-separated, strictly
+    /// increasing list (`0.1,0.5,0.9`) fits all levels jointly as one
+    /// location-scale model whose curves never cross.
+    #[arg(
+        long = "expectile-tau",
+        value_parser = parse_probability_open_cli,
+        value_delimiter = ','
+    )]
+    pub(crate) expectile_tau: Option<Vec<f64>>,
     /// Survival likelihood mode for Surv(...) formulas; defaults to
     /// transformation for Surv() formulas.
     #[arg(long = "survival-likelihood", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
@@ -512,6 +524,24 @@ pub(crate) struct DiagnoseArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct CompareArgs {
+    #[arg(
+        value_name = "MODEL",
+        required = true,
+        num_args = 1..,
+        help = "Fitted model files produced by `gam fit`, all on the same data and family"
+    )]
+    pub(crate) models: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        num_args = 1..,
+        help = "One label per model, in order (default: the model paths)"
+    )]
+    pub(crate) names: Option<Vec<String>>,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct SampleArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -567,6 +597,12 @@ pub(crate) struct GenerateArgs {
 }
 
 #[derive(Args, Debug)]
+pub(crate) struct SummaryArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+}
+
+#[derive(Args, Debug)]
 pub(crate) struct ReportArgs {
     #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     pub(crate) model: PathBuf,
@@ -595,6 +631,10 @@ pub(crate) enum FamilyArg {
     GammaLog,
     Tweedie,
     Beta,
+    /// Robust scaled Student-t response on the identity link; its scale and
+    /// degrees of freedom are estimated jointly with the smoothing parameters.
+    #[value(alias = "student_t", alias = "t")]
+    StudentT,
     RoystonParmar,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes

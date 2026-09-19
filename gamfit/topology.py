@@ -40,7 +40,7 @@ def _make_topology(
 
     if kind in {"cylinder", "torus"}:
         periodic = (True, kind == "torus")
-        spec = TensorBSpline(
+        spec: Smooth = TensorBSpline(
             marginals=[BSpline(periodic=value) for value in periodic],
             **common,
         )

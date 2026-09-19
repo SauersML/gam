@@ -943,7 +943,9 @@ mod tests {
     use crate::parameter_decomposition::gated_rewrite::{NativeSwiglu, swiglu_hidden};
     use crate::parameter_decomposition::receipts::affine_stage_band;
     use gam_linalg::roundoff::accumulation_growth;
-    use crate::parameter_decomposition::block::{AttentionLayerExecution, AttentionLayerReads, ProjectionRead};
+    use crate::parameter_decomposition::block::{
+        AttentionLayerExecution, AttentionLayerReads, ComponentMasks, ProjectionRead,
+    };
     use crate::parameter_decomposition::program::{Execution, ExecutionError};
     use crate::parameter_decomposition::rewrite::ComponentRead;
     use rand::rngs::StdRng;
@@ -1088,10 +1090,10 @@ mod tests {
 
     fn component_reads(masks: &[Array1<f64>; 4]) -> AttentionLayerReads<'_> {
         AttentionLayerReads {
-            query: ProjectionRead::Components(masks[0].view()),
-            key: ProjectionRead::Components(masks[1].view()),
-            value: ProjectionRead::Components(masks[2].view()),
-            output: ProjectionRead::Components(masks[3].view()),
+            query: ProjectionRead::Components(ComponentMasks::uniform(masks[0].view())),
+            key: ProjectionRead::Components(ComponentMasks::uniform(masks[1].view())),
+            value: ProjectionRead::Components(ComponentMasks::uniform(masks[2].view())),
+            output: ProjectionRead::Components(ComponentMasks::uniform(masks[3].view())),
         }
     }
 
@@ -1106,7 +1108,7 @@ mod tests {
         let layer = fixture.native();
         let program = attention_layer_program(&layer).expect("the layer program is valid");
         let native = layer
-            .execute(AttentionLayerReads::native(), fixture.residual.view(), &fixture.positions)
+            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("native layer");
         let executed = fixture
             .run(&program, &layer, &MaskAssignment::all_on())
@@ -1157,7 +1159,7 @@ mod tests {
                 );
             }
             let expected = layer
-                .execute(component_reads(&masks), fixture.residual.view(), &fixture.positions)
+                .execute(component_reads(&masks), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
                 .expect("component reads");
             let assignment = program.masks(views(&masks)).expect("masks of the right lengths");
             let executed = fixture
@@ -1192,7 +1194,7 @@ mod tests {
         let layer = fixture.component();
         let program = ComponentLayerProgram::new(&layer).expect("the component program is valid");
         let native = layer
-            .execute(AttentionLayerReads::native(), fixture.residual.view(), &fixture.positions)
+            .execute(AttentionLayerReads::native(), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("native reads");
         let executed = fixture
             .run(program.program(), &layer, &MaskAssignment::all_on())
@@ -1206,7 +1208,7 @@ mod tests {
         }
         let ones = all_ones();
         let factored = layer
-            .execute(component_reads(&ones), fixture.residual.view(), &fixture.positions)
+            .execute(component_reads(&ones), ProjectedRows::exact(fixture.residual.view()), &fixture.positions)
             .expect("factored all-ones reads");
         assert!(
             bits(&factored.output) != bits(&native.output),

@@ -552,37 +552,258 @@ pub(crate) fn reject_prefit_binomial_separation(
     // one-column penalty block is a parametric effect's null-recovery ridge
     // (b7b874a2a): along a separating direction REML sends its λ toward zero, so it
     // bounds nothing there. Multi-column blocks are basis expansions, and enough
-    // basis columns separate any response, so their columns stay out (#2898).
+    // basis columns separate any response, so their columns stay out (#2898);
+    // only the directions inside them that no roughness penalty bounds are read
+    // (`penalty_free_block_frames`).
     let certified_columns = canonical_unpenalized_column_mask(
         penalties
             .iter()
             .filter(|penalty| penalty.col_range.len() > 1),
         x_fit.ncols(),
     );
-    if let Some(diagnostic) = detect_prefit_binomial_single_column_separation_in_design(
+    let frames = penalty_free_block_frames(penalties, x_fit.ncols());
+    if frames.is_empty() {
+        return reject_separation_along_columns(y, w, x_fit, &certified_columns, |columns| {
+            columns.to_vec()
+        });
+    }
+
+    let direct_columns = unpenalized_column_indices(&certified_columns);
+    let projected = project_onto_penalty_free_directions(x_fit, &direct_columns, &frames)?;
+    let mut direct_mask = vec![false; projected.ncols()];
+    direct_mask[..direct_columns.len()].fill(true);
+    if let Some(diagnostic) =
+        detect_prefit_binomial_single_column_separation_in_design(y, w, &projected, &direct_mask)?
+    {
+        return Err(EstimationError::PrefitPerfectSeparationDetected {
+            column_index: direct_columns[diagnostic.column_index],
+            threshold: diagnostic.threshold,
+            positive_above_threshold: diagnostic.positive_above_threshold,
+        });
+    }
+    // The realized-design columns each projected column is read from, in the
+    // order `project_onto_penalty_free_directions` lays them out.
+    let supports: Vec<&[usize]> = direct_columns
+        .iter()
+        .map(std::slice::from_ref)
+        .chain(frames.iter().flat_map(|frame| {
+            std::iter::repeat_n(frame.columns.as_slice(), frame.frame.ncols())
+        }))
+        .collect();
+    reject_linear_separation_along_columns(
         y,
         w,
-        x_fit,
-        &certified_columns,
-    )? {
+        &projected,
+        &vec![true; projected.ncols()],
+        |projected_columns| {
+            let mut global: Vec<usize> = projected_columns
+                .iter()
+                .flat_map(|&column| supports[column].iter().copied())
+                .collect();
+            global.sort_unstable();
+            global.dedup();
+            global
+        },
+    )
+}
+
+/// Raise the single-column certificate over `columns`, then the linear one;
+/// `support` maps the linear certificate's columns to the realized design's.
+fn reject_separation_along_columns(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    columns: &[bool],
+    support: impl Fn(&[usize]) -> Vec<usize>,
+) -> Result<(), EstimationError> {
+    if let Some(diagnostic) =
+        detect_prefit_binomial_single_column_separation_in_design(y, w, x, columns)?
+    {
         return Err(EstimationError::PrefitPerfectSeparationDetected {
             column_index: diagnostic.column_index,
             threshold: diagnostic.threshold,
             positive_above_threshold: diagnostic.positive_above_threshold,
         });
     }
-    if let Some(diagnostic) = detect_prefit_binomial_linear_combination_separation_in_design(
-        y,
-        w,
-        x_fit,
-        &certified_columns,
-    )? {
+    reject_linear_separation_along_columns(y, w, x, columns, support)
+}
+
+fn reject_linear_separation_along_columns(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    columns: &[bool],
+    support: impl Fn(&[usize]) -> Vec<usize>,
+) -> Result<(), EstimationError> {
+    if let Some(diagnostic) =
+        detect_prefit_binomial_linear_combination_separation_in_design(y, w, x, columns)?
+    {
         return Err(EstimationError::PrefitLinearSeparationDetected {
             min_signed_margin: diagnostic.min_signed_margin,
             num_unpenalized_columns: diagnostic.num_unpenalized_columns,
-            column_indices: diagnostic.column_indices,
+            column_indices: support(&diagnostic.column_indices),
         });
     }
-
     Ok(())
+}
+
+/// Directions inside one multi-column penalty block that no roughness penalty
+/// bounds, as an orthonormal frame over the block's penalized columns.
+#[derive(Clone, Debug)]
+struct PenaltyFreeFrame {
+    /// The realized design columns the frame's rows stand for.
+    columns: Vec<usize>,
+    /// `columns.len() × m`, orthonormal columns.
+    frame: Array2<f64>,
+}
+
+/// The directions of each multi-column penalty block that are either free of
+/// every penalty on the block or bounded only by a null-space ridge.
+///
+/// A null-space ridge is the one-column ridge's argument on a basis: it is the
+/// penalty on a block whose range is exactly the null space its companions
+/// leave, so along those directions it is the only bound, and along a
+/// separating one REML sends its λ toward zero. A double penalty ships the
+/// ridge beside its roughness penalty, and that pair is symmetric in every
+/// algebraic invariant (each one's range is the other's null space); the
+/// ridge is the smaller member, the low-order kernel of the roughness penalty
+/// it completes, and a pair of equal ranks names neither. A tensor product's
+/// margin penalty never qualifies: its companions leave free only part of
+/// its range. Blocks whose column ranges overlap another block's are read as
+/// before, not at all.
+fn penalty_free_block_frames(penalties: &[CanonicalPenalty], p: usize) -> Vec<PenaltyFreeFrame> {
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for penalty in penalties {
+        let range = &penalty.col_range;
+        if range.len() > 1 && range.end <= p && !ranges.contains(range) {
+            ranges.push(range.clone());
+        }
+    }
+    let overlaps = |left: &std::ops::Range<usize>, right: &std::ops::Range<usize>| {
+        left.start < right.end && right.start < left.end
+    };
+
+    let mut frames = Vec::new();
+    for range in &ranges {
+        if ranges
+            .iter()
+            .any(|other| other != range && overlaps(other, range))
+        {
+            continue;
+        }
+        let members: Vec<&CanonicalPenalty> = penalties
+            .iter()
+            .filter(|penalty| {
+                penalty.col_range == *range && penalty.local.dim() == (range.len(), range.len())
+            })
+            .collect();
+        // A column no penalty on the block touches is already read on its own.
+        let unpenalized = canonical_unpenalized_column_mask(members.iter().copied(), p);
+        let local: Vec<usize> = (0..range.len())
+            .filter(|&column| !unpenalized[range.start + column])
+            .collect();
+        let dim = local.len();
+        if dim == 0 {
+            continue;
+        }
+        // Each penalty at unit spectral scale, so none hides under another's rounding band.
+        let normalized: Vec<(Array2<f64>, usize)> = members
+            .iter()
+            .filter_map(|penalty| {
+                let scale = penalty
+                    .positive_eigenvalues
+                    .iter()
+                    .fold(0.0_f64, |acc, &value| acc.max(value));
+                (scale.is_finite() && scale > 0.0).then(|| {
+                    let block = penalty
+                        .local
+                        .select(Axis(0), &local)
+                        .select(Axis(1), &local);
+                    (block / scale, penalty.positive_eigenvalues.len())
+                })
+            })
+            .collect();
+        let sum_except = |skip: Option<usize>| {
+            let mut sum = Array2::<f64>::zeros((dim, dim));
+            for (index, (matrix, _)) in normalized.iter().enumerate() {
+                if Some(index) != skip {
+                    sum += matrix;
+                }
+            }
+            sum
+        };
+        let Some(free) = super::rho_domain::psd_null_frame(&sum_except(None)) else {
+            continue;
+        };
+        let mut ridge_frames = Vec::new();
+        if normalized.len() > 1 {
+            for (ridge, (_, rank)) in normalized.iter().enumerate() {
+                let Some(companion_free) = super::rho_domain::psd_null_frame(&sum_except(Some(ridge)))
+                else {
+                    continue;
+                };
+                let ridge_only = companion_free.ncols() - free.ncols();
+                let companion_rank = dim - companion_free.ncols();
+                if ridge_only > 0 && ridge_only == *rank && *rank < companion_rank {
+                    ridge_frames.push(companion_free);
+                }
+            }
+        }
+        if ridge_frames.is_empty() && free.ncols() > 0 {
+            ridge_frames.push(free);
+        }
+        let columns: Vec<usize> = local.iter().map(|&column| range.start + column).collect();
+        frames.extend(ridge_frames.into_iter().map(|frame| PenaltyFreeFrame {
+            columns: columns.clone(),
+            frame,
+        }));
+    }
+    frames
+}
+
+/// `[X_direct, X_B1·F1, X_B2·F2, …]`: the design read along the directions the
+/// certificate may use, the direct columns first.
+fn project_onto_penalty_free_directions(
+    x: &DesignMatrix,
+    direct_columns: &[usize],
+    frames: &[PenaltyFreeFrame],
+) -> Result<DesignMatrix, EstimationError> {
+    let width =
+        direct_columns.len() + frames.iter().map(|frame| frame.frame.ncols()).sum::<usize>();
+    let p = x.ncols();
+    let mut projected = Array2::<f64>::zeros((x.nrows(), width));
+    let chunk_rows = gam_runtime::resource::byte_balanced_row_chunk(p, x.nrows());
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit binomial separation check failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let row = chunk.row(local_row);
+            let mut target = projected.row_mut(start + local_row);
+            for (column, &global) in direct_columns.iter().enumerate() {
+                target[column] = row[global];
+            }
+            let mut column = direct_columns.len();
+            for frame in frames {
+                for direction in frame.frame.columns() {
+                    target[column] = frame
+                        .columns
+                        .iter()
+                        .zip(direction.iter())
+                        .map(|(&global, &weight)| row[global] * weight)
+                        .sum();
+                    column += 1;
+                }
+            }
+        }
+    }
+    Ok(DesignMatrix::Dense(
+        gam_linalg::matrix::DenseDesignMatrix::from(projected),
+    ))
 }

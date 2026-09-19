@@ -120,22 +120,31 @@ use std::path::Path;
 // family objective homotopy, a unique mode, or the caller's seed when no rule applied. The field
 // carries a serde default, so an older payload loads as `NotRecorded`, which claims nothing; a
 // v26 binary refuses a v27 payload by version.
-// v28 stops persisting per-row training data in a standard fit (speed F6): the exact
+// v28 records, beside a certified outer point, the criterion value certified there and the
+// fingerprint of the fit's inputs (`OuterWarmStartRecord::{value, input_fingerprint}`, gam#3002),
+// and names its coordinates `theta` (the `rho` of a v25 to v27 record reads as its alias). Both
+// fields carry serde defaults, so an older point loads without them and can only join a search,
+// never resume one; a v27 binary refuses a v28 payload by version.
+// v29 stops persisting per-row training data in a standard fit (speed F6): the exact
 // full-conformal field keeps only the p × p frozen penalty `s_lambda` (the labeled rows are
 // supplied again at prediction time), and `FitGeometry::working` (the final PIRLS weights and
 // working response, n each) is no longer serialized, so a saved standard GAM no longer grows
-// with the training rows. A v27 or older payload still loads: its conformal `x` and `y` and
-// its working geometry are read past and dropped. A v27 binary refuses a v28 payload by
+// with the training rows. A v28 or older payload still loads: its conformal `x` and `y` and
+// its working geometry are read past and dropped. A v28 binary refuses a v29 payload by
 // version instead of failing on the conformal field's missing `x`.
-pub const MODEL_PAYLOAD_VERSION: u32 = 28;
+pub const MODEL_PAYLOAD_VERSION: u32 = 29;
 
 /// The schema before the saved model stopped persisting training rows (speed F6), whose
 /// only difference is the conformal field's `x` and `y` and the serialized working
 /// geometry, both of which this binary reads past.
-const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 27;
+const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 28;
+
+/// The schema before the certified point's value and input fingerprint (gam#3002), whose only
+/// difference from [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is those fields' absence.
+const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
 
 /// The schema before the coefficient-mode record (gam#2661), whose only difference from
-/// [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is that field's absence.
+/// [`WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
 const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
 
 /// The first payload version whose survival location-scale kernel divides the whole
@@ -148,7 +157,7 @@ const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
 
 /// The schema before the certified outer point (`warm_start_from`), whose only difference
 /// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
-const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
+pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
 
 /// The schema before the residual repair block's covariance declination (gam#2985),
 /// whose only difference is that variant's absence.
@@ -180,9 +189,10 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 11] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 12] = [
     MODEL_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+    WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
     MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
     LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
     OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -889,7 +899,7 @@ pub struct FittedModelPayload {
     /// accepts (under the global-ρ grid-Lipschitz assumption). `None` for any
     /// ineligible model, in which case the exact-set predict path errors with a
     /// clear message and the caller uses split conformal or the posterior band.
-    /// Payloads before version 27 stored the training `x` and `y` beside
+    /// Payloads through version 28 stored the training `x` and `y` beside
     /// `s_lambda` here; only `s_lambda` is read back.
     #[serde(default)]
     pub full_conformal: Option<crate::inference::full_conformal::ExactFullConformalPenalty>,
@@ -1168,6 +1178,7 @@ impl FittedModelPayload {
                 linear_terms: Vec::new(),
                 smooth_terms: Vec::new(),
                 random_effect_terms: Vec::new(),
+                level: Default::default(),
             });
     }
 
@@ -1281,16 +1292,40 @@ pub enum ModelKind {
     TransformationNormal,
 }
 
+/// Saved-family tag of a joint multi-level expectile location-scale fit.
+pub const JOINT_EXPECTILE_FAMILY_TAG: &str = "expectile-location-scale";
+
+/// Prediction column carrying the level-`tau` curve of a joint expectile fit.
+pub fn expectile_curve_column_name(tau: f64) -> String {
+    format!("expectile_{tau}")
+}
+
 /// Statistical criterion represented by a saved fitted surface.
 ///
 /// `Likelihood` means the persisted [`LikelihoodSpec`] is also the fitted
 /// observation law. `Expectile` records the asymmetric least-squares target;
 /// it intentionally defines no observation sampler on its own.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+/// `ExpectileLocationScale` records a joint multi-level expectile fit on a
+/// Gaussian location-scale surface: level `levels[k]` is the curve
+/// `μ(x) + standardized_expectiles[k]·E[σ(x)]`. The standardized expectiles
+/// are strictly increasing, which is what makes the curves non-crossing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "estimator_kind", rename_all = "kebab-case")]
 pub enum FittedEstimator {
     Likelihood,
-    Expectile { tau: f64 },
+    Expectile {
+        tau: f64,
+    },
+    ExpectileLocationScale {
+        levels: Vec<f64>,
+        standardized_expectiles: Vec<f64>,
+    },
+}
+
+/// The family name every surface (summary, CLI fit line, Python
+/// `family_name`) reports for an expectile fit.
+pub fn expectile_display_name(tau: f64) -> String {
+    format!("Expectile(tau={tau})")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3662,6 +3697,11 @@ impl FittedModel {
     /// than to a blank family.
     pub fn display_family_name(&self) -> String {
         let payload = self.payload();
+        // An expectile fit's persisted likelihood is its Gaussian-identity
+        // working model; the estimator tag names what was actually fitted.
+        if let FittedEstimator::Expectile { tau } = payload.estimator {
+            return expectile_display_name(tau);
+        }
         match &payload.family_state {
             FittedFamily::LocationScale { .. } if !payload.family.is_empty() => {
                 payload.family.clone()
@@ -3671,8 +3711,34 @@ impl FittedModel {
     }
 
     #[inline]
-    pub fn estimator(&self) -> FittedEstimator {
-        self.payload().estimator
+    pub fn estimator(&self) -> &FittedEstimator {
+        &self.payload().estimator
+    }
+
+    /// Point-payload shape this model's prediction publishes. A joint expectile
+    /// fit publishes one curve per level (`expectile_curves`); every other
+    /// model publishes its class shape (`PredictModelClass::point_shape`).
+    pub fn prediction_point_shape(&self) -> &'static str {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { .. } => "expectile_curves",
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => {
+                self.predict_model_class().point_shape()
+            }
+        }
+    }
+
+    /// Point columns of a joint expectile fit, one per level in increasing
+    /// level order; `None` for every other estimator.
+    pub fn expectile_curve_columns(&self) -> Option<Vec<String>> {
+        match self.estimator() {
+            FittedEstimator::ExpectileLocationScale { levels, .. } => Some(
+                levels
+                    .iter()
+                    .map(|&tau| expectile_curve_column_name(tau))
+                    .collect(),
+            ),
+            FittedEstimator::Likelihood | FittedEstimator::Expectile { .. } => None,
+        }
     }
 
     /// Columns this model consumes from a prediction frame — its *input
@@ -4137,7 +4203,7 @@ impl FittedModel {
         let curved_family = match &family.response {
             // Identity-link Gaussian: inverse link is linear, so the posterior
             // mean equals the plug-in and the cheaper exact path is taken.
-            ResponseFamily::Gaussian => false,
+            ResponseFamily::Gaussian | ResponseFamily::StudentT { .. } => false,
             // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
             ResponseFamily::Poisson
             | ResponseFamily::Gamma
@@ -5178,12 +5244,15 @@ impl FittedModel {
                 ),
             });
         }
-        let expectile_family_tag = {
+        let (expectile_family_tag, joint_expectile_family_tag) = {
             let family = self.family.trim().to_ascii_lowercase();
-            family == "expectile" || family.starts_with("expectile(")
+            (
+                family == "expectile" || family.starts_with("expectile("),
+                family == JOINT_EXPECTILE_FAMILY_TAG,
+            )
         };
-        match self.estimator {
-            FittedEstimator::Likelihood if expectile_family_tag => {
+        match &self.estimator {
+            FittedEstimator::Likelihood if expectile_family_tag || joint_expectile_family_tag => {
                 return Err(FittedModelError::SchemaMismatch {
                     reason:
                         "saved family is tagged expectile but estimator metadata says likelihood"
@@ -5192,6 +5261,7 @@ impl FittedModel {
             }
             FittedEstimator::Likelihood => {}
             FittedEstimator::Expectile { tau } => {
+                let tau = *tau;
                 if !tau.is_finite() || tau <= 0.0 || tau >= 1.0 {
                     return Err(FittedModelError::SchemaMismatch {
                         reason: format!(
@@ -5213,6 +5283,62 @@ impl FittedModel {
                             self.model_kind,
                             self.family,
                             self.family_state.likelihood(),
+                        ),
+                    });
+                }
+            }
+            FittedEstimator::ExpectileLocationScale {
+                levels,
+                standardized_expectiles,
+            } => {
+                let gaussian_identity_location_scale = self.model_kind == ModelKind::LocationScale
+                    && matches!(
+                        &self.family_state,
+                        FittedFamily::LocationScale { likelihood, .. }
+                            if likelihood == &LikelihoodSpec::gaussian_identity()
+                    );
+                if !gaussian_identity_location_scale || !joint_expectile_family_tag {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator requires a \
+                             `{JOINT_EXPECTILE_FAMILY_TAG}`-tagged Gaussian location-scale fit; \
+                             got model_kind={:?}, family={:?}, likelihood={:?}",
+                            self.model_kind,
+                            self.family,
+                            self.family_state.likelihood(),
+                        ),
+                    });
+                }
+                if levels.len() < 2 || levels.len() != standardized_expectiles.len() {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile estimator needs at least two levels, each with \
+                             one standardized expectile; got {} levels and {} expectiles",
+                            levels.len(),
+                            standardized_expectiles.len()
+                        ),
+                    });
+                }
+                if levels.iter().any(|tau| !tau.is_finite() || *tau <= 0.0 || *tau >= 1.0)
+                    || levels.windows(2).any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile levels must be strictly increasing and \
+                             strictly inside (0, 1), got {levels:?}"
+                        ),
+                    });
+                }
+                if standardized_expectiles.iter().any(|c| !c.is_finite())
+                    || standardized_expectiles
+                        .windows(2)
+                        .any(|pair| !(pair[0] < pair[1]))
+                {
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved joint expectile standardized expectiles must be finite and \
+                             strictly increasing (the non-crossing guarantee), got \
+                             {standardized_expectiles:?}"
                         ),
                     });
                 }
@@ -6290,6 +6416,7 @@ mod tests {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![],
+            level: Default::default(),
         }
     }
 
@@ -7500,6 +7627,7 @@ mod tests {
         for version in [
             MODEL_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
             LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
             OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
@@ -7517,8 +7645,12 @@ mod tests {
         }
         assert_eq!(TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
+        );
+        assert_eq!(
+            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
+            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
@@ -7544,6 +7676,29 @@ mod tests {
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
         assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
+    }
+
+    /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
+    /// no value or fingerprint, so a warm start from it can only join a search; a v28 point
+    /// round-trips whole.
+    #[test]
+    fn a_certified_point_before_v28_loads_without_its_value_or_fingerprint_3002() {
+        use gam_solve::model_types::OuterWarmStartRecord;
+        let record: OuterWarmStartRecord =
+            serde_json::from_str(r#"{"rho":[1.5,-2.0],"beta":[0.25]}"#).expect("a v27 point reads");
+        assert_eq!(record.theta, vec![1.5, -2.0]);
+        assert_eq!(
+            (record.value, record.input_fingerprint.as_deref()),
+            (None, None)
+        );
+        let current = OuterWarmStartRecord {
+            value: Some(3.0),
+            input_fingerprint: Some("00ff".to_string()),
+            ..record
+        };
+        let text = serde_json::to_string(&current).expect("a v28 point writes");
+        let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
+        assert_eq!(read, current);
     }
 
     /// #2954: a payload written before the certificate recorded its Newton polish and each
@@ -7896,6 +8051,7 @@ mod tests {
                 shape: ShapeConstraint::None,
                 joint_null_rotation: None,
             }],
+            level: Default::default(),
         }
     }
 

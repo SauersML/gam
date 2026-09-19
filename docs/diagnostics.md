@@ -10,7 +10,7 @@ A fitted `Model` exposes five inspection methods:
 criterion, which is a different statement from "not recorded". A Gaussian
 fit whose fitted mean reproduces the response to floating-point resolution
 has `sigma_hat = 0`, so its restricted likelihood is unbounded and every
-score derived from it — the comparable REML/LAML headline, `Model.conditional_aic`,
+score derived from it — the comparable REML/LAML headline, `Summary.aic_corrected`,
 `Model.evidence_ratio_vs`, `gamfit.compare_models` — is undefined rather than
 large. `Summary.reml_score_unavailable` then carries the explanation, and
 those ranking surfaces raise it instead of ranking a stand-in value. Compare
@@ -57,6 +57,37 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 `model.smoothing_parameters()` returns a `{penalty_index: lambda}` dict of
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
+
+### Shape-constrained smooths have no significance p-value
+
+A smooth with `shape=monotone_increasing` (or `monotone_decreasing`, `convex`,
+`concave`) reports `edf` and `ref_df` in `summary().smooth_terms` but no
+`chi_sq` or `p_value`. The row carries `p_value_unavailable =
+"shape_constrained"` instead, and `model.smooth_significance(data)` returns the
+same reason in place of an LR row. The printed summary (Python and CLI) names
+the reason under the smooth table.
+
+Why the number is withheld:
+
+- The null `f = 0` is the apex of the constraint cone. Under a flat truth the
+  estimator sits on the cone boundary, so neither the Wald χ² nor the LR's
+  spectral reference describes the statistic's null law.
+- Chi-bar-square (a mixture of χ² laws weighted by the cone's face
+  probabilities) and tests conditional on the active set are the textbook fixes.
+  Both are the null law of the **cone projection** with a fixed cone. The
+  coefficients here are the **truncated posterior mean**, which lies strictly
+  inside the cone and has no active set. Its λ is selected by REML on the same
+  data. Neither reference applies.
+
+`basis_check` still reports for these terms. It tests structure outside the
+term's column span, which the cone does not restrict: its score is built from
+enrichment columns made orthogonal (in the working weights) to the whole
+design, so for a Gaussian identity fit the score equals the enrichment
+projection of `y` and does not depend on the shape term's coefficients at all.
+The fit enters only through the dispersion estimate, as it does for an
+unconstrained term. For other families the score uses the fitted mean, which
+is consistent under the null for the truncated posterior mean as it is for the
+unconstrained one.
 
 ## basis_check() — is the basis big enough?
 
