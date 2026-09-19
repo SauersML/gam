@@ -388,21 +388,11 @@ pub fn model_comparison_from_unified(
     // identified outer-Hessian subspace. SigmaPointCubature is a named
     // approximation and must stay out of the exact channel.
     //
-    // Read the RETAINED first-order pair, not the fit's primary
-    // `smoothing_correction()`/`smoothing_correction_method()`: the optimizer's
-    // auto-selector escalates the primary pair to a cubature upgrade exactly
-    // when smoothing-parameter uncertainty is large enough to matter (rho
-    // posterior variance over threshold, near-boundary, or high outer
-    // gradient) — precisely the regime this correction exists to report on.
-    // Gating on the primary pair made this channel `None` whenever the
-    // correction would have been large enough to be interesting and `Some`
-    // only when it was small enough that first-order alone was already
-    // deemed adequate (#946). `compute_smoothing_correction_auto` always
-    // computes the exact first-order correction before deciding whether to
-    // escalate, and the optimizer now retains it alongside the cubature
-    // upgrade rather than discarding it, so this channel is populated
-    // whenever the first-order geometry was computable at all, independent
-    // of whether cubature also ran for some other consumer's benefit.
+    // Read the first-order pair, not the fit's primary
+    // `smoothing_correction()`/`smoothing_correction_method()`: on a fresh fit
+    // the two are identical, but a model saved by an earlier release can
+    // carry a sigma-point cubature in its primary pair while its retained
+    // first-order pair is still the exact correction (#946).
     let method_certified_exact = matches!(
         fit.smoothing_correction_method_first_order(),
         Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })

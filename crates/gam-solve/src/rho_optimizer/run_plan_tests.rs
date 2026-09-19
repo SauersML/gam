@@ -264,7 +264,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 }
 
 #[test]
-fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
+fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
     let seed_config = gam_problem::SeedConfig {
         max_seeds: 1,
@@ -279,7 +279,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         .with_problem_size(8, 3);
     let config = problem.config();
 
-    let mut without_diagnostic = problem.build_objective(
+    let mut uncertified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -303,7 +303,7 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let mut with_diagnostic = problem.build_objective(
+    let mut certified = problem.build_objective(
         (),
         {
             let center = center.clone();
@@ -328,20 +328,18 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline =
-        run_outer_uncertified(&mut without_diagnostic, &config, "rho-diagnostic-baseline")
-            .expect("baseline outer run");
-    let diagnosed = run_outer(&mut with_diagnostic, &config, "rho-diagnostic-run")
-        .expect("diagnostic outer run");
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "certification-baseline")
+        .expect("baseline outer run");
+    let certified_result =
+        run_outer(&mut certified, &config, "certification-run").expect("certified outer run");
 
-    assert_eq!(baseline.rho, diagnosed.rho);
+    assert_eq!(baseline.rho, certified_result.rho);
     assert_eq!(
         baseline.final_value.to_bits(),
-        diagnosed.final_value.to_bits()
+        certified_result.final_value.to_bits()
     );
-    assert_eq!(baseline.iterations, diagnosed.iterations);
-    assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
-    assert!(diagnosed.rho_uncertainty_diagnostic.is_some());
+    assert_eq!(baseline.iterations, certified_result.iterations);
+    assert_eq!(baseline.final_grad_norm, certified_result.final_grad_norm);
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a

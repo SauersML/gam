@@ -2406,7 +2406,7 @@ pub fn first_order_smoothing_correction(
             .collect::<Array1<f64>>()
     };
     let inverted =
-        match gam_solve::estimate::invert_identified_rho_hessian(&h_sub, 0, &g_sub, None, &[]) {
+        match gam_solve::estimate::invert_identified_rho_hessian(&h_sub, 0, &g_sub, None, &[], &[]) {
             Ok(inverted) => inverted,
             Err(refusal) => {
                 log::info!(

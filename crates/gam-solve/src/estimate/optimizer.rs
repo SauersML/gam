@@ -9,7 +9,6 @@ use crate::estimate::penalty::{REML_SEED_SCREENING_RHO_CAP, scaled_covariance};
 use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
 };
-use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
@@ -351,18 +350,12 @@ struct NegbinJointCheckpoint {
 /// The count is assembled from named algorithmic owners rather than a
 /// dimension cliff: ten square matrices can survive into/alongside the fit
 /// payload, six are base factorization/GEMM workspaces, and eight belong to the
-/// first-order smoothing correction. Cubature can retain one inverse Hessian
-/// for each positive/negative sigma point while every concurrently evaluated
-/// point holds its Hessian and inverse workspace. Charging the whole set
-/// atomically prevents several individually acceptable p×p allocations from
+/// first-order smoothing correction. Charging the whole set atomically prevents several individually acceptable p×p allocations from
 /// jointly exceeding the process-wide memory ledger.
 fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
     const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
     const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
-    const CUBATURE_SIGMA_POINTS: usize = 2 * AUTO_CUBATURE_MAX_EIGENVECTORS;
-    const RETAINED_CUBATURE_INVERSES: usize = CUBATURE_SIGMA_POINTS;
-    const IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE: usize = 2 * CUBATURE_SIGMA_POINTS;
     /// A constrained fit assembles its truncated covariance as a sum of Grams
     /// (`ConstrainedPosteriorCorrection::truncated_covariance_psd`, #2705 group
     /// A), which holds three `p × p` blocks live at once: the Cholesky factor of
@@ -378,9 +371,7 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     const PEAK_SQUARE_MATRIX_EQUIVALENTS: usize = STORED_SQUARE_MATRICES
         + BASE_FACTORIZATION_AND_GEMM_WORKSPACES
         + FIRST_ORDER_SMOOTHING_WORKSPACES
-        + CONSTRAINED_TRUNCATION_WORKSPACES
-        + RETAINED_CUBATURE_INVERSES
-        + IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE;
+        + CONSTRAINED_TRUNCATION_WORKSPACES;
 
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
         gam_runtime::resource::ProblemHints::default(),
@@ -2561,10 +2552,9 @@ where
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut smoothing_correction_method = None;
-    // The exact first-order IFT correction, RETAINED even when the primary
-    // pair above escalates to a cubature upgrade (#946): the corrected-EDF/AIC
-    // channel reads these instead of the primary pair so it does not go dark
-    // exactly when smoothing-parameter uncertainty is large enough to matter.
+    // The exact first-order IFT correction the corrected-EDF/AIC channel reads
+    // (#946). The primary pair above IS the first-order correction, so the two
+    // pairs carry the same matrix.
     let mut smoothing_correction_first_order = None;
     let mut smoothing_correction_method_first_order = None;
     let mut smoothing_correction_absence = None;
@@ -3389,7 +3379,7 @@ where
             (beta_covariance_unscaled.as_ref(), posterior_factor.as_ref())
         {
             // Full inverse available: wrap as phi-scaled covariance, compute
-            // frequentist quantities, and pass to smoothing-correction cubature.
+            // frequentist quantities, and form the smoothing correction.
             let mut posterior_covariance = scaled_covariance(h_inv.clone(), cov_scale);
             let constrained_correction = constrained_posterior
                 .as_ref()
@@ -3561,20 +3551,11 @@ where
             beta_covariance_frequentist = Some(ve);
         }
 
-        // Smoothing-parameter correction (first-order delta + optional cubature).
-        // The dense branch can return the complete matrix and optionally
-        // upgrade it by cubature. On governor refusal the factorized branch
-        // computes only diag(J V_rho J') from cached p×k mode responses; calling
-        // `compute_smoothing_correction_auto(..., None, ...)` is not sufficient
-        // because that routine constructs the full p×p first-order product
-        // before it notices that the base covariance is absent.
-        // `cov_scale` is the coefficient-covariance multiplier at the optimum
-        // (σ̂² for profiled Gaussian, 1 for every weight-carries-dispersion
-        // family). The cubature path multiplies its dispersion-free curvature
-        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this scale so the FULL cubature
-        // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
-        // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
-        // stays unscaled.
+        // Smoothing-parameter correction `J·V_ρ·Jᵀ` (Wood, Pya & Säfken 2016,
+        // mgcv's Vc1), analytic for any number of smoothing parameters. The
+        // dense branch forms the complete p×p matrix. On governor refusal the
+        // factorized branch computes only diag(J V_rho J') from cached p×k mode
+        // responses instead, because the full product is p×p.
         if beta_covariance_unscaled.is_some() {
             let no_outer_gradient = Array1::<f64>::zeros(0);
             // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
@@ -3660,17 +3641,26 @@ where
                 )
             }))
             .collect();
-            let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
+            // The coordinates the certificate held at a rail and excluded from
+            // its own PSD test. The correction judges the same face, so a
+            // saturated coordinate's flat-tail curvature is never re-judged
+            // here against a certificate that never judged it.
+            let certified_railed: Vec<usize> = outer_result
+                .criterion_certificate
+                .as_ref()
+                .map(|certificate| {
+                    certificate
+                        .lambdas_railed
+                        .iter()
+                        .copied()
+                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
-                // The box the outer arm searched and the shipped-point
-                // certificate above judged rails against, so it contains the
-                // certified mode by construction.
-                &rho_model_domain,
                 &lambdas,
                 &pirls_res,
-                beta_covariance_unscaled.as_ref(),
-                cov_scale,
-                finalgrad_norm,
                 // #2428: the residual gradient the outer certificate itself
                 // used to accept this ρ̂ is the resolution floor the ρ-Hessian's
                 // definiteness must be judged against. Without it the
@@ -3696,58 +3686,35 @@ where
                 // error, refusing fits this certificate accepted (#2428). Empty
                 // when the certificate cleared nothing.
                 &measured_hessian_error,
-            )?;
+                &certified_railed,
+            );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // A fit certified at an infinite-smoothing rail (typed
-                    // AsymptoteRail, or box-railed coordinates) has NO finite
-                    // ρ-variance along the rail direction — the outer Hessian
-                    // is legitimately non-PD there, so the first-order
-                    // smoothing correction is TYPED-unavailable rather than a
-                    // defect. Ship the certified fit with the plug-in
-                    // covariance and no correction; the downstream corrected
-                    // EDF/AIC channels report the typed absence (#946/#1027)
-                    // instead of the whole fit dying over an enhancement. A
-                    // fit WITHOUT rail evidence keeps the fail-loud error: an
-                    // unexpectedly uninvertible outer Hessian on a
-                    // well-conditioned interior optimum is a real defect.
-                    let rail_certified =
-                        outer_result
-                            .criterion_certificate
-                            .as_ref()
-                            .is_some_and(|certificate| {
-                                matches!(
-                            certificate.stationarity,
-                            crate::model_types::OuterStationarityCertificate::AsymptoteRail { .. }
-                        ) || !certificate.lambdas_railed.is_empty()
-                            });
-                    // The same typed absence applies when the outer Hessian has
-                    // no analytic form for this fit at all (a non-canonical
-                    // Firth link, routed to BFGS): nothing about the optimum is
+                    // The only typed absence is an outer Hessian with no
+                    // analytic form for this fit at all (a non-canonical Firth
+                    // link, routed to BFGS): nothing about the optimum is
                     // suspect, the correction simply cannot be formed, and the
                     // fit was accepted with that link on purpose (#2158).
-                    let structurally_not_analytic = matches!(
+                    // Railed coordinates are not a reason: the correction
+                    // excludes them exactly as the certificate did, so a
+                    // refusal on a railed fit is a real defect like any other.
+                    if !matches!(
                         reason,
                         crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    );
-                    if !rail_certified && !structurally_not_analytic {
+                    ) {
                         return Err(EstimationError::InvalidInput(format!(
                             "exact smoothing-corrected covariance unavailable: {reason:?}"
                         )));
                     }
                     log::info!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a {} fit ({reason:?}); \
-                         shipping the plug-in covariance without a smoothing correction",
-                        if rail_certified { "rail-certified" } else { "non-analytic-outer-Hessian" }
+                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
+                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
                     );
-                    let detail = format!("{reason:?}");
-                    smoothing_correction_absence = Some(if rail_certified {
-                        crate::model_types::SmoothingCorrectionAbsence::RailCertified { detail }
-                    } else {
+                    smoothing_correction_absence = Some(
                         crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail,
-                        }
-                    });
+                            detail: format!("{reason:?}"),
+                        },
+                    );
                     rho_covariance = None;
                     smoothing_correction = None;
                     smoothing_correction_method = None;
@@ -3756,40 +3723,32 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    (
-                        smoothing_correction,
-                        smoothing_correction_method,
-                        smoothing_correction_first_order,
-                        smoothing_correction_method_first_order,
-                    ) = outcome.into_correction_with_method();
+                    (smoothing_correction, smoothing_correction_method) =
+                        outcome.into_correction_with_method();
+                    smoothing_correction_first_order = smoothing_correction.clone();
+                    smoothing_correction_method_first_order = smoothing_correction_method;
                 }
             }
         }
 
-        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML objective
-        // is still live, sample the outer criterion around the converged ρ̂ to
-        // read the PSIS k̂ that says whether the plug-in + first-order V_ρ
-        // correction is adequate. This is the objective-lifecycle seam — the
-        // diagnostic runs against the SAME objective the fit converged on, so
-        // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
-        // when there are no smoothing parameters or the outer Hessian is
-        // unavailable; never fatal.
+        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML
+        // objective is still live, sample the outer criterion around the
+        // converged ρ̂ to read the PSIS k̂ that says whether the plug-in +
+        // first-order V_ρ correction is adequate. It runs against the SAME
+        // objective the fit converged on, so its criterion is the fit's own
+        // bit-for-bit.
         //
-        // The Tier-0 diagnostic is CHEAP (a handful of outer-criterion
-        // evaluations) so it is emitted regardless of `skip_rho_posterior_inference`
-        // whenever it is available (#1810) — the standard formula/CLI fit surfaces
-        // its ρ-posterior adequacy grade by default. Only the EXPENSIVE escalation
-        // tiers (Tier-1 quadrature / Tier-2 NUTS over ρ) are gated by the flag:
-        // interactive formula/CLI fits keep `skip_rho_posterior_inference = true`
-        // so a fit whose plug-in grades `Escalate` never turns into a sampler
-        // benchmark, while lower-level callers that opt in (`skip = false`) get
-        // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond) at this same live seam.
-        (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-            &final_rho,
-            !opts.skip_rho_posterior_inference,
-            None,
-        );
+        // The returned fit does not need it: the covariance above is complete
+        // without it, and the diagnostic costs dozens of inner solves plus a
+        // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
+        // inference (`skip_rho_posterior_inference = false`), together with the
+        // escalation tiers it grades for (quadrature for K≤4, NUTS over ρ for
+        // K≤16, honest Unavailable beyond). Every other fit keeps the typed
+        // `NotComputed(InferenceNotRequested)` set above.
+        if !opts.skip_rho_posterior_inference {
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.rho_posterior_inference(&final_rho, None);
+        }
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
@@ -3925,9 +3884,9 @@ where
         // with `G` and `Δ` derived from `Σ`, not from `Vp`. Along a coordinate
         // the constraint pins, `(GΔGᵀ)_ii` cancels `Σ_ii` to eleven digits, so
         // whatever `(Vp − Σ)_ii` happens to be becomes the WHOLE reported
-        // variance — and `Vp − Σ` is a legitimately sign-indefinite second-order
-        // increment (the cubature branch is `φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂] − φ̂·H_opt⁻¹`,
-        // a difference of two averages, PSD only as a SUM with `Vb`). On
+        // variance — and `Vp − Σ` need not be resolvable against that
+        // cancellation (any increment is PSD only as a SUM with `Vb` once the
+        // truncation has removed most of `Σ_ii`). On
         // `y ~ s(x, shape=convex)` that left `Σ_ii = 2.30e-2` truncated to
         // `6.23e-13` with a `−3.03e-9` smoothing increment on top, i.e. a
         // materially negative published variance, and `se_from_covariance`

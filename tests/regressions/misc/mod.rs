@@ -59,7 +59,7 @@ mod bms_moving_law_certificate_2926;
 mod bms_residual_certificate_2985;
 mod bug_hunt_1680_near_collinear_additive_recovery;
 mod bug_hunt_2623_sampled_marginal_outer_gradient_frame;
-mod corrected_covariance_sigma_node_calibration_2728;
+mod corrected_covariance_saturated_direction_2728;
 mod latent_aux_prior_normalizer_dimension;
 mod owed_1373;
 mod owed_1376;

@@ -108,8 +108,7 @@ pub(crate) use penalty::{
 };
 pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
-    AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
-    AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, RemlConfig,
+    RemlConfig,
     SmoothingCorrectionStatus, SmoothingCorrectionUnavailable, compute_smoothing_correction,
     smooth_floor_dp,
 };

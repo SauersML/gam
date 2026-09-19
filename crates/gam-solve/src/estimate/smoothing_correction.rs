@@ -96,23 +96,6 @@ pub(crate) const DP_FLOOR: f64 = 1e-12;
 /// fraction of the deviance scale `D₀`.
 const DP_FLOOR_SMOOTH_WIDTH: f64 = 1e-8;
 
-// Adaptive cubature guardrails for bounded correction latency.
-pub(crate) const AUTO_CUBATURE_MAX_RHO_DIM: usize = 12;
-pub(crate) const AUTO_CUBATURE_MAX_EIGENVECTORS: usize = 4;
-/// Fraction of the CORRECTION's own variance the upgraded eigendirections must
-/// capture before the truncation stops.
-///
-/// The quantity being apportioned is `tr(J·V_ρ·Jᵀ) = Σ_j ‖Qs·J·u_j‖²/σ_j`, the
-/// first-order correction's trace, so this is a fraction of the estimand. It
-/// used to be applied to the eigenvalues of `V_ρ` — a fraction of the spread of
-/// `ρ` — which is a different quantity and ranks the directions differently:
-/// at a saturated smoothing parameter `1/σ_j` is largest precisely where
-/// `∂β̂/∂ρ → 0`, so the old rule spent the whole rank budget on the direction
-/// that contributes nothing and dropped every direction that does (#2728).
-pub(crate) const AUTO_CUBATURE_TARGET_VAR_FRAC: f64 = 0.95;
-pub(crate) const AUTO_CUBATURE_MAX_BETA_DIM: usize = 1600;
-pub(crate) const AUTO_CUBATURE_BOUNDARY_MARGIN: f64 = 2.0;
-
 /// Smooth, differentiable approximation of `max(dp, floor)` where the floor
 /// and the width of the smoothing band are taken **relative to the supplied
 /// deviance `scale`** (the weighted null deviance `D₀` of the response).
@@ -222,63 +205,6 @@ pub(crate) fn smooth_floor_dp(dp: f64, scale: f64) -> (f64, f64, f64) {
 ///   smoothing/heat operator `exp(0.5 * Delta_Sigma)` (equivalently Wick/Isserlis
 ///   contractions of high-order derivatives).
 /// - Those infinite-series corrections are not expanded in this routine.
-/// The certified ρ-spectrum and coefficient sensitivities the first-order
-/// correction was assembled from.
-///
-/// Retained so the sigma-point cubature upgrade
-/// ([`crate::reml::eval::RemlState::compute_smoothing_correction_auto`]) can
-/// reuse the SAME `V_ρ` this path certified instead of deriving a second,
-/// differently-regularized one. Two objects called `V_ρ` inside one routine is
-/// how the cubature came to need a blanket bail-out whenever the certified
-/// inverse was rank-deficient: its own ridged inverse turns each dropped
-/// direction into a `1/ridge` eigenvalue and would place a sigma point along
-/// it. With the certified spectrum in hand there is nothing to bail out of — a
-/// direction that is not `Active` is simply not a candidate node.
-pub(crate) struct RhoSensitivitySpectrum {
-    /// `Qs · J` — the coefficient sensitivities `∂β̂/∂ρ` in the ORIGINAL
-    /// coefficient basis, `p_orig × n_rho`.
-    pub sensitivity_orig: Array2<f64>,
-    /// The certified ρ-spectrum MODULO the penalty map's exact invariance
-    /// (#2676): the deflated directions first, each carrying its measured
-    /// Rayleigh quotient `t' H t` (which is `Σ_k g_k t_k²` by the chain rule,
-    /// not a curvature), then the judged complement's eigenvalues in
-    /// eigensolver order. With no invariance declared this is exactly the
-    /// ρ-Hessian's own spectrum, in eigensolver order, as it always was.
-    pub eigenvalues: Array1<f64>,
-    /// Matching directions, `n_rho × n_rho`.
-    pub eigenvectors: Array2<f64>,
-    /// Per-direction verdict from [`invert_identified_rho_hessian`].
-    pub classifications: Vec<EigenClassification>,
-}
-
-impl RhoSensitivitySpectrum {
-    /// First-order variance direction `index` contributes to the correction:
-    /// `‖Qs·J·u_j‖² / σ_j`, the squared norm of the column
-    /// [`smoothing_correction_gram`] builds for it, i.e. its share of
-    /// `tr(J·V_ρ·Jᵀ)`.
-    ///
-    /// Ranking directions by THIS ranks them by their share of the estimand.
-    /// Ranking them by `1/σ_j` — the spread of `ρ` — ranks them by a quantity
-    /// the correction does not depend on alone, and puts a saturated direction
-    /// (where `1/σ_j` is huge precisely because `∂β̂/∂ρ → 0`) first (#2728).
-    pub fn first_order_variance(&self, index: usize) -> f64 {
-        let column = self.sensitivity_orig.dot(&self.eigenvectors.column(index));
-        column.dot(&column) / self.eigenvalues[index]
-    }
-
-    /// Indices of the directions the certified inversion admitted, i.e. those
-    /// with strictly positive resolved curvature.
-    pub(crate) fn active_directions(&self) -> Vec<usize> {
-        self.classifications
-            .iter()
-            .enumerate()
-            .filter_map(|(index, class)| {
-                matches!(class, EigenClassification::Active).then_some(index)
-            })
-            .collect()
-    }
-}
-
 pub(crate) struct SmoothingCorrectionComputation {
     pub correction: Option<Array2<f64>>,
     /// Regularized inverse outer Hessian `Cov(rho_hat)` in the same rho ordering
@@ -290,13 +216,8 @@ pub(crate) struct SmoothingCorrectionComputation {
     /// `correction`. `Some(n)` if the matrix was SPD and fully inverted;
     /// `Some(r)` with `r < n` if the pseudo-inverse dropped non-identified
     /// directions; `None` when no inversion was attempted or it failed before
-    /// producing a usable V_ρ. Downstream consumers (e.g. auto-cubature)
-    /// use this to decide whether higher-order corrections are even
-    /// meaningful — they aren't when V_ρ is rank-deficient.
+    /// producing a usable V_ρ.
     pub active_rank: Option<usize>,
-    /// Certified ρ-spectrum + coefficient sensitivities, when the computation
-    /// got far enough to produce them. `None` on every early return.
-    pub spectrum: Option<RhoSensitivitySpectrum>,
     pub status: SmoothingCorrectionStatus,
 }
 
@@ -363,6 +284,9 @@ pub struct InvertedRhoHessian {
     pub inverse: Array2<f64>,
     pub active_rank: usize,
     pub structural_zero: usize,
+    /// Coordinates held at their certified rail, excluded from the judged
+    /// subspace exactly as the outer certificate excludes them.
+    pub railed: usize,
     /// Directions dropped because their curvature sits under the outer loop's
     /// own gradient noise floor (#2428). Distinct from `structural_zero`.
     pub below_gradient_floor: usize,
@@ -416,6 +340,14 @@ pub enum EigenClassification {
     /// assert a certificate from the penalty map that the penalty map had not
     /// issued.
     UnresolvableCurvature,
+    /// A coordinate the outer certificate certified at a rail: the λ → ∞ or
+    /// λ → 0 face where the fitted model already equals its limit to within the
+    /// estimand tolerance. The certificate never judges curvature there
+    /// (`certificate_hessian_is_psd_off_railed`), and the criterion is flat
+    /// along it by the rail's tail law, so its curvature carries no sign a
+    /// verdict could be taken on. `∂β̂/∂ρ → 0` at either rail, so the
+    /// coordinate contributes nothing to `J·V_ρ·Jᵀ` and is held fixed.
+    Railed,
 }
 
 /// Assemble `Q J Vρ Jᵀ Qᵀ` through a rectangular square-root factor.
@@ -636,15 +568,22 @@ pub(crate) fn eigenpair_residual_bounds(
 ///   subsystems' evaluations, not the fit.
 ///
 /// The other difference — that the certificate excludes railed coordinates and
-/// this site excluded nothing — is gone as of #2676: both sites now deflate the
-/// same invariance through `crate::penalty_invariance::judged_subspace_basis`,
-/// and the certificate's rail exclusion is expressed through the same call.
+/// this site excluded nothing — is gone: both sites deflate the same invariance
+/// and exclude the same `railed` coordinates through
+/// `crate::penalty_invariance::judged_subspace_basis`. Until the railed set was
+/// passed here the doc claimed this while the call passed `&[]`, so a
+/// saturated coordinate the certificate never judged was judged here, and its
+/// flat-tail curvature of either sign refused the correction for every fit
+/// with a rail (a six-smooth Gaussian `s(x1) + … + s(x6)` with one null term:
+/// `sigma = -7.003e-7` on a direction carrying a chain-rule term of
+/// `2.254e-22`).
 pub fn invert_identified_rho_hessian(
     hessian_rho: &Array2<f64>,
     expected_structural_nullity: usize,
     outer_gradient: &Array1<f64>,
     invariance: Option<&Array2<f64>>,
     caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
+    railed: &[usize],
 ) -> Result<InvertedRhoHessian, String> {
     let n = hessian_rho.nrows();
     if expected_structural_nullity > n {
@@ -670,9 +609,41 @@ pub fn invert_identified_rho_hessian(
     // as the structural zeros the penalty map certifies. With no invariance
     // (`deflation = None`) every line below runs on `hessian_rho` itself, so a
     // model without a redundant penalty map does not move by an ulp.
+    //
+    // The certificate's railed coordinates are excluded the same way: it
+    // judges curvature only off the railed face, so this site does too.
+    let railed: Vec<usize> = railed
+        .iter()
+        .copied()
+        .filter(|&k| k < n)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if railed.len() == n {
+        // Every coordinate is held at its rail: nothing is judged and the
+        // correction is exactly zero.
+        let mut eigenvectors = Array2::<f64>::zeros((n, n));
+        for k in 0..n {
+            eigenvectors[[k, k]] = 1.0;
+        }
+        return Ok(InvertedRhoHessian {
+            inverse: Array2::zeros((n, n)),
+            active_rank: 0,
+            structural_zero: 0,
+            railed: n,
+            below_gradient_floor: 0,
+            unresolvable_curvature: 0,
+            used_structural_pseudoinverse: true,
+            curvature_resolution: 0.0,
+            eigenvalues: hessian_rho.diag().to_owned(),
+            eigenvectors,
+            classifications: vec![EigenClassification::Railed; n],
+        });
+    }
     let deflation = invariance.filter(|basis| basis.nrows() == n && basis.ncols() > 0);
-    let judged = deflation
-        .and_then(|basis| crate::penalty_invariance::judged_subspace_basis(n, &[], Some(basis)))
+    let judged = (deflation.is_some() || !railed.is_empty())
+        .then(|| crate::penalty_invariance::judged_subspace_basis(n, &railed, deflation))
+        .flatten()
         // A basis that spans everything deflates nothing, and compressing
         // against it would only re-symmetrize `hessian_rho` in the last bits.
         // Drop back to the untouched path instead.
@@ -697,9 +668,29 @@ pub fn invert_identified_rho_hessian(
     // `judged_subspace_basis` can shrink the deflation (the railed-face
     // restriction, the dependence drop), and reporting the input's columns here
     // would name a subspace the verdict was not taken on.
-    let removed = judged
-        .as_ref()
-        .and_then(|basis| crate::penalty_invariance::deflated_directions(n, basis));
+    //
+    // The railed coordinates lead as their own indicator directions, so the
+    // invariance block is read off the complement of `judged` and the railed
+    // axes together (the two are orthogonal: `judged_subspace_basis` deflates
+    // only the invariance that lives inside the judged face).
+    let removed = judged.as_ref().and_then(|basis| {
+        let mut judged_and_railed = Array2::<f64>::zeros((n, basis.ncols() + railed.len()));
+        judged_and_railed
+            .slice_mut(ndarray::s![.., ..basis.ncols()])
+            .assign(basis);
+        for (column, &k) in railed.iter().enumerate() {
+            judged_and_railed[[k, basis.ncols() + column]] = 1.0;
+        }
+        crate::penalty_invariance::deflated_directions(n, &judged_and_railed)
+    });
+    let railed_dimension = railed.len();
+    let invariance_dimension = removed.as_ref().map_or(0, |directions| directions.ncols());
+    if railed_dimension + invariance_dimension != deflated_dimension {
+        return Err(format!(
+            "rho-Hessian judged face drops {deflated_dimension} direction(s) but {railed_dimension} \
+             railed and {invariance_dimension} invariance direction(s) account for them"
+        ));
+    }
 
     // `hessian_rho` is an ANALYTIC Hessian, so the applicable curvature law is
     // Weyl's `‖δH‖₂` (#2690), not the finite-difference `(2/√3)·√(ε_f·M₄)`.
@@ -760,14 +751,19 @@ pub fn invert_identified_rho_hessian(
 
     let mut eigenvalues = Array1::<f64>::zeros(n);
     let mut eigenvectors = Array2::<f64>::zeros((n, n));
-    for column in 0..deflated_dimension {
+    for (column, &k) in railed.iter().enumerate() {
+        eigenvalues[column] = hessian_rho[[k, k]];
+        eigenvectors[[k, column]] = 1.0;
+    }
+    for column in 0..invariance_dimension {
         let direction = removed
             .as_ref()
-            .expect("a deflated dimension implies a removed subspace")
+            .expect("an invariance dimension implies a removed subspace")
             .column(column)
             .to_owned();
-        eigenvalues[column] = direction.dot(&hessian_rho.dot(&direction));
-        eigenvectors.column_mut(column).assign(&direction);
+        let target = railed_dimension + column;
+        eigenvalues[target] = direction.dot(&hessian_rho.dot(&direction));
+        eigenvectors.column_mut(target).assign(&direction);
     }
     for index in 0..judged_dimension {
         let target = deflated_dimension + index;
@@ -860,13 +856,16 @@ pub fn invert_identified_rho_hessian(
     let mut classifications = Vec::with_capacity(n);
     let mut active_rank = 0usize;
     let mut structural_zero = 0usize;
+    let mut railed_count = 0usize;
     let mut below_gradient_floor = 0usize;
     let mut unresolvable_curvature = 0usize;
 
     for i in 0..n {
         let sigma = eigenvalues[i];
         let floor = direction_floor(i);
-        let class = if i < deflated_dimension {
+        let class = if i < railed_dimension {
+            EigenClassification::Railed
+        } else if i < deflated_dimension {
             // #2676: this direction is not judged at all. Its curvature is
             // `sum_k g_k t_k^2` by the chain rule and by nothing else, so
             // `sigma > floor`, `|sigma| <= zero_bound` and `sigma < -floor`
@@ -906,6 +905,7 @@ pub fn invert_identified_rho_hessian(
                 }
             }
             EigenClassification::StructuralZero => structural_zero += 1,
+            EigenClassification::Railed => railed_count += 1,
             EigenClassification::BelowGradientFloor => below_gradient_floor += 1,
             EigenClassification::UnresolvableCurvature => unresolvable_curvature += 1,
         }
@@ -920,14 +920,15 @@ pub fn invert_identified_rho_hessian(
     // is a property of this ρ̂, not of the penalty map, and is expected.
     // Every non-active direction is a candidate for the penalty map's certified
     // null: the map says HOW MANY must be null, never which eigenpair each
-    // lands on, and a direction can fail to be active for any of the three
+    // lands on, and a direction can fail to be active for any of the four
     // reasons above. Excluding the resolution-excused ones would make the
     // identity refuse a fit for having MORE evidence about its own Hessian,
     // which is backwards.
-    let identified_null = structural_zero + below_gradient_floor + unresolvable_curvature;
+    let identified_null =
+        structural_zero + railed_count + below_gradient_floor + unresolvable_curvature;
     if identified_null < expected_structural_nullity {
         return Err(format!(
-            "rho Hessian has only {identified_null} null direction(s) ({structural_zero} certified by the penalty map, {unresolvable_curvature} under the measured curvature resolution {curvature_resolution}, {below_gradient_floor} under the outer gradient floor), but the penalty map certifies {expected_structural_nullity}"
+            "rho Hessian has only {identified_null} null direction(s) ({structural_zero} certified by the penalty map, {railed_count} held at a certified rail, {unresolvable_curvature} under the measured curvature resolution {curvature_resolution}, {below_gradient_floor} under the outer gradient floor), but the penalty map certifies {expected_structural_nullity}"
         ));
     }
 
@@ -944,6 +945,7 @@ pub fn invert_identified_rho_hessian(
             inverse: certified.into_inverse(),
             active_rank: n,
             structural_zero: 0,
+            railed: 0,
             below_gradient_floor: 0,
             unresolvable_curvature: 0,
             used_structural_pseudoinverse: false,
@@ -991,6 +993,7 @@ pub fn invert_identified_rho_hessian(
         inverse,
         active_rank,
         structural_zero,
+        railed: railed_count,
         below_gradient_floor,
         unresolvable_curvature,
         used_structural_pseudoinverse: true,
@@ -1129,7 +1132,12 @@ fn dump_indefinite_rho_hessian_diagnostic(
         let deflated = inv
             .classifications
             .iter()
-            .take_while(|class| matches!(class, EigenClassification::StructuralZero))
+            .take_while(|class| {
+                matches!(
+                    class,
+                    EigenClassification::Railed | EigenClassification::StructuralZero
+                )
+            })
             .count();
         if deflated > 0 {
             log::warn!(
@@ -1146,10 +1154,11 @@ fn dump_indefinite_rho_hessian_diagnostic(
     );
     if let Some(inv) = inverted {
         log::warn!(
-            "[INDEF-HESS] active_rank={}/{} structural_zero={} unresolvable_curvature={} below_gradient_floor={} curvature_resolution={:.3e}",
+            "[INDEF-HESS] active_rank={}/{} structural_zero={} railed={} unresolvable_curvature={} below_gradient_floor={} curvature_resolution={:.3e}",
             inv.active_rank,
             k,
             inv.structural_zero,
+            inv.railed,
             inv.unresolvable_curvature,
             inv.below_gradient_floor,
             inv.curvature_resolution,
@@ -1162,12 +1171,14 @@ fn dump_indefinite_rho_hessian_diagnostic(
                     EigenClassification::Active => "A",
                     EigenClassification::UnresolvableCurvature => "R",
                     EigenClassification::StructuralZero => "Z",
+                    EigenClassification::Railed => "L",
                     EigenClassification::BelowGradientFloor => "G",
                 })
                 .collect();
             log::warn!(
                 "[INDEF-HESS] classifications={:?} (A=active; Z=certified null of the penalty \
-                 map, excused by STRUCTURE; R=under the measured curvature resolution ||dH||_2, \
+                 map, excused by STRUCTURE; L=held at a certified rail, excluded as the \
+                 certificate excludes it; R=under the measured curvature resolution ||dH||_2, \
                  excused by RESOLUTION; G=under the outer loop's own gradient floor, i.e. a \
                  saturation null, excused by the CHAIN RULE)",
                 labels,
@@ -1454,6 +1465,7 @@ pub(crate) fn compute_smoothing_correction(
     outer_gradient: &Array1<f64>,
     outer_hessian: Option<&Array2<f64>>,
     caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
+    railed: &[usize],
 ) -> SmoothingCorrectionComputation {
     use gam_linalg::faer_ndarray::FaerCholesky;
 
@@ -1463,7 +1475,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: None,
             rho_covariance: None,
             active_rank: None,
-            spectrum: None,
             status: SmoothingCorrectionStatus::NotApplicableNoSmoothingParameters,
         };
     }
@@ -1480,7 +1491,6 @@ pub(crate) fn compute_smoothing_correction(
                 correction: None,
                 rho_covariance: None,
                 active_rank: None,
-                spectrum: None,
                 status: SmoothingCorrectionStatus::Unavailable(
                     SmoothingCorrectionUnavailable::PenaltyStructure {
                         error: error.to_string(),
@@ -1495,7 +1505,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: None,
             rho_covariance: None,
             active_rank: None,
-            spectrum: None,
             status: SmoothingCorrectionStatus::Unavailable(
                 SmoothingCorrectionUnavailable::PenaltyDimension {
                     rho: n_rho,
@@ -1522,7 +1531,6 @@ pub(crate) fn compute_smoothing_correction(
                     correction: None,
                     rho_covariance: None,
                     active_rank: None,
-                    spectrum: None,
                     status: SmoothingCorrectionStatus::Unavailable(
                         SmoothingCorrectionUnavailable::PenaltyStructure { error },
                     ),
@@ -1557,7 +1565,6 @@ pub(crate) fn compute_smoothing_correction(
                 correction: None,
                 rho_covariance: None,
                 active_rank: None,
-                spectrum: None,
                 status: SmoothingCorrectionStatus::Unavailable(
                     SmoothingCorrectionUnavailable::ObjectiveInnerHessian {
                         error: error.to_string(),
@@ -1583,7 +1590,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: None,
             rho_covariance: None,
             active_rank: None,
-            spectrum: None,
             status: SmoothingCorrectionStatus::Unavailable(
                 SmoothingCorrectionUnavailable::InnerHessianDimension {
                     rows: h_trans.nrows(),
@@ -1624,7 +1630,6 @@ pub(crate) fn compute_smoothing_correction(
                         correction: None,
                         rho_covariance: None,
                         active_rank: None,
-                        spectrum: None,
                         status: SmoothingCorrectionStatus::Unavailable(
                             SmoothingCorrectionUnavailable::InnerHessianNotPositiveDefinite,
                         ),
@@ -1681,7 +1686,6 @@ pub(crate) fn compute_smoothing_correction(
                     correction: None,
                     rho_covariance: None,
                     active_rank: None,
-                    spectrum: None,
                     status: SmoothingCorrectionStatus::Unavailable(
                         SmoothingCorrectionUnavailable::SensitivitySolve,
                     ),
@@ -1719,7 +1723,6 @@ pub(crate) fn compute_smoothing_correction(
                 correction: None,
                 rho_covariance: None,
                 active_rank: None,
-                spectrum: None,
                 status: SmoothingCorrectionStatus::Unavailable(reason),
             };
         }
@@ -1858,6 +1861,7 @@ pub(crate) fn compute_smoothing_correction(
             components.extend_from_slice(caller_measured_hessian_error);
             components
         },
+        railed,
     ) {
         Ok(inverse) => inverse,
         Err(error) => {
@@ -1873,7 +1877,6 @@ pub(crate) fn compute_smoothing_correction(
                 correction: None,
                 rho_covariance: None,
                 active_rank: None,
-                spectrum: None,
                 status: SmoothingCorrectionStatus::Unavailable(
                     SmoothingCorrectionUnavailable::OuterHessianInverse { error },
                 ),
@@ -1905,7 +1908,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: Some(Array2::<f64>::zeros((p_original, p_original))),
             rho_covariance: Some(inverted.inverse),
             active_rank: Some(0),
-            spectrum: None,
             status: SmoothingCorrectionStatus::ZeroNoIdentifiedOuterDirections,
         };
     }
@@ -1953,15 +1955,6 @@ pub(crate) fn compute_smoothing_correction(
         &inverted.eigenvectors,
         &inverted.classifications,
     );
-    // Retain what the cubature upgrade needs to reuse THIS V_rho rather than
-    // build a second one: the sensitivities in the original basis and the
-    // certified spectrum with its per-direction verdicts (#2728).
-    let spectrum = RhoSensitivitySpectrum {
-        sensitivity_orig: qs.dot(&jacobian_trans),
-        eigenvalues: inverted.eigenvalues,
-        eigenvectors: inverted.eigenvectors,
-        classifications: inverted.classifications,
-    };
     let rho_covariance = inverted.inverse;
 
     // Validate the result
@@ -1971,7 +1964,6 @@ pub(crate) fn compute_smoothing_correction(
             correction: None,
             rho_covariance: Some(rho_covariance),
             active_rank: Some(active_rank_used),
-            spectrum: Some(spectrum),
             status: SmoothingCorrectionStatus::Unavailable(
                 SmoothingCorrectionUnavailable::NonFiniteCorrection,
             ),
@@ -1981,7 +1973,6 @@ pub(crate) fn compute_smoothing_correction(
         correction: Some(v_corr_orig),
         rho_covariance: Some(rho_covariance),
         active_rank: Some(active_rank_used),
-        spectrum: Some(spectrum),
         status: SmoothingCorrectionStatus::Computed,
     }
 }

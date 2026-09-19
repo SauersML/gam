@@ -166,29 +166,13 @@ impl<'a> RemlState<'a> {
         p: &Array1<f64>,
         synthetic_ext_count: usize,
     ) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, synthetic_ext_count, true)
-    }
-
-    /// Evaluate the outer criterion WITHOUT charging the outer-loop
-    /// cost-evaluation counter.
-    ///
-    /// `outer_cost_evals` measures the work the smoothing-parameter SEARCH did,
-    /// and is gated as such (`tests/perf_1689_pspline_thinplate_profile.rs`
-    /// caps it). Post-convergence covariance work — the sigma-node calibration
-    /// in [`super::eval::RemlState::calibrate_sigma_node`], which reads the
-    /// criterion at a handful of fixed ρ to find where one posterior sigma
-    /// actually is — is not part of that search, and charging it there would
-    /// make a work guard read a covariance refinement as an outer-loop
-    /// regression (#2728).
-    pub(crate) fn compute_cost_uncharged(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, 0, false)
+        self.compute_cost_charging(p, synthetic_ext_count)
     }
 
     fn compute_cost_charging(
         &self,
         p: &Array1<f64>,
         synthetic_ext_count: usize,
-        charge: bool,
     ) -> Result<f64, EstimationError> {
         let cost_call_idx = {
             let mut calls = self
@@ -196,9 +180,7 @@ impl<'a> RemlState<'a> {
                 .cost_eval_count
                 .write()
                 .expect("cost-eval counter lock is never held across a panic");
-            if charge {
-                *calls += 1;
-            }
+            *calls += 1;
             *calls
         };
         let t_eval_start = std::time::Instant::now();

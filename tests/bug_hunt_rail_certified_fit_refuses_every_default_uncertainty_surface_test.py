@@ -42,10 +42,13 @@ below its own sampling noise.
 Observed: a certified, summarisable fit refuses every default uncertainty
 surface, and ``diagnose()`` cannot be asked for a weaker one.
 
-Expected: a certified fit reports uncertainty through its default surfaces. The
-conditional covariance it already publishes through ``summary()`` (and returns
-on request through ``predict``) is available; the correction that is missing is
-an enhancement, exactly as the solver comment says.
+Expected: a certified fit reports uncertainty through its default surfaces.
+
+Resolution: the outer certificate judges definiteness only off its railed
+coordinates, and the smoothing correction now excludes the same coordinates.
+At a rail ``d beta_hat / d rho_k -> 0``, so a railed coordinate contributes
+exactly nothing to ``J V_rho J^T``: the fit carries the smoothing-corrected
+covariance, and on this all-railed fit it equals the conditional one.
 """
 
 from __future__ import annotations
@@ -87,9 +90,24 @@ def railed() -> tuple[Any, dict[str, Any]]:
     # assertions below would be testing nothing.
     assert summary.convergence["certified"] is True
     assert summary.convergence["outer"]["lambdas_railed"] == [0]
-    assert summary.covariance_kind == "conditional"
+    assert summary.covariance_kind == "smoothing-corrected"
     assert all(np.isfinite(c["std_error"]) for c in summary.coefficients)
     return model, data
+
+
+def test_railed_coordinate_adds_no_smoothing_variance(railed: tuple[Any, dict[str, Any]]) -> None:
+    model, _ = railed
+    corrected = model.predict(_levels(), interval=0.95, return_type="dict")
+    conditional = model.predict(
+        _levels(), interval=0.95, covariance_mode="conditional", return_type="dict"
+    )
+    assert corrected.covariance_source == "smoothing-corrected"
+    np.testing.assert_allclose(
+        np.asarray(corrected.posterior_mean_standard_error, dtype=float),
+        np.asarray(conditional.posterior_mean_standard_error, dtype=float),
+        rtol=1e-12,
+        atol=0.0,
+    )
 
 
 def _levels() -> dict[str, Any]:

@@ -75,6 +75,13 @@ pub(crate) fn install_matching_initial_inner_seed(
     Ok(())
 }
 
+/// Observation and coefficient counts of the problem an outer run fits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OuterProblemSize {
+    pub n_obs: Option<usize>,
+    pub p_coefficients: Option<usize>,
+}
+
 /// Temporarily require a complete inner solve.
 ///
 /// Search-time REML evaluations may deliberately cap P-IRLS, but a sample
@@ -222,7 +229,9 @@ pub(crate) struct OuterConfig {
     /// seed-prefix key so the next fit with related structure can warm-start
     /// from this one, even after an interrupted run.
     pub(crate) cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    pub(crate) rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
+    /// Observation and coefficient counts of the fitted problem; they size the
+    /// floating-point accumulation band of the Newton-decrement certificate.
+    pub(crate) problem_size: OuterProblemSize,
     /// Converged exact outer Hessian `H(θ̂)` transferred from a prior
     /// structurally-matching fit via the persistent cache (a warm-start *hit*),
     /// in the full θ layout. When present and SPD, the BFGS host path seeds its
@@ -383,8 +392,7 @@ impl Default for OuterConfig {
             bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
-            rho_uncertainty_problem_size:
-                crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+            problem_size: OuterProblemSize::default(),
             warm_start_outer_hessian: None,
             rho_canonical_keys: None,
             native_coordinate_order: None,
@@ -437,7 +445,7 @@ pub struct OuterProblem {
     bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
-    rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
+    problem_size: OuterProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
     sole_seed: bool,
 }
@@ -478,8 +486,7 @@ impl OuterProblem {
             bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
-            rho_uncertainty_problem_size:
-                crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
+            problem_size: OuterProblemSize::default(),
             rho_canonical_keys: None,
             sole_seed: false,
         }
@@ -777,7 +784,7 @@ impl OuterProblem {
     }
 
     pub fn with_problem_size(mut self, n_obs: usize, p_coefficients: usize) -> Self {
-        self.rho_uncertainty_problem_size = crate::rho_uncertainty::RhoUncertaintyProblemSize {
+        self.problem_size = OuterProblemSize {
             n_obs: Some(n_obs),
             p_coefficients: Some(p_coefficients),
         };
@@ -853,7 +860,7 @@ impl OuterProblem {
             bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
-            rho_uncertainty_problem_size: self.rho_uncertainty_problem_size,
+            problem_size: self.problem_size,
             // Populated only by the persistent-cache resume path in `run` after
             // a warm-start hit decodes a converged outer Hessian.
             warm_start_outer_hessian: None,
@@ -1231,7 +1238,7 @@ impl OuterProblem {
 /// Internal outcome of one planned solver/multistart attempt.
 ///
 /// Exhausted checkpoints carry resumable work only. They never pass through
-/// finalization, cache promotion, uncertainty diagnostics, or fitted-model
+/// finalization, cache promotion, or fitted-model
 /// construction.
 pub(crate) enum PlanRunOutcome {
     Converged(OuterResult),
@@ -1628,10 +1635,6 @@ pub struct OuterResult {
     /// `None` means no line search failed (or no `opt` solver produced this
     /// result at all).
     pub line_search_failure: Option<(LineSearchFailureReason, usize)>,
-    /// Post-fit PSIS diagnostic for whether sampled smoothing-parameter weights
-    /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
-    /// once by `run_outer` when the exact rho Hessian is cheap enough to use.
-    pub rho_uncertainty_diagnostic: Option<crate::rho_uncertainty::RhoUncertaintyDiagnostic>,
     /// Reseed point minted by a refused certification whose tail snap CONFIRMED
     /// an exponential tail (#2348 Inc 2b). A snap is a waypoint, never a
     /// candidate optimum: even an interior coordinate stationary before the
@@ -1769,7 +1772,6 @@ impl OuterResult {
             solver_termination: None,
             criterion_certificate: None,
             line_search_failure: None,
-            rho_uncertainty_diagnostic: None,
             tail_snap_reseed: None,
             saddle_escape_reseed: None,
             wrong_rail_reseed: None,
@@ -5109,7 +5111,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
         }
         // `eval_cost` warm-starts the inner solve, so the probes moved the objective
         // off the certified point. Restore it to ρ̂ once iff we actually probed, so
-        // the downstream state (and the rho-uncertainty diagnostic) sees the fitted
+        // the downstream state sees the fitted
         // point. A failure to re-evaluate the same ρ that certified moments ago is a
         // genuinely broken objective and refuses conservatively.
         if probed_any {
@@ -6074,7 +6076,7 @@ fn try_certify_asymptote_rail(
     }
 
     // The probes warm-started the inner solve away from ρ̂; restore it so the
-    // shipped fitted state (and the ρ-uncertainty diagnostic) sees the certified
+    // shipped fitted state sees the certified
     // point. A failure here is a genuinely broken objective, not a refusal.
     if probed_any {
         obj.eval_cost(rho).map_err(|err| {
@@ -7344,150 +7346,6 @@ fn run_drift_within_band(constants: &[f64], band: f64) -> bool {
     (hi - lo) / mean.abs() <= band
 }
 
-pub(crate) fn compute_rho_uncertainty_diagnostic(
-    obj: &mut dyn OuterObjective,
-    config: &OuterConfig,
-    context: &str,
-    result: &mut OuterResult,
-) -> crate::rho_uncertainty::RhoUncertaintyDiagnostic {
-    let terminal_cap_guard = config
-        .outer_inner_cap
-        .as_ref()
-        .map(FullFidelityInnerCapGuard::lift);
-    // Do not reset here. The diagnostic intentionally runs before terminal
-    // installation and certification; the certificate must remain the final
-    // owner of objective state. Holding cap=0 ensures proposal evaluations use
-    // terminal fidelity, and the selected point is reinstalled immediately
-    // afterward before the mint audit.
-    let diagnostic =
-        compute_rho_uncertainty_diagnostic_at_terminal_fidelity(obj, config, context, result);
-    drop(terminal_cap_guard);
-    diagnostic
-}
-
-fn compute_rho_uncertainty_diagnostic_at_terminal_fidelity(
-    obj: &mut dyn OuterObjective,
-    config: &OuterConfig,
-    context: &str,
-    result: &mut OuterResult,
-) -> crate::rho_uncertainty::RhoUncertaintyDiagnostic {
-    let cap = obj.capability();
-    let layout = cap.theta_layout();
-    let rho_dim = layout.rho_dim();
-    let gate = crate::rho_uncertainty::RhoUncertaintyCostGate {
-        sample_count: 32,
-        problem_size: config.rho_uncertainty_problem_size,
-    };
-    if let Err(reason) = crate::rho_uncertainty::cost_gate_allows(rho_dim, gate) {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(reason, 0);
-    }
-    if result.rho.len() != layout.n_params {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-            format!(
-                "final outer point length {} does not match objective dimension {}",
-                result.rho.len(),
-                layout.n_params
-            ),
-            0,
-        );
-    }
-    // The ρ-uncertainty diagnostic needs the EXACT outer Hessian, but it runs
-    // BEFORE terminal certification so that the certificate remains the final
-    // owner of objective state. Under the optimize-3/certify-4 protocol (#2359)
-    // this diagnostic may therefore consume only curvature the SEARCH already
-    // retained. It must never trigger its own `ValueGradientHessian` evaluation:
-    // a gradient-only search has deliberately reserved that one order-four pass
-    // for the mint gate. Such a search skips this optional diagnostic; the
-    // terminal certificate still computes and persists exact curvature.
-    if !cap.hessian.is_analytic() {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-            "outer Hessian is not analytic; rho-uncertainty diagnostic needs exact curvature",
-            0,
-        );
-    }
-    if result.plan_used.hessian_source != HessianSource::Analytic {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-            "search did not use exact outer curvature; order-four work is reserved for the terminal certificate",
-            0,
-        );
-    }
-
-    let hessian = match result.final_hessian.as_ref() {
-        Some(hessian) => hessian.clone(),
-        None => {
-            return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-                "search retained no exact outer Hessian; order-four work is reserved for the terminal certificate",
-                0,
-            );
-        }
-    };
-    if hessian.nrows() != layout.n_params || hessian.ncols() != layout.n_params {
-        return crate::rho_uncertainty::RhoUncertaintyDiagnostic::skipped(
-            format!(
-                "exact outer Hessian shape {}x{} does not match objective dimension {}",
-                hessian.nrows(),
-                hessian.ncols(),
-                layout.n_params
-            ),
-            1,
-        );
-    }
-    let mut hessian_rho = Array2::<f64>::zeros((rho_dim, rho_dim));
-    for row in 0..rho_dim {
-        for col in 0..rho_dim {
-            hessian_rho[[row, col]] = hessian[[row, col]];
-        }
-    }
-    let rho_hat = result.rho.slice(ndarray::s![..rho_dim]).to_owned();
-    let theta_hat = result.rho.clone();
-    let cost_hat = result.final_value;
-    let diagnostic = {
-        let mut served_hat_cost = false;
-        let mut criterion = |rho: &Array1<f64>| -> Option<f64> {
-            let is_hat = rho.len() == rho_hat.len()
-                && rho
-                    .iter()
-                    .zip(rho_hat.iter())
-                    .all(|(&left, &right)| left.to_bits() == right.to_bits());
-            if is_hat && !served_hat_cost {
-                served_hat_cost = true;
-                return Some(cost_hat);
-            }
-            let mut theta = theta_hat.clone();
-            for idx in 0..rho_dim {
-                theta[idx] = rho[idx];
-            }
-            obj.eval_cost(&theta).ok()
-        };
-        crate::rho_uncertainty::rho_uncertainty_diagnostic(
-            &rho_hat,
-            &hessian_rho,
-            gate,
-            &mut criterion,
-        )
-    };
-    match &diagnostic.status {
-        crate::rho_uncertainty::RhoUncertaintyStatus::NoEvidenceOfHeavyTails => {
-            log::info!(
-                "[RHO uncertainty] {context}: no heavy-tail evidence at sampled rho proposals k_hat={:.3} evals={}",
-                diagnostic.k_hat.unwrap_or(f64::NAN),
-                diagnostic.n_evaluations,
-            );
-        }
-        crate::rho_uncertainty::RhoUncertaintyStatus::HeavyTailsDetected { k_hat } => {
-            log::warn!(
-                "[RHO uncertainty] {context}: heavy rho-importance tail detected k_hat={:.3} evals={}",
-                k_hat,
-                diagnostic.n_evaluations,
-            );
-        }
-        crate::rho_uncertainty::RhoUncertaintyStatus::Skipped { reason } => {
-            log::info!("[RHO uncertainty] {context}: skipped ({reason})");
-        }
-    }
-    diagnostic
-}
-
 /// Why the operator trust-region outer loop stopped.
 ///
 /// The inhabitants of this enum are exactly the image of
@@ -7841,30 +7699,26 @@ pub(crate) fn run_outer(
     // checkpoint still collapses that difference, for the same reason. Bounded
     // to a single retry; only fires when the solver CLAIMED convergence (a
     // budget-exhausted result is not a desync — its refusal is genuine).
-    // CERTIFICATION-LAST FIT OWNERSHIP. The uncertainty diagnostic evaluates
-    // proposal points after theta-hat and the terminal reinstallation
-    // re-evaluates at `result.rho`, so any certificate measured BEFORE them
+    // CERTIFICATION-LAST FIT OWNERSHIP. The terminal reinstallation
+    // re-evaluates at `result.rho`, so any certificate measured BEFORE it
     // describes a state the caller never receives: on a nonconvex profile the
     // certificate-time inner mode and the finally-installed inner mode can sit
     // in different coefficient basins (measured on the cause-specific survival
     // gate as a stable bitwise mismatch, terminal 9.1931e2 vs certified
     // 9.1671e2, because the two paths prime the inner solve under different
-    // eval orders). Running the diagnostic and the terminal installation
-    // FIRST and certifying LAST makes the certificate's own evaluation the
-    // final objective-state installer, so the sealed terminal identity fit
-    // assembly binds against IS the certified evidence — bitwise, by
-    // construction, independent of basin multiplicity.
-    let certify_diagnose_and_install = |obj: &mut dyn OuterObjective,
-                                        result: &mut OuterResult|
+    // eval orders). Running the terminal installation FIRST and certifying
+    // LAST makes the certificate's own evaluation the final objective-state
+    // installer, so the sealed terminal identity fit assembly binds against
+    // IS the certified evidence — bitwise, by construction, independent of
+    // basin multiplicity.
+    let certify_and_install = |obj: &mut dyn OuterObjective,
+                               result: &mut OuterResult|
      -> Result<OuterCriterionCertificate, EstimationError> {
-        result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
-            obj, config, context, result,
-        ));
         // Reinstall the selected point under cap=0 so the certificate below
         // measures the full-fidelity state belonging to `result.rho`, not
-        // the diagnostic's final proposal (seeding beta alone does not
-        // restore weights, factors, or link state). Reset forces a real
-        // installation instead of an LRU value hit.
+        // the search's last (possibly capped) evaluation (seeding beta alone
+        // does not restore weights, factors, or link state). Reset forces a
+        // real installation instead of an LRU value hit.
         let terminal_cap_guard = config
             .outer_inner_cap
             .as_ref()
@@ -7928,7 +7782,7 @@ pub(crate) fn run_outer(
     let mut curvature_search_latched = config.curvature_search_latched;
     let mut saddle_escapes = 0usize;
     let certificate = loop {
-        match certify_diagnose_and_install(obj, &mut result) {
+        match certify_and_install(obj, &mut result) {
             Ok(certificate) => break certificate,
             Err(refusal) => {
                 let Some(reseed) = take_certify_reseed(&mut result) else {
