@@ -5217,23 +5217,6 @@ impl PenaltySubspaceCacheKey {
     }
 }
 
-/// Estimate the in-cache footprint of a (compacted) PIRLS result.
-///
-/// Mirrors what `compact_for_reml_cache` keeps:
-/// * six surviving n-length f64 arrays (final_eta, solveweights,
-///   solveworking_response, solvemu, solve_c_array, solve_d_array);
-/// * the p-length coefficient vector;
-/// * the two p×p Hessians (dense or CSC sparse);
-/// * the `ReparamResult` payload, the dominant term beyond n: besides
-///   `s_transformed`, `qs` and `e_transformed` it carries one rotated penalty
-///   per smoothing coordinate, each with a dense p×p Gram, so it grows as K·p²;
-/// * the p-length penalized gradient, the Firth hat diagonal and any
-///   transformed inequality constraints.
-/// A small constant overhead absorbs scalar fields, enum discriminants, and
-/// the HashMap entry. Every array the entry owns is counted: an entry that
-/// under-reports lets the cache hold many times its byte budget (pyGAM audit
-/// speed F1: forty coordinates at p = 221 put 16 MB of rotated penalties in
-/// each entry against a 2.5 MB estimate, so the 128 MiB cache pinned 1.3 GB).
 /// Byte budget of one fit's PIRLS result cache.
 ///
 /// A cache hit saves one P-IRLS solve, and a solve costs passes over the
@@ -5255,6 +5238,23 @@ pub(crate) fn pirls_cache_byte_budget(x: &DesignMatrix) -> usize {
         .map_or(host_ceiling, |design_bytes| design_bytes.min(host_ceiling))
 }
 
+/// Estimate the in-cache footprint of a (compacted) PIRLS result.
+///
+/// Mirrors what `compact_for_reml_cache` keeps:
+/// * six surviving n-length f64 arrays (final_eta, solveweights,
+///   solveworking_response, solvemu, solve_c_array, solve_d_array);
+/// * the p-length coefficient vector;
+/// * the two p×p Hessians (dense or CSC sparse);
+/// * the `ReparamResult` payload, the dominant term beyond n: besides
+///   `s_transformed`, `qs` and `e_transformed` it carries one rotated penalty
+///   per smoothing coordinate, each with a dense p×p Gram, so it grows as K·p²;
+/// * the p-length penalized gradient, the Firth hat diagonal and any
+///   transformed inequality constraints.
+/// A small constant overhead absorbs scalar fields, enum discriminants, and
+/// the HashMap entry. Every array the entry owns is counted: an entry that
+/// under-reports lets the cache hold many times its byte budget (pyGAM audit
+/// speed F1: forty coordinates at p = 221 put 16 MB of rotated penalties in
+/// each entry against a 2.5 MB estimate, so the 128 MiB cache pinned 1.3 GB).
 pub(crate) fn pirls_result_cache_bytes(result: &PirlsResult) -> usize {
     use std::mem::size_of;
     let n_array_elems = result.final_eta.len()
