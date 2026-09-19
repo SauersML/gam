@@ -2,9 +2,8 @@
 //! toward `λ = ∞` must return a certified outer optimum.
 //!
 //! This is the fit the EBM binomial-logit quality comparison makes
-//! (`y ~ s(pc1, k=5) + s(pc2, k=5)` on the 3-of-4 training rows). Before the
-//! rail-face KKT certificate (#3212) the outer optimizer refused it with typed
-//! non-convergence:
+//! (`y ~ s(pc1, k=5) + s(pc2, k=5)` on the 3-of-4 training rows). The #1561
+//! sweep recorded it refused with coordinate 2 held on its rail:
 //!
 //! ```text
 //! |Pg|=2.280e-5 > bound=7.302e-6, railed=[2] theta=22.73,
@@ -12,13 +11,18 @@
 //!                 22.73260730311278, -3.0301791821018074]
 //! ```
 //!
-//! Coordinate 2 was held on its rail while the remaining coordinates' projected
-//! gradient stayed three times over its bound, so the returned point certified
-//! neither as a rail nor as an interior optimum. With the face decided by its
-//! KKT slopes the search returns a point that certifies: `λ₂ ≈ 1.67e9`
-//! (`ρ₂ ≈ 21.2`, where coordinate 2's tail `−c·e^{−ρ}` is already under the
-//! bound) and an analytic projected gradient of `9.0e-11` against a bound of
-//! `2.5e-10`.
+//! On the tree immediately before the rail-face KKT certificate (#3212,
+//! parent `658fec0f^1`) this test still fails, now with nothing railed and the
+//! search stopped just over its bound:
+//!
+//! ```text
+//! |Pg|=2.249e-10 > bound=1.975e-10 (rung=coordinate-band) railed=[]
+//! termination=gradient_tolerance(|g|=2.835361e-11 < 1.000000e-10)
+//! ```
+//!
+//! After #3212 the returned point certifies: `λ₂ ≈ 1.67e9` (`ρ₂ ≈ 21.2`, where
+//! coordinate 2's tail `−c·e^{−ρ}` is already under the bound) and an analytic
+//! projected gradient of `9.0e-11` against a bound of `2.5e-10`.
 //!
 //! The assertions are on the certificate itself, not on the route. A rail
 //! certificate for coordinate 2 is as valid as a gradient certificate, but any
