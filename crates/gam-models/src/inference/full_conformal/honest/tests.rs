@@ -85,25 +85,22 @@ fn unit_weights(n: usize) -> Array1<f64> {
     Array1::ones(n)
 }
 
-/// Brute-force membership of `z` in the honest set: the global REML minimizer
-/// over the augmented domain by a dense scan polished by golden section, then
-/// the explicit augmented fit and its residual rank.
-fn oracle_member(
-    response: &GaussianRemlRhoResponse<'_>,
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    x_star: &Array1<f64>,
-    z: f64,
-    required: usize,
-) -> bool {
+/// The global REML minimizer of `response`'s criterion (`z = None`: the
+/// training rows alone) over its closed domain, by a dense scan polished by
+/// golden section. An end the criterion descends through is found like any
+/// other minimizer.
+fn brute_force_rho(response: &GaussianRemlRhoResponse<'_>, z: Option<f64>) -> f64 {
     let criterion = |rho: f64| {
         response
-            .eval(rho, Some(z))
+            .eval(rho, z)
             .map(|ev| ev.value)
             .unwrap_or(f64::INFINITY)
     };
-    let (lo, hi) = response.augmented_rho_domain;
+    let (lo, hi) = if z.is_some() {
+        response.augmented_rho_domain
+    } else {
+        response.rho_domain
+    };
     let scan = 240usize;
     let step = (hi - lo) / scan as f64;
     let best = (0..=scan)
@@ -133,9 +130,22 @@ fn oracle_member(
             fd = criterion(d);
         }
     }
-    let rho = if fc < fd { c } else { d };
+    if fc < fd { c } else { d }
+}
 
-    let lambda = rho.exp();
+/// Brute-force membership of `z` in the honest set: the global REML minimizer
+/// over the augmented domain, then the explicit augmented fit and its residual
+/// rank.
+fn oracle_member(
+    response: &GaussianRemlRhoResponse<'_>,
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    x_star: &Array1<f64>,
+    z: f64,
+    required: usize,
+) -> bool {
+    let lambda = brute_force_rho(response, Some(z)).exp();
     let mut normal = x.t().dot(x) + s_lambda * lambda;
     for i in 0..P {
         for j in 0..P {
@@ -375,8 +385,10 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
     let weights = unit_weights(n);
     let s = curvature_penalty();
     // The trained fit: λ̂ by REML on the training rows alone, stored as `Sλ`.
+    // Where REML prefers the penalty's null-space model, λ̂ is the domain's
+    // upper end, which the criterion descends through.
     let response = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-    let rho_hat = response.select_rho(None).expect("training REML");
+    let rho_hat = brute_force_rho(&response, None);
     let s_lambda = &s * rho_hat.exp();
     let mut rows = Vec::new();
     let mut honest_extra_refits = [0; 2];
