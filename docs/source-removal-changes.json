@@ -1818,7 +1818,7 @@
     "evidence": "source_removal_guard.py and public_api_census.py run against base 26afd99f5f report exactly these identities. git grep -w finds none of the removed names under crates, src or tests at the head tree. Targeted tests: gam-models third_trace_2998, rigid_row_tensors_3022 (3), multistart_member_2359, flex_measure_932 pass; gam-math jet_trace 2/2; gam-custom-family warm_start 14/14."
   },
   {
-    "base": "aeed171532e0ee9650a02a541113bdc36e130439",
+    "base": "878f4c10c0cb1bb4daced3862c5460d49b4f8c52",
     "items": [
       "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
       "crates/gam-solve/src/estimate/summary.rs:fn:fmt",
