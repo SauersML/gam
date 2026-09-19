@@ -451,3 +451,13 @@ threads-required = 'num-test-threads'
 filter = 'test(/smooth_term_lr_single_p_value_calibration::/)'
 slow-timeout = { period = "600s", terminate-after = 6 }
 threads-required = 'num-test-threads'
+
+# The smooth-term Wald family gate fits `y ~ s(x1) + s(x2)` 200 times per
+# family and runs each summary row's λ̂-selection replay (a certified REML
+# select per null draw) for both terms. Seven families contending for one
+# four-core pool each ran past the 600 s kill. Each family takes the whole pool
+# (the replicates are the parallelism); terminate-after = 6 still kills a hang.
+[[profile.default.overrides]]
+filter = 'test(/sbc_wood_smooth_test_family_size_curve::/)'
+slow-timeout = { period = "600s", terminate-after = 6 }
+threads-required = 'num-test-threads'

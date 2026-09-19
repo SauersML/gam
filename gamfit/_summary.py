@@ -251,12 +251,15 @@ class Summary:
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
-        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
-        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
-        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
-        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
-        instead, because its null ``f = 0`` is the apex of the constraint cone
-        and no calibrated reference exists for the truncated posterior mean.
+        and — for penalized smooths — ``chi_sq`` (the whitened Wald
+        statistic) and ``p_value``, read against the statistic's null law with
+        the REML selection of ``λ`` replayed. Random-effect smooths report
+        ``edf`` only. A shape-constrained smooth (``shape=...``) has no
+        ``chi_sq`` or ``p_value``; it carries
+        ``p_value_unavailable = "shape_constrained"`` instead, because its null
+        ``f = 0`` is the apex of the constraint cone and no calibrated reference
+        exists for the truncated posterior mean. A term whose selection replay
+        refused carries ``p_value_unavailable = "selection_refused"``.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -502,8 +505,8 @@ class Summary:
         table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``, ``p_value``
         (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
         shape-constrained term, matching the engine, which only computes the
-        Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason.
+        Wald test for ordinary penalized smooths). A row without a p-value adds
+        a ``p_value_unavailable`` column naming the reason.
         """
         import pandas as pd
 

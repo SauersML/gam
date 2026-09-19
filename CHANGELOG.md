@@ -1,5 +1,20 @@
 ## Unreleased
 
+- **The summary smooth-term Wald p-value is uniform under the null.**
+  `summary().smooth_terms[*].p_value` was Wood's (2013) fixed-`λ` test read at the REML
+  `λ̂`. REML shrinks a null term onto its penalty null space in most fits, where that
+  statistic vanishes, so on `y ~ s(x1) + s(x2)` with a null `x2` (n = 200, 200 fits per
+  family) 44% of Gaussian p-values were above 0.99 and the size at 0.05 was 0.019–0.050
+  across the seven standard families; the Kolmogorov distance from U(0, 1) exceeded its
+  three-sigma radius in every family. The row now carries the whitened Wald statistic
+  `W = uᵀ(I + T(t̂))⁻¹u` of the term's profiled score `u ~ N(0, I)`, with `t̂` chosen for
+  the observation by the same certified REML selection the λ̂-selection replay applies to
+  each null draw, and the p-value is read against that replayed law (studentized through
+  the exact Beta radius map at estimated scale). A term with no identified direction
+  publishes `p = 1`, the one genuine atom of the law. A term whose replay refuses
+  publishes no p-value, with `pvalue_unavailable = "selection_refused"`, rather than the
+  anti-conservative fixed-`λ` tail. The design Gram the old test needed is no longer
+  built: `smooth_term_summary_rows(design, spec, fit)` lost its whitening argument.
 - **`smooth_significance` publishes one calibrated p-value per term.** Each row used to
   carry `p_value_uncorrected`, `p_value_corrected`, `p_value_conditional` and
   `p_value_bound`, and they disagreed under the null. The conditional (fixed-`λ`) tail

@@ -1,5 +1,10 @@
 # pv-wald-families: the smooth-term Wald p-value across response families
 
+> **Superseded.** Everything below "Results" measures the old summary
+> p-value, `wood_smooth_test` at the fitted `λ̂`. It is kept as the record of
+> why that test was replaced. The shipped p-value and its gate results are in
+> "The λ̂-selection Wald law" at the end.
+
 Target: `summary().smooth_terms[*].p_value`, i.e. `wood_smooth_test`
 (`crates/gam-terms/src/inference/smooth_test.rs`) as it is called by the
 production summary walk `smooth_term_summary_rows`.

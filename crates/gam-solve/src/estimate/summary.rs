@@ -56,6 +56,11 @@ pub enum SmoothPValueUnavailable {
     ///   REML-selected λ shrink every face together, and the mixture weights
     ///   move with them.
     ShapeConstrained,
+    /// The λ̂-selection replay refused this term: its penalty geometry or its
+    /// certified selection could not be resolved. The fixed-λ tail treats the
+    /// REML λ̂ as known and is anti-conservative under the null, so it is not
+    /// published in its place.
+    SelectionRefused,
 }
 
 impl SmoothPValueUnavailable {
@@ -63,6 +68,7 @@ impl SmoothPValueUnavailable {
     pub fn label(self) -> &'static str {
         match self {
             Self::ShapeConstrained => "shape_constrained",
+            Self::SelectionRefused => "selection_refused",
         }
     }
 
@@ -73,6 +79,11 @@ impl SmoothPValueUnavailable {
                 "shape-constrained: the null f = 0 is the apex of the constraint cone, so no \
                  chi-square, spectral or chi-bar-square reference is valid for the truncated \
                  posterior mean; no p-value is reported"
+            }
+            Self::SelectionRefused => {
+                "selection refused: the lambda-selection replay could not resolve this term's \
+                 penalty geometry or selection, so no calibrated p-value exists; the fixed-lambda \
+                 tail is anti-conservative and is not reported in its place"
             }
         }
     }

@@ -4,7 +4,7 @@
 //!
 //! The same smooth-term Wald primitive is reached by every standard family,
 //! and the family changes three of its inputs: the IRLS weights inside the
-//! whitening Gram `X'WX`, the covariance `Vb` (whose scale is profiled,
+//! penalized Hessian, the covariance `Vb` (whose scale is profiled,
 //! Pearson-refreshed, or fixed), and the reference law. A wrong weight, a
 //! wrong scale predicate, or a residual df read off the wrong fit is invisible
 //! to a Gaussian-only gate.
@@ -12,8 +12,8 @@
 //! Audit: `y ~ s(x1) + s(x2)` with a real `s(x1)` and a TRUE-NULL `s(x2)`
 //! (`x2` is drawn independently of `y`), `n = 200`, 200 seeded replications
 //! per family. The p-value read is the production summary row — the shared
-//! `smooth_term_summary_rows` walk with the fit's exact weighted Gram, the same
-//! call `saved_model_summary` makes for CLI and Python.
+//! `smooth_term_summary_rows` walk, the same call `saved_model_summary` makes
+//! for CLI and Python.
 //!
 //! Under the null the p-value must be U(0, 1) over the whole range, so the
 //! gate is two-sided. A conservative p-value (a pile near one, a size below
@@ -176,12 +176,7 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
-    let rows = smooth_term_summary_rows(
-        &fit.design,
-        &fit.resolvedspec,
-        &fit.fit,
-        fit.fit.weighted_gram(),
-    );
+    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))
