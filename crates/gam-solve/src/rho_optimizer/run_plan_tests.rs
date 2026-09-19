@@ -4139,8 +4139,8 @@ fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
 /// it ran from a larger cubic regularization, so it is not a replay of the window
 /// before, and it licenses one more. The single ordinary start stopped here at
 /// |Pg| = 4.7e-1, after rejected steps of 9.9 and then 8.6 e-folds, one window
-/// before the step that converged. A window whose nearest rejected trial came no
-/// nearer is a replay, and it halts as one.
+/// before the step that converged. A window that evaluated the same trials from
+/// the same incumbent as the one before is a replay, and it halts as one.
 #[test]
 fn a_window_of_contracting_rejected_steps_is_not_a_replay_2830() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
@@ -4185,18 +4185,18 @@ fn a_window_of_contracting_rejected_steps_is_not_a_replay_2830() {
     let contracted = guard.observe(&rejected_at(8.6), rejected_value, grad, true);
     assert!(
         matches!(contracted, CostStallVerdict::StuckKeepDescending { .. }),
-        "the incumbent is bit-identical, but the window's rejected steps shortened, so \
-         it is not a replay. Got {:?}",
+        "the incumbent is bit-identical, but the window evaluated shorter rejected \
+         steps, so it is not a replay. Got {:?}",
         std::mem::discriminant(&contracted)
     );
 
-    guard.observe(&rejected_at(9.0), rejected_value, grad, true);
-    guard.observe(&rejected_at(9.0), rejected_value, grad, true);
-    let replay = guard.observe(&rejected_at(9.0), rejected_value, grad, true);
+    guard.observe(&rejected_at(8.6), rejected_value, grad, true);
+    guard.observe(&rejected_at(8.6), rejected_value, grad, true);
+    let replay = guard.observe(&rejected_at(8.6), rejected_value, grad, true);
     assert!(
         matches!(replay, CostStallVerdict::FlatValleyStall { .. }),
-        "a window whose rejected steps came no nearer is a proven replay and halts. \
-         Got {:?}",
+        "a window that evaluated the same trials from the same incumbent is a proven \
+         replay and halts. Got {:?}",
         std::mem::discriminant(&replay)
     );
     assert!(
