@@ -246,7 +246,9 @@ create_exception!(
     _rust,
     ModelOverparameterizedError,
     GamError,
-    "Model is over-parameterized: more coefficients than samples."
+    "Model is over-parameterized: its unpenalized coefficient directions \
+     (intercept, unpenalized terms, penalty null spaces) are not fewer than the \
+     observations, or the design is rank deficient."
 );
 
 create_exception!(

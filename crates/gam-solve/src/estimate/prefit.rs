@@ -257,6 +257,13 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
 /// of the unpenalized design — is the separate check
 /// [`reject_prefit_unpenalized_rank_deficiency`].)
 ///
+/// Identified is not the same as smooth. Once the penalized directions REML may
+/// release span the `n − M_p` contrasts, the Gaussian marginal likelihood has a
+/// finite limit as `φ → 0`, since the random-effect covariance alone is then
+/// nonsingular. On some data REML's optimum lies at that limit and the fit
+/// interpolates. That is the criterion's answer, not an unidentified model, so
+/// this gate does not refuse it.
+///
 /// `n` counts positive-weight rows, the same count the REML objective uses, and
 /// the rank is the balanced structural rank the reparameterization and the
 /// criterion's `log|S|₊` use, so this gate and the criterion agree on `M_p`.
