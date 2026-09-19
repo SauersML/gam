@@ -99,3 +99,6 @@ def test_a_location_scale_fit_tabulates_its_mean_smooths() -> None:
         assert p is not None and 0.0 <= p <= 1.0, (name, p)
     # The mean truly depends on x1 and not on x2.
     assert rows["s(x1)"]["p_value"] < 1e-6, rows["s(x1)"]
+    # No scalar family, so no AIC -- stated, not failed.
+    assert summary.aic_corrected is None
+    assert summary.aic_corrected_unavailable, summary
