@@ -938,8 +938,8 @@ def main() -> int:
         lift = None
         X_fit, X_base = X_fit_chart, X_base_chart
 
-    log(f"fitting gamfit.sae_manifold_fit ({structure.topology}, softmax assignment)")
-    sae_model = gamfit.sae_manifold_fit(
+    log(f"fitting gamfit.sae.sae_manifold_fit ({structure.topology}, softmax assignment)")
+    sae_model = gamfit.sae.sae_manifold_fit(
         X_fit, K=args.k_atoms, d_atom=1, atom_topology=structure.topology,
         assignment="softmax", n_iter=args.n_iter, random_state=args.seed)
     fit_ev = float(1.0 - np.sum((X_fit - np.asarray(sae_model.fitted)) ** 2)
@@ -951,8 +951,8 @@ def main() -> int:
     log(f"empirical label->coordinate map: "
         f"{ {structure.labels[i]: round(float(label_map[i]), 4) for i in range(structure.n_labels)} }")
 
-    log("fitting flat-SAE control (gamfit.sparse_dictionary_fit)")
-    flat_fit = gamfit.sparse_dictionary_fit(
+    log("fitting flat-SAE control (gamfit.sae.sparse_dictionary_fit)")
+    flat_fit = gamfit.sae.sparse_dictionary_fit(
         X_fit.astype(np.float32), min(args.flat_k, X_fit.shape[0] - 1), active=1, max_epochs=40)
     flat_dirs, flat_latents = select_flat_directions(
         flat_fit, X_fit.astype(np.float32), fit_label_index, structure.n_labels)

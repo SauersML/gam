@@ -9,9 +9,9 @@ train/test split from --seed, so numbers are directly comparable across jobs.
 
 Arms:
   external_topk  — Gao-et-al. TopK SAE (torch, GPU), the "traditional SAE" bar.
-  gam_flat       — gamfit.sparse_dictionary_fit (our certified linear sparse-code
+  gam_flat       — gamfit.sae.sparse_dictionary_fit (our certified linear sparse-code
                    lane; the manifold engine rejects the flat config), held-out EV.
-  curved_topk    — gamfit.sae_manifold_fit(assignment='topk') (CPU Rust core).
+  curved_topk    — gamfit.sae.sae_manifold_fit(assignment='topk') (CPU Rust core).
   hybrid_rust    — native flat sparse coding plus a native curved TopK model on
                    the residual at a matched active-scalar budget.
 
@@ -486,7 +486,7 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, minibatch, score_mode,
                  max_epochs, collect):
     import gamfit
 
-    fit = gamfit.sparse_dictionary_fit(
+    fit = gamfit.sae.sparse_dictionary_fit(
         x_tr, K, active=top_k, minibatch=minibatch, max_epochs=max_epochs,
         score_mode=score_mode)
     tr = fit.transform(x_te, score_mode=score_mode)
@@ -508,7 +508,7 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, seed):
     # The curved fit keeps its own inner budget. `--max-epochs` is the flat tier's
     # epoch cap; passed as `n_iter` it set every criterion evaluation's refine
     # ceilings to 16x and 64x that cap (#2283).
-    model = gamfit.sae_manifold_fit(
+    model = gamfit.sae.sae_manifold_fit(
         x_tr, K=K, d_atom=d_atom, atom_topology=topology,
         assignment="topk", top_k=top_k, random_state=seed)
     recon = np.asarray(model.reconstruct(x_te), dtype=np.float32)
@@ -554,7 +554,7 @@ def fit_hybrid_flat_checkpoint(
         flush=True,
     )
     t0 = time.perf_counter()
-    flat = gamfit.sparse_dictionary_fit(
+    flat = gamfit.sae.sparse_dictionary_fit(
         x_tr,
         flat_config["K_flat"],
         active=flat_config["active_flat"],
@@ -636,7 +636,7 @@ def fit_hybrid_curved_resume(
     r_tr = np.ascontiguousarray(x_tr - flat_recon_tr)
     r_te = np.ascontiguousarray(x_te - flat_recon_te)
     t1 = time.perf_counter()
-    curved = gamfit.sae_manifold_fit(
+    curved = gamfit.sae.sae_manifold_fit(
         r_tr, K=curved_K, d_atom=d, atom_topology=topology,
         assignment="topk", top_k=curved_k, random_state=seed)
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)

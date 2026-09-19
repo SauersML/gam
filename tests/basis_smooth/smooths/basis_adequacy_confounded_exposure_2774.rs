@@ -252,7 +252,7 @@ fn fit_confounded(n: usize, seed: u64, effect: PcEffect) -> FitOutcome {
         nullspace_dim: row.nullspace_dim,
         enrichment_rank: row.enrichment_rank,
         provenance: row.provenance.label().to_string(),
-        notes: outcome.inference_notes.clone(),
+        notes: outcome.inference_notes.advisories.clone(),
         // The same predicate `summary()` reports as `convergence.certified`:
         // no outer coordinate optimized ⇒ the converged inner mode IS the proof.
         certified: standard

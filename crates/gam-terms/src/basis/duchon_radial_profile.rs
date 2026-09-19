@@ -838,7 +838,7 @@ impl DuchonRadialProfile {
         };
         profile.spot_check()?;
         let (low_count, main_count) = profile.panel_counts();
-        log::info!(
+        log::debug!(
             "[duchon-profile] (p={p}, s={s}, d={d}): {low_count} value-only + {main_count} all-channel \
              panels certified in {:.3}s",
             build_start.elapsed().as_secs_f64()

@@ -5553,7 +5553,7 @@ fn enumerate_and_select_rho_with_controls(
         stack[top] = (a, ea, pa, mid, emid, pmid, depth + 1);
         top += 1;
     }
-    log::info!(
+    log::debug!(
         "[REML-BNB] certified 1-D rho search over [{}, {}]: {cells_visited} cells, \
          {evaluations} objective evaluations, deepest bisection {deepest}/{}, \
          {unbounded_enclosures} unbounded enclosures",

@@ -90,9 +90,10 @@ fn bspline_spec() -> TermCollectionSpec {
                     boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             },
-            shape: gam::terms::smooth::ShapeConstraint::None,
+            shape: gam::terms::smooth::ShapeConstraint::None.into(),
             joint_null_rotation: None,
         }],
+        level: Default::default(),
     }
 }
 

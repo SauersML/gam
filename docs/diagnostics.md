@@ -1,10 +1,15 @@
 # Diagnostics, summaries, plots, reports
 
-A fitted `Model` exposes five inspection methods:
+A fitted `Model` exposes six inspection methods:
 
 | Method | Returns | Contents |
 | --- | --- | --- |
 | `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score (in the `reml_score` field), per-coefficient table, smoothing parameters (`lambdas`), group metadata, and deployment extensions. |
+| `basis_check(data)` | `list[dict]` | Per-smooth basis-adequacy report: is each smooth's basis rich enough for the function it was asked to represent? |
+| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for point-payload models (the point column is the one the model's class publishes: `posterior_mean`, or `mean` for the transformation-normal and Bernoulli marginal-slope classes). |
+| `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
+| `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
+| `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
 
 `reml_score` and `raw_reml_score` are `None` when the fit has **no**
 criterion, which is a different statement from "not recorded". A Gaussian
@@ -16,24 +21,19 @@ large. `Summary.reml_score_unavailable` then carries the explanation, and
 those ranking surfaces raise it instead of ranking a stand-in value. Compare
 such a model on predictive accuracy, or refit on data whose response is not
 an exact function of the design.
-| `basis_check(data)` | `list[dict]` | Per-smooth basis-adequacy report: is each smooth's basis rich enough for the function it was asked to represent? |
-| `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics for point-payload models (the point column is the one the model's class publishes: `posterior_mean`, or `mean` for the transformation-normal and Bernoulli marginal-slope classes). |
-| `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
-| `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |
-| `report(path=None)` | `str` | Self-contained HTML report (string, or written path). |
 
 `gamfit.validate_formula(...)` validates a formula and data against the
 parser and schema without fitting.
 
-The top-level package also exposes research/inference instruments used by
-the SAE and structure-discovery workflows: `split_likelihood_log_e`,
+Research/inference instruments used by the SAE and structure-discovery
+workflows live in submodules: `gamfit.sae` has `split_likelihood_log_e`,
 `e_bh_dictionary_certificate`, `log_e_from_p_value`,
-`select_probe_by_expected_evidence`, `expected_resolution_budget`,
-`plan_probe_for_contested_claim`, `lawley_bartlett_factor`, and
-`glm_full_conformal`. These are low-level building blocks rather than
-`Model` methods; see the [API reference](api-reference.md) for signatures.
-(`debiased_functional`, by contrast, is a `Model` method, not a
-top-level export.)
+`select_probe_by_expected_evidence`, `expected_resolution_budget`, and
+`plan_probe_for_contested_claim`; `gamfit.inference` has
+`lawley_bartlett_factor` and `glm_full_conformal`. These are low-level
+building blocks rather than `Model` methods; see the
+[API reference](api-reference.md) for signatures. (`debiased_functional`, by
+contrast, is a `Model` method.)
 
 ## summary()
 
@@ -45,7 +45,8 @@ s["family_name"]
 s["model_class"]
 s["deviance"]
 s["reml_score"]
-s["iterations"]
+s["scale"]                     # dispersion phi-hat (Gaussian sigma^2)
+s["convergence"]               # certificate incl. outer/inner iteration counts
 s["coefficients"]              # list of dicts (per-term records)
 s.coefficients                 # same list via property
 s.to_dict()                    # full payload as a dict
@@ -57,6 +58,61 @@ s.coefficients_frame()         # pandas.DataFrame; requires pandas
 `model.smoothing_parameters()` returns a `{penalty_index: lambda}` dict of
 the fitted smoothing/precision parameters by penalty index (via a dedicated
 FFI call), the same values surfaced under `summary()["lambdas"]`.
+
+### Fit notes, warnings, and solver logs
+
+A fit records two kinds of notes, both listed in `model.notes` and
+`summary().notes` (and printed under `Notes:` in the text summary):
+
+- **advisories** — the fitted model differs from the literal request (a `k`
+  capped to the covariate's distinct values, a basis too small for the
+  residuals). These are also raised as `gamfit.errors.GamInferenceWarning`, attributed
+  to your calling line; the CLI prints them to stderr.
+- **informational notes** — a default the engine chose for you, such as the
+  internal-knot count of a default `s(x)`. These are never warned.
+
+A default fit writes nothing to stdout or stderr. The engine's solver trace
+(`[OUTER …]`, `[PIRLS …]`, …) goes to the `gamfit` Python logger at `DEBUG`
+(finer records below that), which is silent unless you opt in:
+
+```python
+import logging
+logging.basicConfig()
+logging.getLogger("gamfit").setLevel(logging.DEBUG)
+```
+
+The CLI equivalent is `gam -v …` (`-vv` for the finer records).
+
+### Shape-constrained smooths have no significance p-value
+
+A smooth with `shape=monotone_increasing` (or `monotone_decreasing`, `convex`,
+`concave`) reports `edf` and `ref_df` in `summary().smooth_terms` but no
+`chi_sq` or `p_value`. The row carries `p_value_unavailable =
+"shape_constrained"` instead, and `model.smooth_significance(data)` returns the
+same reason in place of an LR row. The printed summary (Python and CLI) names
+the reason under the smooth table.
+
+Why the number is withheld:
+
+- The null `f = 0` is the apex of the constraint cone. Under a flat truth the
+  estimator sits on the cone boundary, so neither the Wald χ² nor the LR's
+  spectral reference describes the statistic's null law.
+- Chi-bar-square (a mixture of χ² laws weighted by the cone's face
+  probabilities) and tests conditional on the active set are the textbook fixes.
+  Both are the null law of the **cone projection** with a fixed cone. The
+  coefficients here are the **truncated posterior mean**, which lies strictly
+  inside the cone and has no active set. Its λ is selected by REML on the same
+  data. Neither reference applies.
+
+`basis_check` still reports for these terms. It tests structure outside the
+term's column span, which the cone does not restrict: its score is built from
+enrichment columns made orthogonal (in the working weights) to the whole
+design, so for a Gaussian identity fit the score equals the enrichment
+projection of `y` and does not depend on the shape term's coefficients at all.
+The fit enters only through the dispersion estimate, as it does for an
+unconstrained term. For other families the score uses the fitted mean, which
+is consistent under the null for the truncated posterior mean as it is for the
+unconstrained one.
 
 ## basis_check() — is the basis big enough?
 
@@ -206,11 +262,10 @@ Returns a `FormulaValidation` dataclass that wraps the parsed payload.
 Accepts these parser/materialization keyword arguments from `gamfit.fit`,
 with the same semantics, and does no fitting:
 `family`, `negative_binomial_theta`, `expectile_tau`, `offset`, `weights`,
-`persistent_warm_start_root`,
 `transformation_normal`, `transformation_normal_stage1`,
 `survival_likelihood`, `survival_time_anchor`, `baseline_target`,
 `baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`,
-`z_column`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
+`z_column`, `residual_columns`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
 `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
 `noise_offset`, `flexible_link`, `config`.
 
@@ -285,8 +340,8 @@ These are read-only properties.
 
 | Symptom | Try this |
 | --- | --- |
-| `diag.metrics["r_squared"]` low on training | The model is under-flexed. Raise `k` on smooths or add interactions via `te(...)` / multi-d smooths. |
-| `rmse` low on training, high on test | Over-flexed. Reduce `k` or rely on the default complexity. |
+| `diag.metrics["r_squared"]` low on training | The basis may be too small for the function. `k` is an upper bound on each smooth's flexibility, and REML chooses how much of it to use. Run `basis_check(data)` and raise `k` where it reports the basis is inadequate, or add interactions via `te(...)` / multi-d smooths. See [Choosing k](formulas.md#choosing-k). |
+| `rmse` low on training, high on test | Lowering `k` is not the fix: REML already penalizes wiggliness the data do not support. Check for leakage between training and test rows, for a shift between them, and for terms that should not be in the model. |
 | `diagnose()` raises about the response column | Pass `y="column_name"` explicitly. |
 | `check()` reports `missing_column` | The prediction data is missing a required feature. |
 | `predict` raises `SchemaMismatchError` | Run `check()` first to identify the offending column. |

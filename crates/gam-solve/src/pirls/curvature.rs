@@ -70,6 +70,18 @@ impl VarianceJet {
         }
     }
 
+    /// Inverse-Gaussian variance V(μ) = μ³.
+    #[inline]
+    pub fn inverse_gaussian(mu: f64) -> Self {
+        Self {
+            v: mu * mu * mu,
+            v1: 3.0 * mu * mu,
+            v2: 6.0 * mu,
+            v3: 6.0,
+            v4: 0.0,
+        }
+    }
+
     /// Tweedie variance V(μ) = μ^p.
     #[inline]
     pub fn tweedie(mu: f64, p: f64) -> Self {
@@ -191,7 +203,9 @@ pub(crate) fn fixed_glm_dispersion(
     match scale {
         // The profiled Gaussian working geometry is intentionally scale-free.
         Scale::ProfiledGaussian | Scale::Unit | Scale::NegativeBinomial { .. } => Ok(1.0),
-        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => Ok(phi.value()),
+        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } | Scale::Dispersion { phi, .. } => {
+            Ok(phi.value())
+        }
         Scale::Gamma { .. } => scale
             .gamma_phi()
             .map_err(|error| EstimationError::InvalidInput(error.to_string())),
@@ -227,6 +241,8 @@ pub(crate) fn fixed_glm_dispersion(
 ///  * Tweedie: weight `prior·μ^{2−p}/φ` ⇒ `k = 1/φ` (the μ-power is already in
 ///    the deviance's η-derivative, so only the constant `1/φ` is missing from D).
 ///  * Gaussian with an explicitly fixed `φ ≠ 1`: weight `prior/φ` ⇒ `k = 1/φ`.
+///  * Inverse Gaussian, and Gaussian under a non-identity link (both carry a
+///    generic EDM dispersion): weight `prior·h'²/(φV)` ⇒ `k = 1/φ`.
 ///  * Every other family (Poisson, Binomial, negative-binomial, Beta, profiled
 ///    Gaussian): the working weight carries no constant dispersion factor absent
 ///    from D, so `k = 1` and the objective is already self-consistent.
@@ -249,13 +265,20 @@ pub(crate) fn penalized_objective_deviance_scale(
         }
         ResponseFamily::Gaussian => match resolved {
             gam_problem::ResolvedLikelihoodScale::ProfiledGaussian => 1.0,
-            gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi } => 1.0 / phi.value(),
+            gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi }
+            | gam_problem::ResolvedLikelihoodScale::Dispersion { phi, .. } => 1.0 / phi.value(),
             _ => {
                 return Err(EstimationError::InvalidInput(
                     "resolved Gaussian scale has the wrong family variant".to_string(),
                 ));
             }
         },
+        ResponseFamily::InverseGaussian => {
+            let phi = resolved
+                .dispersion_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            1.0 / phi
+        }
         _ => 1.0,
     };
     if k.is_finite() && k > 0.0 {
@@ -289,6 +312,7 @@ pub(crate) fn weight_family_for_glm_likelihood(
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
         }),
         ResponseFamily::Gamma => Ok(WeightFamily::Gamma),
+        ResponseFamily::InverseGaussian => Ok(WeightFamily::InverseGaussian),
         ResponseFamily::Binomial => Ok(WeightFamily::Binomial),
         ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
             "Royston-Parmar is not a GLM weight family".to_string(),
@@ -306,6 +330,8 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
     match inverse_link {
         InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
         InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::Standard(StandardLink::Inverse)
+        | InverseLink::Standard(StandardLink::InverseSquared)
         | InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -327,10 +353,21 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
+    // Every link of these continuous families has an analytic 5-jet, and the
+    // generic `observed_weight_noncanonical` tower evaluates their observed
+    // information exactly (it reduces to Fisher on the canonical cells). The
+    // Student-t row carries its observed information directly.
     if matches!(
         spec.response,
-        ResponseFamily::Gamma | ResponseFamily::StudentT { .. }
+        ResponseFamily::Gamma | ResponseFamily::InverseGaussian | ResponseFamily::StudentT { .. }
     ) {
+        return true;
+    }
+    // A non-identity Gaussian link is non-canonical: the residual-dependent
+    // correction `(y-μ)·B` is nonzero and the Laplace approximation needs it.
+    if matches!(spec.response, ResponseFamily::Gaussian)
+        && !matches!(inverse_link, InverseLink::Standard(StandardLink::Identity))
+    {
         return true;
     }
     if !matches!(spec.response, ResponseFamily::Binomial) {
@@ -433,81 +470,77 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     // arrays.  Parallel evaluation stays O(n), while the ordered scan below
     // deterministically reports the smallest bad row and guarantees atomic
     // output on error.
-    let certified: Vec<Result<(f64, f64, f64), EstimationError>> = (0..n)
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), EstimationError> {
-            let eta_used = eta[i];
-            if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "prior weight",
-                    eta: eta_used,
-                    value: priorweights[i],
-                });
-            }
-            if priorweights[i] == 0.0 {
-                return Ok((0.0, 0.0, 0.0));
-            }
-            // Every jet and every variance carrier is evaluated at this exact
-            // eta.  A non-representable tail is refused below rather than
-            // projected onto a different Hessian surface.
-            let jet =
-                crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
-            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                inverse_link,
-                eta_used,
-            )?;
-            let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                inverse_link,
-                eta_used,
-                jet.mu,
-            );
-            let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
-                weight_family,
-                weight_link,
-                y[i],
-                jet.mu,
-                one_minus_mu,
-                phi,
-                priorweights[i],
-                jet,
-                h4,
-            );
-            // A *finite* but non-positive observed weight is NOT a failure: the
-            // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
-            // indefinite on individual rows for a non-canonical link (probit,
-            // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
-            // whenever a residual flips the correction's sign.  Signed row
-            // weights are assembled exactly; the matrix-level ridge handles a
-            // non-PD aggregate without modifying these statistical carriers.
-            if !w_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian weight",
-                    eta: eta_used,
-                    value: w_obs,
-                });
-            }
-            if !c_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian dW/deta",
-                    eta: eta_used,
-                    value: c_obs,
-                });
-            }
-            if !d_obs.is_finite() {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "observed Hessian d2W/deta2",
-                    eta: eta_used,
-                    value: d_obs,
-                });
-            }
-            Ok((w_obs, c_obs, d_obs))
-        })
-        .collect();
-    let certified: Vec<(f64, f64, f64)> = certified.into_iter().collect::<Result<_, _>>()?;
+    let certified: Vec<(f64, f64, f64)> = super::par_certified_rows(n, |i| -> Result<(f64, f64, f64), EstimationError> {
+        let eta_used = eta[i];
+        if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "prior weight",
+                eta: eta_used,
+                value: priorweights[i],
+            });
+        }
+        if priorweights[i] == 0.0 {
+            return Ok((0.0, 0.0, 0.0));
+        }
+        // Every jet and every variance carrier is evaluated at this exact
+        // eta.  A non-representable tail is refused below rather than
+        // projected onto a different Hessian surface.
+        let jet =
+            crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
+        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+            inverse_link,
+            eta_used,
+        )?;
+        let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+            inverse_link,
+            eta_used,
+            jet.mu,
+        );
+        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
+            weight_family,
+            weight_link,
+            y[i],
+            jet.mu,
+            one_minus_mu,
+            phi,
+            priorweights[i],
+            jet,
+            h4,
+        );
+        // A *finite* but non-positive observed weight is NOT a failure: the
+        // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
+        // indefinite on individual rows for a non-canonical link (probit,
+        // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
+        // whenever a residual flips the correction's sign.  Signed row
+        // weights are assembled exactly; the matrix-level ridge handles a
+        // non-PD aggregate without modifying these statistical carriers.
+        if !w_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian weight",
+                eta: eta_used,
+                value: w_obs,
+            });
+        }
+        if !c_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian dW/deta",
+                eta: eta_used,
+                value: c_obs,
+            });
+        }
+        if !d_obs.is_finite() {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian d2W/deta2",
+                eta: eta_used,
+                value: d_obs,
+            });
+        }
+        Ok((w_obs, c_obs, d_obs))
+    })?;
     for (i, &(w, c, d)) in certified.iter().enumerate() {
         hessian_weights[i] = w;
         hessian_c[i] = c;
@@ -795,6 +828,7 @@ pub(crate) enum WeightFamily {
     NegativeBinomial { theta: f64 },
     Beta { phi: f64 },
     Gamma,
+    InverseGaussian,
 }
 
 /// Link tag for the observed-information weight dispatch.
@@ -827,6 +861,7 @@ pub(crate) fn variance_jet_for_weight_family(
         WeightFamily::NegativeBinomial { theta } => VarianceJet::negative_binomial(mu, theta),
         WeightFamily::Beta { phi } => VarianceJet::beta(mu, one_minus_mu, phi),
         WeightFamily::Gamma => VarianceJet::gamma(mu),
+        WeightFamily::InverseGaussian => VarianceJet::inverse_gaussian(mu),
     }
 }
 

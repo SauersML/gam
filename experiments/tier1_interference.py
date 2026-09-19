@@ -21,9 +21,9 @@ the only sanctioned reweighting is a soft Sigma_hat estimated from the actual
 (anisotropic) residual. ``demonstrate_qperp_blindness`` below pins the failure.
 
 Two Tier-1 sources are supported:
-  * an atom-lane fit (``gamfit.sparse_dictionary_fit`` -> decoder K x P + sparse
+  * an atom-lane fit (``gamfit.sae.sparse_dictionary_fit`` -> decoder K x P + sparse
     codes): ``interference_subspace_from_atoms``;
-  * a block-lane fit (``gamfit.block_sparse_dictionary_fit`` -> orthonormal block
+  * a block-lane fit (``gamfit.sae.block_sparse_dictionary_fit`` -> orthonormal block
     frames): ``interference_subspace_from_blocks``.
 Both return the same ``InterferenceSubspace``.
 """
@@ -115,7 +115,7 @@ def interference_subspace_from_atoms(
 
 
 def interference_subspace_from_blocks(t1, rank: int | None = None) -> InterferenceSubspace:
-    """From a block-lane fit (``gamfit.BlockSparseDictionaryFit``): the union of
+    """From a block-lane fit (``gamfit.sae.BlockSparseDictionaryFit``): the union of
     the orthonormal block frames ``D_g`` (b x P), each weighted by its utilization
     (the fraction of rows that fire block g), forms the usage-weighted Gram."""
     p = int(t1.decoder.shape[1])

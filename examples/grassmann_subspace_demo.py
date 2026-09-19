@@ -4,7 +4,7 @@ import gamfit
 
 
 def main() -> None:
-    print(gamfit.GrassmannManifold(k=2, n=6).to_json())
+    print(gamfit.geometry.GrassmannManifold(k=2, n=6).to_json())
 
 
 if __name__ == "__main__":

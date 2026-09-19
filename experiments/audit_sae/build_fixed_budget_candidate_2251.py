@@ -2,7 +2,7 @@
 """Train and package the fixed-64 block candidate for issue #2251.
 
 The production math stays in Rust through
-``gamfit.fixed_budget_block_sparse_dictionary_fit``.  This script only loads an
+``gamfit.sae.fixed_budget_block_sparse_dictionary_fit``.  This script only loads an
 independent SAE training corpus, routes the frozen emotion-task tokens, performs
 the task's fixed mean pooling, and appends the resulting arm to the audit archive
 consumed by ``fixed_budget_probe_2251.py``.
@@ -99,7 +99,7 @@ def main() -> int:
 
     import gamfit
 
-    fit = gamfit.fixed_budget_block_sparse_dictionary_fit(
+    fit = gamfit.sae.fixed_budget_block_sparse_dictionary_fit(
         np.ascontiguousarray(train, dtype=np.float32),
         args.n_atoms,
         active=ACTIVE,

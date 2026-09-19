@@ -406,7 +406,7 @@ impl Drop for FaerSequentialScope {
 ///
 /// The depth is what distinguishes "faer is sequential because a solve here
 /// asked for it" from "faer is sequential and nobody knows who did it", and it
-/// is readable without a logger, which `log::info!` is not under `cargo test`.
+/// is readable without a logger, which `log::debug!` is not under `cargo test`.
 pub(crate) fn faer_sequential_scope_depth() -> usize {
     FAER_SEQ_STATE
         .lock()
@@ -3525,7 +3525,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             let eigh_nanos_total = EIGH_NANOS
                 .fetch_add(eigh_elapsed.as_nanos() as u64, Ordering::Relaxed)
                 + eigh_elapsed.as_nanos() as u64;
-            log::debug!(
+            log::trace!(
                 "[eigh] dim={} elapsed={:.3}s faer_parallelism={:?} \
                  calls_so_far={eigh_calls} cumulative={:.3}s",
                 matrix.nrows(),

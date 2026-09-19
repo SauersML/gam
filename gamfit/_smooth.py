@@ -49,10 +49,10 @@ class Smooth(BasisDescriptor):
     Examples
     --------
     >>> import gamfit
-    >>> sm = gamfit.Smooth(
-    ...     latent=gamfit.Circle(),
-    ...     basis=gamfit.PeriodicHarmonic(harmonics=3),
-    ...     penalty=gamfit.ARDPenalty(0.1),
+    >>> sm = gamfit.basis.Smooth(
+    ...     latent=gamfit.topology.Circle(),
+    ...     basis=gamfit.basis.PeriodicHarmonic(harmonics=3),
+    ...     penalty=gamfit.penalties.ARDPenalty(0.1),
     ... )
     >>> phi = sm.evaluate(torch.linspace(0.0, 6.28, 64))   # (64, 7)
     """

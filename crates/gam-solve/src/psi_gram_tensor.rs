@@ -528,7 +528,7 @@ impl PsiGramTensor {
                     if candidate.spot_check(&mut eval_design, weights, z) {
                         candidate.grad_psi_lo = psi_lo;
                         candidate.grad_psi_hi = psi_hi;
-                        log::info!(
+                        log::debug!(
                             "ψ-Gram tensor certified: nodes={m} exact_node_realizations={} window=[{psi_lo:.6}, {psi_hi:.6}]",
                             node_statistics.len(),
                         );

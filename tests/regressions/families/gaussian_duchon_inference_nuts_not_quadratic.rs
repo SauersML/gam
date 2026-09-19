@@ -57,7 +57,7 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
             },
             input_scale: None,
         },
-        shape: ShapeConstraint::None,
+        shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
 }
@@ -146,6 +146,7 @@ fn gaussian_duchon_rho_posterior_inference_is_not_quadratic_in_n() {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![duchon2_smooth("f_pc", centers)],
+        level: Default::default(),
     };
     let weights = Array1::ones(n);
     let offset = Array1::zeros(n);

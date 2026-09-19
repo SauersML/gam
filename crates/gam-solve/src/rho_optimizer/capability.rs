@@ -553,7 +553,7 @@ pub(crate) fn log_plan(context: &str, cap: &OuterCapability, the_plan: &OuterPla
     // tells the user immediately whether ARC, BFGS, EFS, etc. was selected
     // and why. That information is otherwise inferred only from the per-iter
     // log tag prefix once the loop has started.
-    log::info!(
+    log::debug!(
         "[OUTER] {context}: n_params={}, gradient={:?}, hessian={:?} -> {} [{}]{hess_warning}{barrier_note}{hybrid_note}",
         cap.n_params,
         cap.gradient,
@@ -657,7 +657,7 @@ pub(crate) fn primary_capability_for_config(
         // disabled and an analytic gradient available, selecting HybridEFS as
         // the only primary attempt is internally inconsistent; BFGS is the
         // standalone first-order primary for that capability.
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: HybridEFS requires the automatic first-order \
              escape path for ψ coordinates; fallback is disabled, so routing the \
              primary attempt to analytic-gradient BFGS"
@@ -673,7 +673,7 @@ pub(crate) fn primary_capability_for_config(
         // the mint just measured, and restarted inside its own gradient band it
         // stops at iteration 0 (#2939). The declared Hessian takes over the
         // search for the rest of this solve.
-        log::info!(
+        log::debug!(
             "[OUTER] {context}: a certified strict saddle latched the declared analytic \
              Hessian into the search; planning ARC instead of gradient-only BFGS (#2939)"
         );

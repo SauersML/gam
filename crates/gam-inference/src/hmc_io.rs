@@ -34,7 +34,7 @@ use gam_problem::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
     ResolvedLikelihoodScale, ResponseFamily, StandardLink, is_valid_tweedie_power,
 };
-use gam_solve::estimate::reml::FirthDenseOperator;
+use gam_solve::estimate::reml::{FirthDenseOperator, JeffreysHalfLogDet};
 use gam_solve::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
 use gam_solve::model_types::InferenceCovarianceMode;
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -95,11 +95,32 @@ pub enum HmcError {
     /// Sampling produced no usable output (empty kept set, non-finite
     /// summary statistic, etc.).
     SamplingFailed { reason: String },
+    /// The Jeffreys Metropolis step of Pólya-Gamma Gibbs accepted so few of
+    /// the draw phase's proposals that the draws hold at most `accepted +
+    /// chains` distinct coefficient vectors, no more than the ESS target
+    /// `min_ess`, while accepting every proposal would have exceeded it: the
+    /// rejections alone keep these draws from describing the posterior.
+    JeffreysProposalsStarved {
+        accepted: usize,
+        proposals: usize,
+        chains: usize,
+        min_ess: f64,
+    },
 }
 
 impl fmt::Display for HmcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HmcError::JeffreysProposalsStarved {
+                accepted,
+                proposals,
+                chains,
+                min_ess,
+            } => write!(
+                f,
+                "Pólya-Gamma Gibbs under the Jeffreys prior accepted {accepted} of {proposals} proposals: its {chains} chains hold at most {} distinct coefficient vectors, which cannot carry the effective sample size {min_ess} the draws must exceed",
+                accepted + chains
+            ),
             HmcError::NonFiniteState { reason }
             | HmcError::InvalidConfig { reason }
             | HmcError::DimensionMismatch { reason }
@@ -827,7 +848,7 @@ impl NutsPosterior {
         let (ll, mut grad_ll_beta) = match self.family_logp_and_grad_into(&eta, residual) {
             Ok(value) => value,
             Err(error) => {
-                log::warn!("[NUTS] likelihood target is unrepresentable: {error}");
+                log::debug!("[NUTS] likelihood target is unrepresentable: {error}");
                 grad.fill(0.0);
                 return f64::NEG_INFINITY;
             }
@@ -841,7 +862,7 @@ impl NutsPosterior {
                     grad_ll_beta += &grad_beta_firth;
                 }
                 Err(err) => {
-                    log::warn!(
+                    log::debug!(
                         "[NUTS/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
@@ -1115,7 +1136,7 @@ mod tests {
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use crate::sample::PosteriorSampler;
     use gam_solve::model_types::InferenceCovarianceMode;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array1, Array2, Axis, array};
     use std::sync::Arc;
 
     #[test]
@@ -1934,6 +1955,7 @@ mod tests {
             w.view(),
             penalty.view(),
             mode.view(),
+            false,
             &cfg,
         )
         .expect("pg gibbs should run");
@@ -1959,6 +1981,106 @@ mod tests {
             posterior_nll < zero_nll,
             "posterior mean must discriminate the planted binary responses: {posterior_nll} !< {zero_nll}"
         );
+    }
+
+    /// Under the Jeffreys prior the Pólya-Gamma kernel is exact: on completely
+    /// separated data (whose flat-prior posterior is improper) its draws must
+    /// reproduce the means and quantiles of `exp(loglik) · |XᵀWX|^½`, computed by
+    /// dense quadrature, within Monte Carlo error, and report how many
+    /// proposals it accepted.
+    #[test]
+    fn logit_pg_gibbs_under_jeffreys_prior_matches_quadrature() {
+        let xs = [-2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0];
+        let x = Array2::from_shape_fn((xs.len(), 2), |(i, j)| if j == 0 { 1.0 } else { xs[i] });
+        let y = Array1::from_iter(xs.iter().map(|v| if *v > 0.0 { 1.0 } else { 0.0 }));
+        let w = Array1::<f64>::ones(xs.len());
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let mode = array![0.0, 3.0];
+        let cfg = NutsConfig {
+            n_samples: 4000,
+            target_accept: 0.8,
+            seed: 20_260_919,
+        };
+        let out = run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            w.view(),
+            penalty.view(),
+            mode.view(),
+            true,
+            &cfg,
+        )
+        .expect("Jeffreys PG Gibbs should run on separated data");
+        let rate = out
+            .sampler
+            .acceptance_rate()
+            .expect("the Jeffreys kernel reports its acceptance rate");
+        assert!(rate > 0.0 && rate <= 1.0, "acceptance rate {rate}");
+        assert_eq!(out.sampler.label(), "polya-gamma-jeffreys");
+        assert!(out.sampler.targets_exact_posterior());
+        assert!(out.converged, "rhat {} ess {}", out.rhat, out.ess);
+
+        // Quadrature reference on a grid wide enough that the dropped tail
+        // mass is far below the Monte Carlo error.
+        let (lo0, hi0, lo1, hi1, cells) = (-40.0, 40.0, -6.0, 70.0, 800usize);
+        let axis = |lo: f64, hi: f64| {
+            Array1::from_iter((0..cells).map(|k| lo + (hi - lo) * (k as f64 + 0.5) / cells as f64))
+        };
+        let (g0, g1) = (axis(lo0, hi0), axis(lo1, hi1));
+        let mut log_density = Array2::<f64>::zeros((cells, cells));
+        for (a, b0) in g0.iter().enumerate() {
+            for (b, b1) in g1.iter().enumerate() {
+                let (mut loglik, mut i00, mut i01, mut i11) = (0.0, 0.0, 0.0, 0.0);
+                for (xi, yi) in xs.iter().zip(y.iter()) {
+                    let eta = b0 + b1 * xi;
+                    loglik += yi * eta - gam_linalg::utils::stable_softplus(eta);
+                    let mu = 1.0 / (1.0 + (-eta).exp());
+                    let wi = mu * (1.0 - mu);
+                    i00 += wi;
+                    i01 += wi * xi;
+                    i11 += wi * xi * xi;
+                }
+                log_density[[a, b]] = loglik + 0.5 * (i00 * i11 - i01 * i01).ln();
+            }
+        }
+        let peak = log_density.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mass = log_density.mapv(|v| (v - peak).exp());
+        let total = mass.sum();
+        let marginals = [mass.sum_axis(Axis(1)) / total, mass.sum_axis(Axis(0)) / total];
+        let grids = [g0, g1];
+
+        let ess = out.ess;
+        for coefficient in 0..2 {
+            let (marginal, grid) = (&marginals[coefficient], &grids[coefficient]);
+            let draws = out.samples.column(coefficient);
+            let reference_mean = marginal.dot(grid);
+            let reference_sd = (marginal.dot(&grid.mapv(|v| (v - reference_mean).powi(2)))).sqrt();
+            let mc_se = reference_sd / ess.sqrt();
+            let sampled_mean = draws.mean().expect("draws are non-empty");
+            assert!(
+                (sampled_mean - reference_mean).abs() <= 4.0 * mc_se,
+                "coefficient {coefficient}: sampled mean {sampled_mean} vs quadrature {reference_mean} (MC SE {mc_se})"
+            );
+            let mut cumulative = 0.0;
+            let mut quantiles = [(0.1, f64::NAN), (0.5, f64::NAN), (0.9, f64::NAN)];
+            for (weight, point) in marginal.iter().zip(grid.iter()) {
+                cumulative += weight;
+                for (level, value) in quantiles.iter_mut() {
+                    if value.is_nan() && cumulative >= *level {
+                        *value = *point;
+                    }
+                }
+            }
+            for (level, reference_quantile) in quantiles {
+                let below = draws.iter().filter(|v| **v <= reference_quantile).count() as f64
+                    / draws.len() as f64;
+                let quantile_se = (level * (1.0 - level) / ess).sqrt();
+                assert!(
+                    (below - level).abs() <= 4.0 * quantile_se,
+                    "coefficient {coefficient}: {below} of draws fall below the quadrature {level}-quantile {reference_quantile} (MC SE {quantile_se})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2305,6 +2427,7 @@ mod tests {
             weights.view(),
             penalty.view(),
             mode.view(),
+            false,
             &zero_sample_cfg,
         )
         .expect_err("PG Gibbs must reject zero samples up front, not return an empty posterior");
@@ -3014,11 +3137,21 @@ mod tests {
             lambdas: array![2.0, 0.5],
             a: 0.05,
         };
-        let cases: [(&dyn Fn(usize) -> super::BlockQuadratureMarginal, (f64, Array1<f64>), usize, [usize; 3]); 2] = [
+        let cases: [(
+            &dyn Fn(usize) -> super::BlockQuadratureMarginal,
+            (f64, Array1<f64>),
+            usize,
+            [usize; 3],
+        ); 2] = [
             (
                 &|chunk| {
-                    super::block_quadrature_marginal_correction_in_chunks(&anharmonic, &[4, 5], chunk)
-                        .expect("anharmonic rule")
+                    super::block_quadrature_marginal_correction_in_chunks(
+                        &anharmonic,
+                        &[4, 5],
+                        chunk,
+                        None,
+                    )
+                    .expect("anharmonic rule")
                 },
                 materialized_fine_rule(&anharmonic, &[4, 5]),
                 20,
@@ -3026,8 +3159,13 @@ mod tests {
             ),
             (
                 &|chunk| {
-                    super::block_quadrature_marginal_correction_in_chunks(&matvec, &[3, 4, 2], chunk)
-                        .expect("matvec rule")
+                    super::block_quadrature_marginal_correction_in_chunks(
+                        &matvec,
+                        &[3, 4, 2],
+                        chunk,
+                        None,
+                    )
+                    .expect("matvec rule")
                 },
                 materialized_fine_rule(&matvec, &[3, 4, 2]),
                 24,
@@ -3065,10 +3203,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn certified_orders_integrate_the_fine_rule_the_measured_path_does_784() {
+        // A latched admission evaluates at certified orders: the fine rule alone,
+        // carrying the admission's paired errors. Value, gradient and moments must
+        // be bit for bit the measured path's, since the paired lower rules never
+        // enter them, and the certificate must be the one handed in.
+        use gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector;
+        let target = AnharmonicBlock {
+            lambdas: array![2.0, 1.0, 0.5],
+            a: 0.05,
+        };
+        let orders = [5usize, 4, 6];
+        let corrector = super::HmcIoLaplaceMarginalCorrector;
+        let measured = corrector
+            .block_quadrature_marginal_correction(&target, &orders)
+            .expect("measured rule");
+        let admission_errors = [3.0e-9, 0.0, 7.5e-10];
+        let certified = corrector
+            .block_quadrature_marginal_correction_at_certified_orders(
+                &target,
+                &orders,
+                &admission_errors,
+            )
+            .expect("certified rule");
+        assert_eq!(certified.axis_orders, measured.axis_orders);
+        assert_eq!(certified.node_count, measured.node_count);
+        assert_bitwise_equal("value", &[certified.value], &[measured.value]);
+        assert_bitwise_equal(
+            "rho gradient",
+            certified.rho_gradient.as_slice().expect("contiguous"),
+            measured.rho_gradient.as_slice().expect("contiguous"),
+        );
+        let certified_moments = certified.moments.as_ref().expect("certified moments");
+        let measured_moments = measured.moments.as_ref().expect("measured moments");
+        for ((name, channel), (reference_name, reference)) in moment_channels(certified_moments)
+            .into_iter()
+            .zip(moment_channels(measured_moments))
+        {
+            assert_eq!(name, reference_name);
+            assert_bitwise_equal(&format!("certified {name}"), &channel, &reference);
+        }
+        assert_bitwise_equal(
+            "axis errors",
+            &certified.axis_quadrature_errors,
+            &admission_errors,
+        );
+        assert_bitwise_equal("quadrature error", &[certified.quadrature_error], &[3.0e-9]);
+        assert!(
+            corrector
+                .block_quadrature_marginal_correction_at_certified_orders(&target, &orders, &[1e-9])
+                .is_err(),
+            "a certificate must name one error per axis"
+        );
+    }
+
     /// A corrector that integrates with the standard rule and records every step the
     /// order search publishes.
     struct RecordingCorrector {
-        steps: std::sync::Mutex<Vec<gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep>>,
+        steps:
+            std::sync::Mutex<Vec<gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep>>,
     }
     impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector for RecordingCorrector {
         fn directional_cubic_diagnostic(
@@ -4299,6 +4493,12 @@ pub enum PosteriorSampler {
     /// Pólya-Gamma Gibbs on the exact Bernoulli-logit posterior; `rhat` /
     /// `ess` are measured.
     PolyaGammaGibbs,
+    /// Pólya-Gamma Gibbs on the exact Bernoulli-logit posterior under the
+    /// Jeffreys prior `|I(β)|^½`: each coefficient step proposes from the
+    /// Pólya-Gamma conditional and accepts with probability
+    /// `min(1, |I(β')|^½ / |I(β)|^½)`. The counts are the draw phase's
+    /// accepted proposals out of its proposals; `rhat` / `ess` are measured.
+    PolyaGammaJeffreysMetropolis { accepted: usize, proposals: usize },
     /// Independent draws from the Gaussian (Laplace) posterior
     /// approximation, including its exact rejection-truncated and
     /// latent-chart forms; `rhat = 1.0` and `ess = n_draws` hold by
@@ -4321,9 +4521,26 @@ impl PosteriorSampler {
         match self {
             Self::Nuts => "nuts",
             Self::PolyaGammaGibbs => "polya-gamma",
+            Self::PolyaGammaJeffreysMetropolis { .. } => "polya-gamma-jeffreys",
             Self::Laplace => "laplace",
             Self::TruncatedLaplaceHmc => "truncated-laplace",
             Self::ConjugateGaussian => "conjugate-gaussian",
+        }
+    }
+
+    /// The fraction of Metropolis proposals the draws accepted, for the
+    /// samplers that make an accept/reject decision per draw.
+    pub fn acceptance_rate(self) -> Option<f64> {
+        match self {
+            Self::PolyaGammaJeffreysMetropolis {
+                accepted,
+                proposals,
+            } => Some(accepted as f64 / proposals as f64),
+            Self::Nuts
+            | Self::PolyaGammaGibbs
+            | Self::Laplace
+            | Self::TruncatedLaplaceHmc
+            | Self::ConjugateGaussian => None,
         }
     }
 
@@ -4333,7 +4550,10 @@ impl PosteriorSampler {
     /// is an approximation, however its draws are produced.
     pub const fn targets_exact_posterior(self) -> bool {
         match self {
-            Self::Nuts | Self::PolyaGammaGibbs | Self::ConjugateGaussian => true,
+            Self::Nuts
+            | Self::PolyaGammaGibbs
+            | Self::PolyaGammaJeffreysMetropolis { .. }
+            | Self::ConjugateGaussian => true,
             Self::Laplace | Self::TruncatedLaplaceHmc => false,
         }
     }
@@ -4559,12 +4779,21 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
 ///
 /// For weighted data, this implementation is defined for weights ≈ 1.0 because it
 /// samples PG(1,·) latent variables.
+///
+/// With `jeffreys_prior` the target carries the extra factor `|I(β)|^½` of a
+/// Firth/Jeffreys fit. It does not involve ω, so step 1 is unchanged, and
+/// `β | ω, y ∝ N(β; Q^{-1} b, Q^{-1}) · |I(β)|^½`. Step 2 then proposes
+/// `β' ~ N(Q^{-1} b, Q^{-1})` and accepts it with probability
+/// `min(1, |I(β')|^½ / |I(β)|^½)`: the proposal density cancels the Gaussian
+/// factor exactly, so this Metropolis-within-Gibbs kernel leaves the Jeffreys
+/// posterior invariant with no step size to tune.
 pub(crate) fn run_logit_polya_gamma_gibbs(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     weights: ArrayView1<f64>,
     penalty_matrix: ArrayView2<f64>,
     mode: ArrayView1<f64>,
+    jeffreys_prior: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     let n = x.nrows();
@@ -4611,10 +4840,26 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
     let mut mean = Array1::<f64>::zeros(p);
     let mut z = Array1::<f64>::zeros(p);
     let mut noise = Array1::<f64>::zeros(p);
+    let mut proposal = Array1::<f64>::zeros(p);
 
-    // Per chain: the coefficients, the normal-draw stream, and the sweep counter
-    // that seeds the Pólya-Gamma stream.
-    let mut chains: Vec<(Array1<f64>, StdRng, usize)> = (0..NUTS_CHAINS)
+    let jeffreys = if jeffreys_prior {
+        Some(
+            JeffreysHalfLogDet::new(&InverseLink::Standard(StandardLink::Logit), &x.to_owned())
+                .map_err(|e| format!("Jeffreys prior design factor failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let half_log_jeffreys = |beta: &Array1<f64>| -> Result<f64, String> {
+        match &jeffreys {
+            Some(density) => density
+                .at(&gam_linalg::faer_ndarray::fast_av(&x, beta))
+                .map_err(|e| format!("Jeffreys prior evaluation failed: {e}")),
+            None => Ok(0.0),
+        }
+    };
+
+    let mut chains = (0..NUTS_CHAINS)
         .map(|chain| {
             let mut init_rng =
                 StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xB3C4_5A1F_8E9D_7632));
@@ -4625,13 +4870,26 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
             for j in 0..p {
                 beta[j] += 0.05 * sample_standard_normal(&mut init_rng);
             }
-            (beta, draw_rng, 0)
+            let half_log_jeffreys = half_log_jeffreys(&beta)?;
+            Ok(PolyaGammaChain {
+                beta,
+                draw_rng,
+                sweeps: 0,
+                half_log_jeffreys,
+                accepted: 0,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     // One Gibbs sweep of a chain: ω | β, then β | ω.
-    let mut sweep = |chain: usize, state: &mut (Array1<f64>, StdRng, usize)| -> Result<(), String> {
-        let (beta, draw_rng, iter) = state;
+    let mut sweep = |chain: usize, state: &mut PolyaGammaChain| -> Result<(), String> {
+        let PolyaGammaChain {
+            beta,
+            draw_rng,
+            sweeps: iter,
+            half_log_jeffreys: current_half_log_jeffreys,
+            accepted,
+        } = state;
         eta.assign(&gam_linalg::faer_ndarray::fast_av(&x, &*beta));
         draw_logit_pg1_omega(
             pg_shapes.view(),
@@ -4667,7 +4925,18 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         }
         let l = factor.lower_triangular();
         back_substitution_lower_transpose_guarded_into(&l, &z, &mut noise);
-        beta.assign(&(&mean + &noise));
+        proposal.assign(&(&mean + &noise));
+        if jeffreys.is_some() {
+            let proposal_half_log_jeffreys = half_log_jeffreys(&proposal)?;
+            let log_ratio = proposal_half_log_jeffreys - *current_half_log_jeffreys;
+            if draw_rng.random::<f64>().ln() < log_ratio {
+                beta.assign(&proposal);
+                *current_half_log_jeffreys = proposal_half_log_jeffreys;
+                *accepted += 1;
+            }
+        } else {
+            beta.assign(&proposal);
+        }
         *iter += 1;
         Ok(())
     };
@@ -4684,7 +4953,7 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         for (chain, state) in chains.iter_mut().enumerate() {
             for t in 0..window_len {
                 sweep(chain, state)?;
-                window.slice_mut(ndarray::s![chain, t, ..]).assign(&state.0);
+                window.slice_mut(ndarray::s![chain, t, ..]).assign(&state.beta);
             }
         }
         burn_in += window_len;
@@ -4724,13 +4993,40 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
 
     let mut samples_array = Array3::<f64>::zeros((NUTS_CHAINS, config.n_samples, p));
     for (chain, state) in chains.iter_mut().enumerate() {
+        state.accepted = 0;
         for s in 0..config.n_samples {
             sweep(chain, state)?;
             samples_array
                 .slice_mut(ndarray::s![chain, s, ..])
-                .assign(&state.0);
+                .assign(&state.beta);
         }
     }
+    let sampler = if jeffreys_prior {
+        let accepted = chains.iter().map(|state| state.accepted).sum::<usize>();
+        let proposals = NUTS_CHAINS * config.n_samples;
+        // The coefficients move only on acceptance, so each chain's draws are
+        // at most `1 + accepted` distinct vectors. When that caps them at or
+        // below the ESS target although accepting every proposal would not,
+        // the rejection rate is provably too low for these draws.
+        let distinct_bound = (accepted + NUTS_CHAINS) as f64;
+        if distinct_bound <= NUTS_CONVERGENCE.min_ess
+            && (proposals + NUTS_CHAINS) as f64 > NUTS_CONVERGENCE.min_ess
+        {
+            return Err(HmcError::JeffreysProposalsStarved {
+                accepted,
+                proposals,
+                chains: NUTS_CHAINS,
+                min_ess: NUTS_CONVERGENCE.min_ess,
+            }
+            .into());
+        }
+        PosteriorSampler::PolyaGammaJeffreysMetropolis {
+            accepted,
+            proposals,
+        }
+    } else {
+        PosteriorSampler::PolyaGammaGibbs
+    };
 
     let total_samples = NUTS_CHAINS * config.n_samples;
     let mut samples = Array2::<f64>::zeros((total_samples, p));
@@ -4757,9 +5053,21 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         ess,
         converged: mixing_converged(rhat, ess),
         warmup_transitions: burn_in,
-        sampler: PosteriorSampler::PolyaGammaGibbs,
+        sampler,
         covariance: InferenceCovarianceMode::Conditional,
     })
+}
+
+/// One Pólya-Gamma Gibbs chain: its coefficients, its normal- and
+/// uniform-draw stream, the sweep counter that seeds its Pólya-Gamma stream,
+/// the Jeffreys log-density `½ log|I(β)|` at `beta` (zero without the prior),
+/// and the proposals it has accepted since the counter was last reset.
+struct PolyaGammaChain {
+    beta: Array1<f64>,
+    draw_rng: StdRng,
+    sweeps: usize,
+    half_log_jeffreys: f64,
+    accepted: usize,
 }
 
 /// Runs NUTS sampling using general-mcmc with whitened parameter space.
@@ -4825,7 +5133,7 @@ pub(crate) fn run_nuts_sampling(
         "NUTS sampling failed",
         Array1::zeros(dim),
     )?;
-    log::info!("NUTS sampling complete: {}", run_stats);
+    log::debug!("NUTS sampling complete: {}", run_stats);
 
     Ok(result)
 }
@@ -5097,7 +5405,7 @@ where
         "rho-posterior NUTS sampling failed",
         mode.clone(),
     )?;
-    log::info!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
+    log::debug!("rho-posterior NUTS (#938 tier 2): sampling complete dim={dim} {run_stats}");
     Ok(result)
 }
 
@@ -5254,17 +5562,17 @@ pub fn run_nuts_sampling_flattened_family(
             // The Pólya-Gamma augmentation here assumes η = Xβ (no offset); an
             // offset model routes to NUTS, which carries the offset through
             // `glm.offset` (#882). PG-with-offset is a valid but separate scheme
-            // we deliberately do not duplicate.
-            if !glm.firth_bias_reduction
-                && glm.offset.is_none()
-                && glm.weights.iter().all(|w| *w == 1.0)
-            {
+            // we deliberately do not duplicate. A Firth/Jeffreys fit keeps the
+            // same Gibbs kernel with an exact Metropolis correction for
+            // `|I(β)|^½`.
+            if glm.offset.is_none() && glm.weights.iter().all(|w| *w == 1.0) {
                 run_logit_polya_gamma_gibbs(
                     glm.x,
                     glm.y,
                     glm.weights,
                     glm.penalty_matrix,
                     glm.mode,
+                    glm.firth_bias_reduction,
                     config,
                 )
             } else {
@@ -5487,6 +5795,9 @@ pub fn run_nuts_sampling_flattened_family(
         ),        (ResponseFamily::StudentT { .. }, _, FamilyNutsInputs::Glm(_)) => Err(
             "NUTS sampling is not implemented for the Student-t response family".to_string(),
         ),
+        (ResponseFamily::InverseGaussian, _, FamilyNutsInputs::Glm(_)) => {
+            Err("NUTS sampling is not implemented for the inverse-Gaussian family".to_string())
+        }
     }
 }
 
@@ -6020,11 +6331,26 @@ impl gam_problem::laplace_sampler_contract::LaplaceMarginalCorrector
         block_quadrature_marginal_correction(target, axis_orders)
     }
 
+    /// The fine rule alone: the admission's paired errors are the certificate.
+    fn block_quadrature_marginal_correction_at_certified_orders(
+        &self,
+        target: &dyn BlockExcessTarget,
+        axis_orders: &[usize],
+        certified_axis_errors: &[f64],
+    ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
+        block_quadrature_marginal_correction_in_chunks(
+            target,
+            axis_orders,
+            usize::MAX,
+            Some(certified_axis_errors),
+        )
+    }
+
     fn publish_order_search_step(
         &self,
         step: &gam_problem::laplace_sampler_contract::BlockQuadratureOrderStep,
     ) {
-        log::info!("[#784] block quadrature order search: {step}");
+        log::debug!("[#784] block quadrature order search: {step}");
     }
 
     /// `block_quadrature_marginal_correction` refuses the order past this one as
@@ -6200,17 +6526,22 @@ pub fn block_quadrature_marginal_correction<T: BlockExcessTarget + ?Sized>(
     target: &T,
     axis_orders: &[usize],
 ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
-    block_quadrature_marginal_correction_in_chunks(target, axis_orders, usize::MAX)
+    block_quadrature_marginal_correction_in_chunks(target, axis_orders, usize::MAX, None)
 }
 
 /// [`block_quadrature_marginal_correction`] with at most `chunk_limit` nodes per
 /// target batch. The accumulators run node by node in the rule's order whatever the
 /// chunk, so the limit decides only how much of the rule is live at once. Production
 /// passes `usize::MAX` and lets the memory governor decide.
+///
+/// `certified_axis_errors` is `None` to measure each axis's paired-rule error, or the
+/// errors an admission already certified at these orders: the fine rule is then the
+/// only rule built and integrated, and those errors are returned as its certificate.
 fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
     target: &T,
     axis_orders: &[usize],
     chunk_limit: usize,
+    certified_axis_errors: Option<&[f64]>,
 ) -> Result<BlockQuadratureMarginal, BlockQuadratureRefusal> {
     use BlockQuadratureRefusal::Integration;
     let m = target.block_dim();
@@ -6233,6 +6564,15 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             reservation_bytes: 0,
             moments: None,
         });
+    }
+    if let Some(errors) = certified_axis_errors
+        && errors.len() != m
+    {
+        return Err(Integration(format!(
+            "block_quadrature_marginal_correction: {} certified axis errors for a {m}-direction \
+             block",
+            errors.len()
+        )));
     }
     let lambdas = target.block_curvatures();
     if lambdas.len() != m {
@@ -6272,8 +6612,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
         log_rules.push(log_weight_gh_rule(rule));
     }
     // Each axis's lower rules for its paired difference: one order lower, then two.
+    // Certified orders need none.
     let mut lower_rules: Vec<Vec<(usize, Vec<(f64, f64)>)>> = Vec::with_capacity(m);
-    for &order in axis_orders {
+    for &order in axis_orders
+        .iter()
+        .filter(|_| certified_axis_errors.is_none())
+    {
         let mut lower = Vec::new();
         for lower_order in (order.saturating_sub(2).max(1)..order).rev() {
             let rule = gam_math::quadrature::standard_normal_gauss_hermite_rule(lower_order)
@@ -6472,7 +6816,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // while the same-parity rule two orders lower tracks each sequence. Each
     // difference is in the same log-marginal units as Δ_b and is deterministic
     // across rho. An axis at order one has no lower rule, so nothing certifies it.
-    let mut axis_quadrature_errors = Vec::with_capacity(m);
+    let mut axis_quadrature_errors =
+        certified_axis_errors.map_or_else(|| Vec::with_capacity(m), <[f64]>::to_vec);
     for (axis, lower) in lower_rules.iter().enumerate() {
         let order = axis_orders[axis];
         if order < 2 {
@@ -6709,7 +7054,7 @@ mod survival_hmc {
             match self.compute_logp_and_grad_into(position, grad) {
                 Ok(logp) => logp,
                 Err(e) => {
-                    log::warn!("Survival posterior evaluation failed: {}", e);
+                    log::debug!("Survival posterior evaluation failed: {}", e);
                     grad.fill(0.0);
                     f64::NEG_INFINITY
                 }
@@ -6783,7 +7128,7 @@ mod survival_hmc {
             Array1::zeros(dim),
         )?;
 
-        log::info!("Survival NUTS sampling complete: {}", run_stats);
+        log::debug!("Survival NUTS sampling complete: {}", run_stats);
 
         Ok(result)
     }

@@ -299,14 +299,14 @@ pub mod smooth {
         CurvatureInference, FittedTermCollectionWithSpec, SmoothLrCorrection,
         SmoothLrProfiledScale, SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelection,
         SmoothLrPValue, SmoothLrSelectionDecline, SmoothLrUnavailable, SmoothTermLrInference,
-        SmoothTermLrReport, SpatialLengthScaleOptimizationTiming,
+        SmoothTermLrReport, SmoothTermLrUnavailable, SpatialLengthScaleOptimizationTiming,
         build_term_collection_designs_and_freeze_joint, build_term_collection_designs_joint,
         curvature_inference_forspec, fit_term_collection_forspec,
         fit_term_collection_with_coefficient_groups,
         fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
         fit_term_collection_with_penalty_block_gamma_priors,
         fit_term_collectionwith_spatial_length_scale_optimization, get_constant_curvature_kappa,
-        smooth_term_lr_inference_forspec,
+        smooth_term_lr_inference_forspec, smooth_term_lr_unavailable_forspec,
     };
 }
 
