@@ -120,8 +120,9 @@ mutually exclusive.
 ## Removing the intercept {#removing-the-intercept}
 
 ```
-y ~ 0 + x                 # regression through the origin
+y ~ 0 + x                 # regression through the origin (penalized slope)
 y ~ x - 1                 # the same model
+y ~ 0 + linear(x, double_penalty=false)   # unpenalized: OLS through the origin
 y ~ 0 + g                 # cell means: one unpenalized coefficient per level of g
 y ~ 0 + s(x) + s(z)       # s(x) carries the level; s(z) stays centred
 ```
@@ -150,8 +151,13 @@ Without it the level moves to one term, chosen by this rule:
 A random effect (`group(g)`, `re(g)`, `s(g, bs="re")`) never carries the
 level: its levels are mean-zero deviations. When no term can carry it, the
 model has no constant at all and every effect passes through the origin,
-exactly as a parametric no-intercept fit does — `y ~ 0 + x` gives the
-least-squares slope through the origin.
+exactly as a parametric no-intercept fit does. `y ~ 0 + linear(x,
+double_penalty=false)` is ordinary least squares through the origin, to
+rounding. The default `y ~ 0 + x` also passes through the origin, but its
+slope carries the same REML-selected shrinkage ridge as `x` in `y ~ x`
+(see [Linear and constrained coefficients](#linear-and-constrained-coefficients)),
+so it sits slightly toward zero from the least-squares slope when the data
+support shrinkage.
 
 ## Random effects and factor smooths
 

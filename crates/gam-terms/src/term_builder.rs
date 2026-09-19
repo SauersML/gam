@@ -152,6 +152,8 @@ impl std::fmt::Display for TermBuilderError {
     }
 }
 
+impl std::error::Error for TermBuilderError {}
+
 impl From<TermBuilderError> for String {
     fn from(err: TermBuilderError) -> String {
         err.to_string()

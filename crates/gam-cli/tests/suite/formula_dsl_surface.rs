@@ -85,18 +85,36 @@ fn zero_plus_x_is_least_squares_through_the_origin() {
     }
     let slope = x.iter().zip(&y).map(|(a, b)| a * b).sum::<f64>() / x.iter().map(|a| a * a).sum::<f64>();
 
-    for formula in ["y ~ 0 + x", "y ~ x - 1"] {
+    // An unpenalized slope with the intercept removed is exactly OLS through
+    // the origin; both spellings of intercept removal lower to that model.
+    for formula in [
+        "y ~ 0 + linear(x, double_penalty=false)",
+        "y ~ linear(x, double_penalty=false) - 1",
+    ] {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let fitted = fit_and_predict(scratch.path(), &csv, formula);
         assert_eq!(fitted.len(), x.len());
         for (xi, fi) in x.iter().zip(&fitted) {
             let ols = slope * xi;
             assert!(
-                (fi - ols).abs() <= 1e-6 * (1.0 + ols.abs()),
+                (fi - ols).abs() <= 1e-9 * (1.0 + ols.abs()),
                 "`{formula}` at x={xi}: fitted {fi} vs origin least squares {ols}"
             );
         }
     }
+
+    // The default penalized slope keeps its REML shrinkage ridge, but the
+    // fit still has no constant: every fitted value is one slope times x.
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let fitted = fit_and_predict(scratch.path(), &csv, "y ~ 0 + x");
+    let ratio = fitted[0] / x[0];
+    for (xi, fi) in x.iter().zip(&fitted) {
+        assert!(
+            (fi - ratio * xi).abs() <= 1e-9 * (1.0 + fi.abs()),
+            "`y ~ 0 + x` at x={xi}: fitted {fi} is not proportional to x (slope {ratio})"
+        );
+    }
+    assert!(ratio > 0.0 && ratio <= slope * (1.0 + 1e-12), "slope {ratio} vs OLS {slope}");
 }
 
 #[test]

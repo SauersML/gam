@@ -116,6 +116,14 @@ pub enum WorkflowError {
         similar: Vec<String>,
         tsv_hint: bool,
     },
+    /// A formula term could not be built as written: a malformed or unknown
+    /// option (`s(x, k=ten)`, `penalty_order` above the degree), a `domain=`
+    /// that excludes the data, or data degenerate for the requested basis.
+    /// The source keeps the builder's category and the `in term ...:` label
+    /// so front ends raise it as a formula-authoring error.
+    TermBuilder {
+        source: gam_terms::term_builder::TermBuilderError,
+    },
     /// A marginal-slope fit named a link its probit-only kernel cannot fit.
     MarginalSlopeLink {
         context: &'static str,
@@ -149,6 +157,7 @@ impl std::fmt::Display for WorkflowError {
                  centers: the {attempted_centers}-center certification refit failed ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
+            WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
             // Reconstruct the display text from the structured payload so
             // CLI / `to_string()` consumers see the same prose the legacy
             // `missing_column_message` produced. The text is a function of
@@ -223,6 +232,7 @@ impl std::error::Error for WorkflowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WorkflowError::FormulaDsl { source, .. } => Some(source),
+            WorkflowError::TermBuilder { source } => Some(source),
             // Renders exactly its failure, so it is transparent to the chain.
             WorkflowError::Fit(failure) => failure.source(),
             WorkflowError::InvalidConfig { .. }
@@ -276,6 +286,7 @@ impl WorkflowError {
             | Self::MissingDependency { .. }
             | Self::InvalidData { .. }
             | Self::FormulaDsl { .. }
+            | Self::TermBuilder { .. }
             | Self::ColumnNotFound { .. }
             // A marginal-slope link the fit cannot declare: a configuration refusal.
             | Self::MarginalSlopeLink { .. }
@@ -304,6 +315,7 @@ impl WorkflowError {
             Self::MissingDependency { .. } => "WorkflowError::MissingDependency",
             Self::InvalidData { .. } => "WorkflowError::InvalidData",
             Self::FormulaDsl { .. } => "WorkflowError::FormulaDsl",
+            Self::TermBuilder { .. } => "WorkflowError::TermBuilder",
             Self::ColumnNotFound { .. } => "WorkflowError::ColumnNotFound",
             Self::MarginalSlopeLink { .. } => "WorkflowError::MarginalSlopeLink",
             Self::TransformationNormalConflict { .. } => {
@@ -1076,9 +1088,11 @@ impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError 
 /// preserves the structured fields (name, role, available, similar,
 /// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
 /// `gamfit.ColumnNotFoundError` with attributes set from the payload —
-/// not from re-parsed prose. Other variants degrade into the closest
-/// generic workflow bucket; the dedicated typed channels for those
-/// failure classes can be added incrementally as their dispatch arrives.
+/// not from re-parsed prose. Column-resolution failures keep the schema
+/// bucket (and its "same columns as training" advice); every term-authoring
+/// failure (bad option, incompatible configuration, unsupported feature,
+/// data degenerate for the basis) stays a typed `TermBuilder` error so the
+/// boundary raises it as a formula error.
 impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
     fn from(err: gam_terms::term_builder::TermBuilderError) -> Self {
         use gam_terms::term_builder::TermBuilderError;
@@ -1098,10 +1112,10 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
             },
             TermBuilderError::MissingColumn { reason }
             | TermBuilderError::MalformedFormula { reason } => Self::SchemaMismatch { reason },
-            TermBuilderError::IncompatibleConfig { reason }
-            | TermBuilderError::InvalidOption { reason }
-            | TermBuilderError::UnsupportedFeature { reason }
-            | TermBuilderError::DegenerateData { reason } => Self::InvalidConfig { reason },
+            source @ (TermBuilderError::IncompatibleConfig { .. }
+            | TermBuilderError::InvalidOption { .. }
+            | TermBuilderError::UnsupportedFeature { .. }
+            | TermBuilderError::DegenerateData { .. }) => Self::TermBuilder { source },
         }
     }
 }
