@@ -287,7 +287,8 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         }),
     );
     if has_reference {
-        // Reference-grid discrepancies evaluated at fixed coefficients.
+        // The reference grid's fixed-coefficient moves and its certificate,
+        // in posterior standard deviations.
         summary.insert(
             "reference_refinements".to_string(),
             json!(fit.reference_refinements),

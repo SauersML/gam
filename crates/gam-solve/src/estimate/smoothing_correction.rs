@@ -252,20 +252,6 @@ pub(crate) struct RhoSensitivitySpectrum {
 }
 
 impl RhoSensitivitySpectrum {
-    /// First-order variance direction `index` contributes to the correction:
-    /// `‖Qs·J·u_j‖² / σ_j`, the squared norm of the column
-    /// [`smoothing_correction_gram`] builds for it, i.e. its share of
-    /// `tr(J·V_ρ·Jᵀ)`.
-    ///
-    /// Ranking directions by THIS ranks them by their share of the estimand.
-    /// Ranking them by `1/σ_j` — the spread of `ρ` — ranks them by a quantity
-    /// the correction does not depend on alone, and puts a saturated direction
-    /// (where `1/σ_j` is huge precisely because `∂β̂/∂ρ → 0`) first (#2728).
-    pub fn first_order_variance(&self, index: usize) -> f64 {
-        let column = self.sensitivity_orig.dot(&self.eigenvectors.column(index));
-        column.dot(&column) / self.eigenvalues[index]
-    }
-
     /// Indices of the directions the certified inversion admitted, i.e. those
     /// with strictly positive resolved curvature.
     pub(crate) fn active_directions(&self) -> Vec<usize> {

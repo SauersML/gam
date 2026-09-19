@@ -142,6 +142,7 @@ mod custom_family_persistent_warm_start;
 mod assembly;
 mod block_spec;
 mod blockwise_solve;
+mod branch_continuation;
 mod covariance;
 mod fit;
 mod inner_blockwise_fit;
@@ -161,6 +162,7 @@ pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
 pub use assembly::*;
 pub(crate) use blockwise_solve::*;
+pub(crate) use branch_continuation::*;
 pub(crate) use covariance::*;
 // Covariance helpers that are part of the public flat-namespace API: one consumed
 // by the relocated families (`crate::projected_linear_constraint_stationarity_vector`),
