@@ -1,0 +1,10 @@
+
+== expectile90 (n=600, reps=4)
+  gamfit            RMSE 0.1158 (sd 0.0306)  cover95 0.892  time 1.43s  ok=4
+  pygam_default     RMSE 0.1484 (sd 0.0228)  cover95 1.000  time 20.00s  ok=4
+  pygam_gridsearch  RMSE 0.1170 (sd 0.0321)  cover95 0.994  time 129.33s  ok=4
+
+== gamma_inverse (n=600, reps=4)
+  gamfit            RMSE 0.1317 (sd 0.0237)  cover95 0.932  time 8.81s  ok=4
+  pygam_default     RMSE 7.9636 (sd 4.5207)  cover95 0.016  time 29.91s  ok=4
+  pygam_gridsearch  ERRORS (4): AttributeError: 'NoneType' object has no attribute 'get_params'

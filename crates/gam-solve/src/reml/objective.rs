@@ -264,7 +264,7 @@ impl<'a> RemlState<'a> {
         // tabulated `backend DenseSpectral` from THIS line on both sides of a
         // 12x per-trial cost change and could conclude only "it is not a
         // backend switch" -- the label is two-valued, so it cannot say which of
-        // the six routes to it was taken, nor whether a density was measured at
+        // the routes to it was taken, nor whether a density was measured at
         // all.
         log::trace!(
             "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?} | {}",
@@ -1555,6 +1555,7 @@ impl<'a> RemlState<'a> {
             if let Some(ref taka) = sparse.takahashi {
                 op = op.with_takahashi(taka.clone());
             }
+            op = op.with_hessian(sparse.hessian.clone());
             std::sync::Arc::new(op)
         };
 
@@ -4090,11 +4091,11 @@ mod ift_warm_start_tests {
         }
         let nullity = p - rank;
         CanonicalPenalty {
-            root,
+            root: root.into_shared(),
             col_range: 0..p,
             total_dim: p,
             nullity,
-            local,
+            local: local.into_shared(),
             prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,

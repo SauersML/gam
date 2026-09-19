@@ -1,0 +1,11 @@
+fit wall=100.743 cpu=27.328
+GAM fitted model
+  Formula: y ~ s(x0) + s(x1) + s(x2) + s(x3) + s(x4)
+  Family:  Poisson Log
+  Class:   standard
+  Training rows: 10000
+  Deviance: 11266
+  REML score: 4960.04
+  Effective dof: 36.5651
+  Outer iterations: 28
+  Coefficients: 56
