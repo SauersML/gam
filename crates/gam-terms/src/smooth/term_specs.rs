@@ -7870,7 +7870,11 @@ pub(crate) fn build_factor_smooth(
         FactorSmoothFlavour::Sz => "sz",
         FactorSmoothFlavour::Re => "re",
         FactorSmoothFlavour::LevelSlopes => {
-            unreachable!("level slopes return from build_factor_level_slopes above")
+            crate::bail_invalid_basis!(
+                "factor smooth term '{}': level slopes are built by build_factor_level_slopes, \
+                 not the replicated-marginal path",
+                term_name
+            );
         }
     }
     .to_string();
