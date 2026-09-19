@@ -643,6 +643,105 @@ pub fn build_term_collection_prediction_design(
     })
 }
 
+/// One linear or smooth term's design columns on new rows: the columns
+/// [`build_term_collection_prediction_design`] realizes over that term's range,
+/// built without realizing the terms its columns do not read.
+///
+/// A smooth's realized block reads the blocks of the smooths it is
+/// residualized against (the owners a frozen chart names, or the ownership
+/// hierarchy when nothing is frozen) and, under an automatic center strategy,
+/// the joint spatial center plan; everything else — random effects and every
+/// unrelated smooth — only widens the rows' design. The fixed affine channel is
+/// not a column, so it is not part of the result.
+pub fn build_term_prediction_columns(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let is_linear = spec.linear_terms.iter().any(|linear| linear.name == term);
+    let mut kept = vec![false; spec.smooth_terms.len()];
+    if !is_linear {
+        let target = spec
+            .smooth_terms
+            .iter()
+            .position(|smooth| smooth.name == term)
+            .ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "term {term:?} is neither a linear nor a smooth term of this model"
+                ))
+            })?;
+        let auto_centered = |smooth: &SmoothTermSpec| {
+            spatial_term_center_strategy(smooth).is_some_and(center_strategy_is_auto)
+        };
+        let mut ownership = None;
+        let mut pending = vec![target];
+        while let Some(idx) = pending.pop() {
+            if std::mem::replace(&mut kept[idx], true) {
+                continue;
+            }
+            let smooth = &spec.smooth_terms[idx];
+            if let Some(chart) = frozen_parametric_residualization(smooth) {
+                pending.extend(chart.owner_terms.iter().copied());
+            }
+            if frozen_global_orthogonality(smooth).is_none()
+                && !smooth_has_frozen_identifiability(smooth)
+            {
+                let SmoothStructureAnalysis { term_owners, .. } =
+                    ownership.get_or_insert_with(|| analyze_smooth_ownership(&spec.smooth_terms));
+                pending.extend(term_owners[idx].iter().copied());
+            }
+            if auto_centered(smooth) {
+                pending.extend(
+                    (0..spec.smooth_terms.len())
+                        .filter(|&other| auto_centered(&spec.smooth_terms[other])),
+                );
+            }
+        }
+    }
+    // Kept smooths keep their relative order, so the ownership order and every
+    // owner list restricted to them are the full spec's.
+    let mut new_index = vec![None; spec.smooth_terms.len()];
+    let mut smooth_terms = Vec::new();
+    for (idx, smooth) in spec.smooth_terms.iter().enumerate() {
+        if kept[idx] {
+            new_index[idx] = Some(smooth_terms.len());
+            smooth_terms.push(smooth.clone());
+        }
+    }
+    for smooth in &mut smooth_terms {
+        if let Some(chart) = smooth.frozen_parametric_residualization.as_mut() {
+            for owner in &mut chart.owner_terms {
+                *owner = new_index[*owner].expect("a kept smooth's chart owners are kept with it");
+            }
+        }
+    }
+    let level = match spec.level {
+        ModelLevel::NoIntercept { level_smooth } => ModelLevel::NoIntercept {
+            level_smooth: level_smooth.and_then(|idx| new_index[idx]),
+        },
+        ModelLevel::Intercept => ModelLevel::Intercept,
+    };
+    let reduced = TermCollectionSpec {
+        linear_terms: spec.linear_terms.clone(),
+        random_effect_terms: Vec::new(),
+        smooth_terms,
+        level,
+    };
+    let design = build_term_collection_prediction_design(data, &reduced)?;
+    let range = design
+        .linear_ranges
+        .iter()
+        .chain(&design.smooth_ranges)
+        .find(|(name, _)| name == term)
+        .map(|(_, range)| range.clone())
+        .ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "term {term:?} has no columns in its restricted design"
+            ))
+        })?;
+    Ok(design.design.extract_columns(&range.collect::<Vec<_>>()))
+}
+
 /// Exact analytic derivative of an affine term-collection realization.
 #[derive(Debug, Clone)]
 pub struct TermCollectionDerivativeDesign {

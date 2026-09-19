@@ -5276,6 +5276,72 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
     }
 }
 
+/// Partial dependence evaluates one term on a grid. Its columns must be the
+/// full prediction design's columns over the term's range, while the terms the
+/// block does not read are never built: realizing every term's basis on the
+/// grid made the cost scale with the model's width, not the term's.
+#[test]
+fn term_prediction_columns_match_the_full_prediction_design() {
+    let train = prediction_design_dataset(160);
+    let new_rows = Array2::from_shape_fn((37, 4), |(i, j)| match j {
+        0 => 0.0,
+        1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
+        _ => (i % 3) as f64,
+    });
+    for formula in [
+        "y ~ s(x) + s(z)",
+        "y ~ x + s(x)",
+        "y ~ x + s(x) + s(z)",
+        "y ~ s(x, double_penalty=true)",
+        "y ~ te(x, z)",
+        "y ~ s(x) + te(x, z)",
+        "y ~ s(x) + s(z) + ti(x, z)",
+        "y ~ s(x, z)",
+        "y ~ matern(x, z)",
+        "y ~ duchon(x, z)",
+        "y ~ g + s(x, by=g)",
+        "y ~ s(x, g, bs=\"fs\")",
+        "y ~ s(x) + s(g, x, bs=\"sz\")",
+    ] {
+        let spec = build_formula(formula, &train);
+        let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+            .unwrap_or_else(|err| panic!("`{formula}` training design: {err}"));
+        let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted)
+            .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
+        let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
+            .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
+        for (name, range) in full.linear_ranges.iter().chain(&full.smooth_ranges) {
+            let columns =
+                crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
+                    .unwrap_or_else(|err| panic!("`{formula}` term {name}: {err}"));
+            assert_eq!(
+                columns,
+                full.design
+                    .extract_columns(&range.clone().collect::<Vec<_>>()),
+                "`{formula}`: term {name}'s columns must be the full design's over {range:?}"
+            );
+        }
+    }
+
+    // `s(x)` reads nothing of `s(z)`, so a grid whose `z` the full build
+    // rejects still evaluates it.
+    let spec = build_formula("y ~ s(x) + s(z)", &train);
+    let fitted = crate::smooth::build_term_collection_design(train.values.view(), &spec)
+        .expect("training design");
+    let frozen = crate::smooth::freeze_term_collection_from_design(&spec, &fitted).expect("freeze");
+    let mut grid = new_rows.clone();
+    grid.column_mut(2).fill(f64::NAN);
+    assert!(
+        crate::smooth::build_term_collection_prediction_design(grid.view(), &frozen).is_err(),
+        "the full build must reject a non-finite `z`"
+    );
+    let reference = crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, "s(x)")
+        .expect("s(x) on finite rows");
+    let columns = crate::smooth::build_term_prediction_columns(grid.view(), &frozen, "s(x)")
+        .expect("s(x) must not build s(z)");
+    assert_eq!(columns, reference);
+}
+
 #[test]
 fn frozen_tensor_design_is_built_without_its_penalties() {
     let train = prediction_design_dataset(160);
