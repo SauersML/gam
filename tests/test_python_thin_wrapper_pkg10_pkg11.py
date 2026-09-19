@@ -160,7 +160,7 @@ def test_predict_proba_returns_the_posterior_mean_as_fitted() -> None:
     clf = GAMClassifier(formula="y ~ s(x1)", family="binomial").fit(X, y)
     proba = clf.predict_proba(X)
     posterior = np.asarray(
-        clf.model_.predict(clf._strip_response_column(X), return_type="dict")["posterior_mean"],
+        clf.model_.predict(X, return_type="dict")["posterior_mean"],
         dtype=float,
     )
     np.testing.assert_array_equal(proba[:, 1], posterior)

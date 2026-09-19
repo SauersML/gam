@@ -107,7 +107,6 @@ fn firth_inner_solve(link: StandardLink) -> PirlsResult {
     };
     let penalty = PenaltyConfig {
         canonical_penalties: &canonical,
-        balanced_penalty_root: None,
         reparam_invariant: None,
         p,
         coefficient_lower_bounds: None,

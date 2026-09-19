@@ -110,7 +110,8 @@ pub(crate) use gam::types::{
 pub(crate) use gam::families::fit_orchestration::{
     FitConfig, FitResult,
     PreparedSurvivalTimeStack, WorkflowError,
-    fit_from_formula_with_notes, fit_required_columns, formula_columns, is_binary_response,
+    drop_zero_weight_rows, fit_from_formula_with_notes, fit_required_columns, formula_columns,
+    is_binary_response,
     prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
 };
 
